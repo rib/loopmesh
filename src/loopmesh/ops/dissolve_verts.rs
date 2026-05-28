@@ -504,6 +504,46 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// §7 triangle-corner edge-pair row / §6.6 degenerate-face reaping: a vert
+    /// with exactly two incident edges on the corner of a lone triangle. The
+    /// phase-4 collapse pushes the triangle to a 2-gon and the primitive reaps
+    /// it, splicing away the redundant duplicate edge. Delta:
+    /// -1 V, -2 E, -1 F (V=3,E=3,F=1 → V=2,E=1,F=0).
+    #[test]
+    fn dissolve_verts_edge_pair_on_lone_triangle_reaps_face() {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)]
+            .into_iter()
+            .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+            .collect();
+        let e0 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e1 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e2 = mesh.create_edge([v[2], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(&[v[0], v[1], v[2]], &[e0, e1, e2], FaceCreateFlags::NONE);
+
+        assert_eq!(mesh.totvert(), 3);
+        assert_eq!(mesh.totedge(), 3);
+        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vert_edge_keys(v[1]).len(), 2, "corner is an edge-pair vert");
+
+        mesh.dissolve_verts(&[v[1]]);
+
+        assert_eq!(mesh.totvert(), 2, "-1 V (the collapsed corner)");
+        assert_eq!(mesh.totedge(), 1, "-2 E (spoke + spliced duplicate)");
+        assert_eq!(mesh.totface(), 0, "-1 F (the 2-gon is reaped)");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v[1]), "the dissolved corner is gone");
+        assert!(live.contains(&v[0]) && live.contains(&v[2]), "neighbours survive");
+
+        let edges = mesh.edge_keys();
+        assert_eq!(edges.len(), 1, "a single edge between the two neighbours");
+        let endpoints: std::collections::HashSet<VertexKey> =
+            mesh.edge_vert_keys(edges[0]).into_iter().collect();
+        assert_eq!(endpoints, [v[0], v[2]].into_iter().collect());
+        mesh.validate_topology();
+    }
+
     /// §3 row 2 / §6.1 + §6.4: a wire-only vert with a single wire edge. Phase
     /// 1 kills the wire edge; phase 4 kills the now-isolated vert. The far
     /// endpoint survives. Delta: -1 V, -1 E.

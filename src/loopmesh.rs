@@ -66,6 +66,7 @@ mod euler;
 mod mid;
 mod ops;
 
+pub use mid::EdgeCollapseFlags;
 pub use ops::{
     DissolveFacesOptions, DissolveFacesResult, InsetIndividualParams, InsetIndividualResult,
     InsetRegionParams, InsetRegionResult, NgonMethod, QuadMethod,

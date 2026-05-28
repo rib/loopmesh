@@ -8,6 +8,8 @@
 
 mod edge_collapse;
 mod edge_rotate;
+
+pub use edge_collapse::EdgeCollapseFlags;
 mod edge_split;
 mod face_split;
 mod faces_join;
