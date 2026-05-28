@@ -8,12 +8,14 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod dissolve_faces;
 mod extrude_region;
 mod face_poke;
 mod face_triangulate;
 mod inset_individual;
 mod inset_region;
 
+pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
 pub use face_triangulate::{NgonMethod, QuadMethod};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
