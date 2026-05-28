@@ -12,20 +12,15 @@ const ANGLE_EPS: f32 = 0.0001;
 /// Mirrors the BMOP set-input shape described in
 /// `radial-mesh-guides/operators/DISSOLVE_EDGES.md` §1.
 ///
-/// The default-parameter path and the `use_verts` post-pass with a wide or
-/// near-zero `angle_threshold` (the canonical "inverse of an edge cut", plus
-/// the §1 short-circuit) are implemented. Two configurations are not yet
-/// supported. Rather than panic on them — an expected-failure mode, which
-/// per the project rubric must not be a panic — [`LoopMesh::dissolve_edges`]
-/// declines them as a no-op and reports the decline through its return value
-/// ([`DissolveEdgesResult::Unsupported`]). The unsupported configurations:
+/// The default-parameter path and the full `use_verts` post-pass — wide,
+/// near-zero, *and* intermediate `angle_threshold` (the §5.2 blended-angle
+/// gate) — are implemented. One configuration is not yet supported. Rather
+/// than panic on it — an expected-failure mode, which per the project rubric
+/// must not be a panic — [`LoopMesh::dissolve_edges`] declines it as a no-op
+/// and reports the decline through its return value
+/// ([`DissolveEdgesResult::Unsupported`]). The unsupported configuration:
 ///
 /// - `use_face_split == true` (§4, the vert-centred pre-pass) — unwritten.
-/// - `use_verts == true` with an intermediate `angle_threshold` (above `ε`,
-///   below `π − ε`) — the full §5.2 blended-angle gate is unwritten. The two
-///   short-circuit branches are supported: `angle_threshold ≥ π − ε`
-///   collapses every candidate, and `angle_threshold ≤ ε` forces `use_verts`
-///   off.
 #[derive(Clone, Copy)]
 pub struct DissolveEdgesParams {
     /// Post-pass: collapse adjacent verts that became edge-pairs after the
@@ -38,7 +33,9 @@ pub struct DissolveEdgesParams {
     pub use_face_split: bool,
     /// Gate for `use_verts` (§5.2). Only consulted when `use_verts` is on.
     /// At the default `π` every edge-pair candidate collapses; at `0` the
-    /// `use_verts` pass is short-circuited entirely (§1).
+    /// `use_verts` pass is short-circuited entirely (§1); at an intermediate
+    /// value each still-edge-pair candidate's collapse is gated on its
+    /// blended dihedral angle being strictly below `angle_threshold − ε`.
     pub angle_threshold: f32,
 }
 
@@ -60,22 +57,27 @@ pub enum DissolveEdgesResult {
     /// The operator ran (the mesh may or may not have changed, depending on
     /// the per-edge classifications).
     Ran,
-    /// The parameter tuple is outside the implemented surface (§4 pre-pass,
-    /// or the §5.2 blended-angle gate for an intermediate threshold). The
-    /// mesh was left untouched.
+    /// The parameter tuple is outside the implemented surface (currently only
+    /// the §4 `use_face_split` pre-pass). The mesh was left untouched.
     Unsupported,
 }
 
 /// How the `use_verts` post-pass treats the marked candidates after the
-/// merges, decided up front from `angle_threshold` (§1 / §5.2).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// merges, decided up front from `angle_threshold` (§1 / §5.2 / §6.5).
+#[derive(Clone, Copy, PartialEq)]
 enum UseVertsMode {
     /// Post-pass disabled: either `use_verts` was off, or the threshold sits
     /// at/below the epsilon floor and forces it off (§1).
     Off,
-    /// Threshold at/above `π − ε`: every still-edge-pair candidate collapses
-    /// without an angle test (§5.2 default branch).
+    /// Threshold at/above `π − ε` (the `dissolve_all` fast path): every
+    /// still-edge-pair candidate collapses without an angle test (§5.2
+    /// default branch / §6.5 sub-step 3 first bullet).
     CollapseAll,
+    /// Intermediate threshold (above `ε`, below `π − ε`): each still-edge-pair
+    /// candidate's collapse is gated by the §5.2 blended-angle test against
+    /// the carried threshold, unless the candidate was reached via the §5.1
+    /// chain-walk (chain verts always collapse — the §6.5 chain override).
+    Gated { angle_threshold: f32 },
 }
 
 /// Per-edge classification of an input edge (§3). Drives whether the
@@ -148,8 +150,10 @@ impl LoopMesh {
             // §5.2 default branch — every edge-pair candidate collapses.
             UseVertsMode::CollapseAll
         } else {
-            // §5.2 blended-angle gate for an intermediate threshold: unwritten.
-            return DissolveEdgesResult::Unsupported;
+            // §5.2 blended-angle gate for an intermediate threshold.
+            UseVertsMode::Gated {
+                angle_threshold: params.angle_threshold,
+            }
         };
 
         // §6.1 / §6.2 — when the post-pass is on, tag the input set and mark
@@ -165,6 +169,11 @@ impl LoopMesh {
             // (§8): the §5.1 walk stops if it runs into a *different* input
             // chain edge, avoiding double-marking intersecting selections.
             let chain = self.push_edge_op_flag_layer();
+            // §6.5 chain override — verts reached through the §5.1 chain-walk
+            // skip the §5.2 angle test entirely and always collapse. Recorded
+            // as a separate vert layer so the gated collapse pass can honour
+            // the override without re-walking.
+            let chain_target = self.push_vert_op_flag_layer();
             for &edge in edges {
                 if self.edges.try_get(edge).is_none() {
                     continue;
@@ -187,10 +196,16 @@ impl LoopMesh {
             // unselected chain edges that dissolve as a consequence.
             self.dissolve_edges_tag_chains(edges, tagged);
             let marked = self.push_vert_op_flag_layer();
-            self.dissolve_edges_mark_use_verts_candidates(edges, tagged, chain, marked);
+            self.dissolve_edges_mark_use_verts_candidates(
+                edges,
+                tagged,
+                chain,
+                marked,
+                chain_target,
+            );
             self.pop_edge_op_flag_layer(chain);
             self.pop_edge_op_flag_layer(tagged);
-            Some(marked)
+            Some((marked, chain_target))
         };
 
         // §6.4 — per-edge dispatch in input order. Each iteration
@@ -216,9 +231,11 @@ impl LoopMesh {
         }
 
         // §6.5 sub-step 3 — collapse the marked candidates that are still
-        // edge-pairs after the merges.
-        if let Some(marked) = candidate_marks {
-            self.dissolve_edges_collapse_marked_candidates(marked);
+        // edge-pairs after the merges, gating each on the §5.2 blended angle
+        // when the mode demands it.
+        if let Some((marked, chain_target)) = candidate_marks {
+            self.dissolve_edges_collapse_marked_candidates(marked, chain_target, mode);
+            self.pop_vert_op_flag_layer(chain_target);
             self.pop_vert_op_flag_layer(marked);
         }
 
@@ -293,6 +310,7 @@ impl LoopMesh {
         tagged: crate::op_flags::EdgeOpFlagLayer,
         chain: crate::op_flags::EdgeOpFlagLayer,
         marked: crate::op_flags::VertOpFlagLayer,
+        chain_target: crate::op_flags::VertOpFlagLayer,
     ) {
         for &edge in edges {
             if self.edges.try_get(edge).is_none() {
@@ -316,7 +334,8 @@ impl LoopMesh {
                 // walk the chain to its terminus and mark that instead. A
                 // walk that runs into a *different* input chain edge mid-walk
                 // (intersecting selections, §8) yields None → skip.
-                let v_target = if self.vertex_disk_count_edges_capped(v_edge, 3) == 2 {
+                let reached_via_chain_walk = self.vertex_disk_count_edges_capped(v_edge, 3) == 2;
+                let v_target = if reached_via_chain_walk {
                     match self.dissolve_edges_find_chain_end(v_edge, edge, chain) {
                         Some(v) => v,
                         None => continue,
@@ -335,6 +354,12 @@ impl LoopMesh {
                 }
 
                 self.vert_op_flag_set(marked, v_target, 0);
+                if reached_via_chain_walk {
+                    // §6.5 chain override marker — this candidate is the
+                    // terminus of a selected chain, so its collapse bypasses
+                    // the §5.2 angle test (§5.2.6).
+                    self.vert_op_flag_set(chain_target, v_target, 0);
+                }
             }
         }
     }
@@ -374,16 +399,24 @@ impl LoopMesh {
         }
     }
 
-    /// §6.5 sub-step 3 / §5.3 — single mesh-wide walk over live verts;
-    /// collapse each vert that was marked in §6.2 and is *still* an edge-pair.
-    /// The candidates are gathered first and collapsed afterwards so each
-    /// (would-be) angle sample sees the post-merge geometry uniformly (§6.5
-    /// snapshot-then-act); at a wide `angle_threshold` (the only mode that
-    /// reaches here) the gather is unconditional past the still-edge-pair
-    /// re-test.
+    /// §6.5 sub-step 3 / §5.3 — the two-sweep `use_verts` post-pass. An
+    /// angle-test sweep gathers the candidates that are still edge-pairs and
+    /// pass the §5.2 gate (without touching topology), then a collapse sweep
+    /// acts on the survivors. Splitting the sweeps is what makes every
+    /// blended angle a *post-merge* sample uncontaminated by an earlier
+    /// collapse (§6.5 snapshot-then-act).
+    ///
+    /// - [`UseVertsMode::CollapseAll`] (the `dissolve_all` fast path, §6.5
+    ///   first bullet) gathers every still-edge-pair candidate with no angle
+    ///   math.
+    /// - [`UseVertsMode::Gated`] keeps a candidate iff it is a chain terminus
+    ///   (`chain_target`, the §6.5 chain override) or its blended angle is
+    ///   strictly below `angle_threshold − ε` (§5.2.6).
     fn dissolve_edges_collapse_marked_candidates(
         &mut self,
         marked: crate::op_flags::VertOpFlagLayer,
+        chain_target: crate::op_flags::VertOpFlagLayer,
+        mode: UseVertsMode,
     ) {
         let mut to_collapse: SmallVec<[VertexKey; 16]> = SmallVec::new();
         let mut iter = MeshVerts::default();
@@ -392,9 +425,26 @@ impl LoopMesh {
                 continue;
             }
             if self.vertex_disk_count_edges_capped(vertex, 3) != 2 {
+                // The merges may have demoted this candidate below edge-pair
+                // status (§6.5 angle-test sweep first guard).
                 continue;
             }
-            to_collapse.push(vertex);
+            let keep = match mode {
+                UseVertsMode::Off => false,
+                UseVertsMode::CollapseAll => true,
+                UseVertsMode::Gated { angle_threshold } => {
+                    if self.vert_op_flag_test(chain_target, vertex, 0) {
+                        // §6.5 chain override — chain termini always collapse.
+                        true
+                    } else {
+                        let angle = self.blended_edge_pair_angle(vertex);
+                        angle < angle_threshold - ANGLE_EPS
+                    }
+                }
+            };
+            if keep {
+                to_collapse.push(vertex);
+            }
         }
 
         for vertex in to_collapse {
@@ -411,6 +461,81 @@ impl LoopMesh {
                 continue;
             };
             let _ = self.vert_collapse_edge(e_kill, vertex);
+        }
+    }
+
+    /// §5.2 / §9 helper — the blended edge-pair angle at a candidate vert,
+    /// sampled live on the current post-merge mesh (§5.2.0; nothing is
+    /// captured pre-merge).
+    ///
+    /// `vertex` is known to be an edge-pair (the caller re-tested it). The
+    /// baseline `α_raw = π − ∠(v_a, v, v_b)` is always formed from the two
+    /// surviving edges' far-endpoint positions (§5.2.1). The face-pair branch
+    /// (§5.2.2) is taken *only* when the vert's primary edge `v.e` still
+    /// flanks two distinct faces post-merge; then both flanking faces' normals
+    /// are recomputed live (their cached normals are stale after the merges),
+    /// the raw-blend factor `r = clamp(−dot(no_a, no_b), 0, 1)` and the
+    /// normal-axis angle `α_normal = π − ∠axis(v_a, v, v_b, v.no)` are formed,
+    /// and the result is `lerp(α_raw, α_normal, r)`. When the branch is not
+    /// taken — single-face perimeter edge, wire, or non-manifold `v.e` — the
+    /// result is exactly `α_raw` (§5.2.2 no-live-two-face-edge fallback), which
+    /// is the common inverse-of-a-cut case (§5.2.5).
+    fn blended_edge_pair_angle(&self, vertex: VertexKey) -> f32 {
+        let pi = std::f32::consts::PI;
+
+        // The two surviving incident edges. The first one emitted by the disk
+        // iterator is the primary edge `v.e` (the disk-cycle entry edge).
+        let mut disk = self.vertex_disk_iter(vertex);
+        let primary_edge = disk.next().expect("edge-pair vert has a primary edge");
+        let second_edge = disk.next().expect("edge-pair vert has a second edge");
+
+        let far_a = self
+            .edges
+            .get(primary_edge)
+            .other_vertex(vertex)
+            .expect("primary edge has a far endpoint");
+        let far_b = self
+            .edges
+            .get(second_edge)
+            .other_vertex(vertex)
+            .expect("second edge has a far endpoint");
+
+        let position = self.vertex_position(vertex);
+        let position_a = self.vertex_position(far_a);
+        let position_b = self.vertex_position(far_b);
+
+        // §5.2.1 — baseline, always computed.
+        let raw_angle = pi - corner_angle(position_a, position, position_b);
+
+        // §5.2.2 — face-pair branch, taken iff `v.e` currently flanks two
+        // distinct faces. If it does not, `α = α_raw` and no normal is read.
+        let Some((face_a, face_b)) = self.dissolve_edges_edge_face_pair(primary_edge) else {
+            return raw_angle;
+        };
+
+        // §5.2.2 / §9 note — derive both normals from the faces' live corner
+        // positions; the cached per-face normals are stale after the merges.
+        let normal_a = self.face_compute_normal(face_a);
+        let normal_b = self.face_compute_normal(face_b);
+        let raw_blend = (-normal_a.dot(normal_b)).clamp(0.0, 1.0);
+
+        // §5.2.3 — unsigned corner angle in the plane ⊥ `v.no`.
+        let axis = self.vertex_normal(vertex);
+        let normal_angle = pi - corner_angle_on_axis(position_a, position, position_b, axis);
+
+        // §5.2.2 — lerp toward the normal-axis angle as the dihedral folds.
+        raw_angle + raw_blend * (normal_angle - raw_angle)
+    }
+
+    /// §5.2.2 helper — the two distinct faces flanking `edge` in the current
+    /// post-merge mesh, or `None` when the radial cycle is not exactly two
+    /// loops belonging to two distinct faces (wire, boundary, single-face
+    /// perimeter edge, self-radial, or non-manifold). Shares the radial-cycle
+    /// inspection shape with [`Self::dissolve_edges_classify`].
+    fn dissolve_edges_edge_face_pair(&self, edge: EdgeKey) -> Option<(FaceKey, FaceKey)> {
+        match self.dissolve_edges_classify(edge) {
+            EdgeClass::ManifoldPair { face_a, face_b } => Some((face_a, face_b)),
+            EdgeClass::NoOp => None,
         }
     }
 
@@ -492,6 +617,30 @@ impl LoopMesh {
         }
         EdgeClass::ManifoldPair { face_a, face_b }
     }
+}
+
+/// §5.2.1 — the corner angle `∠(corner_a, apex, corner_b)`: the unsigned angle
+/// at `apex` between the two edge directions, in `[0, π]`. Uses glam's
+/// `angle_between`, the safe angle-between-vectors primitive that clamps its
+/// argument and returns a finite angle rather than a NaN on degenerate input
+/// (§5.2.4).
+fn corner_angle(corner_a: Vec3, apex: Vec3, corner_b: Vec3) -> f32 {
+    (corner_a - apex).angle_between(corner_b - apex)
+}
+
+/// §5.2.3 — the corner angle at `apex` after projecting both edge directions
+/// into the plane through the origin perpendicular to `axis`. The result is
+/// the unsigned angle between the projected directions, in `[0, π]`; there is
+/// no winding sign. `axis` is taken as a unit vector (`v.no` is stored
+/// normalised). A near-zero projected direction (an incident edge nearly
+/// parallel to `axis`) flows through the same safe angle primitive as
+/// [`corner_angle`] (§5.2.4).
+fn corner_angle_on_axis(corner_a: Vec3, apex: Vec3, corner_b: Vec3, axis: Vec3) -> f32 {
+    let direction_a = corner_a - apex;
+    let direction_b = corner_b - apex;
+    let projected_a = direction_a - direction_a.dot(axis) * axis;
+    let projected_b = direction_b - direction_b.dot(axis) * axis;
+    projected_a.angle_between(projected_b)
 }
 
 #[cfg(test)]
@@ -1112,6 +1261,138 @@ mod tests {
                  got {got:?}, expected {cd_value:?}"
             );
         }
+        mesh.validate_topology();
+    }
+
+    // ---- §5.2 blended-angle gate (intermediate angle_threshold) ----
+
+    /// Build the §5.2.5 worked-example fixture: two unit quads sharing edge
+    /// `{1,2}`, the second folded out of the first's plane. Vert numbering
+    /// matches the guide: flat quad `[0,1,2,3]` lies in z=0 extending in −x
+    /// from the shared edge; the second quad `[1,4,5,2]` extends from the
+    /// shared edge along `displacement`. With `displacement = (0,0,1)` this is
+    /// the canonical 90° fold (vert 4 = `(1,0,1)`, vert 5 = `(1,1,1)`). The
+    /// vertex normals are populated so the §5.2.2 face-pair branch — when it
+    /// is reached — has a real `v.no` to project against. Returns `verts[6]`.
+    fn build_folded_two_quads(mesh: &mut LoopMesh, displacement: Vec3) -> Vec<VertexKey> {
+        let positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0) + displacement,
+            Vec3::new(1.0, 1.0, 0.0) + displacement,
+        ];
+        let v: Vec<VertexKey> = positions
+            .iter()
+            .map(|&p| mesh.create_vertex(p))
+            .collect();
+
+        let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+
+        // Flat quad [0,1,2,3] and folded quad [1,4,5,2], both CCW so the
+        // shared edge {1,2} flanks two distinct faces.
+        mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e_01, e_12, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[v[1], v[4], v[5], v[2]],
+            &[e_14, e_45, e_52, e_12],
+            FaceCreateFlags::NONE,
+        );
+
+        mesh.mesh_normals_update();
+        v
+    }
+
+    /// §5.2.5 worked example / the targeted parity row. Two unit quads folded
+    /// at 90° sharing edge `{1,2}`; dissolving it with `use_verts = true` and
+    /// an intermediate `angle_threshold = 0.5`. The merge produces one hexagon;
+    /// both endpoints (verts 1 and 2) land on the single merged-face perimeter,
+    /// so each candidate's primary edge has only one flanking face — the §5.2.2
+    /// face-pair branch is *not* taken and `α = α_raw = π/2 ≈ 1.5708`. Since
+    /// `1.5708 ≥ 0.5 − ε`, both collapses are rejected. Net `−1 E, −1 F`,
+    /// 0 V removed: 6 V, 6 E, 1 F.
+    #[test]
+    fn dissolve_edges_blended_angle_rejects_ninety_degree_fold() {
+        let mut mesh = LoopMesh::new();
+        let v = build_folded_two_quads(&mut mesh, Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+
+        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge {1,2}");
+
+        let result = mesh.dissolve_edges(&[shared], &use_verts(0.5));
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        assert_eq!(mesh.totvert(), 6, "0 V removed — both candidates rejected by the gate");
+        assert_eq!(mesh.totedge(), 6, "-1 E (only the merge)");
+        assert_eq!(mesh.totface(), 1, "-1 F (the two quads merge into one hexagon)");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(live.contains(&v[1]), "vert 1 survives — α_raw = π/2 ≥ 0.5");
+        assert!(live.contains(&v[2]), "vert 2 survives — α_raw = π/2 ≥ 0.5");
+        let face = mesh.face_keys();
+        assert_eq!(face.len(), 1);
+        assert_eq!(mesh.face_len(face[0]), 6, "merged hexagon perimeter 0-1-4-5-2-3");
+        mesh.validate_topology();
+    }
+
+    /// Same 90° fold, but a wide-enough intermediate threshold (`2.0 > π/2`):
+    /// `α_raw = π/2 ≈ 1.5708 < 2.0 − ε`, so the gate now *accepts* both
+    /// collapses. Direct contrast with the reject case above — only the
+    /// threshold differs. Both endpoints collapse: net `−1 V` each (`−2 V`
+    /// total), the merged hexagon shrinking to a quad: 4 V, 4 E, 1 F.
+    #[test]
+    fn dissolve_edges_blended_angle_accepts_ninety_degree_fold_with_wide_threshold() {
+        let mut mesh = LoopMesh::new();
+        let v = build_folded_two_quads(&mut mesh, Vec3::new(0.0, 0.0, 1.0));
+
+        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge {1,2}");
+
+        let result = mesh.dissolve_edges(&[shared], &use_verts(2.0));
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v[1]), "vert 1 collapses — α_raw = π/2 < 2.0");
+        assert!(!live.contains(&v[2]), "vert 2 collapses — α_raw = π/2 < 2.0");
+        assert_eq!(mesh.totvert(), 4, "-2 V (both endpoints collapsed)");
+        assert_eq!(mesh.totface(), 1, "-1 F (the merge)");
+        mesh.validate_topology();
+    }
+
+    /// Intermediate-threshold gate on a *straight* (near-collinear) chain: the
+    /// 2x2 face grid, dissolving `{1,4}`. Vert 1 becomes an edge-pair whose two
+    /// surviving edges `{0,1}` and `{1,2}` are collinear along x, so
+    /// `α_raw = π − π = 0`. Its primary edge is a single-face grid-boundary
+    /// edge post-merge, so the face-pair branch is skipped and `α = α_raw ≈ 0`.
+    /// At `angle_threshold = 0.5` the gate accepts (`0 < 0.5 − ε`), so vert 1
+    /// collapses — matching the wide-threshold headline outcome exactly while
+    /// going through the gated code path. Vert 4 stays 3-valent and survives.
+    #[test]
+    fn dissolve_edges_blended_angle_accepts_straight_chain() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_face_grid_2x2(&mut mesh);
+
+        let edge = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+
+        let result = mesh.dissolve_edges(&[edge], &use_verts(0.5));
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        assert_eq!(mesh.totvert(), 8, "-1 V (vert 1, α_raw≈0, collapses)");
+        assert_eq!(mesh.totedge(), 10, "-1 E merge, -1 E collapse");
+        assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&verts[1]), "vert 1 (straight chain) collapsed by the gate");
+        assert!(live.contains(&verts[4]), "vert 4 (still 3-valent) survives");
         mesh.validate_topology();
     }
 }
