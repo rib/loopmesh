@@ -690,10 +690,14 @@ impl LoopMesh {
         // along its shell normal — the area-less normal averaged from the
         // seam loops on tagged faces touching the vertex.
         //
-        // For flat regions the shell factor is 1.0, which is what this
-        // implementation assumes. The general curved-surface form
-        // (`shell_factor_at(v)`, INSET.md §8.2) is not yet pinned down in
-        // the guide and not yet implemented here.
+        // When `use_even_offset` is set, the displacement along the shell
+        // normal is scaled by the curved-surface shell factor
+        // (`shell_factor_at`, INSET.md §8.2) so the lifted boundary stays at a
+        // uniform perpendicular distance from each incident face's pre-depth
+        // plane regardless of how the surface curves at the vertex. The factor
+        // reads incident corner angles off the *pre-depth* positions, which the
+        // two-pass scratch-buffer structure (§8 step 6) preserves: positions
+        // are not written back until every factor has been measured.
         if params.depth != 0.0 {
             // Collect the set of tagged-region vertex identities. After
             // Phase 5, the inset boundary lives on the tagged-side verts
@@ -749,8 +753,12 @@ impl LoopMesh {
                 } else {
                     1.0
                 };
-                // shell_factor = 1.0 (flat-region approximation).
-                let offset = params.depth * scale;
+                let shell = if params.use_even_offset {
+                    self.shell_factor_at(v, n)
+                } else {
+                    1.0
+                };
+                let offset = params.depth * scale * shell;
                 let pos = self.vertex_position(v);
                 moves.push((v, pos + n * offset));
             }
@@ -833,6 +841,74 @@ impl LoopMesh {
         let a = self.loop_vertex(non_seam_loop);
         let b = self.loop_vertex(self.loop_next(non_seam_loop));
         Some(if a == corner_live { b } else { a })
+    }
+
+    /// INSET.md §8.2 — the curved-surface shell factor at `v`: the
+    /// corner-angle-weighted mean over `v`'s incident faces of the per-face
+    /// factor `1/|dot(vertex_normal, face_normal)|`.
+    ///
+    /// ```text
+    ///              Σ_f  per_face_shell(v, f) · corner_angle(f, v)
+    /// shell(v)  =  ───────────────────────────────────────────────
+    ///                     Σ_f  corner_angle(f, v)
+    /// ```
+    ///
+    /// `vertex_normal` is the per-vertex shell normal already built in §8 steps
+    /// 1–3 (assumed unit-length, as is each face normal). `corner_angle(f, v)`
+    /// is the interior angle of `f` at `v` — the unsigned angle ∠(prev, v, next)
+    /// in `[0, π]` measured at `v`'s current (pre-depth) position.
+    ///
+    /// Two guards keep the result finite and `≥ 1` (§8.2.3): the per-face
+    /// factor is clamped to `1` when the move direction is near-tangent to the
+    /// face (`|dot| < EPS`), and the whole factor falls back to `1` when the
+    /// total corner angle is zero (a fully collapsed corner with no weight to
+    /// average).
+    fn shell_factor_at(&self, v: VertexKey, vertex_normal: Vec3) -> f32 {
+        const TANGENT_EPS: f32 = 1.0e-6;
+
+        let mut accumulated_shell = 0.0_f32;
+        let mut accumulated_angle = 0.0_f32;
+
+        // Visit every face-corner at `v`: walk the disk, and for each incident
+        // edge walk its radial fan, keeping the loops whose own vertex is `v`
+        // (one per incident face). Dedup faces so a face reached via two of
+        // `v`'s spokes is only weighted once.
+        let mut seen_faces: Vec<FaceKey> = Vec::new();
+        let disk: Vec<EdgeKey> = self.vertex_disk_iter(v).collect();
+        for edge in disk {
+            for corner_loop in self.edge_radial_iter(edge).collect::<Vec<_>>() {
+                if self.loop_vertex(corner_loop) != v {
+                    continue;
+                }
+                let face = self.loop_face(corner_loop);
+                if seen_faces.contains(&face) {
+                    continue;
+                }
+                seen_faces.push(face);
+
+                let apex = self.vertex_position(v);
+                let previous = self.vertex_position(self.loop_vertex(self.loop_prev(corner_loop)));
+                let next = self.vertex_position(self.loop_vertex(self.loop_next(corner_loop)));
+                let corner_angle = (previous - apex).angle_between(next - apex);
+
+                let face_normal = self.face_normal(face);
+                let cosine = vertex_normal.dot(face_normal).abs();
+                let per_face_shell = if cosine < TANGENT_EPS {
+                    1.0
+                } else {
+                    1.0 / cosine
+                };
+
+                accumulated_shell += per_face_shell * corner_angle;
+                accumulated_angle += corner_angle;
+            }
+        }
+
+        if accumulated_angle != 0.0 {
+            accumulated_shell / accumulated_angle
+        } else {
+            1.0
+        }
     }
 
     /// INSET.md §4.5 — capture one face's loop/vert customdata baseline and
@@ -2084,6 +2160,233 @@ mod tests {
         assert!(
             (d1.x + 0.25).abs() < 1.0e-5 && (d2.x + 0.25).abs() < 1.0e-5,
             "perpendicular projection should equal thickness; d1={d1:?} d2={d2:?}"
+        );
+    }
+
+    // ---- Depth pass: curved-surface shell factor (INSET.md §8.2) ----
+
+    /// Build a "tent" of two quads sharing the ridge edge `r0–r1`, each plane
+    /// tilted by `tilt` radians off the XY plane in opposite directions. The
+    /// ridge runs along +Y at x = 0; the left quad falls away to -X, the right
+    /// to +X, both rising in +Z by `tan(tilt)` at unit horizontal distance.
+    /// Returns `(faces, ridge_v0, ridge_v1)`.
+    fn make_tent(mesh: &mut LoopMesh, tilt: f32) -> (Vec<FaceKey>, VertexKey, VertexKey) {
+        let lift = tilt.tan();
+        // Ridge.
+        let r0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.0, 2.0, 0.0));
+        // Left skirt (-X, rising in +Z).
+        let l0 = mesh.create_vertex(Vec3::new(-1.0, 0.0, lift));
+        let l1 = mesh.create_vertex(Vec3::new(-1.0, 2.0, lift));
+        // Right skirt (+X, rising in +Z).
+        let rr0 = mesh.create_vertex(Vec3::new(1.0, 0.0, lift));
+        let rr1 = mesh.create_vertex(Vec3::new(1.0, 2.0, lift));
+
+        let quad = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| {
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[3]], EdgeCreateFlags::NO_DUPLICATE);
+            let e3 = mesh.create_edge([vs[3], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(&vs, &[e0, e1, e2, e3], FaceCreateFlags::NONE)
+        };
+
+        // Both faces wound so their normals point up (+Z component).
+        let left = quad(mesh, [l0, r0, r1, l1]);
+        let right = quad(mesh, [r0, rr0, rr1, r1]);
+        (vec![left, right], r0, r1)
+    }
+
+    #[test]
+    fn shell_factor_curved_corner_exceeds_one() {
+        // A ridge vertex shared by two tilted faces is a curved corner: its
+        // shell normal bisects the two face normals, so the move direction is
+        // oblique to each face plane and the shell factor must exceed 1
+        // (INSET.md §8.2). A flat corner (coplanar faces) yields exactly 1.
+        let tilt = 30.0_f32.to_radians();
+        let mut mesh = LoopMesh::new();
+        let (_faces, ridge_v0, _ridge_v1) = make_tent(&mut mesh, tilt);
+        mesh.calc_face_normals();
+
+        // Shell normal at the ridge vertex: area-less sum of the two incident
+        // face normals, normalised (the depth pass's §8 steps 1–3 input).
+        let mut shell_normal = Vec3::ZERO;
+        let disk: Vec<EdgeKey> = mesh.vertex_disk_iter(ridge_v0).collect();
+        let mut seen: Vec<FaceKey> = Vec::new();
+        for e in disk {
+            for l in mesh.edge_radial_iter(e).collect::<Vec<_>>() {
+                if mesh.loop_vertex(l) != ridge_v0 {
+                    continue;
+                }
+                let f = mesh.loop_face(l);
+                if seen.contains(&f) {
+                    continue;
+                }
+                seen.push(f);
+                shell_normal += mesh.face_normal(f);
+            }
+        }
+        let shell_normal = shell_normal.normalize();
+
+        let factor = mesh.shell_factor_at(ridge_v0, shell_normal);
+        assert!(
+            factor > 1.0 + 1.0e-4,
+            "curved corner shell factor should exceed 1; got {factor}"
+        );
+
+        // A flat ridge (zero tilt → coplanar faces) gives exactly 1.
+        let mut flat = LoopMesh::new();
+        let (_f, flat_v0, _f1) = make_tent(&mut flat, 0.0);
+        flat.calc_face_normals();
+        let flat_factor = flat.shell_factor_at(flat_v0, Vec3::Z);
+        assert!(
+            (flat_factor - 1.0).abs() < 1.0e-5,
+            "flat corner shell factor should be 1; got {flat_factor}"
+        );
+    }
+
+    #[test]
+    fn shell_factor_two_face_reduces_to_inv_cos_half_dihedral() {
+        // §8.2.2 reduction proof: for a vertex shared by exactly two equally
+        // tilted faces, the shell normal bisects the two face normals, so the
+        // angle between the move direction and each face normal is the
+        // half-dihedral. Each per-face factor is 1/cos(half-dihedral) and the
+        // angle-weighted mean of two equal values is that same value.
+        //
+        // Tent halves tilt by `tilt` off horizontal, so each face normal makes
+        // an angle `tilt` with +Z; the dihedral between the two normals is
+        // `2*tilt` and the half-dihedral is `tilt`. The shell factor must equal
+        // 1/cos(tilt).
+        for tilt_deg in [15.0_f32, 30.0, 45.0] {
+            let tilt = tilt_deg.to_radians();
+            let mut mesh = LoopMesh::new();
+            let (_faces, ridge_v0, _ridge_v1) = make_tent(&mut mesh, tilt);
+            mesh.calc_face_normals();
+
+            // Shell normal at the ridge vertex bisects the two face normals.
+            // By the tent's symmetry it points straight up (+Z).
+            let shell_normal = Vec3::Z;
+
+            let factor = mesh.shell_factor_at(ridge_v0, shell_normal);
+            let expected = 1.0 / tilt.cos();
+            assert!(
+                (factor - expected).abs() < 1.0e-4,
+                "tilt {tilt_deg}°: shell factor {factor} should be 1/cos(half-dihedral) {expected}"
+            );
+        }
+    }
+
+    /// A folded strip of two tagged tent quads meeting at the ridge `r0–r1`,
+    /// flanked on the two long sides by untagged quads so the ridge endpoints
+    /// `r0`/`r1` are seam corners *shared by both tagged faces*. After the
+    /// inset, each ridge-end tagged corner therefore has two differently-tilted
+    /// tagged faces incident — a genuine curved corner whose shell factor
+    /// exceeds 1. Returns `(tagged_faces, r0, r1)`.
+    fn make_folded_strip(mesh: &mut LoopMesh, tilt: f32) -> (Vec<FaceKey>, VertexKey, VertexKey) {
+        let lift = tilt.tan();
+        // Ridge along Y at x=0.
+        let r0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.0, 2.0, 0.0));
+        // Left skirt edge of the tent (-X, up).
+        let l0 = mesh.create_vertex(Vec3::new(-1.0, 0.0, lift));
+        let l1 = mesh.create_vertex(Vec3::new(-1.0, 2.0, lift));
+        // Right skirt edge of the tent (+X, up).
+        let rr0 = mesh.create_vertex(Vec3::new(1.0, 0.0, lift));
+        let rr1 = mesh.create_vertex(Vec3::new(1.0, 2.0, lift));
+        // Outer untagged flank verts beyond the tent's near (y<0) and far
+        // (y>2) ends, so the ridge endpoints become mixed-radial seams.
+        let nl = mesh.create_vertex(Vec3::new(-1.0, -1.0, lift));
+        let nr = mesh.create_vertex(Vec3::new(1.0, -1.0, lift));
+        let nc = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+
+        let quad = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| {
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[3]], EdgeCreateFlags::NO_DUPLICATE);
+            let e3 = mesh.create_edge([vs[3], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(&vs, &[e0, e1, e2, e3], FaceCreateFlags::NONE)
+        };
+
+        // Tagged tent halves, both rising to the ridge.
+        let left = quad(mesh, [l0, r0, r1, l1]);
+        let right = quad(mesh, [r0, rr0, rr1, r1]);
+        // Untagged flanks at the near (y<0) end, making the near ridge edges of
+        // each tent half mixed-radial → r0 becomes a seam corner shared by both
+        // tagged faces.
+        let _f_left = quad(mesh, [nl, nc, r0, l0]);
+        let _f_right = quad(mesh, [nc, nr, rr0, r0]);
+        (vec![left, right], r0, r1)
+    }
+
+    #[test]
+    fn depth_even_offset_scales_by_shell_factor_at_curved_boundary_corner() {
+        // End-to-end: the near ridge vertex r0 is a seam corner shared by two
+        // tilted tagged faces. With `use_even_offset` on, the depth pass lifts
+        // its tagged corner by `depth * shell_factor_at(r0)` along the (upward)
+        // shell normal — a longer move than the `use_even_offset`-off lift of
+        // exactly `depth` (§8.2.5). Track the tagged corner that descends from
+        // r0 and compare its post-inset displacement length.
+        let tilt = 35.0_f32.to_radians();
+        let depth = 0.4_f32;
+
+        // Displacement of the tagged corner nearest the origin (the one that
+        // came from r0 at (0,0,0)), measured from r0's original position.
+        let r0_corner_disp = |mesh: &LoopMesh| {
+            let origin = Vec3::ZERO;
+            let mut best: Option<Vec3> = None;
+            for v in mesh.vertices.iter() {
+                let p = mesh.vertex_position(v);
+                // Only verts lifted by depth (z away from 0) and near origin in
+                // xy are candidate r0 corners; pick the one closest in xy.
+                if p.z.abs() < 1.0e-4 {
+                    continue;
+                }
+                let xy = (p.x * p.x + p.y * p.y).sqrt();
+                best = match best {
+                    Some(cur) if (cur.x * cur.x + cur.y * cur.y).sqrt() <= xy => best,
+                    _ => Some(p),
+                };
+            }
+            best.expect("expected a lifted r0 corner") - origin
+        };
+
+        let mut even_on = LoopMesh::new();
+        let (on_faces, _r0, _r1) = make_folded_strip(&mut even_on, tilt);
+        even_on.inset_region(
+            &on_faces,
+            InsetRegionParams {
+                thickness: 0.15,
+                depth,
+                use_boundary: false,
+                use_even_offset: true,
+                ..Default::default()
+            },
+        );
+        even_on.validate_topology();
+
+        let mut even_off = LoopMesh::new();
+        let (off_faces, _r0b, _r1b) = make_folded_strip(&mut even_off, tilt);
+        even_off.inset_region(
+            &off_faces,
+            InsetRegionParams {
+                thickness: 0.15,
+                depth,
+                use_boundary: false,
+                use_even_offset: false,
+                ..Default::default()
+            },
+        );
+        even_off.validate_topology();
+
+        let on_disp = r0_corner_disp(&even_on);
+        let off_disp = r0_corner_disp(&even_off);
+        // The shell factor (> 1 at this curved corner) only *lengthens* the
+        // depth component, so the even-on corner travels strictly farther.
+        assert!(
+            on_disp.length() > off_disp.length() + 1.0e-3,
+            "even-offset shell factor should lengthen the depth move at a curved corner: \
+             on={} off={}",
+            on_disp.length(),
+            off_disp.length()
         );
     }
 }
