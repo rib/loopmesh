@@ -24,6 +24,12 @@ impl LoopMesh {
     /// Customdata: every new vertex copies its source vertex's attribs;
     /// every duplicated edge copies its source edge's attribs; each wall
     /// face inherits the attribs of the selected face that contributed it.
+    /// Each wall's four corner loops source their per-corner loop customdata
+    /// from the surround (unselected) face's two loops on the boundary edge,
+    /// so the wall is attribute-transparent with the surround; both the
+    /// original-side and duplicate-side corners take the same surround source
+    /// at the matching endpoint. A wall on a boundary edge with no surround
+    /// (a mesh-boundary radial-1 edge) keeps default loop customdata.
     /// The newly-created side ("vertical") edges between old and new verts
     /// take default attribute values.
     ///
@@ -69,6 +75,13 @@ impl LoopMesh {
             // (loop, its pre-mutation vertex). The vertex equals one of the
             // edge's two endpoints — used to decide the wall's winding.
             selected_loop_verts: SmallVec<[(LoopKey, VertexKey, FaceKey); 4]>,
+            // The surround face's two corner-loops on this edge, keyed by the
+            // endpoint vertex each corner sits at. A wall corner at endpoint
+            // `v` (original or duplicate side) sources its loop customdata
+            // from `surround_loop_at[i]` whose `.0 == v`. Absent when the
+            // edge has no unselected (surround) face — e.g. a mesh-boundary
+            // radial-1 edge — in which case wall loops keep default values.
+            surround_loop_at: SmallVec<[(VertexKey, LoopKey); 2]>,
         }
         let mut edge_info: Vec<Option<EdgeInfo>> = (0..edge_watermark).map(|_| None).collect();
         for slot in 0..edge_watermark {
@@ -78,6 +91,7 @@ impl LoopMesh {
             let e = EdgeKey::from_usize(slot);
             let mut selected_loop_verts: SmallVec<[(LoopKey, VertexKey, FaceKey); 4]> =
                 SmallVec::new();
+            let mut surround_loop_at: SmallVec<[(VertexKey, LoopKey); 2]> = SmallVec::new();
             let mut has_unselected = false;
             let mut radial = self.radial_loops(e);
             while let Some(l) = radial.next(self) {
@@ -87,6 +101,17 @@ impl LoopMesh {
                     selected_loop_verts.push((l, lref.vertex, face));
                 } else {
                     has_unselected = true;
+                    // First surround face wins as the customdata source. Its
+                    // two corner-loops on this edge are `l` (anchored at
+                    // `lref.vertex`) and `l`'s face-cycle successor (anchored
+                    // at the edge's other endpoint).
+                    if surround_loop_at.is_empty() {
+                        let l_next = self.loops.get(l).face_loop_links.next;
+                        let v_here = lref.vertex;
+                        let v_next = self.loops.get(l_next).vertex;
+                        surround_loop_at.push((v_here, l));
+                        surround_loop_at.push((v_next, l_next));
+                    }
                 }
             }
             // An edge is *interior to the selection* only when every face
@@ -103,6 +128,7 @@ impl LoopMesh {
             edge_info[slot] = Some(EdgeInfo {
                 is_boundary,
                 selected_loop_verts,
+                surround_loop_at,
             });
         }
 
@@ -153,6 +179,7 @@ impl LoopMesh {
         //               same source vertex. ----
         let mut side_edge_at_v: Vec<EdgeKey> = vec![EdgeKey::NULL; vert_watermark];
         let mut wall_faces: Vec<FaceKey> = Vec::new();
+        let do_loop_cd = !self.loop_attribs.is_empty();
         let mut vert_map_out: Vec<(VertexKey, VertexKey)> = Vec::new();
         let mut edge_map_out: Vec<(EdgeKey, EdgeKey)> = Vec::new();
 
@@ -199,6 +226,36 @@ impl LoopMesh {
                 );
                 self.face_attribs
                     .copy_into(wall.as_usize(), src_face.as_usize());
+
+                // Wall loop customdata flows continuously across the wall from
+                // the surround face: each of the four corners copies from the
+                // surround loop sitting at the corner's *original* endpoint, so
+                // the duplicate-side corners (v_b_new, v_a_new) pick up the same
+                // values as the original-side corners they sit above.
+                if do_loop_cd && !info.surround_loop_at.is_empty() {
+                    let surround_source_at = |v: VertexKey| -> Option<LoopKey> {
+                        info.surround_loop_at
+                            .iter()
+                            .find(|(sv, _)| *sv == v)
+                            .map(|(_, l)| *l)
+                    };
+                    let wall_loop_a_old = self.faces.get(wall).first_edge_loop;
+                    let wall_loop_b_old = self.loops.get(wall_loop_a_old).face_loop_links.next;
+                    let wall_loop_b_new = self.loops.get(wall_loop_b_old).face_loop_links.next;
+                    let wall_loop_a_new = self.loops.get(wall_loop_b_new).face_loop_links.next;
+                    for (wall_loop, origin_vert) in [
+                        (wall_loop_a_old, v_a_old),
+                        (wall_loop_b_old, v_b_old),
+                        (wall_loop_b_new, v_b_old),
+                        (wall_loop_a_new, v_a_old),
+                    ] {
+                        if let Some(source) = surround_source_at(origin_vert) {
+                            self.loop_attribs
+                                .copy_into(wall_loop.as_usize(), source.as_usize());
+                        }
+                    }
+                }
+
                 wall_faces.push(wall);
             }
         }
@@ -439,6 +496,131 @@ mod tests {
                 .unwrap();
             assert_eq!(src_val, dup_val);
         }
+    }
+
+    #[test]
+    fn extrude_region_wall_loop_uv_sourced_from_surround() {
+        // Two quads sharing edge v1–v2. Each face carries a distinct
+        // per-corner UV. Extruding face 0 makes the shared edge a manifold
+        // boundary whose surround is face 1; per EXTRUDE.md §4.3 the wall on
+        // that edge sources all four corner UVs from face 1's two loops on
+        // the edge (the duplicate-side corners take the same source as the
+        // original-side corners). The other three walls sit on mesh-boundary
+        // edges with no surround and keep default (zero) loop UVs.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+        let face0 = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let face1 = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+
+        // Give every corner of both faces a UV equal to its world XY, so the
+        // gradient is non-trivial and distinct per corner.
+        for &f in &[face0, face1] {
+            for l in mesh.iter_face_loops(f).collect::<Vec<_>>() {
+                let v = mesh.loop_vertex(l);
+                let p = mesh.vertex_position(v);
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            }
+        }
+
+        // Capture face 1's (surround) loop UVs at the shared-edge endpoints.
+        let mut surround_uv_at_v1 = None;
+        let mut surround_uv_at_v2 = None;
+        for l in mesh.iter_face_loops(face1).collect::<Vec<_>>() {
+            let v = mesh.loop_vertex(l);
+            let val = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            if v == v1 {
+                surround_uv_at_v1 = Some(val);
+            } else if v == v2 {
+                surround_uv_at_v2 = Some(val);
+            }
+        }
+        let surround_uv_at_v1 = surround_uv_at_v1.unwrap();
+        let surround_uv_at_v2 = surround_uv_at_v2.unwrap();
+
+        let result = mesh.extrude_region(&[face0]);
+
+        // The duplicates of v1 / v2.
+        let mut v1_dup = None;
+        let mut v2_dup = None;
+        for &(src, dup) in &result.vert_map {
+            if src == v1 {
+                v1_dup = Some(dup);
+            } else if src == v2 {
+                v2_dup = Some(dup);
+            }
+        }
+        let v1_dup = v1_dup.unwrap();
+        let v2_dup = v2_dup.unwrap();
+
+        // Find the wall on the shared edge: the wall face whose corner set
+        // contains both v1 and v2 (its original-edge endpoints).
+        let mut shared_wall = None;
+        for &wf in &result.wall_faces {
+            let verts = mesh.face_vert_keys(wf);
+            if verts.contains(&v1) && verts.contains(&v2) {
+                shared_wall = Some(wf);
+                break;
+            }
+        }
+        let shared_wall = shared_wall.expect("a wall sits on the shared edge");
+
+        // Each of the four wall corners must carry the surround's UV at the
+        // matching original endpoint — including the duplicate-side corners.
+        for l in mesh.iter_face_loops(shared_wall).collect::<Vec<_>>() {
+            let corner_vert = mesh.loop_vertex(l);
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            let expected = if corner_vert == v1 || corner_vert == v1_dup {
+                surround_uv_at_v1
+            } else {
+                assert!(corner_vert == v2 || corner_vert == v2_dup);
+                surround_uv_at_v2
+            };
+            assert_eq!(
+                got, expected,
+                "shared-edge wall corner at {corner_vert:?} must source surround UV"
+            );
+        }
+
+        // The surround UVs are non-zero, so this is a real propagation, not a
+        // coincidental default.
+        assert!(surround_uv_at_v1 != [0.0, 0.0] || surround_uv_at_v2 != [0.0, 0.0]);
+
+        // A mesh-boundary wall (e.g. on edge v0–v3, no surround) keeps default
+        // zero UVs on every corner.
+        let mut boundary_wall = None;
+        for &wf in &result.wall_faces {
+            let verts = mesh.face_vert_keys(wf);
+            if verts.contains(&v0) && verts.contains(&v3) {
+                boundary_wall = Some(wf);
+                break;
+            }
+        }
+        let boundary_wall = boundary_wall.expect("a wall sits on the v0–v3 mesh-boundary edge");
+        for l in mesh.iter_face_loops(boundary_wall).collect::<Vec<_>>() {
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert_eq!(got, [0.0, 0.0], "mesh-boundary wall has no surround source");
+        }
+
+        mesh.validate_topology();
     }
 
     #[test]
