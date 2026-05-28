@@ -16,6 +16,7 @@ mod face_poke;
 mod face_triangulate;
 mod inset_individual;
 mod inset_region;
+mod mean_value;
 
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};

@@ -1415,6 +1415,69 @@ impl ElementAttributes {
         }
     }
 
+    /// Capture every attribute layer's values at `slots` into a detached
+    /// [`SlotSnapshot`]. The snapshot is independent of the live buckets, so
+    /// it survives later writes to those same slots — the prerequisite for an
+    /// in-place resample where a destination slot is also one of its own
+    /// sources (inset's `use_interpolate` rebake reads a face's *original*
+    /// corner values to recompute the *same* corners' values; see
+    /// `radial-mesh-guides/operators/INSET.md` §4.5/§7).
+    pub fn snapshot_slots(&self, slots: &[usize]) -> SlotSnapshot {
+        let mut layers = Vec::with_capacity(self.attributes.len());
+        for (_, desc) in self.attributes.iter() {
+            let values = match desc.storage {
+                AttributeStorage::U8(b) => SnapshotValues::U8(gather(&self.attributes_u8[b], slots)),
+                AttributeStorage::I32(b) => {
+                    SnapshotValues::I32(gather(&self.attributes_i32[b], slots))
+                }
+                AttributeStorage::U32(b) => {
+                    SnapshotValues::U32(gather(&self.attributes_u32[b], slots))
+                }
+                AttributeStorage::F32(b) => {
+                    SnapshotValues::F32(gather(&self.attributes_f32[b], slots))
+                }
+                AttributeStorage::Vec2(b) => {
+                    SnapshotValues::Vec2(gather(&self.attributes_vec2[b], slots))
+                }
+                AttributeStorage::Vec3(b) => {
+                    SnapshotValues::Vec3(gather(&self.attributes_vec3[b], slots))
+                }
+                AttributeStorage::Vec4(b) => {
+                    SnapshotValues::Vec4(gather(&self.attributes_vec4[b], slots))
+                }
+                AttributeStorage::String(b) => SnapshotValues::String(
+                    slots
+                        .iter()
+                        .map(|&s| self.attributes_string[b].get(s).cloned().flatten())
+                        .collect(),
+                ),
+            };
+            layers.push((desc.storage, desc.interp, values));
+        }
+        SlotSnapshot { layers }
+    }
+
+    /// Blend a [`SlotSnapshot`]'s captured corners into `dst_slot` by
+    /// `weights` (one weight per snapshot index, in the same order the slots
+    /// were captured). Each layer composes the weights under its own
+    /// [`InterpPolicy`] — the fixed-arity blend-descriptor handoff of
+    /// `radial-mesh-guides/BMESH.md` §10.1.4. The weights are taken as already
+    /// normalised to a partition of unity; `Linear` layers re-normalise by
+    /// their own weight total for robustness.
+    pub fn interpolate_from_snapshot(
+        &mut self,
+        dst_slot: usize,
+        snapshot: &SlotSnapshot,
+        weights: &[f32],
+    ) {
+        for (storage, interp, values) in &snapshot.layers {
+            if matches!(interp, InterpPolicy::NoInterp) {
+                continue;
+            }
+            apply_interp_from_snapshot(self, dst_slot, *storage, *interp, values, weights);
+        }
+    }
+
     /// 1:1 attribute copy: every attribute's `dst_slot` receives `src_slot`'s
     /// value. Useful for ops that duplicate an element without blending
     /// (e.g. `euler_vert_separate`, `face_split` inheriting the source
@@ -1498,6 +1561,227 @@ impl ElementAttributes {
                 }
             }
         }
+    }
+}
+
+/// A detached copy of every attribute layer's values at an ordered list of
+/// slots, captured by [`ElementAttributes::snapshot_slots`]. Used as a
+/// resample source that is immune to in-place writes on the slots it was
+/// captured from.
+pub struct SlotSnapshot {
+    layers: Vec<(AttributeStorage, InterpPolicy, SnapshotValues)>,
+}
+
+impl SlotSnapshot {
+    /// Number of captured slots (snapshot corners).
+    pub fn len(&self) -> usize {
+        self.layers.first().map_or(0, |(_, _, v)| v.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+enum SnapshotValues {
+    U8(Vec<u8>),
+    I32(Vec<i32>),
+    U32(Vec<u32>),
+    F32(Vec<f32>),
+    Vec2(Vec<[f32; 2]>),
+    Vec3(Vec<[f32; 3]>),
+    Vec4(Vec<[f32; 4]>),
+    String(Vec<Option<String>>),
+}
+
+impl SnapshotValues {
+    fn len(&self) -> usize {
+        match self {
+            SnapshotValues::U8(v) => v.len(),
+            SnapshotValues::I32(v) => v.len(),
+            SnapshotValues::U32(v) => v.len(),
+            SnapshotValues::F32(v) => v.len(),
+            SnapshotValues::Vec2(v) => v.len(),
+            SnapshotValues::Vec3(v) => v.len(),
+            SnapshotValues::Vec4(v) => v.len(),
+            SnapshotValues::String(v) => v.len(),
+        }
+    }
+}
+
+/// Gather `slots` out of a bucket into a dense Vec (default-init for any
+/// out-of-range slot, which should not occur for live element slots).
+fn gather<T: Copy + Default>(bucket: &[T], slots: &[usize]) -> Vec<T> {
+    slots
+        .iter()
+        .map(|&s| bucket.get(s).copied().unwrap_or_default())
+        .collect()
+}
+
+/// Index of the snapshot corner carrying the largest weight (first wins on
+/// ties); `None` when every weight is non-positive and no source qualifies.
+fn nearest_snapshot_index(weights: &[f32]) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (i, &w) in weights.iter().enumerate() {
+        if best.map_or(true, |(bw, _)| w > bw) {
+            best = Some((w, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// Snapshot-source analogue of [`apply_interp`]: blend the captured corner
+/// values by `weights` under `policy` and write the result to `dst`.
+fn apply_interp_from_snapshot(
+    attrs: &mut ElementAttributes,
+    dst: usize,
+    storage: AttributeStorage,
+    policy: InterpPolicy,
+    values: &SnapshotValues,
+    weights: &[f32],
+) {
+    macro_rules! linear_vecn {
+        ($bucket:expr, $src:expr, $lanes:expr, $zero:expr) => {{
+            if let Some(out) = $bucket.get_mut(dst) {
+                match policy {
+                    InterpPolicy::Linear => {
+                        let mut sum = $zero;
+                        let mut wsum = 0.0_f32;
+                        for (i, &w) in weights.iter().enumerate() {
+                            if let Some(val) = $src.get(i) {
+                                for lane in 0..$lanes {
+                                    sum[lane] += w * val[lane];
+                                }
+                                wsum += w;
+                            }
+                        }
+                        if wsum != 0.0 {
+                            for lane in 0..$lanes {
+                                sum[lane] /= wsum;
+                            }
+                            *out = sum;
+                        }
+                    }
+                    InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
+                        let idx = match policy {
+                            InterpPolicy::CopyFirst => 0,
+                            _ => match nearest_snapshot_index(weights) {
+                                Some(i) => i,
+                                None => return,
+                            },
+                        };
+                        if let Some(val) = $src.get(idx) {
+                            *out = *val;
+                        }
+                    }
+                    InterpPolicy::NoInterp => {}
+                }
+            }
+        }};
+    }
+
+    macro_rules! pick_int {
+        ($bucket:expr, $src:expr) => {{
+            if let Some(out) = $bucket.get_mut(dst) {
+                let idx = match policy {
+                    InterpPolicy::CopyFirst => 0,
+                    InterpPolicy::NoInterp => return,
+                    // Integer attributes never produce a fractional blend
+                    // (§10.1.4); Linear routes to highest-weight like Nearest.
+                    _ => match nearest_snapshot_index(weights) {
+                        Some(i) => i,
+                        None => return,
+                    },
+                };
+                if let Some(val) = $src.get(idx) {
+                    *out = *val;
+                }
+            }
+        }};
+    }
+
+    match (storage, values) {
+        (AttributeStorage::F32(b), SnapshotValues::F32(src)) => {
+            if let Some(v) = attrs.attributes_f32.get_mut(b) {
+                if let Some(out) = v.get_mut(dst) {
+                    match policy {
+                        InterpPolicy::Linear => {
+                            let mut sum = 0.0_f32;
+                            let mut wsum = 0.0_f32;
+                            for (i, &w) in weights.iter().enumerate() {
+                                if let Some(&val) = src.get(i) {
+                                    sum += w * val;
+                                    wsum += w;
+                                }
+                            }
+                            if wsum != 0.0 {
+                                *out = sum / wsum;
+                            }
+                        }
+                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
+                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
+                                0
+                            } else {
+                                match nearest_snapshot_index(weights) {
+                                    Some(i) => i,
+                                    None => return,
+                                }
+                            };
+                            if let Some(&val) = src.get(idx) {
+                                *out = val;
+                            }
+                        }
+                        InterpPolicy::NoInterp => {}
+                    }
+                }
+            }
+        }
+        (AttributeStorage::Vec2(b), SnapshotValues::Vec2(src)) => {
+            if let Some(v) = attrs.attributes_vec2.get_mut(b) {
+                linear_vecn!(v, src, 2, [0.0_f32; 2]);
+            }
+        }
+        (AttributeStorage::Vec3(b), SnapshotValues::Vec3(src)) => {
+            if let Some(v) = attrs.attributes_vec3.get_mut(b) {
+                linear_vecn!(v, src, 3, [0.0_f32; 3]);
+            }
+        }
+        (AttributeStorage::Vec4(b), SnapshotValues::Vec4(src)) => {
+            if let Some(v) = attrs.attributes_vec4.get_mut(b) {
+                linear_vecn!(v, src, 4, [0.0_f32; 4]);
+            }
+        }
+        (AttributeStorage::U8(b), SnapshotValues::U8(src)) => {
+            if let Some(v) = attrs.attributes_u8.get_mut(b) {
+                pick_int!(v, src);
+            }
+        }
+        (AttributeStorage::I32(b), SnapshotValues::I32(src)) => {
+            if let Some(v) = attrs.attributes_i32.get_mut(b) {
+                pick_int!(v, src);
+            }
+        }
+        (AttributeStorage::U32(b), SnapshotValues::U32(src)) => {
+            if let Some(v) = attrs.attributes_u32.get_mut(b) {
+                pick_int!(v, src);
+            }
+        }
+        (AttributeStorage::String(b), SnapshotValues::String(src)) => {
+            if let Some(v) = attrs.attributes_string.get_mut(b) {
+                if let Some(out) = v.get_mut(dst) {
+                    let idx = match policy {
+                        InterpPolicy::CopyFirst | InterpPolicy::Linear => 0,
+                        InterpPolicy::Nearest => match nearest_snapshot_index(weights) {
+                            Some(i) => i,
+                            None => return,
+                        },
+                        InterpPolicy::NoInterp => return,
+                    };
+                    *out = src.get(idx).cloned().flatten();
+                }
+            }
+        }
+        _ => {}
     }
 }
 

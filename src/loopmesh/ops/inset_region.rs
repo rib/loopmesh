@@ -1,8 +1,41 @@
 use std::collections::HashMap;
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
+use super::mean_value::{mean_value_weights, PlaneProjection};
 use crate::loopmesh::*;
+
+/// One snapshotted face's customdata baseline (INSET.md §4.5). Captured before
+/// the offset solver moves any corner so that phase four (§7) can resample the
+/// *original* corner attributes at the *new* corner positions.
+struct FaceSnapshot {
+    /// The face's loops in cycle order. Loop keys are stable across phases
+    /// 2–5, so each entry still names the live corner at rebake time. The
+    /// corner vertices are re-read live through these loops at rebake time
+    /// (their identities may change under vert-separate).
+    loops: Vec<LoopKey>,
+    /// Original corner positions projected into the face-local 2D plane.
+    proj_corners: Vec<Vec2>,
+    /// Detached copy of each corner's loop customdata block.
+    loop_cd: SlotSnapshot,
+    /// Detached copy of each corner-vertex's customdata block.
+    vert_cd: SlotSnapshot,
+    /// Axis-dominant projection shared by the snapshot corners and the query
+    /// points (§10.1.1).
+    projection: PlaneProjection,
+}
+
+/// One wall's inner-edge (tagged-corner) loop and the source loops behind it,
+/// recorded for the §6.3 corner customdata merge. Two such records share a
+/// corner vertex when two walls meet there.
+struct CornerLoop {
+    /// The wall loop sitting on the new (tagged) edge at the corner vertex.
+    wall_loop: LoopKey,
+    /// The tagged inset face's loop at the corner ("inner" loop, §6.3).
+    tagged_src: LoopKey,
+    /// The untagged original face's loop at the corner ("outer" loop), if any.
+    outer_src: Option<LoopKey>,
+}
 
 /// Parameters controlling [`LoopMesh::inset_region`]. Each field gates one
 /// of the toggles described in `radial-mesh-guides/operators/INSET.md` (see
@@ -269,6 +302,36 @@ impl LoopMesh {
         endpoint_set.sort_unstable_by_key(|v| v.as_usize());
         endpoint_set.dedup();
 
+        // (Optional) customdata snapshot — INSET.md §4.5. Capture the original
+        // per-corner loop/vert customdata and projected corner positions for
+        // every tagged face incident to a seam endpoint, before phase three
+        // moves any corner. Phase four (§7) rebakes from this baseline.
+        let face_snapshots: Vec<FaceSnapshot> = if params.use_interpolate
+            && (!self.loop_attribs.is_empty() || !self.vertex_attribs.is_empty())
+        {
+            // Tagged faces incident to any seam endpoint. The walk goes
+            // through each endpoint's live disk and keeps faces still tagged.
+            let mut snap_faces: Vec<FaceKey> = Vec::new();
+            let mut seen: std::collections::HashSet<FaceKey> = std::collections::HashSet::new();
+            for &v in &endpoint_set {
+                let disk: Vec<EdgeKey> = self.vertex_disk_iter(v).collect();
+                for e in disk {
+                    for l in self.edge_radial_iter(e).collect::<Vec<_>>() {
+                        let f = self.loop_face(l);
+                        if self.face_op_flag_test(face_tag, f, 0) && seen.insert(f) {
+                            snap_faces.push(f);
+                        }
+                    }
+                }
+            }
+            snap_faces
+                .into_iter()
+                .map(|f| self.capture_face_snapshot(f))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // For `use_edge_rail` (INSET.md §5.5) the slide direction is measured
         // toward a far vertex along a shared non-seam edge, using *pre-inset*
         // coordinates — phase three moves boundary verts as it walks, so a
@@ -448,9 +511,20 @@ impl LoopMesh {
             }
         }
 
+        // Phase 4: re-interpolate face attributes (INSET.md §7). Runs after
+        // the offset solver moved the corners but before phase five builds the
+        // walls, so the wall's §6.2 loop-CD copy reads the already-rebaked
+        // tagged-face corners and §6.3 midpoints those rebaked values.
+        if params.use_interpolate {
+            self.inset_reinterpolate_faces(&face_snapshots);
+        }
+
         // Phase 5: build wall faces.
+        let do_loop_interp = !self.loop_attribs.is_empty();
         let mut wall_faces: Vec<FaceKey> = Vec::with_capacity(split_edges.len());
         let mut side_edge_cache: HashMap<(VertexKey, VertexKey), EdgeKey> = HashMap::new();
+        // §6.3: wall inner-edge loops grouped by their tagged corner vertex.
+        let mut corner_records: HashMap<VertexKey, Vec<CornerLoop>> = HashMap::new();
 
         for (i, s) in split_edges.iter().enumerate() {
             let v0_tag = endpoint_tagged_v.get(&(i, 0)).copied().unwrap_or(s.v0);
@@ -511,7 +585,60 @@ impl LoopMesh {
             let face = self.face_create(&verts, &edges, FaceCreateFlags::NONE);
             self.face_attribs
                 .copy_into(face.as_usize(), s.face.as_usize());
+
+            // §6.2 wall loop customdata copy (attribute-transparent wall) and
+            // §6.3 per-corner merge bookkeeping — only when loop layers exist.
+            if do_loop_interp {
+                // Tagged-side source loops: the seam loop sits at v0_tag going
+                // toward v1_tag, so it owns the v0_tag corner; its successor
+                // owns the v1_tag corner (INSET.md §6.2).
+                let src_v0_tag = s.seam_loop;
+                let src_v1_tag = self.loop_next(s.seam_loop);
+                // Untagged-side source loops: the loop on e_old whose face is
+                // untagged. None for a fabricated mesh-boundary e_old.
+                let (src_v0_un, src_v1_un) = self.untagged_seam_loops(s, face_tag, v0_un, v1_un);
+
+                // Map each wall loop to its corner vertex and copy from the
+                // matching source. Walls inherit the tagged corner's (now
+                // §7-rebaked) values on the inner edge.
+                let mut wl = self.faces.get(face).first_edge_loop;
+                for _ in 0..verts.len() {
+                    let wv = self.loop_vertex(wl);
+                    let src = if wv == v0_tag {
+                        Some(src_v0_tag)
+                    } else if wv == v1_tag {
+                        Some(src_v1_tag)
+                    } else if wv == v0_un {
+                        src_v0_un.or(Some(src_v0_tag))
+                    } else if wv == v1_un {
+                        src_v1_un.or(Some(src_v1_tag))
+                    } else {
+                        None
+                    };
+                    if let Some(src) = src {
+                        self.loop_attribs.copy_into(wl.as_usize(), src.as_usize());
+                    }
+                    // Record the wall's inner-edge (tagged-corner) loops for
+                    // the §6.3 corner merge.
+                    if params.use_interpolate && (wv == v0_tag || wv == v1_tag) {
+                        let outer = if wv == v0_tag { src_v0_un } else { src_v1_un };
+                        corner_records.entry(wv).or_default().push(CornerLoop {
+                            wall_loop: wl,
+                            tagged_src: if wv == v0_tag { src_v0_tag } else { src_v1_tag },
+                            outer_src: outer,
+                        });
+                    }
+                    wl = self.loop_next(wl);
+                }
+            }
+
             wall_faces.push(face);
+        }
+
+        // §6.3 corner loop-CD merge. Run after every wall is built so each
+        // tagged corner has the full set of incident wall inner-edge loops.
+        if params.use_interpolate && do_loop_interp {
+            self.inset_merge_corner_loops(&corner_records);
         }
 
         // Phase 6: depth pass (INSET.md §8). Lift every tagged-region vertex
@@ -628,6 +755,152 @@ impl LoopMesh {
         let a = self.loop_vertex(non_seam_loop);
         let b = self.loop_vertex(self.loop_next(non_seam_loop));
         Some(if a == corner_live { b } else { a })
+    }
+
+    /// INSET.md §4.5 — capture one face's loop/vert customdata baseline and
+    /// its corners' axis-dominant 2D projection, for phase-four rebaking.
+    fn capture_face_snapshot(&self, face: FaceKey) -> FaceSnapshot {
+        let normal = self.face_normal(face);
+        let projection = PlaneProjection::from_normal(normal);
+
+        let mut loops: Vec<LoopKey> = Vec::new();
+        let mut verts: Vec<VertexKey> = Vec::new();
+        let mut proj_corners: Vec<Vec2> = Vec::new();
+        let mut it = self.face_loops(face);
+        while let Some(l) = it.next(self) {
+            let v = self.loop_vertex(l);
+            loops.push(l);
+            verts.push(v);
+            proj_corners.push(projection.project(self.vertex_position(v)));
+        }
+
+        let loop_slots: Vec<usize> = loops.iter().map(|l| l.as_usize()).collect();
+        let vert_slots: Vec<usize> = verts.iter().map(|v| v.as_usize()).collect();
+        let loop_cd = self.loop_attribs.snapshot_slots(&loop_slots);
+        let vert_cd = self.vertex_attribs.snapshot_slots(&vert_slots);
+
+        FaceSnapshot {
+            loops,
+            proj_corners,
+            loop_cd,
+            vert_cd,
+            projection,
+        }
+    }
+
+    /// INSET.md §7 — rebake each snapshotted face's per-corner customdata at
+    /// the post-displacement corner positions using the §10.1 mean-value
+    /// resample. Reads the §4.5 baseline (immune to the in-place write) and
+    /// writes the blended values back to the live loops and corner verts.
+    fn inset_reinterpolate_faces(&mut self, snapshots: &[FaceSnapshot]) {
+        for snap in snapshots {
+            let n = snap.loops.len();
+            if n == 0 {
+                continue;
+            }
+            for i in 0..n {
+                // Live corner identity may have changed under vert-separate;
+                // re-read the loop's current vertex and its moved position.
+                let live_vert = self.loop_vertex(snap.loops[i]);
+                let q = snap.projection.project(self.vertex_position(live_vert));
+                let weights = mean_value_weights(&snap.proj_corners, q);
+                self.loop_attribs.interpolate_from_snapshot(
+                    snap.loops[i].as_usize(),
+                    &snap.loop_cd,
+                    &weights,
+                );
+                self.vertex_attribs.interpolate_from_snapshot(
+                    live_vert.as_usize(),
+                    &snap.vert_cd,
+                    &weights,
+                );
+            }
+        }
+    }
+
+    /// Locate the untagged-side loops on a seam edge's `e_old` at the two
+    /// corner vertices, for the §6.2 wall loop-CD copy. Returns
+    /// `(loop_at_v0_un, loop_at_v1_un)`; either is `None` when no untagged
+    /// loop sits on `e_old` (mesh-boundary seam: `e_old` is a fabricated wire
+    /// edge with an empty radial).
+    fn untagged_seam_loops(
+        &self,
+        s: &SplitEdge,
+        face_tag: crate::op_flags::FaceOpFlagLayer,
+        v0_un: VertexKey,
+        v1_un: VertexKey,
+    ) -> (Option<LoopKey>, Option<LoopKey>) {
+        let mut at_v0 = None;
+        let mut at_v1 = None;
+        for l in self.edge_radial_iter(s.e_old).collect::<Vec<_>>() {
+            if self.face_op_flag_test(face_tag, self.loop_face(l), 0) {
+                continue;
+            }
+            // The untagged face's two loops on this edge: `l` and its next.
+            let l_next = self.loop_next(l);
+            for cl in [l, l_next] {
+                let v = self.loop_vertex(cl);
+                if v == v0_un {
+                    at_v0 = Some(cl);
+                } else if v == v1_un {
+                    at_v1 = Some(cl);
+                }
+            }
+        }
+        (at_v0, at_v1)
+    }
+
+    /// INSET.md §6.3 — merge per-corner loop customdata where two wall faces
+    /// meet at a shared tagged corner. For each corner with exactly two walls:
+    /// gate on the two outer (untagged) loops being equal (no pre-existing UV
+    /// seam), then write the midpoint of the two inner (tagged inset) loops to
+    /// both inner loops and to both walls' inner-edge loops.
+    fn inset_merge_corner_loops(&mut self, corner_records: &HashMap<VertexKey, Vec<CornerLoop>>) {
+        for records in corner_records.values() {
+            if records.len() != 2 {
+                // The four-loop find of §6.3 is defined for exactly the two
+                // walls meeting at a corner. Lone walls (boundary) and
+                // higher-valence pinches keep their §6.2-copied values.
+                continue;
+            }
+            let a = &records[0];
+            let b = &records[1];
+
+            // Outer-pair-equality gate: skip when the original untagged face
+            // already carried a seam (diverging outer loop values) here.
+            match (a.outer_src, b.outer_src) {
+                (Some(oa), Some(ob)) => {
+                    if !self.loop_cd_equal(oa, ob) {
+                        continue;
+                    }
+                }
+                // Missing outer loop(s) → mesh-boundary corner, no merge.
+                _ => continue,
+            }
+
+            // Midpoint of the two inner (tagged inset) loop values. Snapshot
+            // the two source corners first so the in-place writes below don't
+            // feed back through the still-being-read source slots.
+            let snapshot = self
+                .loop_attribs
+                .snapshot_slots(&[a.tagged_src.as_usize(), b.tagged_src.as_usize()]);
+            let weights = [0.5_f32, 0.5_f32];
+            // Write into both inner loops and both walls' inner-edge loops.
+            for dst in [a.tagged_src, b.tagged_src, a.wall_loop, b.wall_loop] {
+                self.loop_attribs
+                    .interpolate_from_snapshot(dst.as_usize(), &snapshot, &weights);
+            }
+        }
+    }
+
+    /// Loop customdata equality test (byte-fingerprint) for the §6.3 outer-pair
+    /// gate.
+    fn loop_cd_equal(&self, a: LoopKey, b: LoopKey) -> bool {
+        let mut fa = Vec::new();
+        let mut fb = Vec::new();
+        self.loop_attribs.write_fingerprint(a.as_usize(), &mut fa);
+        self.loop_attribs.write_fingerprint(b.as_usize(), &mut fb);
+        fa == fb
     }
 }
 
@@ -916,5 +1189,308 @@ mod tests {
         rail_pos.sort_by_key(|a| key(a));
         plain_pos.sort_by_key(|a| key(a));
         assert_eq!(rail_pos, plain_pos);
+    }
+
+    // ---- use_interpolate: §7 face re-interpolation + §6.3 corner merge ----
+
+    use super::super::mean_value::{mean_value_weights, PlaneProjection};
+    use glam::Vec2;
+
+    /// Register a Vec2 loop "uv" attribute and a Vec3 vertex "color"
+    /// attribute, returning their keys.
+    fn register_uv_color(mesh: &mut LoopMesh) -> (ElementAttributeKey, ElementAttributeKey) {
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let color = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("color"),
+                Format::new(ComponentType::F32, 3),
+            ))
+            .unwrap();
+        (uv, color)
+    }
+
+    /// Expected mean-value blend of `corner_vals` at the post-displacement
+    /// projected position of a corner, using the documented §10.1 routine.
+    fn expected_blend2(
+        proj_corners: &[Vec2],
+        corner_vals: &[[f32; 2]],
+        q: Vec2,
+    ) -> [f32; 2] {
+        let w = mean_value_weights(proj_corners, q);
+        let mut out = [0.0_f32; 2];
+        for i in 0..w.len() {
+            out[0] += w[i] * corner_vals[i][0];
+            out[1] += w[i] * corner_vals[i][1];
+        }
+        out
+    }
+
+    #[test]
+    fn interpolate_rebakes_nonaffine_uv_via_mean_value() {
+        // Centre face of a 3×3 grid carries a deliberately NON-affine UV
+        // (u = x*y, v = x²) so that any affine / barycentric scheme would
+        // disagree with mean value coordinates. After inset, each moved
+        // corner's UV must equal the mean-value resample of the original
+        // corner UVs at the corner's new projected position.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+        let (uv, _color) = register_uv_color(&mut mesh);
+
+        // Snapshot original corner positions + UVs in loop-cycle order.
+        let mut orig_loops = Vec::new();
+        let mut orig_pos = Vec::new();
+        let mut it = mesh.face_loops(centre);
+        while let Some(l) = it.next(&mesh) {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            let uv_val = [p.x * p.y, p.x * p.x];
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_val);
+            orig_loops.push(l);
+            orig_pos.push(p);
+        }
+        let projection = PlaneProjection::from_normal(Vec3::Z);
+        let proj_corners: Vec<Vec2> = orig_pos.iter().map(|&p| projection.project(p)).collect();
+        let corner_uvs: Vec<[f32; 2]> = orig_pos
+            .iter()
+            .map(|&p| [p.x * p.y, p.x * p.x])
+            .collect();
+
+        mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+
+        // The four loops of the inset (shrunken) centre face are the same
+        // loop keys (loops are stable); their verts moved inward. Verify the
+        // rebaked UV equals the mean-value resample at the moved position.
+        let mut checked = 0;
+        for (i, &l) in orig_loops.iter().enumerate() {
+            let new_p = mesh.vertex_position(mesh.loop_vertex(l));
+            let q = projection.project(new_p);
+            let want = expected_blend2(&proj_corners, &corner_uvs, q);
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert!(
+                (got[0] - want[0]).abs() < 1e-4 && (got[1] - want[1]).abs() < 1e-4,
+                "corner {i}: got {got:?} want {want:?} (new_p={new_p:?})"
+            );
+            // The corner genuinely moved, so this is the smooth-interior path,
+            // not the identity short-circuit.
+            assert!((new_p - orig_pos[i]).length() > 1e-3, "corner {i} did not move");
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn interpolate_identity_rebake_for_unmoved_untagged_face() {
+        // An untagged face adjacent to the seam is over-snapshotted (§7) but
+        // none of its corners move, so it must rebake byte-exactly to its
+        // original UVs (the on-corner identity short-circuit, §10.1.3).
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+        let neighbour = faces[1]; // shares an edge with the centre.
+        let (uv, _color) = register_uv_color(&mut mesh);
+
+        let mut neigh_loops = Vec::new();
+        let mut neigh_orig = Vec::new();
+        let mut it = mesh.face_loops(neighbour);
+        while let Some(l) = it.next(&mesh) {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            // Non-affine, distinctive per-corner UVs.
+            let uv_val = [p.x + 2.0 * p.y, (p.x - p.y) * (p.x - p.y)];
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_val);
+            neigh_loops.push(l);
+            neigh_orig.push(uv_val);
+        }
+
+        mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.15,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+
+        for (l, want) in neigh_loops.iter().zip(neigh_orig.iter()) {
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert_eq!(got, *want, "unmoved corner must rebake byte-exact");
+        }
+    }
+
+    #[test]
+    fn interpolate_rebakes_vertex_color_with_same_weights() {
+        // The per-vertex domain rebakes by the same weight vector as the
+        // per-loop domain (§10.1.4). Verify a vertex color channel matches the
+        // mean-value blend at the moved corner.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+        let (_uv, color) = register_uv_color(&mut mesh);
+
+        let mut corner_loops = Vec::new();
+        let mut orig_pos = Vec::new();
+        let mut corner_cols = Vec::new();
+        let mut it = mesh.face_loops(centre);
+        while let Some(l) = it.next(&mesh) {
+            let v = mesh.loop_vertex(l);
+            let p = mesh.vertex_position(v);
+            // Non-affine color.
+            let c = [p.x * p.x, p.y * p.y, p.x * p.y];
+            mesh.vertex_attribs_mut().set_vec3(color, v.as_usize(), c);
+            corner_loops.push(l);
+            orig_pos.push(p);
+            corner_cols.push(c);
+        }
+        let projection = PlaneProjection::from_normal(Vec3::Z);
+        let proj_corners: Vec<Vec2> = orig_pos.iter().map(|&p| projection.project(p)).collect();
+
+        mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+
+        for (i, &l) in corner_loops.iter().enumerate() {
+            let v = mesh.loop_vertex(l);
+            let q = projection.project(mesh.vertex_position(v));
+            let w = mean_value_weights(&proj_corners, q);
+            let mut want = [0.0_f32; 3];
+            for k in 0..4 {
+                for c in 0..3 {
+                    want[c] += w[k] * corner_cols[k][c];
+                }
+            }
+            let got = mesh.vertex_attribs().get_vec3(color, v.as_usize()).unwrap();
+            for c in 0..3 {
+                assert!(
+                    (got[c] - want[c]).abs() < 1e-4,
+                    "corner {i} chan {c}: got {} want {}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corner_merge_equalises_inner_loops_when_outer_equal() {
+        // §6.3: two walls meet at each inset corner. With UV ≡ a continuous
+        // function of position (so the untagged "outer" loops at the shared
+        // original vertex are equal), the two walls' inner-edge loops at the
+        // corner must end up holding the same midpointed UV.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+        let (uv, _color) = register_uv_color(&mut mesh);
+
+        // Continuous per-vertex UV shared by every loop at that vertex, so the
+        // untagged outer loops on either side of each corner agree (no seam).
+        let set_uv_from_pos = |mesh: &mut LoopMesh, uv: ElementAttributeKey| {
+            let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+            for l in loops {
+                let p = mesh.vertex_position(mesh.loop_vertex(l));
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            }
+        };
+        set_uv_from_pos(&mut mesh, uv);
+
+        let result = mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        mesh.validate_topology();
+
+        // For each inset-boundary (tagged) vertex, every wall loop sitting on
+        // that vertex's inner edge must carry the merged (equal) UV.
+        // Collect, per tagged vertex, the wall loops on the inner edge.
+        let mut by_vert: std::collections::HashMap<VertexKey, Vec<[f32; 2]>> =
+            std::collections::HashMap::new();
+        for &wf in &result.wall_faces {
+            let mut it = mesh.face_loops(wf);
+            while let Some(l) = it.next(&mesh) {
+                let v = mesh.loop_vertex(l);
+                let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                by_vert.entry(v).or_default().push(got);
+            }
+        }
+        // A corner where two walls meet contributes two inner-edge loops at the
+        // tagged vertex; after the merge their UVs are equal.
+        let mut merged_corners = 0;
+        for vals in by_vert.values() {
+            if vals.len() >= 2 {
+                let first = vals[0];
+                if vals
+                    .iter()
+                    .all(|v| (v[0] - first[0]).abs() < 1e-5 && (v[1] - first[1]).abs() < 1e-5)
+                {
+                    merged_corners += 1;
+                }
+            }
+        }
+        assert!(merged_corners >= 4, "expected merged corners, got {merged_corners}");
+    }
+
+    #[test]
+    fn corner_merge_skipped_when_outer_uv_seam_present() {
+        // §6.3 gate: if the original untagged faces already disagree on UV at
+        // the corner (a user UV seam), no merge happens. We give each untagged
+        // face its own distinct per-corner UVs, so the outer-pair-equality
+        // gate fails and the inner loops keep their §7-rebaked (per-face,
+        // diverged) values. The operator must still complete cleanly.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+        let (uv, _color) = register_uv_color(&mut mesh);
+
+        // Per-FACE UV islands: each loop's UV depends on its face index, so no
+        // two faces agree at a shared corner.
+        let face_keys: Vec<FaceKey> = mesh.face_keys();
+        for (fi, &f) in face_keys.iter().enumerate() {
+            let loops: Vec<LoopKey> = {
+                let mut acc = Vec::new();
+                let mut it = mesh.face_loops(f);
+                while let Some(l) = it.next(&mesh) {
+                    acc.push(l);
+                }
+                acc
+            };
+            for l in loops {
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [fi as f32, fi as f32 * 2.0]);
+            }
+        }
+
+        let result = mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        mesh.validate_topology();
+        // No panic / clean topology is the assertion: the gate declined the
+        // merge and the rebaked per-face values were left in place.
     }
 }
