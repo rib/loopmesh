@@ -17,7 +17,7 @@ mod face_triangulate;
 mod inset_individual;
 mod inset_region;
 
-pub use dissolve_edges::DissolveEdgesParams;
+pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
 pub use dissolve_verts::DissolveVertsParams;
 pub use face_triangulate::{NgonMethod, QuadMethod};
