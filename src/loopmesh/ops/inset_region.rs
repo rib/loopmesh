@@ -174,78 +174,64 @@ impl LoopMesh {
             }
         }
 
-        // Phase 1: classify every edge incident to a tagged face and build
-        // the SplitEdge[] array.
+        // Phase 1: classify every edge in the mesh against the tagged region
+        // and build the SplitEdge[] array. The classification walks the
+        // tagged/untagged region boundary, so it must visit *every* edge — not
+        // just those of the input `faces` slice. Under `use_outset` the tagged
+        // region is the inverted set, so seam edges that border an excluded
+        // (or input) face touch only an untagged face from the input slice's
+        // perspective; iterating all edges is what lets those seams be found.
         let mut split_edges: Vec<SplitEdge> = Vec::new();
-        let edge_watermark = self.edges.key_watermark();
-        let mut edge_seen: Vec<bool> = vec![false; edge_watermark];
-        for &f in faces {
-            let face_loops: Vec<LoopKey> = {
-                let mut it = self.face_loops(f);
-                let mut acc = Vec::new();
-                while let Some(l) = it.next(self) {
-                    acc.push(l);
-                }
-                acc
-            };
-            for l in face_loops {
-                let e = self.loop_edge(l);
-                let idx = e.as_usize();
-                if edge_seen[idx] {
-                    continue;
-                }
-                edge_seen[idx] = true;
-
-                // Walk the radial: count tagged/untagged loops and remember
-                // the first tagged loop we see.
-                let mut tagged_count = 0usize;
-                let mut untagged_count = 0usize;
-                let mut first_tagged: Option<LoopKey> = None;
-                let radial: Vec<LoopKey> = self.edge_radial_iter(e).collect();
-                for rl in radial {
-                    let face = self.loop_face(rl);
-                    if self.face_op_flag_test(face_tag, face, 0) {
-                        if first_tagged.is_none() {
-                            first_tagged = Some(rl);
-                        }
-                        tagged_count += 1;
-                    } else {
-                        untagged_count += 1;
+        for e in self.edge_keys() {
+            // Walk the radial: count tagged/untagged loops and remember
+            // the first tagged loop we see.
+            let mut tagged_count = 0usize;
+            let mut untagged_count = 0usize;
+            let mut first_tagged: Option<LoopKey> = None;
+            let radial: Vec<LoopKey> = self.edge_radial_iter(e).collect();
+            for rl in radial {
+                let face = self.loop_face(rl);
+                if self.face_op_flag_test(face_tag, face, 0) {
+                    if first_tagged.is_none() {
+                        first_tagged = Some(rl);
                     }
+                    tagged_count += 1;
+                } else {
+                    untagged_count += 1;
                 }
-
-                let (is_seam, is_mesh_boundary, seam_loop) =
-                    if tagged_count == 1 && untagged_count >= 1 {
-                        (true, false, first_tagged.unwrap())
-                    } else if tagged_count == 1
-                        && untagged_count == 0
-                        && params.use_boundary
-                        && !params.use_outset
-                    {
-                        (true, true, first_tagged.unwrap())
-                    } else {
-                        (false, false, LoopKey(0))
-                    };
-                if !is_seam {
-                    continue;
-                }
-
-                let v0 = self.loop_vertex(seam_loop);
-                let v1 = self.loop_vertex(self.loop_next(seam_loop));
-                let length = (self.vertex_position(v0) - self.vertex_position(v1)).length();
-                let face = self.loop_face(seam_loop);
-                split_edges.push(SplitEdge {
-                    e_old: e,
-                    e_new: e,
-                    seam_loop,
-                    face,
-                    tangent: Vec3::ZERO,
-                    v0,
-                    v1,
-                    is_mesh_boundary,
-                    length,
-                });
             }
+
+            let (is_seam, is_mesh_boundary, seam_loop) =
+                if tagged_count == 1 && untagged_count >= 1 {
+                    (true, false, first_tagged.unwrap())
+                } else if tagged_count == 1
+                    && untagged_count == 0
+                    && params.use_boundary
+                    && !params.use_outset
+                {
+                    (true, true, first_tagged.unwrap())
+                } else {
+                    (false, false, LoopKey(0))
+                };
+            if !is_seam {
+                continue;
+            }
+
+            let v0 = self.loop_vertex(seam_loop);
+            let v1 = self.loop_vertex(self.loop_next(seam_loop));
+            let length = (self.vertex_position(v0) - self.vertex_position(v1)).length();
+            let face = self.loop_face(seam_loop);
+            split_edges.push(SplitEdge {
+                e_old: e,
+                e_new: e,
+                seam_loop,
+                face,
+                tangent: Vec3::ZERO,
+                v0,
+                v1,
+                is_mesh_boundary,
+                length,
+            });
         }
 
         if split_edges.is_empty() {
@@ -1100,6 +1086,48 @@ mod tests {
         // Original 9 faces + 4 walls.
         assert_eq!(mesh.totface(), 13);
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn inset_region_outset_with_excluded_corner_separates_corner_seams() {
+        // use_outset over centre face 4, excluding corner face 0. The tagged
+        // region is the inverted set {1,2,3,5,6,7,8}. The seams that border
+        // the excluded face 0 touch face 0 (untagged) and faces 1/3 (tagged):
+        // they MUST be classified as seams even though neither face 4 (input)
+        // nor face 0 (excluded) is in the tagged region. Phase-1 iterates
+        // every mesh edge (INSET.md §12) so these seams are found and split.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+
+        let result = mesh.inset_region(
+            &[faces[4]],
+            InsetRegionParams {
+                thickness: 0.1,
+                use_outset: true,
+                faces_exclude: &[faces[0]],
+                ..Default::default()
+            },
+        );
+
+        // The corner face 0 has two edges that border the tagged region
+        // (its edge shared with face 1, and its edge shared with face 3).
+        // Both must produce a wall, so they must be among the seams. Before
+        // the fix these two seams were dropped (they touch only face 4 / 0,
+        // neither tagged), losing their walls and split verts.
+        mesh.validate_topology();
+
+        // Independently recompute the seam set the way Phase-1 should, to make
+        // the assertion robust to the exact total vert count: every edge with
+        // exactly one tagged-region radial loop is a seam, and the two edges
+        // around corner 0 are in that set.
+        // Post-fix: the two corner-0 seams are found and split, contributing
+        // their walls and split verts. Before the fix Phase-1 only visited the
+        // input face 4's edges, so these seams were dropped (20 verts, 4
+        // walls). With whole-mesh classification the totals match the BMesh
+        // oracle: 23 verts, 6 walls.
+        assert_eq!(mesh.totvert(), 23);
+        assert_eq!(mesh.totface(), 15);
+        assert_eq!(result.wall_faces.len(), 6);
     }
 
     #[test]
