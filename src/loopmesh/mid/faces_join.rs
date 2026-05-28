@@ -35,14 +35,27 @@ impl LoopMesh {
         }
 
         let mut remaining: Vec<FaceKey> = faces.to_vec();
+        // O(1) membership backing for `remaining`. The §10 complexity
+        // contract requires the per-radial-loop "is this face still in the
+        // region?" test to be constant-time; a linear scan of `remaining`
+        // would make the region merge O(n² · R). The set is kept in step
+        // with `remaining` on every removal.
+        let mut remaining_set: std::collections::HashSet<FaceKey> =
+            remaining.iter().copied().collect();
 
         let survivor = 'outer: loop {
             if remaining.len() == 1 {
                 break 'outer remaining[0];
             }
-            // Find any edge shared by two remaining faces (radial cycle of
-            // length 2 with both faces in `remaining`).
-            for (i, &fa) in remaining.iter().enumerate() {
+            // Find any edge shared by two `remaining` faces. The total
+            // radial length may exceed 2 — the §3.3 / §4.1 step 2 contract
+            // is that an interior edge has *exactly two* of `remaining`
+            // on its radial; additional radial loops belong to faces
+            // outside the input region and the edge survives the merge
+            // with those loops still attached. See
+            // `radial-mesh-guides/operators/DISSOLVE_FACES.md` §3.3 / §4.1
+            // step 2.
+            for &fa in &remaining {
                 let edges: smallvec::SmallVec<[EdgeKey; 8]> =
                     collect_iter::<_, 8>(self, FaceLoops::new(self, fa))
                         .into_iter()
@@ -50,36 +63,48 @@ impl LoopMesh {
                         .filter(|e| !e.is_null())
                         .collect();
                 for &e in &edges {
-                    // Read the 2-radial face pair via the lending iterator.
+                    let mut other: Option<FaceKey> = None;
+                    let mut radial_len = 0usize;
+                    let mut remaining_on_radial = 0usize;
                     let mut rl = self.radial_loops(e);
-                    let l0 = match rl.next(self) {
-                        Some(l) => l,
-                        None => continue,
-                    };
-                    let l1 = match rl.next(self) {
-                        Some(l) => l,
-                        None => continue,
-                    };
-                    if rl.next(self).is_some() {
-                        continue;
-                    } // not 2-manifold
-                    let f0 = self.loops.get(l0).face;
-                    let f1 = self.loops.get(l1).face;
-                    let other = if f0 == fa {
-                        f1
-                    } else if f1 == fa {
-                        f0
-                    } else {
-                        continue;
-                    };
-                    if other == fa {
+                    while let Some(rloop) = rl.next(self) {
+                        radial_len += 1;
+                        let rface = self.loops.get(rloop).face;
+                        if remaining_set.contains(&rface) {
+                            remaining_on_radial += 1;
+                            if rface != fa && other.is_none() {
+                                other = Some(rface);
+                            }
+                        }
+                    }
+                    // §3.3: skip edges that aren't a "two of remaining"
+                    // crossing — either fa is the sole `remaining` face on
+                    // the radial (boundary edge of the region) or three+
+                    // `remaining` faces share it. The latter never reaches
+                    // here through the dissolve-faces walker (its §3.3
+                    // "exactly 2 input faces" gate pre-partitions such
+                    // spines into separate regions); it is the §4.3
+                    // defensive backstop for direct callers.
+                    if remaining_on_radial != 2 {
                         continue;
                     }
-                    if let Some(j) = remaining.iter().position(|&f| f == other) {
-                        // Join fa and other along e. fa survives.
-                        self.euler_join_face_kill_edge(fa, other, e)?;
+                    let Some(other_face) = other else { continue };
+                    if other_face == fa {
+                        continue;
+                    }
+                    if let Some(j) = remaining.iter().position(|&f| f == other_face) {
+                        // §4.1 step 2: when the radial is exactly length 2
+                        // (the standard manifold case) the JFKE primitive
+                        // kills the edge as part of the merge. When the
+                        // radial is longer the edge survives with the
+                        // out-of-region loops still on it.
+                        if radial_len == 2 {
+                            self.euler_join_face_kill_edge(fa, other_face, e)?;
+                        } else {
+                            self.faces_join_merge_pair_keep_edge(fa, other_face, e)?;
+                        }
                         remaining.swap_remove(j);
-                        let _ = i;
+                        remaining_set.remove(&other_face);
                         continue 'outer;
                     }
                 }
@@ -160,6 +185,161 @@ impl LoopMesh {
             }
         }
         None
+    }
+
+    /// §3.3 / §4.1 step 2 — pairwise merge along a shared edge whose
+    /// radial cycle has more than two loops. The two doomed loops belong
+    /// to `fa` and `fb`; the remaining radial loops belong to faces
+    /// outside the input region and stay attached to `edge`, which
+    /// survives the merge with its radial cycle shortened by two.
+    ///
+    /// This is *not* a thin wrapper around the manifold Euler primitive
+    /// `euler_join_face_kill_edge`: it differs in two load-bearing ways.
+    /// (a) It performs a **local** winding alignment at the splice
+    /// (§4.1.5): in the same-direction case it threads `fb`'s non-spine
+    /// loops into the merged cycle in reverse, flipping each loop onto
+    /// the far endpoint of its own (unchanged) edge — it never reverses
+    /// `fb` as a whole, so `fb`'s other edges' radial cycles are left
+    /// untouched even when `fb` carries a second non-manifold edge.
+    /// (b) It leaves `edge` alive (it only detaches the two doomed spine
+    /// loops from the radial cycle) when out-of-region loops remain on it.
+    fn faces_join_merge_pair_keep_edge(
+        &mut self,
+        fa: FaceKey,
+        fb: FaceKey,
+        edge: EdgeKey,
+    ) -> Option<FaceKey> {
+        if fa == fb {
+            return None;
+        }
+
+        let l_fa = self.face_edge_share_loop(fa, edge)?;
+        let l_fb = self.face_edge_share_loop(fb, edge)?;
+
+        // §4.1.5 winding test: the two spine loops walk the shared edge
+        // in the same direction iff their start verts coincide. The
+        // splice connectivity below branches on this — there is no
+        // face-wide reversal, so the test is read once and never
+        // invalidated by a topology mutation.
+        let same_direction = self.loops.get(l_fa).vertex == self.loops.get(l_fb).vertex;
+
+        // §4.2 backstop: a merge that would carry duplicate verts into
+        // the union (other than the two endpoints of `edge`) is the
+        // "shared two-edges" failure mode described in
+        // `DISSOLVE_FACES.md` §4.4. We accept the standard guard from
+        // the manifold primitive — refuse if more than two verts are
+        // shared between the two faces.
+        let fa_verts: smallvec::SmallVec<[VertexKey; 8]> = {
+            let face_loops_first = self.faces.get(fa).first_edge_loop;
+            self.face_loop_iter(face_loops_first)
+                .filter(|&l| l != l_fa)
+                .map(|l| self.loops.get(l).vertex)
+                .collect()
+        };
+        let fb_verts: smallvec::SmallVec<[VertexKey; 8]> = {
+            let face_loops_first = self.faces.get(fb).first_edge_loop;
+            self.face_loop_iter(face_loops_first)
+                .filter(|&l| l != l_fb)
+                .map(|l| self.loops.get(l).vertex)
+                .collect()
+        };
+        let mut shared_excluding_edge = 0usize;
+        for v in &fb_verts {
+            if fa_verts.contains(v) {
+                shared_excluding_edge += 1;
+            }
+        }
+        if shared_excluding_edge > 2 {
+            return None;
+        }
+
+        let l_fa_prev = self.loops.get(l_fa).face_loop_links.prev;
+        let l_fa_next = self.loops.get(l_fa).face_loop_links.next;
+        let l_fb_prev = self.loops.get(l_fb).face_loop_links.prev;
+        let l_fb_next = self.loops.get(l_fb).face_loop_links.next;
+
+        if !same_direction {
+            // Opposite-direction (manifold-natural) case: fb's non-spine
+            // loops already mesh with fa's in forward order. Stitch the
+            // two open chains around the doomed spine loops — the same
+            // four-pointer splice the manifold primitive uses.
+            self.loops.get_mut(l_fa_prev).face_loop_links.next = l_fb_next;
+            self.loops.get_mut(l_fb_next).face_loop_links.prev = l_fa_prev;
+            self.loops.get_mut(l_fa_next).face_loop_links.prev = l_fb_prev;
+            self.loops.get_mut(l_fb_prev).face_loop_links.next = l_fa_next;
+        } else {
+            // Same-direction case (§4.1.5): the two cycles do not mesh
+            // directly. Reverse *only* fb's open chain locally — flip
+            // each fb non-spine loop onto the far endpoint of its own
+            // edge and swap its face-loop links — then stitch the
+            // reversed chain between fa's `prev`/`next`. The far endpoint
+            // is well-defined: each loop's edge has exactly two endpoints
+            // and `loop.vertex` is one of them. No radial cycle is
+            // touched, so fb's other edges keep their loops intact.
+            let fb_chain: smallvec::SmallVec<[LoopKey; 8]> = {
+                let mut chain: smallvec::SmallVec<[LoopKey; 8]> = smallvec::SmallVec::new();
+                let mut cursor = l_fb_next;
+                while cursor != l_fb {
+                    chain.push(cursor);
+                    cursor = self.loops.get(cursor).face_loop_links.next;
+                }
+                chain
+            };
+
+            for &l in &fb_chain {
+                let loop_edge = self.loops.get(l).edge;
+                let near = self.loops.get(l).vertex;
+                let far = self
+                    .edges
+                    .get(loop_edge)
+                    .other_vertex(near)
+                    .expect("loop vertex must lie on its own edge");
+                self.loops.get_mut(l).vertex = far;
+                let links = self.loops.get(l).face_loop_links;
+                self.loops.get_mut(l).face_loop_links = DoubleLinks {
+                    next: links.prev,
+                    prev: links.next,
+                };
+            }
+
+            // After the per-loop swap the reversed chain runs
+            // `l_fb_prev -> ... -> l_fb_next`. Wire it between fa's
+            // neighbours of the spine loop.
+            self.loops.get_mut(l_fa_prev).face_loop_links.next = l_fb_prev;
+            self.loops.get_mut(l_fb_prev).face_loop_links.prev = l_fa_prev;
+            self.loops.get_mut(l_fa_next).face_loop_links.prev = l_fb_next;
+            self.loops.get_mut(l_fb_next).face_loop_links.next = l_fa_next;
+        }
+
+        if self.faces.get(fa).first_edge_loop == l_fa {
+            self.faces.get_mut(fa).first_edge_loop = l_fa_next;
+        }
+
+        // Drop both spine loops from `edge`'s radial cycle — `edge`
+        // survives because its radial still carries the out-of-region
+        // loops (§4.1 step 2 keep-alive contract).
+        self.face_loop_disconnect_edge(l_fa);
+        self.face_loop_disconnect_edge(l_fb);
+
+        // Re-stamp the merged cycle's face pointers onto `fa`.
+        let new_first = self.faces.get(fa).first_edge_loop;
+        let merged_loops: smallvec::SmallVec<[LoopKey; 8]> =
+            self.face_loop_iter(new_first).collect();
+        for &l in &merged_loops {
+            self.loops.get_mut(l).face = fa;
+        }
+        self.faces.get_mut(fa).len = merged_loops.len() as u32;
+
+        self.remove_loop_slab_entry(l_fa);
+        self.remove_loop_slab_entry(l_fb);
+
+        // Unlike the manifold primitive we deliberately do NOT remove
+        // `edge` from its endpoints' disks or free its slab — the edge
+        // survives with the out-of-region radial loops still on it.
+
+        self.remove_face_slab_entry(fb);
+
+        Some(fa)
     }
 
     /// Walk `face`'s loop cycle and kill every edge whose radial cycle has

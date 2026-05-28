@@ -196,32 +196,29 @@ impl LoopMesh {
                     .collect();
 
             for edge in edges {
-                // §3 + §3.3 — manifold gate: radial must be exactly length 2.
+                // §3.3 crossability predicate: an edge is crossable iff
+                // *exactly two* of its radial faces are in the input set.
+                // The total radial length may be >2 (non-manifold spine
+                // with one or more out-of-input faces on it); what gates
+                // the cross is the input-set count, not the radial count.
+                let mut input_face_count = 0usize;
+                let mut neighbour: Option<FaceKey> = None;
                 let mut radial = self.radial_loops(edge);
-                let l0 = match radial.next(self) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                let l1 = match radial.next(self) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                if radial.next(self).is_some() {
+                while let Some(rloop) = radial.next(self) {
+                    let rface = self.loops.get(rloop).face;
+                    if !self.face_op_flag_test(in_input, rface, 0) {
+                        continue;
+                    }
+                    input_face_count += 1;
+                    if rface != face && neighbour.is_none() {
+                        neighbour = Some(rface);
+                    }
+                }
+                if input_face_count != 2 {
                     continue;
                 }
-                let f0 = self.loops.get(l0).face;
-                let f1 = self.loops.get(l1).face;
-                let neighbour = if f0 == face {
-                    f1
-                } else if f1 == face {
-                    f0
-                } else {
-                    continue;
-                };
+                let Some(neighbour) = neighbour else { continue };
                 if neighbour == face {
-                    continue;
-                }
-                if !self.face_op_flag_test(in_input, neighbour, 0) {
                     continue;
                 }
                 if self.face_op_flag_test(visited, neighbour, 0) {
@@ -650,6 +647,304 @@ mod tests {
         assert!(live.contains(&f_shadow));
         assert!(!live.contains(&f_left));
         assert!(!live.contains(&f_right));
+        mesh.validate_topology();
+    }
+
+    /// Build the `nonmanifold_book(3)` topology: three triangles all
+    /// sharing one spine edge `{v0, v1}`. Returns `(verts[5], faces[3])`
+    /// with verts laid out as `[spine_start, spine_end, apex_0, apex_1,
+    /// apex_2]` and each face winding `[v0, v1, apex_i]` (all three
+    /// walking the spine in the same direction — that's what makes this
+    /// fixture a genuine non-manifold join, not just three coplanar
+    /// triangles).
+    ///
+    /// Counts: 5 V, 7 E (1 spine + 2 per page), 3 F.
+    fn build_nonmanifold_book_3(mesh: &mut LoopMesh) -> (Vec<VertexKey>, Vec<FaceKey>) {
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0, 0.0), // 0: spine start
+            (1.0, 0.0, 0.0), // 1: spine end
+            (0.5, 1.0, 0.0), // 2: apex of face 0
+            (0.5, -0.5, 0.866), // 3: apex of face 1
+            (0.5, -0.5, -0.866), // 4: apex of face 2
+        ]
+        .into_iter()
+        .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+        .collect();
+
+        let e_spine = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let mut faces = Vec::with_capacity(3);
+        for apex_idx in 2..5 {
+            let e_v0_apex = mesh.create_edge([v[0], v[apex_idx]], EdgeCreateFlags::NO_DUPLICATE);
+            let e_apex_v1 = mesh.create_edge([v[apex_idx], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+            // Winding [v0, v1, apex_i] — all three spine loops walk v0→v1.
+            faces.push(mesh.face_create(
+                &[v[0], v[1], v[apex_idx]],
+                &[e_spine, e_apex_v1, e_v0_apex],
+                FaceCreateFlags::NONE,
+            ));
+        }
+        (v, faces)
+    }
+
+    /// §3.3 headline: when only *two* of the spine's three radial faces
+    /// are in the input set, the spine edge is crossable for the walker
+    /// (its "input-set count" is exactly 2) even though its raw radial
+    /// count is 3. The two input faces merge into a single 4-corner
+    /// kite face; the third face survives untouched; the spine edge
+    /// survives with its radial cycle shortened from 3 to 1.
+    ///
+    /// Contrast the §3.3 walker-crossability path (here) with the
+    /// §4.3 `BM_faces_join` `rlen > 2` reject (covered by the
+    /// all-three input scaffold) — same fixture, different code path.
+    #[test]
+    fn dissolve_faces_non_manifold_edge_splits_two_of_three_input() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_nonmanifold_book_3(&mut mesh);
+        let v0 = verts[0];
+        let v1 = verts[1];
+        let apex_0 = verts[2];
+        let apex_1 = verts[3];
+
+        assert_eq!(mesh.totvert(), 5);
+        assert_eq!(mesh.totedge(), 7);
+        assert_eq!(mesh.totface(), 3);
+        let spine = mesh
+            .query_edge_exists(v0, v1)
+            .expect("spine edge {v0,v1} must exist pre-merge");
+        assert_eq!(
+            mesh.edge_face_keys(spine).len(),
+            3,
+            "spine has radial cycle of length 3 pre-merge"
+        );
+
+        // Input = first two pages only — face 2 stays outside the set.
+        let f2 = faces[2];
+        let result = mesh.dissolve_faces(&[faces[0], faces[1]], DissolveFacesOptions::default());
+
+        assert_eq!(result.region.len(), 1, "the two-of-three input forms one region");
+        let kite = result.region[0];
+
+        // §7 row 2 for the kite region: -1 F (2 source → 1 merged); no
+        // edge killed (the spine survives with f2's loop on it); no
+        // verts killed (every region vert retains at least one edge).
+        assert_eq!(mesh.totface(), 2, "f0 + f1 merged into the kite; f2 untouched");
+        assert_eq!(mesh.totedge(), 7, "spine survives — its radial dropped to 1, not 0");
+        assert_eq!(mesh.totvert(), 5);
+
+        // The spine edge is still alive and its radial cycle is now the
+        // singleton {f2}.
+        let spine_post = mesh
+            .query_edge_exists(v0, v1)
+            .expect("spine {v0,v1} survives the merge");
+        let spine_radial = mesh.edge_face_keys(spine_post);
+        assert_eq!(spine_radial.len(), 1, "radial cycle dropped from 3 to 1");
+        assert_eq!(spine_radial[0], f2, "the surviving radial loop belongs to f2");
+
+        // f2 is still alive, still has v0 and v1 in its corner cycle.
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(live.contains(&f2), "f2 (the page left out of the input set) survives");
+        let f2_verts: std::collections::HashSet<VertexKey> =
+            mesh.face_vert_keys(f2).into_iter().collect();
+        assert!(f2_verts.contains(&v0));
+        assert!(f2_verts.contains(&v1));
+
+        // The kite has exactly 4 corners — the symmetric difference of
+        // the two input perimeters is `{v0, v1, apex_0, apex_1}` minus
+        // the spine `{v0, v1}` shared edge, leaving 4 boundary edges
+        // and 4 corners: apex_0 → v0 → apex_1 → v1.
+        let kite_verts: Vec<VertexKey> = mesh.face_vert_keys(kite);
+        assert_eq!(kite_verts.len(), 4, "merged face is a 4-corner kite");
+        let kite_set: std::collections::HashSet<VertexKey> = kite_verts.iter().copied().collect();
+        let expected: std::collections::HashSet<VertexKey> =
+            [v0, v1, apex_0, apex_1].into_iter().collect();
+        assert_eq!(kite_set, expected);
+
+        // §4.1.5 winding: the merged perimeter must walk in a single
+        // consistent direction. Two checks pin this against a winding bug
+        // in the same-direction splice:
+        //   (a) the ordered corner cycle visits each corner exactly once
+        //       (no repeat, which a self-intersecting splice would
+        //       produce), and
+        //   (b) every consecutive corner pair is a real edge whose radial
+        //       cycle references the kite exactly once — i.e. the kite
+        //       sits on each of its perimeter edges with a single loop,
+        //       the hallmark of a non-degenerate, consistently-wound face.
+        let mut seen: std::collections::HashSet<VertexKey> = std::collections::HashSet::new();
+        for &corner in &kite_verts {
+            assert!(seen.insert(corner), "kite corner {corner:?} visited twice — winding self-intersects");
+        }
+        for window_start in 0..kite_verts.len() {
+            let a = kite_verts[window_start];
+            let b = kite_verts[(window_start + 1) % kite_verts.len()];
+            let perimeter_edge = mesh
+                .query_edge_exists(a, b)
+                .expect("each consecutive kite corner pair must be a real edge");
+            let kite_loops_on_edge = mesh
+                .edge_face_keys(perimeter_edge)
+                .into_iter()
+                .filter(|&f| f == kite)
+                .count();
+            assert_eq!(
+                kite_loops_on_edge, 1,
+                "kite must sit on perimeter edge {{{a:?},{b:?}}} exactly once"
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// Build the `nonmanifold_book(3)` topology and additionally fan two
+    /// extra triangles off page 1's non-spine edge `{v0, apex_1}`, so that
+    /// edge becomes non-manifold (radial cycle length 3) *in addition* to
+    /// the spine. Returns `(verts, faces)` where `faces[0..3]` are the
+    /// three book pages (winding `[v0, v1, apex_i]`, all spine loops walk
+    /// v0→v1) and `faces[3..5]` are the two fins sharing `{v0, apex_1}`.
+    ///
+    /// This is the design-blocker fixture: merging pages 0 and 1 makes
+    /// page 1 the `fb` of the keep-edge splice, and page 1 carries the
+    /// second non-manifold edge `{v0, apex_1}`. A face-wide reversal of
+    /// page 1 would corrupt the fins' radial cycle on that edge; the local
+    /// splice must leave it intact.
+    fn build_nonmanifold_book_3_with_fin_on_page1(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<VertexKey>, Vec<FaceKey>) {
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0, 0.0),    // 0: spine start
+            (1.0, 0.0, 0.0),    // 1: spine end
+            (0.5, 1.0, 0.0),    // 2: apex of page 0
+            (0.5, -0.5, 0.866), // 3: apex of page 1
+            (0.5, -0.5, -0.866),// 4: apex of page 2
+            (-0.5, 0.5, 0.3),   // 5: fin A apex
+            (-0.5, 0.5, -0.3),  // 6: fin B apex
+        ]
+        .into_iter()
+        .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+        .collect();
+
+        let e_spine = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let mut faces = Vec::with_capacity(5);
+        for apex_idx in 2..5 {
+            let e_v0_apex = mesh.create_edge([v[0], v[apex_idx]], EdgeCreateFlags::NO_DUPLICATE);
+            let e_apex_v1 = mesh.create_edge([v[apex_idx], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+            faces.push(mesh.face_create(
+                &[v[0], v[1], v[apex_idx]],
+                &[e_spine, e_apex_v1, e_v0_apex],
+                FaceCreateFlags::NONE,
+            ));
+        }
+
+        // Two fins fanning off page 1's non-spine edge {v0, apex_1}.
+        let e_v0_apex1 = mesh
+            .query_edge_exists(v[0], v[3])
+            .expect("page 1's {v0, apex_1} edge exists");
+        for fin_apex in [v[5], v[6]] {
+            let e_apex1_fin = mesh.create_edge([v[3], fin_apex], EdgeCreateFlags::NO_DUPLICATE);
+            let e_fin_v0 = mesh.create_edge([fin_apex, v[0]], EdgeCreateFlags::NO_DUPLICATE);
+            faces.push(mesh.face_create(
+                &[v[0], v[3], fin_apex],
+                &[e_v0_apex1, e_apex1_fin, e_fin_v0],
+                FaceCreateFlags::NONE,
+            ));
+        }
+
+        (v, faces)
+    }
+
+    /// The design-blocker guard (§4.1.5 + the local-splice fix): merging
+    /// two pages of a book spine where the `fb` page *also* carries a
+    /// second non-manifold edge must not corrupt that other edge's radial
+    /// cycle. A face-wide reversal of `fb` would disconnect and reconnect
+    /// every one of `fb`'s edges, mangling the fins on `{v0, apex_1}`. The
+    /// local splice touches only the two doomed spine loops, so the fins
+    /// survive with their radial cycle intact.
+    #[test]
+    fn dissolve_faces_non_manifold_edge_keeps_other_nonmanifold_edge_intact() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_nonmanifold_book_3_with_fin_on_page1(&mut mesh);
+        let v0 = verts[0];
+        let apex_1 = verts[3];
+        let fin_a = faces[3];
+        let fin_b = faces[4];
+
+        // Pre-merge: page 1's {v0, apex_1} edge is non-manifold (page 1 +
+        // two fins = radial 3).
+        let other_edge = mesh
+            .query_edge_exists(v0, apex_1)
+            .expect("page 1's second non-manifold edge exists pre-merge");
+        let pre_radial: std::collections::HashSet<FaceKey> =
+            mesh.edge_face_keys(other_edge).into_iter().collect();
+        assert_eq!(pre_radial.len(), 3, "{{v0, apex_1}} is non-manifold pre-merge");
+        assert!(pre_radial.contains(&faces[1]), "page 1 is on the radial");
+        assert!(pre_radial.contains(&fin_a));
+        assert!(pre_radial.contains(&fin_b));
+
+        // Merge pages 0 and 1 — page 1 becomes the keep-edge splice's `fb`,
+        // and its spine loop walks the spine in the same direction as page
+        // 0's (both `[v0, v1, apex]`), exercising the §4.1.5 same-direction
+        // path.
+        let result = mesh.dissolve_faces(&[faces[0], faces[1]], DissolveFacesOptions::default());
+        assert_eq!(result.region.len(), 1, "the two pages form one region");
+        let kite = result.region[0];
+
+        // The fins' radial cycle on {v0, apex_1} must be uncorrupted: the
+        // edge survives, the two fins are still on it, and page 1's old
+        // loop has been replaced by the merged kite's loop (the kite now
+        // borders {v0, apex_1}). Radial length stays 3.
+        let other_edge_post = mesh
+            .query_edge_exists(v0, apex_1)
+            .expect("{{v0, apex_1}} survives the merge");
+        let post_radial: std::collections::HashSet<FaceKey> =
+            mesh.edge_face_keys(other_edge_post).into_iter().collect();
+        assert_eq!(
+            post_radial.len(),
+            3,
+            "the second non-manifold edge keeps radial length 3 after the merge"
+        );
+        assert!(post_radial.contains(&fin_a), "fin A radial loop intact");
+        assert!(post_radial.contains(&fin_b), "fin B radial loop intact");
+        assert!(
+            post_radial.contains(&kite),
+            "the merged kite borders {{v0, apex_1}} in place of the consumed page 1"
+        );
+
+        // The fins are still well-formed triangles.
+        let fin_a_live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(fin_a_live.contains(&fin_a));
+        assert!(fin_a_live.contains(&fin_b));
+        assert_eq!(mesh.face_vert_keys(fin_a).len(), 3, "fin A is still a triangle");
+        assert_eq!(mesh.face_vert_keys(fin_b).len(), 3, "fin B is still a triangle");
+
+        mesh.validate_topology();
+    }
+
+    /// Sanity check that the walker change doesn't regress the
+    /// all-three-input case documented in the matrix row
+    /// `dissolve_faces_non_manifold_book_spine_declines`: when every
+    /// page is in the input set, the §3.3 predicate "input-set count
+    /// == 2" fails on the spine (count = 3) so the walker doesn't
+    /// cross, every triangle becomes a singleton, and §3.1 skips them
+    /// all. Mesh unchanged.
+    #[test]
+    fn dissolve_faces_non_manifold_book_spine_all_three_declines() {
+        let mut mesh = LoopMesh::new();
+        let (_verts, faces) = build_nonmanifold_book_3(&mut mesh);
+
+        let v0_count = mesh.totvert();
+        let e0_count = mesh.totedge();
+        let f0_count = mesh.totface();
+
+        let result = mesh.dissolve_faces(
+            &[faces[0], faces[1], faces[2]],
+            DissolveFacesOptions::default(),
+        );
+
+        assert!(
+            result.region.is_empty(),
+            "every region is a singleton — §3.1 skips them all"
+        );
+        assert_eq!(mesh.totvert(), v0_count, "mesh unchanged");
+        assert_eq!(mesh.totedge(), e0_count, "mesh unchanged");
+        assert_eq!(mesh.totface(), f0_count, "mesh unchanged");
         mesh.validate_topology();
     }
 }
