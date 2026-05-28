@@ -421,11 +421,38 @@ impl LoopMesh {
                 let (tvec, relative) = match seam_new.len() {
                     1 => {
                         // One-seam corner — only reachable at a mesh-boundary
-                        // seam vertex (INSET.md §5.6). Use the tangent
-                        // directly; the even-offset scaling for this case
-                        // is not yet wired up.
-                        let s = &split_edges[seam_new[0]];
-                        (s.tangent, s.length)
+                        // seam vertex (INSET.md §5.6). The direction is gated on
+                        // `use_even_offset`:
+                        //   off → the bare seam inward tangent (§4.3); the corner
+                        //         moves perpendicular to the seam at magnitude
+                        //         `thickness` and the non-seam boundary edge is
+                        //         ignored entirely.
+                        //   on  → the slide *along* the non-seam boundary edge,
+                        //         scaled by `1/|tangent · slide|` (§5.2) so its
+                        //         perpendicular projection onto the seam tangent
+                        //         equals `thickness`.
+                        // The relative-offset scale is the single seam edge's
+                        // pre-inset length (§5.6).
+                        let tangent = split_edges[seam_new[0]].tangent;
+                        let length = split_edges[seam_new[0]].length;
+                        let dir = if params.use_even_offset {
+                            match self.one_seam_slide_dir(fv, &e_new_to_split, &e_old_to_split) {
+                                Some(slide) => {
+                                    let cos = tangent.dot(slide).abs();
+                                    if cos > 1.0e-6 {
+                                        slide / cos
+                                    } else {
+                                        slide
+                                    }
+                                }
+                                // No non-seam boundary edge at this fan: fall back
+                                // to the seam tangent.
+                                None => tangent,
+                            }
+                        } else {
+                            tangent
+                        };
+                        (dir, length)
                     }
                     _ => {
                         // Two-or-more-seam case (INSET.md §5.1, §5.2).
@@ -748,6 +775,39 @@ impl LoopMesh {
 
         self.pop_face_op_flag_layer(face_tag);
         InsetRegionResult { wall_faces }
+    }
+
+    /// INSET.md §5.6 — the unit slide direction for a one-seam mesh-boundary
+    /// fan-instance: the direction from the fan-instance `fv` to its neighbour
+    /// *along the non-seam boundary edge*. That edge is the one in `fv`'s disk
+    /// that is neither the seam edge (`e_new`) nor the fabricated parallel
+    /// untagged edge (`e_old`) and that lies on the mesh boundary (radial
+    /// count ≤ 1). Returns `None` if no such edge exists, so the caller can
+    /// fall back to the seam tangent.
+    fn one_seam_slide_dir(
+        &self,
+        fv: VertexKey,
+        e_new_to_split: &HashMap<EdgeKey, usize>,
+        e_old_to_split: &HashMap<EdgeKey, usize>,
+    ) -> Option<Vec3> {
+        let here = self.vertex_position(fv);
+        for e in self.vertex_disk_iter(fv) {
+            if e_new_to_split.contains_key(&e) || e_old_to_split.contains_key(&e) {
+                continue;
+            }
+            // Only the mesh boundary (or a wire) is a valid slide rail; an
+            // interior edge would not be "along the mesh boundary" (§5.6).
+            if self.edge_radial_iter(e).count() > 1 {
+                continue;
+            }
+            let [a, b] = self.edge_vertices(e);
+            let other = if a == fv { b } else { a };
+            let dir = (self.vertex_position(other) - here).normalize_or_zero();
+            if dir != Vec3::ZERO {
+                return Some(dir);
+            }
+        }
+        None
     }
 
     /// For `use_edge_rail` (INSET.md §5.5): the far endpoint of the *other*
@@ -1845,5 +1905,157 @@ mod tests {
         mesh.validate_topology();
         // No panic / clean topology is the assertion: the gate declined the
         // merge and the rebaked per-face values were left in place.
+    }
+
+    // ---- One-seam mesh-boundary corner: §5.6 use_even_offset gate ----
+
+    /// Two quads sharing the interior edge `v1–v2`, only the left quad (f0)
+    /// tagged, with the shared edge *skewed* so the bottom/top mesh-boundary
+    /// edges meet the seam off-perpendicular (v1 pushed below the v0–v4 line,
+    /// v2 pushed above the v3–v5 line). With `use_boundary` off the shared
+    /// edge is the single seam at both v1 and v2, so both are one-seam
+    /// boundary verts (INSET.md §5.6).
+    fn make_one_seam_two_quads(mesh: &mut LoopMesh) -> Vec<FaceKey> {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, -0.5, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.5, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+
+        let quad = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| {
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[3]], EdgeCreateFlags::NO_DUPLICATE);
+            let e3 = mesh.create_edge([vs[3], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(&vs, &[e0, e1, e2, e3], FaceCreateFlags::NONE)
+        };
+
+        // f0 (tagged) = left quad; f1 (untagged) = right quad sharing v1–v2.
+        let f0 = quad(mesh, [v0, v1, v2, v3]);
+        let _f1 = quad(mesh, [v1, v4, v5, v2]);
+        vec![f0]
+    }
+
+    /// The two displaced tagged corners (those that moved off their original
+    /// positions), returned as `(displacement_at_v1, displacement_at_v2)`
+    /// keyed by which original (skewed) seam endpoint they came from.
+    fn one_seam_displacements(mesh: &LoopMesh) -> (Vec3, Vec3) {
+        let v1_orig = Vec3::new(1.0, -0.5, 0.0);
+        let v2_orig = Vec3::new(1.0, 1.5, 0.0);
+        let originals = [
+            Vec3::new(0.0, 0.0, 0.0),
+            v1_orig,
+            v2_orig,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+        ];
+        let mut from_v1: Option<Vec3> = None;
+        let mut from_v2: Option<Vec3> = None;
+        for v in mesh.vertices.iter() {
+            let p = mesh.vertex_position(v);
+            // A vertex still sitting on an original position did not move.
+            if originals.iter().any(|o| (*o - p).length() < 1.0e-5) {
+                continue;
+            }
+            // Attribute the moved corner to whichever seam endpoint it is
+            // closest to (the tagged corner is a small offset from it).
+            if (p - v1_orig).length() < (p - v2_orig).length() {
+                from_v1 = Some(p - v1_orig);
+            } else {
+                from_v2 = Some(p - v2_orig);
+            }
+        }
+        (
+            from_v1.expect("expected a displaced corner from v1"),
+            from_v2.expect("expected a displaced corner from v2"),
+        )
+    }
+
+    #[test]
+    fn inset_region_one_seam_even_off_uses_bare_seam_tangent() {
+        // §5.6 use_even_offset OFF: both one-seam corners move by the *same*
+        // vector — the seam edge's inward tangent times `thickness` — and the
+        // skewed boundary edges play no role. The seam edge v1–v2 runs along
+        // +Y, so its inward tangent (into f0, the -X side) is purely along X
+        // with zero Y component.
+        let mut mesh = LoopMesh::new();
+        let faces = make_one_seam_two_quads(&mut mesh);
+
+        let result = mesh.inset_region(
+            &faces,
+            InsetRegionParams {
+                thickness: 0.25,
+                use_boundary: false,
+                use_even_offset: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 1);
+        mesh.validate_topology();
+
+        let (d1, d2) = one_seam_displacements(&mesh);
+        // Same displacement at both ends.
+        assert!(
+            (d1 - d2).length() < 1.0e-5,
+            "even-off one-seam corners should share one displacement; d1={d1:?} d2={d2:?}"
+        );
+        // Perpendicular to the seam: zero Y, magnitude `thickness`, pointing
+        // into f0 (toward -X).
+        assert!(d1.y.abs() < 1.0e-5, "bare tangent should have no Y; d1={d1:?}");
+        assert!(d1.z.abs() < 1.0e-5, "planar mesh stays in z=0; d1={d1:?}");
+        assert!(d1.x < 0.0, "tangent should point into the tagged face (-X); d1={d1:?}");
+        assert!(
+            (d1.length() - 0.25).abs() < 1.0e-5,
+            "displacement magnitude should equal thickness; |d1|={}",
+            d1.length()
+        );
+    }
+
+    #[test]
+    fn inset_region_one_seam_even_on_slides_along_boundary() {
+        // §5.6 use_even_offset ON: each one-seam corner slides along its *own*
+        // skewed boundary edge, so the two corners move in *different*
+        // directions (non-zero, opposite-sign Y components) — visibly distinct
+        // from the bare-tangent OFF case. The slide is scaled so its
+        // perpendicular projection onto the seam tangent still equals
+        // `thickness` (the X component stays at -thickness).
+        let mut mesh = LoopMesh::new();
+        let faces = make_one_seam_two_quads(&mut mesh);
+
+        let result = mesh.inset_region(
+            &faces,
+            InsetRegionParams {
+                thickness: 0.25,
+                use_boundary: false,
+                use_even_offset: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 1);
+        mesh.validate_topology();
+
+        let (d1, d2) = one_seam_displacements(&mesh);
+        // The two corners disagree in direction (the gate is load-bearing).
+        assert!(
+            (d1 - d2).length() > 1.0e-3,
+            "even-on one-seam corners should slide differently; d1={d1:?} d2={d2:?}"
+        );
+        // Each genuinely slides along its boundary edge → non-zero Y, with
+        // opposite signs (v1's boundary edge v0–v1 tilts down, v2's edge
+        // v2–v3 tilts up).
+        assert!(d1.y.abs() > 1.0e-4, "even-on v1 should slide off-axis; d1={d1:?}");
+        assert!(d2.y.abs() > 1.0e-4, "even-on v2 should slide off-axis; d2={d2:?}");
+        assert!(
+            d1.y.signum() != d2.y.signum(),
+            "the two corners slide toward opposite Y; d1={d1:?} d2={d2:?}"
+        );
+        // The even-offset shell factor keeps the perpendicular (seam-tangent)
+        // projection at exactly `thickness`: the X component is -thickness.
+        assert!(
+            (d1.x + 0.25).abs() < 1.0e-5 && (d2.x + 0.25).abs() < 1.0e-5,
+            "perpendicular projection should equal thickness; d1={d1:?} d2={d2:?}"
+        );
     }
 }
