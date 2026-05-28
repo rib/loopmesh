@@ -1144,6 +1144,33 @@ impl ElementAttributes {
         }
     }
 
+    pub fn get_i32(&self, attr: ElementAttributeKey, slot: usize) -> Option<i32> {
+        match self.attributes.get(attr.as_usize())?.storage {
+            AttributeStorage::I32(b) => self
+                .attributes_i32
+                .get(b)
+                .and_then(|v| v.get(slot).copied()),
+            _ => None,
+        }
+    }
+
+    pub fn set_i32(&mut self, attr: ElementAttributeKey, slot: usize, value: i32) -> bool {
+        let storage = match self.attributes.get(attr.as_usize()) {
+            Some(d) => d.storage,
+            None => return false,
+        };
+        match storage {
+            AttributeStorage::I32(b) => match self.attributes_i32.get_mut(b) {
+                Some(v) if slot < v.len() => {
+                    v[slot] = value;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     pub fn get_vec2(&self, attr: ElementAttributeKey, slot: usize) -> Option<[f32; 2]> {
         match self.attributes.get(attr.as_usize())?.storage {
             AttributeStorage::Vec2(b) => self
@@ -5468,3 +5495,82 @@ fn op_flag_each_axis_is_independent() {
 }
 
 // extrude_region tests now live in loopmesh/ops/extrude_region.rs.
+
+#[test]
+fn i32_vertex_attrib_round_trips() {
+    let mut mesh = LoopMesh::new();
+    let v0 = mesh.create_vertex(Vec3::ZERO);
+    let v1 = mesh.create_vertex(Vec3::X);
+
+    let material = mesh
+        .register_vertex_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("material"),
+            Format::new(ComponentType::I32, 1),
+        ))
+        .unwrap();
+
+    assert!(mesh.vertex_attribs_mut().set_i32(material, v0.as_usize(), 7));
+    assert!(mesh
+        .vertex_attribs_mut()
+        .set_i32(material, v1.as_usize(), -3));
+
+    assert_eq!(
+        mesh.vertex_attribs().get_i32(material, v0.as_usize()),
+        Some(7)
+    );
+    assert_eq!(
+        mesh.vertex_attribs().get_i32(material, v1.as_usize()),
+        Some(-3)
+    );
+}
+
+#[test]
+fn i32_loop_attrib_round_trips() {
+    let mut mesh = LoopMesh::new();
+    let v0 = mesh.create_vertex(Vec3::ZERO);
+    let v1 = mesh.create_vertex(Vec3::X);
+    let v2 = mesh.create_vertex(Vec3::Y);
+    let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+    let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+    let e2 = mesh.create_edge([v2, v0], EdgeCreateFlags::NONE);
+    let f = mesh.face_create(&[v0, v1, v2], &[e0, e1, e2], FaceCreateFlags::NONE);
+
+    let tag = mesh
+        .register_loop_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("tag"),
+            Format::new(ComponentType::I32, 1),
+        ))
+        .unwrap();
+
+    let loops: Vec<LoopKey> = mesh.iter_face_loops(f).collect();
+    for (i, l) in loops.iter().enumerate() {
+        assert!(mesh.loop_attribs_mut().set_i32(tag, l.as_usize(), i as i32 * 10));
+    }
+    for (i, l) in loops.iter().enumerate() {
+        assert_eq!(
+            mesh.loop_attribs().get_i32(tag, l.as_usize()),
+            Some(i as i32 * 10)
+        );
+    }
+}
+
+#[test]
+fn i32_setter_rejects_wrong_bucket_and_missing_key() {
+    let mut mesh = LoopMesh::new();
+    let v0 = mesh.create_vertex(Vec3::ZERO);
+
+    // A float-bucket attribute must not accept an i32 write.
+    let color = mesh
+        .register_vertex_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("color"),
+            Format::new(ComponentType::F32, 3),
+        ))
+        .unwrap();
+    assert!(!mesh.vertex_attribs_mut().set_i32(color, v0.as_usize(), 1));
+    assert_eq!(mesh.vertex_attribs().get_i32(color, v0.as_usize()), None);
+
+    // An unregistered key resolves to nothing.
+    let bogus = ElementAttributeKey(9999);
+    assert!(!mesh.vertex_attribs_mut().set_i32(bogus, v0.as_usize(), 1));
+    assert_eq!(mesh.vertex_attribs().get_i32(bogus, v0.as_usize()), None);
+}
