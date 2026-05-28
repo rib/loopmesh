@@ -44,9 +44,12 @@ impl LoopMesh {
     ///    `region.out`).
     ///
     /// Supports the default-parameter manifold-region path and the optional
-    /// `use_verts` post-pass (§6). The double-face detection of §4.2 is not
-    /// yet implemented; on inputs that would hit it the merged face is
-    /// reported as the survivor.
+    /// `use_verts` post-pass (§6). The §4.2 double-face detection runs
+    /// inside `faces_join`: when the merge's perimeter coincides with a
+    /// pre-existing face's perimeter, the primitive returns that
+    /// pre-existing face as the survivor and the merge result is killed.
+    /// `DissolveFacesResult.region` therefore naturally carries the
+    /// pre-existing face on that path.
     pub fn dissolve_faces(
         &mut self,
         faces: &[FaceKey],
@@ -576,6 +579,77 @@ mod tests {
 
         assert_eq!(mesh.vert_edge_keys(v1).len(), 2, "v1 sits on the merged perimeter as a 2-edge node");
         assert_eq!(mesh.vert_edge_keys(v2).len(), 2, "v2 sits on the merged perimeter as a 2-edge node");
+        mesh.validate_topology();
+    }
+
+    /// §4.2 BMOP-wrapper path: when the per-region merge would build a
+    /// face whose perimeter coincides with a pre-existing face, the
+    /// shadow wins. `DissolveFacesResult.region` carries the shadow as
+    /// the per-region survivor; the two source quads and the
+    /// newly-built merged face are gone.
+    ///
+    /// Fixture mirrors the A/B scaffold's `shadow_face_over_two_quad_region`:
+    /// two adjacent unit quads sharing interior edge {v1,v2}, overlaid
+    /// by a third hexagonal face whose perimeter coincides with the
+    /// outer rim of the two-quad region.
+    #[test]
+    fn dissolve_faces_double_face_detection_shadow_wins() {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+        .collect();
+
+        let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+
+        let f_left = mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e_01, e_12, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+        let f_right = mesh.face_create(
+            &[v[1], v[4], v[5], v[2]],
+            &[e_14, e_45, e_52, e_12],
+            FaceCreateFlags::NONE,
+        );
+        let f_shadow = mesh.face_create(
+            &[v[0], v[1], v[4], v[5], v[2], v[3]],
+            &[e_01, e_14, e_45, e_52, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+
+        assert_eq!(mesh.totvert(), 6);
+        assert_eq!(mesh.totedge(), 7);
+        assert_eq!(mesh.totface(), 3);
+
+        let result = mesh.dissolve_faces(&[f_left, f_right], DissolveFacesOptions::default());
+
+        assert_eq!(result.region.len(), 1, "one region, one successful merge");
+        assert_eq!(
+            result.region[0], f_shadow,
+            "region.out carries the shadow, not the merge result"
+        );
+        assert_eq!(mesh.totvert(), 6);
+        assert_eq!(mesh.totedge(), 6);
+        assert_eq!(mesh.totface(), 1);
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(live.contains(&f_shadow));
+        assert!(!live.contains(&f_left));
+        assert!(!live.contains(&f_right));
         mesh.validate_topology();
     }
 }

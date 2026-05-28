@@ -107,7 +107,59 @@ impl LoopMesh {
             }
         }
 
+        // §4.2 double-face detection: a pre-existing face whose perimeter
+        // coincides with the merged face's perimeter wins; the merge
+        // result is killed and the pre-existing face is returned as the
+        // survivor (its customdata is preserved). The merged face's
+        // perimeter is, by construction, a simple cycle of boundary
+        // edges shared with at most one other face on each edge's
+        // radial cycle. Any face that shares *every* edge of the merged
+        // perimeter must appear on the radial of every such edge — so
+        // checking the radial cycle of a single perimeter edge is
+        // sufficient to enumerate the candidates.
+        if let Some(shadow) = self.faces_join_find_coincident_face(survivor) {
+            self.face_kill(survivor);
+            return Some(shadow);
+        }
+
         Some(survivor)
+    }
+
+    /// Search the radial cycle of `merged`'s first perimeter edge for a
+    /// pre-existing face whose corner cycle (vertex sequence) equals
+    /// `merged`'s corner cycle modulo rotation and reflection. Returns
+    /// the matching face if any, else `None`.
+    ///
+    /// A face that shares the merged face's entire perimeter must sit on
+    /// every one of those perimeter edges' radial cycles, so probing any
+    /// single such cycle enumerates all candidates. The full perimeter
+    /// match is then verified by comparing the candidate's vertex cycle
+    /// against `merged`'s as an ordered sequence (allowing rotation /
+    /// reversal).
+    fn faces_join_find_coincident_face(&self, merged: FaceKey) -> Option<FaceKey> {
+        let merged_perimeter = self.face_vert_keys(merged);
+        if merged_perimeter.is_empty() {
+            return None;
+        }
+
+        let first_loop = self.faces.get(merged).first_edge_loop;
+        let probe_edge = self.loops.get(first_loop).edge;
+        if probe_edge.is_null() {
+            return None;
+        }
+
+        let mut radial = self.radial_loops(probe_edge);
+        while let Some(loop_key) = radial.next(self) {
+            let candidate = self.loops.get(loop_key).face;
+            if candidate == merged {
+                continue;
+            }
+            let candidate_perimeter = self.face_vert_keys(candidate);
+            if vertex_cycles_coincide(&merged_perimeter, &candidate_perimeter) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Walk `face`'s loop cycle and kill every edge whose radial cycle has
@@ -219,6 +271,32 @@ impl LoopMesh {
     }
 }
 
+/// True iff `cycle_a` and `cycle_b` are the same cyclic vertex sequence
+/// modulo rotation and reflection. Used by §4.2 double-face detection
+/// to decide whether the merged face duplicates a pre-existing face's
+/// perimeter.
+fn vertex_cycles_coincide(cycle_a: &[VertexKey], cycle_b: &[VertexKey]) -> bool {
+    let n = cycle_a.len();
+    if n == 0 || n != cycle_b.len() {
+        return false;
+    }
+    let start_indices: smallvec::SmallVec<[usize; 4]> = cycle_b
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v == cycle_a[0])
+        .map(|(i, _)| i)
+        .collect();
+    for start in start_indices {
+        if (0..n).all(|i| cycle_b[(start + i) % n] == cycle_a[i]) {
+            return true;
+        }
+        if (0..n).all(|i| cycle_b[(start + n - i) % n] == cycle_a[i]) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
@@ -310,6 +388,126 @@ mod tests {
             totvert_before,
             "no verts may be killed when every region vert retains a surviving edge"
         );
+
+        mesh.validate_topology();
+    }
+
+    /// Construct the shadow-face fixture for §4.2: two adjacent quads
+    /// (`face 0` left, `face 1` right) sharing interior edge `{v1, v2}`,
+    /// overlaid by a third hexagonal `shadow` face (`face 2`) whose
+    /// perimeter coincides with the outer boundary of the two-quad
+    /// region (`[v0, v1, v4, v5, v2, v3]`). Returns
+    /// `(verts, [left_quad, right_quad, shadow])`.
+    fn build_shadow_over_two_quads(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<VertexKey>, [FaceKey; 3]) {
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+        .collect();
+
+        let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+
+        let f_left = mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e_01, e_12, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+        let f_right = mesh.face_create(
+            &[v[1], v[4], v[5], v[2]],
+            &[e_14, e_45, e_52, e_12],
+            FaceCreateFlags::NONE,
+        );
+        let f_shadow = mesh.face_create(
+            &[v[0], v[1], v[4], v[5], v[2], v[3]],
+            &[e_01, e_14, e_45, e_52, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+
+        (v, [f_left, f_right, f_shadow])
+    }
+
+    /// §4.2: joining the two quads of `build_shadow_over_two_quads` would
+    /// normally produce a hexagonal merged face whose perimeter coincides
+    /// with the shadow's. Double-face detection must kick in: the shadow
+    /// survives, the merge result is killed, and `faces_join` returns the
+    /// shadow as the survivor. Final mesh: 6 V, 6 E, 1 F.
+    #[test]
+    fn faces_join_double_face_detection_shadow_wins() {
+        let mut mesh = LoopMesh::new();
+        let (verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
+
+        assert_eq!(mesh.totvert(), 6);
+        assert_eq!(mesh.totedge(), 7, "6 outer-rim + 1 interior v1-v2");
+        assert_eq!(mesh.totface(), 3);
+
+        let survivor = mesh
+            .faces_join(&[f_left, f_right])
+            .expect("two-quad region joins successfully");
+
+        assert_eq!(
+            survivor, f_shadow,
+            "§4.2 step 3: the pre-existing shadow face becomes the reported survivor"
+        );
+
+        assert_eq!(mesh.totvert(), 6, "every perimeter vert retains a shadow edge");
+        assert_eq!(mesh.totedge(), 6, "interior v1-v2 edge gone; outer rim survives");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "two source quads + new merged face killed; only the shadow remains"
+        );
+
+        // The surviving face is exactly the shadow, with the original
+        // perimeter still anchored on the six outer-rim verts.
+        let survivor_perimeter = mesh.face_vert_keys(survivor);
+        assert_eq!(survivor_perimeter.len(), 6);
+        let expected: std::collections::HashSet<VertexKey> = verts.iter().copied().collect();
+        let got: std::collections::HashSet<VertexKey> =
+            survivor_perimeter.iter().copied().collect();
+        assert_eq!(got, expected);
+
+        // The two source quads must be gone from the face table.
+        let live_faces: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(!live_faces.contains(&f_left));
+        assert!(!live_faces.contains(&f_right));
+        assert!(live_faces.contains(&f_shadow));
+
+        mesh.validate_topology();
+    }
+
+    /// Negative case for §4.2: joining two adjacent quads on a 3x3 grid
+    /// has no pre-existing coincident face. The detection must NOT
+    /// trigger; the merge result itself is returned as the survivor.
+    #[test]
+    fn faces_join_double_face_detection_does_not_fire_without_shadow() {
+        let mut mesh = LoopMesh::new();
+        let (_verts, faces) = build_grid_3x3(&mut mesh);
+
+        let survivor = mesh
+            .faces_join(&[faces[0], faces[1]])
+            .expect("two-quad merge");
+
+        // The survivor must be a brand-new face (the JFKE chain keeps
+        // face[0]'s slot alive as the survivor; either way it is NOT some
+        // *other* pre-existing face).
+        let live_faces: std::collections::HashSet<FaceKey> =
+            mesh.face_keys().into_iter().collect();
+        assert!(live_faces.contains(&survivor));
+        assert_eq!(survivor, faces[0], "JFKE preserves the first input's face slot");
 
         mesh.validate_topology();
     }
