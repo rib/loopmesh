@@ -9,6 +9,7 @@
 //! Euler operators in [`euler`](super::euler).
 
 mod dissolve_faces;
+mod dissolve_verts;
 mod extrude_region;
 mod face_poke;
 mod face_triangulate;
