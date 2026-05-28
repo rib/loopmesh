@@ -12,15 +12,11 @@ const ANGLE_EPS: f32 = 0.0001;
 /// Mirrors the BMOP set-input shape described in
 /// `radial-mesh-guides/operators/DISSOLVE_EDGES.md` §1.
 ///
-/// The default-parameter path and the full `use_verts` post-pass — wide,
+/// The default-parameter path, the full `use_verts` post-pass — wide,
 /// near-zero, *and* intermediate `angle_threshold` (the §5.2 blended-angle
-/// gate) — are implemented. One configuration is not yet supported. Rather
-/// than panic on it — an expected-failure mode, which per the project rubric
-/// must not be a panic — [`LoopMesh::dissolve_edges`] declines it as a no-op
-/// and reports the decline through its return value
-/// ([`DissolveEdgesResult::Unsupported`]). The unsupported configuration:
-///
-/// - `use_face_split == true` (§4, the vert-centred pre-pass) — unwritten.
+/// gate) — and the `use_face_split` pre-pass (§4) are all implemented.
+/// [`LoopMesh::dissolve_edges`] reports its run through
+/// [`DissolveEdgesResult::Ran`].
 #[derive(Clone, Copy)]
 pub struct DissolveEdgesParams {
     /// Post-pass: collapse adjacent verts that became edge-pairs after the
@@ -28,8 +24,7 @@ pub struct DissolveEdgesParams {
     /// `angle_threshold` (see the type docs).
     pub use_verts: bool,
     /// Pre-pass: triangulate n-gon corners around verts that would become
-    /// edge-pairs (§4). Not yet implemented; setting it makes
-    /// [`LoopMesh::dissolve_edges`] decline (no-op + `Unsupported`).
+    /// edge-pairs after the merges (§4). Runs before any per-edge merge.
     pub use_face_split: bool,
     /// Gate for `use_verts` (§5.2). Only consulted when `use_verts` is on.
     /// At the default `π` every edge-pair candidate collapses; at `0` the
@@ -57,8 +52,9 @@ pub enum DissolveEdgesResult {
     /// The operator ran (the mesh may or may not have changed, depending on
     /// the per-edge classifications).
     Ran,
-    /// The parameter tuple is outside the implemented surface (currently only
-    /// the §4 `use_face_split` pre-pass). The mesh was left untouched.
+    /// The parameter tuple is outside the implemented surface. The mesh was
+    /// left untouched. No parameter currently triggers this; the variant is
+    /// retained so future unimplemented knobs can decline without panicking.
     Unsupported,
 }
 
@@ -110,37 +106,32 @@ impl LoopMesh {
     ///    left by earlier merges (the shared-endpoint case picks up the
     ///    post-first-merge face pair; disjoint pairs are order-independent).
     ///
-    /// The default-parameter path and the `use_verts` post-pass (§5) with a
-    /// wide or near-zero `angle_threshold` are implemented:
+    /// The default-parameter path, the `use_face_split` pre-pass (§4), and the
+    /// `use_verts` post-pass (§5) with any `angle_threshold` are implemented:
     ///
+    /// - **Phase 1 (§6.1)** — when `use_face_split` or `use_verts` is on, tag
+    ///   every input edge with the `EDGE_TAG` bit so the pre-/post-passes can
+    ///   recognise input-set membership.
     /// - **Phase 2 (§6.2)** — when `use_verts` is on, mark the collapse
     ///   candidates *before* the merges run, so the §5.1 predicates
     ///   (tagged-edge counts, "touches an unselected face") read the
     ///   pre-merge topology. The marking applies the three §5.1 filters: the
     ///   triangle-to-quad anti-degeneration guard, the chain-walk to the
     ///   chain terminus, and the T-junction / incidental-touch filter.
+    /// - **Phase 3 (§6.3 / §4)** — when `use_face_split` is on, mark every
+    ///   vert whose untagged-edge count is ≤ 2 and triangulate the n-gon
+    ///   corners around the marked (non-edge-pair) verts, *before* any merge.
     /// - **Phase 4 (§6.4)** — the per-edge merges (the default path).
     /// - **Phase 5 (§6.5)** — for each marked vert that is *still* an
     ///   edge-pair after the merges, collapse it via `vert_collapse_edge`
     ///   (§5.3). The angle is sampled once per candidate before any collapse
     ///   runs (§6.5 snapshot-then-act); at a wide `angle_threshold` every
     ///   candidate qualifies so no angle math is needed this far.
-    ///
-    /// Not yet implemented (declined as a no-op returning
-    /// [`DissolveEdgesResult::Unsupported`]): the `use_face_split` pre-pass
-    /// (§4) and the §5.2 blended-angle gate for an intermediate
-    /// `angle_threshold`. See [`DissolveEdgesParams`].
     pub fn dissolve_edges(
         &mut self,
         edges: &[EdgeKey],
         params: &DissolveEdgesParams,
     ) -> DissolveEdgesResult {
-        // §4 / §5.2 — decline unsupported configurations without touching the
-        // mesh. This is an expected failure mode (an unimplemented knob), so
-        // it returns through the status enum rather than panicking.
-        if params.use_face_split {
-            return DissolveEdgesResult::Unsupported;
-        }
         let mode = if !params.use_verts {
             UseVertsMode::Off
         } else if params.angle_threshold <= ANGLE_EPS {
@@ -156,14 +147,33 @@ impl LoopMesh {
             }
         };
 
-        // §6.1 / §6.2 — when the post-pass is on, tag the input set and mark
-        // the §5.1 collapse candidates against the pre-merge topology. The
-        // marks live in a pushed op-flag layer (the BMOP flag-bit layer of
-        // §10) so they vanish when the operator returns.
+        // §6.1 — the `EDGE_TAG` (input-set membership) bit is needed by either
+        // pre-/post-pass: the §6.3 pre-pass counts each vert's *untagged*
+        // edges, and the §5.1 candidate marking counts each vert's *tagged*
+        // edges. It is seeded once here and kept alive through phase 3, then
+        // popped before the phase-4 merges. The layer is a pushed op-flag layer
+        // (the BMOP flag-bit layer of §10) so it vanishes when the operator
+        // returns.
+        let tag_inputs = params.use_face_split || mode != UseVertsMode::Off;
+        let tagged = if tag_inputs {
+            let tagged = self.push_edge_op_flag_layer();
+            for &edge in edges {
+                if self.edges.try_get(edge).is_none() {
+                    continue;
+                }
+                self.edge_op_flag_set(tagged, edge, 0);
+            }
+            Some(tagged)
+        } else {
+            None
+        };
+
+        // §6.2 — when the post-pass is on, mark the §5.1 collapse candidates
+        // against the pre-merge topology.
         let candidate_marks = if mode == UseVertsMode::Off {
             None
         } else {
-            let tagged = self.push_edge_op_flag_layer();
+            let tagged = tagged.expect("EDGE_TAG seeded whenever use_verts is on");
             // §6.1 — `EDGE_CHAIN`: set on input edges that flank two faces and
             // have an edge-pair endpoint. Used as the chain-walk abort marker
             // (§8): the §5.1 walk stops if it runs into a *different* input
@@ -178,7 +188,6 @@ impl LoopMesh {
                 if self.edges.try_get(edge).is_none() {
                     continue;
                 }
-                self.edge_op_flag_set(tagged, edge, 0);
                 if matches!(
                     self.dissolve_edges_classify(edge),
                     EdgeClass::ManifoldPair { .. }
@@ -204,9 +213,21 @@ impl LoopMesh {
                 chain_target,
             );
             self.pop_edge_op_flag_layer(chain);
-            self.pop_edge_op_flag_layer(tagged);
             Some((marked, chain_target))
         };
+
+        // §6.3 — the `use_face_split` pre-pass, run after the §6.2 marking but
+        // before the phase-4 merges (the §6 phase ordering). The two passes are
+        // independent (§6.3) — they share neither marker bit nor effect.
+        if params.use_face_split {
+            let tagged = tagged.expect("EDGE_TAG seeded whenever use_face_split is on");
+            self.dissolve_edges_face_split_pre_pass(tagged);
+        }
+
+        // The `EDGE_TAG` set has served both passes; drop it before the merges.
+        if let Some(tagged) = tagged {
+            self.pop_edge_op_flag_layer(tagged);
+        }
 
         // §6.4 — per-edge dispatch in input order. Each iteration
         // re-classifies the edge against the *current* topology so the
@@ -240,6 +261,106 @@ impl LoopMesh {
         }
 
         DissolveEdgesResult::Ran
+    }
+
+    /// §6.3 / §4 — the `use_face_split` pre-pass. Mirrors the dissolve-verts §4
+    /// pre-pass in shape but keys the candidate marking off the *untagged*-edge
+    /// count rather than input-set membership.
+    ///
+    /// Sub-pass 1 (§4.1 / §6.3): mark every vert in the mesh whose count of
+    /// incident edges *not* carrying the `EDGE_TAG` (input-set) bit is ≤ 2 — a
+    /// vert that would become an edge-pair (or less) once the input edges are
+    /// dissolved.
+    ///
+    /// Sub-pass 2 (§4.1): for every marked vert `v` that is **not** already an
+    /// edge-pair (it currently has more than two incident edges, so the mark
+    /// came from many input edges meeting at `v` rather than from `v` already
+    /// being a corner), and every incident face whose corner count is `> 3`,
+    /// draw the diagonal `(v_prev, v_next)` provided **neither** `v_prev` nor
+    /// `v_next` is itself a marked vert. The cut-off triangle `(v_prev, v,
+    /// v_next)` holds `v` as its sole marked corner; the rest of the face
+    /// survives as an `(n−1)`-gon. The diagonals are gathered before any split
+    /// because the diagonal `v_prev – v_next` never touches `v`, so slicing one
+    /// face of `v`'s fan does not change which loop sits at `v` on any other.
+    fn dissolve_edges_face_split_pre_pass(&mut self, tagged: crate::op_flags::EdgeOpFlagLayer) {
+        const MARK_BIT: u8 = 0;
+        // Sub-pass 1 — mark candidate verts and gather them for sub-pass 2's
+        // membership test (the diagonal skip uses the *marked* set, §4.1).
+        let marked = self.push_vert_op_flag_layer();
+        let mut candidates: SmallVec<[VertexKey; 16]> = SmallVec::new();
+        let mut vert_iter = MeshVerts::default();
+        while let Some(vertex) = vert_iter.next(self) {
+            if self.vert_untagged_edge_count_capped(vertex, tagged, 3) <= 2 {
+                self.vert_op_flag_set(marked, vertex, MARK_BIT);
+                candidates.push(vertex);
+            }
+        }
+
+        // Sub-pass 2 — gather the (face, v_prev, v_next) diagonals to cut.
+        let mut diagonals: SmallVec<[(FaceKey, VertexKey, VertexKey); 8]> = SmallVec::new();
+        for &vertex in &candidates {
+            // §4.1 — edge-pair verts (≤ 2 incident edges) have no third corner
+            // to slice; they are skipped (the §4.4 "already an edge-pair" no-op).
+            if self.vertex_disk_count_edges_capped(vertex, 3) <= 2 {
+                continue;
+            }
+            let mut seen_faces: SmallVec<[FaceKey; 8]> = SmallVec::new();
+            let mut disk = self.disk_edges(vertex);
+            while let Some(edge) = disk.next(self) {
+                let mut radial = self.radial_loops(edge);
+                while let Some(loop_key) = radial.next(self) {
+                    if self.loops.get(loop_key).vertex != vertex {
+                        continue;
+                    }
+                    let face = self.loops.get(loop_key).face;
+                    if seen_faces.contains(&face) {
+                        continue;
+                    }
+                    seen_faces.push(face);
+                    // §4.1 / §4.4 — already-triangle faces have no n-gon diagonal.
+                    if self.face_len(face) <= 3 {
+                        continue;
+                    }
+                    let v_next = self.loops.get(self.loop_next(loop_key)).vertex;
+                    let v_prev = self.loops.get(self.loop_prev(loop_key)).vertex;
+                    // §4.1 — skip when either diagonal endpoint is itself marked.
+                    if self.vert_op_flag_test(marked, v_next, MARK_BIT)
+                        || self.vert_op_flag_test(marked, v_prev, MARK_BIT)
+                    {
+                        continue;
+                    }
+                    diagonals.push((face, v_prev, v_next));
+                }
+            }
+        }
+
+        for (face, v_prev, v_next) in diagonals {
+            // §4.1 — the same shared SFME `face_split` helper the dissolve-verts
+            // §4 pre-pass uses (§9 Euler inventory).
+            let _ = self.face_split(face, v_prev, v_next);
+        }
+
+        self.pop_vert_op_flag_layer(marked);
+    }
+
+    /// §4.1 / §6.3 helper — count `v`'s incident edges *not* carrying the
+    /// `EDGE_TAG` (input-set) bit, stopping at `cap`. The §6.3 candidate test
+    /// marks a vert when this count is ≤ 2.
+    fn vert_untagged_edge_count_capped(
+        &self,
+        v: VertexKey,
+        tagged: crate::op_flags::EdgeOpFlagLayer,
+        cap: usize,
+    ) -> usize {
+        let mut count = 0usize;
+        let mut disk = self.disk_edges(v);
+        while count < cap {
+            let Some(edge) = disk.next(self) else { break };
+            if !self.edge_op_flag_test(tagged, edge, 0) {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// §6.1 — extend the `EDGE_TAG` set along the chains rooted at each input
@@ -1393,6 +1514,194 @@ mod tests {
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&verts[1]), "vert 1 (straight chain) collapsed by the gate");
         assert!(live.contains(&verts[4]), "vert 4 (still 3-valent) survives");
+        mesh.validate_topology();
+    }
+
+    // ---- use_face_split pre-pass (§4 / §6.3) ----
+
+    fn use_face_split() -> DissolveEdgesParams {
+        DissolveEdgesParams {
+            use_verts: false,
+            use_face_split: true,
+            angle_threshold: std::f32::consts::PI,
+        }
+    }
+
+    /// Count faces with `face_len == 3` in the mesh.
+    fn count_triangles(mesh: &LoopMesh) -> usize {
+        let mut tris = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(mesh) {
+            if mesh.face_len(f) == 3 {
+                tris += 1;
+            }
+        }
+        tris
+    }
+
+    /// §4 / §6.3 headline + §4.2 structural contrast — the targeted parity row.
+    /// Two input edges `{1,4}` and `{3,4}` converge on the 4-valence centre
+    /// vert 4 of the 2x2 face grid. Vert 4's untagged-edge count is 2 (4 edges,
+    /// 2 tagged), so it is marked and — being a non-edge-pair n-gon corner — its
+    /// surrounding quads are diagonal-sliced *before* the merges.
+    ///
+    /// Of vert 4's four quads, three have a marked vert on *both* corners of the
+    /// candidate diagonal (verts 1 and 3 are also marked) and are skipped per
+    /// §4.1; only `face3 = (4,5,8,7)`, whose neighbours 5 and 7 are unmarked,
+    /// is sliced — adding the diagonal `{5,7}` (+1 E, +1 F). The two merges of
+    /// `{1,4}` and `{3,4}` do not touch face3, so the `{5,7}` diagonal and the
+    /// triangle it produces survive into the final mesh. The contrast against
+    /// `use_face_split = false` (no diagonal, no triangle) is the documented
+    /// "with vs without" pre-pass difference (§4.2 / §7).
+    #[test]
+    fn dissolve_edges_use_face_split_slices_corner_around_shared_vert() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_face_grid_2x2(&mut mesh);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(mesh.vert_edge_keys(verts[4]).len(), 4, "vert 4 is the 4-valence centre");
+
+        let edge_a = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge_b = mesh.query_edge_exists(verts[3], verts[4]).expect("edge {3,4}");
+
+        let result = mesh.dissolve_edges(&[edge_a, edge_b], &use_face_split());
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        // Pre-pass: +1 E (diag {5,7}) +1 F. Merge {1,4}: -1 E, -1 F. Merge
+        // {3,4}: -1 E, -1 F. Net from 9/12/4: 0 V, -1 E, -1 F.
+        assert_eq!(mesh.totvert(), 9, "0 V (pre-pass adds no verts)");
+        assert_eq!(mesh.totedge(), 11, "+1 diagonal, -2 merges");
+        assert_eq!(mesh.totface(), 3, "+1 slice, -2 merges");
+
+        assert!(
+            mesh.query_edge_exists(verts[5], verts[7]).is_some(),
+            "the pre-pass sliced face3 along the diagonal {{5,7}}"
+        );
+        // The single slice cuts quad face3 into two triangles; the merges
+        // (which act on the other three quads around vert 4) leave them intact.
+        assert_eq!(
+            count_triangles(&mesh),
+            2,
+            "two triangles from splitting the one untouched quad along {{5,7}}"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §4.2 structural contrast: the *same* input with `use_face_split = false`.
+    /// No pre-pass runs, so no `{5,7}` diagonal is drawn and no triangle is
+    /// produced; the two merges consume one more face than the sliced run. This
+    /// is the direct "without" half of the headline contrast.
+    #[test]
+    fn dissolve_edges_no_face_split_leaves_corner_intact() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_face_grid_2x2(&mut mesh);
+
+        let edge_a = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge_b = mesh.query_edge_exists(verts[3], verts[4]).expect("edge {3,4}");
+
+        let result = mesh.dissolve_edges(&[edge_a, edge_b], &Default::default());
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        // No pre-pass: 9/12/4 → merge {1,4} → 9/11/3 → merge {3,4} → 9/10/2.
+        assert_eq!(mesh.totvert(), 9, "0 V");
+        assert_eq!(mesh.totedge(), 10, "-2 merges, no diagonal added");
+        assert_eq!(mesh.totface(), 2, "-2 merges, no slice");
+
+        assert!(
+            mesh.query_edge_exists(verts[5], verts[7]).is_none(),
+            "without the pre-pass no {{5,7}} diagonal exists"
+        );
+        assert_eq!(count_triangles(&mesh), 0, "no triangles without the pre-pass");
+        mesh.validate_topology();
+    }
+
+    /// §4.4 no-op — already-triangulated mesh. `use_face_split = true` on two
+    /// triangles sharing a diagonal finds no n-gon corner to slice (every face
+    /// is already a triangle, the §4.4 "corner count > 3 fails" no-op), so the
+    /// result is identical to the default-parameter run: the two triangles
+    /// merge into a quad with no extra geometry.
+    #[test]
+    fn dissolve_edges_use_face_split_noop_on_triangulated_mesh() {
+        let mut mesh = LoopMesh::new();
+        let (_verts, diagonal, _faces) = build_two_tris_shared_diagonal(&mut mesh);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 5, 2));
+
+        let result = mesh.dissolve_edges(&[diagonal], &use_face_split());
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        // Same outcome as `use_face_split = false`: -1 E (diagonal), -1 F.
+        assert_eq!(mesh.totvert(), 4, "0 V");
+        assert_eq!(mesh.totedge(), 4, "-1 E (the diagonal), no slice added");
+        assert_eq!(mesh.totface(), 1, "-1 F (two tris → one quad)");
+
+        let faces = mesh.face_keys();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(mesh.face_len(faces[0]), 4, "merged face is an intact quad");
+        mesh.validate_topology();
+    }
+
+    /// §4.4 no-op — every candidate vert is already an edge-pair. On the 3x3
+    /// face grid, dissolving the deep-interior edge `{5,6}` leaves both
+    /// endpoints with 3 untagged edges (4 incident − 1 tagged), so neither is
+    /// marked. The only verts with ≤ 2 untagged edges are the grid corners,
+    /// which are pre-existing edge-pairs (2 incident edges) — the §4.1
+    /// sub-pass-2 "not already an edge-pair" guard skips them, so no diagonal
+    /// is drawn. The result matches the `use_face_split = false` merge exactly.
+    #[test]
+    fn dissolve_edges_use_face_split_noop_when_candidates_are_edge_pairs() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (16, 24, 9));
+
+        // verts[5] and verts[6] are deep-interior 4-valence verts sharing an
+        // interior edge between faces[1] and faces[4].
+        let edge = mesh
+            .query_edge_exists(verts[5], verts[6])
+            .expect("interior edge {5,6}");
+        assert_eq!(mesh.vert_edge_keys(verts[5]).len(), 4);
+        assert_eq!(mesh.vert_edge_keys(verts[6]).len(), 4);
+
+        let result = mesh.dissolve_edges(&[edge], &use_face_split());
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        // Pure merge, no slice: -1 E, -1 F, 0 V.
+        assert_eq!(mesh.totvert(), 16, "0 V");
+        assert_eq!(mesh.totedge(), 23, "-1 E (the merge only)");
+        assert_eq!(mesh.totface(), 8, "-1 F (the merge only)");
+        assert_eq!(
+            count_triangles(&mesh),
+            0,
+            "no triangles: every candidate was an edge-pair, nothing sliced"
+        );
+        // The merged face is the hexagon spanning the two source quads.
+        let merged = mesh
+            .face_keys()
+            .into_iter()
+            .find(|&f| mesh.face_len(f) == 6)
+            .expect("a hexagonal merged face exists");
+        assert_eq!(mesh.face_len(merged), 6);
+        mesh.validate_topology();
+    }
+
+    /// §4.4 no-op — no candidate verts at all. A single interior edge `{5,6}`
+    /// in a mesh with no low-valence verts would be the previous test; here we
+    /// confirm the empty-input degenerate: `use_face_split = true` with an empty
+    /// edge set tags nothing, so every vert has its full (untagged) disk. On the
+    /// 3x3 face grid the corner verts are still ≤ 2 untagged but edge-pairs, the
+    /// boundary-midpoints are 3 untagged, the interior verts 4 untagged — so no
+    /// diagonal is ever drawn and the mesh is untouched.
+    #[test]
+    fn dissolve_edges_use_face_split_empty_input_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let (_verts, _faces) = build_grid_3x3(&mut mesh);
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        let result = mesh.dissolve_edges(&[], &use_face_split());
+        assert_eq!(result, DissolveEdgesResult::Ran);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(count_triangles(&mesh), 0, "no slices on empty input");
         mesh.validate_topology();
     }
 }
