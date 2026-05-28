@@ -98,9 +98,14 @@ impl LoopMesh {
     ///    bisector offset of the two seam-edge tangents (one-tangent for the
     ///    single-seam corner case), optionally scaled by `1/cos(half-angle)`
     ///    when `use_even_offset` is set.
+    ///    When `use_edge_rail` is set and a two-seam corner sits on a common
+    ///    non-seam edge shared by its two tagged faces (INSET.md §5.5), the
+    ///    move direction is the slide along that existing edge — toward the
+    ///    shared far vertex, using its pre-inset position — instead of the
+    ///    tangent bisector. Corners without a shared edge fall back to the
+    ///    bisector.
     /// 4. *(Not yet implemented: face re-interpolation when `use_interpolate`
-    ///    is set; the depth pass when `depth != 0.0`; `use_outset`,
-    ///    `use_edge_rail`, and `use_relative_offset` offset modes.)*
+    ///    is set.)*
     /// 5. **Build wall quads.** For each seam edge, build a face spanning
     ///    `(v0_old, v1_old, v1_new, v0_new)` with edges `(e_old, side_v1,
     ///    e_new, side_v0)`. Side edges between matched tagged/untagged
@@ -264,6 +269,20 @@ impl LoopMesh {
         endpoint_set.sort_unstable_by_key(|v| v.as_usize());
         endpoint_set.dedup();
 
+        // For `use_edge_rail` (INSET.md §5.5) the slide direction is measured
+        // toward a far vertex along a shared non-seam edge, using *pre-inset*
+        // coordinates — phase three moves boundary verts as it walks, so a
+        // far vertex read live could feed back its own displacement. Snapshot
+        // every vertex position that exists before any move.
+        let original_coords: HashMap<VertexKey, Vec3> = if params.use_edge_rail {
+            let live: Vec<VertexKey> = self.vertices.iter().collect();
+            live.into_iter()
+                .map(|v| (v, self.vertex_position(v)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // Phase 3: at each endpoint, vert-separate and offset the tagged fan.
         // `endpoint_tagged_v[(split_edge_idx, role)]` → the post-separate
         // tagged-side vertex for split-edge `split_edge_idx` at endpoint
@@ -348,20 +367,75 @@ impl LoopMesh {
                     _ => {
                         // Two-or-more-seam case (INSET.md §5.1, §5.2).
                         // First-two-wins for 3+ seams.
-                        let sa = &split_edges[seam_new[0]];
-                        let sb = &split_edges[seam_new[1]];
-                        let bisector = (sa.tangent + sb.tangent).normalize_or_zero();
-                        let dir = if params.use_even_offset {
-                            let cos_half = sa.tangent.dot(bisector).abs();
-                            if cos_half > 1.0e-6 {
-                                bisector / cos_half
-                            } else {
-                                bisector
+                        let idx_a = seam_new[0];
+                        let idx_b = seam_new[1];
+                        let tangent_a = split_edges[idx_a].tangent;
+                        let tangent_b = split_edges[idx_b].tangent;
+
+                        // `use_edge_rail` (INSET.md §5.5): if the two seam edges
+                        // share a common non-seam edge leading out of the corner
+                        // — their tagged faces' "other" edge at this corner
+                        // points at the same far vertex — slide along that
+                        // existing edge instead of along the tangent bisector.
+                        let rail_dir = if params.use_edge_rail {
+                            let far_a = self.rail_far_vertex(&split_edges[idx_a], v_pre);
+                            let far_b = self.rail_far_vertex(&split_edges[idx_b], v_pre);
+                            match (far_a, far_b) {
+                                (Some(fa), Some(fb)) if fa == fb => {
+                                    let far_pos = original_coords
+                                        .get(&fa)
+                                        .copied()
+                                        .unwrap_or_else(|| self.vertex_position(fa));
+                                    let dir = (far_pos - pre_pos).normalize_or_zero();
+                                    if dir == Vec3::ZERO {
+                                        None
+                                    } else {
+                                        Some(dir)
+                                    }
+                                }
+                                _ => None,
                             }
                         } else {
-                            bisector
+                            None
                         };
-                        (dir, 0.5 * (sa.length + sb.length))
+
+                        let dir = match rail_dir {
+                            Some(slide) => {
+                                if params.use_even_offset {
+                                    // Scale the slide so its perpendicular
+                                    // projection onto a seam tangent equals
+                                    // `thickness` — use whichever tangent makes
+                                    // the larger angle with the slide (the
+                                    // smaller |dot|), matching §5.5.
+                                    let dot_a = tangent_a.dot(slide).abs();
+                                    let dot_b = tangent_b.dot(slide).abs();
+                                    let cos = dot_a.min(dot_b);
+                                    if cos > 1.0e-6 {
+                                        slide / cos
+                                    } else {
+                                        slide
+                                    }
+                                } else {
+                                    slide
+                                }
+                            }
+                            None => {
+                                let bisector = (tangent_a + tangent_b).normalize_or_zero();
+                                if params.use_even_offset {
+                                    let cos_half = tangent_a.dot(bisector).abs();
+                                    if cos_half > 1.0e-6 {
+                                        bisector / cos_half
+                                    } else {
+                                        bisector
+                                    }
+                                } else {
+                                    bisector
+                                }
+                            }
+                        };
+                        let relative =
+                            0.5 * (split_edges[idx_a].length + split_edges[idx_b].length);
+                        (dir, relative)
                     }
                 };
                 let scale = if params.use_relative_offset {
@@ -516,6 +590,45 @@ impl LoopMesh {
         self.pop_face_op_flag_layer(face_tag);
         InsetRegionResult { wall_faces }
     }
+
+    /// For `use_edge_rail` (INSET.md §5.5): the far endpoint of the *other*
+    /// edge of `split.face` incident to the corner `corner` — i.e. the
+    /// non-seam edge of the tagged face leading out of the corner. Two seam
+    /// edges that return the same far vertex share a common edge through it,
+    /// which is the rail the inset corner slides along.
+    ///
+    /// `corner` is the pre-separation endpoint identity; the seam loop walks
+    /// `split.v0 → split.v1`, so the corner is reached either at the seam
+    /// loop itself (`corner == v0`) or at its successor (`corner == v1`).
+    fn rail_far_vertex(&self, split: &SplitEdge, corner: VertexKey) -> Option<VertexKey> {
+        // Two face loops touch the corner: the one whose `loop_vertex` is the
+        // corner, and its predecessor. One sits on the seam edge; the other
+        // sits on the non-seam edge that is the candidate rail.
+        let corner_loop = if split.v0 == corner {
+            split.seam_loop
+        } else if split.v1 == corner {
+            self.loop_next(split.seam_loop)
+        } else {
+            return None;
+        };
+        let prev_loop = self.loop_prev(corner_loop);
+        let seam_edge = self.loop_edge(split.seam_loop);
+        // The non-seam loop's edge leads to the far vertex along the rail; its
+        // far endpoint is whichever of the loop's two corner-adjacent verts is
+        // not the corner itself.
+        let non_seam_loop = if self.loop_edge(corner_loop) == seam_edge {
+            prev_loop
+        } else {
+            corner_loop
+        };
+        // The corner vertex's live identity (after this fan's vert-separate)
+        // is `corner_loop`'s own vertex; the rail's far end is the non-seam
+        // edge's other endpoint.
+        let corner_live = self.loop_vertex(corner_loop);
+        let a = self.loop_vertex(non_seam_loop);
+        let b = self.loop_vertex(self.loop_next(non_seam_loop));
+        Some(if a == corner_live { b } else { a })
+    }
 }
 
 #[cfg(test)]
@@ -634,5 +747,174 @@ mod tests {
         // 2 top + 2 bottom + 1 left + 1 right.
         assert_eq!(result.wall_faces.len(), 6);
         mesh.validate_topology();
+    }
+
+    /// Build a two-triangle fan whose shared (interior) edge `c → far` is the
+    /// rail. The two outer edges `c–A` and `c–B` are made mixed-radial by
+    /// flanking unselected triangles, so they become the two seams meeting at
+    /// the corner `c`. `far` is placed off the symmetry axis so the rail
+    /// slide direction (c → far) differs from the tangent bisector.
+    ///
+    /// Returns `(selected_faces, c_key, far_position)`.
+    fn make_rail_fan(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey, Vec3) {
+        let c = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let far = mesh.create_vertex(Vec3::new(1.0, 3.0, 0.0));
+        let a = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(-2.0, 0.0, 0.0));
+        let ao = mesh.create_vertex(Vec3::new(1.0, -2.0, 0.0));
+        let bo = mesh.create_vertex(Vec3::new(-1.0, -2.0, 0.0));
+
+        let tri = |mesh: &mut LoopMesh, vs: [VertexKey; 3]| {
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(&vs, &[e0, e1, e2], FaceCreateFlags::NONE)
+        };
+
+        // Selected fan: both triangles share edge c–far.
+        let f_a = tri(mesh, [c, a, far]);
+        let f_b = tri(mesh, [c, far, b]);
+        // Unselected flanks making c–A and c–B mixed-radial seams.
+        let _u_a = tri(mesh, [a, c, ao]);
+        let _u_b = tri(mesh, [c, b, bo]);
+
+        (vec![f_a, f_b], c, Vec3::new(1.0, 3.0, 0.0))
+    }
+
+    /// The inset corner that came from `c`: the moved vertex nearest the
+    /// origin whose position is not one of the original (unmoved) verts.
+    fn moved_corner_near_origin(mesh: &LoopMesh) -> Vec3 {
+        let originals = [
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(-2.0, 0.0, 0.0),
+            Vec3::new(1.0, 3.0, 0.0),
+            Vec3::new(1.0, -2.0, 0.0),
+            Vec3::new(-1.0, -2.0, 0.0),
+        ];
+        let mut best: Option<Vec3> = None;
+        for v in mesh.vertices.iter() {
+            let p = mesh.vertex_position(v);
+            if originals.iter().any(|o| (*o - p).length() < 1.0e-4) {
+                continue;
+            }
+            // Skip the unmoved untagged copies still sitting at the origin.
+            if p.length() < 1.0e-4 {
+                continue;
+            }
+            best = match best {
+                Some(cur) if cur.length() <= p.length() => Some(cur),
+                _ => Some(p),
+            };
+        }
+        best.expect("expected a displaced inset corner")
+    }
+
+    #[test]
+    fn inset_region_edge_rail_slides_along_shared_edge() {
+        let mut mesh = LoopMesh::new();
+        let (faces, _c, far) = make_rail_fan(&mut mesh);
+
+        let result = mesh.inset_region(
+            &faces,
+            InsetRegionParams {
+                thickness: 0.3,
+                use_boundary: false,
+                use_even_offset: false,
+                use_edge_rail: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 2);
+        mesh.validate_topology();
+
+        let moved = moved_corner_near_origin(&mesh);
+        // The corner slid along the existing edge c → far.
+        let rail_dir = far.normalize();
+        let moved_dir = moved.normalize();
+        assert!(
+            (moved_dir - rail_dir).length() < 1.0e-4,
+            "edge-rail corner should slide toward far vertex; moved={moved:?}"
+        );
+    }
+
+    #[test]
+    fn inset_region_edge_rail_differs_from_bisector() {
+        // Same fixture, rail off: the corner follows the tangent bisector,
+        // which for this asymmetric fan is *not* parallel to c → far.
+        let mut mesh = LoopMesh::new();
+        let (faces, _c, far) = make_rail_fan(&mut mesh);
+
+        mesh.inset_region(
+            &faces,
+            InsetRegionParams {
+                thickness: 0.3,
+                use_boundary: false,
+                use_even_offset: false,
+                use_edge_rail: false,
+                ..Default::default()
+            },
+        );
+
+        let moved = moved_corner_near_origin(&mesh);
+        let rail_dir = far.normalize();
+        let moved_dir = moved.normalize();
+        assert!(
+            (moved_dir - rail_dir).length() > 1.0e-3,
+            "bisector corner should not coincide with the rail; moved={moved:?}"
+        );
+    }
+
+    #[test]
+    fn inset_region_edge_rail_falls_back_to_bisector_without_shared_edge() {
+        // Centre face of a 3×3 grid: the four seam corners are "free" — the
+        // two seam edges at each corner belong to faces that do not share a
+        // non-seam edge through the corner. `use_edge_rail` must therefore
+        // produce the same result as the default bisector path.
+        let mut rail = LoopMesh::new();
+        let rail_faces = make_grid_3x3_faces(&mut rail);
+        rail.inset_region(
+            &[rail_faces[4]],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_edge_rail: true,
+                ..Default::default()
+            },
+        );
+
+        let mut plain = LoopMesh::new();
+        let plain_faces = make_grid_3x3_faces(&mut plain);
+        plain.inset_region(
+            &[plain_faces[4]],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_edge_rail: false,
+                ..Default::default()
+            },
+        );
+
+        rail.validate_topology();
+        assert_eq!(rail.totvert(), plain.totvert());
+        assert_eq!(rail.totface(), plain.totface());
+        // The four inset-boundary verts should land at identical positions.
+        let mut rail_pos: Vec<[f32; 3]> = rail
+            .vertices
+            .iter()
+            .map(|v| rail.vertex_position(v).to_array())
+            .collect();
+        let mut plain_pos: Vec<[f32; 3]> = plain
+            .vertices
+            .iter()
+            .map(|v| plain.vertex_position(v).to_array())
+            .collect();
+        let key = |a: &[f32; 3]| {
+            (
+                (a[0] * 1.0e4) as i64,
+                (a[1] * 1.0e4) as i64,
+                (a[2] * 1.0e4) as i64,
+            )
+        };
+        rail_pos.sort_by_key(|a| key(a));
+        plain_pos.sort_by_key(|a| key(a));
+        assert_eq!(rail_pos, plain_pos);
     }
 }
