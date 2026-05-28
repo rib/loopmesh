@@ -65,7 +65,16 @@ impl LoopMesh {
     ///   merge. (§6.5 blesses the n-input form as producing the identical
     ///   canonical mesh as the per-edge join-pair loop; the per-edge form is a
     ///   performance-only variant tracked separately.)
-    /// - **Bowtie / non-manifold** — no-op; the vert survives (§3 row 5).
+    /// - **Manifold boundary fan** (one or more interior radial-2 spokes plus
+    ///   two boundary radial-1 spokes) — phase 3 fuses the interior spokes,
+    ///   demoting the corner to a 2-valence edge-pair on the boundary, then
+    ///   phase 4 re-tests the predicate fresh (§6.4) and collapses it via
+    ///   `vert_collapse_edge`. Net `−1 V, −k E, −(k−1) F` (§7). This is *not*
+    ///   a no-op — the presence of an interior bridging spoke is exactly what
+    ///   distinguishes it from the bowtie below (§8).
+    /// - **Bowtie / non-manifold** — no-op; the vert survives (§3 row 5). A
+    ///   bowtie has zero interior bridging spokes, a T-junction a radial-≥3
+    ///   spoke; neither phase 3 nor phase 4 fires, so the vert stays put.
     ///
     /// The `use_boundary_tear` pre-pass (§5) is not yet implemented; the
     /// `use_face_split` pre-pass (§4) is — see [`Self::dissolve_verts_ex`].
@@ -187,14 +196,18 @@ impl LoopMesh {
             }
         }
 
-        // (b) Collapse every input vert flagged edge-pair in phase 2 that is
-        // *still* edge-pair (phase 3's joins around neighbours, and the wire
-        // sweep above, may have changed the count).
+        // (b) Collapse every input vert that is an edge-pair *at this point*.
+        // Per §6.4 the predicate is re-tested FRESH here, not read from the
+        // phase-2 snapshot, and this matters in both directions:
+        //   - a vert that was edge-pair in phase 2 may have stopped being one
+        //     (a neighbouring join or the wire sweep above changed its count);
+        //   - the load-bearing case: a vert that was NOT an edge-pair in phase
+        //     2 may have BECOME one because phase 3 consumed one of its spokes.
+        //     The boundary manifold-fan corner is exactly this — three incident
+        //     edges before phase 3 (so no edge-pair flag), two after the
+        //     interior spoke fused, so it qualifies for collapse here.
         for &v in verts {
             if self.vertices.try_get(v).is_none() {
-                continue;
-            }
-            if !self.vert_op_flag_test(edge_pair_pending, v, BIT) {
                 continue;
             }
             if self.vert_disk_count_edges_capped(v, 3) != 2 {
@@ -1180,6 +1193,142 @@ mod tests {
         assert!(!live.contains(&a), "a dissolved");
         assert!(!live.contains(&b), "b dissolved");
         assert!(mesh.totface() >= 1, "{f0} faces before; mesh non-empty after");
+        mesh.validate_topology();
+    }
+
+    /// Build a regular hexagon body (verts `h[0..6]`, one face) with two
+    /// triangle tabs grafted onto two of its boundary edges. Returns
+    /// `(h[0..6], [tab_a_apex, tab_b_apex])`.
+    ///
+    /// Tab A is a triangle on hexagon edge `(h0, h1)` with apex `t0`; tab B is
+    /// a triangle on hexagon edge `(h2, h3)` with apex `t1`. Each shared edge
+    /// is radial-2 (interior). Corner verts `h0` and `h2` are each a two-face
+    /// boundary manifold fan: one interior radial-2 spoke (the shared
+    /// hexagon/tab edge) plus two boundary radial-1 spokes. Totals: 8 V, 10 E,
+    /// 3 F. Mirrors the §11 `hexagon_with_two_triangle_tabs` A/B fixture.
+    fn build_hexagon_with_two_triangle_tabs(
+        mesh: &mut LoopMesh,
+    ) -> ([VertexKey; 6], [VertexKey; 2]) {
+        use std::f32::consts::TAU;
+        let h: [VertexKey; 6] = std::array::from_fn(|i| {
+            let angle = TAU * (i as f32) / 6.0;
+            mesh.create_vertex(Vec3::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0))
+        });
+        let ring_edges: [EdgeKey; 6] = std::array::from_fn(|i| {
+            mesh.create_edge([h[i], h[(i + 1) % 6]], EdgeCreateFlags::NO_DUPLICATE)
+        });
+        mesh.face_create(&h, &ring_edges, FaceCreateFlags::NONE);
+
+        // Tab A on edge (h0, h1).
+        let t0 = mesh.create_vertex(Vec3::new(2.0, -1.5, 0.0));
+        let e_h0_t0 = mesh.create_edge([h[0], t0], EdgeCreateFlags::NO_DUPLICATE);
+        let e_t0_h1 = mesh.create_edge([t0, h[1]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(
+            &[h[0], t0, h[1]],
+            &[e_h0_t0, e_t0_h1, ring_edges[0]],
+            FaceCreateFlags::NONE,
+        );
+
+        // Tab B on edge (h2, h3).
+        let t1 = mesh.create_vertex(Vec3::new(-2.0, -1.5, 0.0));
+        let e_h2_t1 = mesh.create_edge([h[2], t1], EdgeCreateFlags::NO_DUPLICATE);
+        let e_t1_h3 = mesh.create_edge([t1, h[3]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(
+            &[h[2], t1, h[3]],
+            &[e_h2_t1, e_t1_h3, ring_edges[2]],
+            FaceCreateFlags::NONE,
+        );
+
+        (h, [t0, t1])
+    }
+
+    /// §3 boundary manifold-fan row / §7 boundary-fan delta / §8 corrected
+    /// bullet: a corner vert with one interior radial-2 spoke and two boundary
+    /// radial-1 spokes is a single manifold fan that opens onto the boundary.
+    /// It must be **dissolved**, not no-opped. Phase 3 fuses the tab into the
+    /// hexagon across the interior spoke; phase 4 re-tests `is_edge_pair` fresh,
+    /// finds the now-2-valence corner, and collapses it across the boundary.
+    /// Dissolving both corners reduces the mesh to a single hexagon:
+    /// 8 V, 10 E, 3 F → 6 V, 6 E, 1 F.
+    #[test]
+    fn dissolve_verts_boundary_manifold_fan_both_corners_collapse_to_hexagon() {
+        let mut mesh = LoopMesh::new();
+        let (h, _tabs) = build_hexagon_with_two_triangle_tabs(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 10, 3));
+        // Each corner has 3 incident edges (1 interior + 2 boundary).
+        assert_eq!(mesh.vert_edge_keys(h[0]).len(), 3, "h0 is a 3-edge fan corner");
+        assert_eq!(mesh.vert_edge_keys(h[2]).len(), 3, "h2 is a 3-edge fan corner");
+
+        mesh.dissolve_verts(&[h[0], h[2]]);
+
+        // §7 boundary-fan delta for k = 2 per corner (−1 V, −2 E, −1 F each).
+        assert_eq!(mesh.totvert(), 6, "−1 V per dissolved corner");
+        assert_eq!(mesh.totedge(), 6, "−2 E per corner (interior spoke + boundary merge)");
+        assert_eq!(mesh.totface(), 1, "both tabs fused, both corners collapsed → one face");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&h[0]), "corner h0 is dissolved");
+        assert!(!live.contains(&h[2]), "corner h2 is dissolved");
+
+        // The lone surviving face is a hexagon on six verts.
+        let faces = mesh.face_keys();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(mesh.face_len(faces[0]), 6, "the survivor is a single hexagon");
+        mesh.validate_topology();
+    }
+
+    /// Single-corner variant of the boundary manifold-fan row: dissolving just
+    /// one corner fuses its tab into the body and collapses the corner, leaving
+    /// the other tab intact. 8 V, 10 E, 3 F → 7 V, 8 E, 2 F.
+    #[test]
+    fn dissolve_verts_boundary_manifold_fan_single_corner() {
+        let mut mesh = LoopMesh::new();
+        let (h, _tabs) = build_hexagon_with_two_triangle_tabs(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 10, 3));
+
+        mesh.dissolve_verts(&[h[0]]);
+
+        assert_eq!(mesh.totvert(), 7, "−1 V (corner h0)");
+        assert_eq!(mesh.totedge(), 8, "−2 E (interior spoke fused + boundary merge)");
+        assert_eq!(mesh.totface(), 2, "−1 F (tab A fused into the body); tab B survives");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&h[0]), "corner h0 is dissolved");
+        assert!(live.contains(&h[2]), "the other corner is untouched");
+        mesh.validate_topology();
+    }
+
+    /// Contrast partner pinning the §8 distinction: the boundary manifold-fan
+    /// corner dissolves *because* it has an interior bridging spoke, whereas a
+    /// bowtie corner (zero interior spokes) stays a no-op. Run both shapes in
+    /// one set-input call and assert each outcome independently.
+    #[test]
+    fn dissolve_verts_boundary_fan_dissolves_while_bowtie_no_ops() {
+        let mut mesh = LoopMesh::new();
+        let (h, _tabs) = build_hexagon_with_two_triangle_tabs(&mut mesh);
+
+        // A bowtie hub far from the hexagon: two triangles sharing only `hub`.
+        let hub = mesh.create_vertex(Vec3::new(20.0, 0.0, 0.0));
+        let a0 = mesh.create_vertex(Vec3::new(19.0, 1.0, 0.0));
+        let a1 = mesh.create_vertex(Vec3::new(19.0, -1.0, 0.0));
+        let b0 = mesh.create_vertex(Vec3::new(21.0, 1.0, 0.0));
+        let b1 = mesh.create_vertex(Vec3::new(21.0, -1.0, 0.0));
+        let e_h_a0 = mesh.create_edge([hub, a0], EdgeCreateFlags::NO_DUPLICATE);
+        let e_a0_a1 = mesh.create_edge([a0, a1], EdgeCreateFlags::NO_DUPLICATE);
+        let e_a1_h = mesh.create_edge([a1, hub], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(&[hub, a0, a1], &[e_h_a0, e_a0_a1, e_a1_h], FaceCreateFlags::NONE);
+        let e_h_b0 = mesh.create_edge([hub, b0], EdgeCreateFlags::NO_DUPLICATE);
+        let e_b0_b1 = mesh.create_edge([b0, b1], EdgeCreateFlags::NO_DUPLICATE);
+        let e_b1_h = mesh.create_edge([b1, hub], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(&[hub, b0, b1], &[e_h_b0, e_b0_b1, e_b1_h], FaceCreateFlags::NONE);
+
+        mesh.dissolve_verts(&[h[0], hub]);
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&h[0]), "boundary fan corner dissolves (has interior spoke)");
+        assert!(live.contains(&hub), "bowtie hub no-ops (no interior spoke)");
         mesh.validate_topology();
     }
 }
