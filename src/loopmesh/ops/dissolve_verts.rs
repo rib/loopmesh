@@ -17,9 +17,12 @@ pub struct DissolveVertsParams {
     /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §4.
     pub use_face_split: bool,
     /// Pre-pass: for a boundary-touching input vert, tear the surrounding
-    /// faces open rather than healing the surface. Documented in
-    /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §5. Not yet
-    /// implemented.
+    /// faces open rather than healing the surface. For every input vert that
+    /// is not an edge-pair and has at least one boundary edge incident, the
+    /// pre-pass re-runs the n-gon diagonal split (§5.3) and then kills every
+    /// incident edge along with the faces those edges bounded, leaving the
+    /// surviving boundary as wire stubs. Documented in
+    /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §5.
     pub use_boundary_tear: bool,
 }
 
@@ -76,8 +79,9 @@ impl LoopMesh {
     ///   bowtie has zero interior bridging spokes, a T-junction a radial-≥3
     ///   spoke; neither phase 3 nor phase 4 fires, so the vert stays put.
     ///
-    /// The `use_boundary_tear` pre-pass (§5) is not yet implemented; the
-    /// `use_face_split` pre-pass (§4) is — see [`Self::dissolve_verts_ex`].
+    /// The optional `use_face_split` (§4) and `use_boundary_tear` (§5)
+    /// pre-passes are exposed through [`Self::dissolve_verts_ex`]; this
+    /// convenience entry point runs the default-parameter path with both off.
     pub fn dissolve_verts(&mut self, verts: &[VertexKey]) {
         self.dissolve_verts_ex(verts, &DissolveVertsParams::default());
     }
@@ -91,7 +95,18 @@ impl LoopMesh {
     ///   vert is demoted to a triangle-slice fan. The downstream join then
     ///   produces a `2k`-cornered merged face instead of the wider
     ///   `sum(n_i) − 2k` n-gon (§4.2).
-    /// - **`use_boundary_tear`** (§5) — not yet implemented.
+    /// - **`use_boundary_tear`** (§5) — before any vert is removed, every
+    ///   input vert that is *not* an edge-pair and has at least one boundary
+    ///   edge incident is torn open instead of repaired: the n-gon diagonal
+    ///   split runs (re-run internally per §5.3, regardless of
+    ///   `use_face_split`), then every edge incident at the vert is killed
+    ///   together with the faces those edges bounded, leaving the surviving
+    ///   boundary edges as wire stubs and the now-edge-less vert for the
+    ///   phase-4 isolated sweep. Net `−1 V, −(k + b) E, −k F` per torn vert
+    ///   (§7), where `k` is the incident face count and `b` the boundary-edge
+    ///   count. The two pre-passes are sequential: `use_face_split` runs first
+    ///   across the whole input, then `use_boundary_tear` over the qualifying
+    ///   subset (§5.3).
     pub fn dissolve_verts_ex(&mut self, verts: &[VertexKey], params: &DissolveVertsParams) {
         // §8 empty-input fast path.
         if verts.is_empty() {
@@ -103,6 +118,13 @@ impl LoopMesh {
         // topology.
         if params.use_face_split {
             self.dissolve_verts_face_split_pre_pass(verts);
+        }
+
+        // §5 — boundary-tear pre-pass. Runs after the §4 split (§5.3) over the
+        // non-edge-pair, boundary-touching subset of the input, tearing those
+        // dissolve sites open rather than letting the §6 phases repair them.
+        if params.use_boundary_tear {
+            self.dissolve_verts_boundary_tear_pre_pass(verts);
         }
 
         // GC bit (§6.1): every element the surgery flags as a cleanup
@@ -315,6 +337,93 @@ impl LoopMesh {
         }
 
         self.pop_vert_op_flag_layer(input_set);
+    }
+
+    /// §5 — the `use_boundary_tear` pre-pass.
+    ///
+    /// Per §5.2, selects the subset of input verts that are **not** edge-pairs
+    /// (more than two incident edges) **and** have at least one boundary edge
+    /// incident (an edge whose radial cycle has length 1). For that subset:
+    ///
+    /// - Re-run the §4 n-gon diagonal split (§5.3) — over *just* this subset,
+    ///   so each surrounding n-gon is pre-triangulated at the corner, giving
+    ///   the tear a clean termination. This runs regardless of whether the
+    ///   outer call also set `use_face_split`.
+    /// - Then drain each target's disk: kill every incident edge, which (via
+    ///   `edge_kill`) also kills the faces those edges bounded. The perimeter
+    ///   vertices of the destroyed faces survive; the spoke edges and faces
+    ///   are gone; the surviving perimeter edges become wire (radial 0). The
+    ///   now-edge-less target is left for the phase-4 isolated-vert sweep.
+    ///
+    /// Edge-pair boundary verts and fully-interior verts are intentionally not
+    /// torn (§5.2): the former go through the §6.4 edge collapse, the latter
+    /// through the §6.3 fan merge, both of which already produce a clean
+    /// (non-torn) result.
+    fn dissolve_verts_boundary_tear_pre_pass(&mut self, verts: &[VertexKey]) {
+        let mut targets: SmallVec<[VertexKey; 8]> = SmallVec::new();
+        for &v in verts {
+            if self.vertices.try_get(v).is_none() {
+                continue;
+            }
+            // §5.2 — edge-pair verts are not torn.
+            if self.vert_disk_count_edges_capped(v, 3) <= 2 {
+                continue;
+            }
+            // §5.2 — at least one boundary edge (radial length 1) incident.
+            let mut disk = self.disk_edges(v);
+            let mut has_boundary = false;
+            while let Some(edge) = disk.next(self) {
+                if self.edge_radial_count_capped(edge, 2) == 1 {
+                    has_boundary = true;
+                    break;
+                }
+            }
+            if !has_boundary {
+                continue;
+            }
+            targets.push(v);
+        }
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // §5.3 — re-run the diagonal split over the tear subset before
+        // destroying anything, so the cut-off triangles terminate the tear.
+        self.dissolve_verts_face_split_pre_pass(&targets);
+
+        // §5.1 — kill the whole fan around each target, then drain the disk.
+        //
+        // The order is load-bearing. We kill every face incident at `v`
+        // *first*, which demotes every spoke at `v` to a wire stub (radial
+        // empty). Only then do we drain the disk, killing those wire stubs.
+        //
+        // Doing it the other way around — draining the disk directly so that
+        // each `edge_kill` cascades into the faces the spoke still bounded —
+        // is orientation-dependent: when the disk hands an interior (radial-2)
+        // spoke to `edge_kill` while both its faces are still live, the
+        // radial-cycle walk frees the first face's loops and then steps onto a
+        // loop that face-kill spliced out of the cycle, dereferencing a
+        // already-freed loop. Killing the faces up front means every spoke is
+        // wire by the time it reaches `edge_kill`, whose radial walk is a no-op
+        // on an empty cycle — so the result is independent of disk order.
+        for &v in &targets {
+            if self.vertices.try_get(v).is_none() {
+                continue;
+            }
+            let fan_faces: SmallVec<[FaceKey; 8]> =
+                self.vert_face_keys(v).into_iter().collect();
+            for face in fan_faces {
+                if self.faces.try_get(face).is_some() {
+                    self.face_kill(face);
+                }
+            }
+            // Every incident edge is now a wire stub; drain them. Re-read the
+            // disk head each step since `edge_kill` unhooks it from the disk.
+            while let Some(edge) = self.vertices.get(v).disk_loop_start {
+                self.edge_kill(edge);
+            }
+        }
     }
 
     /// Classify `v` per `DISSOLVE_VERTS.md` §3. Reads `v`'s disk + per-edge
@@ -1329,6 +1438,415 @@ mod tests {
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&h[0]), "boundary fan corner dissolves (has interior spoke)");
         assert!(live.contains(&hub), "bowtie hub no-ops (no interior spoke)");
+        mesh.validate_topology();
+    }
+
+    /// Build a 2x2 grid of quads on a 3x3 vertex lattice, row-major. Returns
+    /// `(verts[9], faces[4])` with `verts[r * 3 + c]` for `r,c in 0..3` and
+    /// faces:
+    /// `f0 = (0,1,4,3)` bottom-left, `f1 = (1,2,5,4)` bottom-right,
+    /// `f2 = (3,4,7,6)` top-left, `f3 = (4,5,8,7)` top-right.
+    /// Vert 1 is the bottom-middle boundary vert (3 incident edges: the two
+    /// boundary edges {0,1} and {1,2} plus the interior spoke {1,4}); vert 4
+    /// is the 4-valence interior centre. Mirrors the §11 `grid_3x3` A/B
+    /// fixture (a 3x3 *vertex* grid = 2x2 quads). Totals: 9 V, 12 E, 4 F.
+    fn build_quad_grid_2x2(mesh: &mut LoopMesh) -> (Vec<VertexKey>, Vec<FaceKey>) {
+        let mut verts: Vec<VertexKey> = Vec::with_capacity(9);
+        for r in 0..3 {
+            for c in 0..3 {
+                verts.push(mesh.create_vertex(Vec3::new(c as f32, r as f32, 0.0)));
+            }
+        }
+        let mut faces: Vec<FaceKey> = Vec::new();
+        for r in 0..2 {
+            for c in 0..2 {
+                let v_bl = verts[r * 3 + c];
+                let v_br = verts[r * 3 + c + 1];
+                let v_tr = verts[(r + 1) * 3 + c + 1];
+                let v_tl = verts[(r + 1) * 3 + c];
+                let e_b = mesh.create_edge([v_bl, v_br], EdgeCreateFlags::NO_DUPLICATE);
+                let e_r = mesh.create_edge([v_br, v_tr], EdgeCreateFlags::NO_DUPLICATE);
+                let e_t = mesh.create_edge([v_tr, v_tl], EdgeCreateFlags::NO_DUPLICATE);
+                let e_l = mesh.create_edge([v_tl, v_bl], EdgeCreateFlags::NO_DUPLICATE);
+                faces.push(mesh.face_create(
+                    &[v_bl, v_br, v_tr, v_tl],
+                    &[e_b, e_r, e_t, e_l],
+                    FaceCreateFlags::NONE,
+                ));
+            }
+        }
+        (verts, faces)
+    }
+
+    /// §5 headline tear case: `use_boundary_tear = true` on the bottom-middle
+    /// boundary vert (vert 1) of a 2x2 quad grid. Vert 1 is not an edge-pair
+    /// (3 incident edges) and has boundary edges ({0,1}, {1,2}), so §5.2 marks
+    /// it. The pre-pass (§5.1/§5.3) first slices each of the two bottom quads
+    /// with the corner diagonal isolating vert 1 in a triangle, then kills
+    /// every edge incident at vert 1 — which kills the cut-off triangles that
+    /// touched vert 1. The outer halves of the two bottom quads survive as
+    /// fresh triangles no longer touching vert 1; the two top quads are
+    /// untouched. Vert 1 is then garbage-collected (edge-less). Net on this
+    /// fixture: 9 V, 12 E, 4 F → 8 V, 11 E, 4 F (the +2 split diagonals /
+    /// +2 split faces are cancelled by the −3 spoke edges / −2 torn faces and
+    /// the −1 vert; face count is unchanged but the two bottom quads become
+    /// triangles).
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_bottom_edge_vert() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        let v1 = verts[1];
+        assert_eq!(
+            mesh.vert_edge_keys(v1).len(),
+            3,
+            "bottom-middle vert is a 3-edge boundary fan corner"
+        );
+
+        mesh.dissolve_verts_ex(
+            &[v1],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), 8, "−1 V (vert 1 torn out and GC'd)");
+        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.totface(), 4, "two bottom quads → triangles; counts unchanged");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v1), "the torn vert is gone");
+        for idx in [0usize, 2, 3, 4, 5, 6, 7, 8] {
+            assert!(live.contains(&verts[idx]), "perimeter vert {idx} survives");
+        }
+
+        // No surviving face touches vert 1 (it is fully torn out).
+        let mut face_iter = MeshFaces::default();
+        let mut tri_count = 0usize;
+        let mut quad_count = 0usize;
+        while let Some(f) = face_iter.next(&mesh) {
+            let fv: std::collections::HashSet<VertexKey> =
+                mesh.face_vert_keys(f).into_iter().collect();
+            assert!(!fv.contains(&v1), "no surviving face touches the torn vert");
+            match mesh.face_len(f) {
+                3 => tri_count += 1,
+                4 => quad_count += 1,
+                n => panic!("unexpected face with {n} corners"),
+            }
+        }
+        assert_eq!(tri_count, 2, "the two bottom quads each tear to one triangle");
+        assert_eq!(quad_count, 2, "the two top quads survive unchanged");
+
+        // The two surviving triangles are the outer halves of the bottom quads
+        // (the halves not touching vert 1).
+        let tri_vert_sets: Vec<std::collections::HashSet<VertexKey>> = {
+            let mut out = Vec::new();
+            let mut it = MeshFaces::default();
+            while let Some(f) = it.next(&mesh) {
+                if mesh.face_len(f) == 3 {
+                    out.push(mesh.face_vert_keys(f).into_iter().collect());
+                }
+            }
+            out
+        };
+        let expected_left: std::collections::HashSet<VertexKey> =
+            [verts[0], verts[3], verts[4]].into_iter().collect();
+        let expected_right: std::collections::HashSet<VertexKey> =
+            [verts[2], verts[5], verts[4]].into_iter().collect();
+        assert!(
+            tri_vert_sets.contains(&expected_left),
+            "outer half of the bottom-left quad survives as a triangle"
+        );
+        assert!(
+            tri_vert_sets.contains(&expected_right),
+            "outer half of the bottom-right quad survives as a triangle"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// Orientation-independence regression: tearing the *left*-middle
+    /// boundary vert (vert 3) must reach the same 8/11/4 canonical state as
+    /// tearing the bottom-middle vert (vert 1). Vert 3's fan is wound the
+    /// opposite way around the torn corner, which used to drive `edge_kill`'s
+    /// radial walk onto a loop a sibling `face_kill` had already freed. The
+    /// pre-pass now kills the bounded faces first, so the spokes are wire by
+    /// the time they reach `edge_kill` and the result is disk-order
+    /// independent. Surviving triangles are the outer halves of the two left
+    /// quads (the halves not touching vert 3).
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_left_edge_vert() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        let v3 = verts[3];
+        assert_eq!(
+            mesh.vert_edge_keys(v3).len(),
+            3,
+            "left-middle vert is a 3-edge boundary fan corner"
+        );
+
+        mesh.dissolve_verts_ex(
+            &[v3],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), 8, "−1 V (vert 3 torn out and GC'd)");
+        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.totface(), 4, "two left quads → triangles; counts unchanged");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v3), "the torn vert is gone");
+        for idx in [0usize, 1, 2, 4, 5, 6, 7, 8] {
+            assert!(live.contains(&verts[idx]), "perimeter vert {idx} survives");
+        }
+
+        let mut face_iter = MeshFaces::default();
+        let mut tri_count = 0usize;
+        let mut quad_count = 0usize;
+        while let Some(f) = face_iter.next(&mesh) {
+            let fv: std::collections::HashSet<VertexKey> =
+                mesh.face_vert_keys(f).into_iter().collect();
+            assert!(!fv.contains(&v3), "no surviving face touches the torn vert");
+            match mesh.face_len(f) {
+                3 => tri_count += 1,
+                4 => quad_count += 1,
+                n => panic!("unexpected face with {n} corners"),
+            }
+        }
+        assert_eq!(tri_count, 2, "the two left quads each tear to one triangle");
+        assert_eq!(quad_count, 2, "the two right quads survive unchanged");
+
+        let tri_vert_sets: Vec<std::collections::HashSet<VertexKey>> = {
+            let mut out = Vec::new();
+            let mut it = MeshFaces::default();
+            while let Some(f) = it.next(&mesh) {
+                if mesh.face_len(f) == 3 {
+                    out.push(mesh.face_vert_keys(f).into_iter().collect());
+                }
+            }
+            out
+        };
+        // Outer halves of the bottom-left quad (0,1,4,3) and top-left quad
+        // (3,4,7,6), i.e. the triangles not touching vert 3.
+        let expected_bottom: std::collections::HashSet<VertexKey> =
+            [verts[0], verts[1], verts[4]].into_iter().collect();
+        let expected_top: std::collections::HashSet<VertexKey> =
+            [verts[4], verts[7], verts[6]].into_iter().collect();
+        assert!(
+            tri_vert_sets.contains(&expected_bottom),
+            "outer half of the bottom-left quad survives as a triangle"
+        );
+        assert!(
+            tri_vert_sets.contains(&expected_top),
+            "outer half of the top-left quad survives as a triangle"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// Orientation-independence regression: tearing the *top*-middle boundary
+    /// vert (vert 7) — the fourth winding orientation — must also reach the
+    /// 8/11/4 canonical state. Pairs with the bottom (vert 1) and left
+    /// (vert 3) cases to pin all four boundary midpoints of the 2x2 grid.
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_top_edge_vert() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        let v7 = verts[7];
+        assert_eq!(
+            mesh.vert_edge_keys(v7).len(),
+            3,
+            "top-middle vert is a 3-edge boundary fan corner"
+        );
+
+        mesh.dissolve_verts_ex(
+            &[v7],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), 8, "−1 V (vert 7 torn out and GC'd)");
+        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.totface(), 4, "two top quads → triangles; counts unchanged");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v7), "the torn vert is gone");
+        for idx in [0usize, 1, 2, 3, 4, 5, 6, 8] {
+            assert!(live.contains(&verts[idx]), "perimeter vert {idx} survives");
+        }
+
+        let mut face_iter = MeshFaces::default();
+        let mut tri_count = 0usize;
+        let mut quad_count = 0usize;
+        while let Some(f) = face_iter.next(&mesh) {
+            let fv: std::collections::HashSet<VertexKey> =
+                mesh.face_vert_keys(f).into_iter().collect();
+            assert!(!fv.contains(&v7), "no surviving face touches the torn vert");
+            match mesh.face_len(f) {
+                3 => tri_count += 1,
+                4 => quad_count += 1,
+                n => panic!("unexpected face with {n} corners"),
+            }
+        }
+        assert_eq!(tri_count, 2, "the two top quads each tear to one triangle");
+        assert_eq!(quad_count, 2, "the two bottom quads survive unchanged");
+
+        mesh.validate_topology();
+    }
+
+    /// Multi-target disjoint tear: tearing the bottom-middle (vert 1) and
+    /// top-middle (vert 7) boundary verts in a single set-input call. The two
+    /// tear sites share no face, so they compose: each contributes −1 V,
+    /// −1 net E (−3 spokes + 2 diagonals), and 0 net F (two quads → two
+    /// triangles). 9 V, 12 E, 4 F → 7 V, 10 E, 4 F (all four quads become
+    /// triangles). Pins that the orientation-independent tear composes across
+    /// multiple boundary inputs in one call.
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_two_disjoint_boundary_verts() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        let v1 = verts[1];
+        let v7 = verts[7];
+
+        mesh.dissolve_verts_ex(
+            &[v1, v7],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), 7, "−1 V per torn vert");
+        assert_eq!(mesh.totedge(), 10, "−1 net E per torn vert");
+        assert_eq!(mesh.totface(), 4, "all four quads tear to triangles; count unchanged");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v1), "bottom-middle torn out");
+        assert!(!live.contains(&v7), "top-middle torn out");
+
+        let mut face_iter = MeshFaces::default();
+        let mut tri_count = 0usize;
+        while let Some(f) = face_iter.next(&mesh) {
+            let fv: std::collections::HashSet<VertexKey> =
+                mesh.face_vert_keys(f).into_iter().collect();
+            assert!(!fv.contains(&v1), "no surviving face touches vert 1");
+            assert!(!fv.contains(&v7), "no surviving face touches vert 7");
+            assert_eq!(mesh.face_len(f), 3, "every quad tore to a triangle");
+            tri_count += 1;
+        }
+        assert_eq!(tri_count, 4, "all four faces are now triangles");
+
+        mesh.validate_topology();
+    }
+
+    /// §8 / §5.2 edge-case: `use_boundary_tear = true` on a vert with no
+    /// boundary edges marks nothing (the "at least one boundary edge"
+    /// condition fails), so the default surgery proceeds exactly as if the
+    /// flag were off. The 4-valence interior centre of the 2x2 quad grid is
+    /// fully interior; with the tear flag on it must still merge its fan into
+    /// one face, matching the default path. Delta: −1 V, −4 E, −3 F (4 → 1
+    /// quad merge into one octagon-free… the four quads merge into a single
+    /// 8-corner face exactly as in the default case).
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_interior_vert_is_noop_tear() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        let centre = verts[4];
+        assert_eq!(
+            mesh.vert_edge_keys(centre).len(),
+            4,
+            "centre is a 4-valence fully-interior vert (no boundary edge)"
+        );
+
+        mesh.dissolve_verts_ex(
+            &[centre],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        // Identical to the default-parameter manifold-interior-fan outcome:
+        // the tear flag never fires because the vert has no boundary edge.
+        assert_eq!(mesh.totvert(), v0 - 1, "−1 V (the centre)");
+        assert_eq!(mesh.totedge(), e0 - 4, "−4 spokes (no tear, no diagonals)");
+        assert_eq!(mesh.totface(), f0 - 3, "four quads merge into one face");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&centre), "centre vert dissolved as if tear were off");
+
+        // The single merged face has 8 corners (the perimeter ring); no tear
+        // hole, no wire stubs.
+        let faces = mesh.face_keys();
+        assert_eq!(faces.len(), 1, "the fan merged into a single face");
+        assert_eq!(mesh.face_len(faces[0]), 8, "merged face is the 8-corner ring");
+        mesh.validate_topology();
+    }
+
+    /// §5.2 edge-case: `use_boundary_tear = true` on an *edge-pair* boundary
+    /// vert is not torn (the "not an edge-pair" condition fails). The default
+    /// edge-collapse surgery handles it and leaves a clean (non-torn)
+    /// boundary. Here the bottom-left corner (vert 0) of the 2x2 grid has
+    /// exactly two incident edges, both boundary, bounding one quad. With the
+    /// tear flag on it must still collapse cleanly: the quad loses a corner
+    /// (4 → 3), no hole. Delta: −1 V, −1 E, 0 F.
+    #[test]
+    fn dissolve_verts_use_boundary_tear_true_edge_pair_corner_collapses_clean() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        let corner = verts[0];
+        assert_eq!(
+            mesh.vert_edge_keys(corner).len(),
+            2,
+            "bottom-left corner is an edge-pair boundary vert"
+        );
+
+        mesh.dissolve_verts_ex(
+            &[corner],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: true,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), v0 - 1, "−1 V (corner collapsed, not torn)");
+        assert_eq!(mesh.totedge(), e0 - 1, "−1 E (two boundary edges merge into one)");
+        assert_eq!(mesh.totface(), f0, "all four faces survive; no tear hole");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&corner), "the corner is collapsed away");
+        // The face that touched the corner is now a triangle, not torn open.
+        let mut tri_count = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            if mesh.face_len(f) == 3 {
+                tri_count += 1;
+            }
+        }
+        assert_eq!(tri_count, 1, "the corner's quad lost one corner → one triangle");
         mesh.validate_topology();
     }
 }
