@@ -484,8 +484,21 @@ impl LoopMesh {
     /// vert is a single topologically-connected fan) and delegates to the
     /// n-input `faces_join` primitive. `faces_join` kills the interior spoke
     /// edges and the now-orphaned hub vertex `v` as part of the merge.
+    ///
+    /// The merged face's per-face customdata winner is pinned by §6.3 / §6.5 /
+    /// §11: it is the face on `(v.e).l` — the representative radial loop of
+    /// `v`'s representative disk edge. `faces_join` seeds its survivor from
+    /// `faces[0]` (§6.5), so the fan array is anchored to put that face first
+    /// rather than whatever a raw disk-then-radial walk yields. See
+    /// [`Self::dissolve_verts_fan_anchor_face`] for how `(v.e).l` is resolved
+    /// against loopmesh's build conventions.
     fn dissolve_verts_merge_fan(&mut self, v: VertexKey) {
+        let anchor = self.dissolve_verts_fan_anchor_face(v);
+
         let mut fan_faces: SmallVec<[FaceKey; 8]> = SmallVec::new();
+        if let Some(anchor) = anchor {
+            fan_faces.push(anchor);
+        }
         let mut disk = self.disk_edges(v);
         while let Some(edge) = disk.next(self) {
             let mut radial = self.radial_loops(edge);
@@ -500,6 +513,36 @@ impl LoopMesh {
             return;
         }
         let _ = self.faces_join(&fan_faces);
+    }
+
+    /// Resolve the merged-face customdata winner for `v`'s fan: the face on
+    /// `(v.e).l`, per `DISSOLVE_VERTS.md` §3.1 / §6.3 / §11.
+    ///
+    /// `v.e` is `v`'s representative disk edge — the head of its disk cycle,
+    /// which (because [`Self::vertex_disk_append_edge`] splices new edges in
+    /// behind the head without displacing it) is `v`'s first-created incident
+    /// edge. `(v.e).l` is that edge's representative radial loop.
+    ///
+    /// One build-convention twist matters here. §3.1 defines `e.l` as the loop
+    /// **appended last** to the edge's radial cycle (the second-built of the
+    /// two flanking faces for an interior edge). loopmesh's radial append
+    /// ([`Self::face_loop_connect_edge`]) instead keeps the *first*-appended
+    /// loop as the stored cycle head (`edge.radial_link`) and inserts later
+    /// loops as its `next`. So the loop §3.1 calls `e.l` is, in loopmesh, the
+    /// radial head's `next` (the last-appended loop), **not** the head itself.
+    /// Anchoring at `edge.radial_link` directly would pick the first-built
+    /// face and diverge; anchoring at its `next` picks the same face §3.1 does.
+    ///
+    /// For a boundary disk-head edge (a single radial loop) there is no second
+    /// loop, so the sole loop's face is the anchor.
+    fn dissolve_verts_fan_anchor_face(&self, v: VertexKey) -> Option<FaceKey> {
+        let disk_head = self.vertices.get(v).disk_loop_start?;
+        let radial_head = self.edges.get(disk_head).radial_link?;
+        // §3.1 `e.l` = last-appended radial loop = the head's `next`. For a
+        // single-loop (boundary) radial the cycle self-points, so `next` is the
+        // head itself, which is the correct sole-loop fallback.
+        let representative_loop = self.loops.get(radial_head).edge_radial_links.next;
+        Some(self.loops.get(representative_loop).face)
     }
 
     /// True iff `edge`'s radial fan carries no loops (a wire edge). Cheap
@@ -938,6 +981,115 @@ mod tests {
         assert!(!live.contains(&wire_far), "wire-only vert gone");
         assert!(live.contains(&hub), "bowtie hub survives (no-op)");
         assert!(live.contains(&verts[0]), "wire edge's far endpoint (grid corner) survives");
+        mesh.validate_topology();
+    }
+
+    /// §6.3 / §6.5 / §11 — customdata identity on the merged face. When a fan
+    /// of faces around a dissolved interior vert merges into one, that merged
+    /// face inherits the per-face customdata of the face on `(v.e).l`: the
+    /// representative radial loop of `v`'s representative disk edge `v.e`. This
+    /// is *not* "whatever the disk-then-radial walk yields first" — under
+    /// loopmesh's build conventions those differ (see
+    /// [`super::LoopMesh::dissolve_verts_fan_anchor_face`]), and the §3.1
+    /// worked example for `grid_3x3` derives the winner as the *second-built*
+    /// of the two faces flanking `v.e`, i.e. fixture **face 1**, not face 0.
+    ///
+    /// The test attaches a *distinct* per-face colour to each of the four quads
+    /// around the 4-valence centre of a 3x3 grid (keyed by fixture build
+    /// order), independently resolves which face `(v.e).l` names, dissolves the
+    /// centre, and asserts the merged octagon carries exactly that face's
+    /// colour — and none of the three loser faces' colours.
+    #[test]
+    fn dissolve_verts_merged_face_keeps_first_in_disk_walk_customdata() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_grid_3x3(&mut mesh);
+
+        let mat = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("material_color"),
+                Format::new(ComponentType::F32, 3),
+            ))
+            .unwrap();
+
+        let centre = verts[5];
+
+        // The four fixture faces fanning around the centre, in build order.
+        let fan = [faces[0], faces[1], faces[3], faces[4]];
+        let live_fan: std::collections::HashSet<FaceKey> =
+            mesh.vert_face_keys(centre).into_iter().collect();
+        assert_eq!(live_fan.len(), 4, "centre is a 4-fan of quads");
+        for f in fan {
+            assert!(live_fan.contains(&f), "fixture fan face {f:?} is incident at the centre");
+        }
+
+        // A distinct colour per fixture face, keyed by build order.
+        let colours: [[f32; 3]; 4] = [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.25, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 0.75, 0.0],
+        ];
+        for (i, &face) in fan.iter().enumerate() {
+            mesh.face_attribs_mut()
+                .set_vec3(mat, face.as_usize(), colours[i]);
+        }
+
+        // Independently resolve the §3.1 winner: the face on `(v.e).l` — the
+        // last-appended radial loop of the centre's disk-head edge. This is the
+        // face `faces_join`'s survivor inherits its per-face customdata from.
+        let disk_head = mesh.vertices.get(centre).disk_loop_start.unwrap();
+        let radial_head = mesh.edges.get(disk_head).radial_link.unwrap();
+        let representative_loop = mesh.loops.get(radial_head).edge_radial_links.next;
+        let winner_face = mesh.loops.get(representative_loop).face;
+
+        // §6.3 worked example: on `grid_3x3` the winner is fixture face 1
+        // (second-built flanker of `v.e`), never face 0.
+        assert_eq!(
+            winner_face, faces[1],
+            "§3.1/§6.3: the merged-face CD winner is fixture face 1, the second-built \
+             face flanking the centre's disk-head edge"
+        );
+        assert_ne!(winner_face, faces[0], "the first-built flanker (face 0) must NOT win");
+
+        let winner_idx = fan.iter().position(|&f| f == winner_face).unwrap();
+        let winner_colour = colours[winner_idx];
+
+        mesh.dissolve_verts(&[centre]);
+
+        // Locate the merged octagon (the only 8-corner face).
+        let mut octagon: Option<FaceKey> = None;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            if mesh.face_vert_keys(f).len() == 8 {
+                octagon = Some(f);
+            }
+        }
+        let octagon = octagon.expect("an 8-corner merged face exists");
+
+        let merged_colour = mesh
+            .face_attribs()
+            .get_vec3(mat, octagon.as_usize())
+            .expect("merged face carries the material colour");
+
+        for i in 0..3 {
+            assert!(
+                (merged_colour[i] - winner_colour[i]).abs() < 1e-6,
+                "merged face must keep the face on (v.e).l (fixture face 1): \
+                 got {merged_colour:?}, expected {winner_colour:?}"
+            );
+        }
+        // Determinism guard: it is specifically the `(v.e).l` face that wins,
+        // not an arbitrary survivor. The merged colour must not match any of
+        // the three loser faces' distinct colours.
+        for (i, loser) in colours.iter().enumerate() {
+            if i == winner_idx {
+                continue;
+            }
+            assert!(
+                (0..3).any(|c| (merged_colour[c] - loser[c]).abs() >= 1e-6),
+                "merged face must NOT carry a loser face's customdata {loser:?}"
+            );
+        }
         mesh.validate_topology();
     }
 
