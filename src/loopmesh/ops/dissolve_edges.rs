@@ -79,6 +79,12 @@ enum UseVertsMode {
 /// Per-edge classification of an input edge (§3). Drives whether the
 /// per-edge merge runs at all: only `ManifoldPair` does work; everything
 /// else is a silent no-op for that edge.
+///
+/// For `ManifoldPair`, `face_a` is the **survivor** — the face on the
+/// dissolved edge's primary loop `e.l` (§3.1 / §11). The merged face keeps
+/// `face_a`'s identity and per-face customdata, so `face_a` must be passed
+/// first to [`LoopMesh::faces_join`] (whose two-face form keeps its first
+/// argument's face). `face_b` is the other flanking face.
 enum EdgeClass {
     ManifoldPair { face_a: FaceKey, face_b: FaceKey },
     NoOp,
@@ -717,7 +723,7 @@ impl LoopMesh {
     /// (wire, boundary, self-radial, non-manifold) is `NoOp`.
     fn dissolve_edges_classify(&self, edge: EdgeKey) -> EdgeClass {
         let mut radial = self.radial_loops(edge);
-        let Some(first_loop) = radial.next(self) else {
+        let Some(head_loop) = radial.next(self) else {
             // Radial cycle empty: wire edge (§3 row 1).
             return EdgeClass::NoOp;
         };
@@ -729,14 +735,24 @@ impl LoopMesh {
             // Radial cycle length ≥ 3: non-manifold edge (§3 row 5).
             return EdgeClass::NoOp;
         }
-        let face_a = self.loops.get(first_loop).face;
-        let face_b = self.loops.get(second_loop).face;
-        if face_a == face_b {
+        // §3.1 / §11 survivor rule: the merged face keeps the per-face
+        // customdata of the face on the dissolved edge's primary loop `e.l` —
+        // the **second-built** of the two flanking faces. In this crate's
+        // radial cycle the *first-built* face's loop sits at the radial head
+        // (`radial_loops` emits it first); the second-built face's loop is the
+        // head's radial-next, i.e. `second_loop` here. So the survivor `face_a`
+        // is `second_loop`'s face, and `face_b` is the head loop's face.
+        let head_face = self.loops.get(head_loop).face;
+        let second_face = self.loops.get(second_loop).face;
+        if head_face == second_face {
             // Radial cycle length 2 but both loops on the same face: a
             // self-radial fin (§3 row 4).
             return EdgeClass::NoOp;
         }
-        EdgeClass::ManifoldPair { face_a, face_b }
+        EdgeClass::ManifoldPair {
+            face_a: second_face,
+            face_b: head_face,
+        }
     }
 }
 
@@ -918,6 +934,57 @@ mod tests {
         let merged = mesh.face_keys();
         assert_eq!(merged.len(), 1);
         assert_eq!(mesh.face_len(merged[0]), 4, "3 + 3 - 2 = 4 corners");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn dissolve_edges_merged_face_keeps_second_built_face_cd() {
+        // §3.1 / §11 — the merged face retains the per-face customdata of the
+        // face on the dissolved edge's primary loop `e.l`, which under the
+        // standard build order is the *second-built* of the two flanking
+        // faces. `build_two_tris_shared_diagonal` creates triangle A first and
+        // triangle B second, both sharing the diagonal `e_12`, so the survivor
+        // must carry triangle B's color — not triangle A's.
+        let mut mesh = LoopMesh::new();
+        let (_verts, diagonal, faces) = build_two_tris_shared_diagonal(&mut mesh);
+        let first_built = faces[0];
+        let second_built = faces[1];
+
+        let color = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("face_color"),
+                Format::new(ComponentType::F32, 3),
+            ))
+            .unwrap();
+        let first_color = [1.0_f32, 0.0, 0.0];
+        let second_color = [0.0_f32, 1.0, 0.0];
+        mesh.face_attribs_mut()
+            .set_vec3(color, first_built.as_usize(), first_color);
+        mesh.face_attribs_mut()
+            .set_vec3(color, second_built.as_usize(), second_color);
+
+        mesh.dissolve_edges(&[diagonal], &Default::default());
+
+        let merged = mesh.face_keys();
+        assert_eq!(merged.len(), 1, "two tris collapse to one quad");
+        let got = mesh
+            .face_attribs()
+            .get_vec3(color, merged[0].as_usize())
+            .expect("merged face carries the customdata layer");
+
+        // Direction-explicit: the survivor is the second-built face's CD.
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - second_color[axis]).abs() < 1e-6,
+                "merged face must keep the second-built (`e.l`) face's CD: \
+                 got {got:?}, expected {second_color:?} (regression to \
+                 first-built {first_color:?} would fail here)"
+            );
+        }
+        assert!(
+            (got[0] - first_color[0]).abs() > 1e-6 || (got[1] - first_color[1]).abs() > 1e-6,
+            "merged face must NOT keep the first-built face's CD {first_color:?}"
+        );
         mesh.validate_topology();
     }
 
