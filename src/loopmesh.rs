@@ -68,8 +68,8 @@ mod ops;
 
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    DissolveFacesOptions, DissolveFacesResult, InsetIndividualParams, InsetIndividualResult,
-    InsetRegionParams, InsetRegionResult, NgonMethod, QuadMethod,
+    DissolveFacesOptions, DissolveFacesResult, DissolveVertsParams, InsetIndividualParams,
+    InsetIndividualResult, InsetRegionParams, InsetRegionResult, NgonMethod, QuadMethod,
 };
 
 // Shared fixtures for the per-operator unit tests that live in the `euler`,

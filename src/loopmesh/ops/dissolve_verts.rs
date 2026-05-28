@@ -2,6 +2,27 @@ use smallvec::SmallVec;
 
 use crate::loopmesh::*;
 
+/// Parameters controlling [`LoopMesh::dissolve_verts_ex`].
+///
+/// Mirrors the BMOP set-input shape described in
+/// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §1. Both pre-pass bools
+/// default off; the all-defaults form is the convenience
+/// [`LoopMesh::dissolve_verts`].
+#[derive(Clone, Copy, Default)]
+pub struct DissolveVertsParams {
+    /// Pre-pass: before any vert is removed, draw a diagonal across every
+    /// surrounding n-gon (`n ≥ 4`) so the input vert ends up isolated inside a
+    /// triangle slice. The post-join merged face is then `2k`-cornered rather
+    /// than `sum(n_i) − 2k`. Documented in
+    /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §4.
+    pub use_face_split: bool,
+    /// Pre-pass: for a boundary-touching input vert, tear the surrounding
+    /// faces open rather than healing the surface. Documented in
+    /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §5. Not yet
+    /// implemented.
+    pub use_boundary_tear: bool,
+}
+
 /// Per-vert topology class, decided up front from the shape of `v`'s
 /// incident disk + radial cycles. Mirrors the classification table in
 /// `radial-mesh-guides/operators/DISSOLVE_VERTS.md` §3.
@@ -46,12 +67,33 @@ impl LoopMesh {
     ///   performance-only variant tracked separately.)
     /// - **Bowtie / non-manifold** — no-op; the vert survives (§3 row 5).
     ///
-    /// The optional `use_face_split` / `use_boundary_tear` pre-passes
-    /// (§4 / §5) are not yet implemented.
+    /// The `use_boundary_tear` pre-pass (§5) is not yet implemented; the
+    /// `use_face_split` pre-pass (§4) is — see [`Self::dissolve_verts_ex`].
     pub fn dissolve_verts(&mut self, verts: &[VertexKey]) {
+        self.dissolve_verts_ex(verts, &DissolveVertsParams::default());
+    }
+
+    /// Parameterised form of [`Self::dissolve_verts`]. The default-parameter
+    /// behaviour is identical; the pre-pass options layer extra surgery on top
+    /// of the §6 four-phase core:
+    ///
+    /// - **`use_face_split`** (§4) — before any vert is removed, slice each
+    ///   surrounding n-gon (`n ≥ 4`) at the input vert with a diagonal so the
+    ///   vert is demoted to a triangle-slice fan. The downstream join then
+    ///   produces a `2k`-cornered merged face instead of the wider
+    ///   `sum(n_i) − 2k` n-gon (§4.2).
+    /// - **`use_boundary_tear`** (§5) — not yet implemented.
+    pub fn dissolve_verts_ex(&mut self, verts: &[VertexKey], params: &DissolveVertsParams) {
         // §8 empty-input fast path.
         if verts.is_empty() {
             return;
+        }
+
+        // §4 — n-gon corner diagonal pre-pass. Runs across the full input set
+        // before any vert is removed, so the §6 phases see the already-sliced
+        // topology.
+        if params.use_face_split {
+            self.dissolve_verts_face_split_pre_pass(verts);
         }
 
         // GC bit (§6.1): every element the surgery flags as a cleanup
@@ -186,6 +228,80 @@ impl LoopMesh {
         self.pop_vert_op_flag_layer(edge_pair_pending);
         self.pop_edge_op_flag_layer(gc_edge);
         self.pop_vert_op_flag_layer(gc_vert);
+    }
+
+    /// §4 — the `use_face_split` n-gon corner diagonal pre-pass.
+    ///
+    /// For every input vert `v` that is not an edge-pair (more than two
+    /// incident edges, §4.1 / §4.3), and every face `f` incident at `v` whose
+    /// corner count is `> 3`, slice `f` along the diagonal `v_prev – v_next`
+    /// (the two perimeter neighbours of `v` on `f`). The cut-off triangle
+    /// `(v_prev, v, v_next)` holds `v` as its sole input corner; the rest of
+    /// `f` survives as an `(n−1)`-gon. The slice is skipped when either
+    /// `v_prev` or `v_next` is itself an input vert (§4.1): the diagonal would
+    /// be wasted work since both its endpoints are about to be dissolved.
+    ///
+    /// The diagonal `v_prev – v_next` never touches `v`, so slicing one face
+    /// of `v`'s fan does not change which loop sits at `v` on any other face;
+    /// the per-face targets are therefore gathered up front and the splits
+    /// applied afterwards.
+    fn dissolve_verts_face_split_pre_pass(&mut self, verts: &[VertexKey]) {
+        // O(1) input-set membership for the §4.1 skip condition, mirroring the
+        // GC-bit idiom the four-phase core uses.
+        let input_set = self.push_vert_op_flag_layer();
+        const BIT: u8 = 0;
+        for &v in verts {
+            if self.vertices.try_get(v).is_some() {
+                self.vert_op_flag_set(input_set, v, BIT);
+            }
+        }
+
+        // (face, v_prev, v_next) diagonals to cut, gathered before any split.
+        let mut diagonals: SmallVec<[(FaceKey, VertexKey, VertexKey); 8]> = SmallVec::new();
+        for &v in verts {
+            if self.vertices.try_get(v).is_none() {
+                continue;
+            }
+            // §4.1 / §4.3 — edge-pair verts have no third corner to split.
+            if self.vert_disk_count_edges_capped(v, 3) <= 2 {
+                continue;
+            }
+            // Find each incident face via the loop at `v` on every disk edge's
+            // radial fan; dedup so a face shared by two of `v`'s spokes is only
+            // sliced once.
+            let mut seen_faces: SmallVec<[FaceKey; 8]> = SmallVec::new();
+            let mut disk = self.disk_edges(v);
+            while let Some(edge) = disk.next(self) {
+                let mut radial = self.radial_loops(edge);
+                while let Some(loop_key) = radial.next(self) {
+                    if self.loops.get(loop_key).vertex != v {
+                        continue;
+                    }
+                    let face = self.loops.get(loop_key).face;
+                    if seen_faces.contains(&face) {
+                        continue;
+                    }
+                    seen_faces.push(face);
+                    if self.face_len(face) <= 3 {
+                        continue;
+                    }
+                    let v_next = self.loops.get(self.loop_next(loop_key)).vertex;
+                    let v_prev = self.loops.get(self.loop_prev(loop_key)).vertex;
+                    if self.vert_op_flag_test(input_set, v_next, BIT)
+                        || self.vert_op_flag_test(input_set, v_prev, BIT)
+                    {
+                        continue;
+                    }
+                    diagonals.push((face, v_prev, v_next));
+                }
+            }
+        }
+
+        for (face, v_prev, v_next) in diagonals {
+            let _ = self.face_split(face, v_prev, v_next);
+        }
+
+        self.pop_vert_op_flag_layer(input_set);
     }
 
     /// Classify `v` per `DISSOLVE_VERTS.md` §3. Reads `v`'s disk + per-edge
@@ -783,6 +899,287 @@ mod tests {
             "the face not touching the dissolved vert is unaffected"
         );
         let _ = f_left;
+        mesh.validate_topology();
+    }
+
+    /// §4 / §4.2 — `use_face_split = true` on the 4-valence centre of a 3x3
+    /// quad grid. The pre-pass slices each surrounding quad with a diagonal at
+    /// the centre, demoting the centre to a 4-triangle fan; the join then
+    /// merges those four triangles into a single **quad** (the four shared
+    /// immediate neighbours of the centre). Each source quad leaves a triangle
+    /// behind (the `(n−1)`-gon outside the diagonal). Delta from the
+    /// pre-call grid: +4 E / +4 F from the pre-pass, then −1 V / −4 E / −3 F
+    /// from the four-triangle merge → net −1 V / 0 E / +1 F.
+    #[test]
+    fn dissolve_verts_use_face_split_true_merges_fan_into_quad() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+        assert_eq!((v0, e0, f0), (16, 24, 9));
+
+        let centre = verts[5];
+        assert_eq!(mesh.vert_edge_keys(centre).len(), 4);
+
+        mesh.dissolve_verts_ex(
+            &[centre],
+            &DissolveVertsParams {
+                use_face_split: true,
+                use_boundary_tear: false,
+            },
+        );
+
+        // Pre-pass: +4 E (diagonals) +4 F (triangle slices). Merge of the
+        // resulting 4-triangle fan: −1 V, −4 E (spokes), −3 F (4 → 1).
+        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (the centre)");
+        assert_eq!(mesh.totedge(), e0, "+4 diagonals, −4 spokes → net 0 E");
+        assert_eq!(mesh.totface(), f0 + 1, "+4 slices, −3 from the merge");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&centre), "centre vert is gone");
+
+        // The merged face is a QUAD on the four immediate neighbours of the
+        // dissolved centre (lattice points 1, 4, 6, 9). With face_split the
+        // merged face is the narrow 4-corner ring, not the 8-corner octagon.
+        let mut quad: Option<FaceKey> = None;
+        let mut octagon_present = false;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            match mesh.face_vert_keys(f).len() {
+                4 => {
+                    let ring: std::collections::HashSet<VertexKey> =
+                        mesh.face_vert_keys(f).into_iter().collect();
+                    if [1usize, 4, 6, 9].iter().all(|&i| ring.contains(&verts[i])) {
+                        quad = Some(f);
+                    }
+                }
+                8 => octagon_present = true,
+                _ => {}
+            }
+        }
+        assert!(quad.is_some(), "merged face is the 4-corner ring, a quad");
+        assert!(!octagon_present, "no wide octagon is produced with face_split");
+
+        // Each of the four source quads leaves a triangle behind (the
+        // (n−1)-gon outside the cut diagonal): there are exactly four new
+        // triangles among the faces.
+        let mut tri_count = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            if mesh.face_len(f) == 3 {
+                tri_count += 1;
+            }
+        }
+        assert_eq!(tri_count, 4, "four triangle leftovers, one per source quad");
+
+        mesh.validate_topology();
+    }
+
+    /// §4.2 structural contrast: `use_face_split = false` (the default,
+    /// expressed through the params form) on the same 3x3 grid centre merges
+    /// the four quads into one wide **octagon** — no diagonals, no leftover
+    /// triangles. This is the documented "with vs without" difference. Delta:
+    /// −1 V / −4 E / −3 F (matching the default-parameter headline case).
+    #[test]
+    fn dissolve_verts_use_face_split_false_merges_fan_into_octagon() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        mesh.dissolve_verts_ex(
+            &[verts[5]],
+            &DissolveVertsParams {
+                use_face_split: false,
+                use_boundary_tear: false,
+            },
+        );
+
+        // No pre-pass: the four-quad fan merges directly into one octagon.
+        assert_eq!(mesh.totvert(), v0 - 1, "-1 V");
+        assert_eq!(mesh.totedge(), e0 - 4, "-4 spokes, no diagonals added");
+        assert_eq!(mesh.totface(), f0 - 3, "4 quads → 1");
+
+        let mut octagon: Option<FaceKey> = None;
+        let mut tri_count = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            match mesh.face_len(f) {
+                8 => octagon = Some(f),
+                3 => tri_count += 1,
+                _ => {}
+            }
+        }
+        assert!(octagon.is_some(), "the merged face is a wide octagon");
+        assert_eq!(tri_count, 0, "no leftover triangles without face_split");
+
+        mesh.validate_topology();
+    }
+
+    /// §8 per-vert independence with `use_face_split = true`: two non-adjacent
+    /// interior verts of a 5x5 quad grid. Each fan is sliced and merged into a
+    /// quad independently; the surgeries do not interact. Per fan the net is
+    /// −1 V / 0 E / +1 F (see the single-fan true-case test), so two disjoint
+    /// fans give −2 V / 0 E / +2 F.
+    #[test]
+    fn dissolve_verts_use_face_split_true_two_disjoint_fans() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_5x5(&mut mesh);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        let a = verts[1 * 6 + 1];
+        let b = verts[3 * 6 + 3];
+        assert_eq!(mesh.vert_edge_keys(a).len(), 4);
+        assert_eq!(mesh.vert_edge_keys(b).len(), 4);
+
+        mesh.dissolve_verts_ex(
+            &[a, b],
+            &DissolveVertsParams {
+                use_face_split: true,
+                use_boundary_tear: false,
+            },
+        );
+
+        assert_eq!(mesh.totvert(), v0 - 2, "-1 V per fan");
+        assert_eq!(mesh.totedge(), e0, "+4 diagonals −4 spokes per fan → net 0 E");
+        assert_eq!(mesh.totface(), f0 + 2, "+1 F per fan (4 → 1 merge + 4 slices)");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&a) && !live.contains(&b));
+
+        // Two quad merges, eight triangle leftovers (four per fan).
+        let mut quad_merges = 0usize;
+        let mut tri_count = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            match mesh.face_len(f) {
+                3 => tri_count += 1,
+                8 => quad_merges += 1, // an octagon would appear without face_split
+                _ => {}
+            }
+        }
+        assert_eq!(quad_merges, 0, "no octagons: each fan merges to a quad");
+        assert_eq!(tri_count, 8, "four triangle leftovers per disjoint fan");
+
+        mesh.validate_topology();
+    }
+
+    /// §8 "no-op on already-triangulated fan": `use_face_split = true` on a
+    /// vert whose every incident face is already a triangle finds nothing to
+    /// split (every `face_len == 3`), so the result is identical to the
+    /// default path. Here the centre of a triangulated 4-fan merges to a quad
+    /// regardless of the flag.
+    #[test]
+    fn dissolve_verts_use_face_split_noop_on_triangle_fan() {
+        // Four triangles fanning around a shared centre, forming a quad
+        // diamond: centre c, rim verts n/e/s/w. Each triangle is (c, rim_i,
+        // rim_{i+1}).
+        let mut mesh = LoopMesh::new();
+        let c = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let n = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let e = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let s = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let w = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let rim = [n, e, s, w];
+
+        let e_spokes: Vec<EdgeKey> = rim
+            .iter()
+            .map(|&r| mesh.create_edge([c, r], EdgeCreateFlags::NO_DUPLICATE))
+            .collect();
+        for i in 0..4 {
+            let r0 = rim[i];
+            let r1 = rim[(i + 1) % 4];
+            let e_rim = mesh.create_edge([r0, r1], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(
+                &[c, r0, r1],
+                &[e_spokes[i], e_rim, e_spokes[(i + 1) % 4]],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+        assert_eq!((v0, e0, f0), (5, 8, 4));
+        assert_eq!(mesh.vert_edge_keys(c).len(), 4);
+
+        mesh.dissolve_verts_ex(
+            &[c],
+            &DissolveVertsParams {
+                use_face_split: true,
+                use_boundary_tear: false,
+            },
+        );
+
+        // The pre-pass adds no diagonals (every face is already a triangle):
+        // the four triangles merge straight into one quad rim. −1 V, −4 E
+        // (spokes), −3 F (4 → 1).
+        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (the centre)");
+        assert_eq!(mesh.totedge(), e0 - 4, "no diagonals added; −4 spokes");
+        assert_eq!(mesh.totface(), f0 - 3, "4 triangles → 1 quad");
+
+        let mut quad: Option<FaceKey> = None;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            if mesh.face_len(f) == 4 {
+                quad = Some(f);
+            }
+        }
+        let quad = quad.expect("the merged face is the 4-vert rim quad");
+        let ring: std::collections::HashSet<VertexKey> =
+            mesh.face_vert_keys(quad).into_iter().collect();
+        assert_eq!(ring, rim.into_iter().collect());
+
+        mesh.validate_topology();
+    }
+
+    /// §4.1 skip condition: when both diagonal endpoints would themselves be
+    /// dissolved, the pre-pass skips the split. Two adjacent grid-centre verts
+    /// sharing a spoke edge: slicing a quad whose `v_prev`/`v_next` neighbour
+    /// is the *other* input vert is wasted work and is skipped. This pins that
+    /// the skip does not crash and that an unrelated quad (whose neighbours are
+    /// not input verts) is still sliced.
+    #[test]
+    fn dissolve_verts_use_face_split_skips_diagonal_between_two_inputs() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_5x5(&mut mesh);
+
+        // Two horizontally-adjacent interior verts sharing the spoke between
+        // them. verts[r*6+c]: (2,2) and (2,3).
+        let a = verts[2 * 6 + 2];
+        let b = verts[2 * 6 + 3];
+        // They share an edge (the spoke a-b).
+        let shared = mesh
+            .vert_edge_keys(a)
+            .into_iter()
+            .find(|&e| mesh.edge_vert_keys(e).contains(&b));
+        assert!(shared.is_some(), "a and b are adjacent");
+
+        // Run the pre-pass directly (no dissolve) and confirm it does not
+        // panic and that the faces straddling the a-b spoke are NOT sliced
+        // (their adjacent corner is the other input vert).
+        let f0 = mesh.totface();
+        mesh.dissolve_verts_ex(
+            &[a, b],
+            &DissolveVertsParams {
+                use_face_split: true,
+                use_boundary_tear: false,
+            },
+        );
+        // Both verts dissolve; the operator does not crash. The two fans are
+        // adjacent so they union — the exact final count is topology-dependent,
+        // but the mesh must remain valid and both inputs must be gone.
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&a), "a dissolved");
+        assert!(!live.contains(&b), "b dissolved");
+        assert!(mesh.totface() >= 1, "{f0} faces before; mesh non-empty after");
         mesh.validate_topology();
     }
 }

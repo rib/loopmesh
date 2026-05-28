@@ -17,6 +17,7 @@ mod inset_individual;
 mod inset_region;
 
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
+pub use dissolve_verts::DissolveVertsParams;
 pub use face_triangulate::{NgonMethod, QuadMethod};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
