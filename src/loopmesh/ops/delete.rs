@@ -8,11 +8,10 @@ use crate::loopmesh::*;
 /// upward to bounded higher-dimensional elements, or not at all) and which of
 /// those elements are killed versus spared.
 ///
-/// Only the two face-seeded modes that differ *solely* in whether the downward
-/// cascade runs are implemented today (§4 / §5.1). The remaining five modes
-/// (`verts`, `edges`, `edges+faces`, `faces-keep-edges`, `tagged-only`) are
+/// The three face-seeded modes are implemented today (§4 / §5.1 / §5.2). The
+/// remaining four modes (`verts`, `edges`, `edges+faces`, `tagged-only`) are
 /// documented in the guide but not yet built; new variants slot in here without
-/// disturbing the existing two.
+/// disturbing the existing ones.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeleteContext {
     /// Kill the seeded faces, plus any boundary edge / vert used by *no*
@@ -22,6 +21,12 @@ pub enum DeleteContext {
     /// Kill only the seeded face headers. The entire boundary wireframe
     /// (shared *and* solely-owned) survives. No downward cascade. (§5.1.)
     FacesOnly,
+    /// Like [`DeleteContext::Faces`], but an edge that is *already* a mesh
+    /// boundary edge at op time — radial cycle length 1 on the live mesh,
+    /// before any deletion — is always kept-as-wire (and its verts rescued),
+    /// even when the deleted region solely owns it. An interior edge that would
+    /// only *become* boundary after deletion is not spared. (§5.2.)
+    FacesKeepBoundary,
 }
 
 impl LoopMesh {
@@ -52,7 +57,8 @@ impl LoopMesh {
         }
         match context {
             DeleteContext::FacesOnly => self.delete_faces_only(faces),
-            DeleteContext::Faces => self.delete_faces(faces),
+            DeleteContext::Faces => self.delete_faces(faces, false),
+            DeleteContext::FacesKeepBoundary => self.delete_faces(faces, true),
         }
     }
 
@@ -77,7 +83,14 @@ impl LoopMesh {
     /// Three mesh-wide mark passes (§4.3) compute the closed kill set, then the
     /// face→edge→vert sweep (§3.1) frees it bottom-of-the-cascade-first so each
     /// kill in the sweep is a leaf kill.
-    fn delete_faces(&mut self, faces: &[FaceKey]) {
+    ///
+    /// When `keep_boundary` is set this is the §5.2 `faces-keep-edges` mode: an
+    /// extra unmark pass, gated on the edge's *live* radial cycle length being 1
+    /// (already a mesh-boundary edge at op time), runs before phase 1c so a kept
+    /// edge's verts ride along and survive when 1c flushes the keep down to them.
+    /// An interior edge that would only *become* boundary after deletion is
+    /// radial-2 right now, fails the test, and still dies with the region.
+    fn delete_faces(&mut self, faces: &[FaceKey], keep_boundary: bool) {
         let seeded = self.push_face_op_flag_layer();
         let doomed_vert = self.push_vert_op_flag_layer();
         let doomed_edge = self.push_edge_op_flag_layer();
@@ -125,6 +138,25 @@ impl LoopMesh {
                 let edge = self.loop_edge(corner);
                 self.vert_op_flag_clear(doomed_vert, vert, DOOM);
                 self.edge_op_flag_clear(doomed_edge, edge, DOOM);
+            }
+        }
+
+        // §5.2 carve-out — un-doom edges already on the mesh boundary. An edge
+        // whose *live* radial cycle (measured on the mesh as it stands, before
+        // any deletion) has length 1 is pre-existing boundary/wire fringe; keep
+        // it as wire even when the region solely owns it. Runs before 1c so the
+        // kept edge's verts are rescued when 1c flushes surviving-edge keeps
+        // down to their endpoints. Interior edges (radial-2) that would only
+        // *become* boundary after the sweep stay marked and die.
+        if keep_boundary {
+            let mut edge_iter = MeshEdges::default();
+            while let Some(edge) = edge_iter.next(self) {
+                if !self.edge_op_flag_test(doomed_edge, edge, DOOM) {
+                    continue;
+                }
+                if self.edge_radial_iter(edge).count() == 1 {
+                    self.edge_op_flag_clear(doomed_edge, edge, DOOM);
+                }
             }
         }
 
@@ -341,6 +373,110 @@ mod tests {
         assert_eq!(mesh.totface(), 0);
         assert_eq!(mesh.totedge(), 4);
         assert_eq!(mesh.totvert(), 4);
+    }
+
+    /// Two quads sharing one edge: 6 verts, 7 edges (4 + 4 − 1 shared), 2
+    /// faces. The 6 perimeter edges are each radial-1 (mesh boundary); the 1
+    /// shared edge is radial-2 (interior). Returns the two faces.
+    fn build_two_quads_shared_edge(mesh: &mut LoopMesh) -> [FaceKey; 2] {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+
+        let mut make = |mesh: &mut LoopMesh, ring: [VertexKey; 4]| {
+            let mut edges = [EdgeKey::NULL; 4];
+            for i in 0..4 {
+                let a = ring[i];
+                let b = ring[(i + 1) % 4];
+                edges[i] = mesh
+                    .query_edge_exists(a, b)
+                    .unwrap_or_else(|| mesh.create_edge([a, b], EdgeCreateFlags::NONE));
+            }
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+        };
+
+        let left = make(mesh, [v0, v1, v4, v3]);
+        let right = make(mesh, [v1, v2, v5, v4]);
+        [left, right]
+    }
+
+    #[test]
+    fn keep_boundary_keeps_owned_fringe_kills_interior() {
+        // §5.2 / §7: deleting both quads. Every perimeter edge is radial-1
+        // (already boundary) and is kept-as-wire with its verts; the single
+        // radial-2 shared edge would only *become* boundary, so it dies.
+        // Surviving counts: 6 V, 6 E, 0 F.
+        let mut mesh = LoopMesh::new();
+        let block = build_two_quads_shared_edge(&mut mesh);
+
+        // The shared edge (v1–v4) is radial-2 before deletion.
+        let shared = mesh.query_edge_exists(
+            mesh.face_vert_keys(block[0])[1],
+            mesh.face_vert_keys(block[0])[2],
+        );
+        let shared = shared.expect("shared edge exists");
+        assert_eq!(mesh.edge_radial_iter(shared).count(), 2, "shared is interior");
+
+        mesh.delete(&block, DeleteContext::FacesKeepBoundary);
+
+        assert_eq!(mesh.totface(), 0, "both faces gone");
+        assert_eq!(mesh.totedge(), 6, "6 boundary edges kept as wire");
+        assert_eq!(mesh.totvert(), 6, "all verts rescued by kept wire edges");
+        assert!(
+            mesh.edges.try_get(shared).is_none(),
+            "radial-2 shared edge dies (only would-be boundary)"
+        );
+    }
+
+    #[test]
+    fn keep_boundary_contrast_with_plain_faces() {
+        // Same seed under plain Faces: the region solely owns the entire two-
+        // quad surface, so every edge and vert dies along with the faces.
+        let mut mesh = LoopMesh::new();
+        let block = build_two_quads_shared_edge(&mut mesh);
+
+        mesh.delete(&block, DeleteContext::Faces);
+
+        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.totedge(), 0, "plain Faces drops the owned boundary too");
+        assert_eq!(mesh.totvert(), 0);
+    }
+
+    #[test]
+    fn keep_boundary_keeps_single_quad_as_wire() {
+        // A lone quad: all four edges are radial-1 boundary, so keep-boundary
+        // leaves the full wire loop and corners standing where plain Faces
+        // (see `faces_context_single_quad_drops_owned_boundary`) wipes them.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+
+        mesh.delete(&faces, DeleteContext::FacesKeepBoundary);
+
+        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.totedge(), 4);
+        assert_eq!(mesh.totvert(), 4);
+    }
+
+    #[test]
+    fn keep_boundary_interior_block_matches_plain_faces() {
+        // §5.2: the interior 2×2 block's at-risk edges are its four cross-edges,
+        // all radial-2 (both faces seeded) — they would only *become* boundary,
+        // so keep-boundary spares none of them and matches plain Faces exactly:
+        // −4 F, −4 E, −1 V (the centre vert). The block's outer ring is shared
+        // (radial-2 with a surviving grid face) and kept by the §4.2 keep-alive.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 5);
+        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        let block = interior_2x2_block(&faces);
+        mesh.delete(&block, DeleteContext::FacesKeepBoundary);
+
+        assert_eq!(f0 - mesh.totface(), 4, "faces");
+        assert_eq!(e0 - mesh.totedge(), 4, "edges (radial-2 cross-edges die)");
+        assert_eq!(v0 - mesh.totvert(), 1, "verts (centre)");
     }
 
     #[test]
