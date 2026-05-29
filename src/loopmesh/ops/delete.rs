@@ -8,12 +8,18 @@ use crate::loopmesh::*;
 /// upward to bounded higher-dimensional elements, or not at all) and which of
 /// those elements are killed versus spared.
 ///
-/// The three face-seeded modes are implemented today (§4 / §5.1 / §5.2). The
-/// remaining four modes (`verts`, `edges`, `edges+faces`, `tagged-only`) are
+/// The four face-/vert-seeded modes are implemented today (§4 / §5.1 / §5.2 /
+/// §6). The remaining three modes (`edges`, `edges+faces`, `tagged-only`) are
 /// documented in the guide but not yet built; new variants slot in here without
 /// disturbing the existing ones.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeleteContext {
+    /// Kill the seeded verts, and — entirely via the kernel vert-kill's
+    /// *unconditional* upward cascade — every edge incident to a seeded vert and
+    /// every face on those edges' radial cycles. Nothing incident survives. A
+    /// non-seed vert the cascade leaves loose is **not** swept up: it stays as
+    /// an isolated point. Seed is a vert slice. (§6.)
+    Verts,
     /// Kill the seeded faces, plus any boundary edge / vert used by *no*
     /// surviving face — geometry the deleted region solely owned. Edges and
     /// verts still shared with an out-of-set face are spared. (§4.)
@@ -29,12 +35,57 @@ pub enum DeleteContext {
     FacesKeepBoundary,
 }
 
+/// Seed element type for [`LoopMesh::delete`].
+///
+/// The guide's `geom` buffer (`DELETE.md` §1) is a mixed verts ∪ edges ∪ faces
+/// set, but each context reads only one dimension of it (§4.1 / §6.1). Rather
+/// than carry an untyped buffer, the seed slice is typed: a `&[FaceKey]` for the
+/// face-seeded contexts and a `&[VertexKey]` for the verts context. This trait
+/// lets the single `delete` entry accept either, dispatching to the right
+/// routine and guarding that the context matches the seed's dimension.
+pub trait DeleteSeed: Copy {
+    #[doc(hidden)]
+    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext);
+}
+
+impl DeleteSeed for FaceKey {
+    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+        match context {
+            DeleteContext::FacesOnly => mesh.delete_faces_only(seed),
+            DeleteContext::Faces => mesh.delete_faces(seed, false),
+            DeleteContext::FacesKeepBoundary => mesh.delete_faces(seed, true),
+            DeleteContext::Verts => {
+                panic!("DeleteContext::Verts requires a vert seed, not faces")
+            }
+        }
+    }
+}
+
+impl DeleteSeed for VertexKey {
+    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+        match context {
+            DeleteContext::Verts => mesh.delete_verts(seed),
+            _ => panic!("a vert seed is only valid with DeleteContext::Verts"),
+        }
+    }
+}
+
 impl LoopMesh {
-    /// Remove the seeded `faces` according to `context`.
+    /// Remove the seeded geometry according to `context`.
     ///
-    /// Implements the face-seeded modes of
-    /// `radial-mesh-guides/operators/DELETE.md`:
+    /// Implements the face- and vert-seeded modes of
+    /// `radial-mesh-guides/operators/DELETE.md`. The seed slice is typed to the
+    /// dimension the chosen context reads (the guide's mixed `geom` buffer is
+    /// read one-dimension-at-a-time per context — §4.1 / §6.1), so pass a
+    /// `&[FaceKey]` for the face-seeded contexts and a `&[VertexKey]` for
+    /// [`DeleteContext::Verts`]. A mismatched seed/context pair panics (it is a
+    /// caller bug, not an expected mesh state).
     ///
+    /// - [`DeleteContext::Verts`] (§6) — kill the seeded verts and let the
+    ///   kernel vert-kill's *unconditional* upward cascade take every incident
+    ///   edge and every face on those edges. No mark phase, no downward sweep —
+    ///   a non-seed vert left loose by the cascade survives as an isolated point
+    ///   (the §6.2 loose-neighbour rule).
     /// - [`DeleteContext::FacesOnly`] (§5.1) — the non-cascading face sweep.
     ///   Every seeded face header and its loops are freed; every boundary edge
     ///   and vert is left standing as wire. No mark phase.
@@ -42,23 +93,42 @@ impl LoopMesh {
     ///   seeded faces die, and so does every boundary edge/vert the region
     ///   solely owned; geometry still shared with a surviving face is kept (the
     ///   §4.2 shared-boundary keep-alive).
+    /// - [`DeleteContext::FacesKeepBoundary`] (§5.2) — like
+    ///   [`DeleteContext::Faces`], but an edge already on the mesh boundary
+    ///   (radial cycle length 1 on the live mesh) is kept-as-wire even when the
+    ///   region solely owns it; an edge that would only *become* boundary after
+    ///   deletion is not spared.
     ///
     /// Delete creates no replacement geometry, so there is no customdata
     /// interpolation: survivors keep their attributes byte-for-byte and killed
     /// elements' attributes are discarded with them.
-    ///
-    /// The seed is a face slice because both implemented contexts are
-    /// face-seeded (verts/edges in the guide's mixed `geom` buffer are ignored
-    /// by these contexts — §4.1). The lower-dimension-seeded modes, when added,
-    /// will take their own seed shape.
-    pub fn delete(&mut self, faces: &[FaceKey], context: DeleteContext) {
-        if faces.is_empty() {
+    pub fn delete<S: DeleteSeed>(&mut self, seed: &[S], context: DeleteContext) {
+        if seed.is_empty() {
             return;
         }
-        match context {
-            DeleteContext::FacesOnly => self.delete_faces_only(faces),
-            DeleteContext::Faces => self.delete_faces(faces, false),
-            DeleteContext::FacesKeepBoundary => self.delete_faces(faces, true),
+        S::delete_seeded(self, seed, context);
+    }
+
+    /// §6 — kill the seeded verts and let each vert-kill's upward cascade do the
+    /// rest.
+    ///
+    /// `vertex_kill` (DELETE.md §3) is the fully-cascading primitive: it first
+    /// kills every edge on the vert's disk — each of which first kills every
+    /// face on its radial cycle — then frees the vert. So a single vert sweep
+    /// subsumes the §3.1 face→edge→vert ordering *inside* each kill, and there
+    /// is no separate face or edge sweep (§6.3).
+    ///
+    /// No mark phase is needed: the cascade is unconditional, and the verts
+    /// context never sweeps downward to non-seed verts the cascade leaves loose
+    /// (§6.2). The sweep is over the seed slice directly, re-testing liveness so
+    /// a duplicate seed entry — or a seed vert an earlier kill already freed
+    /// (verts are never freed by *another* vert's cascade, but a defensive
+    /// re-test keeps the loop idempotent) — is skipped.
+    fn delete_verts(&mut self, verts: &[VertexKey]) {
+        for &vert in verts {
+            if self.vertices.try_get(vert).is_some() {
+                self.vertex_kill(vert);
+            }
         }
     }
 
@@ -485,9 +555,147 @@ mod tests {
         let faces = build_quad_grid(&mut mesh, 3);
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
 
-        mesh.delete(&[], DeleteContext::Faces);
-        mesh.delete(&[], DeleteContext::FacesOnly);
+        mesh.delete::<FaceKey>(&[], DeleteContext::Faces);
+        mesh.delete::<FaceKey>(&[], DeleteContext::FacesOnly);
+        mesh.delete::<VertexKey>(&[], DeleteContext::Verts);
 
         assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
+    }
+
+    #[test]
+    fn verts_interior_manifold_vert_punches_hole() {
+        // §6.4 interior-manifold-vert case (scaffold `grid_3x3` centre vert 4 →
+        // here the centre of a 2×2 grid: the lone 4-valence interior vert). The
+        // four meeting faces, the four spoke edges, and the seed vert die; the
+        // eight outer verts and the outer ring edges (which never touched the
+        // seed) survive. Net: −1 V, −4 E, −4 F.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 2);
+        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        // In a 2×2 grid (3×3 verts), the single interior vert is the v11 corner
+        // of face (0,0) — the corner diagonally opposite that face's origin.
+        let centre = mesh.face_vert_keys(faces[0])[2];
+        mesh.delete(&[centre], DeleteContext::Verts);
+
+        assert_eq!(f0 - mesh.totface(), 4, "all four faces die");
+        assert_eq!(e0 - mesh.totedge(), 4, "four spoke edges die");
+        assert_eq!(v0 - mesh.totvert(), 1, "only the seed vert dies");
+        assert!(mesh.vertices.try_get(centre).is_none(), "seed vert gone");
+    }
+
+    #[test]
+    fn verts_single_corner_kills_face_keeps_far_edges() {
+        // §6.4 "deleting one corner of a face": seed one corner of a lone quad.
+        // The two edges incident to that corner die (taking the face with
+        // them), plus the seed vert. The face's two far edges and three other
+        // corners survive (the far edges as wire). Net: −1 V, −2 E, −1 F →
+        // remaining 3 V, 2 E, 0 F.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+        let corner = mesh.face_vert_keys(faces[0])[0];
+
+        mesh.delete(&[corner], DeleteContext::Verts);
+
+        assert_eq!(mesh.totface(), 0, "the face dies through its corner");
+        assert_eq!(mesh.totvert(), 3, "three far corners survive");
+        assert_eq!(mesh.totedge(), 2, "two far edges survive as wire");
+        assert!(mesh.vertices.try_get(corner).is_none());
+    }
+
+    #[test]
+    fn verts_wire_anchor_drops_wire_keeps_far_endpoint_loose() {
+        // §6.4 wire-anchor case (scaffold quad + wire {1,4}, seed vert 1). A
+        // lone quad with a wire edge hanging off one corner; seed that corner.
+        // The quad's two incident edges + face die, the wire edge dies (on the
+        // seed's disk), and the seed vert dies — but the wire's *far* endpoint
+        // is not seeded and survives as a loose point (§6.2).
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+        let corner = mesh.face_vert_keys(faces[0])[0];
+
+        // A wire edge off `corner` to a fresh far vert.
+        let far = mesh.create_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        mesh.create_edge([corner, far], EdgeCreateFlags::NONE);
+
+        mesh.delete(&[corner], DeleteContext::Verts);
+
+        assert_eq!(mesh.totface(), 0, "quad face dies");
+        assert!(mesh.vertices.try_get(corner).is_none(), "seed vert gone");
+        assert!(
+            mesh.vertices.try_get(far).is_some(),
+            "wire far endpoint survives loose (§6.2)"
+        );
+        // Survivors: the three far quad corners + the loose wire endpoint = 4 V;
+        // the two far quad edges (wire) = 2 E; the wire edge itself is gone.
+        assert_eq!(mesh.totvert(), 4, "3 quad corners + 1 loose far endpoint");
+        assert_eq!(mesh.totedge(), 2, "two far quad edges survive, wire dies");
+    }
+
+    /// Two triangles sharing exactly one vert (a bowtie): tris `(a,b,hub)` and
+    /// `(hub,c,d)`. Returns the shared hub vert and the four non-shared corners.
+    fn build_bowtie(mesh: &mut LoopMesh) -> (VertexKey, [VertexKey; 4]) {
+        let a = mesh.create_vertex(Vec3::new(-2.0, 1.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(-2.0, -1.0, 0.0));
+        let hub = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(2.0, -1.0, 0.0));
+
+        let mut make = |mesh: &mut LoopMesh, ring: [VertexKey; 3]| {
+            let mut edges = [EdgeKey::NULL; 3];
+            for i in 0..3 {
+                let p = ring[i];
+                let q = ring[(i + 1) % 3];
+                edges[i] = mesh
+                    .query_edge_exists(p, q)
+                    .unwrap_or_else(|| mesh.create_edge([p, q], EdgeCreateFlags::NONE));
+            }
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        };
+        make(mesh, [a, b, hub]);
+        make(mesh, [hub, c, d]);
+        (hub, [a, b, c, d])
+    }
+
+    #[test]
+    fn verts_nonmanifold_hub_kills_both_fans_keeps_corners_loose() {
+        // §6.4 non-manifold-hub case (scaffold `bowtie` shared corner vert 2).
+        // Seeding the shared hub of a bowtie kills *both* triangles. The four
+        // edges incident to the hub (two per triangle) die; each triangle's
+        // *opposite* edge (a–b and c–d) does not touch the hub, so the two of
+        // them survive as wire. The four non-shared corners survive as the
+        // endpoints of those surviving wire edges (none were seeded — §6.2).
+        // Net: −1 V (hub), −4 E (hub edges), −2 F → remaining 4 V, 2 E, 0 F.
+        let mut mesh = LoopMesh::new();
+        let (hub, corners) = build_bowtie(&mut mesh);
+
+        mesh.delete(&[hub], DeleteContext::Verts);
+
+        assert_eq!(mesh.totface(), 0, "both triangles die");
+        assert_eq!(mesh.totedge(), 2, "the two hub-free opposite edges survive");
+        assert_eq!(mesh.totvert(), 4, "four non-shared corners survive loose");
+        assert!(mesh.vertices.try_get(hub).is_none(), "hub gone");
+        for c in corners {
+            assert!(
+                mesh.vertices.try_get(c).is_some(),
+                "non-shared corner survives as loose point (§6.2)"
+            );
+        }
+    }
+
+    #[test]
+    fn verts_all_corners_erases_face() {
+        // §6.4 "deleting every vert of a face": seeding all four corners of a
+        // lone quad removes the face, all edges, and all verts — no surviving
+        // loose geometry, since every would-be-loose vert was itself seeded.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+        let corners = mesh.face_vert_keys(faces[0]);
+
+        mesh.delete(&corners, DeleteContext::Verts);
+
+        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.totedge(), 0);
+        assert_eq!(mesh.totvert(), 0, "mesh fully erased");
     }
 }

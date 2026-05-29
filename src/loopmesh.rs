@@ -68,7 +68,7 @@ mod ops;
 
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    DeleteContext, DissolveEdgesParams, DissolveEdgesResult, DissolveFacesOptions,
+    DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult, DissolveFacesOptions,
     DissolveFacesResult, DissolveVertsParams, InsetIndividualParams, InsetIndividualResult,
     InsetRegionParams, InsetRegionResult, NgonMethod, QuadMethod,
 };
@@ -3962,21 +3962,15 @@ impl LoopMesh {
     }
 
     pub fn vertex_kill(&mut self, vertex: VertexKey) {
-        // Can't use an iterator since that would take a shared reference to the mesh
-        // and stop us removing the associated edges/faces.
-        let loop_start = self.vertices.get(vertex).disk_loop_start;
-        if let Some(first) = loop_start {
-            let mut cur = first;
-            loop {
-                let links = self.edges.get(cur).disk_loop_links_for_vert(vertex);
-
-                self.edge_kill(cur);
-
-                cur = links.next;
-                if cur == first {
-                    break;
-                }
-            }
+        // Kill every edge on the vert's disk, then free the vert. We can't hold
+        // a disk iterator across the kills (it would borrow the mesh), and we
+        // can't pre-capture the cycle's `next` either: each `edge_kill` shortens
+        // the disk in place, so any edge key captured before a kill can name an
+        // edge a later kill has already freed. Instead we always re-read the
+        // live `disk_loop_start` and kill whatever it currently points at; each
+        // `edge_kill` clears or advances it, so the disk drains to empty.
+        while let Some(edge) = self.vertices.get(vertex).disk_loop_start {
+            self.edge_kill(edge);
         }
 
         self.vertex_data_remove(vertex);
@@ -4047,20 +4041,17 @@ impl LoopMesh {
     pub fn edge_kill(&mut self, edge: EdgeKey) {
         // Can't use an iterator since that would take a shared reference to the mesh
         // and stop us removing the associated faces.
-        let radial_link = self.edges.get(edge).radial_link;
-        if let Some(first) = radial_link {
-            let mut cur = first;
-            loop {
-                let links = self.loops.get(cur).edge_radial_links;
-
-                let face = self.loops.get(cur).face;
-                self.face_kill(face);
-
-                cur = links.next;
-                if cur == first {
-                    break;
-                }
-            }
+        // Kill every face on the edge's radial cycle. We can't pre-capture the
+        // cycle's `next` loop: each `face_kill` splices its loop out of this
+        // edge's radial cycle (and frees that loop), so a loop key captured
+        // before a kill can name a freed loop, and the original `first` loop is
+        // gone after the first kill — leaving the `cur == first` termination
+        // unreachable. Instead we always re-read the live `radial_link` and kill
+        // the face it currently points at; each `face_kill` clears or advances
+        // it, so the radial cycle drains to empty.
+        while let Some(loopi) = self.edges.get(edge).radial_link {
+            let face = self.loops.get(loopi).face;
+            self.face_kill(face);
         }
 
         let vertices = self.edges.get(edge).vertices;
