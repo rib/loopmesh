@@ -114,6 +114,162 @@ impl LoopMesh {
         self.extrude_region_impl(faces, &[], false, use_normal_flip, use_normal_from_adjacent)
     }
 
+    /// [`extrude_region_ex`](Self::extrude_region_ex) with the
+    /// `use_dissolve_ortho_edges` post-pass exposed (EXTRUDE.md §7).
+    ///
+    /// Runs the standard region extrude first, then — when
+    /// `use_dissolve_ortho_edges` is set — cleans up any side wall that ended up
+    /// lying in the plane of the extruded region. Such "fold walls" arise when a
+    /// boundary edge's surround (un-extruded neighbour) face is itself roughly
+    /// parallel to the extrude direction: its normal is then nearly
+    /// perpendicular to the region's average normal, so the wall built on that
+    /// edge would be a zero-thickness crease in the surface.
+    ///
+    /// The post-pass (§7): compute the average normal of the lifted caps; for
+    /// each boundary edge whose surround face's normal is within `1e-4` (by
+    /// absolute dot product) of perpendicular to that average, absorb the wall
+    /// back into the surround by killing the shared original edge
+    /// (join-face-kill-edge), then collapse any boundary vert that the absorption
+    /// has reduced to an edge-pair vertex along its flagged candidate edge.
+    ///
+    /// With `use_dissolve_ortho_edges = false` this is byte-for-byte identical to
+    /// [`extrude_region_ex`](Self::extrude_region_ex): the fold walls are
+    /// retained as standalone faces.
+    pub fn extrude_region_ex_dissolve_ortho(
+        &mut self,
+        faces: &[FaceKey],
+        use_normal_flip: bool,
+        use_dissolve_ortho_edges: bool,
+    ) -> ExtrudeResult {
+        let result = self.extrude_region_impl(faces, &[], false, use_normal_flip, false);
+        if use_dissolve_ortho_edges {
+            self.dissolve_ortho_walls(faces, &result);
+        }
+        result
+    }
+
+    /// EXTRUDE.md §7 ortho-edge dissolve post-pass. Runs after the walls are
+    /// built; absorbs every wall whose surround face lies (nearly) in the plane
+    /// of the extrude direction back into that surround, then collapses the
+    /// boundary verts the absorption strands as edge-pair vertices.
+    fn dissolve_ortho_walls(&mut self, caps: &[FaceKey], result: &ExtrudeResult) {
+        // §7.1: average normal of the lifted cap set (the duplicate faces). In
+        // the default path the caps are the re-anchored original faces. Fall
+        // back to +Z when the sum cancels to zero.
+        let mut avg_normal = Vec3::ZERO;
+        for &cap in caps {
+            avg_normal += self.face_compute_normal(cap);
+        }
+        let avg_normal = avg_normal.normalize_or_zero();
+        let avg_normal = if avg_normal == Vec3::ZERO {
+            Vec3::Z
+        } else {
+            avg_normal
+        };
+
+        let wall_set: std::collections::HashSet<FaceKey> =
+            result.wall_faces.iter().copied().collect();
+
+        // §7.2: flag the candidate edges and verts, and queue the wall/surround
+        // join for each ortho boundary edge. We snapshot the join work before
+        // performing any kill so the radial walks read pre-merge topology.
+        let mut candidate_edges: std::collections::HashSet<EdgeKey> =
+            std::collections::HashSet::new();
+        let mut candidate_verts: SmallVec<[VertexKey; 16]> = SmallVec::new();
+        let mut joins: Vec<(FaceKey, FaceKey, EdgeKey)> = Vec::new();
+
+        // §7.2 says walk the boundary-map. We iterate the full region edge_map
+        // (every original/duplicate pair) instead, and recover the boundary
+        // subset by the wall/surround radial test below. This is equivalent: an
+        // edge interior to the selection has every radial face selected, so no
+        // wall face is built on it and it can never present a (wall, surround)
+        // pair — it is filtered out by the `match` that demands both. Only true
+        // boundary edges carry both a wall and a non-wall (surround) face on
+        // `e_old`, so iterating the full map visits exactly the boundary-map.
+        for &(e_old, e_dup) in &result.edge_map {
+            // The wall sits on `e_old` together with the surround face. A
+            // mesh-boundary edge (no surround) has only the wall on `e_old`, so
+            // there is nothing to test or absorb — skip it.
+            let mut wall_face: Option<FaceKey> = None;
+            let mut surround_face: Option<FaceKey> = None;
+            let mut radial = self.radial_loops(e_old);
+            while let Some(l) = radial.next(self) {
+                let face = self.loops.get(l).face;
+                if wall_set.contains(&face) {
+                    if wall_face.is_none() {
+                        wall_face = Some(face);
+                    }
+                } else if surround_face.is_none() {
+                    surround_face = Some(face);
+                }
+            }
+            let (wall_face, surround_face) = match (wall_face, surround_face) {
+                (Some(w), Some(s)) => (w, s),
+                _ => continue,
+            };
+
+            // §7.2 perpendicularity gate: the surround face is "ortho" when its
+            // normal is nearly perpendicular to the region's average normal.
+            let surround_normal = self.face_compute_normal(surround_face);
+            if surround_normal.dot(avg_normal).abs() >= 1e-4 {
+                continue;
+            }
+
+            // Flag this wall's two horizontal edges (original + duplicate) and
+            // both endpoint verts as ortho-dissolve candidates.
+            candidate_edges.insert(e_old);
+            candidate_edges.insert(e_dup);
+            for v in self.edge_vertices(e_old) {
+                if !candidate_verts.contains(&v) {
+                    candidate_verts.push(v);
+                }
+            }
+            // §7.3: absorb the wall into the surround by killing `e_old`.
+            joins.push((surround_face, wall_face, e_old));
+        }
+
+        // §7.3: perform the join-face-kill-edge merges. The surround survives
+        // and absorbs the wall n-gon; `e_old` is killed.
+        //
+        // §7 describes each ortho wall's absorption independently: join the wall
+        // with its surround across `e_old`. It does not describe two queued
+        // ortho walls that share a single surround face — an earlier join that
+        // grows the surround can invalidate a later join's manifold/single-
+        // shared-edge precondition. When that happens the kernel join declines
+        // (returns `None`); we honour §7's per-wall framing by skipping that
+        // wall cleanly, leaving it intact rather than forcing a merge §7 never
+        // sanctions. Shared-surround ortho walls are thus out of §7's scope.
+        for (surround_face, wall_face, e_old) in joins {
+            // A `None` return is the kernel declining the merge (a shared-surround
+            // collision invalidated the precondition); leave that wall intact.
+            let _declined_join_left_wall_intact =
+                self.euler_join_face_kill_edge(surround_face, wall_face, e_old);
+        }
+
+        // §7.4: collapse the candidate verts that the merges have reduced to
+        // edge-pair (degree-2) vertices. §7.4 only authorises collapsing such a
+        // vert when one of its two incident edges is itself a previously-flagged
+        // candidate edge; the collapse then runs along that candidate edge. A
+        // degree-2 vert whose neither edge is a flagged candidate is left alone
+        // — collapsing along an arbitrary disk edge is outside §7.4's contract
+        // and against its stated conservatism. A vert that still carries other
+        // edges (because some wall there did not ortho-dissolve) is likewise
+        // left alone.
+        for &v in &candidate_verts {
+            if self.vertices.try_get(v).is_none() {
+                continue;
+            }
+            if self.vertex_disk_count_edges_capped(v, 3) != 2 {
+                continue;
+            }
+            let incident: SmallVec<[EdgeKey; 2]> = self.vertex_disk_iter(v).collect();
+            let kill_edge = incident.iter().copied().find(|e| candidate_edges.contains(e));
+            if let Some(e_kill) = kill_edge {
+                self.vert_collapse_edge(e_kill, v);
+            }
+        }
+    }
+
     fn extrude_region_impl(
         &mut self,
         faces: &[FaceKey],
@@ -1537,6 +1693,290 @@ mod tests {
             );
         }
         mesh.validate_topology();
+    }
+
+    // A folded strip for the §7 ortho-dissolve tests. The centre quad lies flat
+    // in the XY plane (normal +Z). Its two side-shared edges (x=0 and x=1) each
+    // carry a neighbour quad folded up into a vertical plane (normal ±X), so each
+    // neighbour's normal is perpendicular to the centre's +Z. The centre quad's
+    // other two edges (y=0, y=1) are mesh-boundary (no surround). Returns
+    // (centre_face, left_neighbour, right_neighbour).
+    fn folded_strip(mesh: &mut LoopMesh) -> (FaceKey, FaceKey, FaceKey) {
+        // Centre quad in XY plane.
+        let c0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let c1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let c3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // Far edge of the right neighbour (folded up in plane x=1).
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 1.0));
+        let r1 = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
+        // Far edge of the left neighbour (folded up in plane x=0).
+        let l0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let l1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+
+        let e_c01 = mesh.create_edge([c0, c1], EdgeCreateFlags::NONE);
+        let e_c12 = mesh.create_edge([c1, c2], EdgeCreateFlags::NONE);
+        let e_c23 = mesh.create_edge([c2, c3], EdgeCreateFlags::NONE);
+        let e_c30 = mesh.create_edge([c3, c0], EdgeCreateFlags::NONE);
+        let centre = mesh.face_create(
+            &[c0, c1, c2, c3],
+            &[e_c01, e_c12, e_c23, e_c30],
+            FaceCreateFlags::NONE,
+        );
+
+        // Right neighbour shares edge c1–c2 (x=1).
+        let e_c1r0 = mesh.create_edge([c1, r0], EdgeCreateFlags::NONE);
+        let e_r01 = mesh.create_edge([r0, r1], EdgeCreateFlags::NONE);
+        let e_r1c2 = mesh.create_edge([r1, c2], EdgeCreateFlags::NONE);
+        let right = mesh.face_create(
+            &[c1, r0, r1, c2],
+            &[e_c1r0, e_r01, e_r1c2, e_c12],
+            FaceCreateFlags::NONE,
+        );
+
+        // Left neighbour shares edge c3–c0 (x=0).
+        let e_c3l1 = mesh.create_edge([c3, l1], EdgeCreateFlags::NONE);
+        let e_l10 = mesh.create_edge([l1, l0], EdgeCreateFlags::NONE);
+        let e_l0c0 = mesh.create_edge([l0, c0], EdgeCreateFlags::NONE);
+        let left = mesh.face_create(
+            &[c3, l1, l0, c0],
+            &[e_c3l1, e_l10, e_l0c0, e_c30],
+            FaceCreateFlags::NONE,
+        );
+
+        (centre, left, right)
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_absorbs_coplanar_fold_walls() {
+        // EXTRUDE.md §7: extruding the centre of a folded strip with
+        // use_dissolve_ortho_edges = true absorbs the two in-plane fold walls
+        // (on the side edges shared with the perpendicular neighbours) back into
+        // those neighbours, leaving only the two mesh-boundary walls. So the face
+        // count is strictly lower than the no-dissolve run.
+        let mut mesh = LoopMesh::new();
+        let (centre, _left, _right) = folded_strip(&mut mesh);
+
+        let faces_before = mesh.totface();
+        let result =
+            mesh.extrude_region_ex_dissolve_ortho(&[centre], false, true);
+
+        // The centre face still has four boundary edges, so four walls were
+        // built; two of them sat on perpendicular surrounds and were dissolved.
+        assert_eq!(result.wall_faces.len(), 4, "four walls built before dissolve");
+
+        // Dissolve absorbs the two side walls into the two neighbour faces and
+        // collapses the stranded boundary verts: strictly fewer faces than the
+        // input plus the surviving (non-dissolved) walls. Starting faces: 3
+        // (centre + 2 neighbours). After plain extrude that would be 3 - 1 (the
+        // centre is re-anchored, no net change) + 4 walls = 7. Dissolving the two
+        // side walls into the neighbours removes 2 faces → 5.
+        assert!(
+            mesh.totface() < faces_before + 4,
+            "ortho dissolve must remove some walls: got {} faces",
+            mesh.totface()
+        );
+        assert_eq!(
+            mesh.totface(),
+            5,
+            "centre cap + 2 neighbours (each absorbed a wall) + 2 retained walls"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_off_keeps_coplanar_fold_walls() {
+        // §7 contrast: with the flag off, the in-plane fold walls are retained as
+        // standalone faces. This is the pin that distinguishes "correct dissolve"
+        // from "never dissolve / always dissolve".
+        let mut mesh = LoopMesh::new();
+        let (centre, _left, _right) = folded_strip(&mut mesh);
+
+        let result =
+            mesh.extrude_region_ex_dissolve_ortho(&[centre], false, false);
+
+        assert_eq!(result.wall_faces.len(), 4, "four walls built");
+        // 3 input faces, centre re-anchored to cap (net 0), + 4 walls = 7.
+        assert_eq!(
+            mesh.totface(),
+            7,
+            "no dissolve: all four walls retained alongside the 3 originals/cap"
+        );
+        // Every wall face is still alive.
+        for &wf in &result.wall_faces {
+            assert!(
+                mesh.faces.try_get(wf).is_some(),
+                "wall {wf:?} must survive when dissolve is off"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_keeps_nonperpendicular_walls() {
+        // §7 perpendicularity gate: when no surround is perpendicular to the cap
+        // normal, the dissolve fires on nothing. A flat (all-coplanar) strip has
+        // neighbour normals parallel to the cap normal (+Z), so |dot| ≈ 1, well
+        // above the 1e-4 threshold — every wall is kept, matching the plain
+        // extrude.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+        let face0 =
+            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let _face1 =
+            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+
+        let result_dissolve_on =
+            mesh.extrude_region_ex_dissolve_ortho(&[face0], false, true);
+
+        // Coplanar surround (normal +Z, parallel to cap +Z) is NOT perpendicular,
+        // so nothing dissolves: all 4 walls survive, just like plain extrude.
+        assert_eq!(result_dissolve_on.wall_faces.len(), 4);
+        for &wf in &result_dissolve_on.wall_faces {
+            assert!(
+                mesh.faces.try_get(wf).is_some(),
+                "no wall should dissolve when the surround is parallel, not perpendicular"
+            );
+        }
+        // 2 originals (one re-anchored cap + neighbour) + 4 walls = 6.
+        assert_eq!(mesh.totface(), 6);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_collapse_is_conservative() {
+        // §7.4 conservatism clause: a candidate boundary vert is collapsed only
+        // when the absorption has reduced it to a true edge-pair (degree-2)
+        // vertex. In the folded strip every side vert (c0..c3) still anchors a
+        // *retained* mesh-boundary wall after the two side walls dissolve, so it
+        // keeps more than two incident edges and must be left in place — never
+        // collapsed, which would corrupt the surviving walls. Pin that all four
+        // side verts survive the dissolve and the mesh stays valid.
+        let mut mesh = LoopMesh::new();
+        // Re-derive the side verts by position after building the strip.
+        let (centre, _l, _r) = folded_strip(&mut mesh);
+        let side_positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+
+        mesh.extrude_region_ex_dissolve_ortho(&[centre], false, true);
+
+        let live: HashSet<[u32; 3]> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| pos_key(mesh.vertex_position(v)))
+            .collect();
+        for p in side_positions {
+            assert!(
+                live.contains(&pos_key(p)),
+                "side vert at {p:?} anchors a retained wall and must not be \
+                 collapsed by the conservative §7.4 stage"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_degree2_no_candidate_edge_not_collapsed() {
+        // §7.4 contract: a candidate boundary vert reduced to degree-2 by the
+        // ortho-join merges is collapsed *only* when one of its two remaining
+        // incident edges is itself a previously-flagged candidate edge. This
+        // builds the "cup": a floor quad whose four edges each carry a
+        // perpendicular standing wall. Extruding the floor with dissolve on
+        // absorbs all four walls into the perpendicular surrounds, killing every
+        // flagged `e_old`. Each floor corner ends up degree-2, but its two
+        // surviving edges are both non-candidates (the side/vertical edges) — no
+        // flagged candidate edge remains incident. §7.4 must therefore decline
+        // to collapse these verts. Pin that no floor corner is removed: the
+        // dissolve-on vert count equals the dissolve-off count.
+        let build_cup = |mesh: &mut LoopMesh| -> FaceKey {
+            // Floor quad in XY plane (normal +Z).
+            let f0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+            let f1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+            let f2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+            let f3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+            // Top rim verts directly above each floor corner.
+            let t0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+            let t1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 1.0));
+            let t2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
+            let t3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+
+            let e_f01 = mesh.create_edge([f0, f1], EdgeCreateFlags::NONE);
+            let e_f12 = mesh.create_edge([f1, f2], EdgeCreateFlags::NONE);
+            let e_f23 = mesh.create_edge([f2, f3], EdgeCreateFlags::NONE);
+            let e_f30 = mesh.create_edge([f3, f0], EdgeCreateFlags::NONE);
+            let floor = mesh.face_create(
+                &[f0, f1, f2, f3],
+                &[e_f01, e_f12, e_f23, e_f30],
+                FaceCreateFlags::NONE,
+            );
+
+            // Four vertical side walls, each sharing one floor edge and standing
+            // perpendicular to the floor (normal in the XY plane).
+            let mut wall = |a: VertexKey, b: VertexKey, ta: VertexKey, tb: VertexKey, shared: EdgeKey| {
+                let e_a_ta = mesh.create_edge([a, ta], EdgeCreateFlags::NO_DUPLICATE);
+                let e_ta_tb = mesh.create_edge([ta, tb], EdgeCreateFlags::NO_DUPLICATE);
+                let e_tb_b = mesh.create_edge([tb, b], EdgeCreateFlags::NO_DUPLICATE);
+                mesh.face_create(&[a, ta, tb, b], &[e_a_ta, e_ta_tb, e_tb_b, shared], FaceCreateFlags::NONE);
+            };
+            wall(f0, f1, t0, t1, e_f01);
+            wall(f1, f2, t1, t2, e_f12);
+            wall(f2, f3, t2, t3, e_f23);
+            wall(f3, f0, t3, t0, e_f30);
+            floor
+        };
+
+        let mut mesh_off = LoopMesh::new();
+        let floor_off = build_cup(&mut mesh_off);
+        mesh_off.extrude_region_ex_dissolve_ortho(&[floor_off], false, false);
+        let verts_off = mesh_off.totvert();
+
+        let mut mesh_on = LoopMesh::new();
+        let floor_on = build_cup(&mut mesh_on);
+        let floor_corner_positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        mesh_on.extrude_region_ex_dissolve_ortho(&[floor_on], false, true);
+        let verts_on = mesh_on.totvert();
+
+        // Walls were absorbed (faces drop), but no floor corner is collapsed:
+        // none of them retains a flagged candidate edge, so §7.4 leaves them.
+        assert_eq!(
+            verts_on, verts_off,
+            "degree-2 verts with no flagged candidate edge must not collapse: \
+             on={verts_on} off={verts_off}"
+        );
+        let live: HashSet<[u32; 3]> = mesh_on
+            .vert_keys()
+            .into_iter()
+            .map(|v| pos_key(mesh_on.vertex_position(v)))
+            .collect();
+        for p in floor_corner_positions {
+            assert!(
+                live.contains(&pos_key(p)),
+                "floor corner {p:?} is degree-2 with no candidate edge incident \
+                 and must survive the §7.4 stage"
+            );
+        }
+        mesh_on.validate_topology();
     }
 
     #[test]
