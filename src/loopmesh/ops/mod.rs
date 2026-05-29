@@ -8,6 +8,7 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod delete;
 mod dissolve_edges;
 mod dissolve_faces;
 mod dissolve_verts;
@@ -18,6 +19,7 @@ mod inset_individual;
 mod inset_region;
 mod mean_value;
 
+pub use delete::DeleteContext;
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
 pub use dissolve_verts::DissolveVertsParams;
