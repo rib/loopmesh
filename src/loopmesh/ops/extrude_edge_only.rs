@@ -69,10 +69,43 @@ impl LoopMesh {
         use_normal_flip: bool,
         ledger: &mut ExtrudeVertDupLedger,
     ) -> ExtrudeResult {
+        self.extrude_edge_only_seeded_exclude(edges, &[], use_normal_flip, ledger)
+    }
+
+    /// [`extrude_edge_only_seeded`](Self::extrude_edge_only_seeded) honouring an
+    /// `edges_exclude` set (EXTRUDE.md §4.6 / §8.3).
+    ///
+    /// Each input edge is still duplicated (verts and edge), so a shared corner
+    /// stays consistent across passes through `ledger`. The exclusion only
+    /// changes what happens at *wall* time:
+    ///
+    /// - An **excluded wire** edge (no face on either side) takes the §4.6
+    ///   *before wall construction* kill: its freshly-created duplicate edge is
+    ///   killed outright, and any duplicate endpoint vert the kill leaves with
+    ///   no other incident edge is killed too. No wall. The original wire pair
+    ///   is untouched. This is the §8.3 wire-boundary kill.
+    /// - An **excluded face-bounded** edge keeps its duplicate edge/vert pair
+    ///   but builds no wall (§4.6 second bullet).
+    /// - A non-excluded edge behaves exactly as the plain seeded pass.
+    pub(crate) fn extrude_edge_only_seeded_exclude(
+        &mut self,
+        edges: &[EdgeKey],
+        edges_exclude: &[EdgeKey],
+        use_normal_flip: bool,
+        ledger: &mut ExtrudeVertDupLedger,
+    ) -> ExtrudeResult {
         let do_loop_cd = !self.loop_attribs.is_empty();
 
         let vert_watermark = self.vertices.key_watermark();
         let edge_watermark = self.edges.key_watermark();
+
+        let mut edge_excluded: Vec<bool> = vec![false; edge_watermark];
+        for &e in edges_exclude {
+            let slot = e.as_usize();
+            if slot < edge_watermark {
+                edge_excluded[slot] = true;
+            }
+        }
 
         // ---- Phase 1: tag the input edges and their endpoints. Dedup verts and
         //               edges via slab-indexed presence flags. ----
@@ -177,6 +210,10 @@ impl LoopMesh {
         // Side edges this pass freshly created (a reused, ledger-seeded edge is
         // owned by the pass that minted it, so it is not reported again here).
         let mut side_edges_out: Vec<EdgeKey> = Vec::new();
+        // §8.3 wire-boundary kill drops some just-minted duplicates; their slots
+        // are excluded from the output maps so callers never see a dead element.
+        let mut edge_dup_killed: Vec<bool> = vec![false; edge_watermark];
+        let mut vert_dup_killed: Vec<bool> = vec![false; vert_watermark];
 
         for slot in 0..edge_watermark {
             let source = match &edge_source[slot] {
@@ -188,6 +225,29 @@ impl LoopMesh {
             let v0_new = vert_to_dup[v0_old.as_usize()];
             let v1_new = vert_to_dup[v1_old.as_usize()];
             let e_new = edge_to_dup[slot];
+
+            // §4.6 / §8.3: an excluded edge builds no wall. A non-wire excluded
+            // edge keeps its duplicate edge/verts; a wire excluded edge (no
+            // surround loop) would otherwise leave its duplicate as a stranded
+            // wire, so the *before wall construction* kill removes the duplicate
+            // edge outright, plus any duplicate endpoint the kill leaves with an
+            // empty disk. The original wire pair is untouched. These killed
+            // duplicates are not recorded in the output maps below.
+            if edge_excluded[slot] {
+                if source.source_loop_at.is_empty() {
+                    self.edge_kill(e_new);
+                    edge_dup_killed[slot] = true;
+                    for (endpoint_old, endpoint_dup) in
+                        [(v0_old, v0_new), (v1_old, v1_new)]
+                    {
+                        if self.vertex_disk_iter(endpoint_dup).next().is_none() {
+                            self.vertex_kill(endpoint_dup);
+                            vert_dup_killed[endpoint_old.as_usize()] = true;
+                        }
+                    }
+                }
+                continue;
+            }
 
             // §5 vert order. `a_is_v0` decides which endpoint leads the wall's
             // loop on the original edge; `use_normal_flip` swaps the two
@@ -262,13 +322,13 @@ impl LoopMesh {
         // Build the output maps in dense-index order.
         let mut vert_map_out: Vec<(VertexKey, VertexKey)> = Vec::new();
         for slot in 0..vert_watermark {
-            if vert_in_input[slot] {
+            if vert_in_input[slot] && !vert_dup_killed[slot] {
                 vert_map_out.push((VertexKey::from_usize(slot), vert_to_dup[slot]));
             }
         }
         let mut edge_map_out: Vec<(EdgeKey, EdgeKey)> = Vec::new();
         for slot in 0..edge_watermark {
-            if edge_in_input[slot] {
+            if edge_in_input[slot] && !edge_dup_killed[slot] {
                 edge_map_out.push((EdgeKey::from_usize(slot), edge_to_dup[slot]));
             }
         }

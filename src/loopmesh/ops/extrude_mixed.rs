@@ -86,6 +86,46 @@ impl LoopMesh {
         use_keep_orig: bool,
         use_normal_flip: bool,
     ) -> ExtrudeMixedResult {
+        self.extrude_region_mixed_ex_exclude(
+            faces,
+            edges,
+            verts,
+            &[],
+            use_keep_orig,
+            use_normal_flip,
+        )
+    }
+
+    /// [`extrude_region_mixed_ex`](Self::extrude_region_mixed_ex) with an
+    /// `edges_exclude` set (EXTRUDE.md §4.6 / §8.3).
+    ///
+    /// An edge in `edges_exclude` gets no side wall built between its original
+    /// and its duplicate. For a **wire** excluded edge — one routed to the
+    /// edge-only pass with no face on either side (region radial 0) — the
+    /// exclusion is stronger: per §4.6's *before wall construction* check the
+    /// edge is still duplicated, but that duplicate edge is then **killed**
+    /// outright, along with any duplicate endpoint verts the kill leaves
+    /// orphaned (no other incident edge). The original wire pair is left in
+    /// place. This is the §8.3 wire-boundary kill — distinct from the plain
+    /// wall-suppression of a face-bounded excluded edge, which keeps its
+    /// duplicate pair and merely skips the wall.
+    ///
+    /// An excluded edge that belongs to an input face's boundary is owned by
+    /// the region pass; the exclusion is forwarded there as a wall-suppression
+    /// (`extrude_region_exclude`), so a boundary edge of the lifted region gets
+    /// no wall. An excluded edge naming an interior region edge is a silent
+    /// no-op (§8.9). An excluded edge that is *not* wire and *not* on an input
+    /// face (a face-bounded loose edge routed to the edge-only pass) keeps its
+    /// duplicate pair and only skips the wall.
+    pub fn extrude_region_mixed_ex_exclude(
+        &mut self,
+        faces: &[FaceKey],
+        edges: &[EdgeKey],
+        verts: &[VertexKey],
+        edges_exclude: &[EdgeKey],
+        use_keep_orig: bool,
+        use_normal_flip: bool,
+    ) -> ExtrudeMixedResult {
         let vert_watermark = self.vertices.key_watermark();
         let edge_watermark = self.edges.key_watermark();
 
@@ -101,6 +141,18 @@ impl LoopMesh {
                 let e = self.loops.get(l).edge;
                 vert_on_face[v.as_usize()] = true;
                 edge_on_face[e.as_usize()] = true;
+            }
+        }
+
+        // Excluded edges that belong to an input face's boundary are owned by
+        // the region pass; forward them there as wall-suppressions (§4.6 /
+        // §8.9). Routed (non-face) excluded edges are handled by the edge-only
+        // pass below.
+        let mut face_excluded: SmallVec<[EdgeKey; 8]> = SmallVec::new();
+        for &e in edges_exclude {
+            let slot = e.as_usize();
+            if slot < edge_watermark && edge_on_face[slot] {
+                face_excluded.push(e);
             }
         }
 
@@ -155,8 +207,12 @@ impl LoopMesh {
         let mut ledger = ExtrudeVertDupLedger::new(vert_watermark);
 
         if !faces.is_empty() {
-            let region =
-                self.extrude_region_exclude(faces, &[], use_keep_orig, use_normal_flip);
+            let region = self.extrude_region_exclude(
+                faces,
+                &face_excluded,
+                use_keep_orig,
+                use_normal_flip,
+            );
             // Seed the ledger from the region result: each duplicated source
             // vert, plus the vertical edge the region lifted at it (if any —
             // an interior region vert has no wall and thus no vertical edge,
@@ -176,8 +232,12 @@ impl LoopMesh {
         }
 
         if !routed_edges.is_empty() {
-            let edge_res =
-                self.extrude_edge_only_seeded(&routed_edges, use_normal_flip, &mut ledger);
+            let edge_res = self.extrude_edge_only_seeded_exclude(
+                &routed_edges,
+                edges_exclude,
+                use_normal_flip,
+                &mut ledger,
+            );
             // The seeded pass reuses any cross-kind shared corner's duplicate
             // and vertical edge, so its vert_map / side_edges already exclude
             // the doubly-counted entries. A shared corner therefore appears in
@@ -440,6 +500,129 @@ mod tests {
         assert_eq!(result.wire_edges.len(), 0, "edge endpoint is not isolated");
         assert_eq!(result.vert_map.len(), 2, "both edge endpoints duplicated once");
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn mixed_excluded_wire_edge_kills_duplicate() {
+        // §4.6 / §8.3: a faceless wire edge routed through the mixed input AND
+        // named in edges_exclude has its lifted duplicate killed outright, plus
+        // any orphaned duplicate endpoint verts. The original wire pair stays;
+        // no wall, no duplicate wire are produced for it.
+        let mut mesh = LoopMesh::new();
+        let (face, wire, _loose) = face_loose_edge_and_vert(&mut mesh);
+
+        // Pre-state: 4 quad verts + 2 wire verts + 1 loose vert = 7 verts.
+        assert_eq!(mesh.totvert(), 7);
+
+        let result = mesh.extrude_region_mixed_ex_exclude(
+            &[face],
+            &[wire],
+            &[],
+            &[wire],
+            false,
+            false,
+        );
+
+        // Only the 4 quad verts are duplicated; the wire's duplicate was killed
+        // along with its two orphaned duplicate endpoints. 7 + 4 = 11 verts.
+        assert_eq!(mesh.totvert(), 11, "excluded-wire duplicate verts killed");
+        assert_eq!(result.vert_map.len(), 4, "only the 4 face verts survive in the map");
+        // No wire wall, no contribution from the excluded wire edge.
+        assert_eq!(result.wall_faces.len(), 4, "4 face walls, no wire wall");
+        // 1 cap (re-anchored original quad) + 4 walls = 5 faces.
+        assert_eq!(mesh.totface(), 5, "5 faces after the wire kill");
+
+        // The original wire edge is still present and faceless.
+        let [w0, w1] = mesh.edge_vertices(wire);
+        assert!(mesh.query_edge_exists(w0, w1).is_some(), "original wire kept");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn mixed_non_excluded_wire_edge_lifts_duplicate() {
+        // Contrast with the excluded case: the SAME fixture and wire edge with
+        // an EMPTY edges_exclude lifts the wire into a duplicate pair + wall,
+        // so the result has strictly more verts and faces than the kill case.
+        let mut mesh = LoopMesh::new();
+        let (face, wire, _loose) = face_loose_edge_and_vert(&mut mesh);
+
+        assert_eq!(mesh.totvert(), 7);
+
+        let result = mesh.extrude_region_mixed_ex_exclude(
+            &[face],
+            &[wire],
+            &[],
+            &[],
+            false,
+            false,
+        );
+
+        // 4 quad verts + 2 wire-endpoint verts duplicated = 6 dups, 13 verts.
+        assert_eq!(mesh.totvert(), 13, "wire endpoints duplicated when not excluded");
+        assert_eq!(result.vert_map.len(), 6);
+        // 4 face walls + 1 wire wall.
+        assert_eq!(result.wall_faces.len(), 5, "wire contributes a wall");
+        // 1 cap + 4 face walls + 1 wire wall = 6 faces.
+        assert_eq!(mesh.totface(), 6);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn mixed_excluded_face_boundary_edge_suppresses_wall_only() {
+        // §4.6 / §8.9: an excluded edge that is on the input face's boundary is
+        // owned by the region pass. The exclusion suppresses that one wall but
+        // keeps the duplicate region intact (no kill — the edge is not wire).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let boundary = mesh
+            .query_edge_exists(fv[0], fv[1])
+            .expect("perimeter edge v0-v1");
+
+        let result = mesh.extrude_region_mixed_ex_exclude(
+            &[face],
+            &[],
+            &[],
+            &[boundary],
+            false,
+            false,
+        );
+
+        // 3 walls instead of 4: the excluded boundary edge builds no wall.
+        assert_eq!(result.wall_faces.len(), 3, "one wall suppressed");
+        // All four quad verts still duplicated (no kill).
+        assert_eq!(result.vert_map.len(), 4);
+        // 1 cap + 3 walls = 4 faces.
+        assert_eq!(mesh.totface(), 4);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn mixed_empty_exclude_matches_plain_mixed() {
+        // An empty edges_exclude reproduces extrude_region_mixed exactly.
+        let mut mesh_a = LoopMesh::new();
+        let (face_a, wire_a, loose_a) = face_loose_edge_and_vert(&mut mesh_a);
+        let res_a =
+            mesh_a.extrude_region_mixed(&[face_a], &[wire_a], &[loose_a]);
+
+        let mut mesh_b = LoopMesh::new();
+        let (face_b, wire_b, loose_b) = face_loose_edge_and_vert(&mut mesh_b);
+        let res_b = mesh_b.extrude_region_mixed_ex_exclude(
+            &[face_b],
+            &[wire_b],
+            &[loose_b],
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(res_a.vert_map.len(), res_b.vert_map.len());
+        assert_eq!(res_a.edge_map.len(), res_b.edge_map.len());
+        assert_eq!(res_a.wall_faces.len(), res_b.wall_faces.len());
+        assert_eq!(res_a.wire_edges.len(), res_b.wire_edges.len());
+        assert_eq!(mesh_a.totvert(), mesh_b.totvert());
+        assert_eq!(mesh_a.totface(), mesh_b.totface());
+        mesh_b.validate_topology();
     }
 
     #[test]
