@@ -8,6 +8,7 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod collapse;
 mod connect_verts;
 mod delete;
 mod dissolve_edges;
