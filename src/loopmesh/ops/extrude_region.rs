@@ -170,9 +170,38 @@ impl LoopMesh {
         let wall_set: std::collections::HashSet<FaceKey> =
             result.wall_faces.iter().copied().collect();
 
-        // §7.2: flag the candidate edges and verts, and queue the wall/surround
-        // join for each ortho boundary edge. We snapshot the join work before
-        // performing any kill so the radial walks read pre-merge topology.
+        // The wall's two vertical side edges run from an original boundary vert
+        // up to its duplicate. §7.3 records the wall's *near-side* vertical as a
+        // collapse-candidate edge; across all of a vert's flanking dissolved
+        // walls, that vert's own vertical is always one such near-side, so
+        // mapping each original vert to its vertical edge and flagging the
+        // verticals of every dissolved wall reproduces the same flagged set.
+        //
+        // `vert_map`'s first column is the *original* vertex (see the
+        // `vert_map_out` build), so an O(B) `old → dup` set is enough to find
+        // each side edge's original endpoint without an inner endpoint scan.
+        let dup_of_old: std::collections::HashMap<VertexKey, VertexKey> = result
+            .vert_map
+            .iter()
+            .map(|&(old_v, dup_v)| (old_v, dup_v))
+            .collect();
+        let mut vertical_at_old: std::collections::HashMap<VertexKey, EdgeKey> =
+            std::collections::HashMap::with_capacity(result.side_edges.len());
+        for &side in &result.side_edges {
+            let [a, b] = self.edge_vertices(side);
+            // The original endpoint is whichever endpoint is a map key and pairs
+            // with the duplicate at the far end; the other endpoint is the dup.
+            if dup_of_old.get(&a) == Some(&b) {
+                vertical_at_old.insert(a, side);
+            } else if dup_of_old.get(&b) == Some(&a) {
+                vertical_at_old.insert(b, side);
+            }
+        }
+
+        // §7.2/§7.3: flag the candidate edges, append the candidate verts in
+        // boundary-walk order (deduped), and queue the wall/surround join for
+        // each ortho boundary edge. We snapshot the join work before performing
+        // any kill so the radial walks read pre-merge topology.
         let mut candidate_edges: std::collections::HashSet<EdgeKey> =
             std::collections::HashSet::new();
         let mut candidate_verts: SmallVec<[VertexKey; 16]> = SmallVec::new();
@@ -215,11 +244,17 @@ impl LoopMesh {
                 continue;
             }
 
-            // Flag this wall's two horizontal edges (original + duplicate) and
-            // both endpoint verts as ortho-dissolve candidates.
+            // §7.3: flag `e_old` (about to be killed by the join) and the
+            // wall's vertical side edges as collapse-candidate edges; the
+            // verticals survive the join and become the edge a §7.4 collapse is
+            // taken along. Append both endpoints of `e_old` to the ordered
+            // candidate-vert list, each at most once.
+            let _ = e_dup;
             candidate_edges.insert(e_old);
-            candidate_edges.insert(e_dup);
             for v in self.edge_vertices(e_old) {
+                if let Some(&vertical) = vertical_at_old.get(&v) {
+                    candidate_edges.insert(vertical);
+                }
                 if !candidate_verts.contains(&v) {
                     candidate_verts.push(v);
                 }
@@ -246,15 +281,20 @@ impl LoopMesh {
                 self.euler_join_face_kill_edge(surround_face, wall_face, e_old);
         }
 
-        // §7.4: collapse the candidate verts that the merges have reduced to
-        // edge-pair (degree-2) vertices. §7.4 only authorises collapsing such a
-        // vert when one of its two incident edges is itself a previously-flagged
-        // candidate edge; the collapse then runs along that candidate edge. A
-        // degree-2 vert whose neither edge is a flagged candidate is left alone
-        // — collapsing along an arbitrary disk edge is outside §7.4's contract
-        // and against its stated conservatism. A vert that still carries other
-        // edges (because some wall there did not ortho-dissolve) is likewise
-        // left alone.
+        // §7.4: walk the candidate-vert list once and collapse each vert whose
+        // *live* disk cycle now stands at exactly two edges — an edge-pair vert.
+        // The live degree is the sole decision: there is no closed-versus-open
+        // signal and no count of how many walls dissolved here. A vert that
+        // still carries a surviving wall vertical, an un-dissolved cap edge, or
+        // a third surround edge is degree ≥ 3 and is left untouched. The
+        // candidate-edge flag is consulted only *after* the decision, to choose
+        // *which* survivor the collapse runs along: the flagged survivor (the
+        // wall's vertical) if either survivor is flagged, otherwise the vert's
+        // first disk edge.
+        //
+        // The §7.4 degree-1/wire-fan endpoint collapse is out of scope for this
+        // row; the edge-collapse kernel only fuses an exactly-degree-2 vert (see
+        // §7.4), so a degree-≤1 candidate is left intact here.
         for &v in &candidate_verts {
             if self.vertices.try_get(v).is_none() {
                 continue;
@@ -263,10 +303,12 @@ impl LoopMesh {
                 continue;
             }
             let incident: SmallVec<[EdgeKey; 2]> = self.vertex_disk_iter(v).collect();
-            let kill_edge = incident.iter().copied().find(|e| candidate_edges.contains(e));
-            if let Some(e_kill) = kill_edge {
-                self.vert_collapse_edge(e_kill, v);
-            }
+            let kill_edge = incident
+                .iter()
+                .copied()
+                .find(|e| candidate_edges.contains(e))
+                .unwrap_or(incident[0]);
+            self.vert_collapse_edge(kill_edge, v);
         }
     }
 
@@ -1892,18 +1934,19 @@ mod tests {
     }
 
     #[test]
-    fn extrude_region_dissolve_ortho_degree2_no_candidate_edge_not_collapsed() {
-        // §7.4 contract: a candidate boundary vert reduced to degree-2 by the
-        // ortho-join merges is collapsed *only* when one of its two remaining
-        // incident edges is itself a previously-flagged candidate edge. This
-        // builds the "cup": a floor quad whose four edges each carry a
-        // perpendicular standing wall. Extruding the floor with dissolve on
-        // absorbs all four walls into the perpendicular surrounds, killing every
-        // flagged `e_old`. Each floor corner ends up degree-2, but its two
-        // surviving edges are both non-candidates (the side/vertical edges) — no
-        // flagged candidate edge remains incident. §7.4 must therefore decline
-        // to collapse these verts. Pin that no floor corner is removed: the
-        // dissolve-on vert count equals the dissolve-off count.
+    fn extrude_region_dissolve_ortho_closed_cup_collapses_floor_corners() {
+        // §7.4 closed-cup case (EXTRUDE.md §7.4 worked trace, §14): a "cup" —
+        // a floor quad whose four edges each carry a perpendicular standing wall
+        // — is *not* spared. Extruding the floor with dissolve on absorbs all
+        // four walls into the perpendicular surrounds (each join kills the floor
+        // edge it ran along), so every floor corner is driven to a live disk
+        // degree of 2: its pre-existing cup vertical edge and the one new wall
+        // vertical. The live-degree-≤-2 test fires at all four corners and each
+        // floor corner fuses into its duplicate along the flagged wall vertical.
+        // There is no "cup declines" exception — the discriminator is live
+        // degree, not a closed/open distinction. Pin the vert count: starting
+        // from 8 verts, the floor's 4 duplicates bring it to 12, and the 4
+        // corner collapses bring it back to 8.
         let build_cup = |mesh: &mut LoopMesh| -> FaceKey {
             // Floor quad in XY plane (normal +Z).
             let f0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
@@ -1941,13 +1984,10 @@ mod tests {
             floor
         };
 
-        let mut mesh_off = LoopMesh::new();
-        let floor_off = build_cup(&mut mesh_off);
-        mesh_off.extrude_region_ex_dissolve_ortho(&[floor_off], false, false);
-        let verts_off = mesh_off.totvert();
-
         let mut mesh_on = LoopMesh::new();
         let floor_on = build_cup(&mut mesh_on);
+        // Cup starts with 8 verts (4 floor + 4 top rim).
+        assert_eq!(mesh_on.totvert(), 8);
         let floor_corner_positions = [
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
@@ -1955,15 +1995,20 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
         ];
         mesh_on.extrude_region_ex_dissolve_ortho(&[floor_on], false, true);
-        let verts_on = mesh_on.totvert();
 
-        // Walls were absorbed (faces drop), but no floor corner is collapsed:
-        // none of them retains a flagged candidate edge, so §7.4 leaves them.
+        // All four walls absorbed and all four floor corners collapsed into
+        // their duplicates: 8 → 12 (floor duplicates) → 8 (corner collapses).
         assert_eq!(
-            verts_on, verts_off,
-            "degree-2 verts with no flagged candidate edge must not collapse: \
-             on={verts_on} off={verts_off}"
+            mesh_on.totvert(),
+            8,
+            "every floor corner must collapse: the cup is not spared (§7.4)"
         );
+        // Each original floor-corner position is now occupied by the duplicate
+        // (the collapse fuses the original up its vertical into the duplicate at
+        // the same coordinate), but the *original* floor corners are gone — the
+        // count being back to 8 with the rim still present pins this. Confirm
+        // every floor corner position still resolves to exactly one live vert
+        // (the surviving duplicate) and no floor edge survives uncollapsed.
         let live: HashSet<[u32; 3]> = mesh_on
             .vert_keys()
             .into_iter()
@@ -1972,11 +2017,119 @@ mod tests {
         for p in floor_corner_positions {
             assert!(
                 live.contains(&pos_key(p)),
-                "floor corner {p:?} is degree-2 with no candidate edge incident \
-                 and must survive the §7.4 stage"
+                "floor corner position {p:?} should still hold the surviving \
+                 duplicate after the §7.4 collapse"
             );
         }
         mesh_on.validate_topology();
+    }
+
+    // A cap quad meeting two perpendicular surrounds at a single shared corner,
+    // for the §7.4 live-collapse test. The cap lies flat in XY (normal +Z). Two
+    // surrounds stand vertically and share the cap's corner `c0` *and* the
+    // vertical edge c0–t0 rising from it. Surround A shares cap edge c0–c1
+    // (folded up in the y=0 plane, normal ±Y); surround B shares cap edge c3–c0
+    // (folded up in the x=0 plane, normal ±X). Both surround normals are
+    // perpendicular to +Z. The cap's other two edges (c1–c2, c2–c3) are
+    // mesh-boundary. Returns the cap face.
+    fn corner_of_two_ortho_walls(mesh: &mut LoopMesh) -> FaceKey {
+        let c0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let c1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let c3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // Shared vertical above the shared corner c0, plus one far vert per wall.
+        let t0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let a1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 1.0));
+        let b1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+
+        let e_c01 = mesh.create_edge([c0, c1], EdgeCreateFlags::NONE);
+        let e_c12 = mesh.create_edge([c1, c2], EdgeCreateFlags::NONE);
+        let e_c23 = mesh.create_edge([c2, c3], EdgeCreateFlags::NONE);
+        let e_c30 = mesh.create_edge([c3, c0], EdgeCreateFlags::NONE);
+        let cap = mesh.face_create(
+            &[c0, c1, c2, c3],
+            &[e_c01, e_c12, e_c23, e_c30],
+            FaceCreateFlags::NONE,
+        );
+
+        // Shared surround-surround vertical edge at the shared corner.
+        let e_c0t0 = mesh.create_edge([c0, t0], EdgeCreateFlags::NONE);
+
+        // Surround A on c0–c1 (y=0, XZ plane). Wound so its loop on the shared
+        // edge runs c1->c0, opposite the cap's c0->c1 loop (a coherently-oriented
+        // shared edge): c1 -> c0 -> t0 -> a1.
+        let e_t0a1 = mesh.create_edge([t0, a1], EdgeCreateFlags::NONE);
+        let e_a1c1 = mesh.create_edge([a1, c1], EdgeCreateFlags::NONE);
+        mesh.face_create(
+            &[c1, c0, t0, a1],
+            &[e_c01, e_c0t0, e_t0a1, e_a1c1],
+            FaceCreateFlags::NONE,
+        );
+
+        // Surround B on c3–c0 (x=0, YZ plane). Wound so its loop on the shared
+        // edge runs c0->c3, opposite the cap's c3->c0 loop: c0 -> c3 -> b1 -> t0,
+        // reusing the shared c0–t0 vertical.
+        let e_c3b1 = mesh.create_edge([c3, b1], EdgeCreateFlags::NONE);
+        let e_b1t0 = mesh.create_edge([b1, t0], EdgeCreateFlags::NONE);
+        mesh.face_create(
+            &[c0, c3, b1, t0],
+            &[e_c30, e_c3b1, e_b1t0, e_c0t0],
+            FaceCreateFlags::NONE,
+        );
+
+        cap
+    }
+
+    #[test]
+    fn extrude_region_dissolve_ortho_live_collapse_shared_corner() {
+        // §7.4 live-collapse case (EXTRUDE.md §7.4 worked trace, §14): the cap
+        // meets two orthogonal surrounds at the single shared corner c0. With
+        // valid normals both flanking walls dissolve; both joins kill the cap
+        // edges at c0, leaving c0 with only the shared surround-surround vertical
+        // and the one new wall vertical — live degree 2 — so it collapses,
+        // fusing up its flagged wall vertical into its duplicate. The cap's other
+        // two corners (c1, c3) each have one incident wall dissolved (so they
+        // land on the candidate list) but retain a surviving mesh-boundary wall
+        // vertical plus their other surround edge → live degree 3 → declined. c2
+        // has no dissolved wall incident, so it never reaches the list. This one
+        // fixture therefore exercises both the collapse branch and the declined
+        // branch.
+        let mut mesh = LoopMesh::new();
+        let cap = corner_of_two_ortho_walls(&mut mesh);
+        // 4 cap + t0 + a1 + b1 = 7 verts.
+        assert_eq!(mesh.totvert(), 7);
+        let shared_corner = Vec3::new(0.0, 0.0, 0.0);
+        let declined_corners = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
+
+        mesh.extrude_region_ex_dissolve_ortho(&[cap], false, true);
+
+        // 7 → 11 (4 cap duplicates) → 10 (the shared corner collapses once).
+        assert_eq!(
+            mesh.totvert(),
+            10,
+            "exactly the shared corner collapses; the two degree-3 corners do not"
+        );
+
+        let live: HashSet<[u32; 3]> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| pos_key(mesh.vertex_position(v)))
+            .collect();
+        // The two declined corners survive (degree 3, kept by the live-degree
+        // guard).
+        for p in declined_corners {
+            assert!(
+                live.contains(&pos_key(p)),
+                "declined degree-3 corner {p:?} must survive the §7.4 stage"
+            );
+        }
+        // The shared corner position still resolves to a live vert: the
+        // collapse fuses the original up into its duplicate at the same coord.
+        assert!(
+            live.contains(&pos_key(shared_corner)),
+            "shared-corner position should hold the surviving duplicate after collapse"
+        );
+        mesh.validate_topology();
     }
 
     #[test]
