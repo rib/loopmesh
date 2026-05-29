@@ -11,6 +11,7 @@
 mod collapse;
 mod connect_verts;
 mod delete;
+mod dissolve_degenerate;
 mod dissolve_edges;
 mod dissolve_faces;
 mod dissolve_verts;
