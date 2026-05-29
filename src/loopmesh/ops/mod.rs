@@ -13,6 +13,7 @@ mod dissolve_edges;
 mod dissolve_faces;
 mod dissolve_verts;
 mod extrude_discrete;
+mod extrude_edge_only;
 mod extrude_region;
 mod face_poke;
 mod face_triangulate;
