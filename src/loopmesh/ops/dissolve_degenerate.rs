@@ -40,10 +40,11 @@ impl LoopMesh {
     ///
     /// `dist` is a single tolerance shared by both passes (world units).
     ///
-    /// The §5.3 / §7 collapse batches delegate to [`Self::collapse`]. The
-    /// `uvs = true` per-loop customdata blend the guide names in §5.2 is not yet
-    /// implemented on the `collapse` side; this operator passes `uvs = false`
-    /// until that blend lands. Topology and survivor positions are unaffected.
+    /// The §5.3 / §7 collapse batches delegate to [`Self::collapse`] with
+    /// `uvs = true` (§5.2): the per-loop customdata blend is part of the
+    /// intended cleanup semantics, so each batch's collapse sites have their
+    /// has-math loop layers (UVs / colours) snapped to the island midpoint.
+    /// Topology and survivor positions are unaffected by the flag.
     pub fn dissolve_degenerate(&mut self, edges: &[EdgeKey], dist: f32) {
         // §1 / §8 — an empty candidate set marks nothing and walks nothing.
         if edges.is_empty() {
@@ -80,7 +81,7 @@ impl LoopMesh {
         // §5.3 — first collapse batch over the §5-flagged edges.
         if any_short {
             let flagged = self.collect_pending_edges(pending);
-            self.collapse(&flagged, false);
+            self.collapse(&flagged, true);
         }
 
         // §6 — ear-clip walk over every surviving input edge.
@@ -100,7 +101,7 @@ impl LoopMesh {
         // §7 — second collapse batch over the §6-flagged edges.
         if any_ears {
             let flagged = self.collect_pending_edges(pending);
-            self.collapse(&flagged, false);
+            self.collapse(&flagged, true);
         }
 
         self.pop_loop_op_flag_layer(tested);
