@@ -18,6 +18,7 @@ mod extrude_edge_only;
 mod extrude_mixed;
 mod extrude_region;
 mod extrude_vert_indiv;
+mod find_doubles;
 mod face_poke;
 mod face_triangulate;
 mod inset_individual;
