@@ -8,10 +8,10 @@ use crate::loopmesh::*;
 /// upward to bounded higher-dimensional elements, or not at all) and which of
 /// those elements are killed versus spared.
 ///
-/// The four face-/vert-seeded modes are implemented today (§4 / §5.1 / §5.2 /
-/// §6). The remaining three modes (`edges`, `edges+faces`, `tagged-only`) are
-/// documented in the guide but not yet built; new variants slot in here without
-/// disturbing the existing ones.
+/// The vert-, edge-, and face-seeded modes are implemented today (§4 / §5.1 /
+/// §5.2 / §6 / §7 / §7.5). The remaining mode (`tagged-only`) is documented in
+/// the guide but not yet built; new variants slot in here without disturbing
+/// the existing ones.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeleteContext {
     /// Kill the seeded verts, and — entirely via the kernel vert-kill's
@@ -20,6 +20,19 @@ pub enum DeleteContext {
     /// non-seed vert the cascade leaves loose is **not** swept up: it stays as
     /// an isolated point. Seed is a vert slice. (§6.)
     Verts,
+    /// Kill the seeded edges, and — via the kernel edge-kill's *unconditional*
+    /// upward cascade — every face on a seed edge's radial cycle. Then a
+    /// *conditional* downward sweep removes a **seed-edge endpoint** iff it is
+    /// left loose (empty disk — no remaining incident edge). An endpoint a
+    /// surviving edge still holds is kept (the §7.2 keep-alive), and a vert that
+    /// was not a seed endpoint is never touched. Seed is an edge slice. (§7.)
+    Edges,
+    /// Like [`DeleteContext::Edges`], but **skip** the loose-endpoint sweep:
+    /// kill the seeded edges and the faces on them, yet keep *every* vert — even
+    /// a seed endpoint left with an empty disk stays as an isolated point. The
+    /// single dropped sweep is the entire Edges-vs-EdgesFaces distinction. Seed
+    /// is an edge slice. (§7.5.)
+    EdgesFaces,
     /// Kill the seeded faces, plus any boundary edge / vert used by *no*
     /// surviving face — geometry the deleted region solely owned. Edges and
     /// verts still shared with an out-of-set face are spared. (§4.)
@@ -40,9 +53,10 @@ pub enum DeleteContext {
 /// The guide's `geom` buffer (`DELETE.md` §1) is a mixed verts ∪ edges ∪ faces
 /// set, but each context reads only one dimension of it (§4.1 / §6.1). Rather
 /// than carry an untyped buffer, the seed slice is typed: a `&[FaceKey]` for the
-/// face-seeded contexts and a `&[VertexKey]` for the verts context. This trait
-/// lets the single `delete` entry accept either, dispatching to the right
-/// routine and guarding that the context matches the seed's dimension.
+/// face-seeded contexts, a `&[VertexKey]` for the verts context, and a
+/// `&[EdgeKey]` for the edge-seeded contexts. This trait lets the single
+/// `delete` entry accept any of them, dispatching to the right routine and
+/// guarding that the context matches the seed's dimension.
 pub trait DeleteSeed: Copy {
     #[doc(hidden)]
     fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext);
@@ -57,6 +71,9 @@ impl DeleteSeed for FaceKey {
             DeleteContext::Verts => {
                 panic!("DeleteContext::Verts requires a vert seed, not faces")
             }
+            DeleteContext::Edges | DeleteContext::EdgesFaces => {
+                panic!("DeleteContext::Edges / EdgesFaces require an edge seed, not faces")
+            }
         }
     }
 }
@@ -70,22 +87,42 @@ impl DeleteSeed for VertexKey {
     }
 }
 
+impl DeleteSeed for EdgeKey {
+    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+        match context {
+            DeleteContext::Edges => mesh.delete_edges(seed, true),
+            DeleteContext::EdgesFaces => mesh.delete_edges(seed, false),
+            _ => panic!("an edge seed is only valid with DeleteContext::Edges / EdgesFaces"),
+        }
+    }
+}
+
 impl LoopMesh {
     /// Remove the seeded geometry according to `context`.
     ///
     /// Implements the face- and vert-seeded modes of
     /// `radial-mesh-guides/operators/DELETE.md`. The seed slice is typed to the
     /// dimension the chosen context reads (the guide's mixed `geom` buffer is
-    /// read one-dimension-at-a-time per context — §4.1 / §6.1), so pass a
-    /// `&[FaceKey]` for the face-seeded contexts and a `&[VertexKey]` for
-    /// [`DeleteContext::Verts`]. A mismatched seed/context pair panics (it is a
-    /// caller bug, not an expected mesh state).
+    /// read one-dimension-at-a-time per context — §4.1 / §6.1 / §7.1), so pass a
+    /// `&[FaceKey]` for the face-seeded contexts, a `&[VertexKey]` for
+    /// [`DeleteContext::Verts`], and a `&[EdgeKey]` for
+    /// [`DeleteContext::Edges`] / [`DeleteContext::EdgesFaces`]. A mismatched
+    /// seed/context pair panics (it is a caller bug, not an expected mesh state).
     ///
     /// - [`DeleteContext::Verts`] (§6) — kill the seeded verts and let the
     ///   kernel vert-kill's *unconditional* upward cascade take every incident
     ///   edge and every face on those edges. No mark phase, no downward sweep —
     ///   a non-seed vert left loose by the cascade survives as an isolated point
     ///   (the §6.2 loose-neighbour rule).
+    /// - [`DeleteContext::Edges`] (§7) — kill the seeded edges and let the
+    ///   kernel edge-kill's *unconditional* upward cascade take every face on
+    ///   their radial cycles. Then a conditional loose-endpoint sweep removes a
+    ///   seed-edge endpoint iff it is left with an empty disk; an endpoint a
+    ///   surviving edge still holds is kept (the §7.2 keep-alive).
+    /// - [`DeleteContext::EdgesFaces`] (§7.5) — like [`DeleteContext::Edges`]
+    ///   but with the loose-endpoint sweep skipped, so every vert survives even
+    ///   a seed endpoint left loose. That single dropped sweep is the whole
+    ///   Edges-vs-EdgesFaces difference.
     /// - [`DeleteContext::FacesOnly`] (§5.1) — the non-cascading face sweep.
     ///   Every seeded face header and its loops are freed; every boundary edge
     ///   and vert is left standing as wire. No mark phase.
@@ -130,6 +167,77 @@ impl LoopMesh {
                 self.vertex_kill(vert);
             }
         }
+    }
+
+    /// §7 / §7.5 — kill the seeded edges, their cascaded faces, and (when
+    /// `sweep_loose_endpoints` is set) any seed endpoint left loose.
+    ///
+    /// `edge_kill` (DELETE.md §3) is the upward-cascading primitive: it first
+    /// kills every face on the edge's radial cycle — including a non-manifold
+    /// radial ≥ 3 — then unlinks the edge from its endpoints' disks and frees
+    /// it. So the single edge sweep over the seed subsumes all the face kills;
+    /// no separate face sweep is written (§7.3).
+    ///
+    /// The endpoints are first flushed into a transient mark (the only downward
+    /// marking this context does, and unconditional). After the edge sweep, the
+    /// conditional part runs: a marked endpoint is killed iff its disk is now
+    /// empty (`is_loose()` in guide terms — no remaining incident edge). The
+    /// `is_loose()` guard is the entire behavioural difference from the verts
+    /// context (§7.3): it spares a seed endpoint a surviving non-seed edge still
+    /// anchors (the §7.2 keep-alive), and scopes the sweep to seed endpoints
+    /// only — a third-party vert is never reconsidered.
+    ///
+    /// `DeleteContext::EdgesFaces` (§7.5) passes `sweep_loose_endpoints = false`,
+    /// dropping the loose-endpoint sweep entirely so every vert survives — even
+    /// a seed endpoint left with an empty disk. That single skipped sweep is the
+    /// whole Edges-vs-EdgesFaces distinction.
+    fn delete_edges(&mut self, edges: &[EdgeKey], sweep_loose_endpoints: bool) {
+        let doomed_edge = self.push_edge_op_flag_layer();
+        let seed_endpoint = self.push_vert_op_flag_layer();
+
+        const DOOM: u8 = 0;
+        const ENDPOINT: u8 = 0;
+
+        // Phase 1 — mark the seed edges and flush the mark down to both
+        // endpoints. The endpoint mark scopes the later loose sweep to seed
+        // endpoints only (§7.2 / §7.3).
+        for &edge in edges {
+            if self.edges.try_get(edge).is_none() {
+                continue;
+            }
+            self.edge_op_flag_set(doomed_edge, edge, DOOM);
+            let [v0, v1] = self.edge_vertices(edge);
+            self.vert_op_flag_set(seed_endpoint, v0, ENDPOINT);
+            self.vert_op_flag_set(seed_endpoint, v1, ENDPOINT);
+        }
+
+        // Phase 2a — sweep the edges. Each edge-kill cascades upward to the
+        // faces on its radial cycle, so this single sweep performs all the face
+        // kills implicitly. The mesh-wide lending iterator re-tests liveness on
+        // each step, so it is kill-safe against faces an earlier kill freed.
+        let mut edge_iter = MeshEdges::default();
+        while let Some(edge) = edge_iter.next(self) {
+            if self.edge_op_flag_test(doomed_edge, edge, DOOM) {
+                self.edge_kill(edge);
+            }
+        }
+
+        // Phase 2b — loose-endpoint sweep (skipped under EdgesFaces, §7.5). Kill
+        // a marked seed endpoint iff its disk is now empty; a marked endpoint a
+        // surviving edge still anchors is left standing (§7.2 keep-alive).
+        if sweep_loose_endpoints {
+            let mut vert_iter = MeshVerts::default();
+            while let Some(vert) = vert_iter.next(self) {
+                if self.vert_op_flag_test(seed_endpoint, vert, ENDPOINT)
+                    && self.vertex_disk_iter(vert).next().is_none()
+                {
+                    self.vertex_kill(vert);
+                }
+            }
+        }
+
+        self.pop_vert_op_flag_layer(seed_endpoint);
+        self.pop_edge_op_flag_layer(doomed_edge);
     }
 
     /// §5.1 — kill exactly the seeded faces, touch nothing else.
@@ -681,6 +789,155 @@ mod tests {
                 "non-shared corner survives as loose point (§6.2)"
             );
         }
+    }
+
+    /// An `n`-page "book": `n` triangles sharing one spine edge `(spine0,
+    /// spine1)`. Each page `i` has its own apex vert. Returns the spine edge and
+    /// its two endpoints.
+    fn build_nonmanifold_book(mesh: &mut LoopMesh, pages: usize) -> (EdgeKey, [VertexKey; 2]) {
+        let spine0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let spine1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let spine = mesh.create_edge([spine0, spine1], EdgeCreateFlags::NONE);
+
+        for i in 0..pages {
+            let apex = mesh.create_vertex(Vec3::new(1.0 + i as f32, 0.5, 0.0));
+            let ring = [spine0, spine1, apex];
+            let mut edges = [EdgeKey::NULL; 3];
+            for j in 0..3 {
+                let a = ring[j];
+                let b = ring[(j + 1) % 3];
+                edges[j] = mesh
+                    .query_edge_exists(a, b)
+                    .unwrap_or_else(|| mesh.create_edge([a, b], EdgeCreateFlags::NONE));
+            }
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        (spine, [spine0, spine1])
+    }
+
+    #[test]
+    fn edges_interior_manifold_edge_keeps_endpoints() {
+        // §7.4 interior-manifold-edge case (scaffold `grid_3x3`). A radial-2 seed
+        // edge shared by two faces: both faces die and the edge dies, but each
+        // endpoint still has three other edges, so both survive. Net: −2 F,
+        // −1 E, 0 V.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 3);
+        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        // A vertical interior edge between faces (1,1) and (1,1)'s right
+        // neighbour: the shared edge of faces[4] (centre) and faces[5].
+        let centre = faces[1 * 3 + 1];
+        let right = faces[1 * 3 + 2];
+        let centre_verts = mesh.face_vert_keys(centre);
+        let right_verts = mesh.face_vert_keys(right);
+        // The shared edge connects the two verts common to both faces.
+        let shared = centre_verts
+            .iter()
+            .flat_map(|&a| centre_verts.iter().map(move |&b| (a, b)))
+            .filter_map(|(a, b)| mesh.query_edge_exists(a, b))
+            .find(|&e| {
+                let [x, y] = mesh.edge_vertices(e);
+                right_verts.contains(&x) && right_verts.contains(&y)
+            })
+            .expect("shared interior edge exists");
+        let [ea, eb] = mesh.edge_vertices(shared);
+
+        mesh.delete(&[shared], DeleteContext::Edges);
+
+        assert_eq!(f0 - mesh.totface(), 2, "both radial faces die");
+        assert_eq!(e0 - mesh.totedge(), 1, "only the seed edge dies");
+        assert_eq!(v0 - mesh.totvert(), 0, "both endpoints kept (§7.2)");
+        assert!(mesh.vertices.try_get(ea).is_some());
+        assert!(mesh.vertices.try_get(eb).is_some());
+    }
+
+    #[test]
+    fn edges_isolated_wire_sweeps_both_endpoints() {
+        // §7.4 isolated-wire case (scaffold `wire_edge_pair`). A lone wire edge
+        // whose endpoints have no other edge: deleting it sweeps up both
+        // endpoints, so the whole 2-vert/1-edge component vanishes.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let wire = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+
+        mesh.delete(&[wire], DeleteContext::Edges);
+
+        assert_eq!(mesh.totedge(), 0, "wire edge gone");
+        assert_eq!(mesh.totvert(), 0, "both loose endpoints swept (§7.4)");
+    }
+
+    #[test]
+    fn edges_nonmanifold_spine_kills_pages_keeps_wire() {
+        // §7.4 non-manifold-edge case (scaffold `nonmanifold_book(3)`). Seeding
+        // the spine edge of a 3-page book kills the edge and *all three*
+        // triangles (the exhaustive radial cascade). Each spine endpoint still
+        // anchors three page edges, so both survive with those page edges left
+        // as wire; no page edge or apex vert is a seed endpoint, so the downward
+        // sweep never reaches them. Remaining: 5 V (2 spine + 3 apex), 6 E (the
+        // page edges), 0 F.
+        let mut mesh = LoopMesh::new();
+        let (spine, [s0, s1]) = build_nonmanifold_book(&mut mesh, 3);
+
+        mesh.delete(&[spine], DeleteContext::Edges);
+
+        assert_eq!(mesh.totface(), 0, "all three pages die (exhaustive cascade)");
+        assert_eq!(mesh.totedge(), 6, "six page edges survive as wire");
+        assert_eq!(mesh.totvert(), 5, "both spine ends + three apexes survive");
+        assert!(mesh.vertices.try_get(s0).is_some(), "spine end kept (§7.2)");
+        assert!(mesh.vertices.try_get(s1).is_some(), "spine end kept (§7.2)");
+        assert!(mesh.edges.try_get(spine).is_none(), "spine edge gone");
+    }
+
+    #[test]
+    fn edges_all_quad_edges_erases_face() {
+        // §7.4 all-edges-of-a-face case (scaffold `quad`). Seeding all four
+        // edges of a lone quad kills the face and all four edges; every corner
+        // then has an empty disk and is swept (it is a seed endpoint). The quad
+        // is erased entirely.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+        let seed = mesh.face_edge_keys(faces[0]);
+
+        mesh.delete(&seed, DeleteContext::Edges);
+
+        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.totedge(), 0);
+        assert_eq!(mesh.totvert(), 0, "all four loose corners swept");
+    }
+
+    #[test]
+    fn edges_faces_isolated_wire_keeps_both_endpoints() {
+        // §7.5 contrast pin (scaffold `wire_edge_pair`). The *same* isolated
+        // wire seed as `edges_isolated_wire_sweeps_both_endpoints`, but under
+        // EdgesFaces the loose-endpoint sweep is skipped, so both endpoints
+        // survive as isolated points even with empty disks. The single dropped
+        // sweep is the entire Edges-vs-EdgesFaces difference.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let wire = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+
+        mesh.delete(&[wire], DeleteContext::EdgesFaces);
+
+        assert_eq!(mesh.totedge(), 0, "wire edge gone");
+        assert_eq!(mesh.totvert(), 2, "both endpoints kept loose (§7.5)");
+        assert!(mesh.vertices.try_get(a).is_some());
+        assert!(mesh.vertices.try_get(b).is_some());
+    }
+
+    #[test]
+    fn edges_empty_seed_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 3);
+        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        mesh.delete::<EdgeKey>(&[], DeleteContext::Edges);
+        mesh.delete::<EdgeKey>(&[], DeleteContext::EdgesFaces);
+        let _ = faces;
+
+        assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
     }
 
     #[test]
