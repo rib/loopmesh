@@ -50,7 +50,7 @@ impl LoopMesh {
     /// other way. Topology (counts, incidence) is identical either way — only
     /// the per-wall loop direction differs.
     pub fn extrude_region_ex(&mut self, faces: &[FaceKey], use_normal_flip: bool) -> ExtrudeResult {
-        self.extrude_region_impl(faces, &[], false, use_normal_flip)
+        self.extrude_region_impl(faces, &[], false, use_normal_flip, false)
     }
 
     /// [`extrude_region_ex`](Self::extrude_region_ex) with per-edge wall
@@ -75,7 +75,37 @@ impl LoopMesh {
         use_keep_orig: bool,
         use_normal_flip: bool,
     ) -> ExtrudeResult {
-        self.extrude_region_impl(faces, edges_exclude, use_keep_orig, use_normal_flip)
+        self.extrude_region_impl(faces, edges_exclude, use_keep_orig, use_normal_flip, false)
+    }
+
+    /// [`extrude_region_ex`](Self::extrude_region_ex) with the
+    /// `use_normal_from_adjacent` winding cue exposed (EXTRUDE.md §5).
+    ///
+    /// The default region extrude derives each side-wall's winding from the
+    /// *duplicated* face's loop direction across the boundary edge — i.e. from
+    /// the lifted region itself. When `use_normal_from_adjacent` is set, the
+    /// winding cue is read instead from the *un-extruded neighbour* (surround)
+    /// face's loop on that edge. For a boundary edge with a surround face the
+    /// two cues can disagree, so the resulting wall winding can differ; for a
+    /// boundary edge with no surround (mesh-boundary) there is no neighbour to
+    /// read and the wall falls back to the duplicate-face cue, matching the
+    /// default. `use_normal_flip` still flips whichever cue was chosen.
+    ///
+    /// This is the form chained operators (e.g. spin) want: successive
+    /// iterations' walls stay wound consistently with the surround they grow
+    /// out of, rather than with whatever orientation the duplicate sub-step
+    /// happened to give the fresh cap.
+    ///
+    /// Topology (counts, incidence) is identical to
+    /// [`extrude_region_ex`](Self::extrude_region_ex); only per-wall loop
+    /// direction can change.
+    pub fn extrude_region_ex_normal_from_adjacent(
+        &mut self,
+        faces: &[FaceKey],
+        use_normal_flip: bool,
+        use_normal_from_adjacent: bool,
+    ) -> ExtrudeResult {
+        self.extrude_region_impl(faces, &[], false, use_normal_flip, use_normal_from_adjacent)
     }
 
     fn extrude_region_impl(
@@ -84,6 +114,7 @@ impl LoopMesh {
         edges_exclude: &[EdgeKey],
         use_keep_orig: bool,
         use_normal_flip: bool,
+        use_normal_from_adjacent: bool,
     ) -> ExtrudeResult {
         assert!(
             !use_keep_orig,
@@ -146,6 +177,13 @@ impl LoopMesh {
             // side) copies from the entry whose `.0 == v`. Only empty for a
             // genuinely faceless wire edge.
             source_loop_at: SmallVec<[(VertexKey, LoopKey); 2]>,
+            // §5 `use_normal_from_adjacent`: the vertex the first *surround*
+            // (un-extruded neighbour) loop is anchored at on this edge. The
+            // winding cue when `use_normal_from_adjacent` is set is read from
+            // this rather than from the duplicate face's loop. `None` when the
+            // edge has no surround face (mesh-boundary) — there is nothing to
+            // read, so the wall falls back to the duplicate-face cue.
+            adjacent_loop_vert: Option<VertexKey>,
         }
         let mut edge_info: Vec<Option<EdgeInfo>> = (0..edge_watermark).map(|_| None).collect();
         for slot in 0..edge_watermark {
@@ -160,6 +198,10 @@ impl LoopMesh {
             // face's own loops (`fallback_loop_at`) when no surround exists.
             let mut surround_loop_at: SmallVec<[(VertexKey, LoopKey); 2]> = SmallVec::new();
             let mut fallback_loop_at: SmallVec<[(VertexKey, LoopKey); 2]> = SmallVec::new();
+            // §5: the first surround loop's anchored vertex, used as the
+            // `use_normal_from_adjacent` winding cue. Set on the same first
+            // surround loop that supplies `surround_loop_at`.
+            let mut adjacent_loop_vert: Option<VertexKey> = None;
             let mut has_unselected = false;
             let mut radial = self.radial_loops(e);
             while let Some(l) = radial.next(self) {
@@ -181,13 +223,15 @@ impl LoopMesh {
                     }
                 } else {
                     has_unselected = true;
-                    // First surround face wins as the customdata source.
+                    // First surround face wins as the customdata source and as
+                    // the §5 `use_normal_from_adjacent` winding cue.
                     if surround_loop_at.is_empty() {
                         let l_next = self.loops.get(l).face_loop_links.next;
                         let v_here = lref.vertex;
                         let v_next = self.loops.get(l_next).vertex;
                         surround_loop_at.push((v_here, l));
                         surround_loop_at.push((v_next, l_next));
+                        adjacent_loop_vert = Some(v_here);
                     }
                 }
             }
@@ -213,6 +257,7 @@ impl LoopMesh {
                 is_boundary,
                 selected_loop_verts,
                 source_loop_at,
+                adjacent_loop_vert,
             });
         }
 
@@ -285,13 +330,23 @@ impl LoopMesh {
 
             for &(_l_sel, l_v_orig, src_face) in &info.selected_loop_verts {
                 // l_v_orig is the loop's PRE-MUTATION vertex; one of v0_old / v1_old.
-                // The default (un-flipped) order winds the wall so its loop on
-                // the duplicate edge runs opposite the duplicate face's loop
-                // (EXTRUDE.md §5). `use_normal_flip` swaps the two endpoints,
-                // reversing the quad cycle and the wall's outward normal.
-                let default_a_is_v0 = l_v_orig == v0_old;
-                debug_assert!(default_a_is_v0 || l_v_orig == v1_old);
-                let a_is_v0 = default_a_is_v0 != use_normal_flip;
+                // EXTRUDE.md §5 picks the wall's winding cue (`edge_normal_flip`)
+                // from one of two sources:
+                //   - default: the duplicate face's loop direction across the
+                //     edge — captured here as the selected loop's pre-mutation
+                //     vertex `l_v_orig` (the duplicate is the re-anchored same
+                //     loop, so its e_dup loop runs in the same vertex order);
+                //   - use_normal_from_adjacent: the surround (un-extruded
+                //     neighbour) loop's vertex on the edge. With no surround
+                //     (mesh-boundary) there is nothing to read, so fall back to
+                //     the default cue.
+                // `use_normal_flip` then flips whichever cue was chosen.
+                debug_assert!(l_v_orig == v0_old || l_v_orig == v1_old);
+                let edge_normal_flip = match (use_normal_from_adjacent, info.adjacent_loop_vert) {
+                    (true, Some(adjacent_vert)) => v0_old == adjacent_vert,
+                    _ => l_v_orig != v0_old,
+                };
+                let a_is_v0 = edge_normal_flip == use_normal_flip;
                 let (v_a_old, v_b_old, v_a_new, v_b_new) = if a_is_v0 {
                     (v0_old, v1_old, v0_new, v1_new)
                 } else {
@@ -1100,6 +1155,177 @@ mod tests {
             "excluding an interior edge changes nothing"
         );
         mesh.validate_topology();
+    }
+
+    // Build two quads sharing edge v1–v2: face0 = {v0,v1,v2,v3}, face1 the
+    // neighbour on the far side of v1–v2. Returns (mesh, face0, face1, v1, v2).
+    fn two_quads_shared_edge(
+        mesh: &mut LoopMesh,
+    ) -> (FaceKey, FaceKey, VertexKey, VertexKey) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+        let face0 =
+            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let face1 =
+            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        (face0, face1, v1, v2)
+    }
+
+    // The vertex cycle of a wall, as positions.
+    fn wall_cycle_pos(mesh: &LoopMesh, wf: FaceKey) -> Vec<Vec3> {
+        mesh.face_vert_keys(wf)
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .collect()
+    }
+
+    // Find the wall whose original-edge endpoints are exactly `a` and `b`.
+    fn find_wall_on(mesh: &LoopMesh, walls: &[FaceKey], a: VertexKey, b: VertexKey) -> FaceKey {
+        for &wf in walls {
+            let verts = mesh.face_vert_keys(wf);
+            if verts.contains(&a) && verts.contains(&b) {
+                return wf;
+            }
+        }
+        panic!("no wall on edge");
+    }
+
+    #[test]
+    fn extrude_region_normal_from_adjacent_reverses_surround_edge_wall() {
+        // EXTRUDE.md §5: with a real surround, `use_normal_from_adjacent` reads
+        // the wall winding cue from the un-extruded neighbour's loop direction
+        // rather than the duplicated face's. On the shared edge v1–v2 the
+        // surround face's loop runs opposite the extruded face's loop, so the
+        // adjacent-mode wall must be the *reverse* cycle of the default wall on
+        // that same boundary edge. CanonicalMesh is winding-blind, so this
+        // in-crate cycle check is the load-bearing pin.
+        let mut mesh_def = LoopMesh::new();
+        let (f0_def, _f1_def, v1, v2) = two_quads_shared_edge(&mut mesh_def);
+        let res_def = mesh_def.extrude_region(&[f0_def]);
+        let wall_def = find_wall_on(&mesh_def, &res_def.wall_faces, v1, v2);
+        let def_pos = wall_cycle_pos(&mesh_def, wall_def);
+
+        let mut mesh_adj = LoopMesh::new();
+        let (f0_adj, _f1_adj, _v1, _v2) = two_quads_shared_edge(&mut mesh_adj);
+        let res_adj =
+            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let wall_adj = find_wall_on(&mesh_adj, &res_adj.wall_faces, v1, v2);
+        let adj_pos = wall_cycle_pos(&mesh_adj, wall_adj);
+
+        // Same topology either way.
+        assert_eq!(res_def.wall_faces.len(), res_adj.wall_faces.len());
+        // Surround-edge wall: reversed cycle under the adjacent cue.
+        assert!(
+            cycles_are_reversed(&def_pos, &adj_pos),
+            "surround-edge wall must reverse under use_normal_from_adjacent: \
+             default {def_pos:?} vs adjacent {adj_pos:?}"
+        );
+        mesh_adj.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_normal_from_adjacent_keeps_mesh_boundary_walls() {
+        // EXTRUDE.md §5: a boundary edge with no surround (mesh-boundary) has no
+        // neighbour loop to read, so `use_normal_from_adjacent` falls back to
+        // the duplicate-face cue — those walls must wind identically to the
+        // default. Pin this on the two mesh-boundary edges v0–v1 (bottom) and
+        // v2–v3 (top) of the extruded face, which have no surround.
+        let mut mesh_def = LoopMesh::new();
+        let (f0_def, _f1, _v1, _v2) = two_quads_shared_edge(&mut mesh_def);
+        let v0 = mesh_def.face_vert_keys(f0_def)[0];
+        let v1 = mesh_def.face_vert_keys(f0_def)[1];
+        let res_def = mesh_def.extrude_region(&[f0_def]);
+        let wall_def = find_wall_on(&mesh_def, &res_def.wall_faces, v0, v1);
+        let def_pos = wall_cycle_pos(&mesh_def, wall_def);
+
+        let mut mesh_adj = LoopMesh::new();
+        let (f0_adj, _f1b, _v1b, _v2b) = two_quads_shared_edge(&mut mesh_adj);
+        let res_adj =
+            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let wall_adj = find_wall_on(&mesh_adj, &res_adj.wall_faces, v0, v1);
+        let adj_pos = wall_cycle_pos(&mesh_adj, wall_adj);
+
+        // Identical cycle (same rotation, not reversed): no surround to read.
+        let n = def_pos.len();
+        let same_rotation =
+            (0..n).any(|shift| (0..n).all(|i| def_pos[i] == adj_pos[(i + shift) % n]));
+        assert!(
+            same_rotation,
+            "mesh-boundary wall must keep the default winding under \
+             use_normal_from_adjacent (no surround to read): \
+             default {def_pos:?} vs adjacent {adj_pos:?}"
+        );
+        mesh_adj.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_normal_from_adjacent_off_matches_ex() {
+        // `use_normal_from_adjacent = false` must reproduce extrude_region_ex
+        // exactly — identical wall windings on every boundary edge, surround or
+        // not. Pin on the shared-edge fixture so a surround edge is involved.
+        let mut mesh_ex = LoopMesh::new();
+        let (f0_ex, _f1, v1, v2) = two_quads_shared_edge(&mut mesh_ex);
+        let v0 = mesh_ex.face_vert_keys(f0_ex)[0];
+        let res_ex = mesh_ex.extrude_region_ex(&[f0_ex], false);
+
+        let mut mesh_off = LoopMesh::new();
+        let (f0_off, _f1b, _v1, _v2) = two_quads_shared_edge(&mut mesh_off);
+        let res_off =
+            mesh_off.extrude_region_ex_normal_from_adjacent(&[f0_off], false, false);
+
+        assert_eq!(res_ex.wall_faces.len(), res_off.wall_faces.len());
+        for &(a, b) in &[(v0, v1), (v1, v2)] {
+            let pos_ex = wall_cycle_pos(&mesh_ex, find_wall_on(&mesh_ex, &res_ex.wall_faces, a, b));
+            let pos_off =
+                wall_cycle_pos(&mesh_off, find_wall_on(&mesh_off, &res_off.wall_faces, a, b));
+            let n = pos_ex.len();
+            let same_rotation =
+                (0..n).any(|shift| (0..n).all(|i| pos_ex[i] == pos_off[(i + shift) % n]));
+            assert!(
+                same_rotation,
+                "adjacent=false must match extrude_region_ex on edge {a:?}-{b:?}: \
+                 {pos_ex:?} vs {pos_off:?}"
+            );
+        }
+        mesh_off.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_normal_from_adjacent_flip_reverses_adjacent_cue() {
+        // §5: `use_normal_flip` flips whichever cue was chosen. With the
+        // adjacent cue active, flipping must reverse the surround-edge wall
+        // relative to the un-flipped adjacent result.
+        let mut mesh_adj = LoopMesh::new();
+        let (f0_adj, _f1, v1, v2) = two_quads_shared_edge(&mut mesh_adj);
+        let res_adj =
+            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let adj_pos =
+            wall_cycle_pos(&mesh_adj, find_wall_on(&mesh_adj, &res_adj.wall_faces, v1, v2));
+
+        let mut mesh_flip = LoopMesh::new();
+        let (f0_flip, _f1b, _v1, _v2) = two_quads_shared_edge(&mut mesh_flip);
+        let res_flip =
+            mesh_flip.extrude_region_ex_normal_from_adjacent(&[f0_flip], true, true);
+        let flip_pos =
+            wall_cycle_pos(&mesh_flip, find_wall_on(&mesh_flip, &res_flip.wall_faces, v1, v2));
+
+        assert!(
+            cycles_are_reversed(&adj_pos, &flip_pos),
+            "use_normal_flip must reverse the adjacent-cued wall: \
+             adjacent {adj_pos:?} vs adjacent+flip {flip_pos:?}"
+        );
+        mesh_flip.validate_topology();
     }
 
     #[test]
