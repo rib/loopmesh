@@ -24,6 +24,7 @@ mod face_triangulate;
 mod inset_individual;
 mod inset_region;
 mod mean_value;
+mod pointmerge;
 mod remove_doubles;
 mod weld_verts;
 
