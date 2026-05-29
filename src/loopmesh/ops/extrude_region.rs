@@ -65,9 +65,15 @@ impl LoopMesh {
     /// selected) is a silent no-op for exclusion purposes: interior edges never
     /// get walls, so there is nothing to suppress (EXTRUDE.md §8.9).
     ///
-    /// `use_keep_orig` is accepted for forward compatibility with the full
-    /// region-extrude parameter set but is not yet implemented; the wire-
-    /// boundary-kill interaction (§8.3) is likewise out of scope here.
+    /// `use_keep_orig` selects the "shell"/"thicken" semantics of EXTRUDE.md
+    /// §3.2: when clear (the default) each input face is replaced by its
+    /// duplicate — the original face's loops are re-anchored onto the duplicate
+    /// verts/edges so the original *becomes* the lifted cap. When set, both the
+    /// original interior face *and* a freshly-built duplicate cap persist,
+    /// joined by the same boundary side walls; phase-5 interior removal is
+    /// skipped. The kept originals then have their winding flipped per §6.1 so
+    /// their normals point outward of the cavity the walls enclose. The
+    /// wire-boundary-kill interaction (§8.3) remains out of scope here.
     pub fn extrude_region_exclude(
         &mut self,
         faces: &[FaceKey],
@@ -116,10 +122,6 @@ impl LoopMesh {
         use_normal_flip: bool,
         use_normal_from_adjacent: bool,
     ) -> ExtrudeResult {
-        assert!(
-            !use_keep_orig,
-            "extrude_region_exclude: use_keep_orig is not yet implemented"
-        );
         // Mark the selection. Bit 0 = "in region".
         let sel = self.push_face_op_flag_layer();
         for &f in faces {
@@ -287,18 +289,55 @@ impl LoopMesh {
             self.edge_attribs.copy_into(dup.as_usize(), slot);
         }
 
-        // ---- Phase 4: re-anchor each selected face's loops to dup verts +
-        //               dup edges. The face's loop cycle (face_loop_links)
-        //               stays intact; only loop.vertex and the radial
-        //               attachment change. ----
-        for (_f, loops) in &per_face_loops {
-            for &l in loops {
-                let old_e = self.loops.get(l).edge;
-                let old_v = self.loops.get(l).vertex;
-                let new_e = edge_to_dup[old_e.as_usize()];
-                let new_v = vert_to_dup[old_v.as_usize()];
-                self.edge_replace_in_face_loop(l, new_e);
-                self.loops.get_mut(l).vertex = new_v;
+        let do_loop_cd = !self.loop_attribs.is_empty();
+
+        // ---- Phase 4: lift each selected face onto the duplicate verts/edges.
+        //
+        // `use_keep_orig=false` (EXTRUDE.md §3.2 default): re-anchor each
+        // selected face's loops onto the duplicate verts/edges. The face's loop
+        // cycle (face_loop_links) stays intact; only loop.vertex and the radial
+        // attachment change, so the original face *becomes* the lifted cap and
+        // the original edges are freed to serve as the walls' lower side.
+        //
+        // `use_keep_orig=true` (EXTRUDE.md §3.2 shell semantics): the original
+        // face stays in place. A fresh duplicate cap face is built on the
+        // duplicate verts/edges in the same cycle order, copying the original's
+        // face and per-corner loop customdata. Both copies then share their
+        // boundary edges via the walls; the originals are flipped after wall
+        // construction per §6.1. ----
+        let mut cap_faces: Vec<FaceKey> = Vec::new();
+        if use_keep_orig {
+            for (f, loops) in &per_face_loops {
+                let mut cap_verts: SmallVec<[VertexKey; 8]> = SmallVec::new();
+                let mut cap_edges: SmallVec<[EdgeKey; 8]> = SmallVec::new();
+                for &l in loops {
+                    let old_v = self.loops.get(l).vertex;
+                    let old_e = self.loops.get(l).edge;
+                    cap_verts.push(vert_to_dup[old_v.as_usize()]);
+                    cap_edges.push(edge_to_dup[old_e.as_usize()]);
+                }
+                let cap = self.face_create(&cap_verts, &cap_edges, FaceCreateFlags::NONE);
+                self.face_attribs.copy_into(cap.as_usize(), f.as_usize());
+                if do_loop_cd {
+                    let mut cap_loop = self.faces.get(cap).first_edge_loop;
+                    for &l_org in loops {
+                        self.loop_attribs
+                            .copy_into(cap_loop.as_usize(), l_org.as_usize());
+                        cap_loop = self.loops.get(cap_loop).face_loop_links.next;
+                    }
+                }
+                cap_faces.push(cap);
+            }
+        } else {
+            for (_f, loops) in &per_face_loops {
+                for &l in loops {
+                    let old_e = self.loops.get(l).edge;
+                    let old_v = self.loops.get(l).vertex;
+                    let new_e = edge_to_dup[old_e.as_usize()];
+                    let new_v = vert_to_dup[old_v.as_usize()];
+                    self.edge_replace_in_face_loop(l, new_e);
+                    self.loops.get_mut(l).vertex = new_v;
+                }
             }
         }
 
@@ -308,7 +347,6 @@ impl LoopMesh {
         //               same source vertex. ----
         let mut side_edge_at_v: Vec<EdgeKey> = vec![EdgeKey::NULL; vert_watermark];
         let mut wall_faces: Vec<FaceKey> = Vec::new();
-        let do_loop_cd = !self.loop_attribs.is_empty();
         let mut vert_map_out: Vec<(VertexKey, VertexKey)> = Vec::new();
         let mut edge_map_out: Vec<(EdgeKey, EdgeKey)> = Vec::new();
 
@@ -411,6 +449,19 @@ impl LoopMesh {
             }
         }
 
+        // EXTRUDE.md §6.1: with the originals kept in place, the walls now sit
+        // on the outside of where the originals used to live, so the originals'
+        // outward normals would point into the cavity the walls enclose. Flip
+        // each kept original's winding so its normal points back outward,
+        // consistent with a closed double-shell. Skipped entirely in the
+        // default (`use_keep_orig=false`) path, where phase 5 would otherwise
+        // remove the originals and the flip question never arises.
+        if use_keep_orig {
+            for &f in faces {
+                self.euler_loop_reverse(f);
+            }
+        }
+
         // Build the output maps in dense-index order.
         for slot in 0..vert_watermark {
             if vert_in_region[slot] {
@@ -438,6 +489,7 @@ impl LoopMesh {
             edge_map: edge_map_out,
             side_edges: side_edges_out,
             wall_faces,
+            cap_faces,
         }
     }
 }
@@ -1360,6 +1412,158 @@ mod tests {
                     "wall face {wf:?}: got {got:?}, expected {source_color:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn extrude_region_keep_orig_retains_original_and_cap() {
+        // EXTRUDE.md §3.2 shell semantics: with use_keep_orig the original face
+        // is NOT consumed into the cap. Both the original interior face and a
+        // fresh duplicate cap persist, joined by the four side walls. So an
+        // isolated quad goes from 1 face to 6: original + cap + 4 walls (versus
+        // the default 5: re-anchored-original-as-cap + 4 walls).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+
+        let result =
+            mesh.extrude_region_exclude(&[face], &[], /* use_keep_orig */ true, false);
+
+        assert_eq!(result.vert_map.len(), 4, "4 boundary verts duplicated");
+        assert_eq!(result.edge_map.len(), 4, "4 boundary edges duplicated");
+        assert_eq!(result.side_edges.len(), 4, "4 vertical edges");
+        assert_eq!(result.wall_faces.len(), 4, "4 wall quads");
+        assert_eq!(result.cap_faces.len(), 1, "1 fresh duplicate cap");
+
+        // 8 verts (4 orig + 4 dup); 6 faces (original kept + cap + 4 walls).
+        assert_eq!(mesh.totvert(), 8);
+        assert_eq!(mesh.totface(), 6);
+
+        // The kept original still references the original (non-duplicated)
+        // verts; the cap references only duplicates.
+        let cap = result.cap_faces[0];
+        let cap_verts = mesh.face_vert_keys(cap);
+        let dup_verts: HashSet<VertexKey> =
+            result.vert_map.iter().map(|&(_s, d)| d).collect();
+        for v in &cap_verts {
+            assert!(dup_verts.contains(v), "cap must reference only duplicate verts");
+        }
+        let orig_verts = mesh.face_vert_keys(face);
+        for v in &orig_verts {
+            assert!(!dup_verts.contains(v), "kept original keeps its source verts");
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_keep_orig_vs_default_face_delta() {
+        // The load-bearing delta: keep_orig keeps the original alive, the
+        // default replaces it by re-anchoring. Same fixture, +1 face under
+        // keep_orig.
+        let mut mesh_default = LoopMesh::new();
+        let f_default = unit_quad(&mut mesh_default);
+        mesh_default.extrude_region_exclude(&[f_default], &[], false, false);
+
+        let mut mesh_keep = LoopMesh::new();
+        let f_keep = unit_quad(&mut mesh_keep);
+        mesh_keep.extrude_region_exclude(&[f_keep], &[], true, false);
+
+        assert_eq!(mesh_default.totface(), 5);
+        assert_eq!(mesh_keep.totface(), 6);
+        assert_eq!(mesh_keep.totface(), mesh_default.totface() + 1);
+        // Vertex counts match — keep_orig adds no extra verts, only the cap face.
+        assert_eq!(mesh_keep.totvert(), mesh_default.totvert());
+        mesh_keep.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_keep_orig_flips_original_normal() {
+        // EXTRUDE.md §6.1: the kept original's winding is flipped so its normal
+        // points outward of the wall cavity. An isolated quad in the XY plane
+        // built CCW has +Z normal; after keep_orig extrude the kept original
+        // must have a flipped (-Z) normal, while the fresh cap keeps the
+        // original's +Z orientation.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let normal_before = mesh.face_normal(face);
+        assert!(normal_before.z > 0.9, "unit quad starts +Z");
+
+        let result =
+            mesh.extrude_region_exclude(&[face], &[], /* use_keep_orig */ true, false);
+
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let normal_after = mesh.face_normal(face);
+        assert!(
+            normal_after.z < -0.9,
+            "kept original normal must be flipped per §6.1: got {normal_after:?}"
+        );
+
+        // The fresh cap keeps the original orientation (+Z): it is built in the
+        // original's loop order and is not flipped.
+        let cap_normal = mesh.face_normal(result.cap_faces[0]);
+        assert!(
+            cap_normal.z > 0.9,
+            "duplicate cap keeps the original +Z orientation: got {cap_normal:?}"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_keep_orig_with_edges_exclude_suppresses_wall() {
+        // §3.2 + §4.6 interaction: keep_orig still honours edges_exclude. The
+        // excluded boundary edge keeps its original/duplicate pair but builds no
+        // wall, so the isolated quad yields original + cap + 3 walls = 5 faces.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let source_verts = mesh.face_vert_keys(face);
+        let v0 = source_verts[0];
+        let v1 = source_verts[1];
+        let excluded = mesh.query_edge_exists(v0, v1).expect("perimeter edge v0-v1");
+
+        let result = mesh.extrude_region_exclude(&[face], &[excluded], true, false);
+
+        assert_eq!(result.wall_faces.len(), 3, "excluded edge builds no wall");
+        assert_eq!(result.cap_faces.len(), 1);
+        // original + cap + 3 walls.
+        assert_eq!(mesh.totface(), 5);
+        // No wall sits on the excluded edge's endpoints.
+        for &wf in &result.wall_faces {
+            let wall_verts = mesh.face_vert_keys(wf);
+            assert!(
+                !(wall_verts.contains(&v0) && wall_verts.contains(&v1)),
+                "no wall on the excluded edge"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_keep_orig_copies_cap_face_attribs() {
+        // The fresh cap inherits the original face's attribs (parity with the
+        // duplicate sub-operator's face-map copy).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let mat = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("material_color"),
+                Format::new(ComponentType::F32, 3),
+            ))
+            .unwrap();
+        let source_color = [0.2_f32, 0.5, 0.9];
+        mesh.face_attribs_mut()
+            .set_vec3(mat, face.as_usize(), source_color);
+
+        let result = mesh.extrude_region_exclude(&[face], &[], true, false);
+
+        let cap = result.cap_faces[0];
+        let got = mesh.face_attribs().get_vec3(mat, cap.as_usize()).unwrap();
+        for i in 0..3 {
+            assert!(
+                (got[i] - source_color[i]).abs() < 1e-6,
+                "cap face must copy the original's attribs: got {got:?}"
+            );
         }
     }
 }

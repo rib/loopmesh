@@ -224,6 +224,7 @@ impl LoopMesh {
             edge_map: edge_map_out,
             side_edges: side_edges_out,
             wall_faces,
+            cap_faces: Vec::new(),
         }
     }
 }

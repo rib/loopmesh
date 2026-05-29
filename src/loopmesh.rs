@@ -2138,6 +2138,12 @@ pub struct ExtrudeResult {
     /// is one wall per boundary edge; on a non-manifold mesh it can be
     /// more.
     pub wall_faces: Vec<FaceKey>,
+    /// Freshly-built duplicate cap faces, one per input face. Populated only
+    /// in the `use_keep_orig` path (EXTRUDE.md §3.2 shell semantics), where
+    /// the duplicate cap is genuinely new geometry alongside the kept
+    /// original. Empty in the default path, where the original face is
+    /// re-anchored to *become* the cap and so is not new geometry.
+    pub cap_faces: Vec<FaceKey>,
 }
 
 pub struct LoopMesh {
