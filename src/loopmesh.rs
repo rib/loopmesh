@@ -2146,6 +2146,69 @@ pub struct ExtrudeResult {
     pub cap_faces: Vec<FaceKey>,
 }
 
+/// Cross-pass record of which source vertices have already been duplicated by
+/// an extrude pass, and which vertical/connecting edge was lifted at each.
+///
+/// A mixed-input extrude routes faces, directly-named edges, and isolated
+/// verts to three separate passes (EXTRUDE.md §1–§2). When a vertex is shared
+/// across kinds — e.g. a face corner that is also an endpoint of a
+/// directly-named wire edge — §8.4 requires it be duplicated exactly once and
+/// the two passes' walls to meet at that single duplicate, sharing one
+/// vertical edge. Passing this ledger between the passes lets a later pass
+/// reuse an earlier pass's duplicate (and its vertical edge) instead of
+/// minting a parallel one. Slab-indexed by the source vertex's slot, sized to
+/// the watermark captured before any pass runs (duplicates created during a
+/// pass always land at higher slots, so they never need a ledger entry).
+#[derive(Debug)]
+pub(crate) struct ExtrudeVertDupLedger {
+    dup: Vec<Option<VertexKey>>,
+    side_edge: Vec<EdgeKey>,
+}
+
+impl ExtrudeVertDupLedger {
+    pub(crate) fn new(vert_watermark: usize) -> Self {
+        Self {
+            dup: vec![None; vert_watermark],
+            side_edge: vec![EdgeKey::NULL; vert_watermark],
+        }
+    }
+
+    fn in_range(&self, v: VertexKey) -> bool {
+        v.as_usize() < self.dup.len()
+    }
+
+    pub(crate) fn dup_of(&self, v: VertexKey) -> Option<VertexKey> {
+        if !self.in_range(v) {
+            return None;
+        }
+        self.dup[v.as_usize()]
+    }
+
+    pub(crate) fn record_dup(&mut self, source: VertexKey, dup: VertexKey) {
+        if self.in_range(source) {
+            self.dup[source.as_usize()] = Some(dup);
+        }
+    }
+
+    pub(crate) fn side_edge_of(&self, v: VertexKey) -> Option<EdgeKey> {
+        if !self.in_range(v) {
+            return None;
+        }
+        let e = self.side_edge[v.as_usize()];
+        if e.is_null() {
+            None
+        } else {
+            Some(e)
+        }
+    }
+
+    pub(crate) fn record_side_edge(&mut self, source: VertexKey, edge: EdgeKey) {
+        if self.in_range(source) {
+            self.side_edge[source.as_usize()] = edge;
+        }
+    }
+}
+
 pub struct LoopMesh {
     pub(crate) flags: LoopMeshFlags,
 

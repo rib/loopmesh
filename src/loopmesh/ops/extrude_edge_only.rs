@@ -46,6 +46,29 @@ impl LoopMesh {
         edges: &[EdgeKey],
         use_normal_flip: bool,
     ) -> ExtrudeResult {
+        let mut ledger = ExtrudeVertDupLedger::new(self.vertices.key_watermark());
+        self.extrude_edge_only_seeded(edges, use_normal_flip, &mut ledger)
+    }
+
+    /// Edge-only extrude that shares its vertex-duplication and vertical-edge
+    /// bookkeeping with other extrude passes through `ledger` (EXTRUDE.md §8.4).
+    ///
+    /// When a mixed-input extrude routes a directly-named wire edge whose
+    /// endpoint is *also* a corner of an input face, that corner must be
+    /// duplicated exactly once across the whole operation, and the face
+    /// region's wall and this edge's wall must meet at the *same* duplicate
+    /// corner, sharing one vertical edge. The region pass seeds `ledger` with
+    /// the duplicate it minted for that corner and the vertical edge it lifted
+    /// there; this pass then reuses both instead of minting parallel ones —
+    /// the §4.5 "does an edge already exist between `v_old` and `v_dup`?" reuse
+    /// rule, extended across passes. A vertex not present in the seed is
+    /// duplicated here and recorded for any later pass.
+    pub(crate) fn extrude_edge_only_seeded(
+        &mut self,
+        edges: &[EdgeKey],
+        use_normal_flip: bool,
+        ledger: &mut ExtrudeVertDupLedger,
+    ) -> ExtrudeResult {
         let do_loop_cd = !self.loop_attribs.is_empty();
 
         let vert_watermark = self.vertices.key_watermark();
@@ -109,7 +132,10 @@ impl LoopMesh {
             });
         }
 
-        // ---- Phase 3: duplicate verts and edges. ----
+        // ---- Phase 3: duplicate verts and edges. A vertex already duplicated
+        //               by another pass (its corner shared with an input face,
+        //               §8.4) reuses that duplicate rather than minting a fresh
+        //               one. ----
         let mut vert_to_dup: Vec<VertexKey> =
             vec![VertexKey::from_usize(usize::MAX); vert_watermark];
         for slot in 0..vert_watermark {
@@ -117,9 +143,16 @@ impl LoopMesh {
                 continue;
             }
             let v_old = VertexKey::from_usize(slot);
-            let dup = self.create_vertex(self.vertex_position(v_old));
+            let dup = match ledger.dup_of(v_old) {
+                Some(existing) => existing,
+                None => {
+                    let dup = self.create_vertex(self.vertex_position(v_old));
+                    self.vertex_attribs.copy_into(dup.as_usize(), slot);
+                    ledger.record_dup(v_old, dup);
+                    dup
+                }
+            };
             vert_to_dup[slot] = dup;
-            self.vertex_attribs.copy_into(dup.as_usize(), slot);
         }
         let mut edge_to_dup: Vec<EdgeKey> = vec![EdgeKey::NULL; edge_watermark];
         for slot in 0..edge_watermark {
@@ -138,9 +171,12 @@ impl LoopMesh {
 
         // ---- Phase 4: build one wall quad per input edge. Vertical edges are
         //               lazily created and shared across walls at the same source
-        //               vertex (§4.5). ----
-        let mut side_edge_at_v: Vec<EdgeKey> = vec![EdgeKey::NULL; vert_watermark];
+        //               vertex (§4.5) — and, through the ledger, shared with the
+        //               face region pass at a cross-kind corner (§8.4). ----
         let mut wall_faces: Vec<FaceKey> = Vec::new();
+        // Side edges this pass freshly created (a reused, ledger-seeded edge is
+        // owned by the pass that minted it, so it is not reported again here).
+        let mut side_edges_out: Vec<EdgeKey> = Vec::new();
 
         for slot in 0..edge_watermark {
             let source = match &edge_source[slot] {
@@ -163,19 +199,23 @@ impl LoopMesh {
                 (v1_old, v0_old, v1_new, v0_new)
             };
 
-            let side_a = if side_edge_at_v[v_a_old.as_usize()].is_null() {
-                let e = self.create_edge([v_a_old, v_a_new], EdgeCreateFlags::NONE);
-                side_edge_at_v[v_a_old.as_usize()] = e;
-                e
-            } else {
-                side_edge_at_v[v_a_old.as_usize()]
+            let side_a = match ledger.side_edge_of(v_a_old) {
+                Some(existing) => existing,
+                None => {
+                    let e = self.create_edge([v_a_old, v_a_new], EdgeCreateFlags::NONE);
+                    ledger.record_side_edge(v_a_old, e);
+                    side_edges_out.push(e);
+                    e
+                }
             };
-            let side_b = if side_edge_at_v[v_b_old.as_usize()].is_null() {
-                let e = self.create_edge([v_b_old, v_b_new], EdgeCreateFlags::NONE);
-                side_edge_at_v[v_b_old.as_usize()] = e;
-                e
-            } else {
-                side_edge_at_v[v_b_old.as_usize()]
+            let side_b = match ledger.side_edge_of(v_b_old) {
+                Some(existing) => existing,
+                None => {
+                    let e = self.create_edge([v_b_old, v_b_new], EdgeCreateFlags::NONE);
+                    ledger.record_side_edge(v_b_old, e);
+                    side_edges_out.push(e);
+                    e
+                }
             };
 
             // Wall quad: v_a_old -> v_b_old -> v_b_new -> v_a_new (outward winding).
@@ -232,14 +272,6 @@ impl LoopMesh {
                 edge_map_out.push((EdgeKey::from_usize(slot), edge_to_dup[slot]));
             }
         }
-        let mut side_edges_out: Vec<EdgeKey> = Vec::new();
-        for slot in 0..vert_watermark {
-            let e = side_edge_at_v[slot];
-            if !e.is_null() {
-                side_edges_out.push(e);
-            }
-        }
-
         ExtrudeResult {
             vert_map: vert_map_out,
             edge_map: edge_map_out,

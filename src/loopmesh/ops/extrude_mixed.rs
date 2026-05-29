@@ -144,9 +144,30 @@ impl LoopMesh {
 
         let mut out = ExtrudeMixedResult::default();
 
+        // §8.4 cross-kind vert-dup ledger: a vertex shared between an input
+        // face and a directly-named wire edge must be duplicated exactly once,
+        // with the face region's wall and the edge's wall meeting at that
+        // single duplicate corner and sharing one vertical edge. The region
+        // pass seeds the ledger; the edge-only pass then reuses the seeded
+        // duplicate and vertical edge instead of minting parallel ones. Sized
+        // to the pre-pass watermark — the only verts that can be shared across
+        // kinds are originals, which sit below it.
+        let mut ledger = ExtrudeVertDupLedger::new(vert_watermark);
+
         if !faces.is_empty() {
             let region =
                 self.extrude_region_exclude(faces, &[], use_keep_orig, use_normal_flip);
+            // Seed the ledger from the region result: each duplicated source
+            // vert, plus the vertical edge the region lifted at it (if any —
+            // an interior region vert has no wall and thus no vertical edge,
+            // which correctly yields no seed). Found via the §4.5 reuse
+            // predicate "does an edge already exist between v_old and v_dup?".
+            for &(src, dup) in &region.vert_map {
+                ledger.record_dup(src, dup);
+                if let Some(vertical) = self.query_edge_exists(src, dup) {
+                    ledger.record_side_edge(src, vertical);
+                }
+            }
             out.vert_map.extend(region.vert_map);
             out.edge_map.extend(region.edge_map);
             out.side_edges.extend(region.side_edges);
@@ -155,8 +176,17 @@ impl LoopMesh {
         }
 
         if !routed_edges.is_empty() {
-            let edge_res = self.extrude_edge_only_ex(&routed_edges, use_normal_flip);
-            out.vert_map.extend(edge_res.vert_map);
+            let edge_res =
+                self.extrude_edge_only_seeded(&routed_edges, use_normal_flip, &mut ledger);
+            // The seeded pass reuses any cross-kind shared corner's duplicate
+            // and vertical edge, so its vert_map / side_edges already exclude
+            // the doubly-counted entries. A shared corner therefore appears in
+            // the region pass's vert_map only.
+            for (src, dup) in edge_res.vert_map {
+                if !out.vert_map.iter().any(|&(s, _)| s == src) {
+                    out.vert_map.push((src, dup));
+                }
+            }
             out.edge_map.extend(edge_res.edge_map);
             out.side_edges.extend(edge_res.side_edges);
             out.wall_faces.extend(edge_res.wall_faces);
@@ -201,6 +231,106 @@ mod tests {
         let wire = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let loose = mesh.create_vertex(Vec3::new(6.0, 6.0, 0.0));
         (face, wire, loose)
+    }
+
+    // §8.4 shared-corner shape: a quad (verts 0..3) plus a wire edge {v1, v4}
+    // whose v1 endpoint is the quad's corner vert 1. The wire edge is named
+    // directly; the quad is named as a face. The corner vert is reachable
+    // through both kinds.
+    fn quad_with_wire_at_corner(
+        mesh: &mut LoopMesh,
+    ) -> (FaceKey, EdgeKey, VertexKey) {
+        let face = unit_quad(mesh);
+        let corner = mesh.face_vert_keys(face)[1];
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let wire = mesh.create_edge([corner, v4], EdgeCreateFlags::NONE);
+        (face, wire, corner)
+    }
+
+    #[test]
+    fn mixed_shared_corner_vert_duplicated_once() {
+        // §8.4: a corner vertex that is both on an input face and an endpoint
+        // of a directly-named wire edge must be duplicated exactly ONCE. The
+        // region pass and the edge-only pass meet at that single duplicate
+        // corner. Naive composition would duplicate it twice (one per pass).
+        let mut mesh = LoopMesh::new();
+        let (face, wire, corner) = quad_with_wire_at_corner(&mut mesh);
+
+        // Pre-state: 4 quad verts + 1 wire tip = 5 verts.
+        assert_eq!(mesh.totvert(), 5);
+
+        let result = mesh.extrude_region_mixed(&[face], &[wire], &[]);
+
+        // Verts duplicated: 4 quad verts + the wire tip v4. The shared corner
+        // is counted once (it is one of the 4 quad verts). So 5 duplicates,
+        // 10 verts total — NOT 6 duplicates / 11 verts.
+        assert_eq!(mesh.totvert(), 10, "shared corner duplicated once");
+        assert_eq!(
+            result.vert_map.len(),
+            5,
+            "5 unique source verts duplicated (corner not double-counted)"
+        );
+        // The corner appears in the merged vert_map exactly once.
+        let corner_entries =
+            result.vert_map.iter().filter(|&&(s, _)| s == corner).count();
+        assert_eq!(corner_entries, 1, "corner has a single duplicate entry");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn mixed_shared_corner_shares_single_vertical_edge() {
+        // §8.4 / §4.5: the face region's wall and the wire edge's wall that
+        // meet at the shared corner must reuse the SAME vertical edge between
+        // the corner and its single duplicate — not two parallel verticals.
+        let mut mesh = LoopMesh::new();
+        let (face, wire, corner) = quad_with_wire_at_corner(&mut mesh);
+
+        let result = mesh.extrude_region_mixed(&[face], &[wire], &[]);
+
+        let corner_dup = result
+            .vert_map
+            .iter()
+            .find(|&&(s, _)| s == corner)
+            .map(|&(_, d)| d)
+            .expect("corner is duplicated");
+
+        // Exactly one edge spans corner -> its duplicate (the shared vertical).
+        let verticals: Vec<EdgeKey> = mesh
+            .vert_edge_keys(corner)
+            .into_iter()
+            .filter(|&e| {
+                let [x, y] = mesh.edge_vertices(e);
+                (x == corner && y == corner_dup) || (x == corner_dup && y == corner)
+            })
+            .collect();
+        assert_eq!(
+            verticals.len(),
+            1,
+            "single shared vertical edge at the cross-kind corner"
+        );
+        let shared_vertical = verticals[0];
+
+        // That single vertical is referenced by walls from BOTH passes: the
+        // wire edge's wall and at least one of the face region's walls at the
+        // corner. Count walls in the merged result that use it.
+        let walls_using: usize = result
+            .wall_faces
+            .iter()
+            .filter(|&&wf| mesh.face_edge_keys(wf).contains(&shared_vertical))
+            .count();
+        assert!(
+            walls_using >= 2,
+            "the shared vertical is reused by walls from both passes (got {walls_using})"
+        );
+
+        // It must appear once in the merged side_edges list, not twice.
+        let side_count = result
+            .side_edges
+            .iter()
+            .filter(|&&e| e == shared_vertical)
+            .count();
+        assert_eq!(side_count, 1, "shared vertical reported once in side_edges");
+        mesh.validate_topology();
     }
 
     #[test]
