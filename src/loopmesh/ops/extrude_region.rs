@@ -39,6 +39,17 @@ impl LoopMesh {
     /// See `radial-mesh-guides/EXTRUDE_REGION.md` for the full algorithm
     /// description and parity contract.
     pub fn extrude_region(&mut self, faces: &[FaceKey]) -> ExtrudeResult {
+        self.extrude_region_ex(faces, false)
+    }
+
+    /// [`extrude_region`](Self::extrude_region) with the `use_normal_flip`
+    /// parameter exposed: when set, each side-wall quad's winding is reversed
+    /// (EXTRUDE.md §4.2 / §5). The default (`false`) winds each wall so its
+    /// loop on the duplicate edge runs opposite the duplicate face's loop;
+    /// flipping reverses that choice, so the wall's outward normal points the
+    /// other way. Topology (counts, incidence) is identical either way — only
+    /// the per-wall loop direction differs.
+    pub fn extrude_region_ex(&mut self, faces: &[FaceKey], use_normal_flip: bool) -> ExtrudeResult {
         // Mark the selection. Bit 0 = "in region".
         let sel = self.push_face_op_flag_layer();
         for &f in faces {
@@ -221,10 +232,16 @@ impl LoopMesh {
 
             for &(_l_sel, l_v_orig, src_face) in &info.selected_loop_verts {
                 // l_v_orig is the loop's PRE-MUTATION vertex; one of v0_old / v1_old.
-                let (v_a_old, v_b_old, v_a_new, v_b_new) = if l_v_orig == v0_old {
+                // The default (un-flipped) order winds the wall so its loop on
+                // the duplicate edge runs opposite the duplicate face's loop
+                // (EXTRUDE.md §5). `use_normal_flip` swaps the two endpoints,
+                // reversing the quad cycle and the wall's outward normal.
+                let default_a_is_v0 = l_v_orig == v0_old;
+                debug_assert!(default_a_is_v0 || l_v_orig == v1_old);
+                let a_is_v0 = default_a_is_v0 != use_normal_flip;
+                let (v_a_old, v_b_old, v_a_new, v_b_new) = if a_is_v0 {
                     (v0_old, v1_old, v0_new, v1_new)
                 } else {
-                    debug_assert_eq!(l_v_orig, v1_old);
                     (v1_old, v0_old, v1_new, v0_new)
                 };
 
@@ -319,10 +336,42 @@ impl LoopMesh {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use glam::Vec3;
 
     use crate::loopmesh::test_support::{create_face_from_verts, mesh_add_cube};
     use crate::loopmesh::*;
+
+    fn unit_quad(mesh: &mut LoopMesh) -> FaceKey {
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        create_face_from_verts(mesh, &verts)
+    }
+
+    fn pos_key(p: Vec3) -> [u32; 3] {
+        [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
+    }
+
+    // Two N-cycles describe the same polygon with opposite winding iff one is
+    // the reverse rotation of the other.
+    fn cycles_are_reversed(a: &[Vec3], b: &[Vec3]) -> bool {
+        let n = a.len();
+        if b.len() != n {
+            return false;
+        }
+        let rev: Vec<Vec3> = b.iter().rev().copied().collect();
+        for shift in 0..n {
+            if (0..n).all(|i| a[i] == rev[(i + shift) % n]) {
+                return true;
+            }
+        }
+        false
+    }
 
     #[test]
     fn extrude_region_single_quad_isolated() {
@@ -752,6 +801,119 @@ mod tests {
         );
 
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_normal_flip_reverses_wall_winding() {
+        // use_normal_flip must reverse each side-wall's vertex cycle relative to
+        // the default. Extrude the same isolated quad twice (default vs flipped)
+        // and assert each wall's perimeter is the reverse cycle of its default
+        // counterpart over the same original boundary edge. CanonicalMesh is
+        // winding-insensitive, so this in-crate cycle check is what truly pins
+        // the flag.
+        let mut mesh_default = LoopMesh::new();
+        let face_default = unit_quad(&mut mesh_default);
+        let res_default = mesh_default.extrude_region(&[face_default]);
+
+        let mut mesh_flip = LoopMesh::new();
+        let face_flip = unit_quad(&mut mesh_flip);
+        let res_flip = mesh_flip.extrude_region_ex(&[face_flip], true);
+
+        // Same topology — only winding differs.
+        assert_eq!(res_default.wall_faces.len(), res_flip.wall_faces.len());
+        assert_eq!(res_default.wall_faces.len(), 4);
+
+        // A wall's two lower (original) verts identify its boundary edge.
+        // Positions are identical across both meshes, so match by position.
+        let lower_pos = |mesh: &LoopMesh, wf: FaceKey| -> HashSet<[u32; 3]> {
+            mesh.face_vert_keys(wf)
+                .into_iter()
+                .filter(|&v| mesh.vertex_position(v).z == 0.0)
+                .map(|v| pos_key(mesh.vertex_position(v)))
+                .collect()
+        };
+
+        for &wf_def in &res_default.wall_faces {
+            let def_pos: Vec<Vec3> = mesh_default
+                .face_vert_keys(wf_def)
+                .iter()
+                .map(|&v| mesh_default.vertex_position(v))
+                .collect();
+            let def_lower = lower_pos(&mesh_default, wf_def);
+
+            let mut matched = false;
+            for &wf_flip in &res_flip.wall_faces {
+                if lower_pos(&mesh_flip, wf_flip) != def_lower {
+                    continue;
+                }
+                let flip_pos: Vec<Vec3> = mesh_flip
+                    .face_vert_keys(wf_flip)
+                    .iter()
+                    .map(|&v| mesh_flip.vertex_position(v))
+                    .collect();
+                assert!(
+                    cycles_are_reversed(&def_pos, &flip_pos),
+                    "flip wall must be the reverse cycle of the default wall"
+                );
+                matched = true;
+                break;
+            }
+            assert!(matched, "every default wall has a flipped counterpart");
+        }
+
+        mesh_flip.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_default_matches_ex_false() {
+        // The convenience form must delegate to the _ex form with
+        // use_normal_flip = false, producing identical wall windings.
+        let mut mesh_a = LoopMesh::new();
+        let face_a = unit_quad(&mut mesh_a);
+        let res_a = mesh_a.extrude_region(&[face_a]);
+
+        let mut mesh_b = LoopMesh::new();
+        let face_b = unit_quad(&mut mesh_b);
+        let res_b = mesh_b.extrude_region_ex(&[face_b], false);
+
+        assert_eq!(res_a.wall_faces.len(), res_b.wall_faces.len());
+
+        let lower_pos = |mesh: &LoopMesh, wf: FaceKey| -> HashSet<[u32; 3]> {
+            mesh.face_vert_keys(wf)
+                .into_iter()
+                .filter(|&v| mesh.vertex_position(v).z == 0.0)
+                .map(|v| pos_key(mesh.vertex_position(v)))
+                .collect()
+        };
+
+        for &wf_a in &res_a.wall_faces {
+            let a_pos: Vec<Vec3> = mesh_a
+                .face_vert_keys(wf_a)
+                .iter()
+                .map(|&v| mesh_a.vertex_position(v))
+                .collect();
+            let a_lower = lower_pos(&mesh_a, wf_a);
+            let mut matched = false;
+            for &wf_b in &res_b.wall_faces {
+                if lower_pos(&mesh_b, wf_b) != a_lower {
+                    continue;
+                }
+                let b_pos: Vec<Vec3> = mesh_b
+                    .face_vert_keys(wf_b)
+                    .iter()
+                    .map(|&v| mesh_b.vertex_position(v))
+                    .collect();
+                // Same winding: identical as a rotation (not reversed).
+                let n = a_pos.len();
+                let same_rotation = (0..n).any(|shift| {
+                    (0..n).all(|i| a_pos[i] == b_pos[(i + shift) % n])
+                });
+                assert!(same_rotation, "extrude_region must equal _ex(false) winding");
+                matched = true;
+                break;
+            }
+            assert!(matched);
+        }
     }
 
     #[test]
