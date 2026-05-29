@@ -46,53 +46,147 @@ pub enum DeleteContext {
     /// even when the deleted region solely owns it. An interior edge that would
     /// only *become* boundary after deletion is not spared. (§5.2.)
     FacesKeepBoundary,
+    /// Kill exactly the seeded elements of each type — every seeded vert, edge,
+    /// and face — with **no expansion in either direction**: no conditional
+    /// downward cascade (unlike [`DeleteContext::Faces`]), no loose-endpoint
+    /// sweep (unlike [`DeleteContext::Edges`]), no reliance on the kernel's
+    /// upward cascade to find more work (unlike [`DeleteContext::Verts`]).
+    ///
+    /// This is the only context whose seed is genuinely **mixed** (verts, edges
+    /// and faces in one buffer — see [`MixedSeed`]). Closure is the *caller's*
+    /// responsibility (§8.3): the sweep uses the plain kernel kill primitives,
+    /// which still cascade **upward**, so an unclosed tag set (a tagged vert
+    /// without its edges, or a tagged edge without its faces) will still lose
+    /// those untagged higher-dimensional users to the kernel cascade.
+    /// tagged-only declines to *add* to the kill set; it does not *protect*
+    /// untagged users from the primitives' own cascade. Tagging a face without
+    /// its boundary is the benign direction — face-kill never cascades
+    /// downward, so the wire stays. (§8.)
+    TaggedOnly,
 }
 
-/// Seed element type for [`LoopMesh::delete`].
+/// Mixed-type seed for [`DeleteContext::TaggedOnly`].
 ///
-/// The guide's `geom` buffer (`DELETE.md` §1) is a mixed verts ∪ edges ∪ faces
-/// set, but each context reads only one dimension of it (§4.1 / §6.1). Rather
-/// than carry an untyped buffer, the seed slice is typed: a `&[FaceKey]` for the
-/// face-seeded contexts, a `&[VertexKey]` for the verts context, and a
-/// `&[EdgeKey]` for the edge-seeded contexts. This trait lets the single
-/// `delete` entry accept any of them, dispatching to the right routine and
-/// guarding that the context matches the seed's dimension.
-pub trait DeleteSeed: Copy {
-    #[doc(hidden)]
-    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext);
+/// Every other delete context is driven by a single-type seed (`&[FaceKey]` /
+/// `&[VertexKey]` / `&[EdgeKey]`), but tagged-only (`DELETE.md` §8) reads all
+/// three element types from one buffer: it kills exactly the verts, edges, and
+/// faces it is handed, in the §3.1 face-then-edge-then-vert sweep order, with
+/// no mark expansion. The three slices are borrowed for the duration of the
+/// call; an empty slice simply contributes nothing of that type (a face-only
+/// tagged seed, for instance, leaves `verts` and `edges` empty — §8.3 benign
+/// direction).
+#[derive(Clone, Copy)]
+pub struct MixedSeed<'verts, 'edges, 'faces> {
+    pub verts: &'verts [VertexKey],
+    pub edges: &'edges [EdgeKey],
+    pub faces: &'faces [FaceKey],
 }
 
-impl DeleteSeed for FaceKey {
-    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+/// A seed buffer for [`LoopMesh::delete`].
+///
+/// The guide's `geom` buffer (`DELETE.md` §1) is a mixed verts/edges/faces set,
+/// but every context except tagged-only reads only one dimension of it (§4.1 /
+/// §6.1 / §7.1). The single-dimension contexts therefore take a typed slice
+/// seed — `&[FaceKey]` for the face-seeded contexts, `&[VertexKey]` for the
+/// verts context, `&[EdgeKey]` for the edge-seeded contexts — while
+/// [`DeleteContext::TaggedOnly`] (§8) takes a [`MixedSeed`] carrying all three
+/// types at once (§8.5). This trait lets the single `delete` entry accept any
+/// of those seed shapes, dispatching to the right routine and guarding that the
+/// context matches the seed's dimension.
+pub trait DeleteSeed {
+    #[doc(hidden)]
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext);
+}
+
+impl DeleteSeed for &[FaceKey] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
         match context {
-            DeleteContext::FacesOnly => mesh.delete_faces_only(seed),
-            DeleteContext::Faces => mesh.delete_faces(seed, false),
-            DeleteContext::FacesKeepBoundary => mesh.delete_faces(seed, true),
+            DeleteContext::FacesOnly => mesh.delete_faces_only(self),
+            DeleteContext::Faces => mesh.delete_faces(self, false),
+            DeleteContext::FacesKeepBoundary => mesh.delete_faces(self, true),
             DeleteContext::Verts => {
                 panic!("DeleteContext::Verts requires a vert seed, not faces")
             }
             DeleteContext::Edges | DeleteContext::EdgesFaces => {
                 panic!("DeleteContext::Edges / EdgesFaces require an edge seed, not faces")
             }
+            DeleteContext::TaggedOnly => {
+                panic!("DeleteContext::TaggedOnly requires a MixedSeed, not a face slice")
+            }
         }
     }
 }
 
-impl DeleteSeed for VertexKey {
-    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+impl DeleteSeed for &[VertexKey] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
         match context {
-            DeleteContext::Verts => mesh.delete_verts(seed),
+            DeleteContext::Verts => mesh.delete_verts(self),
+            DeleteContext::TaggedOnly => {
+                panic!("DeleteContext::TaggedOnly requires a MixedSeed, not a vert slice")
+            }
             _ => panic!("a vert seed is only valid with DeleteContext::Verts"),
         }
     }
 }
 
-impl DeleteSeed for EdgeKey {
-    fn delete_seeded(mesh: &mut LoopMesh, seed: &[Self], context: DeleteContext) {
+impl DeleteSeed for &[EdgeKey] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
         match context {
-            DeleteContext::Edges => mesh.delete_edges(seed, true),
-            DeleteContext::EdgesFaces => mesh.delete_edges(seed, false),
+            DeleteContext::Edges => mesh.delete_edges(self, true),
+            DeleteContext::EdgesFaces => mesh.delete_edges(self, false),
+            DeleteContext::TaggedOnly => {
+                panic!("DeleteContext::TaggedOnly requires a MixedSeed, not an edge slice")
+            }
             _ => panic!("an edge seed is only valid with DeleteContext::Edges / EdgesFaces"),
+        }
+    }
+}
+
+// Array-reference seeds (`&block`, `&[centre]`, …) unsize to the slice impls so
+// callers need not spell out the `&seed[..]` coercion.
+impl<const N: usize> DeleteSeed for &[FaceKey; N] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+impl<const N: usize> DeleteSeed for &[VertexKey; N] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+impl<const N: usize> DeleteSeed for &[EdgeKey; N] {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+// `Vec`-reference seeds (the `face_vert_keys` / `face_edge_keys` results, …)
+// likewise forward to the slice impls.
+impl DeleteSeed for &Vec<FaceKey> {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+impl DeleteSeed for &Vec<VertexKey> {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+impl DeleteSeed for &Vec<EdgeKey> {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        (self.as_slice()).delete_seeded(mesh, context)
+    }
+}
+
+impl DeleteSeed for MixedSeed<'_, '_, '_> {
+    fn delete_seeded(self, mesh: &mut LoopMesh, context: DeleteContext) {
+        match context {
+            DeleteContext::TaggedOnly => mesh.delete_tagged(self.verts, self.edges, self.faces),
+            _ => panic!("a MixedSeed is only valid with DeleteContext::TaggedOnly"),
         }
     }
 }
@@ -139,11 +233,14 @@ impl LoopMesh {
     /// Delete creates no replacement geometry, so there is no customdata
     /// interpolation: survivors keep their attributes byte-for-byte and killed
     /// elements' attributes are discarded with them.
-    pub fn delete<S: DeleteSeed>(&mut self, seed: &[S], context: DeleteContext) {
-        if seed.is_empty() {
-            return;
-        }
-        S::delete_seeded(self, seed, context);
+    /// The mixed-seed [`DeleteContext::TaggedOnly`] mode (§8) takes a
+    /// [`MixedSeed`] rather than a slice; pass
+    /// `MixedSeed { verts, edges, faces }` with each field a key slice (any may
+    /// be empty). It kills exactly the tagged elements of each type in the §3.1
+    /// face->edge->vert order with no mark expansion of its own — closure is the
+    /// caller's responsibility (§8.3).
+    pub fn delete<S: DeleteSeed>(&mut self, seed: S, context: DeleteContext) {
+        seed.delete_seeded(self, context);
     }
 
     /// §6 — kill the seeded verts and let each vert-kill's upward cascade do the
@@ -380,6 +477,80 @@ impl LoopMesh {
         self.pop_edge_op_flag_layer(doomed_edge);
         self.pop_vert_op_flag_layer(doomed_vert);
         self.pop_face_op_flag_layer(seeded);
+    }
+
+    /// §8 — kill exactly the tagged elements of each type, no mark expansion.
+    ///
+    /// There is no mark *computation* (§8.3): the seed already names every
+    /// element to kill. The only structure is the mark-then-sweep, marking each
+    /// element by its own type with no flushing down to sub-elements and no
+    /// marking up to super-elements, then sweeping in the §3.1
+    /// face->edge->vert order so that — *for a closed tag set* — each kill in
+    /// the sweep is a leaf kill (every doomed face already gone by the time the
+    /// edge sweep runs, every doomed edge gone by the vert sweep).
+    ///
+    /// Closure is the *caller's* responsibility. The sweep uses the plain
+    /// kernel kill primitives (`face_kill`, `edge_kill`, `vertex_kill`), which
+    /// always cascade **upward** (DELETE.md §3). So an unclosed tag set that
+    /// tags an edge without its faces, or a vert without its edges, still loses
+    /// those untagged higher-dimensional users to the kernel cascade during the
+    /// later edge/vert sweep — tagged-only declines to *add* to the kill set but
+    /// does not *protect* untagged users from the primitives' own cascade (§8.3).
+    /// Tagging a face without its boundary is benign: face-kill never cascades
+    /// downward, so the untagged wire survives.
+    ///
+    /// There is no loose-vert sweep and no `is_loose` guard (contrast the edges
+    /// context's §7.3): a tagged vert is killed iff tagged, full stop.
+    fn delete_tagged(&mut self, verts: &[VertexKey], edges: &[EdgeKey], faces: &[FaceKey]) {
+        let doomed_face = self.push_face_op_flag_layer();
+        let doomed_edge = self.push_edge_op_flag_layer();
+        let doomed_vert = self.push_vert_op_flag_layer();
+
+        const DOOM: u8 = 0;
+
+        // Phase 1 — mark exactly the seeded elements, each by its own type.
+        for &face in faces {
+            if self.faces.try_get(face).is_some() {
+                self.face_op_flag_set(doomed_face, face, DOOM);
+            }
+        }
+        for &edge in edges {
+            if self.edges.try_get(edge).is_some() {
+                self.edge_op_flag_set(doomed_edge, edge, DOOM);
+            }
+        }
+        for &vert in verts {
+            if self.vertices.try_get(vert).is_some() {
+                self.vert_op_flag_set(doomed_vert, vert, DOOM);
+            }
+        }
+
+        // Phase 2 — sweep faces, then edges, then verts (the §3.1 invariant).
+        // The mesh-wide lending iterators re-test liveness on each step, so they
+        // are kill-safe against elements an earlier kill's upward cascade freed
+        // (the unclosed-set case — §8.3).
+        let mut face_iter = MeshFaces::default();
+        while let Some(face) = face_iter.next(self) {
+            if self.face_op_flag_test(doomed_face, face, DOOM) {
+                self.face_kill(face);
+            }
+        }
+        let mut edge_iter = MeshEdges::default();
+        while let Some(edge) = edge_iter.next(self) {
+            if self.edge_op_flag_test(doomed_edge, edge, DOOM) {
+                self.edge_kill(edge);
+            }
+        }
+        let mut vert_iter = MeshVerts::default();
+        while let Some(vert) = vert_iter.next(self) {
+            if self.vert_op_flag_test(doomed_vert, vert, DOOM) {
+                self.vertex_kill(vert);
+            }
+        }
+
+        self.pop_vert_op_flag_layer(doomed_vert);
+        self.pop_edge_op_flag_layer(doomed_edge);
+        self.pop_face_op_flag_layer(doomed_face);
     }
 }
 
@@ -663,9 +834,9 @@ mod tests {
         let faces = build_quad_grid(&mut mesh, 3);
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
 
-        mesh.delete::<FaceKey>(&[], DeleteContext::Faces);
-        mesh.delete::<FaceKey>(&[], DeleteContext::FacesOnly);
-        mesh.delete::<VertexKey>(&[], DeleteContext::Verts);
+        mesh.delete(&[] as &[FaceKey], DeleteContext::Faces);
+        mesh.delete(&[] as &[FaceKey], DeleteContext::FacesOnly);
+        mesh.delete(&[] as &[VertexKey], DeleteContext::Verts);
 
         assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
     }
@@ -933,8 +1104,8 @@ mod tests {
         let faces = build_quad_grid(&mut mesh, 3);
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
 
-        mesh.delete::<EdgeKey>(&[], DeleteContext::Edges);
-        mesh.delete::<EdgeKey>(&[], DeleteContext::EdgesFaces);
+        mesh.delete(&[] as &[EdgeKey], DeleteContext::Edges);
+        mesh.delete(&[] as &[EdgeKey], DeleteContext::EdgesFaces);
         let _ = faces;
 
         assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
@@ -954,5 +1125,107 @@ mod tests {
         assert_eq!(mesh.totface(), 0);
         assert_eq!(mesh.totedge(), 0);
         assert_eq!(mesh.totvert(), 0, "mesh fully erased");
+    }
+
+    #[test]
+    fn tagged_only_closed_set_removes_exactly_tagged() {
+        // §8.4 closed-set case (scaffold `grid_3x3`): tag the four block faces,
+        // the four spoke (disk) edges of the centre vert, and the centre vert
+        // itself — the full closure. tagged-only kills exactly that set with no
+        // expansion. Net: −4 F, −4 E, −1 V, leaving the eight outer ring edges
+        // and verts untouched. (9 V → 8 V, 12 E → 8 E, 4 F → 0 F.)
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 2);
+
+        // The lone 4-valence interior vert of a 2×2 grid, and its disk edges.
+        let centre = mesh.face_vert_keys(faces[0])[2];
+        let spokes: Vec<EdgeKey> = mesh.vertex_disk_iter(centre).collect();
+        assert_eq!(spokes.len(), 4, "centre vert has a 4-edge disk");
+
+        let outer_ring_edges: Vec<EdgeKey> = {
+            let mut all: std::collections::HashSet<EdgeKey> = std::collections::HashSet::new();
+            let mut it = MeshEdges::default();
+            while let Some(e) = it.next(&mesh) {
+                all.insert(e);
+            }
+            for s in &spokes {
+                all.remove(s);
+            }
+            all.into_iter().collect()
+        };
+        assert_eq!(outer_ring_edges.len(), 8, "eight outer ring edges");
+
+        mesh.delete(
+            MixedSeed {
+                verts: &[centre],
+                edges: &spokes,
+                faces: &faces,
+            },
+            DeleteContext::TaggedOnly,
+        );
+
+        assert_eq!(mesh.totface(), 0, "all four tagged faces gone");
+        assert_eq!(mesh.totedge(), 8, "only the four tagged spokes removed");
+        assert_eq!(mesh.totvert(), 8, "only the tagged centre vert removed");
+        assert!(mesh.vertices.try_get(centre).is_none(), "centre vert gone");
+        for e in outer_ring_edges {
+            assert!(
+                mesh.edges.try_get(e).is_some(),
+                "untagged outer ring edge must survive (§8.2 closed set)"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_only_face_only_keeps_boundary_wireframe() {
+        // §8.3 benign-direction case (scaffold lone `quad`): tag a single face,
+        // with neither its edges nor its verts in the seed. face-kill does not
+        // cascade downward (§3), so the face header goes and the entire
+        // four-edge wire loop with its four corner verts stays standing.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 1);
+
+        mesh.delete(
+            MixedSeed {
+                verts: &[],
+                edges: &[],
+                faces: &faces,
+            },
+            DeleteContext::TaggedOnly,
+        );
+
+        assert_eq!(mesh.totface(), 0, "tagged face gone");
+        assert_eq!(mesh.totedge(), 4, "untagged wire loop kept (§8.3 benign)");
+        assert_eq!(mesh.totvert(), 4, "untagged corners kept");
+    }
+
+    #[test]
+    fn tagged_only_unclosed_vert_seed_cascades_through_kernel() {
+        // §8.4 unclosed contrast (scaffold `grid_3x3`): tag only the centre vert
+        // and *one* block face, leaving the spokes and the other three faces
+        // untagged. The one tagged face is killed first (no cascade), then the
+        // centre-vert sweep `vertex_kill`s the centre — and that cascades up its
+        // disk, removing all four spokes and all four faces anyway. tagged-only
+        // does not protect untagged users from the kernel cascade (§8.3): the
+        // outcome matches the closed set, −4 F, −4 E, −1 V.
+        let mut mesh = LoopMesh::new();
+        let faces = build_quad_grid(&mut mesh, 2);
+        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        let centre = mesh.face_vert_keys(faces[0])[2];
+
+        mesh.delete(
+            MixedSeed {
+                verts: &[centre],
+                edges: &[],
+                faces: &faces[..1],
+            },
+            DeleteContext::TaggedOnly,
+        );
+
+        assert_eq!(f0 - mesh.totface(), 4, "all four faces gone via cascade");
+        assert_eq!(e0 - mesh.totedge(), 4, "all four spokes gone via cascade");
+        assert_eq!(v0 - mesh.totvert(), 1, "only the tagged centre vert removed");
+        assert!(mesh.vertices.try_get(centre).is_none(), "centre vert gone");
     }
 }

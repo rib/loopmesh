@@ -19,7 +19,7 @@ mod inset_individual;
 mod inset_region;
 mod mean_value;
 
-pub use delete::{DeleteContext, DeleteSeed};
+pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
 pub use dissolve_verts::DissolveVertsParams;
