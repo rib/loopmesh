@@ -50,6 +50,45 @@ impl LoopMesh {
     /// other way. Topology (counts, incidence) is identical either way — only
     /// the per-wall loop direction differs.
     pub fn extrude_region_ex(&mut self, faces: &[FaceKey], use_normal_flip: bool) -> ExtrudeResult {
+        self.extrude_region_impl(faces, &[], false, use_normal_flip)
+    }
+
+    /// [`extrude_region_ex`](Self::extrude_region_ex) with per-edge wall
+    /// suppression (EXTRUDE.md §4.6). Each edge in `edges_exclude` keeps both
+    /// its original and its duplicate edge — the duplication phase is
+    /// unchanged — but no side-wall face is built spanning that pair. Every
+    /// non-excluded boundary edge builds its wall exactly as the plain region
+    /// extrude does. Passing an empty `edges_exclude` is byte-for-byte
+    /// identical to [`extrude_region_ex`](Self::extrude_region_ex).
+    ///
+    /// An excluded edge that is *interior* to the selection (every radial face
+    /// selected) is a silent no-op for exclusion purposes: interior edges never
+    /// get walls, so there is nothing to suppress (EXTRUDE.md §8.9).
+    ///
+    /// `use_keep_orig` is accepted for forward compatibility with the full
+    /// region-extrude parameter set but is not yet implemented; the wire-
+    /// boundary-kill interaction (§8.3) is likewise out of scope here.
+    pub fn extrude_region_exclude(
+        &mut self,
+        faces: &[FaceKey],
+        edges_exclude: &[EdgeKey],
+        use_keep_orig: bool,
+        use_normal_flip: bool,
+    ) -> ExtrudeResult {
+        self.extrude_region_impl(faces, edges_exclude, use_keep_orig, use_normal_flip)
+    }
+
+    fn extrude_region_impl(
+        &mut self,
+        faces: &[FaceKey],
+        edges_exclude: &[EdgeKey],
+        use_keep_orig: bool,
+        use_normal_flip: bool,
+    ) -> ExtrudeResult {
+        assert!(
+            !use_keep_orig,
+            "extrude_region_exclude: use_keep_orig is not yet implemented"
+        );
         // Mark the selection. Bit 0 = "in region".
         let sel = self.push_face_op_flag_layer();
         for &f in faces {
@@ -66,6 +105,15 @@ impl LoopMesh {
         // meshes.
         let mut vert_in_region: Vec<bool> = vec![false; vert_watermark];
         let mut edge_in_region: Vec<bool> = vec![false; edge_watermark];
+        // §4.6 wall suppression: edges named here keep their original/duplicate
+        // pair but get no wall face. Slab-index keyed to match the region flags.
+        let mut edge_excluded: Vec<bool> = vec![false; edge_watermark];
+        for &e in edges_exclude {
+            let slot = e.as_usize();
+            if slot < edge_watermark {
+                edge_excluded[slot] = true;
+            }
+        }
         for &f in faces {
             let mut loops: SmallVec<[LoopKey; 8]> = SmallVec::new();
             let mut it = self.face_loops(f);
@@ -224,6 +272,11 @@ impl LoopMesh {
                 Some(info) if info.is_boundary => info,
                 _ => continue,
             };
+            // §4.6: an excluded boundary edge keeps its original/duplicate pair
+            // (built in Phase 3) but gets no wall face here.
+            if edge_excluded[slot] {
+                continue;
+            }
             let e_old = EdgeKey::from_usize(slot);
             let [v0_old, v1_old] = self.edge_vertices(e_old);
             let v0_new = vert_to_dup[v0_old.as_usize()];
@@ -914,6 +967,139 @@ mod tests {
             }
             assert!(matched);
         }
+    }
+
+    #[test]
+    fn extrude_region_exclude_one_perimeter_edge_suppresses_one_wall() {
+        // EXTRUDE.md §4.6: an excluded boundary edge keeps its original and
+        // duplicate edge pair but gets no wall face. Extruding an isolated quad
+        // normally yields 4 walls; excluding one perimeter edge yields 3.
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        let source_verts = mesh.face_vert_keys(face);
+        let v0 = source_verts[0];
+        let v1 = source_verts[1];
+        let excluded_edge = mesh.query_edge_exists(v0, v1).expect("perimeter edge v0-v1");
+
+        let result = mesh.extrude_region_exclude(&[face], &[excluded_edge], false, false);
+
+        assert_eq!(result.vert_map.len(), 4, "all 4 boundary verts still duplicated");
+        assert_eq!(
+            result.edge_map.len(),
+            4,
+            "all 4 boundary edges still duplicated, including the excluded one"
+        );
+        assert_eq!(
+            result.wall_faces.len(),
+            3,
+            "the excluded edge contributes no wall face"
+        );
+
+        // The excluded edge's duplicate still exists (it's in edge_map).
+        assert!(
+            result.edge_map.iter().any(|(src, _)| *src == excluded_edge),
+            "excluded edge is still duplicated"
+        );
+        // No wall face spans the excluded edge's two original verts.
+        for &wf in &result.wall_faces {
+            let wall_verts = mesh.face_vert_keys(wf);
+            assert!(
+                !(wall_verts.contains(&v0) && wall_verts.contains(&v1)),
+                "no wall should sit on the excluded edge"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_exclude_empty_matches_plain_region() {
+        // An empty exclude set must produce exactly the plain-region result:
+        // identical wall count and identical wall windings.
+        let mut mesh_plain = LoopMesh::new();
+        let face_plain = unit_quad(&mut mesh_plain);
+        let res_plain = mesh_plain.extrude_region(&[face_plain]);
+
+        let mut mesh_excl = LoopMesh::new();
+        let face_excl = unit_quad(&mut mesh_excl);
+        let res_excl = mesh_excl.extrude_region_exclude(&[face_excl], &[], false, false);
+
+        assert_eq!(res_plain.vert_map.len(), res_excl.vert_map.len());
+        assert_eq!(res_plain.edge_map.len(), res_excl.edge_map.len());
+        assert_eq!(res_plain.side_edges.len(), res_excl.side_edges.len());
+        assert_eq!(res_plain.wall_faces.len(), res_excl.wall_faces.len());
+        assert_eq!(res_plain.wall_faces.len(), 4);
+
+        let lower_pos = |mesh: &LoopMesh, wf: FaceKey| -> HashSet<[u32; 3]> {
+            mesh.face_vert_keys(wf)
+                .into_iter()
+                .filter(|&v| mesh.vertex_position(v).z == 0.0)
+                .map(|v| pos_key(mesh.vertex_position(v)))
+                .collect()
+        };
+
+        for &wf_plain in &res_plain.wall_faces {
+            let plain_pos: Vec<Vec3> = mesh_plain
+                .face_vert_keys(wf_plain)
+                .iter()
+                .map(|&v| mesh_plain.vertex_position(v))
+                .collect();
+            let plain_lower = lower_pos(&mesh_plain, wf_plain);
+            let mut matched = false;
+            for &wf_excl in &res_excl.wall_faces {
+                if lower_pos(&mesh_excl, wf_excl) != plain_lower {
+                    continue;
+                }
+                let excl_pos: Vec<Vec3> = mesh_excl
+                    .face_vert_keys(wf_excl)
+                    .iter()
+                    .map(|&v| mesh_excl.vertex_position(v))
+                    .collect();
+                let n = plain_pos.len();
+                let same_rotation =
+                    (0..n).any(|shift| (0..n).all(|i| plain_pos[i] == excl_pos[(i + shift) % n]));
+                assert!(same_rotation, "empty-exclude wall must match plain wall winding");
+                matched = true;
+                break;
+            }
+            assert!(matched, "every plain wall has an empty-exclude counterpart");
+        }
+        mesh_excl.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_exclude_interior_edge_is_noop() {
+        // EXTRUDE.md §8.9: excluding an interior edge (every radial face
+        // selected) has no effect — interior edges never get walls.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e02 = mesh.create_edge([v0, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let f1 = mesh.face_create(&[v0, v1, v2], &[e01, e12, e02], FaceCreateFlags::NONE);
+        let f2 = mesh.face_create(&[v0, v2, v3], &[e02, e23, e30], FaceCreateFlags::NONE);
+
+        // e02 is interior to the {f1, f2} selection.
+        let result = mesh.extrude_region_exclude(&[f1, f2], &[e02], false, false);
+
+        // Same as the no-exclude two-adjacent-faces case: 4 walls, 5 dup edges.
+        assert_eq!(result.edge_map.len(), 5);
+        assert_eq!(
+            result.wall_faces.len(),
+            4,
+            "excluding an interior edge changes nothing"
+        );
+        mesh.validate_topology();
     }
 
     #[test]
