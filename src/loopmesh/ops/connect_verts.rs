@@ -26,9 +26,10 @@ impl LoopMesh {
     /// are never collected or split (§1); `check_degenerate` selects the
     /// legality filter over the optimal one (§1/§5).
     ///
-    /// The edge-reuse variant (§6.2/§6.3) — for a pair already joined by an
-    /// interior edge — is not reached on the inputs this covers; the plain
-    /// face-split path handles every collected chord.
+    /// The edge-reuse variant (§6.2/§6.3) handles a chord whose endpoints are
+    /// already joined by an interior/wire edge: the split adopts that edge
+    /// instead of duplicating it, and any duplicate sub-face it leaves is
+    /// removed in a deferred cleanup pass.
     pub fn connect_verts(
         &mut self,
         verts: &[VertexKey],
@@ -281,16 +282,63 @@ impl LoopMesh {
         edges_out: &mut HashSet<EdgeKey>,
     ) {
         let mut sub_faces: Vec<FaceKey> = vec![f0];
+        // §6.3 — duplicate sub-faces from the reuse path are killed only after
+        // the whole chord list is processed; killing mid-loop would invalidate
+        // the working-face re-resolution of §6.1.
+        let mut deferred_doubles: Vec<FaceKey> = Vec::new();
         for &(a, b) in chords {
             let Some(target) = self.find_sub_face_with_pair(&sub_faces, a, b) else {
                 continue; // endpoint no longer a corner of any live sub-face
             };
+            let working = sub_faces[target];
+            // §6.2 — an interior/wire edge already joining a–b means the split
+            // must adopt it (SFME edge-reuse variant) rather than allocate a
+            // duplicate. Only this path can produce a duplicate sub-face.
+            let reuse_existing_edge = self.query_edge_exists(a, b).is_some();
             let (new_face, new_edge) = self
-                .face_split(sub_faces[target], a, b)
+                .face_split_reusing(working, a, b, reuse_existing_edge)
                 .expect("connect_verts: face_split failed on a filtered chord");
             edges_out.insert(new_edge);
             sub_faces.push(new_face);
+            if reuse_existing_edge {
+                self.collect_doubles_after_split(working, new_face, &mut deferred_doubles);
+            }
         }
+        for f_dup in deferred_doubles {
+            self.face_kill(f_dup);
+        }
+    }
+
+    /// §6.3 — after a reuse split, either resulting sub-face may duplicate a
+    /// pre-existing face (one whose corner cycle coincides). Record each
+    /// sub-face that has such a twin so it can be killed once the chord list is
+    /// done. The kept twin is the pre-existing face; the freshly-produced
+    /// sub-face is the one recorded for removal.
+    fn collect_doubles_after_split(
+        &self,
+        survived: FaceKey,
+        new_face: FaceKey,
+        deferred: &mut Vec<FaceKey>,
+    ) {
+        for sub_face in [survived, new_face] {
+            if self.face_has_duplicate(sub_face) {
+                deferred.push(sub_face);
+            }
+        }
+    }
+
+    /// True when some *other* live face has the same corner-vertex set as
+    /// `face` (a duplicate sub-face, §6.3). The corner cycles of two faces over
+    /// the same vertex set are equal up to rotation/reflection, so a set
+    /// comparison suffices to detect the duplicate.
+    fn face_has_duplicate(&self, face: FaceKey) -> bool {
+        let target: HashSet<VertexKey> = self.face_vert_keys(face).into_iter().collect();
+        self.face_keys().into_iter().any(|other| {
+            other != face && {
+                let verts = self.face_vert_keys(other);
+                verts.len() == target.len() && verts.iter().all(|v| target.contains(v))
+            }
+        })
     }
 
     fn find_sub_face_with_pair(
@@ -604,6 +652,68 @@ mod tests {
         let created = mesh.connect_verts_out(&[vk[0], vk[2]], &[quad0], false);
         assert!(created.is_empty(), "excluded face's chord is suppressed");
         assert_eq!(mesh.face_keys().len(), faces_before, "mesh unchanged");
+    }
+
+    #[test]
+    fn edge_exists_reuse_kills_duplicate_subfaces() {
+        // §6.2 / §6.3 fixture: a quad [0,1,2,3] overlaid on two coincident
+        // triangles [0,1,2] and [0,2,3] that already share the interior
+        // diagonal edge {0,2}. Tagging 0 and 2 yields the single chord {0,2};
+        // its endpoints are already joined by {0,2}, so the split must reuse
+        // that edge and then kill the two duplicate sub-faces it leaves.
+        let mut mesh = LoopMesh::new();
+        let coords = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let vk: Vec<VertexKey> = coords.iter().map(|&c| mesh.create_vertex(c)).collect();
+
+        let edge_of = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.query_edge_exists(a, b)
+                .unwrap_or_else(|| mesh.create_edge([a, b], EdgeCreateFlags::NONE))
+        };
+        let mk = |mesh: &mut LoopMesh, ring: &[VertexKey]| {
+            let edges: Vec<EdgeKey> = (0..ring.len())
+                .map(|i| edge_of(mesh, ring[i], ring[(i + 1) % ring.len()]))
+                .collect();
+            mesh.face_create(ring, &edges, FaceCreateFlags::NONE)
+        };
+
+        let quad = mk(&mut mesh, &[vk[0], vk[1], vk[2], vk[3]]);
+        mk(&mut mesh, &[vk[0], vk[1], vk[2]]);
+        mk(&mut mesh, &[vk[0], vk[2], vk[3]]);
+
+        let diagonal = mesh.query_edge_exists(vk[0], vk[2]).unwrap();
+        assert_eq!(mesh.vert_keys().len(), 4);
+        assert_eq!(mesh.edge_keys().len(), 5);
+        assert_eq!(mesh.face_keys().len(), 3);
+
+        let created = mesh.connect_verts_out(&[vk[0], vk[2]], &[], false);
+
+        // Net delta: -1 face, 0 edges, 0 verts. The reused diagonal is the
+        // edge reported, not a freshly-created duplicate.
+        assert_eq!(mesh.vert_keys().len(), 4, "no verts created or removed");
+        assert_eq!(mesh.edge_keys().len(), 5, "diagonal reused, no edge added");
+        assert_eq!(mesh.face_keys().len(), 2, "quad consumed, duplicates killed");
+        assert_eq!(
+            mesh.query_edge_exists(vk[0], vk[2]),
+            Some(diagonal),
+            "the original diagonal survives (not duplicated)"
+        );
+        assert!(
+            created.contains(&diagonal),
+            "the reused diagonal is reported in edges.out"
+        );
+        for f in mesh.face_keys() {
+            assert_eq!(mesh.face_len(f), 3, "both survivors are triangles");
+        }
+        // The quad handle is gone (consumed into a triangle and then either
+        // kept as a survivor or killed as a duplicate — either way no quad
+        // remains).
+        assert!(!mesh.face_keys().iter().any(|&f| mesh.face_len(f) == 4));
+        let _ = quad;
     }
 
     #[test]

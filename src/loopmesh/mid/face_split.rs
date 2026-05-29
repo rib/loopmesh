@@ -13,6 +13,22 @@ impl LoopMesh {
         v1: VertexKey,
         v2: VertexKey,
     ) -> Option<(FaceKey, EdgeKey)> {
+        self.face_split_reusing(face, v1, v2, false)
+    }
+
+    /// [`Self::face_split`] with the SFME edge-reuse variant
+    /// (RADIAL_EDGE_STRUCTURE.md §8.3.1). When `reuse_existing_edge` is set and
+    /// `v1`–`v2` are already joined by an interior/wire edge, that edge is
+    /// adopted as the splitting diagonal instead of a duplicate being created.
+    /// The reuse path can leave a duplicate sub-face; the caller is responsible
+    /// for detecting and removing it.
+    pub fn face_split_reusing(
+        &mut self,
+        face: FaceKey,
+        v1: VertexKey,
+        v2: VertexKey,
+        reuse_existing_edge: bool,
+    ) -> Option<(FaceKey, EdgeKey)> {
         if v1 == v2 {
             return None;
         }
@@ -34,7 +50,8 @@ impl LoopMesh {
         }
         let l_v1 = l_v1?;
         let l_v2 = l_v2?;
-        let (new_face, new_edge, l_f2) = self.euler_split_face_make_edge(face, l_v1, l_v2);
+        let (new_face, new_edge, l_f2) =
+            self.euler_split_face_make_edge_reusing(face, l_v1, l_v2, reuse_existing_edge);
 
         // Customdata interp: new_face copies the source face's CD. new_edge is
         // a fresh interior diagonal — no source edge to inherit from, so it

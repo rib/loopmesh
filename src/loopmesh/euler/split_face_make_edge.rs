@@ -18,6 +18,24 @@ impl LoopMesh {
         l_v1: LoopKey,
         l_v2: LoopKey,
     ) -> (FaceKey, EdgeKey, LoopKey) {
+        self.euler_split_face_make_edge_reusing(face, l_v1, l_v2, false)
+    }
+
+    /// SFME with the edge-reuse variant (RADIAL_EDGE_STRUCTURE.md §8.3.1).
+    /// When `reuse_existing_edge` is set and `l_v1.vertex`–`l_v2.vertex` are
+    /// already joined by an interior/wire edge off this face's loop cycle, that
+    /// edge is adopted as the splitting edge instead of a fresh one being
+    /// allocated (`0 E` instead of `+1 E`); otherwise the behaviour is
+    /// identical to the default fresh-edge path. The reuse path can leave a
+    /// duplicate sub-face — detection and removal are the caller's
+    /// responsibility (§8.3.1).
+    pub fn euler_split_face_make_edge_reusing(
+        &mut self,
+        face: FaceKey,
+        l_v1: LoopKey,
+        l_v2: LoopKey,
+        reuse_existing_edge: bool,
+    ) -> (FaceKey, EdgeKey, LoopKey) {
         debug_assert_eq!(self.loops.get(l_v1).face, face);
         debug_assert_eq!(self.loops.get(l_v2).face, face);
         debug_assert_ne!(l_v1, l_v2);
@@ -25,8 +43,14 @@ impl LoopMesh {
         let v1 = self.loops.get(l_v1).vertex;
         let v2 = self.loops.get(l_v2).vertex;
 
-        // 1. Allocate the new edge connecting v1 and v2.
-        let new_edge = self.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        // 1. Resolve the splitting edge: adopt an existing v1–v2 edge on the
+        //    reuse path, otherwise allocate a fresh one.
+        let new_edge = if reuse_existing_edge {
+            self.query_edge_exists(v1, v2)
+                .unwrap_or_else(|| self.create_edge([v1, v2], EdgeCreateFlags::NONE))
+        } else {
+            self.create_edge([v1, v2], EdgeCreateFlags::NONE)
+        };
 
         // 2. Allocate the new face via direct slab access (face_create
         //    expects a verts/edges list — not applicable here).
