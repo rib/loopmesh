@@ -23,6 +23,7 @@ mod face_triangulate;
 mod inset_individual;
 mod inset_region;
 mod mean_value;
+mod weld_verts;
 
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
