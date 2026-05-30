@@ -94,14 +94,31 @@ impl LoopMesh {
                     }
                     if let Some(j) = remaining.iter().position(|&f| f == other_face) {
                         // §4.1 step 2: when the radial is exactly length 2
-                        // (the standard manifold case) the JFKE primitive
-                        // kills the edge as part of the merge. When the
-                        // radial is longer the edge survives with the
-                        // out-of-region loops still on it.
-                        if radial_len == 2 {
+                        // (the standard manifold case) the merge kills the
+                        // edge. When the radial is longer the edge survives
+                        // with the out-of-region loops still on it.
+                        //
+                        // The strict manifold Euler primitive only accepts
+                        // the opposite-direction (geometrically natural)
+                        // winding at the shared edge. The §4.1.5
+                        // same-direction (non-contiguous) winding is
+                        // reconciled by the local reverse-cycle splice in
+                        // `faces_join_merge_pair`, which produces the same
+                        // merged n-gon either way. Route the natural case
+                        // through the Euler primitive (it is exercised by
+                        // other operators and kept strict); route the
+                        // same-direction case — and every keep-edge case —
+                        // through the reconciling splice.
+                        let same_direction = {
+                            let l_fa = self.face_edge_share_loop(fa, e)?;
+                            let l_other = self.face_edge_share_loop(other_face, e)?;
+                            self.loops.get(l_fa).vertex == self.loops.get(l_other).vertex
+                        };
+                        if radial_len == 2 && !same_direction {
                             self.euler_join_face_kill_edge(fa, other_face, e)?;
                         } else {
-                            self.faces_join_merge_pair_keep_edge(fa, other_face, e)?;
+                            let kill_edge = radial_len == 2;
+                            self.faces_join_merge_pair(fa, other_face, e, kill_edge)?;
                         }
                         remaining.swap_remove(j);
                         remaining_set.remove(&other_face);
@@ -187,11 +204,10 @@ impl LoopMesh {
         None
     }
 
-    /// §3.3 / §4.1 step 2 — pairwise merge along a shared edge whose
-    /// radial cycle has more than two loops. The two doomed loops belong
-    /// to `fa` and `fb`; the remaining radial loops belong to faces
-    /// outside the input region and stay attached to `edge`, which
-    /// survives the merge with its radial cycle shortened by two.
+    /// §4.1.5 / §4.1 step 2 — pairwise merge along a shared edge,
+    /// reconciling the cross-face winding so it works in both the
+    /// opposite-direction (natural) and same-direction (non-contiguous)
+    /// cases. The two doomed loops belong to `fa` and `fb`.
     ///
     /// This is *not* a thin wrapper around the manifold Euler primitive
     /// `euler_join_face_kill_edge`: it differs in two load-bearing ways.
@@ -200,14 +216,21 @@ impl LoopMesh {
     /// loops into the merged cycle in reverse, flipping each loop onto
     /// the far endpoint of its own (unchanged) edge — it never reverses
     /// `fb` as a whole, so `fb`'s other edges' radial cycles are left
-    /// untouched even when `fb` carries a second non-manifold edge.
-    /// (b) It leaves `edge` alive (it only detaches the two doomed spine
-    /// loops from the radial cycle) when out-of-region loops remain on it.
-    fn faces_join_merge_pair_keep_edge(
+    /// untouched even when `fb` carries a second non-manifold edge. The
+    /// merged n-gon, its winding (determined by the surviving boundary
+    /// loops) and its per-corner loop attributes are identical to the
+    /// opposite-direction case — the same-direction handling is purely a
+    /// surgery-scheduling concern (§4.1.5).
+    /// (b) When `kill_edge` is set (the manifold radial-length-2 case)
+    /// `edge` is removed from its endpoints' disks and freed; otherwise
+    /// (the keep-alive case) it survives, carrying its remaining
+    /// out-of-region radial loops.
+    fn faces_join_merge_pair(
         &mut self,
         fa: FaceKey,
         fb: FaceKey,
         edge: EdgeKey,
+        kill_edge: bool,
     ) -> Option<FaceKey> {
         if fa == fb {
             return None;
@@ -286,6 +309,27 @@ impl LoopMesh {
                 chain
             };
 
+            // §4.1.5 per-corner attribute routing. Reversing the chain moves
+            // each fb loop from its near endpoint to its edge's far endpoint
+            // — i.e. onto the corner that, in fb's source cycle, was held by
+            // its *next* loop. Per-loop attributes are keyed to the corner
+            // (identified by vertex), so each reversed loop must inherit the
+            // attributes of the source loop that originally sat at its new
+            // vertex: its forward neighbour in fb's cycle (the spine loop
+            // l_fb for the chain's tail). The forward-order copy is safe —
+            // each destination slot is read as a source before it is itself
+            // overwritten.
+            for window_index in 0..fb_chain.len() {
+                let dst = fb_chain[window_index];
+                let src = if window_index + 1 < fb_chain.len() {
+                    fb_chain[window_index + 1]
+                } else {
+                    l_fb
+                };
+                self.loop_attribs
+                    .copy_into(dst.as_usize(), src.as_usize());
+            }
+
             for &l in &fb_chain {
                 let loop_edge = self.loops.get(l).edge;
                 let near = self.loops.get(l).vertex;
@@ -333,9 +377,18 @@ impl LoopMesh {
         self.remove_loop_slab_entry(l_fa);
         self.remove_loop_slab_entry(l_fb);
 
-        // Unlike the manifold primitive we deliberately do NOT remove
-        // `edge` from its endpoints' disks or free its slab — the edge
-        // survives with the out-of-region radial loops still on it.
+        if kill_edge {
+            // Manifold radial-length-2 case: the edge's radial cycle is
+            // now empty. Remove it from its endpoints' disks and free its
+            // slab — the §4.1 step 2 manifold sub-case.
+            let edge_verts = self.edges.get(edge).vertices;
+            self.vertex_disk_remove_edge(edge_verts[0], edge);
+            self.vertex_disk_remove_edge(edge_verts[1], edge);
+            self.remove_edge_slab_entry(edge);
+        }
+        // Keep-alive case: deliberately do NOT remove `edge` from its
+        // endpoints' disks or free its slab — the edge survives with the
+        // out-of-region radial loops still on it.
 
         self.remove_face_slab_entry(fb);
 
@@ -667,6 +720,210 @@ mod tests {
         assert!(live_faces.contains(&f_shadow));
 
         mesh.validate_topology();
+    }
+
+    /// §4.1.5 same-direction (non-contiguous) winding: two coplanar quads
+    /// share edge `{v1, v2}` but both traverse it `v1 -> v2` (inconsistent
+    /// face orientations). The merge must still succeed and produce the
+    /// same 6-corner n-gon as the opposite-direction case — the
+    /// same-direction handling is purely an internal surgery concern, not
+    /// an observable difference in the result.
+    #[test]
+    fn faces_join_merges_non_contiguous_winding_manifold_pair() {
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .expect("uv layer registers");
+
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+        .collect();
+
+        let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_25 = mesh.create_edge([v[2], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_54 = mesh.create_edge([v[5], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e_41 = mesh.create_edge([v[4], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+
+        // Left quad, CCW: [v0, v1, v2, v3]. Its loop on the shared edge is
+        // anchored at v1 and walks v1 -> v2.
+        let f_left = mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e_01, e_12, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+        // Right quad with inconsistent winding: [v1, v2, v5, v4]. Its loop
+        // on the shared edge is *also* anchored at v1 and walks v1 -> v2 —
+        // the same-direction (non-contiguous) case of §4.1.5.
+        let f_right = mesh.face_create(
+            &[v[1], v[2], v[5], v[4]],
+            &[e_12, e_25, e_54, e_41],
+            FaceCreateFlags::NONE,
+        );
+
+        // Confirm the fixture is genuinely the same-direction case.
+        let l_left = mesh.face_edge_share_loop(f_left, e_12).unwrap();
+        let l_right = mesh.face_edge_share_loop(f_right, e_12).unwrap();
+        assert_eq!(
+            mesh.loops.get(l_left).vertex,
+            mesh.loops.get(l_right).vertex,
+            "fixture must be same-direction: both shared-edge loops start at the same vert"
+        );
+
+        // Tag every loop's UV with (face_id, vertex_index) so we can verify
+        // each surviving boundary corner kept its own source attribute and
+        // is anchored at the correct vertex after the splice.
+        let vert_index = |key: VertexKey| v.iter().position(|&k| k == key).unwrap() as f32;
+        for (face_id, face) in [(1.0_f32, f_left), (2.0_f32, f_right)] {
+            for l in mesh.face_loop_keys(face) {
+                let vi = vert_index(mesh.loop_vertex(l));
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [face_id, vi]);
+            }
+        }
+
+        let totvert_before = mesh.totvert();
+
+        let merged = mesh
+            .faces_join(&[f_left, f_right])
+            .expect("non-contiguous coplanar pair must still merge per §4.1.5");
+
+        // Topology: 6-corner n-gon on the outer rim; the shared interior
+        // edge is killed; no verts lost (every rim vert keeps a rim edge).
+        let perimeter = mesh.face_vert_keys(merged);
+        assert_eq!(perimeter.len(), 6, "merged n-gon has 6 corners");
+        let got: std::collections::HashSet<VertexKey> = perimeter.iter().copied().collect();
+        let expected: std::collections::HashSet<VertexKey> = v.iter().copied().collect();
+        assert_eq!(got, expected, "perimeter is the union's outer rim");
+        assert_eq!(mesh.totvert(), totvert_before, "no verts killed");
+        assert_eq!(mesh.totedge(), 6, "shared interior edge killed; 6 rim edges remain");
+        assert_eq!(mesh.totface(), 1, "two quads merged into one");
+        assert!(mesh.edge_keys().into_iter().all(|e| e != e_12), "shared edge gone");
+
+        // Per-corner attribute routing (§4.1.5): every surviving boundary
+        // loop kept its own source-face UV and is anchored at the vertex
+        // its (face_id, vertex_index) encodes — i.e. the splice did not
+        // shuffle attributes onto the wrong corner.
+        for l in mesh.face_loop_keys(merged) {
+            let tag = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            let recorded_vert = tag[1];
+            assert_eq!(
+                recorded_vert,
+                vert_index(mesh.loop_vertex(l)),
+                "loop attribute stayed pinned to its source corner"
+            );
+            assert!(
+                tag[0] == 1.0 || tag[0] == 2.0,
+                "each corner carries a recognised source-face tag"
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// Build the two-quad coplanar fixture with UVs tagging each corner's
+    /// vertex position. `right_winding` chooses the right quad's winding so
+    /// the caller can build either the opposite-direction (contiguous) or
+    /// same-direction (non-contiguous) case across the shared edge `{v1,v2}`.
+    /// Merges the pair and returns a `(world-position -> source-face UV)`
+    /// map of the merged face's corners. §4.1.5 requires this map to be
+    /// identical for both windings.
+    fn merge_two_quads_corner_uv_map(
+        right_winding: &[usize; 4],
+    ) -> std::collections::HashMap<[u32; 2], [u32; 2]> {
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .expect("uv layer registers");
+
+        let coords = [
+            (0.0_f32, 0.0_f32),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+        ];
+        let v: Vec<VertexKey> = coords
+            .iter()
+            .map(|&(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+            .collect();
+
+        let mk = |mesh: &mut LoopMesh, a: usize, b: usize| {
+            mesh.create_edge([v[a], v[b]], EdgeCreateFlags::NO_DUPLICATE)
+        };
+        let e_01 = mk(&mut mesh, 0, 1);
+        let e_12 = mk(&mut mesh, 1, 2);
+        let e_23 = mk(&mut mesh, 2, 3);
+        let e_30 = mk(&mut mesh, 3, 0);
+
+        let f_left = mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e_01, e_12, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
+
+        let rv = right_winding;
+        let r_edges: Vec<EdgeKey> = (0..4)
+            .map(|i| mk(&mut mesh, rv[i], rv[(i + 1) % 4]))
+            .collect();
+        let r_verts: Vec<VertexKey> = rv.iter().map(|&i| v[i]).collect();
+        let f_right = mesh.face_create(&r_verts, &r_edges, FaceCreateFlags::NONE);
+
+        for (face_id, face) in [(1.0_f32, f_left), (2.0_f32, f_right)] {
+            for l in mesh.face_loop_keys(face) {
+                let pos = mesh.vertex_position(mesh.loop_vertex(l));
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [face_id, pos.x + 10.0 * pos.y]);
+            }
+        }
+
+        let merged = mesh.faces_join(&[f_left, f_right]).expect("pair merges");
+
+        let mut map = std::collections::HashMap::new();
+        for l in mesh.face_loop_keys(merged) {
+            let pos = mesh.vertex_position(mesh.loop_vertex(l));
+            let uv_val = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            map.insert(
+                [pos.x.to_bits(), pos.y.to_bits()],
+                [uv_val[0].to_bits(), uv_val[1].to_bits()],
+            );
+        }
+        map
+    }
+
+    /// §4.1.5 invariant: the same-direction (non-contiguous) merge yields a
+    /// merged face whose per-corner attributes are *identical* to the
+    /// opposite-direction (contiguous) merge of the geometrically-equivalent
+    /// pair. Opposite-direction right quad is `[v1, v4, v5, v2]` (shared
+    /// edge walked v2 -> v1); same-direction is `[v1, v2, v5, v4]` (walked
+    /// v1 -> v2, matching the left quad).
+    #[test]
+    fn faces_join_non_contiguous_matches_contiguous_corner_attributes() {
+        let contiguous = merge_two_quads_corner_uv_map(&[1, 4, 5, 2]);
+        let non_contiguous = merge_two_quads_corner_uv_map(&[1, 2, 5, 4]);
+        assert_eq!(
+            contiguous, non_contiguous,
+            "§4.1.5: same-direction merge must produce the identical per-corner \
+             attribute map as the opposite-direction merge"
+        );
+        // Sanity: both produced a 6-corner map.
+        assert_eq!(contiguous.len(), 6, "merged hexagon has 6 distinct corners");
     }
 
     /// Negative case for §4.2: joining two adjacent quads on a 3x3 grid
