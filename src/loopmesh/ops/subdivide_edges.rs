@@ -34,9 +34,12 @@ impl Default for QuadCornerType {
 /// per-face re-split patterns enabled (`use_grid_fill` + `use_single_edge` on),
 /// and `STRAIGHT_CUT` corners — exactly what this operator implements today.
 ///
-/// The deferred knobs (smooth/fractal/sphere, `cuts >= 2`, the non-default corner
-/// strategies, `use_only_quads`) are not yet part of the surface; supplying a
-/// value outside the core makes the operator decline (§9, see
+/// Turning a gate **off** does not decline the operator: the §3 midpoints are
+/// still inserted, but the corresponding per-face re-split is suppressed and the
+/// touched face is left as a flat-cornered n-gon (§1 pattern-gating note /
+/// §9.3). The deferred knobs (smooth/fractal/sphere, `cuts >= 2`, the non-default
+/// corner strategies, `use_only_quads`) are not yet part of the surface;
+/// supplying a value outside the core makes the operator decline (§9, see
 /// [`SubdivideResult::Unsupported`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubdivideParams {
@@ -59,6 +62,28 @@ impl Default for SubdivideParams {
             use_grid_fill: true,
             quad_corner_type: QuadCornerType::StraightCut,
         }
+    }
+}
+
+impl SubdivideParams {
+    /// Toggle the one-cut re-split patterns (§5.1 / §6.1). On by default. With
+    /// this off, a face with a single cut edge keeps its inserted midpoint but
+    /// is left as a flat-cornered n-gon — the §5.1 / §6.1 surgery is skipped
+    /// (§1 pattern-gating note / §9.3).
+    #[must_use]
+    pub fn use_single_edge(mut self, enabled: bool) -> Self {
+        self.use_single_edge = enabled;
+        self
+    }
+
+    /// Toggle the all-edges re-split patterns (§5.4 / §6.3). On by default.
+    /// With this off, a fully-cut quad or triangle keeps its rim midpoints but
+    /// is left as a flat-cornered n-gon — the §5.4 / §6.3 surgery is skipped
+    /// (§1 pattern-gating note / §9.3).
+    #[must_use]
+    pub fn use_grid_fill(mut self, enabled: bool) -> Self {
+        self.use_grid_fill = enabled;
+        self
     }
 }
 
@@ -999,6 +1024,111 @@ mod tests {
         );
         assert_eq!(res, SubdivideResult::Unsupported);
         assert_eq!(counts(&mesh), before, "declined run leaves mesh untouched");
+    }
+
+    #[test]
+    fn use_single_edge_off_quad_stays_pentagon() {
+        // §1 pattern-gating / §9.3 — with use_single_edge off, the §5.1 one-cut
+        // quad re-split is suppressed: the midpoint is inserted but not connected
+        // into the interior. The quad stays a flat-cornered pentagon.
+        // V 4->5, E 4->5, F unchanged (1).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res =
+            mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (5, 5, 1), "single-edge quad off: flat 5-gon");
+        assert_eq!(mesh.face_len(face), 5, "the face is a flat pentagon");
+    }
+
+    #[test]
+    fn use_single_edge_off_tri_stays_quad() {
+        // §1 pattern-gating / §9.3 — with use_single_edge off, the §6.1 one-cut
+        // tri re-split is suppressed. The triangle stays a flat 4-gon.
+        // V 3->4, E 3->4, F unchanged (1).
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res =
+            mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (4, 4, 1), "single-edge tri off: flat 4-gon");
+        assert_eq!(mesh.face_len(face), 4, "the face is a flat 4-gon");
+    }
+
+    #[test]
+    fn use_grid_fill_off_quad_stays_octagon() {
+        // §1 pattern-gating / §9.3 — with use_grid_fill off, the §5.4 all-edges
+        // quad plus-split is suppressed: the four rim midpoints are inserted but
+        // no inner vert and no spokes. The quad stays a flat 8-gon.
+        // V 4->8, E 4->8, F unchanged (1).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let edges: Vec<_> = (0..4)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
+            .collect();
+
+        let res =
+            mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (8, 8, 1), "grid-fill quad off: flat 8-gon");
+        assert_eq!(mesh.face_len(face), 8, "the face is a flat 8-gon");
+    }
+
+    #[test]
+    fn use_grid_fill_off_tri_stays_hexagon() {
+        // §1 pattern-gating / §9.3 — with use_grid_fill off, the §6.3 all-edges
+        // tri 1-to-4 split is suppressed. The triangle stays a flat 6-gon.
+        // V 3->6, E 3->6, F unchanged (1).
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let edges: Vec<_> = (0..3)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 3]).unwrap())
+            .collect();
+
+        let res =
+            mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (6, 6, 1), "grid-fill tri off: flat 6-gon");
+        assert_eq!(mesh.face_len(face), 6, "the face is a flat 6-gon");
+    }
+
+    #[test]
+    fn gates_default_on_still_resplit() {
+        // The off-case toggles must not change the default: with default params
+        // (both gates on), the one-cut quad still re-splits into 3 fragments and
+        // the all-edges quad still plus-splits into 4 — confirming the seven core
+        // rows stay green. (Spot-check both gate-governed cases.)
+        let mut one_cut = LoopMesh::new();
+        let f1 = unit_quad(&mut one_cut);
+        let fv = one_cut.face_vert_keys(f1);
+        let e01 = one_cut.query_edge_exists(fv[0], fv[1]).unwrap();
+        one_cut.subdivide_edges(&[e01], SubdivideParams::default());
+        assert_eq!(counts(&one_cut), (5, 7, 3), "default one-cut quad re-splits");
+
+        let mut all_cut = LoopMesh::new();
+        let f2 = unit_quad(&mut all_cut);
+        let fv = all_cut.face_vert_keys(f2);
+        let edges: Vec<_> = (0..4)
+            .map(|i| all_cut.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
+            .collect();
+        all_cut.subdivide_edges(&edges, SubdivideParams::default());
+        assert_eq!(counts(&all_cut), (9, 12, 4), "default four-cut quad plus-splits");
     }
 
     #[test]
