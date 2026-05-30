@@ -28,6 +28,7 @@ mod face_triangulate;
 mod inset_individual;
 mod inset_region;
 mod mean_value;
+mod mirror;
 mod pointmerge;
 mod remove_doubles;
 mod split;
@@ -49,6 +50,7 @@ pub use face_poke::{CenterMode, PokeResult};
 pub use face_triangulate::{NgonMethod, QuadMethod};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
+pub use mirror::{Axis, MirrorParams, MirrorResult};
 pub use split::SplitResult;
 pub use subdivide_edges::{
     QuadCornerType, SubdivideGeom, SubdivideParams, SubdivideResult,

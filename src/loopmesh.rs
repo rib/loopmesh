@@ -71,7 +71,8 @@ pub use ops::{
     CenterMode, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
     DissolveVertsParams, DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams,
-    InsetIndividualResult, InsetRegionParams, InsetRegionResult, MixedSeed, NgonMethod, QuadCornerType,
+    InsetIndividualResult, InsetRegionParams, InsetRegionResult, Axis, MirrorParams, MirrorResult,
+    MixedSeed, NgonMethod, QuadCornerType,
     QuadMethod, SubdivideGeom, SubdivideParams, SubdivideResult,
     DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };
