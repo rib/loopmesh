@@ -193,14 +193,20 @@ impl LoopMesh {
             }
             (4, 2) if Self::quad_two_cut_is_opposite(&ring) => {
                 // §5.2 opposite case — the straight loop cut. Always fires
-                // (no strategy choice, no gating flag); the adjacent case is
-                // the gated/strategy row left to the fallback below.
+                // (no strategy choice, no gating flag).
                 self.quad_two_opposite_cut(face, &ring, geom);
             }
-            // The quad-two-adjacent case (the quad_corner_type strategies),
-            // three-edge quads, the n-gon generic, and the deferred strategies
-            // are out of the core's pinned scope (§4.3 / §9); leave the
-            // flat-cornered face untouched.
+            (4, 2) => {
+                // §5.2 adjacent case. The default STRAIGHT_CUT strategy lays a
+                // single corner cut; the non-default strategies (PATH / FAN /
+                // INNERVERT) remain deferred (§9.3) and leave the face flat.
+                if params.quad_corner_type == QuadCornerType::StraightCut {
+                    self.quad_two_adjacent_straight_cut(face, &ring, geom);
+                }
+            }
+            // Three-edge quads, the n-gon generic, and the deferred corner
+            // strategies are out of the core's pinned scope (§4.3 / §9); leave
+            // the flat-cornered face untouched.
             _ => {}
         }
     }
@@ -328,6 +334,48 @@ impl LoopMesh {
         // and v[3] (diametrically opposite in the six-corner ring).
         let (m01, m23) = (v[0], v[3]);
         if let Some((new_face, _)) = self.face_split(face, m01, m23) {
+            geom.faces.push(face);
+            geom.faces.push(new_face);
+        }
+    }
+
+    /// §5.2.1 — quad, two **adjacent** edges cut, default `STRAIGHT_CUT`. The
+    /// two cut edges share corner `v1` (`{v0,v1}` and `{v1,v2}`), midpoints
+    /// `m01` and `m12`. After the §3 insertion the loop cycle is a hexagon
+    /// `v0, m01, v1, m12, v2, v3` with `m01` and `m12` two corners apart on the
+    /// short arc and `v1` sitting between them. A single face-split connects
+    /// `m01` → `m12`, carving the shared corner off as a triangle `{m01, v1,
+    /// m12}` and leaving a pentagon `{v0, m01, m12, v2, v3}`. No inner vert.
+    /// 1 quad -> 2 fragments (1 triangle + 1 pentagon).
+    fn quad_two_adjacent_straight_cut(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        // Rotate so the start corner is the midpoint that opens the short arc:
+        // the one whose loop successor is the shared corner v1, with the second
+        // midpoint two corners further on. The two midpoints sit two apart on
+        // one side of the six-corner ring; pick the start so v[2] is the other
+        // midpoint (i.e. the two-corner gap runs forward from the start).
+        let n = ring.len(); // 6
+        let mids: SmallVec<[usize; 2]> = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| *m)
+            .map(|(i, _)| i)
+            .collect();
+        debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
+        // Forward gap from mids[0] to mids[1]; the start is whichever midpoint
+        // has the other exactly two corners ahead of it.
+        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+
+        let m01 = ring[start].0;
+        let m12 = ring[(start + 2) % n].0;
+        debug_assert!(ring[(start + 1) % n].0 != m01, "shared corner between midpoints");
+
+        // m01 -> m12 carves the corner triangle off the hexagon.
+        if let Some((new_face, _)) = self.face_split(face, m01, m12) {
             geom.faces.push(face);
             geom.faces.push(new_face);
         }
@@ -612,26 +660,76 @@ mod tests {
     }
 
     #[test]
-    fn quad_two_adjacent_edges_declines_to_fallback() {
-        // §5.2 adjacent (the deferred quad_corner_type row) is *not*
-        // implemented: the two midpoints share corner v1, so the case is left
-        // flat-cornered. The midpoints are inserted (V 4->6, E 4->6) but no
-        // connecting cut is laid down — the quad stays one (now six-corner)
-        // face.
+    fn quad_two_adjacent_edges_straight_cut() {
+        // §5.2.1 adjacent STRAIGHT_CUT (default): the two cut edges share
+        // corner v1. After inserting both rim midpoints, a single m01->m12
+        // corner cut carves the shared corner off as a triangle and leaves a
+        // pentagon. V 4->6 (2 rim midpoints), E 4->7 (2 halved + 1 corner cut),
+        // 1 quad -> 2 fragments.
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let fv = mesh.face_vert_keys(face);
-        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
-        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+        let [v0, v1, v2, _v3] = [fv[0], fv[1], fv[2], fv[3]];
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e12 = mesh.query_edge_exists(v1, v2).unwrap();
 
         let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
-        assert!(matches!(res, SubdivideResult::Ran(_)));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
 
         let (v, e, f) = counts(&mesh);
         assert_eq!(
             (v, e, f),
-            (6, 6, 1),
-            "adjacent two-cut left flat-cornered: midpoints only, no re-split"
+            (6, 7, 2),
+            "adjacent two-cut STRAIGHT_CUT: +2V / +3E / +1F"
+        );
+
+        // The two rim midpoints land at the cut-edge midpoints.
+        let m01 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-5)
+            .expect("m01 at bottom-edge midpoint");
+        let m12 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(2.0, 1.0, 0.0)) < 1e-5)
+            .expect("m12 at right-edge midpoint");
+
+        // The connecting cut joins the two adjacent-edge midpoints.
+        assert!(
+            mesh.query_edge_exists(m01, m12).is_some(),
+            "connecting cut joins m01 and m12"
+        );
+
+        // Exactly one triangle and one pentagon fragment.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 5], "1 triangle + 1 pentagon");
+
+        // The triangle is the shared-corner cut-off {m01, v1, m12}; v1 is on it.
+        let tri = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 3)
+            .unwrap();
+        let tri_verts = mesh.face_vert_keys(tri);
+        assert!(tri_verts.contains(&v1), "triangle holds the shared corner v1");
+        assert!(tri_verts.contains(&m01) && tri_verts.contains(&m12));
+
+        // The pentagon does *not* contain the shared corner v1.
+        let pent = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 5)
+            .unwrap();
+        assert!(
+            !mesh.face_vert_keys(pent).contains(&v1),
+            "pentagon excludes the shared corner v1"
         );
     }
 
