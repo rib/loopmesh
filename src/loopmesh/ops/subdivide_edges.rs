@@ -176,6 +176,12 @@ impl LoopMesh {
                     self.tri_one_cut(face, &ring, geom);
                 }
             }
+            (3, 2) => {
+                // §6.2 — triangle, two edges cut. A single shared-corner cut
+                // peels a small triangle and leaves a quad. Always fires (no
+                // gating flag — it is neither a one-cut nor an all-cut case).
+                self.tri_two_cut(face, &ring, geom);
+            }
             (3, 3) => {
                 if params.use_grid_fill {
                     self.tri_three_cut(face, &ring, geom);
@@ -185,6 +191,12 @@ impl LoopMesh {
                 if params.use_single_edge {
                     self.quad_one_cut(face, &ring, geom);
                 }
+            }
+            (4, 3) => {
+                // §5.3 — quad, three edges cut. The two corner triangles plus a
+                // pentagon-diagonal cut; no gating flag (neither one-cut nor
+                // all-cut).
+                self.quad_three_cut(face, &ring, geom);
             }
             (4, 4) => {
                 if params.use_grid_fill {
@@ -246,6 +258,36 @@ impl LoopMesh {
         // opposite the cut edge {v0,v1} is v[2].
         let (m, apex) = (v[0], v[2]);
         if let Some((new_face, _)) = self.face_split(face, m, apex) {
+            geom.faces.push(face);
+            geom.faces.push(new_face);
+        }
+    }
+
+    /// §6.2 — triangle, two edges cut. The two cut edges share corner `v1`
+    /// (`{v0,v1}` and `{v1,v2}`), midpoints `m01` and `m12`. After the §3
+    /// insertion the loop cycle is a pentagon `v0, m01, v1, m12, v2`. A single
+    /// face-split connects `m01` → `m12`, carving the shared corner off as a
+    /// small triangle `{m01, v1, m12}` and leaving a quad `{v0, m01, m12, v2}`.
+    /// 1 tri -> 2 fragments (1 triangle + 1 quad).
+    fn tri_two_cut(&mut self, face: FaceKey, ring: &[(VertexKey, bool)], geom: &mut SubdivideGeom) {
+        // The two midpoints are the only two cut corners and always sit two
+        // apart in the five-corner ring (the shared corner v1 between them).
+        let n = ring.len(); // 5
+        let mids: SmallVec<[usize; 2]> = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| *m)
+            .map(|(i, _)| i)
+            .collect();
+        debug_assert_eq!(mids.len(), 2, "two-cut tri has exactly two midpoints");
+        // Start at the midpoint that has the other exactly two corners ahead,
+        // so v1 (the shared corner) sits between them on the forward arc.
+        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+        let m01 = ring[start].0;
+        let m12 = ring[(start + 2) % n].0;
+        debug_assert!(!ring[(start + 1) % n].1, "shared corner is original, not a midpoint");
+
+        if let Some((new_face, _)) = self.face_split(face, m01, m12) {
             geom.faces.push(face);
             geom.faces.push(new_face);
         }
@@ -379,6 +421,62 @@ impl LoopMesh {
             geom.faces.push(face);
             geom.faces.push(new_face);
         }
+    }
+
+    /// §5.3 — quad, three edges cut. Three of the four edges carry a midpoint
+    /// (`m01`, `m12`, `m23`; edge `{v3,v0}` uncut). After the §3 insertion the
+    /// loop cycle is a heptagon `v0, m01, v1, m12, v2, m23, v3` with the three
+    /// midpoints two apart on the cut side and the uncut edge spanning `v3→v0`.
+    ///
+    /// The pattern peels the two corner triangles flanking the *middle*
+    /// midpoint `m12` (`m12`→`m01` and `m12`→`m23`), then splits the remaining
+    /// pentagon `{v0, m01, m12, m23, v3}` along its `m01`→`m23` diagonal. The
+    /// result is three triangles (`{m01,v1,m12}`, `{m12,v2,m23}`,
+    /// `{m01,m12,m23}`) plus one quad (`{v0,m01,m23,v3}`). No inner vert.
+    /// 1 quad -> 4 fragments.
+    fn quad_three_cut(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        let n = ring.len(); // 7
+        let mids: SmallVec<[usize; 3]> = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| *m)
+            .map(|(i, _)| i)
+            .collect();
+        debug_assert_eq!(mids.len(), 3, "three-cut quad has exactly three midpoints");
+
+        // The middle midpoint is the one with a midpoint two corners away on
+        // *both* sides (the other two are the "end" midpoints, each adjacent to
+        // the uncut edge). Identify it, then name the three in cut order.
+        let is_mid = |i: usize| ring[i % n].1;
+        let middle = *mids
+            .iter()
+            .find(|&&i| is_mid((i + 2) % n) && is_mid((i + n - 2) % n))
+            .expect("three-cut quad has a middle midpoint");
+
+        let m12 = ring[middle].0;
+        let m01 = ring[(middle + n - 2) % n].0; // end midpoint trailing m12
+        let m23 = ring[(middle + 2) % n].0; // end midpoint leading m12
+
+        // m12 -> m01 peels the corner triangle {m01, v1, m12}.
+        let f1 = self.face_with_both(m12, m01);
+        let (corner_a, _) = self.face_split(f1, m12, m01).expect("m12-m01 split");
+        // m12 -> m23 peels the corner triangle {m12, v2, m23}.
+        let f2 = self.face_with_both(m12, m23);
+        let (corner_b, _) = self.face_split(f2, m12, m23).expect("m12-m23 split");
+        // m01 -> m23 splits the remaining pentagon {v0, m01, m12, m23, v3} into
+        // the centre triangle {m01, m12, m23} and the quad {v0, m01, m23, v3}.
+        let f3 = self.face_with_both(m01, m23);
+        let (centre, _) = self.face_split(f3, m01, m23).expect("m01-m23 split");
+
+        geom.faces.push(face);
+        geom.faces.push(corner_a);
+        geom.faces.push(corner_b);
+        geom.faces.push(centre);
     }
 
     /// §5.4 — quad, all four edges cut. Cycle is
@@ -731,6 +829,132 @@ mod tests {
             !mesh.face_vert_keys(pent).contains(&v1),
             "pentagon excludes the shared corner v1"
         );
+    }
+
+    #[test]
+    fn quad_three_edges_mixed_resplit() {
+        // §5.3 — three of four edges cut ({v0,v1},{v1,v2},{v2,v3}); {v3,v0}
+        // whole. V 4->7 (3 rim midpoints), E 4->10 (3 halved + 3 connecting
+        // cuts), 1 quad -> 4 fragments (3 triangles + 1 quad).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let [v0, v1, v2, v3] = [fv[0], fv[1], fv[2], fv[3]];
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e12 = mesh.query_edge_exists(v1, v2).unwrap();
+        let e23 = mesh.query_edge_exists(v2, v3).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12, e23], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (7, 10, 4), "quad three-cut deltas");
+
+        // Fragment shapes: three triangles + one quad.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 3, 3, 4], "3 triangles + 1 quad");
+
+        // The three rim midpoints land at their cut-edge midpoints.
+        let m01 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-5)
+            .expect("m01");
+        let m12 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(2.0, 1.0, 0.0)) < 1e-5)
+            .expect("m12");
+        let m23 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 2.0, 0.0)) < 1e-5)
+            .expect("m23");
+
+        // The middle midpoint m12 fans to both end midpoints; m01-m23 is the
+        // pentagon diagonal. Those three connecting edges exist.
+        assert!(mesh.query_edge_exists(m12, m01).is_some(), "m12-m01 corner cut");
+        assert!(mesh.query_edge_exists(m12, m23).is_some(), "m12-m23 corner cut");
+        assert!(mesh.query_edge_exists(m01, m23).is_some(), "m01-m23 pentagon diagonal");
+
+        // The lone quad fragment is {v0, m01, m23, v3} and holds the two corners
+        // of the uncut edge {v3,v0}.
+        let quad = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 4)
+            .unwrap();
+        let qv = mesh.face_vert_keys(quad);
+        assert!(qv.contains(&v0) && qv.contains(&v3), "quad spans the uncut edge");
+        assert!(qv.contains(&m01) && qv.contains(&m23));
+        assert!(!qv.contains(&v1) && !qv.contains(&v2), "quad excludes the cut corners");
+    }
+
+    #[test]
+    fn tri_two_edges_corner_and_quad() {
+        // §6.2 — two of three edges cut ({v0,v1},{v1,v2}); {v2,v0} whole. The
+        // two cut edges share corner v1. A single m01->m12 cut peels the corner
+        // triangle and leaves a quad. V 3->5 (2 rim midpoints), E 3->6 (2 halved
+        // + 1 corner cut), 1 tri -> 2 fragments.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let [v0, v1, v2] = [fv[0], fv[1], fv[2]];
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e12 = mesh.query_edge_exists(v1, v2).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (5, 6, 2), "tri two-cut deltas");
+
+        // Fragment shapes: one triangle + one quad.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 4], "1 triangle + 1 quad");
+
+        let m01 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-5)
+            .expect("m01");
+        let m12 = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5)
+            .expect("m12");
+        assert!(mesh.query_edge_exists(m01, m12).is_some(), "m01-m12 corner cut");
+
+        // The triangle is the cut-off shared corner {m01, v1, m12}; v1 is on it.
+        let tri = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 3)
+            .unwrap();
+        let tv = mesh.face_vert_keys(tri);
+        assert!(tv.contains(&v1), "triangle holds the shared corner v1");
+        assert!(tv.contains(&m01) && tv.contains(&m12));
+
+        // The quad {v0, m01, m12, v2} excludes the shared corner v1.
+        let quad = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 4)
+            .unwrap();
+        let qv = mesh.face_vert_keys(quad);
+        assert!(!qv.contains(&v1), "quad excludes the shared corner v1");
+        assert!(qv.contains(&v0) && qv.contains(&v2));
     }
 
     #[test]
