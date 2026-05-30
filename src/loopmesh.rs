@@ -69,9 +69,10 @@ mod ops;
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
     CenterMode, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
-    DissolveFacesOptions, DissolveFacesResult, DissolveVertsParams, DuplicateResult,
-    ExtrudeVertIndivResult, GeomKey, InsetIndividualParams, InsetIndividualResult,
-    InsetRegionParams, InsetRegionResult, MixedSeed, NgonMethod, QuadMethod,
+    DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
+    DissolveVertsParams, DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams,
+    InsetIndividualResult, InsetRegionParams, InsetRegionResult, MixedSeed, NgonMethod, QuadMethod,
+    DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };
 
 // Shared fixtures for the per-operator unit tests that live in the `euler`,

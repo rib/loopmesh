@@ -14,6 +14,7 @@ mod delete;
 mod dissolve_degenerate;
 mod dissolve_edges;
 mod dissolve_faces;
+mod dissolve_limit;
 mod dissolve_verts;
 mod duplicate;
 mod extrude_discrete;
@@ -34,6 +35,10 @@ mod weld_verts;
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
+pub use dissolve_limit::{
+    DissolveLimitParams, DissolveLimitResult, DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM,
+    DELIMIT_SHARP, DELIMIT_UV,
+};
 pub use dissolve_verts::DissolveVertsParams;
 pub use duplicate::{DuplicateResult, GeomKey};
 pub use extrude_mixed::ExtrudeMixedResult;
