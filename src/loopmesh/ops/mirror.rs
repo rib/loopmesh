@@ -43,11 +43,10 @@ pub struct MirrorParams {
     pub merge_dist: f32,
     /// Which mirror-space coordinate the reflection negates.
     pub axis: Axis,
-    /// Mirror the cloned face loops' UV `u` coordinate. Accepted for interface
-    /// stability; the non-default (`true`) UV-flip pass (§5) is a by-design
-    /// deferral and is not yet implemented.
+    /// When set, the cloned face loops' UV `u` coordinate is flipped
+    /// `u ↦ 1 − u` across every Float2 (UV) loop layer (§5).
     pub mirror_u: bool,
-    /// As `mirror_u` for the UV `v` coordinate. By-design deferral.
+    /// As `mirror_u` for the UV `v` coordinate (`v ↦ 1 − v`, §5).
     pub mirror_v: bool,
     /// Modifies the UV reflection centre (in-tile vs unit square). By-design
     /// deferral; only meaningful alongside `mirror_u` / `mirror_v`.
@@ -79,18 +78,18 @@ impl LoopMesh {
     /// seam verts (in practice every selection vert) in `geom` alongside the
     /// faces.
     ///
-    /// `mirror_u` / `mirror_v` / `mirror_udim` are accepted for interface
-    /// stability; their non-default (`true`) UV-flip pass (§5) is a by-design
-    /// deferral and is not yet implemented.
+    /// `mirror_u` / `mirror_v` flip the cloned face loops' UVs (§5); with them
+    /// clear, UVs are copied verbatim by the duplicate step. `mirror_udim`
+    /// (within-tile reflection centre) is accepted for interface stability but
+    /// its non-default (`true`) behaviour is a by-design deferral.
     ///
     /// See `radial-mesh-guides/operators/MIRROR.md` for the full algorithm and
     /// parity contract.
     pub fn mirror(&mut self, geom: &[GeomKey], params: MirrorParams) -> MirrorResult {
         debug_assert!(
-            !(params.mirror_u || params.mirror_v),
-            "mirror: mirror_u/mirror_v UV flip is a by-design deferral (MIRROR.md §5)"
+            !params.mirror_udim,
+            "mirror: mirror_udim (within-tile UV reflection) is a by-design deferral (MIRROR.md §5)"
         );
-        let _ = params.mirror_udim;
 
         // Step 1 (§6.1) — clone the selection's closure. The clone is coincident
         // with the source; `vert_map` relates each source vert to its clone.
@@ -106,13 +105,20 @@ impl LoopMesh {
         // `merge_dist` of the plane welds its clone onto it.
         let weld_pairs = self.build_seam_weld_map(geom, &dup.vert_map, params.matrix, params.axis, params.merge_dist);
 
-        // Step 4 (§6.5) — weld the seam: each seam clone collapses onto its
+        // Step 4 (§5) — flip the cloned faces' UVs, after the verbatim CD copy
+        // (done by the clone in step 1) and before the weld. The flip touches
+        // the clone half only; the originals keep their UVs untouched.
+        if params.mirror_u || params.mirror_v {
+            self.mirror_clone_uvs(&dup.geom_out, params.mirror_u, params.mirror_v);
+        }
+
+        // Step 5 (§6.5) — weld the seam: each seam clone collapses onto its
         // original, seam-internal clone edges collapse, the original's
         // customdata survives. `use_centroid = false` keeps the survivor (the
         // original) at its own position so the seam sits on the originals (§4).
         self.weld_verts(&weld_pairs, false);
 
-        // Step 5 (§1 / §6.6) — surface the surviving clone as `geom.out`: the
+        // Step 6 (§1 / §6.6) — surface the surviving clone as `geom.out`: the
         // reflected half minus the welded-away seam clones.
         let welded_away: std::collections::HashSet<VertexKey> =
             weld_pairs.iter().map(|&(clone, _original)| clone).collect();
@@ -144,6 +150,47 @@ impl LoopMesh {
             let in_mirror = matrix.transform_point3(world);
             let reflected = from_mirror.transform_point3(in_mirror * scale);
             self.set_vertex_position(clone, reflected);
+        }
+    }
+
+    /// §5 — flip the cloned faces' loop UVs. Over every loop of every cloned
+    /// face, for each Float2 (UV-shaped) loop layer, reflect the requested
+    /// coordinate about the midpoint of the unit square: `mirror_u` maps
+    /// `u ↦ 1 − u`, `mirror_v` maps `v ↦ 1 − v`. Both may apply together. Only
+    /// `CD_PROP_FLOAT2`-shaped layers (storage `Vec2`) are touched; other loop
+    /// customdata stays as the verbatim duplicate copy left it.
+    fn mirror_clone_uvs(&mut self, clone_geom: &[GeomKey], mirror_u: bool, mirror_v: bool) {
+        let uv_layers: Vec<ElementAttributeKey> = self
+            .loop_attribs()
+            .iter_descriptors()
+            .filter_map(|(key, _)| {
+                matches!(self.loop_attribs().storage_of(key), Some(AttributeStorage::Vec2(_)))
+                    .then_some(key)
+            })
+            .collect();
+        if uv_layers.is_empty() {
+            return;
+        }
+
+        for entry in clone_geom {
+            let GeomKey::Face(face) = *entry else {
+                continue;
+            };
+            let slots: Vec<usize> = self.iter_face_loops(face).map(|l| l.as_usize()).collect();
+            for &layer in &uv_layers {
+                for &slot in &slots {
+                    let Some(mut uv) = self.loop_attribs().get_vec2(layer, slot) else {
+                        continue;
+                    };
+                    if mirror_u {
+                        uv[0] = 1.0 - uv[0];
+                    }
+                    if mirror_v {
+                        uv[1] = 1.0 - uv[1];
+                    }
+                    self.loop_attribs_mut().set_vec2(layer, slot, uv);
+                }
+            }
         }
     }
 
@@ -518,6 +565,154 @@ mod tests {
 
         assert!(result.geom_out.is_empty());
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        mesh.validate_topology();
+    }
+
+    /// Register a Float2 (UV-shaped) loop layer and stamp every loop with a
+    /// distinct, non-symmetric UV so a flip is visible: corner `i` of face `j`
+    /// gets `[0.1 + 0.05*i, 0.2 + 0.05*j]`. Returns the layer key and the
+    /// per-loop value map captured *before* the mirror runs.
+    fn decorate_loops_with_uv(
+        mesh: &mut LoopMesh,
+        faces: &[FaceKey],
+    ) -> (ElementAttributeKey, std::collections::HashMap<LoopKey, [f32; 2]>) {
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .expect("uv layer registers");
+        let mut values: std::collections::HashMap<LoopKey, [f32; 2]> = std::collections::HashMap::new();
+        for (j, &f) in faces.iter().enumerate() {
+            for (i, l) in mesh.face_loop_keys(f).into_iter().enumerate() {
+                let value = [0.1 + 0.05 * i as f32, 0.2 + 0.05 * j as f32];
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+                values.insert(l, value);
+            }
+        }
+        (uv, values)
+    }
+
+    /// §5 fires: with `mirror_u`/`mirror_v` set, the cloned loops' UVs are
+    /// flipped `[u,v] ↦ [1−u, 1−v]`, while the originals keep their UVs verbatim.
+    /// Uses the offset strip with `merge_dist = 0` so nothing welds — the clone
+    /// faces are exactly the surviving `geom_out` faces and their loops are
+    /// readable directly.
+    #[test]
+    fn mirror_uv_flips_clone_uvs_only() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = offset_strip(&mut mesh);
+        let (uv, original_uvs) = decorate_loops_with_uv(&mut mesh, &faces);
+
+        let original_loops: HashSet<LoopKey> = original_uvs.keys().copied().collect();
+
+        let geom = all_geom(&verts, &faces);
+        let mut params = default_params(0.0);
+        params.mirror_u = true;
+        params.mirror_v = true;
+        let result = mesh.mirror(&geom, params);
+
+        // Originals are untouched (§5: the flip is on the clone only).
+        for (&l, &before) in &original_uvs {
+            let after = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert_eq!(after, before, "original loop UV is untouched");
+        }
+
+        // Every clone loop carries the flip of some original loop's UV.
+        let clone_faces: Vec<FaceKey> = result
+            .geom_out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Face(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clone_faces.len(), 2, "two reflected clone faces survive");
+
+        let mut flipped_count = 0;
+        for &f in &clone_faces {
+            for l in mesh.face_loop_keys(f) {
+                assert!(!original_loops.contains(&l), "clone loop is a fresh key");
+                let [u, v] = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                // The flipped value is the reflection of a value the source
+                // carried: u ∈ {0.10,0.15,0.20,0.25} ↦ {0.90,0.85,0.80,0.75}.
+                let source_u = 1.0 - u;
+                let source_v = 1.0 - v;
+                let matches_source = original_uvs.values().any(|&[su, sv]| {
+                    (su - source_u).abs() < 1e-5 && (sv - source_v).abs() < 1e-5
+                });
+                assert!(
+                    matches_source,
+                    "clone UV [{u},{v}] is the 1−x flip of a source UV"
+                );
+                flipped_count += 1;
+            }
+        }
+        assert_eq!(flipped_count, 8, "all eight clone loops flipped");
+        mesh.validate_topology();
+    }
+
+    /// §5 verbatim contrast: with `mirror_u`/`mirror_v` clear, the cloned loops'
+    /// UVs are copied verbatim (the duplicate §4 behaviour). Every clone loop's
+    /// UV matches an original's exactly — no `1−x` flip.
+    #[test]
+    fn mirror_uv_clear_copies_clone_uvs_verbatim() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = offset_strip(&mut mesh);
+        let (uv, original_uvs) = decorate_loops_with_uv(&mut mesh, &faces);
+
+        let source_values: HashSet<[u32; 2]> = original_uvs
+            .values()
+            .map(|&[u, v]| [u.to_bits(), v.to_bits()])
+            .collect();
+
+        let geom = all_geom(&verts, &faces);
+        // Flags clear: verbatim copy.
+        let result = mesh.mirror(&geom, default_params(0.0));
+
+        let clone_faces: Vec<FaceKey> = result
+            .geom_out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Face(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clone_faces.len(), 2);
+
+        for &f in &clone_faces {
+            for l in mesh.face_loop_keys(f) {
+                let [u, v] = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                assert!(
+                    source_values.contains(&[u.to_bits(), v.to_bits()]),
+                    "clone UV [{u},{v}] is a verbatim source UV (no flip)"
+                );
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    /// §5: `mirror_u` alone flips only `u`; `v` is copied verbatim.
+    #[test]
+    fn mirror_u_alone_flips_only_u() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = offset_strip(&mut mesh);
+        let (uv, _) = decorate_loops_with_uv(&mut mesh, &faces);
+
+        let geom = all_geom(&verts, &faces);
+        let mut params = default_params(0.0);
+        params.mirror_u = true;
+        let result = mesh.mirror(&geom, params);
+
+        for g in &result.geom_out {
+            let GeomKey::Face(f) = g else { continue };
+            for l in mesh.face_loop_keys(*f) {
+                let [u, v] = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                // u was flipped into [0.75, 0.90]; v stays in its source band.
+                assert!((0.75..=0.90).contains(&u), "u flipped: {u}");
+                assert!((0.20..=0.25).contains(&v), "v unchanged: {v}");
+            }
+        }
         mesh.validate_topology();
     }
 }
