@@ -191,9 +191,16 @@ impl LoopMesh {
                     self.quad_four_cut(face, &ring, geom);
                 }
             }
-            // Two- and three-edge quads, the n-gon generic, and the
-            // quad_corner_type strategies are out of the core's pinned scope
-            // (§4.3 / §9); leave the flat-cornered face untouched.
+            (4, 2) if Self::quad_two_cut_is_opposite(&ring) => {
+                // §5.2 opposite case — the straight loop cut. Always fires
+                // (no strategy choice, no gating flag); the adjacent case is
+                // the gated/strategy row left to the fallback below.
+                self.quad_two_opposite_cut(face, &ring, geom);
+            }
+            // The quad-two-adjacent case (the quad_corner_type strategies),
+            // three-edge quads, the n-gon generic, and the deferred strategies
+            // are out of the core's pinned scope (§4.3 / §9); leave the
+            // flat-cornered face untouched.
             _ => {}
         }
     }
@@ -284,6 +291,46 @@ impl LoopMesh {
         geom.faces.push(face);
         geom.faces.push(frag_a);
         geom.faces.push(frag_b);
+    }
+
+    /// §5.2 — discriminate the two-cut quad's sub-case. After the §3 midpoint
+    /// insertion a quad with two cut edges is a six-corner ring whose two
+    /// midpoint corners sit either diametrically opposite (the §5.2 *opposite*
+    /// loop-cut case) or two apart on the short side (the §5.2 *adjacent*
+    /// corner-cut case). The cut edges share a quad corner iff their midpoints
+    /// are *not* diametrically opposite in the ring.
+    fn quad_two_cut_is_opposite(ring: &[(VertexKey, bool)]) -> bool {
+        let n = ring.len(); // 6 for a two-cut quad
+        let mids: SmallVec<[usize; 2]> = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| *m)
+            .map(|(i, _)| i)
+            .collect();
+        debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
+        let gap = mids[1] - mids[0];
+        gap == n / 2
+    }
+
+    /// §5.2 opposite case — the straight loop cut. The two cut edges are
+    /// opposite (`{v0,v1}` and `{v2,v3}`), midpoints `m01` and `m23`. After the
+    /// §3 insertion the loop cycle is `v0, m01, v1, v2, m23, v3`; connect the
+    /// two midpoints straight across, splitting the quad into two quads. No
+    /// inner vert, no strategy choice. 1 quad -> 2 quads.
+    fn quad_two_opposite_cut(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        let (v, _) = Self::rotate_to_first_midpoint(ring);
+        // v = [m01, v1, v2, m23, v3, v0]; the two opposite midpoints are v[0]
+        // and v[3] (diametrically opposite in the six-corner ring).
+        let (m01, m23) = (v[0], v[3]);
+        if let Some((new_face, _)) = self.face_split(face, m01, m23) {
+            geom.faces.push(face);
+            geom.faces.push(new_face);
+        }
     }
 
     /// §5.4 — quad, all four edges cut. Cycle is
@@ -520,6 +567,98 @@ mod tests {
             6,
             "shared midpoint welds both quads"
         );
+    }
+
+    #[test]
+    fn quad_two_opposite_edges_loop_cut() {
+        // §5.2 opposite — V 4->6 (2 rim midpoints), E 4->7 (2 halved + 1
+        // connecting cut), 1 quad -> 2 quads.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e23], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (6, 7, 2), "quad opposite two-cut deltas");
+
+        // Both resulting faces are quads (a straight loop cut, no triangles).
+        for f in &geom.faces {
+            assert_eq!(mesh.face_len(*f), 4, "loop cut yields quads");
+        }
+
+        // The two rim midpoints land at the edge midpoints, and a connecting
+        // edge joins them straight across.
+        let m01 = geom.verts[0];
+        let m23 = geom.verts[1];
+        assert!(
+            mesh.vertex_position(m01).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-5,
+            "m01 at midpoint of bottom edge"
+        );
+        assert!(
+            mesh.vertex_position(m23).distance(Vec3::new(1.0, 2.0, 0.0)) < 1e-5,
+            "m23 at midpoint of top edge"
+        );
+        assert!(
+            mesh.query_edge_exists(m01, m23).is_some(),
+            "connecting cut joins the two opposite midpoints"
+        );
+    }
+
+    #[test]
+    fn quad_two_adjacent_edges_declines_to_fallback() {
+        // §5.2 adjacent (the deferred quad_corner_type row) is *not*
+        // implemented: the two midpoints share corner v1, so the case is left
+        // flat-cornered. The midpoints are inserted (V 4->6, E 4->6) but no
+        // connecting cut is laid down — the quad stays one (now six-corner)
+        // face.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!(
+            (v, e, f),
+            (6, 6, 1),
+            "adjacent two-cut left flat-cornered: midpoints only, no re-split"
+        );
+    }
+
+    #[test]
+    fn quad_two_cut_opposite_discriminator() {
+        // Direct check of the opposite-vs-adjacent discriminator on the
+        // post-insertion six-corner ring. Opposite midpoints sit 3 apart;
+        // adjacent midpoints sit 2 apart.
+        let dummy = VertexKey::from_usize(0);
+        let opposite = [
+            (dummy, true),
+            (dummy, false),
+            (dummy, false),
+            (dummy, true),
+            (dummy, false),
+            (dummy, false),
+        ];
+        let adjacent = [
+            (dummy, true),
+            (dummy, false),
+            (dummy, true),
+            (dummy, false),
+            (dummy, false),
+            (dummy, false),
+        ];
+        assert!(LoopMesh::quad_two_cut_is_opposite(&opposite));
+        assert!(!LoopMesh::quad_two_cut_is_opposite(&adjacent));
     }
 
     #[test]
