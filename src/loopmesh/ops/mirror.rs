@@ -245,6 +245,30 @@ mod tests {
             .collect()
     }
 
+    /// The §2 strip rotated so the mirror axis is **y**: the seam edge {v0, v3}
+    /// lies ON the `y = 0` plane and the strip extends into +y. The two quads
+    /// stack along +y, with the in-plane coordinate carried by x. Returns the 6
+    /// verts in the same row-major slot order as `seam_strip`:
+    /// `[v0(0,0) v1(0,1) v4(0,2) v3(1,0) v2(1,1) v5(1,2)]` (x, y).
+    fn seam_strip_y(mesh: &mut LoopMesh) -> (Vec<VertexKey>, Vec<FaceKey>) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(0.0, 2.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(1.0, 2.0, 0.0));
+
+        let mk = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| {
+            let es: Vec<EdgeKey> = (0..4)
+                .map(|i| mesh.create_edge([vs[i], vs[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
+                .collect();
+            mesh.face_create(&vs, &es, FaceCreateFlags::NONE)
+        };
+        let fa = mk(mesh, [v0, v1, v2, v3]);
+        let fb = mk(mesh, [v1, v4, v5, v2]);
+        (vec![v0, v1, v4, v3, v2, v5], vec![fa, fb])
+    }
+
     fn default_params(merge_dist: f32) -> MirrorParams {
         MirrorParams {
             matrix: Mat4::IDENTITY,
@@ -280,6 +304,59 @@ mod tests {
             xs.iter().filter(|&&x| x.abs() < 1e-6).count(),
             2,
             "exactly the two on-plane seam verts at x = 0 (clones welded away)"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §1 / §4 axis-generic path: the same welded four-quad strip headline as
+    /// `seam_strip_welds_into_four_quad_strip`, but reflected across the `y = 0`
+    /// plane (`axis = Y`). Pins that the reflection negates the *y* coordinate
+    /// and the seam test reads the *same* axis coordinate — a regression keying
+    /// on x (the default) would not find the on-plane verts and would weld
+    /// nothing, doubling the counts. Same 10 V / 13 E / 4 F welded outcome.
+    #[test]
+    fn seam_strip_welds_into_four_quad_strip_axis_y() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = seam_strip_y(&mut mesh);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+
+        let mut params = default_params(0.5);
+        params.axis = Axis::Y;
+
+        let geom = all_geom(&verts, &faces);
+        let result = mesh.mirror(&geom, params);
+
+        // The Y analogue of the X headline's welded counts.
+        assert_eq!(mesh.totvert(), 10, "6 originals + 4 surviving clones");
+        assert_eq!(mesh.totedge(), 13, "+6 edges (seam clone edge collapsed)");
+        assert_eq!(mesh.totface(), 4, "original 2 quads + 2 reflected quads");
+
+        // The reflected half lands on −y; the two on-plane originals stay at y=0.
+        let ys: Vec<f32> = mesh.vert_keys().iter().map(|&v| mesh.vertex_position(v).y).collect();
+        assert!(ys.iter().any(|&y| y < -1.5), "a clone reflected to y = -2");
+        assert!(ys.iter().any(|&y| (y - 2.0).abs() < 1e-6), "an original stays at y = 2");
+        assert_eq!(
+            ys.iter().filter(|&&y| y.abs() < 1e-6).count(),
+            2,
+            "exactly the two on-plane seam verts at y = 0 (clones welded away)"
+        );
+
+        // The seam genuinely welded: the two on-plane seam clones are gone, so
+        // only 4 clone verts survive in geom_out (not 6).
+        let clone_verts = result
+            .geom_out
+            .iter()
+            .filter(|g| matches!(g, GeomKey::Vert(_)))
+            .count();
+        assert_eq!(clone_verts, 4, "the 2 on-plane seam clones welded away");
+
+        // The seam edge {v0, v3} (on y = 0) is shared by an original and a
+        // reflected face — radial count 2 proves the two halves fused.
+        let seam = mesh.query_edge_exists(verts[0], verts[3]).expect("seam edge survives");
+        assert_eq!(
+            mesh.iter_radial_loops(seam).count(),
+            2,
+            "the seam edge is shared by an original and a reflected face"
         );
         mesh.validate_topology();
     }
