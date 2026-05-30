@@ -21,7 +21,60 @@ pub enum CenterMode {
     Bounds,
 }
 
+/// The two output buffers of a multi-face [`poke`](LoopMesh::poke)
+/// ([`POKE.md`](../../../../radial-mesh-guides/operators/POKE.md) §7).
+///
+/// `verts` and `faces` are independent: `verts` has one entry per input face,
+/// `faces` has `Σ corner_count(f)` entries. Neither buffer contains the killed
+/// input faces nor any surviving perimeter vert/edge — only the freshly-created
+/// centre verts and triangles (§1).
+#[derive(Default)]
+pub struct PokeResult {
+    /// The new centre vertex of every poked face, one per input face, in input
+    /// (`faces`-slice) order (§7).
+    pub verts: Vec<VertexKey>,
+    /// The new triangle faces. An input face of `n` corners contributes its `n`
+    /// triangles in loop-cycle order; the per-face groups are concatenated in
+    /// input order (§5.2 / §7).
+    pub faces: Vec<FaceKey>,
+}
+
 impl LoopMesh {
+    /// Multi-face poke: fan-triangulate each input face independently,
+    /// inserting a fresh centre vertex per face, and report both output buffers
+    /// ([`POKE.md`](../../../../radial-mesh-guides/operators/POKE.md) §7).
+    ///
+    /// Each face is processed in isolation through the same per-face surgery as
+    /// the single-face [`face_poke_offset`](Self::face_poke_offset); the input
+    /// set has no notion of a shared region. Two adjacent input faces sharing a
+    /// perimeter edge produce non-interacting output — the shared edge keeps its
+    /// radial-2 configuration, with one triangle from each fan occupying a slot
+    /// (§5.3).
+    ///
+    /// Returns a [`PokeResult`] whose `verts` lists each new centre vertex in
+    /// input order, and whose `faces` concatenates each face's `n` new triangles
+    /// (in that face's loop-cycle order) in input order.
+    pub fn poke(
+        &mut self,
+        faces: &[FaceKey],
+        center_mode: CenterMode,
+        offset: f32,
+        use_relative_offset: bool,
+    ) -> PokeResult {
+        let mut result = PokeResult::default();
+        for &face in faces {
+            let v_center = self.face_poke_into(
+                face,
+                center_mode,
+                offset,
+                use_relative_offset,
+                Some(&mut result.faces),
+            );
+            result.verts.push(v_center);
+        }
+        result
+    }
+
     /// Inserts a center vertex at the median position of `face` and
     /// fan-triangulates: each existing perimeter edge becomes the base of
     /// a triangle that includes the new center vertex. The original face
@@ -72,6 +125,21 @@ impl LoopMesh {
         center_mode: CenterMode,
         offset: f32,
         use_relative_offset: bool,
+    ) -> VertexKey {
+        self.face_poke_into(face, center_mode, offset, use_relative_offset, None)
+    }
+
+    /// Per-face poke surgery shared by the single-face and multi-face entry
+    /// points. When `out_faces` is `Some`, the spawned triangles are appended to
+    /// it in loop-cycle order (the `faces.out` contract of §7); the returned
+    /// centre vertex is always the `verts.out` entry for this face.
+    fn face_poke_into(
+        &mut self,
+        face: FaceKey,
+        center_mode: CenterMode,
+        offset: f32,
+        use_relative_offset: bool,
+        mut out_faces: Option<&mut Vec<FaceKey>>,
     ) -> VertexKey {
         // Snapshot the face's perimeter (verts + their outgoing edges + the
         // original loop at each corner) in a single forward walk. SmallVec
@@ -231,6 +299,9 @@ impl LoopMesh {
             let tri_edges = [perim_edges[i], center_edges[j], center_edges[i]];
             let f_new = self.face_create(&tri_verts, &tri_edges, FaceCreateFlags::NONE);
             self.face_attribs.copy_into(f_new.as_usize(), face_slot);
+            if let Some(buffer) = out_faces.as_deref_mut() {
+                buffer.push(f_new);
+            }
 
             if do_loop_interp {
                 // The new face's loops sit at verts[i], verts[j], v_center
@@ -525,5 +596,179 @@ mod tests {
                 "degenerate poke (use_relative={use_relative}) lifted off the flat base: {got:?}"
             );
         }
+    }
+
+    // ---- Multi-face poke wrapper (PokeResult / §7 output buffers) ----
+
+    fn corner_verts(mesh: &LoopMesh, face: FaceKey) -> Vec<VertexKey> {
+        let mut out = Vec::new();
+        let mut it = mesh.face_loops(face);
+        while let Some(l) = it.next(mesh) {
+            out.push(mesh.loops.get(l).vertex);
+        }
+        out
+    }
+
+    fn tri_corner_verts(mesh: &LoopMesh, face: FaceKey) -> [VertexKey; 3] {
+        let l0 = mesh.faces.get(face).first_edge_loop;
+        let l1 = mesh.loops.get(l0).face_loop_links.next;
+        let l2 = mesh.loops.get(l1).face_loop_links.next;
+        [
+            mesh.loops.get(l0).vertex,
+            mesh.loops.get(l1).vertex,
+            mesh.loops.get(l2).vertex,
+        ]
+    }
+
+    /// Two quads sharing the edge v1->v2. Quad A = (v0,v1,v2,v3),
+    /// quad B = (v1,v4,v5,v2). Returns (face_a, face_b, perimeter verts of A,
+    /// perimeter verts of B).
+    fn two_adjacent_quads(
+        mesh: &mut LoopMesh,
+    ) -> (FaceKey, FaceKey, Vec<VertexKey>, Vec<VertexKey>) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+
+        let face_a = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        // Quad B walks v1->v4->v5->v2->v1, sharing edge e12 (v1<->v2) with A.
+        let face_b = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+
+        (face_a, face_b, vec![v0, v1, v2, v3], vec![v1, v4, v5, v2])
+    }
+
+    #[test]
+    fn poke_single_face_buffers_match_corner_count() {
+        // §7 — one centre vert, n triangles for an n-corner face.
+        let corners = unit_square();
+        let mut mesh = LoopMesh::new();
+        let face = create_face_from_verts(&mut mesh, &corners);
+        let perimeter = corner_verts(&mesh, face);
+
+        let result = mesh.poke(&[face], CenterMode::Mean, 0.0, false);
+
+        assert_eq!(result.verts.len(), 1, "one centre vert per input face");
+        assert_eq!(result.faces.len(), 4, "quad yields four triangles");
+        // The centre vert is freshly created — not one of the perimeter verts.
+        assert!(!perimeter.contains(&result.verts[0]));
+    }
+
+    #[test]
+    fn poke_faces_out_grouped_in_loop_cycle_order() {
+        // §5.2 / §7 — triangle i has corners (v_i, v_{i+1}, v_c) and the
+        // group is emitted in loop-cycle order. Verify each spawned triangle's
+        // perimeter corners are the consecutive perimeter pair for its index.
+        let corners = unit_square();
+        let mut mesh = LoopMesh::new();
+        let face = create_face_from_verts(&mut mesh, &corners);
+        let perimeter = corner_verts(&mesh, face);
+        let n = perimeter.len();
+
+        let result = mesh.poke(&[face], CenterMode::Mean, 0.0, false);
+        let v_center = result.verts[0];
+
+        assert_eq!(result.faces.len(), n);
+        for (i, &tri) in result.faces.iter().enumerate() {
+            let tri_verts = tri_corner_verts(&mesh, tri);
+            let expected = [perimeter[i], perimeter[(i + 1) % n], v_center];
+            assert_eq!(
+                tri_verts, expected,
+                "triangle {i} corners {tri_verts:?} != expected loop-cycle order {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn poke_multi_face_verts_out_in_input_order() {
+        // §7 — verts.out follows input-faces-slice order, one per face. Two
+        // adjacent quads sharing a perimeter edge are poked independently.
+        let mut mesh = LoopMesh::new();
+        let (face_a, face_b, perim_a, perim_b) = two_adjacent_quads(&mut mesh);
+
+        let result = mesh.poke(&[face_a, face_b], CenterMode::Mean, 0.0, false);
+
+        assert_eq!(result.verts.len(), 2, "one centre vert per input face");
+        // faces.out is grouped per input face: first quad A's 4 triangles, then
+        // quad B's 4 triangles (§7).
+        assert_eq!(result.faces.len(), 8);
+
+        let centre_a = result.verts[0];
+        let centre_b = result.verts[1];
+        // Each centre vert is new (not a perimeter vert of either quad).
+        assert!(!perim_a.contains(&centre_a) && !perim_b.contains(&centre_a));
+        assert!(!perim_a.contains(&centre_b) && !perim_b.contains(&centre_b));
+
+        // Quad A's group (faces 0..4) fans from centre_a; quad B's (4..8) from
+        // centre_b.
+        for tri in &result.faces[0..4] {
+            assert!(tri_corner_verts(&mesh, *tri).contains(&centre_a));
+        }
+        for tri in &result.faces[4..8] {
+            assert!(tri_corner_verts(&mesh, *tri).contains(&centre_b));
+        }
+    }
+
+    #[test]
+    fn poke_adjacent_quads_share_perimeter_edge_centres_distinct() {
+        // §5.3 — poking two faces that share a perimeter edge produces two
+        // distinct centre verts; the shared edge is not consumed by either fan.
+        let mut mesh = LoopMesh::new();
+        let (face_a, face_b, _perim_a, _perim_b) = two_adjacent_quads(&mut mesh);
+
+        let result = mesh.poke(&[face_a, face_b], CenterMode::Mean, 0.0, false);
+        assert_ne!(result.verts[0], result.verts[1]);
+    }
+
+    #[test]
+    fn poke_triangle_ngon_mix_face_counts() {
+        // §7 — faces.out length == Σ corner counts across a triangle + pentagon
+        // mix; verts.out length == number of input faces.
+        let mut mesh = LoopMesh::new();
+        let tri = create_face_from_verts(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+        );
+        let pentagon: Vec<Vec3> = (0..5)
+            .map(|i| {
+                let theta = (i as f32) * std::f32::consts::TAU / 5.0;
+                Vec3::new(10.0 + theta.cos(), theta.sin(), 0.0)
+            })
+            .collect();
+        let pent = create_face_from_verts(&mut mesh, &pentagon);
+
+        let result = mesh.poke(&[tri, pent], CenterMode::MeanWeighted, 0.0, false);
+
+        assert_eq!(result.verts.len(), 2);
+        assert_eq!(result.faces.len(), 3 + 5, "Σ corner counts");
+        // First three faces are the triangle's fan, the next five the pentagon's.
+        for face in &result.faces[0..3] {
+            assert!(tri_corner_verts(&mesh, *face).contains(&result.verts[0]));
+        }
+        for face in &result.faces[3..8] {
+            assert!(tri_corner_verts(&mesh, *face).contains(&result.verts[1]));
+        }
+    }
+
+    #[test]
+    fn poke_empty_input_yields_empty_buffers() {
+        // §8 — empty faces input does nothing; both buffers empty.
+        let mut mesh = LoopMesh::new();
+        let result = mesh.poke(&[], CenterMode::Mean, 0.0, false);
+        assert!(result.verts.is_empty() && result.faces.is_empty());
     }
 }

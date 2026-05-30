@@ -36,7 +36,7 @@ pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
 pub use dissolve_verts::DissolveVertsParams;
 pub use extrude_mixed::ExtrudeMixedResult;
 pub use extrude_vert_indiv::ExtrudeVertIndivResult;
-pub use face_poke::CenterMode;
+pub use face_poke::{CenterMode, PokeResult};
 pub use face_triangulate::{NgonMethod, QuadMethod};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
