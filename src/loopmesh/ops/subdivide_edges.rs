@@ -91,6 +91,20 @@ impl SubdivideParams {
         self
     }
 
+    /// Select the corner strategy for the quad-two-adjacent case (§5.2).
+    /// Defaults to [`QuadCornerType::StraightCut`] (the core single corner cut,
+    /// §5.2.1). The three non-default strategies lay down distinct interior
+    /// geometry: `INNERVERT` (§5.2.2) drops an inner vert on the corner cut and
+    /// spokes it to the far corner, `PATH` (§5.2.3) chains the corner cut with a
+    /// `v0`→`v2` second cut, and `FAN` (§5.2.4) spokes both rim midpoints to the
+    /// far corner. Only the quad-two-**adjacent**-edges case consults this knob;
+    /// every other re-split pattern is unaffected.
+    #[must_use]
+    pub fn quad_corner_type(mut self, corner_type: QuadCornerType) -> Self {
+        self.quad_corner_type = corner_type;
+        self
+    }
+
     /// Toggle the quad-only re-split restriction (§9.3). Off by default. With
     /// this on, only quad faces re-split; a touched triangle or n-gon keeps its
     /// inserted midpoint(s) but is left as a flat-cornered n-gon — the §6 /
@@ -258,11 +272,18 @@ impl LoopMesh {
                 self.quad_two_opposite_cut(face, &ring, geom);
             }
             (4, 2) => {
-                // §5.2 adjacent case. The default STRAIGHT_CUT strategy lays a
-                // single corner cut; the non-default strategies (PATH / FAN /
-                // INNERVERT) remain deferred (§9.3) and leave the face flat.
-                if params.quad_corner_type == QuadCornerType::StraightCut {
-                    self.quad_two_adjacent_straight_cut(face, &ring, geom);
+                // §5.2 adjacent case. The strategy chooses the interior
+                // geometry laid down once the two rim midpoints exist; all four
+                // share the §5.2.1 shared-corner anchor and far corner `v3`.
+                match params.quad_corner_type {
+                    QuadCornerType::StraightCut => {
+                        self.quad_two_adjacent_straight_cut(face, &ring, geom)
+                    }
+                    QuadCornerType::InnerVert => {
+                        self.quad_two_adjacent_inner_vert(face, &ring, geom)
+                    }
+                    QuadCornerType::Path => self.quad_two_adjacent_path(face, &ring, geom),
+                    QuadCornerType::Fan => self.quad_two_adjacent_fan(face, &ring, geom),
                 }
             }
             // Three-edge quads, the n-gon generic, and the deferred corner
@@ -470,6 +491,117 @@ impl LoopMesh {
             geom.faces.push(face);
             geom.faces.push(new_face);
         }
+    }
+
+    /// Anchor the §5.2 adjacent two-cut quad against its shared corner. The
+    /// post-§3 hexagon ring reads `v0, m01, v1, m12, v2, v3` from some start;
+    /// rotate so the start corner is the rim midpoint `m01` whose loop successor
+    /// is the shared corner `v1`, with the second midpoint `m12` two corners on.
+    /// Returns the six corners in that canonical order: `[m01, v1, m12, v2, v3,
+    /// v0]`. Shared by all four `quad_corner_type` strategies (§5.2.1–§5.2.4).
+    fn adjacent_two_cut_corners(ring: &[(VertexKey, bool)]) -> [VertexKey; 6] {
+        let n = ring.len(); // 6
+        let mids: SmallVec<[usize; 2]> = ring
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| *m)
+            .map(|(i, _)| i)
+            .collect();
+        debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
+        // Start at the midpoint that has the other exactly two corners ahead, so
+        // the shared corner v1 sits between them on the forward arc.
+        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+        let at = |off: usize| ring[(start + off) % n].0;
+        debug_assert!(!ring[(start + 1) % n].1, "shared corner is original, not a midpoint");
+        // ring order from m01: m01, v1, m12, v2, v3, v0.
+        [at(0), at(1), at(2), at(3), at(4), at(5)]
+    }
+
+    /// §5.2.2 — quad, two **adjacent** edges cut, `INNERVERT`. Lay the
+    /// `m01`→`m12` shared-corner cut, drop an inner vert `c` at that cut's
+    /// midpoint, then spoke `c`→`v3` (the far corner). The corner triangle
+    /// `{m01, v1, m12}` gains `c` as a flat rim corner (a 4-gon `{m01, v1, m12,
+    /// c}`); the pentagon splits along `c–v3` into two quads `{v0, m01, c, v3}`
+    /// and `{v3, c, m12, v2}`. The only adjacent strategy with an inner vert.
+    /// 1 quad -> 3 fragments. V 7 / E 9 / F 3.
+    fn quad_two_adjacent_inner_vert(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        let [m01, _v1, m12, _v2, v3, _v0] = Self::adjacent_two_cut_corners(ring);
+
+        // 1. Corner cut m01 -> m12, carving the corner triangle off and leaving
+        //    the pentagon (the STRAIGHT_CUT intermediate).
+        let (new_face, corner_cut_edge) = self.face_split(face, m01, m12).expect("m01-m12 split");
+        geom.faces.push(face);
+        geom.faces.push(new_face);
+
+        // 2. Inner vert c at the midpoint of the m01-m12 cut. The edge_split
+        //    wrapper places c at t = 0.5 and applies the §7.2 two-source blend
+        //    of the cut's endpoints (m01, m12) — exactly the documented inner-
+        //    vert rule, *not* the §5.4 face-wide centroid.
+        let (c, _e_new) = self.edge_split(corner_cut_edge, m01, 0.5);
+        geom.verts.push(c);
+
+        // 3. Spoke c -> v3, splitting the pentagon into the two filling quads.
+        let pent = self.face_with_both(c, v3);
+        let (quad_b, _) = self.face_split(pent, c, v3).expect("c-v3 spoke");
+        geom.faces.push(quad_b);
+    }
+
+    /// §5.2.3 — quad, two **adjacent** edges cut, `PATH`. Lay the `m01`→`m12`
+    /// shared-corner cut, then chain a second `v0`→`v2` cut across the remaining
+    /// pentagon. Yields the corner triangle `{m01, v1, m12}`, a central quad
+    /// `{v0, m01, m12, v2}`, and the far-corner triangle `{v0, v2, v3}`. No
+    /// inner vert. 1 quad -> 3 fragments. V 6 / E 8 / F 3.
+    fn quad_two_adjacent_path(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        let [m01, _v1, m12, v2, _v3, v0] = Self::adjacent_two_cut_corners(ring);
+
+        // 1. Corner cut m01 -> m12.
+        let (new_face, _corner_cut) = self.face_split(face, m01, m12).expect("m01-m12 split");
+        geom.faces.push(face);
+        geom.faces.push(new_face);
+
+        // 2. Chained v0 -> v2 cut across the pentagon {v0, m01, m12, v2, v3},
+        //    splitting it into the central quad {v0, m01, m12, v2} and the far-
+        //    corner triangle {v0, v2, v3}.
+        let pent = self.face_with_both(v0, v2);
+        let (tri_far, _) = self.face_split(pent, v0, v2).expect("v0-v2 chained cut");
+        geom.faces.push(tri_far);
+    }
+
+    /// §5.2.4 — quad, two **adjacent** edges cut, `FAN`. Spoke both rim
+    /// midpoints to the far corner `v3`: `m01`→`v3` then `m12`→`v3`. Yields the
+    /// triangle `{v3, v0, m01}`, a central quad `{v3, m01, v1, m12}` (the only
+    /// fragment holding the shared corner `v1`), and the triangle `{v3, m12,
+    /// v2}`. `v3` becomes a degree-4 fan hub. No inner vert. 1 quad -> 3
+    /// fragments. V 6 / E 8 / F 3.
+    fn quad_two_adjacent_fan(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
+        let [m01, _v1, m12, _v2, v3, _v0] = Self::adjacent_two_cut_corners(ring);
+
+        // 1. First spoke m01 -> v3, carving the triangle {v3, v0, m01}.
+        let f1 = self.face_with_both(m01, v3);
+        let (tri_a, _) = self.face_split(f1, m01, v3).expect("m01-v3 spoke");
+        // 2. Second spoke m12 -> v3, carving the triangle {v3, m12, v2}, leaving
+        //    the central quad {v3, m01, v1, m12} between the two spokes.
+        let f2 = self.face_with_both(m12, v3);
+        let (tri_b, _) = self.face_split(f2, m12, v3).expect("m12-v3 spoke");
+
+        geom.faces.push(face);
+        geom.faces.push(tri_a);
+        geom.faces.push(tri_b);
     }
 
     /// §5.3 — quad, three edges cut. Three of the four edges carry a midpoint
@@ -878,6 +1010,183 @@ mod tests {
             !mesh.face_vert_keys(pent).contains(&v1),
             "pentagon excludes the shared corner v1"
         );
+    }
+
+    /// Cut the two adjacent edges `{v0,v1}` + `{v1,v2}` of a fresh unit quad
+    /// under the given corner strategy. Returns the mesh, the geom, and the four
+    /// original corner keys `[v0, v1, v2, v3]`.
+    fn adjacent_two_cut(
+        corner_type: QuadCornerType,
+    ) -> (LoopMesh, SubdivideGeom, [VertexKey; 4]) {
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let corners = [fv[0], fv[1], fv[2], fv[3]];
+        let e01 = mesh.query_edge_exists(corners[0], corners[1]).unwrap();
+        let e12 = mesh.query_edge_exists(corners[1], corners[2]).unwrap();
+        let res = mesh.subdivide_edges(
+            &[e01, e12],
+            SubdivideParams::default().quad_corner_type(corner_type),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        (mesh, geom, corners)
+    }
+
+    fn find_vert_at(mesh: &LoopMesh, p: Vec3) -> VertexKey {
+        mesh.vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(p) < 1e-5)
+            .unwrap_or_else(|| panic!("no vert at {p:?}"))
+    }
+
+    #[test]
+    fn quad_two_adjacent_inner_vert_strategy() {
+        // §5.2.2 INNERVERT — the m01->m12 corner cut, an inner vert c at its
+        // midpoint, then c->v3. The only adjacent strategy with an inner vert.
+        // V 7 / E 9 / F 3.
+        let (mesh, geom, [_v0, _v1, _v2, _v3]) = adjacent_two_cut(QuadCornerType::InnerVert);
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (7, 9, 3), "INNERVERT: +3V / +5E / +2F");
+
+        // The inner vert c is the geom's last reported vert (after the two rim
+        // midpoints), and it sits at the midpoint of the m01-m12 cut: m01 =
+        // (1,0), m12 = (2,1) => c = (1.5, 0.5).
+        assert_eq!(geom.verts.len(), 3, "two rim midpoints + one inner vert");
+        let c = *geom.verts.last().unwrap();
+        assert!(
+            mesh.vertex_position(c).distance(Vec3::new(1.5, 0.5, 0.0)) < 1e-5,
+            "inner vert at the corner-cut midpoint (two-source blend of m01/m12)"
+        );
+
+        // Fragment shapes: one 4-gon (the shared-corner ring {m01,v1,m12,c})
+        // plus two quads {v0,m01,c,v3} and {v3,c,m12,v2}.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![4, 4, 4], "4-gon + 2 quads");
+
+        // c is spoked to v3: the c-v3 edge exists, and c has the two filling
+        // quads plus the corner 4-gon around it (degree 3 in its disk: the
+        // halved corner cut x2 + the c-v3 spoke).
+        let v3 = find_vert_at(&mesh, Vec3::new(0.0, 2.0, 0.0));
+        assert!(mesh.query_edge_exists(c, v3).is_some(), "c spokes to far corner v3");
+        assert_eq!(mesh.vertex_disk_count_edges(c), 3, "c disk: two cut halves + spoke");
+    }
+
+    #[test]
+    fn quad_two_adjacent_path_strategy() {
+        // §5.2.3 PATH — the m01->m12 corner cut chained with a v0->v2 second
+        // cut. No inner vert. V 6 / E 8 / F 3: corner tri + central quad + far
+        // tri.
+        let (mesh, geom, [v0, v1, v2, v3]) = adjacent_two_cut(QuadCornerType::Path);
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (6, 8, 3), "PATH: +2V / +4E / +2F");
+        assert_eq!(geom.verts.len(), 2, "two rim midpoints, no inner vert");
+
+        let m01 = find_vert_at(&mesh, Vec3::new(1.0, 0.0, 0.0));
+        let m12 = find_vert_at(&mesh, Vec3::new(2.0, 1.0, 0.0));
+        assert!(mesh.query_edge_exists(m01, m12).is_some(), "m01-m12 corner cut");
+        assert!(mesh.query_edge_exists(v0, v2).is_some(), "v0-v2 chained cut");
+
+        // Fragment shapes: two triangles + one quad.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 3, 4], "corner tri + central quad + far tri");
+
+        // The corner triangle {m01, v1, m12} holds the shared corner v1.
+        let corner_tri = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&fk| {
+                mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v1)
+            })
+            .expect("corner triangle holds v1");
+        let cv = mesh.face_vert_keys(corner_tri);
+        assert!(cv.contains(&m01) && cv.contains(&m12));
+
+        // The far-corner triangle {v0, v2, v3} holds v3 and both uncut corners.
+        let far_tri = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&fk| {
+                mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v3)
+            })
+            .expect("far triangle holds v3");
+        let fvv = mesh.face_vert_keys(far_tri);
+        assert!(fvv.contains(&v0) && fvv.contains(&v2), "far tri is {{v0,v2,v3}}");
+    }
+
+    #[test]
+    fn quad_two_adjacent_fan_strategy() {
+        // §5.2.4 FAN — spoke both rim midpoints to the far corner v3. No inner
+        // vert. V 6 / E 8 / F 3: tri + central quad (holds v1) + tri, with v3 a
+        // degree-4 fan hub.
+        let (mesh, geom, [v0, v1, v2, v3]) = adjacent_two_cut(QuadCornerType::Fan);
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (6, 8, 3), "FAN: +2V / +4E / +2F");
+        assert_eq!(geom.verts.len(), 2, "two rim midpoints, no inner vert");
+
+        let m01 = find_vert_at(&mesh, Vec3::new(1.0, 0.0, 0.0));
+        let m12 = find_vert_at(&mesh, Vec3::new(2.0, 1.0, 0.0));
+        // Both spokes terminate at v3; v3 never gets cut across, so there is no
+        // m01-m12 corner cut.
+        assert!(mesh.query_edge_exists(m01, v3).is_some(), "m01->v3 spoke");
+        assert!(mesh.query_edge_exists(m12, v3).is_some(), "m12->v3 spoke");
+        assert!(
+            mesh.query_edge_exists(m01, m12).is_none(),
+            "FAN never cuts across the shared corner"
+        );
+
+        // Fragment shapes: two triangles + one central quad.
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 3, 4], "tri + central quad + tri");
+
+        // The central quad {v3, m01, v1, m12} is the only fragment holding the
+        // shared corner v1.
+        let central = geom
+            .faces
+            .iter()
+            .copied()
+            .find(|&fk| mesh.face_len(fk) == 4)
+            .expect("central quad");
+        let qv = mesh.face_vert_keys(central);
+        assert!(qv.contains(&v1), "central quad holds the shared corner v1");
+        assert!(
+            qv.contains(&v3) && qv.contains(&m01) && qv.contains(&m12),
+            "central quad is {{v3, m01, v1, m12}}"
+        );
+
+        // v1 appears on exactly one fragment (the central quad); the two flank
+        // triangles hold the uncut corners v0 / v2.
+        let holds_v1 = geom
+            .faces
+            .iter()
+            .filter(|&&fk| mesh.face_vert_keys(fk).contains(&v1))
+            .count();
+        assert_eq!(holds_v1, 1, "FAN keeps v1 on a single fragment");
+
+        // v3 is the fan hub: its disk gains both spokes on top of the two uncut
+        // edges {v2,v3} and {v3,v0}.
+        assert_eq!(mesh.vertex_disk_count_edges(v3), 4, "v3 is a degree-4 fan hub");
+        let _ = (v0, v2);
+    }
+
+    #[test]
+    fn quad_corner_type_default_is_straight_cut() {
+        // The setter default and SubdivideParams::default() must agree, leaving
+        // the core STRAIGHT_CUT outcome unchanged (1 triangle + 1 pentagon).
+        assert_eq!(SubdivideParams::default().quad_corner_type, QuadCornerType::StraightCut);
+        let (mesh, geom, _) = adjacent_two_cut(QuadCornerType::StraightCut);
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (6, 7, 2), "STRAIGHT_CUT unchanged via setter");
+        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 5], "1 triangle + 1 pentagon");
     }
 
     #[test]
