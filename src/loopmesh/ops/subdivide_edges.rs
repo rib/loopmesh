@@ -52,6 +52,10 @@ pub struct SubdivideParams {
     /// Corner strategy for the quad-two-adjacent case (§5.2). Core uses
     /// [`QuadCornerType::StraightCut`].
     pub quad_corner_type: QuadCornerType,
+    /// Restrict the per-face re-split to quad faces (§9.3). Off by default. When
+    /// on, triangles and n-gons keep their inserted midpoints but are left as
+    /// flat-cornered n-gons — only quads re-split. Used by loop-cut.
+    pub use_only_quads: bool,
 }
 
 impl Default for SubdivideParams {
@@ -61,6 +65,7 @@ impl Default for SubdivideParams {
             use_single_edge: true,
             use_grid_fill: true,
             quad_corner_type: QuadCornerType::StraightCut,
+            use_only_quads: false,
         }
     }
 }
@@ -83,6 +88,17 @@ impl SubdivideParams {
     #[must_use]
     pub fn use_grid_fill(mut self, enabled: bool) -> Self {
         self.use_grid_fill = enabled;
+        self
+    }
+
+    /// Toggle the quad-only re-split restriction (§9.3). Off by default. With
+    /// this on, only quad faces re-split; a touched triangle or n-gon keeps its
+    /// inserted midpoint(s) but is left as a flat-cornered n-gon — the §6 /
+    /// §5.3 / §7 surgery is skipped. The gate filters the per-face dispatch
+    /// only; every cut edge still gains its midpoint in §3.
+    #[must_use]
+    pub fn use_only_quads(mut self, enabled: bool) -> Self {
+        self.use_only_quads = enabled;
         self
     }
 }
@@ -193,6 +209,14 @@ impl LoopMesh {
 
         if cut_count == 0 {
             return; // never visited
+        }
+
+        // §9.3 — with use_only_quads on, the per-face dispatch is restricted to
+        // quads. A touched triangle or n-gon keeps its §3 midpoint(s) but is
+        // left flat (a dangling 180° rim corner, no interior connection). The
+        // gate filters this pass only; §3 already inserted the midpoint.
+        if params.use_only_quads && corner_count != 4 {
+            return;
         }
 
         match (corner_count, cut_count) {
@@ -1129,6 +1153,136 @@ mod tests {
             .collect();
         all_cut.subdivide_edges(&edges, SubdivideParams::default());
         assert_eq!(counts(&all_cut), (9, 12, 4), "default four-cut quad plus-splits");
+    }
+
+    /// Build a quad `{v0,v1,v2,v3}` and a triangle `{v1,v4,v2}` welded across the
+    /// shared interior edge `{v1,v2}`. Returns the mesh and the shared edge.
+    fn quad_and_tri_shared_edge() -> (LoopMesh, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.5, 0.0));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e42 = mesh.create_edge([v4, v2], EdgeCreateFlags::NONE);
+
+        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(&[v1, v4, v2], &[e14, e42, e12], FaceCreateFlags::NONE);
+        (mesh, e12)
+    }
+
+    #[test]
+    fn use_only_quads_on_skips_shared_triangle() {
+        // §9.3 — quad + triangle sharing the cut edge {v1,v2}, gate ON. The §3
+        // midpoint is inserted once on the shared edge (V 5->6). The quad
+        // re-splits via §5.1 (-> 3 fragments); the triangle is dropped from the
+        // dispatch and left flat (its midpoint a 180° rim corner). 2 faces -> 4.
+        let (mut mesh, shared) = quad_and_tri_shared_edge();
+        assert_eq!(counts(&mesh), (5, 6, 2), "starting quad+tri fixture");
+
+        let res = mesh.subdivide_edges(
+            &[shared],
+            SubdivideParams::default().use_only_quads(true),
+        );
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, f), (6, 4), "gate ON: shared midpoint + quad->3, tri flat");
+
+        // The triangle that shared the edge is now a flat 4-gon (midpoint
+        // inserted as a rim corner, no interior connection).
+        let mid = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 0.5, 0.0)) < 1e-5)
+            .expect("shared midpoint exists");
+        // The non-quad face incident to the midpoint keeps all its original
+        // corners plus the new midpoint: a flat 4-gon, not re-split.
+        let flat = mesh
+            .vert_face_keys(mid)
+            .into_iter()
+            .find(|&fk| mesh.face_len(fk) == 4 && {
+                // the flat 4-gon is the only midpoint-incident face that is NOT
+                // a quad-fragment: it holds the apex v4 (at x=2).
+                mesh.face_vert_keys(fk)
+                    .iter()
+                    .any(|&vk| mesh.vertex_position(vk).x > 1.5)
+            })
+            .expect("flat 4-gon on the triangle side");
+        assert_eq!(mesh.face_len(flat), 4, "triangle left flat (4-gon)");
+        // edge count is consistent: shared edge halved (+1), quad's two §5.1
+        // interior connects (+2). 6 -> 9.
+        assert_eq!(e, 9, "gate ON edge delta: shared halved + 2 quad connects");
+    }
+
+    #[test]
+    fn use_only_quads_off_resplits_shared_triangle() {
+        // §9.3 default (gate OFF) — same fixture, same cut. Both faces re-split
+        // off the shared midpoint: the quad via §5.1 (-> 3) and the triangle via
+        // §6.1 connect-to-apex (-> 2). 2 faces -> 5; the triangle side produces
+        // one more fragment than the gate-ON outcome.
+        let (mut mesh, shared) = quad_and_tri_shared_edge();
+
+        let res = mesh.subdivide_edges(&[shared], SubdivideParams::default());
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, f), (6, 5), "gate OFF: both faces re-split");
+        // shared edge halved (+1), quad's two §5.1 connects (+2), triangle's one
+        // §6.1 connect (+1). 6 -> 10.
+        assert_eq!(e, 10, "gate OFF edge delta vs gate ON adds the tri connect");
+
+        // The triangle side is re-split: the midpoint connects to the apex v4,
+        // so no flat 4-gon remains on that side. The midpoint's disk picks up
+        // the §6.1 connect in addition to the two halves + two quad connects.
+        let mid = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 0.5, 0.0)) < 1e-5)
+            .expect("shared midpoint exists");
+        let apex = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(2.0, 0.5, 0.0)) < 1e-5)
+            .expect("triangle apex v4");
+        assert!(
+            mesh.query_edge_exists(mid, apex).is_some(),
+            "gate OFF: triangle re-splits, midpoint connects to apex"
+        );
+    }
+
+    #[test]
+    fn use_only_quads_on_passes_quad_only_mesh() {
+        // The gate must not change behaviour when every touched face is a quad.
+        // A lone quad with one cut edge still re-splits via §5.1 under the gate.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        mesh.subdivide_edges(&[e01], SubdivideParams::default().use_only_quads(true));
+        assert_eq!(counts(&mesh), (5, 7, 3), "gate ON, all-quad: quad still re-splits");
+    }
+
+    #[test]
+    fn use_only_quads_on_lone_triangle_stays_flat() {
+        // A lone triangle with one cut edge under the gate keeps its midpoint but
+        // is left flat (a 4-gon) — the §6.1 apex connect is skipped. V 3->4,
+        // E 3->4, F unchanged (1).
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        mesh.subdivide_edges(&[e01], SubdivideParams::default().use_only_quads(true));
+        assert_eq!(counts(&mesh), (4, 4, 1), "gate ON, lone tri: flat 4-gon");
+        assert_eq!(mesh.face_len(face), 4, "triangle left flat");
     }
 
     #[test]
