@@ -37,13 +37,15 @@ impl Default for QuadCornerType {
 /// Turning a gate **off** does not decline the operator: the §3 midpoints are
 /// still inserted, but the corresponding per-face re-split is suppressed and the
 /// touched face is left as a flat-cornered n-gon (§1 pattern-gating note /
-/// §9.3). The deferred knobs (smooth/fractal/sphere, `cuts >= 2`, the non-default
-/// corner strategies, `use_only_quads`) are not yet part of the surface;
-/// supplying a value outside the core makes the operator decline (§9, see
-/// [`SubdivideResult::Unsupported`]).
+/// §9.3). Multi-cut (`cuts >= 2`, §3.3 / §9.5) is supported: the lattice fills
+/// honour `use_grid_fill` / `use_single_edge` / `use_only_quads` the same way
+/// the single-cut patterns do. The deferred knobs (smooth/fractal/sphere) are
+/// not yet part of the surface and are at their no-op defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubdivideParams {
-    /// Number of midpoint verts to insert per edge (§1). Only `1` is supported.
+    /// Number of midpoint verts to insert per edge (§1 / §3.3). `1` is the
+    /// single-cut core; `N >= 2` inserts `N` evenly-spaced verts per edge and
+    /// fills each touched face with the §9.5 lattice.
     pub cuts: u32,
     /// Enables the one-cut re-split patterns (§5.1 / §6.1). On for the core.
     pub use_single_edge: bool,
@@ -71,6 +73,18 @@ impl Default for SubdivideParams {
 }
 
 impl SubdivideParams {
+    /// Set the number of midpoint verts inserted per cut edge (§1 / §3.3).
+    /// Defaults to `1` (the single-cut core). `N >= 2` evenly spaces `N`
+    /// midpoints at `t = i/(N+1)` along each cut edge and fills each touched
+    /// face with the §9.5 lattice (the fully-cut quad `(N+1)x(N+1)` grid, the
+    /// fully-cut triangle lattice, and the partial-cut fans). `cuts(0)` is a
+    /// no-op cut count and leaves the mesh untouched.
+    #[must_use]
+    pub fn cuts(mut self, cuts: u32) -> Self {
+        self.cuts = cuts;
+        self
+    }
+
     /// Toggle the one-cut re-split patterns (§5.1 / §6.1). On by default. With
     /// this off, a face with a single cut edge keeps its inserted midpoint but
     /// is left as a flat-cornered n-gon — the §5.1 / §6.1 surgery is skipped
@@ -124,8 +138,9 @@ impl SubdivideParams {
 pub enum SubdivideResult {
     /// The operator ran. Carries the new geometry the cut created.
     Ran(SubdivideGeom),
-    /// The parameter tuple is outside the implemented core (§9 deferred
-    /// parameter, e.g. `cuts != 1`). The mesh was left untouched.
+    /// The parameter tuple is outside the implemented surface (a §9 deferred
+    /// parameter — smooth/fractal/sphere at a non-default value). The mesh was
+    /// left untouched.
     Unsupported,
 }
 
@@ -161,8 +176,11 @@ impl LoopMesh {
         edges: &[EdgeKey],
         params: SubdivideParams,
     ) -> SubdivideResult {
-        if params.cuts != 1 {
-            return SubdivideResult::Unsupported;
+        if params.cuts == 0 {
+            return SubdivideResult::Ran(SubdivideGeom::default());
+        }
+        if params.cuts >= 2 {
+            return self.subdivide_edges_multicut(edges, params);
         }
 
         let mut geom = SubdivideGeom::default();
@@ -720,6 +738,388 @@ impl LoopMesh {
         for f in self.vert_face_keys(c) {
             if !geom.faces.contains(&f) {
                 geom.faces.push(f);
+            }
+        }
+    }
+
+    // ---- Multi-cut (`cuts >= 2`, §3.3 / §9.5) ----------------------------
+
+    /// Multi-cut driver (§3.3 + §9.5). Inserts `N` evenly-spaced midpoints on
+    /// each cut edge (§3.3, crack-free / shared-once on interior edges), then
+    /// fills each touched face with its §9.5 lattice: the fully-cut quad
+    /// `(N+1)x(N+1)` grid (§9.5.1), the fully-cut triangle lattice (§9.5.2), and
+    /// the partial-cut fans (§9.5.3). The per-face pattern is keyed on the same
+    /// `(corner count, cut-side count)` pair as the single-cut dispatch (§4.1);
+    /// `N` scales the *depth* of each pattern, not which pattern fires.
+    fn subdivide_edges_multicut(
+        &mut self,
+        edges: &[EdgeKey],
+        params: SubdivideParams,
+    ) -> SubdivideResult {
+        let cuts = params.cuts;
+        let mut geom = SubdivideGeom::default();
+
+        let midpoint_layer = self.push_vert_op_flag_layer();
+        const MIDPOINT: u8 = 1;
+
+        // Phase one: per-edge N-evenly-spaced split (§3.3). Each input edge is
+        // split into N+1 segments by inserting N midpoints at t = i/(N+1). A
+        // shared interior edge is cut once, so both incident faces see the same
+        // midpoint run — crack-free (§9.5.4).
+        let mut touched_faces: Vec<FaceKey> = Vec::new();
+        for &edge in edges {
+            let [near, _far] = self.edge_vert_keys(edge);
+            let mids = self.edge_split_n(edge, near, cuts);
+            for &m in &mids {
+                self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
+                geom.verts.push(m);
+            }
+            // Any midpoint's incident faces are touched; pick the first to
+            // discover them (all midpoints of an edge touch the same faces).
+            if let Some(&m) = mids.first() {
+                for f in self.vert_face_keys(m) {
+                    if !touched_faces.contains(&f) {
+                        touched_faces.push(f);
+                    }
+                }
+            }
+        }
+
+        // Phase two: per-face §9.5 lattice fill.
+        for face in touched_faces {
+            self.resplit_face_multicut(face, midpoint_layer, MIDPOINT, cuts, &params, &mut geom);
+        }
+
+        self.pop_vert_op_flag_layer(midpoint_layer);
+        SubdivideResult::Ran(geom)
+    }
+
+    /// Decompose a touched face's post-§3.3 loop cycle into its original
+    /// corners and, for each side, the ordered midpoint run between consecutive
+    /// corners (in face-traversal order). A side with an empty run was not cut.
+    fn multicut_corners_and_sides(
+        &self,
+        face: FaceKey,
+        layer: crate::op_flags::VertOpFlagLayer,
+        midpoint_flag: u8,
+    ) -> (Vec<VertexKey>, Vec<Vec<VertexKey>>) {
+        let mut rim: Vec<(VertexKey, bool)> = Vec::new();
+        let mut it = self.face_loops(face);
+        while let Some(l) = it.next(self) {
+            let v = self.loops.get(l).vertex;
+            let is_mid = self.vert_op_flag_test(layer, v, midpoint_flag);
+            rim.push((v, is_mid));
+        }
+
+        // Rotate so the rim starts at an original corner.
+        let start = rim
+            .iter()
+            .position(|(_, m)| !*m)
+            .expect("a touched face has at least one original corner");
+        let n = rim.len();
+
+        let mut corners: Vec<VertexKey> = Vec::new();
+        let mut sides: Vec<Vec<VertexKey>> = Vec::new();
+        let mut current_run: Vec<VertexKey> = Vec::new();
+        for i in 0..n {
+            let (v, is_mid) = rim[(start + i) % n];
+            if is_mid {
+                current_run.push(v);
+            } else {
+                if !corners.is_empty() {
+                    sides.push(std::mem::take(&mut current_run));
+                }
+                corners.push(v);
+            }
+        }
+        // The trailing run closes the cycle back to corners[0].
+        sides.push(std::mem::take(&mut current_run));
+        debug_assert_eq!(sides.len(), corners.len());
+        (corners, sides)
+    }
+
+    fn resplit_face_multicut(
+        &mut self,
+        face: FaceKey,
+        layer: crate::op_flags::VertOpFlagLayer,
+        midpoint_flag: u8,
+        cuts: u32,
+        params: &SubdivideParams,
+        geom: &mut SubdivideGeom,
+    ) {
+        let (corners, sides) = self.multicut_corners_and_sides(face, layer, midpoint_flag);
+        let corner_count = corners.len();
+        let cut_sides = sides.iter().filter(|s| !s.is_empty()).count();
+        if cut_sides == 0 {
+            return;
+        }
+
+        // §9.3 — restrict re-split to quads when use_only_quads is on. A
+        // non-quad keeps its §3.3 midpoints but is left flat.
+        if params.use_only_quads && corner_count != 4 {
+            return;
+        }
+
+        let n = cuts as usize;
+        match (corner_count, cut_sides) {
+            (4, 4) => {
+                if params.use_grid_fill {
+                    self.quad_grid_fill(face, &corners, &sides, n, geom);
+                }
+            }
+            (3, 3) => {
+                if params.use_grid_fill {
+                    self.tri_lattice_fill(face, &corners, &sides, n, geom);
+                }
+            }
+            (4, 1) => {
+                if params.use_single_edge {
+                    self.quad_one_edge_fan(face, &corners, &sides, n, geom);
+                }
+            }
+            (3, 1) => {
+                if params.use_single_edge {
+                    self.tri_one_edge_fan(face, &corners, &sides, geom);
+                }
+            }
+            // Other multi-cut configurations (partial quad two/three-edge,
+            // triangle two-edge, n-gons) are §9.5.3 / §4.3 generic-fan cases
+            // not yet pinned at multi-cut; leave the flat-cornered face.
+            _ => {}
+        }
+    }
+
+    /// Create a lattice cell face from a vert ring, reusing existing boundary
+    /// edges and creating interior edges once. The new face inherits the
+    /// source face's per-face customdata (§7.2 one-source copy).
+    fn create_lattice_cell(&mut self, ring: &[VertexKey], src_face: usize) -> FaceKey {
+        let count = ring.len();
+        let mut cell_edges: SmallVec<[EdgeKey; 4]> = SmallVec::new();
+        for i in 0..count {
+            let a = ring[i];
+            let b = ring[(i + 1) % count];
+            cell_edges.push(self.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE));
+        }
+        let new_face = self.face_create(ring, &cell_edges, FaceCreateFlags::NONE);
+        self.face_attribs.copy_into(new_face.as_usize(), src_face);
+        new_face
+    }
+
+    /// §9.5.1 — fully-cut quad, the `(N+1)x(N+1)` grid. `corners` is
+    /// `[v0, v1, v2, v3]` in loop order; `sides[k]` is the midpoint run on the
+    /// edge `corners[k]->corners[k+1]`. Builds the node grid (rim midpoints +
+    /// `N*N` interior bilinear verts), kills the n-gon, and emits `(N+1)^2`
+    /// quad cells.
+    fn quad_grid_fill(
+        &mut self,
+        face: FaceKey,
+        corners: &[VertexKey],
+        sides: &[Vec<VertexKey>],
+        n: usize,
+        geom: &mut SubdivideGeom,
+    ) {
+        let (v0, v1, v2, v3) = (corners[0], corners[1], corners[2], corners[3]);
+        let p = [
+            self.vertex_position(v0),
+            self.vertex_position(v1),
+            self.vertex_position(v2),
+            self.vertex_position(v3),
+        ];
+
+        // node[row][col], row,col in 0..=n+1. col increases v0->v1, row
+        // increases v0->v3 (so v2 is at (n+1, n+1)).
+        let dim = n + 2;
+        let mut node = vec![vec![VertexKey::from_usize(0); dim]; dim];
+        node[0][0] = v0;
+        node[0][n + 1] = v1;
+        node[n + 1][n + 1] = v2;
+        node[n + 1][0] = v3;
+        for c in 1..=n {
+            node[0][c] = sides[0][c - 1]; // bottom: v0->v1
+            node[n + 1][c] = sides[2][n - c]; // top: v2->v3, reversed
+        }
+        for r in 1..=n {
+            node[r][n + 1] = sides[1][r - 1]; // right: v1->v2
+            node[r][0] = sides[3][n - r]; // left: v3->v0, reversed
+        }
+
+        // Interior bilinear verts (§9.5.1). u = col/(N+1), v = row/(N+1).
+        for r in 1..=n {
+            for c in 1..=n {
+                let u = c as f32 / (n as f32 + 1.0);
+                let v = r as f32 / (n as f32 + 1.0);
+                let pos = p[0] * ((1.0 - u) * (1.0 - v))
+                    + p[1] * (u * (1.0 - v))
+                    + p[2] * (u * v)
+                    + p[3] * ((1.0 - u) * v);
+                let vk = self.create_vertex(pos);
+                let sources = [
+                    ((1.0 - u) * (1.0 - v), v0.as_usize()),
+                    (u * (1.0 - v), v1.as_usize()),
+                    (u * v, v2.as_usize()),
+                    ((1.0 - u) * v, v3.as_usize()),
+                ];
+                self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                node[r][c] = vk;
+                geom.verts.push(vk);
+            }
+        }
+
+        let src_face = face.as_usize();
+        self.face_kill(face);
+        for r in 0..=n {
+            for c in 0..=n {
+                let cell = [
+                    node[r][c],
+                    node[r][c + 1],
+                    node[r + 1][c + 1],
+                    node[r + 1][c],
+                ];
+                let f = self.create_lattice_cell(&cell, src_face);
+                geom.faces.push(f);
+            }
+        }
+    }
+
+    /// §9.5.2 — fully-cut triangle, the `(N+1)^2`-cell lattice. `corners` is
+    /// `[v0, v1, v2]`; `sides[k]` is the midpoint run on `corners[k]->
+    /// corners[k+1]`. Builds the barycentric node grid (`(N-1)N/2` interior
+    /// verts), kills the n-gon, and emits `(N+1)^2` small triangles.
+    fn tri_lattice_fill(
+        &mut self,
+        face: FaceKey,
+        corners: &[VertexKey],
+        sides: &[Vec<VertexKey>],
+        n: usize,
+        geom: &mut SubdivideGeom,
+    ) {
+        let (v0, v1, v2) = (corners[0], corners[1], corners[2]);
+        let p = [
+            self.vertex_position(v0),
+            self.vertex_position(v1),
+            self.vertex_position(v2),
+        ];
+
+        // rows[s] holds the node run at lattice row s (s = 0 on edge v0->v1,
+        // s = n+1 at apex v2). Row s has (n+2-s) nodes, left->right.
+        let mut rows: Vec<Vec<VertexKey>> = Vec::with_capacity(n + 2);
+        for s in 0..=(n + 1) {
+            let width = n + 1 - s; // last index in the row
+            let mut row: Vec<VertexKey> = Vec::with_capacity(width + 1);
+            for k in 0..=width {
+                let vk = if s == 0 && k == 0 {
+                    v0
+                } else if s == 0 && k == n + 1 {
+                    v1
+                } else if s == n + 1 {
+                    v2
+                } else if s == 0 {
+                    sides[0][k - 1] // bottom: v0->v1
+                } else if k == 0 {
+                    sides[2][n - s] // left edge v2->v0, reversed
+                } else if k == width {
+                    sides[1][s - 1] // right edge v1->v2
+                } else {
+                    // Interior barycentric vert (§9.5.2).
+                    let w2 = s as f32 / (n as f32 + 1.0);
+                    let w1 = k as f32 / (n as f32 + 1.0);
+                    let w0 = 1.0 - w1 - w2;
+                    let pos = p[0] * w0 + p[1] * w1 + p[2] * w2;
+                    let vk = self.create_vertex(pos);
+                    let sources = [
+                        (w0, v0.as_usize()),
+                        (w1, v1.as_usize()),
+                        (w2, v2.as_usize()),
+                    ];
+                    self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                    geom.verts.push(vk);
+                    vk
+                };
+                row.push(vk);
+            }
+            rows.push(row);
+        }
+
+        let src_face = face.as_usize();
+        self.face_kill(face);
+        for s in 0..=n {
+            let upper = n - s; // top index of the down-triangle run
+            // Up triangles.
+            for k in 0..=upper {
+                let cell = [rows[s][k], rows[s][k + 1], rows[s + 1][k]];
+                let f = self.create_lattice_cell(&cell, src_face);
+                geom.faces.push(f);
+            }
+            // Down triangles.
+            for k in 0..upper {
+                let cell = [rows[s][k + 1], rows[s + 1][k + 1], rows[s + 1][k]];
+                let f = self.create_lattice_cell(&cell, src_face);
+                geom.faces.push(f);
+            }
+        }
+    }
+
+    /// §9.5.3 — one-edge quad fan. The single cut edge `corners[0]->corners[1]`
+    /// carries `N` midpoints; each connects into the interior toward the two
+    /// opposite corners (the lower half toward `v3`, the upper half toward
+    /// `v2`), fanning the quad into `N + 1` fragments.
+    fn quad_one_edge_fan(
+        &mut self,
+        face: FaceKey,
+        corners: &[VertexKey],
+        sides: &[Vec<VertexKey>],
+        n: usize,
+        geom: &mut SubdivideGeom,
+    ) {
+        let cut = sides.iter().position(|s| !s.is_empty()).expect("one cut side");
+        // Rotate corners so the cut side is corners[0]->corners[1].
+        let v0 = corners[cut];
+        let v1 = corners[(cut + 1) % 4];
+        let v2 = corners[(cut + 2) % 4];
+        let v3 = corners[(cut + 3) % 4];
+        let run = &sides[cut];
+        let _ = (v0, v1);
+
+        geom.faces.push(face);
+        // Lower half (parameter < 0.5) fans to v3; upper half to v2.
+        let split = (n + 1) / 2;
+        for i in 0..n {
+            let m = run[i];
+            let target = if i < split { v3 } else { v2 };
+            let sub = self.face_with_both(m, target);
+            if let Some((new_face, _)) = self.face_split(sub, m, target) {
+                geom.faces.push(new_face);
+            }
+        }
+        // Collect any final residual fragment(s) reachable from the midpoints.
+        for &m in run {
+            for f in self.vert_face_keys(m) {
+                if !geom.faces.contains(&f) {
+                    geom.faces.push(f);
+                }
+            }
+        }
+    }
+
+    /// §9.5.3 — one-edge triangle fan. The single cut edge `corners[0]->
+    /// corners[1]` carries `N` midpoints; each connects to the opposite apex
+    /// `corners[2]`, fanning the triangle into `N + 1` triangles.
+    fn tri_one_edge_fan(
+        &mut self,
+        face: FaceKey,
+        corners: &[VertexKey],
+        sides: &[Vec<VertexKey>],
+        geom: &mut SubdivideGeom,
+    ) {
+        let cut = sides.iter().position(|s| !s.is_empty()).expect("one cut side");
+        let apex = corners[(cut + 2) % 3];
+        let run = sides[cut].clone();
+
+        geom.faces.push(face);
+        for m in run {
+            let sub = self.face_with_both(m, apex);
+            if let Some((new_face, _)) = self.face_split(sub, m, apex) {
+                geom.faces.push(new_face);
             }
         }
     }
@@ -1342,21 +1742,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_multicut_declines() {
+    fn cuts_zero_is_noop() {
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let fv = mesh.face_vert_keys(face);
         let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
         let before = counts(&mesh);
-        let res = mesh.subdivide_edges(
-            &[e01],
-            SubdivideParams {
-                cuts: 2,
-                ..Default::default()
-            },
-        );
-        assert_eq!(res, SubdivideResult::Unsupported);
-        assert_eq!(counts(&mesh), before, "declined run leaves mesh untouched");
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(0));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(counts(&mesh), before, "cuts = 0 leaves the mesh untouched");
     }
 
     #[test]
@@ -1623,5 +2017,226 @@ mod tests {
         // Midpoint of {v0 (u=0), v1 (u=2)} should read u = 1.
         let got = mesh.vertex_attribs().get_f32(u, m.as_usize()).unwrap();
         assert!((got - 1.0).abs() < 1e-5, "midpoint u expected 1.0, got {got}");
+    }
+
+    // ---- Multi-cut (`cuts >= 2`, §3.3 / §9.5) ----------------------------
+
+    fn quad_all_edges(mesh: &mut LoopMesh, face: FaceKey) -> Vec<EdgeKey> {
+        let fv = mesh.face_vert_keys(face);
+        (0..4)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
+            .collect()
+    }
+
+    fn tri_all_edges(mesh: &mut LoopMesh, face: FaceKey) -> Vec<EdgeKey> {
+        let fv = mesh.face_vert_keys(face);
+        (0..3)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 3]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn multicut_quad_grid_cuts2() {
+        // §9.5.1 — fully-cut quad at cuts = 2 → 3x3 grid. V 16 / E 24 / F 9.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let edges = quad_all_edges(&mut mesh, face);
+
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(2));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(counts(&mesh), (16, 24, 9), "quad grid cuts=2 deltas");
+        for &f in &geom.faces {
+            assert_eq!(mesh.face_len(f), 4, "grid cells are quads");
+        }
+        // The four interior verts land at the bilinear lattice nodes of the
+        // [0,2]^2 quad: (2/3, 2/3), (4/3, 2/3), (2/3, 4/3), (4/3, 4/3).
+        for &(x, y) in &[(2.0 / 3.0, 2.0 / 3.0), (4.0 / 3.0, 2.0 / 3.0)] {
+            assert!(
+                mesh.vert_keys()
+                    .into_iter()
+                    .any(|vk| mesh.vertex_position(vk).distance(Vec3::new(x, y, 0.0)) < 1e-5),
+                "interior lattice vert at ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn multicut_quad_grid_cuts3() {
+        // §9.5.1 — fully-cut quad at cuts = 3 → 4x4 grid. V 25 / E 40 / F 16.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let edges = quad_all_edges(&mut mesh, face);
+
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(3));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(counts(&mesh), (25, 40, 16), "quad grid cuts=3 deltas");
+        assert_eq!(geom.faces.len(), 16, "16 grid cells");
+        for &f in &geom.faces {
+            assert_eq!(mesh.face_len(f), 4, "grid cells are quads");
+        }
+    }
+
+    #[test]
+    fn multicut_tri_lattice_cuts2() {
+        // §9.5.2 — fully-cut triangle at cuts = 2 → 9 small triangles, one
+        // interior vert. V 10 / E 18 / F 9.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let edges = tri_all_edges(&mut mesh, face);
+
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(2));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(counts(&mesh), (10, 18, 9), "tri lattice cuts=2 deltas");
+        for &f in &geom.faces {
+            assert_eq!(mesh.face_len(f), 3, "lattice cells are triangles");
+        }
+        // The single interior vert is the barycentric centroid of the tri
+        // {(0,0),(2,0),(0,2)} at (1/3, 1/3) weights → (2/3, 2/3).
+        let interior: Vec<_> = geom
+            .verts
+            .iter()
+            .copied()
+            .filter(|&vk| mesh.vertex_position(vk).distance(Vec3::new(2.0 / 3.0, 2.0 / 3.0, 0.0)) < 1e-5)
+            .collect();
+        assert_eq!(interior.len(), 1, "exactly one interior barycentric vert");
+    }
+
+    #[test]
+    fn multicut_tri_lattice_cuts3() {
+        // §9.5.2 — fully-cut triangle at cuts = 3 → 16 triangles, three
+        // interior verts. V 15 / E 30 / F 16.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let edges = tri_all_edges(&mut mesh, face);
+
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(3));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(counts(&mesh), (15, 30, 16), "tri lattice cuts=3 deltas");
+        assert_eq!(geom.faces.len(), 16, "16 lattice cells");
+        for &f in &geom.faces {
+            assert_eq!(mesh.face_len(f), 3, "lattice cells are triangles");
+        }
+    }
+
+    #[test]
+    fn multicut_quad_one_edge_fan_cuts2() {
+        // §9.5.3 — one-edge quad at cuts = 2 → fan of 3 fragments.
+        // V 6 / E 8 / F 3.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(2));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(counts(&mesh), (6, 8, 3), "one-edge quad fan cuts=2 deltas");
+        // The two midpoints land at t = 1/3 and 2/3 along {v0,v1} = [(0,0),(2,0)].
+        for &x in &[2.0 / 3.0, 4.0 / 3.0] {
+            assert!(
+                mesh.vert_keys()
+                    .into_iter()
+                    .any(|vk| mesh.vertex_position(vk).distance(Vec3::new(x, 0.0, 0.0)) < 1e-5),
+                "rim midpoint at t along the cut edge ({x}, 0)"
+            );
+        }
+    }
+
+    #[test]
+    fn multicut_tri_one_edge_fan_cuts2() {
+        // §9.5.3 — one-edge triangle at cuts = 2 → fan of 3 triangles.
+        // V 5 / E 7 / F 3.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(2));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(counts(&mesh), (5, 7, 3), "one-edge tri fan cuts=2 deltas");
+        for &f in &geom.faces {
+            assert_eq!(mesh.face_len(f), 3, "fan fragments are triangles");
+        }
+        // Both midpoints connect to the opposite apex v2 = (0,2).
+        let apex = fv[2];
+        for &x in &[2.0 / 3.0, 4.0 / 3.0] {
+            let m = find_vert_at(&mesh, Vec3::new(x, 0.0, 0.0));
+            assert!(
+                mesh.query_edge_exists(m, apex).is_some(),
+                "midpoint at ({x},0) connects to the apex"
+            );
+        }
+    }
+
+    #[test]
+    fn multicut_shared_edge_two_quads_cuts2_crack_free() {
+        // §9.5.4 — two quads sharing edge {v1,v2}, that edge cut at cuts = 2.
+        // The 2 midpoints are created once and shared by both quads; each quad
+        // re-splits off the shared run. V 8 / E 13 / F 6.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+
+        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        assert_eq!(counts(&mesh), (6, 7, 2), "starting two-quad fixture");
+
+        mesh.subdivide_edges(&[e12], SubdivideParams::default().cuts(2));
+        assert_eq!(counts(&mesh), (8, 13, 6), "shared-edge cuts=2 crack-free deltas");
+
+        // Each shared midpoint sits on the shared edge and welds both quads:
+        // its disk has the two halves of the (now thrice-split) shared edge
+        // plus one fan connect from each side. Both midpoints are degree 4.
+        for &y in &[1.0 / 3.0, 2.0 / 3.0] {
+            let m = find_vert_at(&mesh, Vec3::new(1.0, y, 0.0));
+            assert_eq!(
+                mesh.vertex_disk_count_edges(m),
+                4,
+                "shared midpoint at (1,{y}) welds both quads (degree 4)"
+            );
+        }
+    }
+
+    #[test]
+    fn multicut_use_only_quads_skips_triangle() {
+        // §9.3 at multi-cut — quad + triangle sharing the cut edge, gate ON at
+        // cuts = 2. The 2 shared midpoints are inserted once; the quad fans, the
+        // triangle is left flat.
+        let (mut mesh, shared) = quad_and_tri_shared_edge();
+        let res = mesh.subdivide_edges(
+            &[shared],
+            SubdivideParams::default().cuts(2).use_only_quads(true),
+        );
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        // 5 -> 7 verts (2 shared midpoints), quad -> 3 fans + flat triangle.
+        let (v, _e, f) = counts(&mesh);
+        assert_eq!(v, 7, "two shared midpoints inserted once");
+        assert_eq!(f, 4, "quad fans to 3, triangle left flat (1)");
     }
 }
