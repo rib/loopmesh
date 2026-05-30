@@ -30,6 +30,7 @@ mod inset_region;
 mod mean_value;
 mod pointmerge;
 mod remove_doubles;
+mod subdivide_edges;
 mod weld_verts;
 
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
@@ -47,3 +48,6 @@ pub use face_poke::{CenterMode, PokeResult};
 pub use face_triangulate::{NgonMethod, QuadMethod};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
+pub use subdivide_edges::{
+    QuadCornerType, SubdivideGeom, SubdivideParams, SubdivideResult,
+};
