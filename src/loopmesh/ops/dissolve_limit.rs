@@ -20,6 +20,12 @@ pub const DELIMIT_SEAM: u32 = 1 << 2;
 pub const DELIMIT_SHARP: u32 = 1 << 3;
 pub const DELIMIT_UV: u32 = 1 << 4;
 
+/// The subset of `delimit` bits this implementation honours (`NORMAL` | `UV`).
+/// A `delimit` value drawn entirely from this set runs; any other set bit
+/// (MATERIAL / SEAM / SHARP) declines via
+/// [`DissolveLimitResult::Unsupported`].
+const DELIMIT_SUPPORTED: u32 = DELIMIT_NORMAL | DELIMIT_UV;
+
 /// Parameters controlling [`LoopMesh::dissolve_limit`].
 ///
 /// Mirrors the BMOP set-input shape described in
@@ -27,11 +33,12 @@ pub const DELIMIT_UV: u32 = 1 << 4;
 ///
 /// The core `delimit = 0` priority sweep — the §4 clamp, the §5 edge pass,
 /// the §6 heap-driven vert pass (with the §6.3 degeneracy guard), and the §7
-/// `use_dissolve_boundaries` linear sweep — is implemented. The §3
-/// `delimit`-flag filtering (NORMAL / MATERIAL / SEAM / SHARP / UV) is a
-/// deferred follow-up: a non-zero `delimit` declines through
-/// [`DissolveLimitResult::Unsupported`] rather than silently producing a
-/// wrong result.
+/// `use_dissolve_boundaries` linear sweep — is implemented, as is the §3
+/// `delimit`-flag filtering for the geometry-only bits `NORMAL` and `UV`
+/// (including the §3.1 zero-UV-layer auto-clear). The semantic bits
+/// `MATERIAL` / `SEAM` / `SHARP` are a deferred follow-up: a `delimit` value
+/// that sets any of them declines through [`DissolveLimitResult::Unsupported`]
+/// rather than silently producing a wrong result.
 #[derive(Clone, Copy)]
 pub struct DissolveLimitParams {
     /// Dihedral / corner-angle tolerance in radians. Clamped to π/2 before
@@ -42,8 +49,10 @@ pub struct DissolveLimitParams {
     /// corner-angle gate (§6). When `true`, it becomes an unconditional linear
     /// sweep that collapses every still-edge-pair candidate with no angle test.
     pub use_dissolve_boundaries: bool,
-    /// Hard candidate filter (§3). `0` is the only implemented value this
-    /// cycle; any non-zero mask declines via [`DissolveLimitResult::Unsupported`].
+    /// Hard candidate filter (§3). The geometry-only bits `DELIMIT_NORMAL` and
+    /// `DELIMIT_UV` are honoured (any combination of them runs); a mask that
+    /// sets `DELIMIT_MATERIAL` / `DELIMIT_SEAM` / `DELIMIT_SHARP` declines via
+    /// [`DissolveLimitResult::Unsupported`].
     pub delimit: u32,
 }
 
@@ -216,20 +225,37 @@ impl LoopMesh {
     /// - **§7** — with `use_dissolve_boundaries`, the vert pass is replaced by
     ///   an unconditional linear sweep with no heap, cost, or degeneracy test.
     ///
+    /// §3 `delimit` filtering is honoured for the geometry-only bits
+    /// `DELIMIT_NORMAL` (a non-contiguous edge — the two flanking faces wind
+    /// the same direction along the shared edge) and `DELIMIT_UV` (the edge is
+    /// a UV-island boundary — its per-loop UVs disagree across some Float2
+    /// loop layer), including the §3.1 zero-UV-layer auto-clear. A delimited
+    /// edge takes the `COST_INVALID` sentinel and is never popped (§3.2); a
+    /// vert touching a delimited manifold edge takes the un-modulated
+    /// corner-angle cost (§3.3).
+    ///
     /// Returns the §1 `region.out` analogue: the surviving merge anchors. A
-    /// non-zero `delimit` is **not** implemented this cycle and declines via
-    /// [`DissolveLimitResult::Unsupported`] (delimit-flag filtering is a
-    /// deferred follow-up).
+    /// `delimit` value setting `DELIMIT_MATERIAL` / `DELIMIT_SEAM` /
+    /// `DELIMIT_SHARP` is **not** implemented this cycle and declines via
+    /// [`DissolveLimitResult::Unsupported`].
     pub fn dissolve_limit(
         &mut self,
         edges: &[EdgeKey],
         verts: &[VertexKey],
         params: &DissolveLimitParams,
     ) -> DissolveLimitResult {
-        // §3 delimit-flag filtering is deferred; only the unfiltered path is
-        // implemented. Decline rather than silently mis-filter.
-        if params.delimit != 0 {
+        // Only the geometry-only delimiter bits are implemented; any semantic
+        // bit (MATERIAL / SEAM / SHARP) declines rather than mis-filtering.
+        if params.delimit & !DELIMIT_SUPPORTED != 0 {
             return DissolveLimitResult::Unsupported;
+        }
+
+        // §3.1 — the UV bit auto-clears when the mesh carries no UV (Float2
+        // loop) layers: with no UV data to delimit against the bit is inert,
+        // and clearing it skips the per-edge loop-CD test entirely.
+        let mut delimit = params.delimit;
+        if delimit & DELIMIT_UV != 0 && self.dissolve_limit_uv_layer_count() == 0 {
+            delimit &= !DELIMIT_UV;
         }
 
         // §4 — clamp the tolerance to π/2 and derive the negated-cosine form
@@ -261,7 +287,7 @@ impl LoopMesh {
         // correctly. The edge pass refreshes each merged face itself.
         self.calc_face_normals();
 
-        let region_out = self.dissolve_limit_edge_pass(edges, edge_threshold);
+        let region_out = self.dissolve_limit_edge_pass(edges, edge_threshold, delimit);
 
         // §5.4 — the vert input set may lose entries the cleanup orphaned;
         // build a live, deduplicated working set before the vert pass.
@@ -293,7 +319,7 @@ impl LoopMesh {
                 }
             }
         } else {
-            self.dissolve_limit_vert_pass(&vert_input, angle_limit);
+            self.dissolve_limit_vert_pass(&vert_input, angle_limit, delimit);
         }
 
         DissolveLimitResult::Ran { region_out }
@@ -304,6 +330,7 @@ impl LoopMesh {
         &mut self,
         edges: &[EdgeKey],
         edge_threshold: f32,
+        delimit: u32,
     ) -> Vec<FaceKey> {
         // §5.3 — the edge → input-index map standing in for `BM_elem_index`.
         // A later re-score looks an edge up here to find its heap slot.
@@ -315,7 +342,7 @@ impl LoopMesh {
             }
             // First-wins if the caller passed a duplicate edge.
             index_of.entry(edge).or_insert(i);
-            let cost = self.dissolve_limit_edge_cost(edge);
+            let cost = self.dissolve_limit_edge_cost(edge, delimit);
             heap.insert(i, cost);
         }
 
@@ -361,7 +388,7 @@ impl LoopMesh {
                     };
                     for perimeter_edge in perimeter {
                         if let Some(&j) = index_of.get(&perimeter_edge) {
-                            let cost = self.dissolve_limit_edge_cost(perimeter_edge);
+                            let cost = self.dissolve_limit_edge_cost(perimeter_edge, delimit);
                             heap.update_cost(j, cost);
                         }
                     }
@@ -442,7 +469,12 @@ impl LoopMesh {
     }
 
     /// §6 — the heap-driven vert pass.
-    fn dissolve_limit_vert_pass(&mut self, vert_input: &[Option<VertexKey>], angle_limit: f32) {
+    fn dissolve_limit_vert_pass(
+        &mut self,
+        vert_input: &[Option<VertexKey>],
+        angle_limit: f32,
+        delimit: u32,
+    ) {
         let mut index_of: HashMap<VertexKey, usize> = HashMap::with_capacity(vert_input.len());
         let mut heap = PriorityHeap::with_capacity(vert_input.len());
         for (i, slot) in vert_input.iter().enumerate() {
@@ -451,7 +483,7 @@ impl LoopMesh {
                 continue;
             }
             index_of.entry(v).or_insert(i);
-            let cost = self.dissolve_limit_vert_cost(v);
+            let cost = self.dissolve_limit_vert_cost(v, delimit);
             heap.insert(i, cost);
         }
 
@@ -487,7 +519,7 @@ impl LoopMesh {
                     let endpoints = self.edges.get(e_new).vertices;
                     for v_other in endpoints {
                         if let Some(&j) = index_of.get(&v_other) {
-                            let cost = self.dissolve_limit_vert_cost(v_other);
+                            let cost = self.dissolve_limit_vert_cost(v_other, delimit);
                             heap.update_cost(j, cost);
                         }
                     }
@@ -522,7 +554,7 @@ impl LoopMesh {
                             }
                             if let Some(&j) = index_of.get(&neighbour) {
                                 if heap.current_cost(j) == COST_INVALID {
-                                    let cost = self.dissolve_limit_vert_cost(neighbour);
+                                    let cost = self.dissolve_limit_vert_cost(neighbour, delimit);
                                     heap.update_cost(j, cost);
                                 }
                             }
@@ -536,14 +568,18 @@ impl LoopMesh {
         }
     }
 
-    /// §5.1 — per-edge dissolve cost. `COST_INVALID` for a non-manifold edge;
+    /// §5.1 — per-edge dissolve cost. `COST_INVALID` for a non-manifold edge,
+    /// or (§3.2) when `delimit != 0` and the edge crosses a set delimiter;
     /// otherwise the signed negated dot of the two face normals (the sign flip
     /// makes "coplanar / no fold" the lowest cost for both contiguous and
     /// non-contiguous edges).
-    fn dissolve_limit_edge_cost(&self, edge: EdgeKey) -> f32 {
+    fn dissolve_limit_edge_cost(&self, edge: EdgeKey, delimit: u32) -> f32 {
         let Some((face_a, face_b)) = self.dissolve_limit_edge_face_pair(edge) else {
             return COST_INVALID;
         };
+        if delimit != 0 && self.dissolve_limit_edge_is_delimiter(edge, delimit) {
+            return COST_INVALID;
+        }
         let normal_a = self.faces.get(face_a).normal;
         let normal_b = self.faces.get(face_b).normal;
         let dot = normal_a.dot(normal_b);
@@ -554,26 +590,30 @@ impl LoopMesh {
         }
     }
 
-    /// §6.1 — per-vert dissolve cost. The corner angle, modulated by the
-    /// incident-edge dihedral when the canonical edge is manifold (the
-    /// multiplicative collinear-and-coplanar form). A non-edge-pair vert is
-    /// `COST_INVALID` (it has no two-edge corner to collapse).
-    fn dissolve_limit_vert_cost(&self, v: VertexKey) -> f32 {
+    /// §6.1 / §3.3 — per-vert dissolve cost. The corner angle, modulated by the
+    /// incident-edge dihedral when the canonical edge is manifold *and* the
+    /// vert is not a delimiter (the multiplicative collinear-and-coplanar
+    /// form). A non-edge-pair vert is `COST_INVALID` (it has no two-edge corner
+    /// to collapse). A delimiter vert — any incident manifold edge crosses a
+    /// set delimiter — takes the un-modulated corner angle (§3.3), the more
+    /// permissive form that still lets an "easy" collinear corner collapse on a
+    /// delimiter line.
+    fn dissolve_limit_vert_cost(&self, v: VertexKey, delimit: u32) -> f32 {
         let Some(corner_angle) = self.dissolve_limit_vert_corner_angle(v) else {
             return COST_INVALID;
         };
-        // delimit = 0 this cycle: every manifold-canonical-edge vert takes the
-        // modulated form; delimiter-aware routing is a deferred follow-up.
         let primary_edge = self
             .vertices
             .get(v)
             .disk_loop_start
             .expect("edge-pair vert has a disk-head edge");
-        if let Some(edge_angle) = self.dissolve_limit_edge_dihedral(primary_edge) {
-            corner_angle * edge_angle / std::f32::consts::FRAC_PI_2
-        } else {
-            corner_angle
+        let is_delimiter = delimit != 0 && self.dissolve_limit_vert_is_delimiter(v, delimit);
+        if !is_delimiter {
+            if let Some(edge_angle) = self.dissolve_limit_edge_dihedral(primary_edge) {
+                return corner_angle * edge_angle / std::f32::consts::FRAC_PI_2;
+            }
         }
+        corner_angle
     }
 
     /// §6.1 — corner angle for an edge-pair vert; `None` for any other valence
@@ -766,6 +806,149 @@ impl LoopMesh {
             return true;
         };
         self.loops.get(loop_a).vertex != self.loops.get(loop_b).vertex
+    }
+
+    /// §3 — the per-edge delimiter predicate. Returns `true` when `edge`
+    /// crosses any delimiter set in `delimit`. Only the geometry-only bits are
+    /// implemented:
+    ///
+    /// - `DELIMIT_NORMAL` — the edge is **not contiguous** (§3 row / §5.1): its
+    ///   two flanking faces' loops run the *same* direction along the shared
+    ///   edge rather than opposite directions, i.e. one face is wound
+    ///   inside-out relative to the other.
+    /// - `DELIMIT_UV` — the edge is a UV-island boundary: it is not loop-CD
+    ///   contiguous across every Float2 loop layer (§3 row, §3.2). The bit is
+    ///   only ever tested when at least one such layer exists (§3.1 auto-clear
+    ///   strips it otherwise).
+    ///
+    /// A non-manifold / boundary edge has no flanking pair and is not classed
+    /// as a delimiter here (the non-manifold case already yields `COST_INVALID`
+    /// independently, §5.1).
+    fn dissolve_limit_edge_is_delimiter(&self, edge: EdgeKey, delimit: u32) -> bool {
+        if delimit & DELIMIT_NORMAL != 0 && !self.dissolve_limit_edge_is_contiguous(edge) {
+            return true;
+        }
+        if delimit & DELIMIT_UV != 0 && !self.dissolve_limit_edge_is_uv_contiguous(edge) {
+            return true;
+        }
+        false
+    }
+
+    /// §3.3 — a vert is a delimiter vert when any incident manifold edge is
+    /// itself a delimiter; such a vert takes the un-modulated corner-angle
+    /// cost. A wire / non-manifold incident edge never carries a delimiter
+    /// classification (the delimiter predicate requires a flanking face pair).
+    fn dissolve_limit_vert_is_delimiter(&self, v: VertexKey, delimit: u32) -> bool {
+        let mut disk = self.disk_edges(v);
+        while let Some(edge) = disk.next(self) {
+            if self.dissolve_limit_edge_face_pair(edge).is_some()
+                && self.dissolve_limit_edge_is_delimiter(edge, delimit)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Count the mesh's Float2 (UV) loop layers. The §3 `DELIMIT_UV` test runs
+    /// against every such layer; a count of zero triggers the §3.1 auto-clear.
+    fn dissolve_limit_uv_layer_count(&self) -> usize {
+        let attribs = self.loop_attribs();
+        attribs
+            .iter_descriptors()
+            .filter(|(key, _)| {
+                matches!(
+                    attribs.storage_of(*key),
+                    Some(crate::loopmesh::AttributeStorage::Vec2(_))
+                )
+            })
+            .count()
+    }
+
+    /// §3 `DELIMIT_UV` — `true` when `edge` is loop-CD contiguous across every
+    /// Float2 (UV) loop layer: the per-loop UVs agree at *both* endpoints of
+    /// the edge across its two flanking faces. A disagreement on any layer at
+    /// either endpoint makes the edge a UV-island boundary (returns `false`).
+    ///
+    /// For a manifold edge with radial loops `la` (on face A) and `lb` (on
+    /// face B), `la` runs from `la.vert` to `loop_next(la).vert` and likewise
+    /// for `lb`; the loop↔edge invariant (`RADIAL_EDGE_STRUCTURE.md` §5.1)
+    /// guarantees those two endpoint vertices are the edge's two ends. The four
+    /// corners at the edge pair up by shared vertex:
+    ///   - at `la.vert`:        `la`            vs `loop_next(lb)`
+    ///   - at `loop_next(la).vert`: `loop_next(la)` vs `lb`
+    /// (the pairing holds whether or not the edge is contiguous, since
+    /// `loop_next` lands on the matching endpoint on the opposite face). Each
+    /// pair's UVs are compared for exact per-component equality.
+    ///
+    /// NOTE — the guide (`DISSOLVE_LIMIT.md` §3, the `UV` row) defines this
+    /// per-loop UV-contiguity predicate but does not specify a comparison
+    /// *tolerance*; this implementation uses exact per-component equality (the
+    /// literal reading of "the per-loop UVs ... don't match"). A near-equal
+    /// island seam may therefore classify differently from a tolerant compare.
+    /// See the cycle report's guide-gap note.
+    fn dissolve_limit_edge_is_uv_contiguous(&self, edge: EdgeKey) -> bool {
+        let mut radial = self.radial_loops(edge);
+        let Some(loop_a) = radial.next(self) else {
+            return true;
+        };
+        let Some(loop_b) = radial.next(self) else {
+            return true;
+        };
+        if radial.next(self).is_some() {
+            return true;
+        }
+
+        let a_start = loop_a;
+        let a_end = self.loop_next(loop_a);
+        let b_start = loop_b;
+        let b_end = self.loop_next(loop_b);
+
+        let vertex_a = self.loops.get(a_start).vertex;
+        // Pair each face's corner by the shared endpoint vertex. `b_start`'s
+        // vertex is one endpoint; whichever of {b_start, b_end} shares
+        // `vertex_a` is the corner to compare against `a_start`.
+        let (b_at_a_start, b_at_a_end) = if self.loops.get(b_start).vertex == vertex_a {
+            (b_start, b_end)
+        } else {
+            (b_end, b_start)
+        };
+
+        let uv_layers: smallvec::SmallVec<[crate::loopmesh::ElementAttributeKey; 4]> = {
+            let attribs = self.loop_attribs();
+            attribs
+                .iter_descriptors()
+                .filter(|(key, _)| {
+                    matches!(
+                        attribs.storage_of(*key),
+                        Some(crate::loopmesh::AttributeStorage::Vec2(_))
+                    )
+                })
+                .map(|(key, _)| key)
+                .collect()
+        };
+        for layer in uv_layers {
+            if self.dissolve_limit_loop_uv(layer, a_start)
+                != self.dissolve_limit_loop_uv(layer, b_at_a_start)
+                || self.dissolve_limit_loop_uv(layer, a_end)
+                    != self.dissolve_limit_loop_uv(layer, b_at_a_end)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Read a loop's UV from a Float2 layer, defaulting to the zero corner if
+    /// the slot is unset.
+    fn dissolve_limit_loop_uv(
+        &self,
+        layer: crate::loopmesh::ElementAttributeKey,
+        loop_key: LoopKey,
+    ) -> [f32; 2] {
+        self.loop_attribs()
+            .get_vec2(layer, loop_key.as_usize())
+            .unwrap_or([0.0; 2])
     }
 
     /// The two distinct faces flanking a manifold `edge`, ordered `e.l` first
@@ -1292,22 +1475,233 @@ mod tests {
     }
 
     #[test]
-    fn delimit_nonzero_declines() {
-        // §3 deferral — a non-zero delimit is not implemented this cycle and
-        // must decline cleanly without touching the mesh.
+    fn delimit_semantic_bit_declines() {
+        // §3 deferral — MATERIAL / SEAM / SHARP filtering is not implemented;
+        // a mask setting any of them declines cleanly without touching the
+        // mesh. The geometry-only NORMAL / UV bits are honoured (tested
+        // separately), so only a semantic bit should decline.
         let mut mesh = LoopMesh::new();
         let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 2);
         let v0 = mesh.totvert();
         let e0 = mesh.totedge();
         let f0 = mesh.totface();
+        for delimit in [DELIMIT_MATERIAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_NORMAL | DELIMIT_SEAM]
+        {
+            let params = DissolveLimitParams {
+                angle_limit: FRAC_PI_2,
+                use_dissolve_boundaries: false,
+                delimit,
+            };
+            let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
+            assert_eq!(result, DissolveLimitResult::Unsupported, "delimit {delimit:#x}");
+            assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        }
+        mesh.validate_topology();
+    }
+
+    /// Two coplanar quads sharing edge `v1–v2`, the second wound *with* the
+    /// shared edge (loop traverses `v1 → v2` on both faces) so the edge is
+    /// **non-contiguous** (§3 row `NORMAL` / §5.1) and face B's normal flips
+    /// relative to face A. Returns `(mesh, shared_edge)`.
+    fn build_noncontiguous_coplanar_pair() -> (LoopMesh, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = vec![
+            mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0)), // v0
+            mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0)), // v1
+            mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0)), // v2
+            mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0)), // v3
+            mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0)), // v4
+            mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0)), // v5
+        ];
+        // Face A: CCW [v0,v1,v2,v3], shared edge v1->v2.
+        let e01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(&[v[0], v[1], v[2], v[3]], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        // Face B: [v1,v2,v5,v4] — also traverses the shared edge v1->v2, so the
+        // edge is non-contiguous and B winds opposite to A (flipped normal).
+        let e25 = mesh.create_edge([v[2], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e54 = mesh.create_edge([v[5], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e41 = mesh.create_edge([v[4], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(&[v[1], v[2], v[5], v[4]], &[e12, e25, e54, e41], FaceCreateFlags::NONE);
+
+        let shared = mesh.query_edge_exists(v[1], v[2]).unwrap();
+        (mesh, shared)
+    }
+
+    #[test]
+    fn delimit_normal_invalidates_noncontiguous_edge_cost() {
+        // §3 row `NORMAL` / §5.1 / §3.2 — a non-contiguous coplanar edge
+        // (winding-discrepant: B's normal is flipped vs A) scores a low,
+        // poppable cost +dot ≈ −1 at delimit = 0, but DELIMIT_NORMAL marks it a
+        // delimiter so its cost becomes the COST_INVALID sentinel and it is
+        // never popped.
+        let (mut mesh, shared) = build_noncontiguous_coplanar_pair();
+        mesh.calc_face_normals();
+        assert!(
+            !mesh.dissolve_limit_edge_is_contiguous(shared),
+            "the engineered pair shares a same-direction edge (non-contiguous)"
+        );
+        let cost_open = mesh.dissolve_limit_edge_cost(shared, 0);
+        assert!(
+            cost_open.is_finite() && cost_open < 0.0,
+            "without NORMAL the non-contiguous coplanar edge is poppable (cost {cost_open})"
+        );
+        let cost_delim = mesh.dissolve_limit_edge_cost(shared, DELIMIT_NORMAL);
+        assert!(
+            cost_delim == super::COST_INVALID,
+            "DELIMIT_NORMAL marks the non-contiguous edge a delimiter (cost {cost_delim})"
+        );
+    }
+
+    #[test]
+    fn delimit_normal_preserves_noncontiguous_edge() {
+        // §3 row `NORMAL` — running the operator with DELIMIT_NORMAL over the
+        // non-contiguous edge leaves it intact: it is never popped, so no merge
+        // is attempted and region.out is empty. (loopmesh's `faces_join`
+        // independently declines a non-contiguous merge, so the delimit = 0
+        // baseline also leaves two faces here; the delimiter's effect is pinned
+        // at the cost level in `delimit_normal_invalidates_noncontiguous_edge_cost`.)
+        let (mut mesh, shared) = build_noncontiguous_coplanar_pair();
         let params = DissolveLimitParams {
             angle_limit: FRAC_PI_2,
             use_dissolve_boundaries: false,
             delimit: DELIMIT_NORMAL,
         };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "DELIMIT_NORMAL preserves the non-contiguous edge");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+    }
+
+    /// A coplanar quad pair sharing edge `v1–v2`, contiguous (the normal
+    /// manifold winding), carrying a per-loop UV layer. `split_uv` controls
+    /// whether the two faces' UVs agree at the seam (a single UV island) or
+    /// disagree (a UV-island boundary). Returns `(mesh, shared_edge, uv_layer)`.
+    fn build_coplanar_pair_with_uv(split_uv: bool) -> (LoopMesh, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = vec![
+            mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0)), // v0
+            mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0)), // v1
+            mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0)), // v2
+            mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0)), // v3
+            mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0)), // v4
+            mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0)), // v5
+        ];
+        let e01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+        let e12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let e23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+        let e30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+        let face_a = mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let e14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+        let e45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        let e52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+        let face_b = mesh.face_create(
+            &[v[1], v[4], v[5], v[2]],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        // Assign UVs by vertex position so both faces agree at the seam verts
+        // v1, v2 (a single island). When `split_uv`, face B's seam corners are
+        // pushed off by a large offset so the edge becomes an island boundary.
+        let seam_offset = if split_uv { 10.0 } else { 0.0 };
+        for l in mesh.face_loop_keys(face_a) {
+            let p = mesh.vertex_position(mesh.loops.get(l).vertex);
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+        }
+        for l in mesh.face_loop_keys(face_b) {
+            let vert = mesh.loops.get(l).vertex;
+            let p = mesh.vertex_position(vert);
+            let on_seam = vert == v[1] || vert == v[2];
+            let off = if on_seam { seam_offset } else { 0.0 };
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x + off, p.y]);
+        }
+
+        let shared = mesh.query_edge_exists(v[1], v[2]).unwrap();
+        (mesh, shared)
+    }
+
+    #[test]
+    fn delimit_uv_preserves_island_boundary() {
+        // §3 row `UV` / §3.2 — an edge whose per-loop UVs disagree across the
+        // seam is a UV-island boundary. With DELIMIT_UV it is delimited and
+        // survives; with matching UVs (single island) or delimit = 0 it
+        // dissolves.
+
+        // delimit = 0: the split-UV edge dissolves (UV ignored).
+        let (mut mesh, shared) = build_coplanar_pair_with_uv(true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "UV split edge dissolves when delimit = 0");
+        mesh.validate_topology();
+
+        // DELIMIT_UV with mismatched seam UVs: the island boundary survives.
+        let (mut mesh, shared) = build_coplanar_pair_with_uv(true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_UV,
+        };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "DELIMIT_UV preserves the UV-island boundary");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+
+        // DELIMIT_UV with matching seam UVs (single island): not delimited,
+        // dissolves as if delimit = 0.
+        let (mut mesh, shared) = build_coplanar_pair_with_uv(false);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_UV,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "matching seam UVs are contiguous; the edge dissolves");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn delimit_uv_auto_clears_with_no_uv_layers() {
+        // §3.1 — DELIMIT_UV with zero Float2 loop layers auto-clears before the
+        // pass runs, so the bit is inert and the mesh behaves as delimit = 0.
+        // A plain coplanar strip (no UV layer) fully collapses under DELIMIT_UV
+        // exactly as it would under delimit = 0.
+        let mut mesh = LoopMesh::new();
+        let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 4);
+        let params = DissolveLimitParams {
+            angle_limit: std::f32::consts::FRAC_PI_4,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_UV,
+        };
         let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
-        assert_eq!(result, DissolveLimitResult::Unsupported);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert!(matches!(result, DissolveLimitResult::Ran { .. }), "UV bit auto-clears, runs");
+        assert_eq!(mesh.totface(), 1, "no UV layers ⇒ UV bit inert ⇒ full collapse");
+        assert_eq!(mesh.totvert(), 4);
         mesh.validate_topology();
     }
 }
+
+
+
