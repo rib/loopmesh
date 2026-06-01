@@ -153,14 +153,23 @@ impl LoopMesh {
             self.split_straddling_face(face, side);
         }
 
-        // Step 5 (§4.1) — clear the selected side(s). Deleting the cleared-side
-        // non-seam verts cascades up to their incident edges and faces; on-plane
-        // verts are never seeded, so the seam survives any clear.
-        if params.clear_outer {
-            self.clear_side(side, Side::Positive);
-        }
-        if params.clear_inner {
-            self.clear_side(side, Side::Negative);
+        // Step 5 (§4.1) — clear the selected side(s). The clear does NOT re-read
+        // the §3 `Side`; it runs a fresh, strict, `dist`-shifted signed-distance
+        // test over the ORIGINAL INPUT verts only (`tagged_verts`, snapshotted
+        // before steps 3-4 created any crossing/duplicate verts). An input vert at
+        // signed distance within `dist` (including exactly on the plane at
+        // `dist = 0`) survives, and verts made during the cut are never deletion
+        // candidates — which is why an on-plane column at `dist = 0` survives both
+        // clears and the degenerate seam face is kept.
+        if params.clear_inner || params.clear_outer {
+            self.clear_input_verts(
+                &tagged_verts,
+                plane_co,
+                normal,
+                params.dist,
+                params.clear_inner,
+                params.clear_outer,
+            );
         }
 
         // Step 6 (§5) — collect outputs from the post-cut classification.
@@ -363,15 +372,33 @@ impl LoopMesh {
         None
     }
 
-    /// §4.1 — clear the geometry strictly on `cleared` side. Seeding the
-    /// cleared-side non-seam verts into a vert-delete cascades up to their
-    /// incident edges and faces; on-plane (seam) verts are never seeded, so the
-    /// seam — and every face/edge wholly on the kept side — survives.
-    fn clear_side(&mut self, side: crate::op_flags::VertOpFlagLayer, cleared: Side) {
+    /// §4.1 — clear the selected side(s) by a fresh, strict, `dist`-shifted
+    /// signed-distance test over the ORIGINAL INPUT verts only. This is NOT the
+    /// §3 cut classification: `clear_outer` kills an input vert iff
+    /// `signed_dist > dist` and `clear_inner` iff `signed_dist < -dist`, both
+    /// strict. An input vert within `dist` of the plane (including exactly on it
+    /// at `dist = 0`) survives both clears; verts created during the cut are not
+    /// in `input_verts`, so they are never deletion candidates. Seeding the
+    /// doomed verts into a vert-delete cascades up to their now-loose incident
+    /// edges and faces, so the seam — and the degenerate seam face, whose
+    /// surviving corners are never killed — survives any clear.
+    fn clear_input_verts(
+        &mut self,
+        input_verts: &[VertexKey],
+        plane_co: Vec3,
+        plane_no: Vec3,
+        dist: f32,
+        clear_inner: bool,
+        clear_outer: bool,
+    ) {
         let mut doomed: Vec<VertexKey> = Vec::new();
-        let mut it = MeshVerts::default();
-        while let Some(vert) = it.next(self) {
-            if self.side_of(side, vert) == cleared {
+        for &vert in input_verts {
+            if self.vertices.try_get(vert).is_none() {
+                continue;
+            }
+            let s = (self.vertex_position(vert) - plane_co).dot(plane_no);
+            let kill = (clear_outer && s - dist > 0.0) || (clear_inner && s + dist < 0.0);
+            if kill {
                 doomed.push(vert);
             }
         }
@@ -418,12 +445,18 @@ impl LoopMesh {
 }
 
 /// §3 — signed plane-distance side classification against the `dist` band.
+///
+/// The boundary is asymmetric: the negative test is checked first and is
+/// inclusive, so a vert exactly at `-dist` (and, when `dist == 0`, a vert
+/// exactly on the plane) lands on the negative side, not on-plane. The on-plane
+/// region is the open band `(-dist, +dist)`; at `dist == 0` that band is empty,
+/// which is what drives the duplicate-column regime (§2.1).
 fn classify(p: Vec3, plane_co: Vec3, plane_no: Vec3, dist: f32) -> Side {
     let signed_dist = (p - plane_co).dot(plane_no);
-    if signed_dist > dist {
-        Side::Positive
-    } else if signed_dist < -dist {
+    if signed_dist <= -dist {
         Side::Negative
+    } else if signed_dist >= dist {
+        Side::Positive
     } else {
         Side::OnPlane
     }
@@ -552,10 +585,34 @@ mod tests {
             classify(Vec3::new(-0.5, 0.0, 0.0), Vec3::ZERO, PLANE_NO_X, 0.2),
             Side::Negative
         );
-        // |signed_dist| == dist is on-plane (non-strict band, §3).
+        // The on-plane region is the OPEN band (-dist, +dist); the boundary is
+        // asymmetric (§3). Exactly inside the band is on-plane:
+        assert_eq!(
+            classify(Vec3::new(0.1, 0.0, 0.0), Vec3::ZERO, PLANE_NO_X, 0.2),
+            Side::OnPlane
+        );
+        // The upper boundary is inclusive — signed_dist == +dist is Positive:
         assert_eq!(
             classify(Vec3::new(0.2, 0.0, 0.0), Vec3::ZERO, PLANE_NO_X, 0.2),
-            Side::OnPlane
+            Side::Positive
+        );
+        // The negative boundary is inclusive and checked first — signed_dist ==
+        // -dist is Negative:
+        assert_eq!(
+            classify(Vec3::new(-0.2, 0.0, 0.0), Vec3::ZERO, PLANE_NO_X, 0.2),
+            Side::Negative
+        );
+        // At dist == 0 the open band is empty and the centre tie goes Negative —
+        // a vert exactly ON the plane classifies Negative, not on-plane (§3,
+        // the load-bearing tie-break behind the duplicate-column regime §2.1):
+        assert_eq!(
+            classify(Vec3::ZERO, Vec3::ZERO, PLANE_NO_X, 0.0),
+            Side::Negative
+        );
+        // A strictly-positive distance still reaches Positive at dist == 0:
+        assert_eq!(
+            classify(Vec3::new(0.01, 0.0, 0.0), Vec3::ZERO, PLANE_NO_X, 0.0),
+            Side::Positive
         );
         // Crossing at x = 0 between x = -1 and x = 3 is t = 1/4 (§4).
         let t = crossing_t(
@@ -627,24 +684,96 @@ mod tests {
     }
 
     #[test]
-    fn no_clear_inscribes_more_geometry_than_a_half_clear() {
-        // §4.1: with neither clear flag the whole strip plus the seam survives —
-        // strictly more verts than a half-clear run.
-        let (mut whole, _f, _v) = strip(-2.0, 4);
-        let geom = whole_mesh_geom(&whole);
-        whole.bisect_plane(&geom, params(0.0, false, false, false));
+    fn dist_zero_duplicates_on_plane_column() {
+        // §2.1 / §3 regime B / §8.2: a 4-quad strip whose middle column (x = 0)
+        // lies exactly on the plane, cut at dist = 0. The on-plane verts classify
+        // Negative (the centre tie-break, §3), the spanning edges to the positive
+        // column straddle and cut at t = 0 (coincident copies, §4), the column is
+        // DUPLICATED, and a degenerate zero-width seam face is inscribed.
+        let cut = |inner: bool, outer: bool| {
+            let (mut mesh, _f, _v) = strip(-2.0, 4); // columns at x = -2..2
+            let geom = whole_mesh_geom(&mesh);
+            mesh.bisect_plane(&geom, params(0.0, false, inner, outer));
+            (mesh.totvert(), mesh.totedge(), mesh.totface())
+        };
 
-        let (mut cleared, _f2, _v2) = strip(-2.0, 4);
-        let geom2 = whole_mesh_geom(&cleared);
-        cleared.bisect_plane(&geom2, params(0.0, false, false, true));
+        // clear_outer keeps the negative half: two kept quads + the degenerate
+        // seam quad {2, 2', 7', 7} (its two on-plane corners 2,7 sit at signed
+        // distance 0, excluded by the §4.1 strict clear test; the duplicates are
+        // post-cut, never deletion candidates) → 8 V / 10 E / 3 F (§2.1 / §8.2).
+        assert_eq!(cut(false, true), (8, 10, 3), "clear_outer @ dist = 0");
+        // clear_inner keeps the positive half: the SAME count, because the §4.1
+        // clear keys off a fresh strict input-vert distance test (not the §3 cut
+        // `Side`), so the degenerate seam face's corners survive this clear too →
+        // also 8 V / 10 E / 3 F (§4.1 consequence 1 / §8.2). A "delete every
+        // Negative vert" reading would give the wrong 6/7/2 here.
+        assert_eq!(cut(true, false), (8, 10, 3), "clear_inner @ dist = 0");
+        // No clear keeps the whole strip; the duplicated column splits it in two
+        // plus the degenerate seam quad → 12 V / 16 E / 5 F.
+        assert_eq!(cut(false, false), (12, 16, 5), "no-clear @ dist = 0");
+    }
 
-        assert!(
-            whole.totvert() > cleared.totvert(),
-            "no-clear keeps strictly more geometry"
+    #[test]
+    fn dist_zero_clears_keep_opposite_survivors() {
+        // §4.1: clear_outer and clear_inner at dist = 0 over the on-plane-column
+        // strip yield the SAME element count (8/10/3) but keep survivors on
+        // OPPOSITE sides — so the two results are not accidentally identical.
+        let survivor_xs = |inner: bool, outer: bool| {
+            let (mut mesh, _f, _v) = strip(-2.0, 4); // columns at x = -2..2
+            let geom = whole_mesh_geom(&mesh);
+            mesh.bisect_plane(&geom, params(0.0, false, inner, outer));
+            let min = mesh
+                .vert_keys()
+                .iter()
+                .map(|&v| mesh.vertex_position(v).x)
+                .fold(f32::INFINITY, f32::min);
+            let max = mesh
+                .vert_keys()
+                .iter()
+                .map(|&v| mesh.vertex_position(v).x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            (min, max)
+        };
+
+        let (outer_min, outer_max) = survivor_xs(false, true);
+        let (inner_min, inner_max) = survivor_xs(true, false);
+        // clear_outer keeps x <= 0: the negative extent reaches -2, none above 0.
+        assert!(outer_min < -1.0, "clear_outer keeps the negative extent");
+        assert!(outer_max <= 1e-5, "clear_outer keeps nothing strictly positive");
+        // clear_inner keeps x >= 0: the positive extent reaches +2, none below 0.
+        assert!(inner_max > 1.0, "clear_inner keeps the positive extent");
+        assert!(inner_min >= -1e-5, "clear_inner keeps nothing strictly negative");
+        // The two survivor x-extents differ — the clears select opposite sides.
+        assert_ne!(
+            (outer_min, outer_max),
+            (inner_min, inner_max),
+            "clears keep opposite-side survivors despite equal counts"
         );
-        // No-clear removes nothing: still one strip's worth of faces (the
-        // middle column was on the plane, so no straddling face was split).
-        assert_eq!(whole.totface(), 4, "no faces removed, none split on-plane");
+    }
+
+    #[test]
+    fn dist_positive_keeps_on_plane_column_single() {
+        // §2.1 regime A / §8.2: the same strip and plane, cut with a small
+        // positive dist so the middle column falls inside the open on-plane band
+        // (§3). Nothing straddles, the column stays single, no degenerate face.
+        let cut = |inner: bool, outer: bool| {
+            let (mut mesh, _f, _v) = strip(-2.0, 4);
+            let geom = whole_mesh_geom(&mesh);
+            mesh.bisect_plane(&geom, params(0.1, false, inner, outer));
+            (mesh.totvert(), mesh.totedge(), mesh.totface())
+        };
+
+        // clear_outer keeps the negative half sharing the single on-plane
+        // column → 6 V / 7 E / 2 F (§2.1 / §8.2), strictly fewer than dist = 0's
+        // 8 V / 10 E / 3 F — the duplication is genuinely suppressed.
+        assert_eq!(cut(false, true), (6, 7, 2), "clear_outer @ dist > 0");
+        // clear_inner keeps the positive half, mirror count → also 6 V / 7 E /
+        // 2 F. The §4.1 strict test kills the strictly-negative input verts; the
+        // on-plane column (within dist) survives as the shared single column.
+        assert_eq!(cut(true, false), (6, 7, 2), "clear_inner @ dist > 0");
+        // No clear leaves the input unchanged (plus seam tagging): 10 V / 13 E /
+        // 4 F — the four original quads, no split, no duplicate.
+        assert_eq!(cut(false, false), (10, 13, 4), "no-clear @ dist > 0");
     }
 
     #[test]
