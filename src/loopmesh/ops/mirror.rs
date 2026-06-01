@@ -49,8 +49,11 @@ pub struct MirrorParams {
     pub mirror_u: bool,
     /// As `mirror_u` for the UV `v` coordinate (`v ↦ 1 − v`, §5).
     pub mirror_v: bool,
-    /// Modifies the UV reflection centre (in-tile vs unit square). By-design
-    /// deferral; only meaningful alongside `mirror_u` / `mirror_v`.
+    /// Modifies the UV reflection centre: when set, each flipped UV coordinate
+    /// reflects **within its UDIM tile** (about the tile's local centre,
+    /// `c ↦ floor(c) + 1 − (c − floor(c))`) rather than about `0.5` of the unit
+    /// square. The tile index (the floor) is preserved. Only meaningful
+    /// alongside `mirror_u` / `mirror_v` (§5).
     pub mirror_udim: bool,
 }
 
@@ -81,17 +84,12 @@ impl LoopMesh {
     ///
     /// `mirror_u` / `mirror_v` flip the cloned face loops' UVs (§5); with them
     /// clear, UVs are copied verbatim by the duplicate step. `mirror_udim`
-    /// (within-tile reflection centre) is accepted for interface stability but
-    /// its non-default (`true`) behaviour is a by-design deferral.
+    /// changes the reflection centre from `0.5` of the unit square to the
+    /// within-tile midpoint, preserving the UDIM tile index (§5).
     ///
     /// See `radial-mesh-guides/operators/MIRROR.md` for the full algorithm and
     /// parity contract.
     pub fn mirror(&mut self, geom: &[GeomKey], params: MirrorParams) -> MirrorResult {
-        debug_assert!(
-            !params.mirror_udim,
-            "mirror: mirror_udim (within-tile UV reflection) is a by-design deferral (MIRROR.md §5)"
-        );
-
         // Step 1 (§6.1) — clone the selection's closure. The clone is coincident
         // with the source; `vert_map` relates each source vert to its clone.
         let dup = self.duplicate(geom, false);
@@ -112,7 +110,7 @@ impl LoopMesh {
         // (done by the clone in step 1) and before the weld. The flip touches
         // the clone half only; the originals keep their UVs untouched.
         if params.mirror_u || params.mirror_v {
-            self.mirror_clone_uvs(&dup.geom_out, params.mirror_u, params.mirror_v);
+            self.mirror_clone_uvs(&dup.geom_out, params.mirror_u, params.mirror_v, params.mirror_udim);
         }
 
         // Step 5 (§6.5) — weld the seam: each seam clone collapses onto its
@@ -158,11 +156,19 @@ impl LoopMesh {
 
     /// §5 — flip the cloned faces' loop UVs. Over every loop of every cloned
     /// face, for each Float2 (UV-shaped) loop layer, reflect the requested
-    /// coordinate about the midpoint of the unit square: `mirror_u` maps
-    /// `u ↦ 1 − u`, `mirror_v` maps `v ↦ 1 − v`. Both may apply together. Only
+    /// coordinate via [`mirror_uv_coord`]: `mirror_u` flips `u`, `mirror_v`
+    /// flips `v`, both may apply together. With `mirror_udim` clear the centre is
+    /// `0.5` of the unit square (`c ↦ 1 − c`); with it set the reflection happens
+    /// within the coordinate's UDIM tile, preserving the tile index. Only
     /// `CD_PROP_FLOAT2`-shaped layers (storage `Vec2`) are touched; other loop
     /// customdata stays as the verbatim duplicate copy left it.
-    fn mirror_clone_uvs(&mut self, clone_geom: &[GeomKey], mirror_u: bool, mirror_v: bool) {
+    fn mirror_clone_uvs(
+        &mut self,
+        clone_geom: &[GeomKey],
+        mirror_u: bool,
+        mirror_v: bool,
+        mirror_udim: bool,
+    ) {
         let uv_layers: Vec<ElementAttributeKey> = self
             .loop_attribs()
             .iter_descriptors()
@@ -186,10 +192,10 @@ impl LoopMesh {
                         continue;
                     };
                     if mirror_u {
-                        uv[0] = 1.0 - uv[0];
+                        uv[0] = mirror_uv_coord(uv[0], mirror_udim);
                     }
                     if mirror_v {
-                        uv[1] = 1.0 - uv[1];
+                        uv[1] = mirror_uv_coord(uv[1], mirror_udim);
                     }
                     self.loop_attribs_mut().set_vec2(layer, slot, uv);
                 }
@@ -236,6 +242,23 @@ impl LoopMesh {
             }
         }
         pairs
+    }
+}
+
+/// §5 — reflect a single UV coordinate. With `udim` clear the reflection centre
+/// is `0.5` of the unit square (`c ↦ 1 − c`). With `udim` set the coordinate
+/// reflects **within its UDIM tile**: the tile index (the floor) is preserved
+/// and only the in-tile fraction flips about the tile centre, giving
+/// `floor + (1 − frac)`. The fraction is the **non-negative** part `c − c.floor()`
+/// (in `[0, 1)`) — not a signed `fract`, which would mis-handle negative `c` and
+/// shift the tile.
+fn mirror_uv_coord(c: f32, udim: bool) -> f32 {
+    if udim {
+        let floor_part = c.floor();
+        let frac = c - floor_part;
+        floor_part + (1.0 - frac)
+    } else {
+        1.0 - c
     }
 }
 
@@ -696,6 +719,108 @@ mod tests {
             }
         }
         mesh.validate_topology();
+    }
+
+    /// Register a Float2 loop layer and stamp every loop with a UV inside the
+    /// UDIM tile `(1, 0)` — `u ∈ (1, 2)`, `v ∈ (0, 1)` — chosen away from the
+    /// tile centre so the in-tile flip moves it: corner `i` of face `j` gets
+    /// `[1.1 + 0.05*i, 0.2 + 0.05*j]`. Returns the layer key.
+    fn decorate_loops_with_tile_uv(mesh: &mut LoopMesh, faces: &[FaceKey]) -> ElementAttributeKey {
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .expect("uv layer registers");
+        for (j, &f) in faces.iter().enumerate() {
+            for (i, l) in mesh.face_loop_keys(f).into_iter().enumerate() {
+                let value = [1.1 + 0.05 * i as f32, 0.2 + 0.05 * j as f32];
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+            }
+        }
+        uv
+    }
+
+    /// §5 `mirror_udim` fires: a UV that starts in the non-zero UDIM tile
+    /// `(1, 0)` (`u ∈ (1, 2)`) stays in that same tile after the flip. The
+    /// within-tile reflection is `u ↦ floor(u) + 1 − (u − floor(u))`, which for
+    /// `u ∈ (1, 2)` lands back in `(1, 2)` — never crossing the tile boundary.
+    #[test]
+    fn mirror_udim_keeps_uv_in_tile() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = offset_strip(&mut mesh);
+        let uv = decorate_loops_with_tile_uv(&mut mesh, &faces);
+
+        let geom = all_geom(&verts, &faces);
+        let mut params = default_params(0.0);
+        params.mirror_u = true;
+        params.mirror_v = true;
+        params.mirror_udim = true;
+        let result = mesh.mirror(&geom, params);
+
+        let clone_faces: Vec<FaceKey> = result
+            .geom_out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Face(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clone_faces.len(), 2);
+
+        for &f in &clone_faces {
+            for l in mesh.face_loop_keys(f) {
+                let [u, v] = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                // u started in tile (1,2); the in-tile flip keeps it there.
+                assert!((1.0..2.0).contains(&u), "u stayed in UDIM tile (1,2): {u}");
+                // v started in tile (0,1); the in-tile flip keeps it there.
+                assert!((0.0..1.0).contains(&v), "v stayed in UDIM tile (0,1): {v}");
+                // The exact reflection: u ∈ {1.10,1.15,1.20,1.25} ↦ {1.90,..,1.75}.
+                let source_u = 1.0 + 1.0 - (u - 1.0); // invert: floor=1, frac flip
+                assert!((1.10..=1.25).contains(&source_u), "u is an in-tile flip: {u}");
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    /// §5 contrast: for the SAME tile-(1,0) input, `mirror_udim` set differs from
+    /// `mirror_udim` clear. The clear path reflects about `0.5` (`u ↦ 1 − u`),
+    /// sending `u ∈ (1, 2)` to `(−1, 0)` — a different tile — while the set path
+    /// keeps it in `(1, 2)`. The two results must not coincide.
+    #[test]
+    fn mirror_udim_differs_from_unit_square() {
+        let collect_clone_uvs = |mirror_udim: bool| -> Vec<[u32; 2]> {
+            let mut mesh = LoopMesh::new();
+            let (verts, faces) = offset_strip(&mut mesh);
+            let uv = decorate_loops_with_tile_uv(&mut mesh, &faces);
+            let geom = all_geom(&verts, &faces);
+            let mut params = default_params(0.0);
+            params.mirror_u = true;
+            params.mirror_v = true;
+            params.mirror_udim = mirror_udim;
+            let result = mesh.mirror(&geom, params);
+            let mut out: Vec<[u32; 2]> = Vec::new();
+            for g in &result.geom_out {
+                let GeomKey::Face(f) = g else { continue };
+                for l in mesh.face_loop_keys(*f) {
+                    let [u, v] = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                    out.push([u.to_bits(), v.to_bits()]);
+                }
+            }
+            out.sort();
+            out
+        };
+
+        let udim = collect_clone_uvs(true);
+        let unit_square = collect_clone_uvs(false);
+        assert_ne!(
+            udim, unit_square,
+            "mirror_udim (within-tile) must differ from the unit-square reflection"
+        );
+        // Unit-square sends tile-(1,2) UVs to negative tile (−1, 0).
+        for [ub, _vb] in &unit_square {
+            assert!(f32::from_bits(*ub) < 0.0, "unit-square flip jumps u below 0");
+        }
     }
 
     /// §5: `mirror_u` alone flips only `u`; `v` is copied verbatim.
