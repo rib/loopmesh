@@ -34,6 +34,7 @@ mod pointmerge;
 mod remove_doubles;
 mod split;
 mod subdivide_edges;
+mod symmetrize;
 mod weld_verts;
 
 pub use bisect_plane::{BisectParams, BisectResult};
@@ -57,3 +58,4 @@ pub use split::SplitResult;
 pub use subdivide_edges::{
     QuadCornerType, SubdivideGeom, SubdivideParams, SubdivideResult,
 };
+pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
