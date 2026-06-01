@@ -4522,6 +4522,20 @@ impl LoopMesh {
         self.remove_loop_slab_entry(loopi);
     }
 
+    /// Normalise to unit length, or return the all-zero vector when the
+    /// input is (near-)zero or contains a NaN. The test is on the squared
+    /// length against a threshold far below float epsilon, so any face with
+    /// measurable area normalises normally; only a genuinely degenerate
+    /// (zero-area) face takes the zero branch.
+    fn normalize_or_zero(v: Vec3) -> Vec3 {
+        let len_sq = v.dot(v);
+        if len_sq > 1.0e-35 {
+            v / len_sq.sqrt()
+        } else {
+            Vec3::ZERO
+        }
+    }
+
     fn calc_tri_cross(corners: [Vec3; 3]) -> Vec3 {
         let side0 = corners[0] - corners[1];
         let side1 = corners[1] - corners[2];
@@ -4529,7 +4543,7 @@ impl LoopMesh {
     }
 
     fn calc_tri_normal(corners: [Vec3; 3]) -> Vec3 {
-        LoopMesh::calc_tri_cross(corners).normalize()
+        LoopMesh::normalize_or_zero(LoopMesh::calc_tri_cross(corners))
     }
 
     fn calc_tri_area(corners: [Vec3; 3]) -> f32 {
@@ -4540,7 +4554,7 @@ impl LoopMesh {
         let diagonal0 = corners[0] - corners[2];
         let diagonal1 = corners[1] - corners[3];
         let cross = diagonal0.cross(diagonal1);
-        cross.normalize()
+        LoopMesh::normalize_or_zero(cross)
     }
 
     fn calc_quad_area(corners: [Vec3; 4]) -> f32 {
@@ -4586,7 +4600,7 @@ impl LoopMesh {
     }
 
     fn calc_poly_normal(corners: &[Vec3]) -> Vec3 {
-        LoopMesh::calc_poly_newell_normal_not_normalized(corners).normalize()
+        LoopMesh::normalize_or_zero(LoopMesh::calc_poly_newell_normal_not_normalized(corners))
     }
 
     fn calc_iter_newell_normal_not_normalized(mut corner_iter: impl Iterator<Item = Vec3>) -> Vec3 {
@@ -4622,7 +4636,7 @@ impl LoopMesh {
     }
 
     fn calc_iter_poly_normal(corner_iter: impl Iterator<Item = Vec3>) -> Vec3 {
-        LoopMesh::calc_iter_newell_normal_not_normalized(corner_iter).normalize()
+        LoopMesh::normalize_or_zero(LoopMesh::calc_iter_newell_normal_not_normalized(corner_iter))
     }
 
     fn calc_poly_area(corners: &[Vec3]) -> f32 {
@@ -4641,9 +4655,9 @@ impl LoopMesh {
     /// Compute (but do not store) the face's normal from its current loop
     /// positions. Uses Newell's method for non-triangle / non-quad faces
     /// so non-planar polygons get a reasonable result. The output is unit
-    /// length unless the face is fully degenerate (zero area), in which
-    /// case it falls back to a non-zero vector — callers must not divide
-    /// by it without checking.
+    /// length for a non-degenerate face; for a fully degenerate (zero-area)
+    /// face — collinear or coincident corners — the output is the all-zero
+    /// vector `(0, 0, 0)`, never a `NaN` or a fixed-axis fallback.
     pub fn face_compute_normal(&self, face: FaceKey) -> Vec3 {
         let (face_len, first_edge_loop) = {
             let face_data = self.faces.get(face);
@@ -5237,6 +5251,71 @@ fn test_calc_tri_quad_poly_normals() {
         .into_iter(),
     );
     assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+}
+
+#[test]
+fn test_normalize_or_zero_unit_and_degenerate() {
+    // Non-degenerate input normalises to unit length.
+    let n = LoopMesh::normalize_or_zero(Vec3::new(0.0, 0.0, 5.0));
+    assert_eq!(n, Vec3::new(0.0, 0.0, 1.0));
+
+    // True zero falls back to the all-zero vector, never NaN.
+    let n = LoopMesh::normalize_or_zero(Vec3::ZERO);
+    assert_eq!(n, Vec3::ZERO);
+
+    // A NaN component fails the `> 1.0e-35` test and takes the zero branch.
+    let n = LoopMesh::normalize_or_zero(Vec3::new(f32::NAN, 0.0, 0.0));
+    assert_eq!(n, Vec3::ZERO);
+}
+
+#[test]
+fn test_degenerate_tri_normal_is_zero() {
+    // Collinear corners -> zero-area triangle -> zero normal.
+    let normal = LoopMesh::calc_tri_normal([
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+    ]);
+    assert_eq!(normal, Vec3::ZERO);
+}
+
+#[test]
+fn test_degenerate_quad_normal_is_zero() {
+    // Parallel diagonals (both along X) -> zero diagonal cross -> zero normal,
+    // even though the quad's edges are non-zero.
+    let normal = LoopMesh::calc_quad_normal([
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(3.0, 0.0, 0.0),
+    ]);
+    assert_eq!(normal, Vec3::ZERO);
+
+    // Coincident-corner sliver quad (two pairs collapse) -> zero normal.
+    let normal = LoopMesh::calc_quad_normal([
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+    ]);
+    assert_eq!(normal, Vec3::ZERO);
+}
+
+#[test]
+fn test_degenerate_poly_normal_is_zero() {
+    // Collinear n-gon -> Newell accumulator is zero -> zero normal.
+    let corners = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(3.0, 0.0, 0.0),
+        Vec3::new(4.0, 0.0, 0.0),
+    ];
+    assert_eq!(LoopMesh::calc_poly_normal(&corners), Vec3::ZERO);
+    assert_eq!(
+        LoopMesh::calc_iter_poly_normal(corners.into_iter()),
+        Vec3::ZERO
+    );
 }
 
 fn create_face_from_verts(mesh: &mut LoopMesh, coords: &[Vec3]) -> FaceKey {
