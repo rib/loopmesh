@@ -8,6 +8,7 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod bisect_plane;
 mod collapse;
 mod connect_verts;
 mod delete;
@@ -35,6 +36,7 @@ mod split;
 mod subdivide_edges;
 mod weld_verts;
 
+pub use bisect_plane::{BisectParams, BisectResult};
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
