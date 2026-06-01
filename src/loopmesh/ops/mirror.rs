@@ -38,8 +38,9 @@ pub struct MirrorParams {
     /// plane is the coordinate plane through the origin perpendicular to `axis`.
     pub matrix: Mat4,
     /// The seam-weld tolerance. A clone welds onto its original iff the
-    /// original's mirror-space `axis` coordinate is within `merge_dist` of zero
-    /// (non-strict `<=`, §4).
+    /// original's raw world `axis` coordinate is within `merge_dist` of zero
+    /// (the world `axis = 0` plane; non-strict `<=`, §4). `matrix` does not
+    /// participate in this test.
     pub merge_dist: f32,
     /// Which mirror-space coordinate the reflection negates.
     pub axis: Axis,
@@ -102,8 +103,10 @@ impl LoopMesh {
 
         // Step 3 (§4) — build the seam weld map over the verts NAMED IN `geom`
         // (not the closure verts). A named vert whose original lies within
-        // `merge_dist` of the plane welds its clone onto it.
-        let weld_pairs = self.build_seam_weld_map(geom, &dup.vert_map, params.matrix, params.axis, params.merge_dist);
+        // `merge_dist` of the WORLD `axis = 0` plane welds its clone onto it.
+        // `matrix` is deliberately NOT passed: it owns the §3 reflection frame
+        // only, never the seam test (§4).
+        let weld_pairs = self.build_seam_weld_map(geom, &dup.vert_map, params.axis, params.merge_dist);
 
         // Step 4 (§5) — flip the cloned faces' UVs, after the verbatim CD copy
         // (done by the clone in step 1) and before the weld. The flip touches
@@ -195,15 +198,18 @@ impl LoopMesh {
     }
 
     /// §4 — the seam test: range over the verts named directly in `geom`, and
-    /// for each one whose original's mirror-space `axis` coordinate is within
-    /// `merge_dist` of the plane, emit a `(clone, original)` weld couple. The map
-    /// is naturally flat — every value is an original, never itself a key — so it
+    /// for each one whose original's raw world `axis` coordinate is within
+    /// `merge_dist` of the world `axis = 0` plane, emit a `(clone, original)`
+    /// weld couple. `matrix` is deliberately NOT consulted here — it owns the §3
+    /// reflection frame only; the seam test always reads the raw world
+    /// coordinate, so a shifted/rotated `matrix` reflects across the shifted
+    /// plane but still welds only verts on the world `axis = 0` plane. The map is
+    /// naturally flat — every value is an original, never itself a key — so it
     /// satisfies weld-verts' flat-map invariant.
     fn build_seam_weld_map(
         &self,
         geom: &[GeomKey],
         vert_map: &std::collections::HashMap<VertexKey, VertexKey>,
-        matrix: Mat4,
         axis: Axis,
         merge_dist: f32,
     ) -> Vec<(VertexKey, VertexKey)> {
@@ -217,9 +223,9 @@ impl LoopMesh {
             if !seen.insert(original) {
                 continue;
             }
-            let in_mirror = matrix.transform_point3(self.vertex_position(original));
+            let world = self.vertex_position(original);
             // Non-strict boundary (§4): a vert at exactly `merge_dist` welds.
-            if in_mirror[axis_index].abs() <= merge_dist {
+            if world[axis_index].abs() <= merge_dist {
                 if let Some(&clone) = vert_map.get(&original) {
                     // Guard against a degenerate `geom` that names an already-clone
                     // key: only weld a true original -> clone direction.
@@ -712,6 +718,66 @@ mod tests {
                 assert!((0.75..=0.90).contains(&u), "u flipped: {u}");
                 assert!((0.20..=0.25).contains(&v), "v unchanged: {v}");
             }
+        }
+        mesh.validate_topology();
+    }
+
+    /// §3 / §4 non-identity `matrix` (shifted mirror plane): a `matrix` that
+    /// reflects across the plane `x = 2` (off the origin), run on the offset
+    /// strip whose verts sit at x ∈ {1, 2, 3} — none on the world `x = 0` plane.
+    /// §3 reflects the clone across the shifted plane, but §4's seam test reads
+    /// the RAW WORLD `x` coordinate and welds only verts on world `x = 0`, so
+    /// nothing welds: the result is a fully disconnected reflected copy (counts
+    /// doubled). This pins that `matrix` reflects but the seam stays pinned to
+    /// world `axis = 0` — the bug being fixed transformed the tested coordinate
+    /// by `matrix`, which would have welded the x=2 verts across the shifted
+    /// plane and corrupted the result.
+    #[test]
+    fn shifted_matrix_reflects_but_welds_nothing() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = offset_strip(&mut mesh);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+
+        // Reflect across the world plane `x = 2`: translate so x=2 maps to the
+        // mirror-frame origin; the §3 negate-then-inverse then mirrors about x=2.
+        let mut params = default_params(0.0);
+        params.matrix = Mat4::from_translation(Vec3::new(-2.0, 0.0, 0.0));
+
+        let geom = all_geom(&verts, &faces);
+        let result = mesh.mirror(&geom, params);
+
+        // Seam test reads raw world x (none on x=0), so nothing welds: doubled.
+        assert_eq!(mesh.totvert(), 12, "no seam weld: full disjoint clone");
+        assert_eq!(mesh.totedge(), 14);
+        assert_eq!(mesh.totface(), 4);
+        assert_eq!(
+            result.geom_out.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count(),
+            6,
+            "every clone vert survives — the world `x = 0` seam test welds nothing"
+        );
+
+        // The clone reflected across x = 2: source x ∈ {1,2,3} maps to {3,2,1},
+        // i.e. the reflected shell lives at x ≥ 1, never at negative x — proof
+        // the shifted `matrix` (not the world plane) drove the reflection.
+        for &v in &mesh.vert_keys() {
+            assert!(
+                mesh.vertex_position(v).x >= 1.0 - 1e-6,
+                "reflection about x = 2 keeps everything at x >= 1"
+            );
+        }
+        // The two shells share no vert: the +x originals at x ∈ {1,2,3} and the
+        // clones reflected about x=2 are distinct keys with no welded seam.
+        let originals: HashSet<VertexKey> = verts.iter().copied().collect();
+        let clone_keys: Vec<VertexKey> = result
+            .geom_out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Vert(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        for c in &clone_keys {
+            assert!(!originals.contains(c), "clone keys are disjoint from originals");
         }
         mesh.validate_topology();
     }
