@@ -20,11 +20,12 @@ pub const DELIMIT_SEAM: u32 = 1 << 2;
 pub const DELIMIT_SHARP: u32 = 1 << 3;
 pub const DELIMIT_UV: u32 = 1 << 4;
 
-/// The subset of `delimit` bits this implementation honours (`NORMAL` | `UV`).
-/// A `delimit` value drawn entirely from this set runs; any other set bit
-/// (MATERIAL / SEAM / SHARP) declines via
+/// The subset of `delimit` bits this implementation honours. Every documented
+/// bit (`NORMAL` | `MATERIAL` | `SEAM` | `SHARP` | `UV`) is implemented; a
+/// `delimit` value with any *undocumented* bit set declines via
 /// [`DissolveLimitResult::Unsupported`].
-const DELIMIT_SUPPORTED: u32 = DELIMIT_NORMAL | DELIMIT_UV;
+const DELIMIT_SUPPORTED: u32 =
+    DELIMIT_NORMAL | DELIMIT_MATERIAL | DELIMIT_SEAM | DELIMIT_SHARP | DELIMIT_UV;
 
 /// Parameters controlling [`LoopMesh::dissolve_limit`].
 ///
@@ -33,11 +34,11 @@ const DELIMIT_SUPPORTED: u32 = DELIMIT_NORMAL | DELIMIT_UV;
 ///
 /// The core `delimit = 0` priority sweep — the §4 clamp, the §5 edge pass,
 /// the §6 heap-driven vert pass (with the §6.3 degeneracy guard), and the §7
-/// `use_dissolve_boundaries` linear sweep — is implemented, as is the §3
-/// `delimit`-flag filtering for the geometry-only bits `NORMAL` and `UV`
-/// (including the §3.1 zero-UV-layer auto-clear). The semantic bits
-/// `MATERIAL` / `SEAM` / `SHARP` are a deferred follow-up: a `delimit` value
-/// that sets any of them declines through [`DissolveLimitResult::Unsupported`]
+/// `use_dissolve_boundaries` linear sweep — is implemented, as is the full §3
+/// `delimit`-flag filtering for every documented bit: the geometry-only
+/// `NORMAL` / `UV` bits (including the §3.1 zero-UV-layer auto-clear) and the
+/// semantic `MATERIAL` / `SEAM` / `SHARP` bits. A `delimit` value with an
+/// *undocumented* bit set declines through [`DissolveLimitResult::Unsupported`]
 /// rather than silently producing a wrong result.
 #[derive(Clone, Copy)]
 pub struct DissolveLimitParams {
@@ -49,10 +50,10 @@ pub struct DissolveLimitParams {
     /// corner-angle gate (§6). When `true`, it becomes an unconditional linear
     /// sweep that collapses every still-edge-pair candidate with no angle test.
     pub use_dissolve_boundaries: bool,
-    /// Hard candidate filter (§3). The geometry-only bits `DELIMIT_NORMAL` and
-    /// `DELIMIT_UV` are honoured (any combination of them runs); a mask that
-    /// sets `DELIMIT_MATERIAL` / `DELIMIT_SEAM` / `DELIMIT_SHARP` declines via
-    /// [`DissolveLimitResult::Unsupported`].
+    /// Hard candidate filter (§3). Every documented bit is honoured (any
+    /// combination runs): `DELIMIT_NORMAL`, `DELIMIT_MATERIAL`, `DELIMIT_SEAM`,
+    /// `DELIMIT_SHARP`, and `DELIMIT_UV`. A mask with an undocumented bit set
+    /// declines via [`DissolveLimitResult::Unsupported`].
     pub delimit: u32,
 }
 
@@ -225,18 +226,19 @@ impl LoopMesh {
     /// - **§7** — with `use_dissolve_boundaries`, the vert pass is replaced by
     ///   an unconditional linear sweep with no heap, cost, or degeneracy test.
     ///
-    /// §3 `delimit` filtering is honoured for the geometry-only bits
+    /// §3 `delimit` filtering is honoured for every documented bit:
     /// `DELIMIT_NORMAL` (a non-contiguous edge — the two flanking faces wind
-    /// the same direction along the shared edge) and `DELIMIT_UV` (the edge is
-    /// a UV-island boundary — its per-loop UVs disagree across some Float2
-    /// loop layer), including the §3.1 zero-UV-layer auto-clear. A delimited
-    /// edge takes the `COST_INVALID` sentinel and is never popped (§3.2); a
-    /// vert touching a delimited manifold edge takes the un-modulated
-    /// corner-angle cost (§3.3).
+    /// the same direction along the shared edge), `DELIMIT_MATERIAL` (the two
+    /// flanking faces have different material indices), `DELIMIT_SEAM` (the
+    /// edge is seam-flagged), `DELIMIT_SHARP` (the edge is sharp / not smooth),
+    /// and `DELIMIT_UV` (the edge is a UV-island boundary — its per-loop UVs
+    /// disagree across some Float2 loop layer), including the §3.1
+    /// zero-UV-layer auto-clear. A delimited edge takes the `COST_INVALID`
+    /// sentinel and is never popped (§3.2); a vert touching a delimited
+    /// manifold edge takes the un-modulated corner-angle cost (§3.3).
     ///
     /// Returns the §1 `region.out` analogue: the surviving merge anchors. A
-    /// `delimit` value setting `DELIMIT_MATERIAL` / `DELIMIT_SEAM` /
-    /// `DELIMIT_SHARP` is **not** implemented this cycle and declines via
+    /// `delimit` value with an undocumented bit set declines via
     /// [`DissolveLimitResult::Unsupported`].
     pub fn dissolve_limit(
         &mut self,
@@ -244,8 +246,8 @@ impl LoopMesh {
         verts: &[VertexKey],
         params: &DissolveLimitParams,
     ) -> DissolveLimitResult {
-        // Only the geometry-only delimiter bits are implemented; any semantic
-        // bit (MATERIAL / SEAM / SHARP) declines rather than mis-filtering.
+        // Every documented delimiter bit is implemented; an undocumented bit
+        // declines rather than silently mis-filtering.
         if params.delimit & !DELIMIT_SUPPORTED != 0 {
             return DissolveLimitResult::Unsupported;
         }
@@ -816,16 +818,37 @@ impl LoopMesh {
     ///   two flanking faces' loops run the *same* direction along the shared
     ///   edge rather than opposite directions, i.e. one face is wound
     ///   inside-out relative to the other.
+    /// - `DELIMIT_MATERIAL` — the two faces flanking the edge have different
+    ///   material indices (§3 row / §8 worked example): `mat(f_a) != mat(f_b)`.
+    /// - `DELIMIT_SEAM` — the edge carries the seam flag (§3 row).
+    /// - `DELIMIT_SHARP` — the edge is *not* smooth, i.e. sharp (§3 row). The
+    ///   smooth state is the positive-presence one, so "sharp" is its negation;
+    ///   loopmesh stores this directly as the per-edge sharp flag.
     /// - `DELIMIT_UV` — the edge is a UV-island boundary: it is not loop-CD
     ///   contiguous across every Float2 loop layer (§3 row, §3.2). The bit is
     ///   only ever tested when at least one such layer exists (§3.1 auto-clear
     ///   strips it otherwise).
     ///
-    /// A non-manifold / boundary edge has no flanking pair and is not classed
-    /// as a delimiter here (the non-manifold case already yields `COST_INVALID`
-    /// independently, §5.1).
+    /// A non-manifold / boundary edge has no flanking pair, so the
+    /// face-relative bits (`NORMAL` / `MATERIAL` / `UV`) cannot fire on it; the
+    /// non-manifold case already yields `COST_INVALID` independently (§5.1). The
+    /// per-edge bits (`SEAM` / `SHARP`) read the edge's own flag and so apply
+    /// regardless of the flanking pair.
     fn dissolve_limit_edge_is_delimiter(&self, edge: EdgeKey, delimit: u32) -> bool {
         if delimit & DELIMIT_NORMAL != 0 && !self.dissolve_limit_edge_is_contiguous(edge) {
+            return true;
+        }
+        if delimit & DELIMIT_MATERIAL != 0 {
+            if let Some((face_a, face_b)) = self.dissolve_limit_edge_face_pair(edge) {
+                if self.face_material_index(face_a) != self.face_material_index(face_b) {
+                    return true;
+                }
+            }
+        }
+        if delimit & DELIMIT_SEAM != 0 && self.edge_seam(edge) {
+            return true;
+        }
+        if delimit & DELIMIT_SHARP != 0 && self.edge_sharp(edge) {
             return true;
         }
         if delimit & DELIMIT_UV != 0 && !self.dissolve_limit_edge_is_uv_contiguous(edge) {
@@ -1475,27 +1498,360 @@ mod tests {
     }
 
     #[test]
-    fn delimit_semantic_bit_declines() {
-        // §3 deferral — MATERIAL / SEAM / SHARP filtering is not implemented;
-        // a mask setting any of them declines cleanly without touching the
-        // mesh. The geometry-only NORMAL / UV bits are honoured (tested
-        // separately), so only a semantic bit should decline.
+    fn delimit_undocumented_bit_declines() {
+        // §3 — every documented bit (NORMAL / MATERIAL / SEAM / SHARP / UV) is
+        // implemented; only an *undocumented* bit declines cleanly without
+        // touching the mesh.
         let mut mesh = LoopMesh::new();
         let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 2);
         let v0 = mesh.totvert();
         let e0 = mesh.totedge();
         let f0 = mesh.totface();
-        for delimit in [DELIMIT_MATERIAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_NORMAL | DELIMIT_SEAM]
+        let undocumented = 1u32 << 5;
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: undocumented,
+        };
+        let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
+        assert_eq!(result, DissolveLimitResult::Unsupported);
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        mesh.validate_topology();
+    }
+
+    /// Two coplanar contiguous quads sharing the single interior edge of a
+    /// 2-quad strip (the `b[1]–t[1]` seam). Returns `(mesh, shared_edge,
+    /// face_a, face_b)`. The seam is contiguous and coplanar, so at
+    /// `delimit = 0` and `angle_limit = π/2` the edge pass merges the pair into
+    /// one face — the baseline every semantic-bit test contrasts against.
+    fn build_coplanar_pair() -> (LoopMesh, EdgeKey, FaceKey, FaceKey) {
+        let mut mesh = LoopMesh::new();
+        let (_verts, edges, _interior_verts) = build_coplanar_strip(&mut mesh, 2);
+        let shared = edges[0];
+        let faces = mesh.face_keys();
+        (mesh, shared, faces[0], faces[1])
+    }
+
+    #[test]
+    fn delimit_material_blocks_material_boundary_edge() {
+        // §3 MATERIAL row / §8 worked example — a coplanar edge between two
+        // faces of *different* material indices is delimited and survives with
+        // DELIMIT_MATERIAL set; at delimit = 0 the same edge dissolves.
+
+        // delimit = 0: matching-or-ignored materials ⇒ the edge dissolves.
+        let (mut mesh, shared, face_a, face_b) = build_coplanar_pair();
+        mesh.set_face_material_index(face_a, 0);
+        mesh.set_face_material_index(face_b, 1);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "without MATERIAL the boundary edge dissolves");
+        mesh.validate_topology();
+
+        // DELIMIT_MATERIAL with mismatched indices: the boundary edge survives.
+        let (mut mesh, shared, face_a, face_b) = build_coplanar_pair();
+        mesh.set_face_material_index(face_a, 0);
+        mesh.set_face_material_index(face_b, 1);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_MATERIAL,
+        };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "DELIMIT_MATERIAL preserves the material boundary");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+
+        // DELIMIT_MATERIAL with matching indices: not a boundary, dissolves.
+        let (mut mesh, shared, face_a, face_b) = build_coplanar_pair();
+        mesh.set_face_material_index(face_a, 2);
+        mesh.set_face_material_index(face_b, 2);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_MATERIAL,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "matching materials are not a boundary; edge dissolves");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn delimit_seam_blocks_seam_flagged_edge() {
+        // §3 SEAM row — a seam-flagged edge is delimited and survives with
+        // DELIMIT_SEAM set; without the bit the seam flag is inert and the
+        // coplanar edge dissolves.
+
+        // delimit = 0: the seam flag is ignored, the edge dissolves.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        mesh.set_edge_seam(shared, true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "without SEAM the flag is inert; edge dissolves");
+        mesh.validate_topology();
+
+        // DELIMIT_SEAM with the flag set: the edge survives.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        mesh.set_edge_seam(shared, true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SEAM,
+        };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "DELIMIT_SEAM preserves the seam-flagged edge");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+
+        // DELIMIT_SEAM with no flag set: not a delimiter, dissolves.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SEAM,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "an un-flagged edge is not a seam; it dissolves");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn delimit_sharp_blocks_sharp_flagged_edge() {
+        // §3 SHARP row — sharp = non-smooth. A sharp-flagged edge is delimited
+        // and survives with DELIMIT_SHARP set; without the bit the sharp flag
+        // is inert and the coplanar edge dissolves.
+
+        // delimit = 0: the sharp flag is ignored, the edge dissolves.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        mesh.set_edge_sharp(shared, true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "without SHARP the flag is inert; edge dissolves");
+        mesh.validate_topology();
+
+        // DELIMIT_SHARP with the flag set (non-smooth): the edge survives.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        mesh.set_edge_sharp(shared, true);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SHARP,
+        };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "DELIMIT_SHARP preserves the sharp (non-smooth) edge");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+
+        // DELIMIT_SHARP with a smooth edge (default): not a delimiter,
+        // dissolves. The smooth state is the positive-presence one.
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SHARP,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "a smooth edge is not sharp; it dissolves");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn delimit_seam_or_material_blocks_either_boundary() {
+        // §8 "delimit = SEAM | MATERIAL | SHARP simultaneously" — the OR
+        // composition delimits the union: an edge that is SEAM-flagged *or* a
+        // material boundary is blocked. Here the shared edge is both at once,
+        // and the combined mask preserves it.
+        let (mut mesh, shared, face_a, face_b) = build_coplanar_pair();
+        mesh.set_edge_seam(shared, true);
+        mesh.set_face_material_index(face_a, 0);
+        mesh.set_face_material_index(face_b, 1);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SEAM | DELIMIT_MATERIAL,
+        };
+        assert!(matches!(
+            mesh.dissolve_limit(&[shared], &[], &params),
+            DissolveLimitResult::Ran { region_out } if region_out.is_empty()
+        ));
+        assert_eq!(mesh.totface(), 2, "SEAM | MATERIAL preserves the doubly-delimited edge");
+        assert!(mesh.edges.try_get(shared).is_some());
+        mesh.validate_topology();
+
+        // The OR fires even when only *one* condition holds: a material
+        // boundary with no seam flag is still blocked by the combined mask.
+        let (mut mesh, shared, face_a, face_b) = build_coplanar_pair();
+        mesh.set_face_material_index(face_a, 0);
+        mesh.set_face_material_index(face_b, 1);
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SEAM | DELIMIT_MATERIAL,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 2, "the OR blocks on the material boundary alone");
+        mesh.validate_topology();
+
+        // And neither condition holding ⇒ the edge dissolves under the same
+        // combined mask (confirms the mask's effect is the conditions).
+        let (mut mesh, shared, _a, _b) = build_coplanar_pair();
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: DELIMIT_SEAM | DELIMIT_MATERIAL,
+        };
+        mesh.dissolve_limit(&[shared], &[], &params);
+        assert_eq!(mesh.totface(), 1, "no seam and matching materials ⇒ edge dissolves");
+        mesh.validate_topology();
+    }
+
+    /// Two quads sharing a seam `s0 – v – s1` (two consecutive seam edges per
+    /// face), gently folded about the seam. The middle seam vert `v` is an
+    /// edge-pair vert whose two incident seam edges are both manifold (each
+    /// flanks faces A and B). `v` is kinked off the `s0 – s1` line so its
+    /// corner angle is a non-trivial ~43.6°, while the inter-face fold is a
+    /// *shallow* ~39.8° dihedral.
+    ///
+    /// This split between a large corner angle and a small dihedral is what
+    /// makes the §3.3 carve-out observable in the *outcome* (not just the
+    /// cost): the §6.1 modulated form `corner · dihedral / (π/2)` shrinks the
+    /// cost well below the gate (the shallow dihedral discounts it), so a
+    /// *non-delimiter* `v` collapses; the §3.3 *un-modulated* form is the raw
+    /// corner angle, above the gate, so a *delimiter* `v` survives. Returns
+    /// `(mesh, v, seam_edge_a, seam_edge_b)`.
+    fn build_folded_seam_with_kinked_vert() -> (LoopMesh, VertexKey, EdgeKey, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        // Seam s0 – v – s1 runs along +Y; `v` kinked toward +X by 0.4.
+        let s0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v = mesh.create_vertex(Vec3::new(0.4, 1.0, 0.0));
+        let s1 = mesh.create_vertex(Vec3::new(0.0, 2.0, 0.0));
+        // Left wing (face A), flat in the z = 0 plane.
+        let wing_a = mesh.create_vertex(Vec3::new(-1.5, 1.0, 0.0));
+        // Right wing (face B), lifted in +Z to a shallow ~40° fold about the seam.
+        let wing_b = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.5));
+
+        let e_s0v = mesh.create_edge([s0, v], EdgeCreateFlags::NO_DUPLICATE);
+        let e_vs1 = mesh.create_edge([v, s1], EdgeCreateFlags::NO_DUPLICATE);
+        let e_s1wa = mesh.create_edge([s1, wing_a], EdgeCreateFlags::NO_DUPLICATE);
+        let e_was0 = mesh.create_edge([wing_a, s0], EdgeCreateFlags::NO_DUPLICATE);
+        // Face A loop: s0 -> v -> s1 -> wing_a (seam half-edges s0-v, v-s1).
+        mesh.face_create(
+            &[s0, v, s1, wing_a],
+            &[e_s0v, e_vs1, e_s1wa, e_was0],
+            FaceCreateFlags::NONE,
+        );
+        // Face B loop: s1 -> v -> s0 -> wing_b, reusing the two seam edges so
+        // each seam edge is manifold (flanked by A and B).
+        let e_s0wb = mesh.create_edge([s0, wing_b], EdgeCreateFlags::NO_DUPLICATE);
+        let e_wbs1 = mesh.create_edge([wing_b, s1], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.face_create(
+            &[s1, v, s0, wing_b],
+            &[e_vs1, e_s0v, e_s0wb, e_wbs1],
+            FaceCreateFlags::NONE,
+        );
+        mesh.calc_face_normals();
+        (mesh, v, e_s0v, e_vs1)
+    }
+
+    #[test]
+    fn delimit_sharp_vert_takes_unmodulated_corner_cost() {
+        // §3.3 / §6.1 — vert-pass transitivity through a *semantic* delimiter.
+        //
+        // `v` is an edge-pair vert whose two seam edges are manifold; the
+        // build gives it a large corner angle (~43.6°, raw cost ~0.761) but a
+        // shallow inter-face fold (~39.8° dihedral). With angle_limit = 40°
+        // (~0.698 rad) the two §6.1 cost forms land on opposite sides of the
+        // gate:
+        //   • non-delimiter (delimit = 0): modulated cost
+        //     corner·dihedral/(π/2) ≈ 0.337 < 0.698  ⇒  v COLLAPSES.
+        //   • delimiter (DELIMIT_SHARP on a seam edge): the §3.3 un-modulated
+        //     corner angle ≈ 0.761 ≥ 0.698  ⇒  v SURVIVES.
+        // The delimiter makes v *more conservative* — it forgoes the
+        // shallow-dihedral discount the modulated form grants, which is the
+        // §3.3 carve-out: a vert on a delimiter still dissolves if its own
+        // corner is shallow, but it does not borrow the dihedral modulation.
+        let angle_limit = 40.0_f32.to_radians();
+
+        // First pin the §6.1 cost forms directly (the mechanism), so the
+        // outcome assertions below are anchored to the documented carve-out and
+        // not to incidental geometry.
         {
-            let params = DissolveLimitParams {
-                angle_limit: FRAC_PI_2,
-                use_dissolve_boundaries: false,
-                delimit,
-            };
-            let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
-            assert_eq!(result, DissolveLimitResult::Unsupported, "delimit {delimit:#x}");
-            assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+            let (mut mesh, v, seam_a, _seam_b) = build_folded_seam_with_kinked_vert();
+            let modulated = mesh.dissolve_limit_vert_cost(v, 0);
+            assert!(
+                modulated < angle_limit,
+                "non-delimiter vert takes the modulated form, discounted below the gate \
+                 (cost {modulated}, limit {angle_limit})"
+            );
+            mesh.set_edge_sharp(seam_a, true);
+            let unmodulated = mesh.dissolve_limit_vert_cost(v, super::DELIMIT_SHARP);
+            assert!(
+                unmodulated >= angle_limit,
+                "§3.3 delimiter vert takes the un-modulated corner angle, above the gate \
+                 (cost {unmodulated}, limit {angle_limit})"
+            );
+            // The collapse is geometrically clean (gentle fold), so the §6.3
+            // degeneracy guard does not interfere with either outcome.
+            assert!(
+                !mesh.dissolve_limit_vert_collapse_is_degenerate(v),
+                "the gentle fold keeps the collapse non-degenerate"
+            );
         }
+
+        // delimit = 0: the modulated cost pops v; the vert pass collapses it.
+        let (mut mesh, v, _seam_a, _seam_b) = build_folded_seam_with_kinked_vert();
+        let v0 = mesh.totvert();
+        let params = DissolveLimitParams {
+            angle_limit,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        let result = mesh.dissolve_limit(&[], &[v], &params);
+        assert!(matches!(result, DissolveLimitResult::Ran { .. }));
+        assert!(
+            mesh.vertices.try_get(v).is_none(),
+            "without a delimiter the modulated cost dissolves the seam vert"
+        );
+        assert_eq!(mesh.totvert(), v0 - 1, "exactly the one seam vert collapses");
+        mesh.validate_topology();
+
+        // DELIMIT_SHARP with a sharp-flagged seam edge: v is a §3.3 delimiter
+        // vert, takes the un-modulated corner cost (above the gate), survives.
+        let (mut mesh, v, seam_a, _seam_b) = build_folded_seam_with_kinked_vert();
+        mesh.set_edge_sharp(seam_a, true);
+        let v0 = mesh.totvert();
+        let params = DissolveLimitParams {
+            angle_limit,
+            use_dissolve_boundaries: false,
+            delimit: super::DELIMIT_SHARP,
+        };
+        let result = mesh.dissolve_limit(&[], &[v], &params);
+        assert!(matches!(result, DissolveLimitResult::Ran { .. }));
+        assert!(
+            mesh.vertices.try_get(v).is_some(),
+            "the §3.3 delimiter vert forgoes the dihedral discount and survives"
+        );
+        assert_eq!(mesh.totvert(), v0, "no collapse: the delimiter vert is preserved");
         mesh.validate_topology();
     }
 
