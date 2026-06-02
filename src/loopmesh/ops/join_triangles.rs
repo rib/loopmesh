@@ -154,6 +154,12 @@ struct DelimitConfig {
     /// check needs no descriptor scan. `None` when `cmp_seam` is off or no seam
     /// layer exists — in the latter case every edge reads as "no seam".
     seam_layer: Option<crate::loopmesh::ElementAttributeKey>,
+    /// The resolved per-edge `sharp` layer key consulted by the §4.1 `cmp_sharp`
+    /// gate, resolved once per run (mirroring `seam_layer`) so the per-edge check
+    /// needs no descriptor scan. `None` when `cmp_sharp` is off or no sharp layer
+    /// exists — in the latter case every edge reads as **smooth** (not sharp), so
+    /// the gate does not fire by default.
+    sharp_layer: Option<crate::loopmesh::ElementAttributeKey>,
 }
 
 /// The per-face attribute layer name carrying each face's material index, the
@@ -171,6 +177,24 @@ pub const MATERIAL_INDEX_ATTRIBUTE: &str = "material_index";
 /// for persistent edge state such as seams is the one endorsed in
 /// `radial-mesh-guides/BMESH.md` §6; see `JOIN_TRIANGLES.md` §4.1.
 pub const SEAM_ATTRIBUTE: &str = "seam";
+
+/// The per-edge attribute layer name carrying each edge's sharp (non-smooth)
+/// flag, the convention the §4.1 `cmp_sharp` gate reads. Stored as a
+/// single-component `I32` numeric layer (mirroring [`SEAM_ATTRIBUTE`]): a
+/// non-zero value means "this edge is sharp" (the smooth shading hint is
+/// cleared), and an edge with no stored value (or no layer at all) is **smooth**
+/// — i.e. not sharp.
+///
+/// Note the polarity, pinned by `radial-mesh-guides/operators/JOIN_TRIANGLES.md`
+/// §4.1 and `radial-mesh-guides/BMESH.md` §6: an edge is "sharp" precisely when
+/// it is *not smooth*, and the default state of an edge is **smooth**. The
+/// per-domain boolean-attribute model that endorses representing shading
+/// sharpness as a `sharp_edge` attribute (rather than a smooth header bit) is the
+/// one described in `BMESH.md` §6. Because the default reads as not-sharp, an
+/// unset/default edge never blocks the merge under `cmp_sharp` — the same net
+/// "default does not block" effect [`SEAM_ATTRIBUTE`] has, despite the inverted
+/// meaning of the stored bit.
+pub const SHARP_ATTRIBUTE: &str = "sharp";
 
 impl LoopMesh {
     /// Whether `edge` carries the seam flag, or the default `false` when no
@@ -205,6 +229,43 @@ impl LoopMesh {
         };
         self.edge_attribs_mut()
             .set_i32(layer, edge.as_usize(), seam as i32);
+    }
+
+    /// Whether `edge` is **sharp** (the smooth shading hint is cleared), or the
+    /// default `false` (smooth) when no per-edge sharp layer exists or the edge
+    /// has no stored value.
+    ///
+    /// The sharp flag is a per-edge attribute under the [`SHARP_ATTRIBUTE`]
+    /// convention; the §4.1 `cmp_sharp` gate of [`LoopMesh::join_triangles`]
+    /// rejects an edge that is sharp (not smooth). The default state of an edge
+    /// is smooth, so an unset edge reads as not-sharp and never blocks the merge.
+    pub fn edge_sharp(&self, edge: EdgeKey) -> bool {
+        let attribs = self.edge_attribs();
+        match attribs.find(&AttributeKey::custom(SHARP_ATTRIBUTE)) {
+            Some(layer) => attribs.get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            None => false,
+        }
+    }
+
+    /// Set `edge`'s sharp flag under the [`SHARP_ATTRIBUTE`] convention,
+    /// registering the per-edge `I32` layer on first use. Setting `true` marks
+    /// the edge sharp (not smooth); setting `false` marks it smooth.
+    ///
+    /// Idempotent in the layer: repeated calls reuse the single registered
+    /// layer. Edges never assigned a value keep the default `false` (smooth).
+    pub fn set_edge_sharp(&mut self, edge: EdgeKey, sharp: bool) {
+        let key = AttributeKey::custom(SHARP_ATTRIBUTE);
+        let layer = match self.edge_attribs().find(&key) {
+            Some(layer) => layer,
+            None => self
+                .register_edge_attribute(ElementAttributeDesc::numeric(
+                    key,
+                    Format::new(ComponentType::I32, 1),
+                ))
+                .expect("I32x1 is a supported edge attribute format"),
+        };
+        self.edge_attribs_mut()
+            .set_i32(layer, edge.as_usize(), sharp as i32);
     }
 
     /// The material index assigned to `face`, or the default `0` when no
@@ -264,10 +325,10 @@ impl LoopMesh {
     /// material attribute layer ([`LoopMesh::face_material_index`] /
     /// [`LoopMesh::set_face_material_index`]). The §4.1 seam gate reads the
     /// per-edge seam attribute layer ([`LoopMesh::edge_seam`] /
-    /// [`LoopMesh::set_edge_seam`]). The §4.1 sharp gate reads per-edge
-    /// smooth-header state loopmesh does not yet expose; its accessor
-    /// ([`LoopMesh::join_triangles_edge_is_sharp`]) currently reports "smooth",
-    /// so the `cmp_sharp` gate never fires until that state lands.
+    /// [`LoopMesh::set_edge_seam`]). The §4.1 sharp gate reads the per-edge sharp
+    /// attribute layer ([`LoopMesh::edge_sharp`] / [`LoopMesh::set_edge_sharp`]);
+    /// an edge is sharp when it is *not smooth*, and the default state is smooth,
+    /// so an unset edge never blocks the merge.
     ///
     /// - **§6** — when `topology_influence` is non-zero, pre-existing input
     ///   quads (§6.1) and each freshly-merged quad (§6.2) discount their
@@ -470,6 +531,12 @@ impl LoopMesh {
             None
         };
 
+        let sharp_layer = if params.cmp_sharp {
+            self.edge_attribs().find(&AttributeKey::custom(SHARP_ATTRIBUTE))
+        } else {
+            None
+        };
+
         DelimitConfig {
             cmp_seam: params.cmp_seam,
             cmp_sharp: params.cmp_sharp,
@@ -482,6 +549,7 @@ impl LoopMesh {
             vcol_layers,
             material_layer,
             seam_layer,
+            sharp_layer,
         }
     }
 
@@ -546,7 +614,7 @@ impl LoopMesh {
         if delimit.cmp_seam && self.join_triangles_edge_is_seam_cached(delimit.seam_layer, edge) {
             return true;
         }
-        if delimit.cmp_sharp && self.join_triangles_edge_is_sharp(edge) {
+        if delimit.cmp_sharp && self.join_triangles_edge_is_sharp_cached(delimit.sharp_layer, edge) {
             return true;
         }
         if delimit.cmp_materials
@@ -700,11 +768,23 @@ impl LoopMesh {
         }
     }
 
-    /// §4.1 — whether `edge` is sharp (the smooth bit cleared). loopmesh has no
-    /// per-edge smooth header today, so this always reports "smooth" (not
-    /// sharp); the `cmp_sharp` gate never fires until that state lands.
-    fn join_triangles_edge_is_sharp(&self, _edge: EdgeKey) -> bool {
-        false
+    /// §4.1 — whether `edge` is sharp (the smooth bit cleared), read through the
+    /// layer key resolved once per run in [`Self::join_triangles_build_delimit`].
+    /// A `None` key (no sharp layer registered) or an edge with no stored value
+    /// reports the default `false` (smooth), so the `cmp_sharp` gate only fires
+    /// on a genuinely sharp edge and never blocks the merge by default. This is
+    /// the hot-path equivalent of the public [`LoopMesh::edge_sharp`], avoiding
+    /// the per-call descriptor scan and `AttributeKey` allocation that accessor
+    /// performs.
+    fn join_triangles_edge_is_sharp_cached(
+        &self,
+        sharp_layer: Option<crate::loopmesh::ElementAttributeKey>,
+        edge: EdgeKey,
+    ) -> bool {
+        match sharp_layer {
+            Some(layer) => self.edge_attribs().get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            None => false,
+        }
     }
 
     /// §4.1 — the face's material index, read through the layer key resolved
@@ -1363,6 +1443,102 @@ mod tests {
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "seam ignored when gate is off");
+        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_len(result.joined[0]), 4);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn edge_sharp_round_trips_with_default_false() {
+        let mut mesh = LoopMesh::new();
+        let (_lower, _upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        let perimeter = mesh
+            .query_edge_exists(verts[0], verts[1])
+            .expect("perimeter edge 0-1 exists");
+
+        // The default state of an edge is smooth, i.e. not sharp (no layer
+        // registered yet). Polarity check: default reads as not-sharp.
+        assert!(!mesh.edge_sharp(diagonal));
+        assert!(!mesh.edge_sharp(perimeter));
+
+        mesh.set_edge_sharp(diagonal, true);
+        // The second assignment reuses the registered layer (idempotent layer).
+        mesh.set_edge_sharp(perimeter, false);
+
+        assert!(mesh.edge_sharp(diagonal));
+        assert!(!mesh.edge_sharp(perimeter), "explicit false reads as smooth");
+
+        // Clearing a previously-set sharp edge round-trips back to smooth.
+        mesh.set_edge_sharp(diagonal, false);
+        assert!(!mesh.edge_sharp(diagonal));
+    }
+
+    #[test]
+    fn cmp_sharp_blocks_merge_across_sharp_edge() {
+        // §4.1 — a sharp (non-smooth) shared edge must not be merged across when
+        // `cmp_sharp` is enabled.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        mesh.set_edge_sharp(diagonal, true);
+
+        let result = mesh.join_triangles(
+            &[lower, upper],
+            JoinTrianglesParams {
+                cmp_sharp: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.joined.is_empty(), "the sharp edge blocks the merge");
+        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_len(lower), 3);
+        assert_eq!(mesh.face_len(upper), 3);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn cmp_sharp_allows_merge_when_smooth() {
+        // With `cmp_sharp` on, a smooth edge (unset → default smooth, or
+        // explicit false) merges exactly as the no-sharp case does. The default
+        // (unset) path is the parity subtlety: a default edge is smooth, not
+        // sharp, so the gate must not block it.
+        for assign_smooth in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+            if assign_smooth {
+                let diagonal = shared_diagonal(&mesh, verts);
+                mesh.set_edge_sharp(diagonal, false);
+            }
+
+            let result = mesh.join_triangles(
+                &[lower, upper],
+                JoinTrianglesParams {
+                    cmp_sharp: true,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(result.joined.len(), 1, "smooth merges (assigned={assign_smooth})");
+            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_len(result.joined[0]), 4);
+            mesh.validate_topology();
+        }
+    }
+
+    #[test]
+    fn cmp_sharp_false_ignores_sharp_flag() {
+        // The default path: with `cmp_sharp` off, a sharp-flagged edge is
+        // irrelevant and the pair merges exactly as the smooth case does.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        mesh.set_edge_sharp(diagonal, true);
+
+        let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
+
+        assert_eq!(result.joined.len(), 1, "sharp ignored when gate is off");
         assert_eq!(mesh.totface(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
