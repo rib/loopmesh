@@ -11,6 +11,21 @@ use crate::triangulate::axis_dominant_basis_negated;
 /// (CONNECT_VERTS_NONPLANAR.md §3.1).
 const DEGENERATE_NORMAL_LEN_SQ: f32 = 1e-12;
 
+/// The captured output buffers of [`LoopMesh::connect_verts_nonplanar_capture`]
+/// (CONNECT_VERTS_NONPLANAR.md §1). Both are sets; enumeration order is not
+/// observable for parity (§1, §6).
+#[derive(Debug, Clone, Default)]
+pub struct ConnectVertsNonplanarOut {
+    /// `edges.out` — the new diagonal edges the operator cut, one per committed
+    /// split (§3.4).
+    pub edges: Vec<EdgeKey>,
+    /// `faces.out` — every face the operator touched: for each committed split,
+    /// both the surviving input-face handle and the newly created face are
+    /// flagged. A face split several times by the recursion appears once
+    /// (re-flagging is idempotent) and every leaf piece is present (§1, §3.4).
+    pub faces: Vec<FaceKey>,
+}
+
 impl LoopMesh {
     /// Cut every non-planar face in `faces` along the diagonal that flattens it
     /// best, recursing on each half until every piece is flat within
@@ -42,11 +57,33 @@ impl LoopMesh {
     /// `edges.out` buffer (CONNECT_VERTS_NONPLANAR.md §1) — the new diagonal
     /// edges the operator cut, one per committed split. The buffer is a set;
     /// enumeration order is not observable for parity (§1, §6).
+    ///
+    /// This is the `edges.out`-only projection of
+    /// [`Self::connect_verts_nonplanar_capture`], kept as a stable contract;
+    /// call the capturing form when `faces.out` is also wanted.
     pub fn connect_verts_nonplanar_out(
         &mut self,
         faces: &[FaceKey],
         angle_limit: f32,
     ) -> Vec<EdgeKey> {
+        self.connect_verts_nonplanar_capture(faces, angle_limit).edges
+    }
+
+    /// Capturing form returning both output buffers of
+    /// connect-verts-nonplanar (CONNECT_VERTS_NONPLANAR.md §1):
+    ///
+    /// - `edges.out` — the new diagonal edges, one per committed split (§3.4).
+    /// - `faces.out` — every touched face: for each committed split both the
+    ///   surviving input-face handle and the newly created half are flagged, so
+    ///   a face cut several times by the recursion appears once (re-flagging is
+    ///   idempotent) and every leaf piece is present (§1, §3.4).
+    ///
+    /// Both are sets; enumeration order is not observable for parity (§1, §6).
+    pub fn connect_verts_nonplanar_capture(
+        &mut self,
+        faces: &[FaceKey],
+        angle_limit: f32,
+    ) -> ConnectVertsNonplanarOut {
         let angle_limit_cos = angle_limit.cos();
 
         // §3 — LIFO work stack, seeded with the n-gon inputs only.
@@ -57,6 +94,9 @@ impl LoopMesh {
             .collect();
 
         let mut cut_diagonals: HashSet<EdgeKey> = HashSet::new();
+        // Dedup keeps faces.out idempotent (§1): a face split several times by
+        // the recursion is re-flagged on each cut but appears once.
+        let mut touched_faces: HashSet<FaceKey> = HashSet::new();
         while let Some(face) = work_stack.pop() {
             let Some((kept_half, new_half, new_edge)) =
                 self.split_by_best_fold(face, angle_limit_cos)
@@ -64,6 +104,11 @@ impl LoopMesh {
                 continue; // flat enough (or no legal diagonal): a leaf.
             };
             cut_diagonals.insert(new_edge);
+            // §3.4 — flag both the surviving handle and the new half. Leaf
+            // pieces are present because the half that does not recurse is
+            // flagged here and never popped again.
+            touched_faces.insert(kept_half);
+            touched_faces.insert(new_half);
             for half in [kept_half, new_half] {
                 if self.face_len(half) > 3 {
                     work_stack.push(half);
@@ -71,7 +116,10 @@ impl LoopMesh {
             }
         }
 
-        cut_diagonals.into_iter().collect()
+        ConnectVertsNonplanarOut {
+            edges: cut_diagonals.into_iter().collect(),
+            faces: touched_faces.into_iter().collect(),
+        }
     }
 
     /// §3.4 — find the flattest-halves legal diagonal of `face` and cut it iff
@@ -339,6 +387,62 @@ mod tests {
         for f in mesh.face_keys() {
             assert!(mesh.face_len(f) >= 3);
         }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn folded_quad_faces_out_contains_both_triangles() {
+        // §1 / §5.2 — one committed cut flags the surviving input-face handle
+        // and the new half: faces.out is exactly the two resulting triangles.
+        let mut mesh = LoopMesh::new();
+        let (face, _) = folded_quad(&mut mesh, 0.8);
+
+        let out = mesh.connect_verts_nonplanar_capture(&[face], ANGLE_TIGHT);
+
+        assert_eq!(out.edges.len(), 1, "one diagonal cut");
+        assert_eq!(out.faces.len(), 2, "both resulting triangles flagged");
+        // The surviving handle is the original face; the other is the new half.
+        assert!(out.faces.contains(&face), "surviving input handle flagged");
+        let all_faces: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        for &f in &out.faces {
+            assert!(all_faces.contains(&f), "faces.out entry is a live face");
+            assert_eq!(mesh.face_len(f), 3, "each flagged leaf is a triangle");
+        }
+        // No-op edges.out projection still matches the historical contract.
+        assert_eq!(
+            mesh.connect_verts_nonplanar_out(&[], ANGLE_TIGHT).len(),
+            0,
+            "empty input is a no-op"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn faces_out_dedup_idempotent_on_recursion() {
+        // §1 — a face split several times appears once. On a recursive multi-cut
+        // pentagon, faces.out holds (p-1) surviving handles + (p-1) new halves
+        // deduped to exactly p leaf pieces — re-flagging a re-split handle does
+        // not double-count it.
+        let mut mesh = LoopMesh::new();
+        let (face, _) = nonplanar_pentagon(&mut mesh, 1.0);
+
+        let out = mesh.connect_verts_nonplanar_capture(&[face], ANGLE_TIGHT);
+
+        let piece_count = mesh.totface();
+        assert!(piece_count >= 3, "the ridge drives recursion past one cut");
+        // Every leaf piece is present and the set is deduped: |faces.out| == p,
+        // strictly greater than the (p-1) new-half count alone — proving the
+        // re-split surviving handles were flagged and merged idempotently.
+        assert_eq!(out.faces.len(), piece_count, "faces.out == p leaf pieces");
+        assert_eq!(out.edges.len(), piece_count - 1, "p-1 diagonals");
+        assert!(
+            out.faces.len() > out.edges.len(),
+            "faces.out exceeds the leaf-only / edge count"
+        );
+        let unique: std::collections::HashSet<FaceKey> = out.faces.iter().copied().collect();
+        assert_eq!(unique.len(), out.faces.len(), "faces.out carries no duplicates");
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert_eq!(unique, live, "faces.out is exactly the live leaf set");
         mesh.validate_topology();
     }
 

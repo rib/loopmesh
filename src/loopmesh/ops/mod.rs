@@ -47,6 +47,7 @@ mod weld_verts;
 
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
+pub use connect_verts_nonplanar::ConnectVertsNonplanarOut;
 pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};

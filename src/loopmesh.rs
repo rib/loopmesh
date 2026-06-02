@@ -70,6 +70,7 @@ pub use mid::EdgeCollapseFlags;
 pub use ops::{
     BisectGeom, BisectParams, BisectResult,
     BridgeLoopsParams, BridgeLoopsResult,
+    ConnectVertsNonplanarOut,
     CenterMode, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
     DissolveVertsParams, DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams,
