@@ -699,76 +699,198 @@ impl LoopMesh {
         // two-pass scratch-buffer structure (§8 step 6) preserves: positions
         // are not written back until every factor has been measured.
         if params.depth != 0.0 {
-            // Collect the set of tagged-region vertex identities. After
-            // Phase 5, the inset boundary lives on the tagged-side verts
-            // recorded in `endpoint_tagged_v`. Interior tagged verts (with
-            // no seam edge incident) currently fall through unchanged — the
-            // BFS-relaxation fallback for their seam-length average
-            // (INSET.md §8.1) is not yet implemented.
-            let mut tagged_verts: std::collections::HashSet<VertexKey> =
-                std::collections::HashSet::new();
-            for &v in endpoint_tagged_v.values() {
-                tagged_verts.insert(v);
-            }
-
-            // Shell normal per tagged vertex: sum the face normals of every
-            // seam loop now incident to the vertex on the tagged side, then
-            // normalize.
-            let mut shell_normal: HashMap<VertexKey, Vec3> = HashMap::new();
-            let mut seam_len_sum: HashMap<VertexKey, (f32, u32)> = HashMap::new();
-            for (i, s) in split_edges.iter().enumerate() {
-                // Tagged-side endpoint identities for this seam edge.
-                let v0 = endpoint_tagged_v.get(&(i, 0)).copied().unwrap_or(s.v0);
-                let v1 = endpoint_tagged_v.get(&(i, 1)).copied().unwrap_or(s.v1);
-                let n = self.face_normal(s.face);
-                for &v in &[v0, v1] {
-                    *shell_normal.entry(v).or_insert(Vec3::ZERO) += n;
-                    let entry = seam_len_sum.entry(v).or_insert((0.0, 0));
-                    entry.0 += s.length;
-                    entry.1 += 1;
-                }
-            }
-
-            // Compute final positions into a scratch buffer to keep the
-            // per-vertex calculation independent of write order (§8 step 6).
-            let mut moves: Vec<(VertexKey, Vec3)> = Vec::with_capacity(tagged_verts.len());
-            for v in tagged_verts {
-                let n = shell_normal
-                    .get(&v)
-                    .copied()
-                    .unwrap_or(Vec3::ZERO)
-                    .normalize_or_zero();
-                let avg_len = seam_len_sum
-                    .get(&v)
-                    .map(|(sum, count)| {
-                        if *count > 0 {
-                            *sum / *count as f32
-                        } else {
-                            1.0
-                        }
-                    })
-                    .unwrap_or(1.0);
-                let scale = if params.use_relative_offset {
-                    avg_len
-                } else {
-                    1.0
-                };
-                let shell = if params.use_even_offset {
-                    self.shell_factor_at(v, n)
-                } else {
-                    1.0
-                };
-                let offset = params.depth * scale * shell;
-                let pos = self.vertex_position(v);
-                moves.push((v, pos + n * offset));
-            }
-            for (v, p) in moves {
-                self.set_vertex_position(v, p);
-            }
+            self.inset_depth_pass(face_tag, &split_edges, &endpoint_tagged_v, &params);
         }
 
         self.pop_face_op_flag_layer(face_tag);
         InsetRegionResult { wall_faces }
+    }
+
+    /// INSET.md §8 — lift every tagged-region vertex (seam boundary *and*
+    /// interior) along its depth normal.
+    ///
+    /// Seam-edge endpoints get a freshly-averaged shell normal (§8 steps 1–3:
+    /// the area-less sum of incident tagged seam loops' face normals). Interior
+    /// tagged verts have no incident seam edge, so steps 1–3 never visit them
+    /// (the step-5 note in §8): they lift along their *incoming, un-recomputed*
+    /// vertex normal as it stood entering the depth pass.
+    ///
+    /// The `use_relative_offset` length scale (§8.1) is the average of incident
+    /// seam-edge pre-inset lengths for a boundary vert; for an interior vert
+    /// with no incident seam edge it is the topological-distance relaxation of
+    /// §8.1 — built lazily and only when its three gates hold.
+    fn inset_depth_pass(
+        &mut self,
+        face_tag: crate::op_flags::FaceOpFlagLayer,
+        split_edges: &[SplitEdge],
+        endpoint_tagged_v: &HashMap<(usize, usize), VertexKey>,
+        params: &InsetRegionParams<'_>,
+    ) {
+        // Step 4: re-tag every vertex of every tagged face — boundary *and*
+        // interior, this time. The tagged faces still carry `face_tag` after
+        // the surgery (the inset face rode onto the new boundary), so their
+        // live corner verts are the tagged-region vertex set.
+        let mut tagged_verts: std::collections::HashSet<VertexKey> =
+            std::collections::HashSet::new();
+        let mut tagged_edges: std::collections::HashSet<EdgeKey> =
+            std::collections::HashSet::new();
+        for f in self.face_keys() {
+            if !self.face_op_flag_test(face_tag, f, 0) {
+                continue;
+            }
+            let mut it = self.face_loops(f);
+            while let Some(l) = it.next(self) {
+                tagged_verts.insert(self.loop_vertex(l));
+                tagged_edges.insert(self.loop_edge(l));
+            }
+        }
+
+        // Steps 1–3 (shell normal) and the boundary half of §8.1 (seam-length
+        // average), accumulated per seam-edge endpoint on its tagged side.
+        let mut shell_normal: HashMap<VertexKey, Vec3> = HashMap::new();
+        let mut seam_len_sum: HashMap<VertexKey, (f32, u32)> = HashMap::new();
+        for (i, s) in split_edges.iter().enumerate() {
+            let v0 = endpoint_tagged_v.get(&(i, 0)).copied().unwrap_or(s.v0);
+            let v1 = endpoint_tagged_v.get(&(i, 1)).copied().unwrap_or(s.v1);
+            let face_normal = self.face_normal(s.face);
+            for &v in &[v0, v1] {
+                *shell_normal.entry(v).or_insert(Vec3::ZERO) += face_normal;
+                let entry = seam_len_sum.entry(v).or_insert((0.0, 0));
+                entry.0 += s.length;
+                entry.1 += 1;
+            }
+        }
+
+        // §8.1 interior-vert length relaxation, gated on all three conditions
+        // (depth ≠ 0 holds here, `use_relative_offset` on, and ≥1 interior
+        // tagged vert with no incident seam edge). Built lazily and reused.
+        let interior_lengths = if params.use_relative_offset {
+            self.relax_interior_seam_lengths(&tagged_verts, &tagged_edges, &seam_len_sum)
+        } else {
+            HashMap::new()
+        };
+
+        // Step 5 → scratch buffer; step 6 writes back after every factor has
+        // been measured against the pre-depth geometry (§8.2.5).
+        let mut moves: Vec<(VertexKey, Vec3)> = Vec::with_capacity(tagged_verts.len());
+        for &v in &tagged_verts {
+            let is_seam_vert = seam_len_sum.contains_key(&v);
+            // Boundary verts lift along their freshly-averaged shell normal;
+            // interior verts along their incoming, un-recomputed `v.no`.
+            let normal = if is_seam_vert {
+                shell_normal
+                    .get(&v)
+                    .copied()
+                    .unwrap_or(Vec3::ZERO)
+                    .normalize_or_zero()
+            } else {
+                self.vertex_normal(v)
+            };
+
+            let scale = if params.use_relative_offset {
+                if let Some((sum, count)) = seam_len_sum.get(&v) {
+                    if *count > 0 {
+                        *sum / *count as f32
+                    } else {
+                        1.0
+                    }
+                } else {
+                    // Interior vert: the topological-distance fallback (§8.1).
+                    interior_lengths.get(&v).copied().unwrap_or(1.0)
+                }
+            } else {
+                1.0
+            };
+
+            let shell = if params.use_even_offset {
+                self.shell_factor_at(v, normal)
+            } else {
+                1.0
+            };
+
+            let offset = params.depth * scale * shell;
+            let pos = self.vertex_position(v);
+            moves.push((v, pos + normal * offset));
+        }
+        for (v, p) in moves {
+            self.set_vertex_position(v, p);
+        }
+    }
+
+    /// INSET.md §8.1 — topological-distance length relaxation for interior
+    /// tagged verts that have no incident seam edge.
+    ///
+    /// Seeds every seam-touching tagged vert with its own
+    /// `avg_seam_edge_length_at(v)` (the boundary case, already in
+    /// `seam_len_sum`), then walks outward through tagged edges: each
+    /// unresolved interior vert takes the mean of its already-resolved
+    /// tagged-edge neighbours' lengths, one BFS-style pass at a time, until
+    /// every reachable interior vert has a length.
+    ///
+    /// Returns the resolved length for each interior vert. Boundary verts are
+    /// not included (their length comes straight from `seam_len_sum`). Returns
+    /// an empty map when no interior tagged vert needs the fallback — the third
+    /// §8.1 gate.
+    fn relax_interior_seam_lengths(
+        &self,
+        tagged_verts: &std::collections::HashSet<VertexKey>,
+        tagged_edges: &std::collections::HashSet<EdgeKey>,
+        seam_len_sum: &HashMap<VertexKey, (f32, u32)>,
+    ) -> HashMap<VertexKey, f32> {
+        let interior: Vec<VertexKey> = tagged_verts
+            .iter()
+            .copied()
+            .filter(|v| !seam_len_sum.contains_key(v))
+            .collect();
+        if interior.is_empty() {
+            return HashMap::new();
+        }
+
+        // Resolved lengths: seeded from the boundary verts' averages.
+        let mut resolved: HashMap<VertexKey, f32> = HashMap::new();
+        for (&v, &(sum, count)) in seam_len_sum {
+            if count > 0 {
+                resolved.insert(v, sum / count as f32);
+            }
+        }
+
+        let mut pending: std::collections::HashSet<VertexKey> = interior.iter().copied().collect();
+        while !pending.is_empty() {
+            let mut newly_resolved: Vec<(VertexKey, f32)> = Vec::new();
+            for &v in &pending {
+                let mut neighbour_sum = 0.0_f32;
+                let mut neighbour_count = 0u32;
+                for edge in self.vertex_disk_iter(v) {
+                    if !tagged_edges.contains(&edge) {
+                        continue;
+                    }
+                    let [a, b] = self.edge_vertices(edge);
+                    let other = if a == v { b } else { a };
+                    if let Some(&length) = resolved.get(&other) {
+                        neighbour_sum += length;
+                        neighbour_count += 1;
+                    }
+                }
+                if neighbour_count > 0 {
+                    newly_resolved.push((v, neighbour_sum / neighbour_count as f32));
+                }
+            }
+            // A pass that resolves nothing means the remaining interior verts
+            // are unreachable from any seam through tagged edges; stop rather
+            // than loop forever (they keep the `1.0` default at the call site).
+            if newly_resolved.is_empty() {
+                break;
+            }
+            for (v, length) in newly_resolved {
+                resolved.insert(v, length);
+                pending.remove(&v);
+            }
+        }
+
+        resolved
+            .into_iter()
+            .filter(|(v, _)| !seam_len_sum.contains_key(v))
+            .collect()
     }
 
     /// INSET.md §5.6 — the unit slide direction for a one-seam mesh-boundary
@@ -2315,6 +2437,233 @@ mod tests {
         let _f_left = quad(mesh, [nl, nc, r0, l0]);
         let _f_right = quad(mesh, [nc, nr, rr0, r0]);
         (vec![left, right], r0, r1)
+    }
+
+    // ---- Interior-vert depth: §8.1 topological-distance length BFS ----
+
+    /// Build an `n`×`n`-vertex grid (so `(n-1)×(n-1)` quads) at the given
+    /// per-axis coordinates, returning `(faces_row_major, verts_row_major)`.
+    /// `xs`/`ys` are the world coordinates of each grid line, so a non-uniform
+    /// spacing yields seam edges of non-uniform length.
+    fn make_graded_grid(
+        mesh: &mut LoopMesh,
+        xs: &[f32],
+        ys: &[f32],
+    ) -> (Vec<FaceKey>, Vec<VertexKey>) {
+        let nx = xs.len();
+        let ny = ys.len();
+        let mut verts = Vec::with_capacity(nx * ny);
+        for &y in ys {
+            for &x in xs {
+                verts.push(mesh.create_vertex(Vec3::new(x, y, 0.0)));
+            }
+        }
+        let mut faces = Vec::with_capacity((nx - 1) * (ny - 1));
+        for gy in 0..ny - 1 {
+            for gx in 0..nx - 1 {
+                let i0 = gy * nx + gx;
+                let i1 = gy * nx + (gx + 1);
+                let i2 = (gy + 1) * nx + (gx + 1);
+                let i3 = (gy + 1) * nx + gx;
+                let v = [verts[i0], verts[i1], verts[i2], verts[i3]];
+                let e0 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
+                let e1 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
+                let e2 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
+                let e3 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
+                faces.push(mesh.face_create(&v, &[e0, e1, e2, e3], FaceCreateFlags::NONE));
+            }
+        }
+        (faces, verts)
+    }
+
+    /// On a graded 5×5-vertex grid (4×4 quads), tag the inner 2×2 face block.
+    /// The block's shared centre vertex (grid index 12) has all four incident
+    /// edges interior to the selection — no mixed radial — so it is the §8.1
+    /// interior tagged vert with no incident seam edge. The grading makes the
+    /// eight boundary seam edges non-uniform in length, so the BFS-relaxed
+    /// interior length is a genuine spatial blend rather than a uniform
+    /// constant.
+    ///
+    /// We pin the *length value* by reading it off the net displacement: with
+    /// `use_even_offset` off the shell factor is 1, and an interior vert lifts
+    /// along its *incoming* normal (§8.1.1) — which we seed to a known
+    /// non-degenerate unit vector so the displacement is exactly
+    /// `depth * relaxed_length` along it.
+    fn graded_5x5_inner_block(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey, [f32; 5], [f32; 5]) {
+        // Deliberately irregular spacing on both axes.
+        let xs = [0.0_f32, 0.7, 1.5, 2.6, 4.0];
+        let ys = [0.0_f32, 0.5, 1.4, 2.0, 3.1];
+        let (faces, verts) = make_graded_grid(mesh, &xs, &ys);
+        // 4×4 face grid, row-major. Inner 2×2 block = faces {5,6,9,10}.
+        let block = vec![faces[5], faces[6], faces[9], faces[10]];
+        // Centre vertex shared by all four block faces: grid vertex 12 (row 2,
+        // col 2 of the 5×5 vertex grid).
+        let centre = verts[12];
+        (block, centre, xs, ys)
+    }
+
+    /// Independently compute the §8.1 BFS-relaxed length at the inner-block
+    /// centre vertex for the graded 5×5 fixture. The centre's four tagged-edge
+    /// neighbours are the four mid-edge verts of the block boundary (grid
+    /// indices 7, 11, 13, 17); each is a seam vert sitting on two seam edges,
+    /// so its `avg_seam_edge_length` is the mean of those two edge lengths.
+    /// One BFS pass resolves the centre to the mean of those four neighbour
+    /// averages.
+    fn expected_centre_length(xs: &[f32; 5], ys: &[f32; 5]) -> f32 {
+        let p = |gx: usize, gy: usize| Vec3::new(xs[gx], ys[gy], 0.0);
+        let len = |a: Vec3, b: Vec3| (a - b).length();
+        // Mid-edge seam verts of the inner 2×2 block (col,row in the 5×5 grid):
+        //   index 7  = (col2,row1) top-mid     seams: (1,1)-(2,1), (2,1)-(3,1)
+        //   index 11 = (col1,row2) left-mid    seams: (1,1)-(1,2), (1,2)-(1,3)
+        //   index 13 = (col3,row2) right-mid   seams: (3,1)-(3,2), (3,2)-(3,3)
+        //   index 17 = (col2,row3) bottom-mid  seams: (1,3)-(2,3), (2,3)-(3,3)
+        let top = 0.5 * (len(p(1, 1), p(2, 1)) + len(p(2, 1), p(3, 1)));
+        let left = 0.5 * (len(p(1, 1), p(1, 2)) + len(p(1, 2), p(1, 3)));
+        let right = 0.5 * (len(p(3, 1), p(3, 2)) + len(p(3, 2), p(3, 3)));
+        let bottom = 0.5 * (len(p(1, 3), p(2, 3)) + len(p(2, 3), p(3, 3)));
+        0.25 * (top + left + right + bottom)
+    }
+
+    #[test]
+    fn depth_interior_vert_relaxed_length_pins_value() {
+        // §8.1.1: pin the BFS *length value* by reading it off the interior
+        // vert's net displacement. Seed the centre vertex with a known
+        // non-degenerate normal so the displacement is observable, run depth +
+        // relative offset with even-offset OFF (shell factor = 1), and assert
+        // the move equals `depth * relaxed_length` along the seeded normal.
+        let mut mesh = LoopMesh::new();
+        let (block, centre, xs, ys) = graded_5x5_inner_block(&mut mesh);
+
+        // A non-axis-aligned unit normal so a degenerate-normal bug (lifting
+        // along +Z or zero) would be visible.
+        let seeded = Vec3::new(0.2, -0.3, 1.0).normalize();
+        mesh.set_vertex_normal(centre, seeded);
+        let before = mesh.vertex_position(centre);
+
+        let depth = 0.37_f32;
+        mesh.inset_region(
+            &block,
+            InsetRegionParams {
+                thickness: 0.1,
+                depth,
+                use_boundary: false,
+                use_even_offset: false,
+                use_relative_offset: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let after = mesh.vertex_position(centre);
+        let displacement = after - before;
+        let relaxed = expected_centre_length(&xs, &ys);
+        let expected = seeded * depth * relaxed;
+        assert!(
+            (displacement - expected).length() < 1.0e-4,
+            "interior vert should lift by depth*relaxed_length along its incoming \
+             normal; got {displacement:?} want {expected:?} (relaxed_len={relaxed})"
+        );
+    }
+
+    #[test]
+    fn depth_interior_vert_no_relative_offset_takes_unit_scale() {
+        // Gate: with `use_relative_offset` OFF the BFS never runs and the
+        // interior vert takes scale 1.0 — the displacement is exactly `depth`
+        // along its seeded normal, NOT `depth * relaxed_length`.
+        let mut mesh = LoopMesh::new();
+        let (block, centre, xs, ys) = graded_5x5_inner_block(&mut mesh);
+
+        let seeded = Vec3::new(0.0, 0.0, 1.0);
+        mesh.set_vertex_normal(centre, seeded);
+        let before = mesh.vertex_position(centre);
+
+        let depth = 0.4_f32;
+        mesh.inset_region(
+            &block,
+            InsetRegionParams {
+                thickness: 0.1,
+                depth,
+                use_boundary: false,
+                use_even_offset: false,
+                use_relative_offset: false,
+                ..Default::default()
+            },
+        );
+
+        let displacement = mesh.vertex_position(centre) - before;
+        // Scale 1.0 → pure `depth` lift.
+        assert!(
+            (displacement - seeded * depth).length() < 1.0e-5,
+            "no-relative interior vert should lift by exactly depth; got {displacement:?}"
+        );
+        // And it is distinguishable from the relative-on length (the fixture is
+        // graded, so the relaxed length differs from 1.0).
+        let relaxed = expected_centre_length(&xs, &ys);
+        assert!(
+            (relaxed - 1.0).abs() > 1.0e-2,
+            "fixture must have a non-trivial relaxed length to make the gate meaningful"
+        );
+    }
+
+    #[test]
+    fn depth_no_interior_vert_skips_relaxation() {
+        // Gate: a region with no interior tagged vert never reaches the BFS.
+        // The centre face of a 3×3 grid has only boundary (seam) verts, so the
+        // depth pass moves them all from their own incident seam lengths — and
+        // the operator must complete cleanly with relative offset on.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+
+        let result = mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.1,
+                depth: 0.3,
+                use_boundary: false,
+                use_even_offset: false,
+                use_relative_offset: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn depth_interior_vert_degenerate_normal_stays_put() {
+        // §8.1.1 caveat made explicit: the BFS length genuinely runs and is
+        // non-trivial, but multiplied into a near-zero incoming normal the net
+        // displacement is near-zero — both `scale=1.0` and the relaxed length
+        // leave the vert effectively in place. This is exactly why the A/B
+        // fixture cannot discriminate the value and pins only the path.
+        let mut mesh = LoopMesh::new();
+        let (block, centre, _xs, _ys) = graded_5x5_inner_block(&mut mesh);
+
+        // A zero-length incoming normal (as a freshly-built interior vert may
+        // carry before any normal recompute).
+        mesh.set_vertex_normal(centre, Vec3::ZERO);
+        let before = mesh.vertex_position(centre);
+
+        mesh.inset_region(
+            &block,
+            InsetRegionParams {
+                thickness: 0.1,
+                depth: 0.5,
+                use_boundary: false,
+                use_even_offset: false,
+                use_relative_offset: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let displacement = mesh.vertex_position(centre) - before;
+        assert!(
+            displacement.length() < 1.0e-6,
+            "a degenerate incoming normal leaves the interior vert in place \
+             regardless of the BFS length; got {displacement:?}"
+        );
     }
 
     #[test]
