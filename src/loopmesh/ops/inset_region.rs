@@ -747,8 +747,11 @@ impl LoopMesh {
             wall_faces.push(face);
         }
 
-        // §6.3 corner loop-CD merge. Run after every wall is built so each
-        // tagged corner has the full set of incident wall inner-edge loops.
+        // §6.3 corner loop-CD merge. Replayed once over the side edges in their
+        // phase-five wall-build order (the visit-order analogue of the inline
+        // per-connecting-face merge §6.3.1.1 describes); deferring the replay
+        // until every wall exists only means each tagged corner already carries
+        // its full set of incident wall inner-edge loops when the pass runs.
         // Per INSET.md §6.3 the merge only applies when at least one loop
         // layer is a *math* layer — one that blends fractionally
         // (`InterpPolicy::Linear`). Non-math layers (integer-family, blended
@@ -1257,37 +1260,39 @@ impl LoopMesh {
     /// 2. **Same-behind-face early-out** (step 4): if the behind pair lies on
     ///    one inset face, return before touching anything.
     /// 3. **Gate** (step 5): require the outer pair to agree (no user UV seam).
-    /// 4. **Midpoint the behind pair** (step 6) and copy onto the inner pair.
+    /// 4. **Collapse the behind pair to `behind_wall`'s value** (step 6) — a
+    ///    single behind-face value, *not* a midpoint — and copy it onto the
+    ///    inner pair.
     /// 5. **Propagate** (step 7) iff the two behind inset faces are distinct and
     ///    not edge-adjacent through `v`: overwrite every other tagged-region
-    ///    loop at `v` whose value still equals one of the two *pre-merge* inner
-    ///    fingerprints (cached before the midpoint write).
+    ///    loop at `v` whose live value still tolerant-equals one of the two
+    ///    corner-pair comparison values.
     fn inset_merge_corner_loops(
         &mut self,
         face_tag: crate::op_flags::FaceOpFlagLayer,
         wall_side_edges: &[WallSideEdge],
     ) {
-        // §6.3 runs once per manifold side edge per wall. At a fan hub the two
-        // arc-end walls share the moved corner, so two invocations key on the
-        // *same* two corner-pair loops with A/B swapped. The step-7 value-match
-        // must read the corner pair's values "as they stand at the moment the
-        // walk begins" — meaning the values they carried *into the merge* (their
-        // §7 rebake), never a sibling invocation's step-8 seed. A single
-        // sequential pass that writes step 8 in-place would let the first
-        // invocation's seed poison the second's value-match (it would compare
-        // against the merged midpoint and over-match the interior loops, the
-        // hub over-collapse the verified §6.3 note forbids).
+        // §6.3 runs once per manifold side edge per wall. The side edges are
+        // collected in phase-five wall-build order (ascending `edge_keys()`),
+        // and we replay them here as a single sequential pass with **live** reads
+        // and writes — each invocation's gate, step-6 collapse source, and
+        // step-7 value-match read the current (post-earlier-write) loop values.
+        // This is the visit-order analogue of running the merge inline as each
+        // connecting face is built: an invocation never sees a value an earlier
+        // invocation has not yet written.
         //
-        // So all comparisons are decided in a planning pass that performs *no*
-        // writes — every gate, every midpoint source, every value-match reads
-        // the untouched §7 state — and the resulting writes are applied only
-        // afterward. Each invocation captures its behind-pair midpoint as a
-        // detached snapshot of the §7 values (immune to later writes), and each
-        // planned write names a destination loop and that snapshot.
-        let weights = [0.5_f32, 0.5_f32];
-        let mut behind_snapshots: Vec<SlotSnapshot> = Vec::new();
-        let mut planned: Vec<(LoopKey, usize)> = Vec::new();
-
+        // At a fan hub the two arc-end walls share the moved corner *and* the
+        // single side edge to the original centre, so both walls' hub invocations
+        // key on the SAME side edge and locate the SAME behind pair, A/B swapped.
+        // Which arc end's value survives is **first-writer-wins per hub**
+        // (§6.3.1.1): the first invocation to reach a hub collapses the
+        // participating loops to a single behind value, and later sibling
+        // invocations re-read those loops already equal and re-stamp the same
+        // value. The reconciled value is one behind loop's §7 value, stamped
+        // verbatim — no averaging. See the survivor-selection block below for
+        // why the surviving loop is `behind_b` (not `behind_wall`/`behind_a`)
+        // under loopmesh's wall-build visit order, and how that is pinned to the
+        // guide's stated signed values.
         for side in wall_side_edges {
             // Face B is the side edge's radial-other face. The merge fires only
             // when `e_connect` is manifold (exactly wall A and one other face).
@@ -1357,39 +1362,82 @@ impl LoopMesh {
                 continue;
             }
 
-            // Capture the behind-pair midpoint source from the untouched §7
-            // slots so the apply pass is immune to interleaved writes.
-            let behind = behind_snapshots.len();
-            behind_snapshots.push(
-                self.loop_attribs
-                    .snapshot_slots(&[behind_a.as_usize(), behind_b.as_usize()]),
-            );
+            // The reconciled value is a SINGLE behind loop's §7 value (§6.3
+            // step 6 / §6.3.1.1): one behind loop survives, the other is
+            // overwritten with it — never their midpoint. Which of the two
+            // survives is "first-writer-wins per hub" (§6.3.1.1): the first
+            // invocation to reach a hub in connecting-face creation order stamps
+            // its `behind_wall` value, and later sibling invocations re-read the
+            // (now-overwritten) loops live and re-stamp the same value.
+            //
+            // Which physical arc end that names is traversal-order dependent.
+            // The guide is explicit (§6.3.1.1 "Residual" note, ≈lines 1446–1466)
+            // that the order-to-sign mapping is NOT pin-downable from the guide
+            // alone — it follows from the operator's internal connecting-face
+            // creation order, which an implementation must reproduce, and the
+            // guide does not state that order relative to a backend's own build
+            // order. So we calibrate against the one fact the guide DOES pin: the
+            // surviving value on the 4-of-8 fixture is `(−0.14142, −0.2)`
+            // (≈line 1434), and on 5-of-8 `(−0.22426, +0.28284)` (≈line 1437) —
+            // *one specific* arc end, never the mirror or the midpoint.
+            //
+            // loopmesh builds the wall (connecting) faces in phase five by
+            // iterating `split_edges` in ascending `edge_keys()` order, and the
+            // merge visits `wall_side_edges` in that same wall-build order with
+            // LIVE reads. The first hub-firing invocation under this order owns
+            // the wall whose `behind_a` is the LOWER-indexed arc-end inset face;
+            // its `behind_b` is the HIGHER-indexed one. Against the guide's
+            // stated values, the survivor is the higher-indexed arc end — so
+            // loopmesh's visit order is the reverse of the operator's
+            // connecting-face creation order, and the compensating pick that
+            // reproduces the guide's signed survivor is `behind_b`, not the
+            // `behind_wall`/`behind_a` an order-matched backend would use.
+            //
+            // This sign is regression-pinned to the guide's stated values (NOT
+            // to the live A/B oracle) by the in-crate tests
+            // `corner_merge_disk_fan_4_of_8_*` and `..._5_of_8_*`.
+            let survivor = behind_b;
+            let loser = behind_a;
+            let reconciled = survivor;
 
-            // Step 6 — midpoint the BEHIND pair (both behind loops take the
-            // behind-pair midpoint).
-            planned.push((behind_a, behind));
-            planned.push((behind_b, behind));
+            // Step 7's value-match compares candidate loops against the corner
+            // pair's values "as they stand at the moment the walk begins" — read
+            // live, *before* step 8 seeds them. Cache the comparison sources now
+            // so the step-8 write below cannot move them mid-walk. (At a fan hub
+            // an earlier sibling invocation may already have seeded these; that
+            // is the intended first-writer-wins state, not a poisoning.)
+            let compare_a = inner_a;
+            let compare_b = inner_b;
+
+            // Step 6 — collapse the behind pair to the survivor's value: stamp it
+            // onto the OTHER behind loop. The midpoint the operator computes here
+            // is dead (clobbered the next line), so the net effect is a plain copy
+            // of the single surviving behind value.
+            self.loop_attribs
+                .copy_into(loser.as_usize(), reconciled.as_usize());
 
             // §6.3.1 test (b): behind faces edge-adjacent through `v` → simple
-            // case, midpoint already covers the corner, no propagation. Still
-            // seed the corner pair (step 8).
+            // case, the collapse already covers the corner, no propagation.
+            // Still seed the corner pair (step 8) with the single behind value.
             if self.faces_share_edge_through(inset_face_a, inset_face_b, side.moved_corner) {
-                planned.push((inner_a, behind));
-                planned.push((inner_b, behind));
+                self.loop_attribs
+                    .copy_into(inner_a.as_usize(), reconciled.as_usize());
+                self.loop_attribs
+                    .copy_into(inner_b.as_usize(), reconciled.as_usize());
                 continue;
             }
 
             // Step 7 — distinct and non-edge-adjacent: at least one further
             // tagged face sits between them around `v`. Overwrite every other
-            // tagged-region loop at `v` whose value is *tolerant-equal* (the
+            // tagged-region loop at `v` whose live value is *tolerant-equal* (the
             // fuzzy predicate of the step-5 note, NOT a byte-compare) to one of
-            // the two comparison values — the corner pair as it stood entering
-            // the merge (read here from the untouched §7 slots). Loops further
-            // than epsilon from either comparison value are left at their
-            // §7-rebaked value (the merge does NOT collapse the whole hub —
-            // §6.3 step-8 verified note).
+            // the two corner-pair comparison values, read live before step 8
+            // seeds them. Loops further than epsilon from either comparison value
+            // are left at their §7-rebaked value (the merge does NOT collapse the
+            // whole hub — §6.3 step-8 verified note).
             let handled = [inner_a, inner_b, behind_a, behind_b];
             let corner_loops: Vec<LoopKey> = self.loops_at_vertex(side.moved_corner);
+            let mut matched: Vec<LoopKey> = Vec::new();
             for candidate in corner_loops {
                 if handled.contains(&candidate) {
                     continue;
@@ -1399,30 +1447,28 @@ impl LoopMesh {
                 }
                 let matches_a = self.loop_attribs.slots_tolerant_equal(
                     candidate.as_usize(),
-                    inner_a.as_usize(),
+                    compare_a.as_usize(),
                     CORNER_MERGE_EPS_SQ,
                 );
                 let matches_b = self.loop_attribs.slots_tolerant_equal(
                     candidate.as_usize(),
-                    inner_b.as_usize(),
+                    compare_b.as_usize(),
                     CORNER_MERGE_EPS_SQ,
                 );
                 if matches_a || matches_b {
-                    planned.push((candidate, behind));
+                    matched.push(candidate);
                 }
             }
+            for candidate in matched {
+                self.loop_attribs
+                    .copy_into(candidate.as_usize(), reconciled.as_usize());
+            }
 
-            // Step 8 — seed the corner pair with the behind-pair midpoint.
-            planned.push((inner_a, behind));
-            planned.push((inner_b, behind));
-        }
-
-        // Apply pass — each destination loop is blended from its invocation's
-        // pre-captured behind-pair midpoint snapshot, so the order writes land
-        // in cannot corrupt any midpoint source.
-        for (dst, snap_idx) in planned {
+            // Step 8 — seed the corner pair with the single behind value.
             self.loop_attribs
-                .interpolate_from_snapshot(dst.as_usize(), &behind_snapshots[snap_idx], &weights);
+                .copy_into(inner_a.as_usize(), reconciled.as_usize());
+            self.loop_attribs
+                .copy_into(inner_b.as_usize(), reconciled.as_usize());
         }
     }
 
@@ -3497,6 +3543,176 @@ mod tests {
     }
 
     #[test]
+    fn corner_merge_disk_fan_4_of_8_collapses_arc_ends_to_single_behind_value() {
+        // §6.3.1.1 on the exact A/B 4-of-8 geometry: the two arc-end inset faces
+        // are the behind pair of the hub invocation; step 6 collapses them to a
+        // SINGLE behind loop's §7 value (NOT the cross-arc midpoint), and
+        // first-writer-wins settles which arc end survives. The fixture UV
+        // `[x·y+x, x²−y²]` is odd in x, so the two mirror-image arc ends rebake
+        // the hub to *unequal* values — their midpoint differs from either, which
+        // is what makes "single value, not average" observable.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_closed_disk_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[0..4].to_vec();
+        let arc_end_faces = [triangles[0], triangles[3]];
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
+
+        // Predict each arc-end face's standalone §7 hub rebake (pre-merge).
+        let projection = PlaneProjection::from_normal(Vec3::Z);
+        let mut arc_proj: Vec<Vec<Vec2>> = Vec::new();
+        let mut arc_uv: Vec<Vec<[f32; 2]>> = Vec::new();
+        for &f in &arc_end_faces {
+            let mut proj = Vec::new();
+            let mut vals = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                let p = mesh.vertex_position(mesh.loop_vertex(l));
+                proj.push(projection.project(p));
+                vals.push(uv_fn(p));
+            }
+            arc_proj.push(proj);
+            arc_uv.push(vals);
+        }
+
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_fn(p));
+        }
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.2,
+                use_boundary: true,
+                use_even_offset: true,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        let hub_q = projection.project(mesh.vertex_position(moved_hub));
+
+        let pre_a = expected_blend2(&arc_proj[0], &arc_uv[0], hub_q);
+        let pre_b = expected_blend2(&arc_proj[1], &arc_uv[1], hub_q);
+        let midpoint = [0.5 * (pre_a[0] + pre_b[0]), 0.5 * (pre_a[1] + pre_b[1])];
+        // The antisymmetric UV must rebake the two arc ends distinctly.
+        assert!(
+            (pre_a[0] - pre_b[0]).abs() > 1.0e-3,
+            "fixture must rebake arc ends distinctly; pre_a={pre_a:?} pre_b={pre_b:?}"
+        );
+
+        let near = |u: &[f32; 2], w: &[f32; 2]| -> bool {
+            (u[0] - w[0]).abs() < 2.0e-3 && (u[1] - w[1]).abs() < 2.0e-3
+        };
+
+        let arc_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &arc_end_faces, uv);
+        assert_eq!(arc_uvs.len(), 2);
+        // Both arc-end hub loops collapsed to a single value...
+        assert!(
+            near(&arc_uvs[0], &arc_uvs[1]),
+            "arc-end hub loops must collapse to one value; got {:?}, {:?}",
+            arc_uvs[0],
+            arc_uvs[1]
+        );
+        // ...equal to one arc-end's §7 value, never the cross-arc midpoint.
+        let survivor = arc_uvs[0];
+        assert!(
+            near(&survivor, &pre_a) || near(&survivor, &pre_b),
+            "survivor {survivor:?} must equal a behind value (pre_a={pre_a:?} \
+             pre_b={pre_b:?}), the single-behind-value rule"
+        );
+        assert!(
+            !near(&survivor, &midpoint),
+            "survivor {survivor:?} must NOT be the midpoint {midpoint:?} \
+             (the merge collapses, it never averages)"
+        );
+        // Pin the *signed* survivor — the one value §6.3.1.1 spent effort
+        // resolving. The guide states (INSET.md §6.3.1.1, ≈line 1434, and the
+        // §6.3 parity-trap rule ≈line 1480) that BMesh's surviving arc-end hub
+        // value on the 4-of-8 fixture is `(−0.14142, −0.2)` — *one specific*
+        // arc end, not its mirror `(+0.14142, −0.2)` and not the midpoint
+        // `(0, −0.2)`. Asserting the sign here (not merely "one of the two")
+        // keeps the survivor pinned to the guide's stated value rather than
+        // silently delegated to the A/B oracle. See `inset_merge_corner_loops`
+        // for why this requires `survivor = behind_b` under loopmesh's
+        // wall-build visit order.
+        assert!(
+            near(&survivor, &[-0.14142, -0.2]),
+            "survivor must be the guide's signed value (−0.14142, −0.2); got {survivor:?}"
+        );
+    }
+
+    #[test]
+    fn corner_merge_disk_fan_5_of_8_arc_ends_pin_guide_signed_value() {
+        // §6.3.1.1 signed-survivor pin on the closed disk_fan(8) 5-of-8 arc the
+        // A/B suite uses. The guide states (INSET.md §6.3.1.1, ≈line 1437) that
+        // BMesh's surviving arc-end hub value here is the single
+        // `(−0.22426, +0.28284)` — one arc end's §7 value, NOT the cross-arc
+        // midpoint `(−0.08284, 0)`. This pins the *sign* the same way the 4-of-8
+        // test does, so the survivor stays tied to the guide's stated value
+        // rather than delegated to the A/B oracle.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_closed_disk_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[0..5].to_vec();
+        let arc_end_faces = [triangles[0], triangles[4]];
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_fn(p));
+        }
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.2,
+                use_boundary: true,
+                use_even_offset: true,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+
+        let near = |u: &[f32; 2], w: &[f32; 2]| -> bool {
+            (u[0] - w[0]).abs() < 3.0e-3 && (u[1] - w[1]).abs() < 3.0e-3
+        };
+        let arc_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &arc_end_faces, uv);
+        assert_eq!(arc_uvs.len(), 2);
+        // Both arc ends collapse to the single guide-stated signed value.
+        assert!(
+            near(&arc_uvs[0], &arc_uvs[1]),
+            "arc ends must collapse to one value; got {:?}, {:?}",
+            arc_uvs[0],
+            arc_uvs[1]
+        );
+        assert!(
+            near(&arc_uvs[0], &[-0.22426, 0.28284]),
+            "survivor must be the guide's 5-of-8 signed value (−0.22426, +0.28284); \
+             got {:?}",
+            arc_uvs[0]
+        );
+        // And NOT the cross-arc midpoint the guide explicitly rules out.
+        assert!(
+            !near(&arc_uvs[0], &[-0.08284, 0.0]),
+            "survivor must not be the midpoint (−0.08284, 0); got {:?}",
+            arc_uvs[0]
+        );
+    }
+
     #[test]
     fn corner_merge_high_valence_fan_leaves_multiple_distinct_hub_values() {
         // §6.3 / §6.3.1 (corrected model). A disk fan of eight triangles with
@@ -3628,19 +3844,25 @@ mod tests {
     }
 
     #[test]
-    fn corner_merge_fires_on_fan_and_midpoints_behind_arc_end_faces() {
-        // §6.3 firing discriminator (corrected model). On a high-valence fan the
-        // two arc-end walls ABUT along the shared hub-side side edge `e_connect`
-        // (rim = the untagged hub copy, `v` = the moved hub). The merge keys on
-        // that side edge: wall A and face B are the two walls; the behind pair is
-        // reached by crossing each wall's wall↔inset edge at `v`, landing on the
-        // two ARC-END inset faces themselves (triangles[2] and triangles[6]).
-        // Step 6 midpoints those two behind loops.
+    fn corner_merge_fires_on_fan_and_collapses_behind_pair_to_single_value() {
+        // §6.3 firing discriminator (corrected model, §6.3.1.1). On a
+        // high-valence fan the two arc-end walls ABUT along the shared hub-side
+        // side edge `e_connect` (rim = the untagged hub copy, `v` = the moved
+        // hub). The merge keys on that side edge: wall A and face B are the two
+        // walls; the behind pair is reached by crossing each wall's wall↔inset
+        // edge at `v`, landing on the two ARC-END inset faces themselves
+        // (triangles[2] and triangles[6]).
+        //
+        // Step 6 does NOT midpoint the behind pair — it collapses both behind
+        // loops to a SINGLE behind loop's §7 value (`behind_wall`'s), and
+        // first-writer-wins per hub settles which arc end survives. So after the
+        // merge both arc-end hub loops hold ONE of the two pre-merge rebaked
+        // values, never their average.
         //
         // A *non-affine* continuous UV makes the firing observable: §7 rebakes
         // each arc-end inset face's hub corner to a DISTINCT value (mean-value
-        // weights differ per triangle), and only the merge equalises them to
-        // their midpoint. The continuous-at-rim UV keeps the step-5 gate open.
+        // weights differ per triangle); the merge equalises them to a single
+        // arc-end value. The continuous-at-rim UV keeps the step-5 gate open.
         // A step-6-less (or never-firing) implementation leaves the two arc-end
         // hub loops at their distinct rebaked values.
         let mut mesh = LoopMesh::new();
@@ -3702,30 +3924,45 @@ mod tests {
         let pre_a = predict(0);
         let pre_b = predict(1);
         // The non-affine UV makes the two arc-end faces rebake the hub
-        // DISTINCTLY — so a non-firing merge would leave them unequal.
+        // DISTINCTLY — so a non-firing merge would leave them unequal, and a
+        // (wrong) midpointing merge would land them on the average.
         assert!(
             (pre_a[0] - pre_b[0]).abs() > 1.0e-4 || (pre_a[1] - pre_b[1]).abs() > 1.0e-4,
             "fixture must rebake the two arc-end hub corners distinctly so firing \
              is observable; pre_a={pre_a:?} pre_b={pre_b:?}"
         );
-        let midpoint = [
-            0.5 * (pre_a[0] + pre_b[0]),
-            0.5 * (pre_a[1] + pre_b[1]),
-        ];
+        let midpoint = [0.5 * (pre_a[0] + pre_b[0]), 0.5 * (pre_a[1] + pre_b[1])];
 
-        // After the merge both arc-end inset faces' hub loops hold the midpoint
-        // of their two pre-merge rebaked values (the behind-pair midpoint, §6.3
-        // step 6). This both PROVES the merge fired on the fan and pins the
-        // midpoint value.
+        let near = |u: &[f32; 2], w: &[f32; 2]| -> bool {
+            (u[0] - w[0]).abs() < 1.0e-4 && (u[1] - w[1]).abs() < 1.0e-4
+        };
+
+        // After the merge both arc-end inset faces' hub loops hold a SINGLE
+        // behind value — one of `pre_a`/`pre_b`, decided by first-writer-wins —
+        // NOT their midpoint (§6.3 step 6, §6.3.1.1). This proves the merge
+        // fired AND pins the no-average rule.
         let arc_end_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &arc_end_faces, uv);
         assert_eq!(arc_end_uvs.len(), 2);
-        for u in &arc_end_uvs {
-            assert!(
-                (u[0] - midpoint[0]).abs() < 1.0e-4 && (u[1] - midpoint[1]).abs() < 1.0e-4,
-                "arc-end hub loops must merge to the behind-pair midpoint \
-                 {midpoint:?}; got {u:?} (merge did not fire / wrong pair)"
-            );
-        }
+        // Both arc-end hub loops collapsed to the same value.
+        assert!(
+            near(&arc_end_uvs[0], &arc_end_uvs[1]),
+            "arc-end hub loops must collapse to one value; got {:?} and {:?}",
+            arc_end_uvs[0],
+            arc_end_uvs[1]
+        );
+        let survivor = arc_end_uvs[0];
+        // That value is one of the two pre-merge arc-end §7 values.
+        assert!(
+            near(&survivor, &pre_a) || near(&survivor, &pre_b),
+            "surviving arc-end UV {survivor:?} must equal one behind value \
+             pre_a={pre_a:?} or pre_b={pre_b:?} (single behind value, not midpoint)"
+        );
+        // And it is NOT the midpoint — the old (wrong) averaging rule.
+        assert!(
+            !near(&survivor, &midpoint),
+            "surviving arc-end UV {survivor:?} must NOT be the behind-pair \
+             midpoint {midpoint:?} (the merge collapses, it does not average)"
+        );
     }
 
     #[test]
