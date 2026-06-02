@@ -339,9 +339,15 @@ impl LoopMesh {
     }
 
     /// Read the §9.1 smooth-placement context for the cut edge `e = {near, far}`
-    /// — the two endpoint positions and (current) vertex normals. `near` is the
-    /// edge's first endpoint `v_a`, so the directional cut parameter `t` (§3.2 /
-    /// §3.3) is measured from it.
+    /// — the two endpoint positions and **angle-weighted** vertex normals
+    /// (§9.1.5). `near` is the edge's first endpoint `v_a`, so the directional
+    /// cut parameter `t` (§3.2 / §3.3) is measured from it.
+    ///
+    /// The endpoint normals are computed here rather than read from the cached
+    /// vertex-normal field because the cached normals are area-weighted, whereas
+    /// the §9.1.2 arc demands the angle-weighted (Thürmer–Wüthrich) convention
+    /// (§9.1.5). Face normals must be current (the caller freshens them via
+    /// [`Self::mesh_normals_update`] before the cut).
     fn smooth_endpoint_context(&self, edge: EdgeKey, near: VertexKey) -> SmoothEndpointContext {
         let far = self
             .edges
@@ -351,8 +357,45 @@ impl LoopMesh {
         SmoothEndpointContext {
             co_a: self.vertex_position(near),
             co_b: self.vertex_position(far),
-            no_a: self.vertex_normal(near),
-            no_b: self.vertex_normal(far),
+            no_a: self.angle_weighted_vertex_normal(near),
+            no_b: self.angle_weighted_vertex_normal(far),
+        }
+    }
+
+    /// §9.1.5 — the angle-weighted (Thürmer–Wüthrich) vertex normal: each
+    /// incident face contributes its **unit** face normal scaled by the interior
+    /// corner angle the vertex subtends in that face, summed and renormalised.
+    /// This is the convention the §9.1.2 smooth arc reads; it is *not* the
+    /// area-weighted [`Self::vertex_normal`] cache. Assumes face normals are
+    /// current. Falls back to `Vec3::ZERO` for a vertex with no incident faces.
+    fn angle_weighted_vertex_normal(&self, vertex: VertexKey) -> Vec3 {
+        let vertex_co = self.vertex_position(vertex);
+        let mut accumulated = Vec3::ZERO;
+
+        let mut disk = self.disk_edges(vertex);
+        while let Some(edge) = disk.next(self) {
+            let mut radial = self.radial_loops(edge);
+            while let Some(corner) = radial.next(self) {
+                // Only count the corner whose vertex is `vertex` (each incident
+                // face has exactly one such loop). The radial walk visits both
+                // sides of every incident edge, so guard on the corner vertex.
+                if self.loops.get(corner).vertex != vertex {
+                    continue;
+                }
+                let prev_co = self.vertex_position(self.loops.get(self.loop_prev(corner)).vertex);
+                let next_co = self.vertex_position(self.loops.get(self.loop_next(corner)).vertex);
+                let to_prev = (prev_co - vertex_co).normalize_or_zero();
+                let to_next = (next_co - vertex_co).normalize_or_zero();
+                let angle = to_prev.dot(to_next).clamp(-1.0, 1.0).acos();
+                let face_normal = self.face_normal(self.loops.get(corner).face);
+                accumulated += face_normal * angle;
+            }
+        }
+
+        if accumulated.length_squared() > 0.0 {
+            accumulated.normalize()
+        } else {
+            Vec3::ZERO
         }
     }
 
@@ -1333,79 +1376,165 @@ impl SmoothEndpointContext {
         co_flat.lerp(co_curved, factor)
     }
 
-    /// §9.1.2 — the curved target: the dual-blended normal-guided arc. Each
-    /// single-sided arc reflects the *other* endpoint's normal across the edge
-    /// direction, then the two are blended at `t`. A flat endpoint (normal ⊥
-    /// `dir`) makes its arc collapse to the straight lerp, so a uniformly flat
-    /// edge returns `co_flat` and `smooth` is a no-op there.
+    /// §9.1.2 — the curved target: the dual-blended circular arc. Two one-sided
+    /// arcs are built, each keyed to a *single* endpoint's normal (the far end
+    /// honours that same normal's reflection across the chord), then blended at
+    /// `t`. Each arc collapses to the straight chord lerp when its keyed normal
+    /// coincides with its own reflection (a chord-perpendicular normal — flat),
+    /// so a uniformly flat edge returns `co_flat` and `smooth` is a no-op there.
     fn curved_target(&self, t: f32) -> Vec3 {
         let chord = self.co_a - self.co_b;
         if chord.length_squared() < SMOOTH_DIR_EPS {
             return self.co_a.lerp(self.co_b, t);
         }
-        let dir = chord.normalize();
+        // §9.1.2 — the single sign convention `chord_dir = normalize(co_a - co_b)`
+        // flows through every reflection and every arc.
+        let chord_dir = chord.normalize();
 
-        let co_toward_a =
-            spherical_interp(self.co_a, self.no_a, self.co_b, reflect(self.no_b, dir), t);
-        let co_toward_b =
-            spherical_interp(self.co_a, reflect(self.no_a, dir), self.co_b, self.no_b, t);
+        // Start-keyed arc: driven entirely by `no_a`; its own reflection across
+        // the chord supplies the far-end normal.
+        let reflected_a = reflect(self.no_a, chord_dir);
+        let toward_start = if normal_coincides_with_reflection(self.no_a, reflected_a) {
+            self.co_a.lerp(self.co_b, t)
+        } else {
+            arc_point(self.co_a, self.no_a, self.co_b, reflected_a, chord_dir, t)
+        };
 
-        co_toward_a.lerp(co_toward_b, t)
+        // End-keyed arc: driven entirely by `no_b`.
+        let reflected_b = reflect(self.no_b, chord_dir);
+        let toward_end = if normal_coincides_with_reflection(self.no_b, reflected_b) {
+            self.co_a.lerp(self.co_b, t)
+        } else {
+            arc_point(self.co_a, reflected_b, self.co_b, self.no_b, chord_dir, t)
+        };
+
+        toward_start.lerp(toward_end, t)
     }
 }
 
-/// Reflect `n` across the plane whose normal is `dir` (a unit edge direction):
-/// `n − 2·(n·dir)·dir`. Used by §9.1.2 to build each single-sided arc.
+/// Reflect `n` across the plane whose normal is `dir` (a unit chord direction):
+/// `n − 2·(n·dir)·dir`. Used by §9.1.2 to build each one-sided arc's far-end
+/// normal.
 fn reflect(n: Vec3, dir: Vec3) -> Vec3 {
     n - 2.0 * n.dot(dir) * dir
 }
 
-/// §9.1.2 single-sided normal-guided arc. Sweeps from `co_a` to `co_b` along a
-/// circular arc whose tangents are constrained perpendicular to the endpoint
-/// normals `na`, `nb`. When a normal is perpendicular to the chord (the flat
-/// case) its tangent contribution vanishes and the arc is the straight lerp;
-/// when a reflected normal coincides with its source (a degenerate fold) the
-/// per-side tangent collapses to the chord for numerical safety.
-///
-/// The arc is the cubic Hermite through `co_a`, `co_b` whose endpoint tangents
-/// are the chord projected into each endpoint's tangent plane. This bows the
-/// path off the chord on the side the normals lean away from, by an amount that
-/// grows with the angle between the normals — matching the §9.1.2 contract.
-fn spherical_interp(co_a: Vec3, na: Vec3, co_b: Vec3, nb: Vec3, t: f32) -> Vec3 {
-    let chord = co_b - co_a;
-    if chord.length_squared() < SMOOTH_DIR_EPS {
-        return co_a.lerp(co_b, t);
-    }
-
-    // Each endpoint tangent is the chord projected onto the plane ⊥ that
-    // endpoint's normal. A normal ⊥ chord leaves the tangent equal to the chord
-    // (flat — no bow); a normal leaning toward the chord shortens the tangent's
-    // chord-aligned part and tilts it off-chord (the bow).
-    let tan_a = tangent_in_plane(chord, na);
-    let tan_b = tangent_in_plane(chord, nb);
-
-    // Cubic Hermite with P0=co_a, P1=co_b, tangents tan_a (out of a) and tan_b
-    // (into b). h00..h11 are the standard Hermite basis weights.
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-    let h10 = t3 - 2.0 * t2 + t;
-    let h01 = -2.0 * t3 + 3.0 * t2;
-    let h11 = t3 - t2;
-
-    co_a * h00 + tan_a * h10 + co_b * h01 + tan_b * h11
+/// §9.1.2 degeneracy guard: a (unit) normal coincides with its reflection when
+/// it already lies in the chord-perpendicular plane — reflecting changes
+/// nothing, so the arc has no bow on that side and collapses to the chord. The
+/// test is a squared-distance threshold of `1e-5` between the normal and its
+/// reflection.
+fn normal_coincides_with_reflection(normal: Vec3, reflected: Vec3) -> bool {
+    (normal - reflected).length_squared() < 1.0e-5
 }
 
-/// Project `chord` onto the plane perpendicular to the (assumed unit-ish)
-/// endpoint normal `n`. Returns `chord` unchanged when `n` is perpendicular to
-/// the chord (flat) and collapses toward `chord` as `n` aligns with it.
-fn tangent_in_plane(chord: Vec3, n: Vec3) -> Vec3 {
-    let n2 = n.length_squared();
-    if n2 < SMOOTH_DIR_EPS {
-        return chord;
+/// §9.1.2 — a point on the single circular arc at parameter `t`. The arc passes
+/// through `start` and `end` and meets the surface tangentially at each end
+/// (its radius there is perpendicular to that end's respected normal). The
+/// radius *direction* is swept by great-arc (slerp) interpolation; the radius
+/// *length* is the straight linear blend `lerp(radius_at_start, radius_at_end,
+/// t)`. Degeneracies (normals parallel to the chord, no finite centre, or
+/// diametrically opposite radii) fall back to the straight chord lerp.
+fn arc_point(start: Vec3, normal_at_start: Vec3, end: Vec3, normal_at_end: Vec3, chord_dir: Vec3, t: f32) -> Vec3 {
+    // Arc plane: perpendicular to the chord and to the shared "up". The average
+    // here is one endpoint's normal with that same normal's reflection (per the
+    // dual-blend caller), so it is exactly the chord-perpendicular part of that
+    // one endpoint's normal.
+    let average_normal = (normal_at_start + normal_at_end).normalize_or_zero();
+    let arc_plane_normal = average_normal.cross(chord_dir);
+    if arc_plane_normal.length_squared() < SMOOTH_DIR_EPS {
+        return start.lerp(end, t);
     }
-    let unit_n = n / n2.sqrt();
-    chord - unit_n * chord.dot(unit_n)
+    let arc_plane_normal = arc_plane_normal.normalize();
+
+    // Centre = the point equidistant from the endpoints whose radius to each end
+    // is perpendicular to that end's normal, confined to the arc plane. Three
+    // planes intersect to fix it:
+    //   - radius at `start` ⊥ normal_at_start  (in-plane part of that normal)
+    //   - radius at `end`   ⊥ normal_at_end    (in-plane part of that normal)
+    //   - centre lies in the arc plane itself.
+    let in_plane_start = project_out(arc_plane_normal.cross(normal_at_start), arc_plane_normal);
+    let in_plane_end = project_out(arc_plane_normal.cross(normal_at_end), arc_plane_normal);
+    let arc_center = match intersect_three_planes(
+        (start, in_plane_start),
+        (end, in_plane_end),
+        (start, arc_plane_normal),
+    ) {
+        Some(c) => c,
+        None => return start.lerp(end, t),
+    };
+
+    let radius_vec_start = start - arc_center;
+    let radius_vec_end = end - arc_center;
+    let radius_at_start = radius_vec_start.length();
+    let radius_at_end = radius_vec_end.length();
+    if radius_at_start < SMOOTH_DIR_EPS || radius_at_end < SMOOTH_DIR_EPS {
+        return start.lerp(end, t);
+    }
+    let unit_radius_start = radius_vec_start / radius_at_start;
+    let unit_radius_end = radius_vec_end / radius_at_end;
+
+    // Sweep DIRECTION by great-arc interpolation; blend RADIUS LINEARLY.
+    match slerp_unit(unit_radius_start, unit_radius_end, t) {
+        Some(swept_direction) => {
+            let radius = radius_at_start + (radius_at_end - radius_at_start) * t;
+            arc_center + swept_direction * radius
+        }
+        // Diametrically opposite radii: no unique sweep, go straight.
+        None => start.lerp(end, t),
+    }
+}
+
+/// Remove the `axis`-aligned component of `v` (project `v` onto the plane whose
+/// normal is the unit-ish `axis`).
+fn project_out(v: Vec3, axis: Vec3) -> Vec3 {
+    let axis2 = axis.length_squared();
+    if axis2 < SMOOTH_DIR_EPS {
+        return v;
+    }
+    v - axis * (v.dot(axis) / axis2)
+}
+
+/// Intersect three planes, each given as `(point_on_plane, plane_normal)`.
+/// Returns the unique intersection point, or `None` when the normals are
+/// near-coplanar (degenerate system).
+fn intersect_three_planes(
+    plane_a: (Vec3, Vec3),
+    plane_b: (Vec3, Vec3),
+    plane_c: (Vec3, Vec3),
+) -> Option<Vec3> {
+    let (pa, na) = plane_a;
+    let (pb, nb) = plane_b;
+    let (pc, nc) = plane_c;
+    // Plane i: n_i · x = n_i · p_i. Solve [n_a; n_b; n_c] x = d by Cramer.
+    let da = na.dot(pa);
+    let db = nb.dot(pb);
+    let dc = nc.dot(pc);
+    let denom = na.dot(nb.cross(nc));
+    if denom.abs() < SMOOTH_DIR_EPS {
+        return None;
+    }
+    let numerator =
+        da * nb.cross(nc) + db * nc.cross(na) + dc * na.cross(nb);
+    Some(numerator / denom)
+}
+
+/// Great-arc (spherical linear) interpolation between two unit vectors. Returns
+/// `None` when the two are diametrically opposite (no unique shortest arc).
+fn slerp_unit(from: Vec3, to: Vec3, t: f32) -> Option<Vec3> {
+    let cosine = from.dot(to).clamp(-1.0, 1.0);
+    if cosine < -1.0 + 1.0e-6 {
+        return None;
+    }
+    if cosine > 1.0 - 1.0e-6 {
+        // Nearly identical: plain lerp avoids the small-angle division blow-up.
+        return Some((from + (to - from) * t).normalize_or_zero());
+    }
+    let angle = cosine.acos();
+    let sin_angle = angle.sin();
+    let w_from = ((1.0 - t) * angle).sin() / sin_angle;
+    let w_to = (t * angle).sin() / sin_angle;
+    Some((from * w_from + to * w_to).normalize_or_zero())
 }
 
 /// §9.1.3 step 2 shell factor: `1 / cos(half-angle between na and nb)`. `1.0`
@@ -2674,6 +2803,114 @@ mod tests {
             (off_sm.length() / off_lin.length() - 2.0).abs() < 1.0e-3,
             "SMOOTH centre-cut offset is ~2× LINEAR's (factor 2.0 vs 1.0): ratio {}",
             off_sm.length() / off_lin.length()
+        );
+    }
+
+    #[test]
+    fn smooth_circular_arc_lands_exact_position_on_fold() {
+        // §9.1.2 — the dual-blend circular arc lands a *specific* point, derived
+        // from the angle-weighted endpoint normals (§9.1.5). On the 60° fold,
+        // cutting {v0, v1} with smooth = 1.0 and the LINEAR falloff (factor = 1.0,
+        // no overshoot, no shell):
+        //
+        //   - v0 touches only the flat quad, so its angle-weighted normal is
+        //     (0, 0, 1); its one-sided arc is chord-perpendicular and collapses
+        //     to the straight lerp (toward_start = chord midpoint).
+        //   - v1 is shared by the flat quad (normal (0,0,1)) and the 60°-folded
+        //     quad (normal (-sin60, 0, cos60)); equal 90° corner angles make its
+        //     angle-weighted normal their bisector, (-0.5, 0, sin60) normalised
+        //     = (-0.5, 0, 0.8660) — i.e. 30° off vertical toward -x.
+        //   - The v1-keyed circular arc through (0,0,0) and (1,0,0), tangent to
+        //     that normal, is a unit-radius circle centred at (0.5, 0, sin60).
+        //     Its symmetric midpoint is (0.5, 0, sin60 - 1) = (0.5, 0, -0.13397).
+        //   - co_curved = lerp(chord_mid, that, 0.5) = (0.5, 0, -0.0669873).
+        //
+        // The bow is purely in -z (no x component): the old cubic-Hermite
+        // construction tilted the path in x via the tangent-plane projection and
+        // would land elsewhere, so this exact-position pin guards the §9.1.2
+        // arc against regressing to the chord-bowing form.
+        let (mut mesh, _v, e01) = folded_two_quads(FRAC_PI_3);
+        let res = mesh.subdivide_edges(
+            &[e01],
+            SubdivideParams::default()
+                .smooth(1.0)
+                .smooth_falloff(SmoothFalloff::Linear),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let placed = midpoint_pos_after_cut(&mesh, &geom);
+
+        let sin60 = FRAC_PI_3.sin();
+        let expected = Vec3::new(0.5, 0.0, (sin60 - 1.0) * 0.5);
+        assert!(
+            placed.distance(expected) < 1.0e-5,
+            "circular-arc midpoint {placed:?} != expected {expected:?}"
+        );
+        // The bow is purely off the surface (no chord-tangent drift): x and y
+        // stay on the chord midplane, only z moves.
+        assert!((placed.x - 0.5).abs() < 1.0e-6 && placed.y.abs() < 1.0e-6,
+            "arc midpoint stays on the symmetric chord midplane (got {placed:?})");
+    }
+
+    #[test]
+    fn smooth_uses_angle_weighted_normals() {
+        // §9.1.5 — the smooth arc reads angle-weighted (not area-weighted)
+        // endpoint normals. On a fixture where the two weightings disagree, the
+        // bow direction differs. Build a fan around a hub vertex whose incident
+        // faces have very different areas but equal corner angles at the hub: the
+        // angle-weighted normal is the equal-weight average of the face normals,
+        // whereas an area-weighted normal would be dominated by the large face.
+        //
+        // Concretely two right triangles share the hub edge and fold about it;
+        // one fold quad is stretched far along its free direction (large area)
+        // while keeping the same 90° hub corner. The angle-weighted hub normal
+        // bisects the fold regardless of the stretch, so the placed midpoint is
+        // independent of the stretch factor — a property area-weighting breaks.
+        let placed_for = |stretch: f32| -> Vec3 {
+            let mut mesh = LoopMesh::new();
+            let s = FRAC_PI_3.sin();
+            let c = FRAC_PI_3.cos();
+            // Flat quad A in z = 0, square.
+            let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+            let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+            let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+            let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+            // Folded quad B about the hinge {v1, v2}; its free side is stretched
+            // by `stretch` (changing area, not the 90° corner angles at v1/v2).
+            let v4 = mesh.create_vertex(Vec3::new(1.0 + c * stretch, 0.0, s * stretch));
+            let v5 = mesh.create_vertex(Vec3::new(1.0 + c * stretch, 1.0, s * stretch));
+            let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+            let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+            let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+            let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+            let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+            let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+            let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+            let res = mesh.subdivide_edges(
+                &[e01],
+                SubdivideParams::default()
+                    .smooth(1.0)
+                    .smooth_falloff(SmoothFalloff::Linear),
+            );
+            let geom = match res {
+                SubdivideResult::Ran(g) => g,
+                _ => panic!("expected Ran"),
+            };
+            midpoint_pos_after_cut(&mesh, &geom)
+        };
+
+        // The hub corner angle is unchanged by the stretch, so angle-weighting
+        // gives the same hub normal and therefore the same bow at both stretches.
+        let near = placed_for(1.0);
+        let far = placed_for(4.0);
+        assert!(
+            near.distance(far) < 1.0e-5,
+            "angle-weighted normals make the bow stretch-independent: \
+             {near:?} vs {far:?} (area-weighting would differ)"
         );
     }
 
