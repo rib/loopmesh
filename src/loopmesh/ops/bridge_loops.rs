@@ -702,17 +702,22 @@ impl LoopMesh {
         Some(face)
     }
 
-    /// §6.2 — the loop on the edge `{from, to}` whose own vertex is `from`,
-    /// used as the per-loop customdata source. `None` when the edge is missing
-    /// or carries no face.
+    /// §6.2 — the corner loop, on a face bordering the edge `{from, to}`, that
+    /// sits at vertex `from`. Used as the per-loop customdata source. A
+    /// bordering face has a corner loop at *both* endpoints of the edge, so the
+    /// requested endpoint is found by taking any radial loop on the edge and, if
+    /// its own vertex is the other endpoint, stepping to the next corner of the
+    /// same face. `None` when the edge is missing or borders no face.
     fn bridge_source_loop(&self, from: VertexKey, to: VertexKey) -> Option<LoopKey> {
         let edge = self.query_edge_exists(from, to)?;
-        for l in self.iter_radial_loops(edge) {
-            if self.loop_vertex(l) == from {
-                return Some(l);
-            }
-        }
-        None
+        let radial = self.iter_radial_loops(edge).next()?;
+        let corner = if self.loop_vertex(radial) == from {
+            radial
+        } else {
+            self.loop_next(radial)
+        };
+        debug_assert_eq!(self.loop_vertex(corner), from);
+        Some(corner)
     }
 
     /// §6.3 — fold every band face's edges into `edges.out`, then drop the
@@ -1324,6 +1329,102 @@ mod tests {
         assert_eq!(partner_map(1), [2, 3, 0, 1]);
         // `t = 2` shifts by +1: A_i -> B_{(i+1)%4}.
         assert_eq!(partner_map(2), [1, 2, 3, 0]);
+    }
+
+    /// §6.2 — every band-face corner copies its per-loop customdata verbatim
+    /// from the bordering existing face's corner at the *same* vertex. The
+    /// regression this pins: a rim edge `{from, to}` borders one face whose two
+    /// corner loops sit at `from` and `to`; both band corners on that edge must
+    /// source from that face — not just the one whose loop vertex matches the
+    /// radial loop's own vertex.
+    #[test]
+    fn band_corners_source_per_corner_customdata() {
+        let mut mesh = LoopMesh::new();
+
+        // Loop A (the bridged top chain) and a wider chain above it that we
+        // close into bordering quads on each A edge.
+        let (a, ea) = open_chain(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+                Vec3::new(3.0, 1.0, 0.0),
+            ],
+        );
+        let above: Vec<VertexKey> = (0..a.len())
+            .map(|i| mesh.create_vertex(Vec3::new(i as f32, 2.0, 0.0)))
+            .collect();
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+
+        // One bordering quad per A edge: `[a_i, a_{i+1}, above_{i+1}, above_i]`.
+        // Each corner gets a UV unique to its vertex so the source is provable.
+        let vert_uv = |mesh: &LoopMesh, v: VertexKey| -> [f32; 2] {
+            let p = mesh.vertex_position(v);
+            [p.x, p.y]
+        };
+        for i in 0..a.len() - 1 {
+            let corners = [a[i], a[i + 1], above[i + 1], above[i]];
+            let edges: Vec<EdgeKey> = (0..4)
+                .map(|k| {
+                    mesh.create_edge([corners[k], corners[(k + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
+                })
+                .collect();
+            let face = mesh.face_create(&corners, &edges, FaceCreateFlags::NONE);
+            for l in mesh.iter_face_loops(face).collect::<Vec<_>>() {
+                let v = mesh.loop_vertex(l);
+                let value = vert_uv(&mesh, v);
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+            }
+        }
+
+        let (_b, eb) = open_chain(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(3.0, 0.0, 0.0),
+            ],
+        );
+
+        let mut selected = ea.clone();
+        selected.extend(eb.iter().copied());
+        let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
+        assert!(result.ok);
+
+        // Each band face borders one A edge; its two corners at the A vertices
+        // must carry that A vertex's UV, sourced from the bordering quad.
+        let a_set: std::collections::HashSet<VertexKey> = a.iter().copied().collect();
+        let mut a_corners_checked = 0;
+        for &face in &result.faces_out {
+            for l in mesh.iter_face_loops(face).collect::<Vec<_>>() {
+                let v = mesh.loop_vertex(l);
+                if !a_set.contains(&v) {
+                    continue;
+                }
+                let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                assert_eq!(
+                    got,
+                    vert_uv(&mesh, v),
+                    "band corner at A vertex must source the bordering face's UV"
+                );
+                // The default layer value is [0,0]; every A corner here has a
+                // non-zero y, so a defaulted corner would fail the equality
+                // above. This guard makes the "not left at default" intent
+                // explicit for the y=1 corners.
+                assert_ne!(got, [0.0, 0.0]);
+                a_corners_checked += 1;
+            }
+        }
+        // Three band quads, two A corners each.
+        assert_eq!(a_corners_checked, 6);
     }
 
     /// The z-stacked, index-aligned ring pair used by the twist tests. The two
