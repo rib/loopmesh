@@ -38,6 +38,7 @@ mod pointmerge;
 mod remove_doubles;
 mod rotate_edges;
 mod split;
+mod split_edges;
 mod subdivide_edges;
 mod symmetrize;
 mod weld_verts;
