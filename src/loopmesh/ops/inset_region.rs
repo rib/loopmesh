@@ -610,6 +610,20 @@ impl LoopMesh {
             self.face_attribs
                 .copy_into(face.as_usize(), s.face.as_usize());
 
+            // INSET.md §6.1 / §8.2.1.1: the wall inherits the tagged inset
+            // face's normal verbatim — not a normal recomputed from the wall
+            // quad's own (roughly perpendicular) plane. The depth pass (§8)
+            // runs after the walls exist and `shell_factor_at` (§8.2) iterates
+            // *all* incident faces of a seam corner, walls included. Carrying
+            // the inset face's normal makes each wall contribute the same
+            // per-face shell term as its source inset face instead of a
+            // near-tangent term the §8.2.3 guard would clamp to 1. The inset
+            // face's stored normal at this point is its pre-offset value
+            // (computed in phase two, never recomputed by the offset solver or
+            // phase four), which is the value §6.1 intends the wall to inherit.
+            let inset_face_normal = self.face_normal(s.face);
+            self.faces.get_mut(face).normal = inset_face_normal;
+
             // §6.2 wall loop customdata copy and §6.3 per-corner merge
             // bookkeeping — only when loop layers exist. Every wall loop sources
             // from the *tagged* inset face; the untagged neighbour never
@@ -2737,5 +2751,164 @@ mod tests {
             on_disp.length(),
             off_disp.length()
         );
+    }
+
+    #[test]
+    fn wall_inherits_inset_face_normal_not_geometric() {
+        // §6.1 / §8.2.1.1: each wall quad must carry a verbatim copy of its
+        // source tagged inset face's normal — NOT a normal recomputed from the
+        // wall's own (roughly perpendicular) plane. The tilted tent gives the
+        // two tagged faces normals that point up-and-outward, while each wall
+        // quad's own geometric plane is nearly vertical, so the inherited
+        // normal and a hypothetical geometric wall normal are far apart and the
+        // distinction is observable.
+        let tilt = 35.0_f32.to_radians();
+        let mut mesh = LoopMesh::new();
+        let (tagged_faces, _ridge_v0, _ridge_v1) = make_folded_strip(&mut mesh, tilt);
+
+        // Capture the two tagged inset faces' stored normals as they stand
+        // entering the wall-building phase — i.e. the pre-offset normals the
+        // operator computes in phase two and never recomputes. They are the
+        // values §6.1 says each wall must inherit.
+        mesh.calc_face_normals();
+        let tagged_normals: Vec<Vec3> =
+            tagged_faces.iter().map(|&f| mesh.face_normal(f)).collect();
+        for normal in &tagged_normals {
+            assert!(
+                normal.length() > 0.5 && normal.z > 0.0,
+                "tent fixture should give well-defined upward tagged normals; got {normal:?}"
+            );
+        }
+
+        let result = mesh.inset_region(
+            &tagged_faces,
+            InsetRegionParams {
+                thickness: 0.15,
+                depth: 0.4,
+                use_boundary: false,
+                use_even_offset: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert!(!result.wall_faces.is_empty(), "expected wall faces");
+
+        for &wall in &result.wall_faces {
+            let stored_normal = mesh.face_normal(wall);
+
+            // The stored normal must match one of the tagged inset faces'
+            // normals verbatim (the wall was spun from one of them).
+            let matches_inherited = tagged_normals
+                .iter()
+                .any(|inset_normal| (stored_normal - *inset_normal).length() < 1.0e-6);
+            assert!(
+                matches_inherited,
+                "wall stored normal {stored_normal:?} must equal a tagged inset face normal \
+                 verbatim; tagged normals = {tagged_normals:?}"
+            );
+
+            // And it must NOT be the wall's own geometric normal: that plane is
+            // near-vertical here, so its normal is near-perpendicular to the
+            // inherited (upward) normal. A geometric normal would have a tiny z
+            // component; the inherited one has a clearly positive z.
+            assert!(
+                stored_normal.z > 0.1,
+                "wall normal should be the inherited upward inset normal, not a near-vertical \
+                 geometric wall normal; got {stored_normal:?}"
+            );
+            let geometric_normal = mesh.face_compute_normal(wall);
+            assert!(
+                stored_normal.dot(geometric_normal).abs() < 0.5,
+                "inherited normal should be far from the wall's own geometric normal \
+                 (stored={stored_normal:?}, geometric={geometric_normal:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn wall_per_face_shell_term_equals_inset_face_term_not_clamp() {
+        // §8.2.1.1, the load-bearing invariant: in the shell-factor face set a
+        // wall quad stands in for the inset face it was spun from. Because the
+        // wall carries that face's normal verbatim, its per-face shell term
+        // `1/|dot(v.no, wall.no)|` equals the term the source inset face
+        // contributes — it neither dilutes nor sharpens the average.
+        //
+        // The bug this pins: a *geometric* wall normal is near-perpendicular to
+        // the inset face (and hence to the seam-corner `v.no`, which is close to
+        // the inset face's own normal), so `|dot|` is tiny and the §8.2.3
+        // near-tangent guard clamps the wall's term to a flat 1 — a *different*
+        // (and on a curved corner, smaller) value than the inset face's term.
+        let tilt = 35.0_f32.to_radians();
+        let mut mesh = LoopMesh::new();
+        let (tagged_faces, _r0, _r1) = make_folded_strip(&mut mesh, tilt);
+
+        let result = mesh.inset_region(
+            &tagged_faces,
+            InsetRegionParams {
+                thickness: 0.15,
+                depth: 0.4,
+                use_boundary: false,
+                use_even_offset: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert!(!result.wall_faces.is_empty(), "expected wall faces");
+
+        // The seam-corner move direction `v.no` is, by §8 steps 1–3, close to
+        // the tilted inset faces' normals; use the up-axis bisector of the two
+        // symmetric tent halves as a representative non-degenerate `v.no`.
+        let vertex_normal = Vec3::Z;
+
+        // Per-face shell term as `shell_factor_at` computes it (§8.2.2/§8.2.3).
+        let per_face_shell = |normal: Vec3| -> f32 {
+            let cosine = vertex_normal.dot(normal).abs();
+            if cosine < 1.0e-6 {
+                1.0
+            } else {
+                1.0 / cosine
+            }
+        };
+
+        for &wall in &result.wall_faces {
+            let wall_normal = mesh.face_normal(wall);
+            // The inset face whose normal this wall inherited.
+            let source_inset = tagged_faces
+                .iter()
+                .copied()
+                .find(|&f| (mesh.face_normal(f) - wall_normal).length() < 1.0e-6)
+                .expect("wall normal should match a source inset face normal");
+            let inset_normal = mesh.face_normal(source_inset);
+
+            // Invariant: the wall's per-face term equals its source inset
+            // face's term.
+            let wall_term = per_face_shell(wall_normal);
+            let inset_term = per_face_shell(inset_normal);
+            assert!(
+                (wall_term - inset_term).abs() < 1.0e-5,
+                "wall per-face shell term {wall_term} must equal the inset face term \
+                 {inset_term}"
+            );
+
+            // The choice of normal is load-bearing: the wall's own geometric
+            // normal produces a *different* per-face term, so a geometric-normal
+            // implementation would feed a different value into the average. The
+            // inherited rule deliberately makes the wall mirror the inset face
+            // instead of contributing this independent geometric term.
+            let geometric_term = per_face_shell(mesh.face_compute_normal(wall));
+            assert!(
+                (geometric_term - wall_term).abs() > 1.0e-3,
+                "a geometric wall normal would contribute a term ({geometric_term}) distinct \
+                 from the inherited one ({wall_term}); the inheritance rule is what aligns it \
+                 with the inset face"
+            );
+            // On this curved corner the inherited (inset-face) term genuinely
+            // exceeds the flat 1 — it is not a degenerate no-op.
+            assert!(
+                wall_term > 1.0 + 1.0e-4,
+                "the inherited inset-face term should exceed 1 on this curved corner; \
+                 got {wall_term}"
+            );
+        }
     }
 }
