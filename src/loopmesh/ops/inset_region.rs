@@ -5,6 +5,15 @@ use glam::{Vec2, Vec3};
 use super::mean_value::{mean_value_weights, PlaneProjection};
 use crate::loopmesh::*;
 
+/// Squared-distance tolerance for the corner customdata merge's value
+/// comparisons (INSET.md §6.3 step-5 note). Both the step-5 gate and the
+/// step-7 propagation value-match treat two math-layer values as equal when
+/// their squared distance is below this threshold — roughly `3.2e-3` units of
+/// separation for a two-component float layer. A byte-exact compare here is the
+/// documented byte-match killer: independently-rebaked float resamples that the
+/// operator should treat as identical differ in their low bits.
+const CORNER_MERGE_EPS_SQ: f32 = 1.0e-5;
+
 /// One snapshotted face's customdata baseline (INSET.md §4.5). Captured before
 /// the offset solver moves any corner so that phase four (§7) can resample the
 /// *original* corner attributes at the *new* corner positions.
@@ -1258,6 +1267,27 @@ impl LoopMesh {
         face_tag: crate::op_flags::FaceOpFlagLayer,
         wall_side_edges: &[WallSideEdge],
     ) {
+        // §6.3 runs once per manifold side edge per wall. At a fan hub the two
+        // arc-end walls share the moved corner, so two invocations key on the
+        // *same* two corner-pair loops with A/B swapped. The step-7 value-match
+        // must read the corner pair's values "as they stand at the moment the
+        // walk begins" — meaning the values they carried *into the merge* (their
+        // §7 rebake), never a sibling invocation's step-8 seed. A single
+        // sequential pass that writes step 8 in-place would let the first
+        // invocation's seed poison the second's value-match (it would compare
+        // against the merged midpoint and over-match the interior loops, the
+        // hub over-collapse the verified §6.3 note forbids).
+        //
+        // So all comparisons are decided in a planning pass that performs *no*
+        // writes — every gate, every midpoint source, every value-match reads
+        // the untouched §7 state — and the resulting writes are applied only
+        // afterward. Each invocation captures its behind-pair midpoint as a
+        // detached snapshot of the §7 values (immune to later writes), and each
+        // planned write names a destination loop and that snapshot.
+        let weights = [0.5_f32, 0.5_f32];
+        let mut behind_snapshots: Vec<SlotSnapshot> = Vec::new();
+        let mut planned: Vec<(LoopKey, usize)> = Vec::new();
+
         for side in wall_side_edges {
             // Face B is the side edge's radial-other face. The merge fires only
             // when `e_connect` is manifold (exactly wall A and one other face).
@@ -1317,43 +1347,47 @@ impl LoopMesh {
                 continue;
             }
 
-            // Step 5 — gate on the outer (rim) pair agreeing.
-            if !self.loop_cd_equal(outer_a, outer_b) {
+            // Step 5 — gate on the outer (rim) pair agreeing, using the
+            // *tolerant* per-layer comparator (§6.3 step-5 note): a math UV
+            // layer compares by squared distance, never byte-for-byte.
+            if !self
+                .loop_attribs
+                .slots_tolerant_equal(outer_a.as_usize(), outer_b.as_usize(), CORNER_MERGE_EPS_SQ)
+            {
                 continue;
             }
 
-            // Step 7's value-match guard compares against the inner pair's
-            // values *before* step 6 overwrites them. Cache both fingerprints
-            // now (read-after-write safety, §6.3 step 7).
-            let mut inner_a_premerge = Vec::new();
-            let mut inner_b_premerge = Vec::new();
-            self.loop_attribs
-                .write_fingerprint(inner_a.as_usize(), &mut inner_a_premerge);
-            self.loop_attribs
-                .write_fingerprint(inner_b.as_usize(), &mut inner_b_premerge);
-
-            // Step 6 — midpoint the BEHIND pair, write back to both behind loops
-            // and copy onto the inner pair so the corner loops at `v` agree.
-            let merged = self
-                .loop_attribs
-                .snapshot_slots(&[behind_a.as_usize(), behind_b.as_usize()]);
-            let weights = [0.5_f32, 0.5_f32];
-            for dst in [behind_a, behind_b, inner_a, inner_b] {
+            // Capture the behind-pair midpoint source from the untouched §7
+            // slots so the apply pass is immune to interleaved writes.
+            let behind = behind_snapshots.len();
+            behind_snapshots.push(
                 self.loop_attribs
-                    .interpolate_from_snapshot(dst.as_usize(), &merged, &weights);
-            }
+                    .snapshot_slots(&[behind_a.as_usize(), behind_b.as_usize()]),
+            );
+
+            // Step 6 — midpoint the BEHIND pair (both behind loops take the
+            // behind-pair midpoint).
+            planned.push((behind_a, behind));
+            planned.push((behind_b, behind));
 
             // §6.3.1 test (b): behind faces edge-adjacent through `v` → simple
-            // case, midpoint already covers the corner, no propagation.
+            // case, midpoint already covers the corner, no propagation. Still
+            // seed the corner pair (step 8).
             if self.faces_share_edge_through(inset_face_a, inset_face_b, side.moved_corner) {
+                planned.push((inner_a, behind));
+                planned.push((inner_b, behind));
                 continue;
             }
 
             // Step 7 — distinct and non-edge-adjacent: at least one further
             // tagged face sits between them around `v`. Overwrite every other
-            // tagged-region loop at `v` whose value still matches one of the two
-            // cached pre-merge inner fingerprints (the value-match guard keeps
-            // unrelated UV islands at the corner untouched).
+            // tagged-region loop at `v` whose value is *tolerant-equal* (the
+            // fuzzy predicate of the step-5 note, NOT a byte-compare) to one of
+            // the two comparison values — the corner pair as it stood entering
+            // the merge (read here from the untouched §7 slots). Loops further
+            // than epsilon from either comparison value are left at their
+            // §7-rebaked value (the merge does NOT collapse the whole hub —
+            // §6.3 step-8 verified note).
             let handled = [inner_a, inner_b, behind_a, behind_b];
             let corner_loops: Vec<LoopKey> = self.loops_at_vertex(side.moved_corner);
             for candidate in corner_loops {
@@ -1363,14 +1397,32 @@ impl LoopMesh {
                 if !self.face_op_flag_test(face_tag, self.loop_face(candidate), 0) {
                     continue;
                 }
-                let mut fingerprint = Vec::new();
-                self.loop_attribs
-                    .write_fingerprint(candidate.as_usize(), &mut fingerprint);
-                if fingerprint == inner_a_premerge || fingerprint == inner_b_premerge {
-                    self.loop_attribs
-                        .interpolate_from_snapshot(candidate.as_usize(), &merged, &weights);
+                let matches_a = self.loop_attribs.slots_tolerant_equal(
+                    candidate.as_usize(),
+                    inner_a.as_usize(),
+                    CORNER_MERGE_EPS_SQ,
+                );
+                let matches_b = self.loop_attribs.slots_tolerant_equal(
+                    candidate.as_usize(),
+                    inner_b.as_usize(),
+                    CORNER_MERGE_EPS_SQ,
+                );
+                if matches_a || matches_b {
+                    planned.push((candidate, behind));
                 }
             }
+
+            // Step 8 — seed the corner pair with the behind-pair midpoint.
+            planned.push((inner_a, behind));
+            planned.push((inner_b, behind));
+        }
+
+        // Apply pass — each destination loop is blended from its invocation's
+        // pre-captured behind-pair midpoint snapshot, so the order writes land
+        // in cannot corrupt any midpoint source.
+        for (dst, snap_idx) in planned {
+            self.loop_attribs
+                .interpolate_from_snapshot(dst.as_usize(), &behind_snapshots[snap_idx], &weights);
         }
     }
 
@@ -1465,23 +1517,13 @@ impl LoopMesh {
             .iter_descriptors()
             .any(|(_, desc)| matches!(desc.interp, InterpPolicy::Linear))
     }
-
-    /// Loop customdata equality test (byte-fingerprint) for the §6.3 outer-pair
-    /// gate.
-    fn loop_cd_equal(&self, a: LoopKey, b: LoopKey) -> bool {
-        let mut fa = Vec::new();
-        let mut fb = Vec::new();
-        self.loop_attribs.write_fingerprint(a.as_usize(), &mut fa);
-        self.loop_attribs.write_fingerprint(b.as_usize(), &mut fb);
-        fa == fb
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
 
-    use super::{InsetRegionParams, InsetRegionResult};
+    use super::{InsetRegionParams, InsetRegionResult, CORNER_MERGE_EPS_SQ};
     use crate::loopmesh::test_support::create_face_from_verts;
     use crate::loopmesh::*;
 
@@ -3326,19 +3368,155 @@ mod tests {
         out
     }
 
+    /// Build a *closed* triangle fan of `count` triangles around a single hub
+    /// vertex at the origin, ring verts on the unit circle. Returns
+    /// `(triangles, hub, rim)`. Mirrors the `disk_fan(n)` A/B fixture so the
+    /// in-crate tests pin the same hub-merge geometry the compat suite does.
+    fn make_closed_disk_fan(
+        mesh: &mut LoopMesh,
+        count: usize,
+    ) -> (Vec<FaceKey>, VertexKey, Vec<VertexKey>) {
+        let hub = mesh.create_vertex(Vec3::ZERO);
+        let mut rim = Vec::with_capacity(count);
+        for i in 0..count {
+            let angle = (i as f32) / (count as f32) * std::f32::consts::TAU;
+            rim.push(mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0)));
+        }
+        let mut triangles = Vec::with_capacity(count);
+        for i in 0..count {
+            let vs = [hub, rim[i], rim[(i + 1) % count]];
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            triangles.push(mesh.face_create(&vs, &[e0, e1, e2], FaceCreateFlags::NONE));
+        }
+        (triangles, hub, rim)
+    }
+
     #[test]
-    fn corner_merge_propagates_across_high_valence_moved_fan() {
-        // §6.3.1 canonical minimal fixture: a disk fan of eight triangles with
-        // five consecutive ones tagged. The hub is the moved two-seam boundary
-        // corner; phase five rings it with walls. With a continuous UV (so the
-        // outer-pair gate passes), the two arc-end walls midpoint their inner
-        // loops (steps 1–3), and step 4 must PROPAGATE that midpoint to the
-        // interior tagged hub loops between the two ends — leaving all five
-        // tagged hub-corner loops at one merged value. A step-4-less
-        // implementation would leave the three interior hub loops at their own
-        // independently-rebaked values.
+    fn corner_merge_closed_disk_fan_hub_keeps_interior_seven_values() {
+        // §6.3 corrected model on the closed disk_fan(8) the A/B suite pins
+        // (continuous non-affine UV, `use_boundary`/`use_even_offset`/
+        // `use_interpolate` on). The verified §6.3 note (and BMESH_PARITY.md
+        // row 316) is explicit: BMesh does NOT collapse the moved hub to one
+        // value. The merge runs the literal steps 1–8 with the tolerant
+        // comparator and reconciles only the loops steps 6–8 reach; the
+        // INTERIOR inset-face hub loops keep their own distinct §7-rebaked
+        // values. This regression-guards the over-collapse this cycle removed:
+        // an all-hub-collapse pass would force every interior loop equal.
+        //
+        // A six-of-eight arc is used because its §7 interior rebake lands
+        // GENUINELY distinct per-corner values (`u=x*y+x, v=x²−y²` is
+        // non-affine), so a collapse is observable as loss of that spread —
+        // unlike the symmetric four-of-eight arc, where the interior pair's §7
+        // value happens to coincide with the merge midpoint and a collapse is
+        // numerically indistinguishable from the correct result.
         let mut mesh = LoopMesh::new();
-        let (triangles, hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let (triangles, _hub, _rim) = make_closed_disk_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[0..6].to_vec();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
+
+        // Predict each interior inset face's STANDALONE §7 hub rebake (mean
+        // value resample at the moved hub) so we can assert the merge leaves it
+        // untouched. The interior faces are triangles[1..5].
+        let interior_faces: Vec<FaceKey> = triangles[1..5].to_vec();
+        let projection = PlaneProjection::from_normal(Vec3::Z);
+        let mut interior_proj: Vec<Vec<Vec2>> = Vec::new();
+        let mut interior_uv: Vec<Vec<[f32; 2]>> = Vec::new();
+        for &f in &interior_faces {
+            let mut proj = Vec::new();
+            let mut vals = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                let p = mesh.vertex_position(mesh.loop_vertex(l));
+                proj.push(projection.project(p));
+                vals.push(uv_fn(p));
+            }
+            interior_proj.push(proj);
+            interior_uv.push(vals);
+        }
+
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_fn(p));
+        }
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.2,
+                use_boundary: true,
+                use_even_offset: true,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        let hub_q = projection.project(mesh.vertex_position(moved_hub));
+
+        // Each interior face's hub loop must still hold its own §7 rebake — the
+        // merge's step-7 tolerant walk does NOT reach it (its rebaked value is
+        // farther than ε from either arc-end comparison value), so it is left
+        // alone. A collapse pass would overwrite it with the hub midpoint.
+        for (idx, &f) in interior_faces.iter().enumerate() {
+            let predicted = expected_blend2(&interior_proj[idx], &interior_uv[idx], hub_q);
+            let got = tagged_corner_uvs_at(&mesh, moved_hub, &[f], uv);
+            assert_eq!(got.len(), 1, "one hub loop per interior face");
+            let u = got[0];
+            assert!(
+                (u[0] - predicted[0]).abs() < 1.0e-3 && (u[1] - predicted[1]).abs() < 1.0e-3,
+                "interior hub loop must keep its §7 rebake {predicted:?}; got {u:?} \
+                 (a collapse pass would force it to the hub midpoint)"
+            );
+        }
+
+        // And the hub as a whole must carry several distinct values, never one.
+        let hub_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &tagged, uv);
+        let mut distinct: Vec<[f32; 2]> = Vec::new();
+        for u in &hub_uvs {
+            if !distinct
+                .iter()
+                .any(|d| (d[0] - u[0]).powi(2) + (d[1] - u[1]).powi(2) < CORNER_MERGE_EPS_SQ)
+            {
+                distinct.push(*u);
+            }
+        }
+        assert!(
+            distinct.len() > 1,
+            "closed disk-fan hub must keep multiple distinct UVs, not collapse to \
+             one; got {hub_uvs:?} -> {} distinct",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    #[test]
+    fn corner_merge_high_valence_fan_leaves_multiple_distinct_hub_values() {
+        // §6.3 / §6.3.1 (corrected model). A disk fan of eight triangles with
+        // five consecutive ones tagged. The hub is the moved two-seam boundary
+        // corner; phase five rings it with two arc-end walls. With a *non-affine*
+        // continuous UV the §7 rebake lands a DISTINCT per-corner value on each
+        // of the five tagged hub loops, and the merge runs the literal steps 1–8
+        // with the TOLERANT comparator (squared distance < 1e-5):
+        //
+        //   - the two arc-end inset faces' hub loops are the behind pair of the
+        //     two hub invocations and are midpointed (here, symmetric → left at
+        //     their equal §7 value);
+        //   - interior hub loops are reconciled only where the tolerant step-7
+        //     walk reaches them; loops outside epsilon stay at their §7 value.
+        //
+        // The corrected guide verifies BMesh leaves the hub carrying SEVERAL
+        // distinct UVs, NOT one merged value. A regression that re-adds an
+        // all-hub-collapse pass would force them all equal; this test fails it.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
         let tagged: Vec<FaceKey> = triangles[2..7].to_vec(); // five consecutive
 
         let uv = mesh
@@ -3347,12 +3525,13 @@ mod tests {
                 Format::new(ComponentType::F32, 2),
             ))
             .unwrap();
-        // Continuous per-position UV → every loop at a shared vertex agrees,
-        // so the §6.3 outer-pair-equality gate passes at the hub.
+        // Continuous (gate-passing) but non-affine UV so each tagged triangle
+        // rebakes the hub corner to its own value.
+        let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
         let loops: Vec<LoopKey> = mesh.loops.iter().collect();
         for l in loops {
             let p = mesh.vertex_position(mesh.loop_vertex(l));
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_fn(p));
         }
 
         let result = mesh.inset_region(
@@ -3365,12 +3544,8 @@ mod tests {
             },
         );
         mesh.validate_topology();
-        // Two arc-end seam spokes → two walls.
         assert_eq!(result.wall_faces.len(), 2);
 
-        // The five contiguous tagged faces share one moved hub vertex after
-        // the two-seam offset. Read every tagged hub-corner loop's UV there.
-        let _ = hub;
         let moved_hub = shared_vertex_of(&mesh, &tagged);
         assert!(
             mesh.vertex_position(moved_hub).length() > 1.0e-6,
@@ -3378,93 +3553,78 @@ mod tests {
         );
 
         let hub_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &tagged, uv);
-        // All five tagged faces contribute one hub-corner loop.
         assert_eq!(hub_uvs.len(), 5, "five tagged hub corners expected");
-        let first = hub_uvs[0];
-        assert!(
-            hub_uvs
+
+        // Count distinct hub values under the tolerant predicate. The corrected
+        // model leaves MORE THAN ONE distinct value; a collapse pass would leave
+        // exactly one.
+        let mut distinct: Vec<[f32; 2]> = Vec::new();
+        for u in &hub_uvs {
+            if !distinct
                 .iter()
-                .all(|u| (u[0] - first[0]).abs() < 1.0e-6 && (u[1] - first[1]).abs() < 1.0e-6),
-            "step 4 must propagate the merged midpoint to every tagged hub loop; got {hub_uvs:?}"
+                .any(|d| (d[0] - u[0]).powi(2) + (d[1] - u[1]).powi(2) < CORNER_MERGE_EPS_SQ)
+            {
+                distinct.push(*u);
+            }
+        }
+        assert!(
+            distinct.len() > 1,
+            "high-valence fan hub must keep multiple distinct UVs (not a single \
+             collapsed value); got {hub_uvs:?} -> {} distinct",
+            distinct.len()
         );
     }
 
     #[test]
-    fn corner_merge_value_pins_propagated_midpoint() {
-        // Stronger than equality: the propagated value must be exactly the
-        // midpoint of the two arc-end inner loops' pre-merge (rebaked) UVs.
-        // We pin the numeric outcome so a regression that propagates the wrong
-        // value (e.g. one arc end's value instead of the midpoint) is caught.
+    fn corner_merge_tolerant_gate_passes_within_epsilon() {
+        // The step-5 gate uses a tolerant (squared-distance < 1e-5) compare, not
+        // a byte fingerprint. Two rim loops whose UVs differ only by float noise
+        // below epsilon must still pass the gate so the merge fires. We pin this
+        // directly on the comparator to guard the documented byte-match killer.
         let mut mesh = LoopMesh::new();
-        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
-        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
-
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
                 Format::new(ComponentType::F32, 2),
             ))
             .unwrap();
-        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
-        for l in loops {
-            let p = mesh.vertex_position(mesh.loop_vertex(l));
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
-        }
-
-        // Snapshot the hub-corner loops of the two arc-END tagged faces. Their
-        // post-§7 rebaked UVs are the two inner values whose midpoint step 4
-        // forces onto every tagged hub loop. Loop keys are stable, so capture
-        // them now and read back the rebaked values afterward.
-        let end_faces = [triangles[2], triangles[6]];
-        let mut end_hub_loops = Vec::new();
-        for &f in &end_faces {
+        // Two loops on a throwaway triangle so we have valid slots to write.
+        let f = create_face_from_verts(&mut mesh, &[Vec3::ZERO, Vec3::X, Vec3::Y]);
+        let face_loops: Vec<LoopKey> = {
+            let mut out = Vec::new();
             let mut it = mesh.face_loops(f);
             while let Some(l) = it.next(&mesh) {
-                if mesh.vertex_position(mesh.loop_vertex(l)).length() < 1.0e-9 {
-                    end_hub_loops.push(l);
-                }
+                out.push(l);
             }
-        }
-        assert_eq!(end_hub_loops.len(), 2);
+            out
+        };
+        let (a, b) = (face_loops[0], face_loops[1]);
 
-        mesh.inset_region(
-            &tagged,
-            InsetRegionParams {
-                thickness: 0.1,
-                use_boundary: false,
-                use_interpolate: true,
-                ..Default::default()
-            },
-        );
-        mesh.validate_topology();
-
-        // After the merge, the two end-face hub loops both hold the midpoint of
-        // their two pre-merge values. They are equal to each other (step 3) and
-        // equal to the midpoint. Read them back and confirm they agree, then
-        // confirm every tagged hub loop equals that same value (step 4).
-        let merged_a = mesh
-            .loop_attribs()
-            .get_vec2(uv, end_hub_loops[0].as_usize())
-            .unwrap();
-        let merged_b = mesh
-            .loop_attribs()
-            .get_vec2(uv, end_hub_loops[1].as_usize())
-            .unwrap();
+        // Within epsilon: separation 1e-3 → squared distance 1e-6 < 1e-5.
+        mesh.loop_attribs_mut().set_vec2(uv, a.as_usize(), [0.5, 0.5]);
+        mesh.loop_attribs_mut()
+            .set_vec2(uv, b.as_usize(), [0.5 + 1.0e-3, 0.5]);
         assert!(
-            (merged_a[0] - merged_b[0]).abs() < 1.0e-6
-                && (merged_a[1] - merged_b[1]).abs() < 1.0e-6,
-            "the two arc-end inner loops must midpoint to one value; {merged_a:?} {merged_b:?}"
+            mesh.loop_attribs().slots_tolerant_equal(
+                a.as_usize(),
+                b.as_usize(),
+                CORNER_MERGE_EPS_SQ
+            ),
+            "values within epsilon must compare tolerant-equal (a byte compare \
+             would reject them)"
         );
 
-        let moved_hub = mesh.loop_vertex(end_hub_loops[0]);
-        let hub_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &tagged, uv);
-        assert_eq!(hub_uvs.len(), 5);
-        for u in &hub_uvs {
-            assert!(
-                (u[0] - merged_a[0]).abs() < 1.0e-6 && (u[1] - merged_a[1]).abs() < 1.0e-6,
-                "every tagged hub loop must equal the merged midpoint {merged_a:?}; got {u:?}"
-            );
-        }
+        // Beyond epsilon: separation 0.1 → squared distance 1e-2 > 1e-5.
+        mesh.loop_attribs_mut()
+            .set_vec2(uv, b.as_usize(), [0.6, 0.5]);
+        assert!(
+            !mesh.loop_attribs().slots_tolerant_equal(
+                a.as_usize(),
+                b.as_usize(),
+                CORNER_MERGE_EPS_SQ
+            ),
+            "values beyond epsilon must compare unequal"
+        );
     }
 
     #[test]

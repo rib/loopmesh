@@ -1415,6 +1415,107 @@ impl ElementAttributes {
         }
     }
 
+    /// Tolerant per-layer equality of two element slots, used by the corner
+    /// customdata merge (see `INSET.md` §6.3 step-5 note). Unlike
+    /// [`write_fingerprint`](Self::write_fingerprint), which is a byte-exact
+    /// serialisation, this compares each layer under its *own* equality
+    /// predicate:
+    ///
+    /// - **Math (float) layers** — descriptors whose interp policy is the
+    ///   fractional [`Linear`](InterpPolicy::Linear) blend — compare by
+    ///   **squared distance across components**, treating the two slots as
+    ///   equal when that squared distance is below `tolerance_sq`. Two
+    ///   independently-rebaked resamples that the operator should treat as
+    ///   "the same value" differ only in their low float bits, so a byte
+    ///   compare would spuriously call them unequal; the tolerant compare is
+    ///   what the merge gate and the propagation value-match both need.
+    /// - **Every other layer** (nearest-policy integers, strings, copy-first)
+    ///   compares **exactly** — a nearest-policy integer has no intermediate
+    ///   value, so its equality is bitwise.
+    ///
+    /// Returns `true` only if *all* layers agree under their respective
+    /// predicate.
+    pub fn slots_tolerant_equal(&self, a: usize, b: usize, tolerance_sq: f32) -> bool {
+        for (_, desc) in self.iter_descriptors() {
+            let is_math = matches!(desc.interp, InterpPolicy::Linear);
+            let equal = match desc.storage {
+                AttributeStorage::F32(bucket) if is_math => {
+                    let s = self.f32_bucket(bucket);
+                    match (s.and_then(|v| v.get(a)), s.and_then(|v| v.get(b))) {
+                        (Some(va), Some(vb)) => {
+                            let d = va - vb;
+                            d * d <= tolerance_sq
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+                }
+                AttributeStorage::Vec2(bucket) if is_math => {
+                    self.vec_lanes_within(self.vec2_bucket(bucket), a, b, tolerance_sq)
+                }
+                AttributeStorage::Vec3(bucket) if is_math => {
+                    self.vec_lanes_within(self.vec3_bucket(bucket), a, b, tolerance_sq)
+                }
+                AttributeStorage::Vec4(bucket) if is_math => {
+                    self.vec_lanes_within(self.vec4_bucket(bucket), a, b, tolerance_sq)
+                }
+                _ => {
+                    // Non-math layer: exact per-layer compare (no allocation).
+                    self.slot_layer_exact_equal(desc, a, b)
+                }
+            };
+            if !equal {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn vec_lanes_within<const N: usize>(
+        &self,
+        bucket: Option<&[[f32; N]]>,
+        a: usize,
+        b: usize,
+        tolerance_sq: f32,
+    ) -> bool {
+        match (bucket.and_then(|s| s.get(a)), bucket.and_then(|s| s.get(b))) {
+            (Some(va), Some(vb)) => {
+                let mut acc = 0.0_f32;
+                for lane in 0..N {
+                    let d = va[lane] - vb[lane];
+                    acc += d * d;
+                }
+                acc <= tolerance_sq
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Exact (bitwise for floats, value-wise otherwise) equality of one
+    /// attribute layer at two slots, allocation-free. Used by the non-math
+    /// branch of [`slots_tolerant_equal`]. A missing value on both slots
+    /// counts as equal; on only one, unequal.
+    fn slot_layer_exact_equal(&self, desc: &ElementAttributeDesc, a: usize, b: usize) -> bool {
+        fn pair_eq<T: PartialEq>(bucket: Option<&[T]>, a: usize, b: usize) -> bool {
+            match (bucket.and_then(|s| s.get(a)), bucket.and_then(|s| s.get(b))) {
+                (Some(va), Some(vb)) => va == vb,
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        match desc.storage {
+            AttributeStorage::U8(bk) => pair_eq(self.u8_bucket(bk), a, b),
+            AttributeStorage::I32(bk) => pair_eq(self.i32_bucket(bk), a, b),
+            AttributeStorage::U32(bk) => pair_eq(self.u32_bucket(bk), a, b),
+            AttributeStorage::F32(bk) => pair_eq(self.f32_bucket(bk), a, b),
+            AttributeStorage::Vec2(bk) => pair_eq(self.vec2_bucket(bk), a, b),
+            AttributeStorage::Vec3(bk) => pair_eq(self.vec3_bucket(bk), a, b),
+            AttributeStorage::Vec4(bk) => pair_eq(self.vec4_bucket(bk), a, b),
+            AttributeStorage::String(bk) => pair_eq(self.string_bucket(bk), a, b),
+        }
+    }
+
     // ----- Customdata interpolation primitives -----
 
     /// Interpolate every attribute into `dst_slot` from a weighted blend of
