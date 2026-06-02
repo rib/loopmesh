@@ -15,6 +15,7 @@ mod collapse;
 mod connect_vert_pair;
 mod connect_verts;
 mod connect_verts_concave;
+mod connect_verts_nonplanar;
 mod delete;
 mod dissolve_degenerate;
 mod dissolve_edges;

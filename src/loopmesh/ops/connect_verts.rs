@@ -355,7 +355,7 @@ impl LoopMesh {
 }
 
 /// Signed area of the 2D polygon (positive for CCW winding).
-fn signed_area(poly: &[Vec2]) -> f32 {
+pub(crate) fn signed_area(poly: &[Vec2]) -> f32 {
     let n = poly.len();
     let mut sum = 0.0_f32;
     for i in 0..n {
@@ -394,7 +394,7 @@ fn polygon_is_convex(poly: &[Vec2]) -> bool {
 /// diagonal of the projected polygon `poly`: it stays inside the polygon
 /// (it is in the interior cone at each endpoint) and crosses no perimeter
 /// edge (CONNECT_VERTS.md §5.2).
-fn is_interior_diagonal(poly: &[Vec2], n: usize, ia: usize, ib: usize) -> bool {
+pub(crate) fn is_interior_diagonal(poly: &[Vec2], n: usize, ia: usize, ib: usize) -> bool {
     if ia == ib {
         return false;
     }
