@@ -10,6 +10,7 @@
 
 mod bisect_edges;
 mod bisect_plane;
+mod bridge_loops;
 mod collapse;
 mod connect_vert_pair;
 mod connect_verts;
@@ -45,6 +46,7 @@ mod weld_verts;
 
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
+pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
