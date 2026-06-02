@@ -697,7 +697,7 @@ impl LoopMesh {
         // by a nearest/winner-take-one policy) must not be midpointed, so a
         // mesh carrying only such layers skips the merge entirely.
         if params.use_interpolate && do_loop_interp && self.has_loop_math_layer() {
-            self.inset_merge_corner_loops(&corner_records);
+            self.inset_merge_corner_loops(face_tag, &corner_records);
         }
 
         // Phase 6: depth pass (INSET.md §8). Lift every tagged-region vertex
@@ -1172,10 +1172,18 @@ impl LoopMesh {
     /// INSET.md §6.3 — merge per-corner loop customdata where two wall faces
     /// meet at a shared tagged corner. For each corner with exactly two walls:
     /// gate on the two outer (untagged) loops being equal (no pre-existing UV
-    /// seam), then write the midpoint of the two inner (tagged inset) loops to
-    /// both inner loops and to both walls' inner-edge loops.
-    fn inset_merge_corner_loops(&mut self, corner_records: &HashMap<VertexKey, Vec<CornerLoop>>) {
-        for records in corner_records.values() {
+    /// seam), midpoint the two inner (tagged inset) loops and write that
+    /// midpoint to both inner loops and both walls' inner-edge loops (steps
+    /// 1–3), then — when the corner's two one-deeper inset-behind faces are
+    /// distinct and non-edge-adjacent around the corner (§6.3.1) — propagate
+    /// that midpoint to every other tagged-region loop at the corner whose
+    /// value still matches one of the two *pre-merge* inner values (step 4).
+    fn inset_merge_corner_loops(
+        &mut self,
+        face_tag: crate::op_flags::FaceOpFlagLayer,
+        corner_records: &HashMap<VertexKey, Vec<CornerLoop>>,
+    ) {
+        for (&corner, records) in corner_records {
             if records.len() != 2 {
                 // The four-loop find of §6.3 is defined for exactly the two
                 // walls meeting at a corner. Lone walls (boundary) and
@@ -1197,19 +1205,169 @@ impl LoopMesh {
                 _ => continue,
             }
 
-            // Midpoint of the two inner (tagged inset) loop values. Snapshot
-            // the two source corners first so the in-place writes below don't
+            // Step 4's value-match guard compares against the inner loops'
+            // values *as they stood before step 3 overwrote them in place*.
+            // Capture both fingerprints up front (the read-after-write hazard
+            // of §6.3 step 3/4): reading them after the midpoint write would
+            // compare against the merged midpoint instead and poison the match.
+            // Only the step-3 *write* moves to the behind pair (below); the
+            // step-4 guard stays anchored on the pre-merge inner values.
+            let mut inner_a_premerge = Vec::new();
+            let mut inner_b_premerge = Vec::new();
+            self.loop_attribs
+                .write_fingerprint(a.tagged_src.as_usize(), &mut inner_a_premerge);
+            self.loop_attribs
+                .write_fingerprint(b.tagged_src.as_usize(), &mut inner_b_premerge);
+
+            // Step 3 — step one face deeper from each inner loop across the
+            // inset face's *inner* edge at the corner (the edge that is not the
+            // connecting wall edge) to the radial-other loop anchored at the
+            // same corner — `behind_a` and `behind_b` (INSET.md §6.3 step 3).
+            // The step-3 midpoint is taken from the *behind* pair, not the
+            // inner pair: on a flat grid the two coincide, but at a moved
+            // high-valence hub they are materially different points and the
+            // guide uses the behind pair.
+            let behind_a = self.inset_behind_loop(a, corner);
+            let behind_b = self.inset_behind_loop(b, corner);
+            let (behind_a, behind_b) = match (behind_a, behind_b) {
+                (Some(la), Some(lb)) => (la, lb),
+                _ => continue,
+            };
+            let face_a = self.loop_face(behind_a);
+            let face_b = self.loop_face(behind_b);
+
+            // §6.3 step 4 first bullet / §6.3.1 test (a): when the two behind
+            // loops lie on the same face they are the same corner loop, so the
+            // midpoint would be a no-op; the invocation returns before touching
+            // anything (no inner, behind, or wall write).
+            if face_a == face_b {
+                continue;
+            }
+
+            // Step 3 write: midpoint of the two *behind* loop values, written
+            // back to both behind loops and copied onto both inner loops, plus
+            // (step 5) both walls' inner-edge loops so the wall corner agrees.
+            // Snapshot the two behind corners first so the in-place writes don't
             // feed back through the still-being-read source slots.
-            let snapshot = self
+            let merged = self
                 .loop_attribs
-                .snapshot_slots(&[a.tagged_src.as_usize(), b.tagged_src.as_usize()]);
+                .snapshot_slots(&[behind_a.as_usize(), behind_b.as_usize()]);
             let weights = [0.5_f32, 0.5_f32];
-            // Write into both inner loops and both walls' inner-edge loops.
-            for dst in [a.tagged_src, b.tagged_src, a.wall_loop, b.wall_loop] {
+            for dst in [
+                behind_a,
+                behind_b,
+                a.tagged_src,
+                b.tagged_src,
+                a.wall_loop,
+                b.wall_loop,
+            ] {
                 self.loop_attribs
-                    .interpolate_from_snapshot(dst.as_usize(), &snapshot, &weights);
+                    .interpolate_from_snapshot(dst.as_usize(), &merged, &weights);
+            }
+
+            // §6.3 step 4 second bullet / §6.3.1 test (b): the two behind-faces
+            // are edge-adjacent through the corner → the step-3 midpoint already
+            // covers every loop here, no propagation needed.
+            if self.faces_share_edge_through(face_a, face_b, corner) {
+                continue;
+            }
+
+            // (iii) Distinct and non-edge-adjacent → at least one further
+            // tagged face sits between them in the fan around the corner.
+            // Walk every loop incident to the corner and overwrite each
+            // tagged-region loop — other than the four already handled — whose
+            // value still equals one of the two cached pre-merge inner values.
+            let handled = [a.tagged_src, b.tagged_src, behind_a, behind_b];
+            let corner_loops: Vec<LoopKey> = self.loops_at_vertex(corner);
+            for candidate in corner_loops {
+                if handled.contains(&candidate) {
+                    continue;
+                }
+                if !self.face_op_flag_test(face_tag, self.loop_face(candidate), 0) {
+                    continue;
+                }
+                let mut fingerprint = Vec::new();
+                self.loop_attribs
+                    .write_fingerprint(candidate.as_usize(), &mut fingerprint);
+                if fingerprint == inner_a_premerge || fingerprint == inner_b_premerge {
+                    self.loop_attribs
+                        .interpolate_from_snapshot(candidate.as_usize(), &merged, &weights);
+                }
             }
         }
+    }
+
+    /// INSET.md §6.3 step 3 — the loop "one face deeper" from a corner's inner
+    /// (tagged inset) loop. From the inset face's loop at `corner`, follow the
+    /// face's *inner* edge — the corner-incident edge that is **not** the
+    /// connecting wall edge (`loop_edge(record.wall_loop)`) — to its
+    /// radial-other loop anchored at `corner`. Returns `None` when no such loop
+    /// exists (the inner edge is on the mesh boundary with no face behind it).
+    fn inset_behind_loop(&self, record: &CornerLoop, corner: VertexKey) -> Option<LoopKey> {
+        let inner = record.tagged_src;
+        let inset_face = self.loop_face(inner);
+        let connecting_edge = self.loop_edge(record.wall_loop);
+
+        // The two corner-incident edges of `inner`: its forward edge and the
+        // edge of its predecessor loop. One is the connecting wall edge; the
+        // other is the inner edge to step across.
+        let forward_edge = self.loop_edge(inner);
+        let backward_edge = self.loop_edge(self.loop_prev(inner));
+        let inner_edge = if forward_edge == connecting_edge {
+            backward_edge
+        } else {
+            forward_edge
+        };
+
+        for behind in self.edge_radial_iter(inner_edge).collect::<Vec<_>>() {
+            if self.loop_face(behind) == inset_face {
+                continue;
+            }
+            if self.loop_vertex(behind) == corner {
+                return Some(behind);
+            }
+        }
+        None
+    }
+
+    /// INSET.md §6.3.1 test (b) — whether two distinct faces are edge-adjacent
+    /// through `corner`: they share one of `corner`'s incident edges.
+    fn faces_share_edge_through(&self, face_a: FaceKey, face_b: FaceKey, corner: VertexKey) -> bool {
+        for edge in self.vertex_disk_iter(corner).collect::<Vec<_>>() {
+            let mut on_a = false;
+            let mut on_b = false;
+            for loop_key in self.edge_radial_iter(edge).collect::<Vec<_>>() {
+                let face = self.loop_face(loop_key);
+                on_a |= face == face_a;
+                on_b |= face == face_b;
+            }
+            if on_a && on_b {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every face-corner loop anchored at `vertex` — one per face incident to
+    /// `vertex`. Walks the disk and each spoke's radial fan, keeping the loop
+    /// whose own vertex is `vertex`, deduplicated by face.
+    fn loops_at_vertex(&self, vertex: VertexKey) -> Vec<LoopKey> {
+        let mut result: Vec<LoopKey> = Vec::new();
+        let mut seen_faces: Vec<FaceKey> = Vec::new();
+        for edge in self.vertex_disk_iter(vertex).collect::<Vec<_>>() {
+            for loop_key in self.edge_radial_iter(edge).collect::<Vec<_>>() {
+                if self.loop_vertex(loop_key) != vertex {
+                    continue;
+                }
+                let face = self.loop_face(loop_key);
+                if seen_faces.contains(&face) {
+                    continue;
+                }
+                seen_faces.push(face);
+                result.push(loop_key);
+            }
+        }
+        result
     }
 
     /// INSET.md §6.3 corner-merge gate — true iff at least one registered
@@ -2910,5 +3068,406 @@ mod tests {
                  got {wall_term}"
             );
         }
+    }
+
+    // ---- §6.3 step 4: corner CD-merge propagation around a high-valence
+    //      moved boundary corner (INSET.md §6.3.1) ----
+
+    /// Build an *open* triangle fan of `count` triangles sharing a single hub
+    /// vertex at the origin. The rim verts lie on a half-circle arc so the
+    /// outermost spokes and the rim form the mesh boundary; each triangle is
+    /// `(hub, rim[i], rim[i+1])`. Returns `(triangles, hub, rim)`.
+    fn make_triangle_fan(
+        mesh: &mut LoopMesh,
+        count: usize,
+    ) -> (Vec<FaceKey>, VertexKey, Vec<VertexKey>) {
+        let hub = mesh.create_vertex(Vec3::ZERO);
+        let mut rim = Vec::with_capacity(count + 1);
+        for i in 0..=count {
+            // Spread the arc over (0, π) so neighbouring spokes are distinct
+            // directions and the fan stays open (a mesh-boundary rim).
+            let t = (i as f32 + 1.0) / (count as f32 + 2.0);
+            let angle = t * std::f32::consts::PI;
+            rim.push(mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0)));
+        }
+        let mut triangles = Vec::with_capacity(count);
+        for i in 0..count {
+            let vs = [hub, rim[i], rim[i + 1]];
+            let e0 = mesh.create_edge([vs[0], vs[1]], EdgeCreateFlags::NO_DUPLICATE);
+            let e1 = mesh.create_edge([vs[1], vs[2]], EdgeCreateFlags::NO_DUPLICATE);
+            let e2 = mesh.create_edge([vs[2], vs[0]], EdgeCreateFlags::NO_DUPLICATE);
+            triangles.push(mesh.face_create(&vs, &[e0, e1, e2], FaceCreateFlags::NONE));
+        }
+        (triangles, hub, rim)
+    }
+
+    /// The single vertex shared by every face in `faces` (the moved hub of a
+    /// contiguous tagged fan after inset). Panics if there is not exactly one.
+    fn shared_vertex_of(mesh: &LoopMesh, faces: &[FaceKey]) -> VertexKey {
+        let mut counts: std::collections::HashMap<VertexKey, usize> =
+            std::collections::HashMap::new();
+        for &f in faces {
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(mesh) {
+                *counts.entry(mesh.loop_vertex(l)).or_default() += 1;
+            }
+        }
+        let shared: Vec<VertexKey> = counts
+            .into_iter()
+            .filter(|&(_, c)| c == faces.len())
+            .map(|(v, _)| v)
+            .collect();
+        assert_eq!(shared.len(), 1, "expected exactly one shared hub vertex");
+        shared[0]
+    }
+
+    /// The UVs of every tagged-region loop anchored at `vertex` after the
+    /// inset (one per face in `tagged_faces` touching `vertex`).
+    fn tagged_corner_uvs_at(
+        mesh: &LoopMesh,
+        vertex: VertexKey,
+        tagged_faces: &[FaceKey],
+        uv: ElementAttributeKey,
+    ) -> Vec<[f32; 2]> {
+        let mut out = Vec::new();
+        for &f in tagged_faces {
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(mesh) {
+                if mesh.loop_vertex(l) == vertex {
+                    out.push(mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn corner_merge_propagates_across_high_valence_moved_fan() {
+        // §6.3.1 canonical minimal fixture: a disk fan of eight triangles with
+        // five consecutive ones tagged. The hub is the moved two-seam boundary
+        // corner; phase five rings it with walls. With a continuous UV (so the
+        // outer-pair gate passes), the two arc-end walls midpoint their inner
+        // loops (steps 1–3), and step 4 must PROPAGATE that midpoint to the
+        // interior tagged hub loops between the two ends — leaving all five
+        // tagged hub-corner loops at one merged value. A step-4-less
+        // implementation would leave the three interior hub loops at their own
+        // independently-rebaked values.
+        let mut mesh = LoopMesh::new();
+        let (triangles, hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec(); // five consecutive
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        // Continuous per-position UV → every loop at a shared vertex agrees,
+        // so the §6.3 outer-pair-equality gate passes at the hub.
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+        }
+
+        let result = mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        // Two arc-end seam spokes → two walls.
+        assert_eq!(result.wall_faces.len(), 2);
+
+        // The five contiguous tagged faces share one moved hub vertex after
+        // the two-seam offset. Read every tagged hub-corner loop's UV there.
+        let _ = hub;
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        assert!(
+            mesh.vertex_position(moved_hub).length() > 1.0e-6,
+            "hub should have moved inward off the origin"
+        );
+
+        let hub_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &tagged, uv);
+        // All five tagged faces contribute one hub-corner loop.
+        assert_eq!(hub_uvs.len(), 5, "five tagged hub corners expected");
+        let first = hub_uvs[0];
+        assert!(
+            hub_uvs
+                .iter()
+                .all(|u| (u[0] - first[0]).abs() < 1.0e-6 && (u[1] - first[1]).abs() < 1.0e-6),
+            "step 4 must propagate the merged midpoint to every tagged hub loop; got {hub_uvs:?}"
+        );
+    }
+
+    #[test]
+    fn corner_merge_value_pins_propagated_midpoint() {
+        // Stronger than equality: the propagated value must be exactly the
+        // midpoint of the two arc-end inner loops' pre-merge (rebaked) UVs.
+        // We pin the numeric outcome so a regression that propagates the wrong
+        // value (e.g. one arc end's value instead of the midpoint) is caught.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+        }
+
+        // Snapshot the hub-corner loops of the two arc-END tagged faces. Their
+        // post-§7 rebaked UVs are the two inner values whose midpoint step 4
+        // forces onto every tagged hub loop. Loop keys are stable, so capture
+        // them now and read back the rebaked values afterward.
+        let end_faces = [triangles[2], triangles[6]];
+        let mut end_hub_loops = Vec::new();
+        for &f in &end_faces {
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                if mesh.vertex_position(mesh.loop_vertex(l)).length() < 1.0e-9 {
+                    end_hub_loops.push(l);
+                }
+            }
+        }
+        assert_eq!(end_hub_loops.len(), 2);
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // After the merge, the two end-face hub loops both hold the midpoint of
+        // their two pre-merge values. They are equal to each other (step 3) and
+        // equal to the midpoint. Read them back and confirm they agree, then
+        // confirm every tagged hub loop equals that same value (step 4).
+        let merged_a = mesh
+            .loop_attribs()
+            .get_vec2(uv, end_hub_loops[0].as_usize())
+            .unwrap();
+        let merged_b = mesh
+            .loop_attribs()
+            .get_vec2(uv, end_hub_loops[1].as_usize())
+            .unwrap();
+        assert!(
+            (merged_a[0] - merged_b[0]).abs() < 1.0e-6
+                && (merged_a[1] - merged_b[1]).abs() < 1.0e-6,
+            "the two arc-end inner loops must midpoint to one value; {merged_a:?} {merged_b:?}"
+        );
+
+        let moved_hub = mesh.loop_vertex(end_hub_loops[0]);
+        let hub_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &tagged, uv);
+        assert_eq!(hub_uvs.len(), 5);
+        for u in &hub_uvs {
+            assert!(
+                (u[0] - merged_a[0]).abs() < 1.0e-6 && (u[1] - merged_a[1]).abs() < 1.0e-6,
+                "every tagged hub loop must equal the merged midpoint {merged_a:?}; got {u:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "blocked: the §6.3 corner merge never runs on the fan — its \
+                outer-pair gate (step 1/2) resolves `outer_src` to the far/rim \
+                vertex rather than the merge corner `v`, so `loop_cd_equal` is \
+                false and the invocation skips before reaching step 3. The \
+                step-3 behind-pair fix is in place and correct per INSET.md \
+                §6.3, but cannot be exercised until the merge's loop-finding \
+                model (which corner / which connecting edge / outer loops) is \
+                fixed. See INSET.md §6.3 step 1-2."]
+    fn corner_merge_step3_midpoints_behind_pair_not_inner_pair() {
+        // §6.3 step 3 discriminator: the step-3 midpoint must be taken from the
+        // two *behind* loops (one face deeper from each arc end — F2 and F(k-1)),
+        // NOT from the two arc-end *inner* loops. On a flat position-keyed UV the
+        // two midpoints coincide, hiding the distinction; here we assign a
+        // per-face-CONSTANT UV so the inner pair and the behind pair carry
+        // genuinely different values, making the choice observable.
+        //
+        // A per-face-constant layer rebakes to identity under §7 (the mean-value
+        // blend of equal corner values is that value), so each face's hub-corner
+        // loop keeps its own constant. Disk fan of eight triangles, five
+        // consecutive tagged (triangles[2..7]):
+        //   - arc-end inset faces  = triangles[2], triangles[6]  → inner constant
+        //   - their behind faces   = triangles[3], triangles[5]  → behind constant
+        //   - the centre face      = triangles[4]                → distinct again
+        // The two arc-end untagged neighbours (triangles[1], triangles[7]) must
+        // share a constant so the outer-pair-equality gate passes.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+
+        let inner_value = [1.0_f32, 0.0];
+        let behind_value = [0.0_f32, 1.0];
+        let inner_midpoint = [
+            (inner_value[0] + inner_value[0]) * 0.5,
+            (inner_value[1] + inner_value[1]) * 0.5,
+        ];
+        let behind_midpoint = [
+            (behind_value[0] + behind_value[0]) * 0.5,
+            (behind_value[1] + behind_value[1]) * 0.5,
+        ];
+        // Per-face-constant assignment. Default every loop to its own face's
+        // marker; the values that matter for the assertion are the arc-end and
+        // behind constants.
+        let outer_gate = [0.5_f32, 0.5];
+        let centre_value = [0.25_f32, 0.25];
+        let face_value = |f: FaceKey| -> [f32; 2] {
+            if f == triangles[1] || f == triangles[7] {
+                outer_gate
+            } else if f == triangles[2] || f == triangles[6] {
+                inner_value
+            } else if f == triangles[3] || f == triangles[5] {
+                behind_value
+            } else if f == triangles[4] {
+                centre_value
+            } else {
+                [0.9, 0.9]
+            }
+        };
+        let face_keys: Vec<FaceKey> = mesh.face_keys();
+        for f in face_keys {
+            let value = face_value(f);
+            let mut loops = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                loops.push(l);
+            }
+            for l in loops {
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+            }
+        }
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        // Read the arc-end inset faces' hub-corner loops (the inner loops the
+        // step-3 write lands on). They must hold the BEHIND midpoint, not the
+        // inner midpoint — the defect-1 fix.
+        let arc_end_uvs = tagged_corner_uvs_at(&mesh, moved_hub, &[triangles[2], triangles[6]], uv);
+        assert_eq!(arc_end_uvs.len(), 2);
+        for u in &arc_end_uvs {
+            assert!(
+                (u[0] - behind_midpoint[0]).abs() < 1.0e-6
+                    && (u[1] - behind_midpoint[1]).abs() < 1.0e-6,
+                "step 3 must midpoint the BEHIND pair → {behind_midpoint:?}; got {u:?}"
+            );
+            assert!(
+                (u[0] - inner_midpoint[0]).abs() > 1.0e-6
+                    || (u[1] - inner_midpoint[1]).abs() > 1.0e-6,
+                "step 3 must NOT midpoint the inner pair → {inner_midpoint:?}; got {u:?} \
+                 (this is the inner-vs-behind regression guard)"
+            );
+        }
+    }
+
+    #[test]
+    fn corner_merge_does_not_propagate_on_low_valence_fan() {
+        // §6.3.1 branches (i)/(ii): a moved corner with only the two arc-end
+        // walls and no further tagged face between them must NOT propagate.
+        // A tagged fan of three triangles is below the five-triangle threshold
+        // the corollary names, so the two behind-faces coincide or are
+        // edge-adjacent and step 4 early-returns. With an asymmetric (skewed)
+        // fan the single interior tagged hub loop rebakes (§7) to a value
+        // distinct from the arc-end midpoint; we confirm step 4 leaves it at
+        // that own value rather than forcing the midpoint onto it.
+        let mut mesh = LoopMesh::new();
+        // Skew the hub off the arc centre so the interior triangle's hub corner
+        // rebakes to a genuinely different UV from the two arc ends.
+        let (triangles, hub, _rim) = make_triangle_fan(&mut mesh, 6);
+        mesh.set_vertex_position(hub, Vec3::new(0.15, -0.1, 0.0));
+        let tagged: Vec<FaceKey> = triangles[2..5].to_vec(); // three consecutive
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        // Non-affine continuous UV so the outer-pair gate passes (per-position)
+        // yet the interior hub corner rebakes distinctly from the arc ends.
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x * p.x + p.y, p.y * p.y - p.x]);
+        }
+
+        let middle = triangles[3];
+        let mut middle_hub_loop = None;
+        {
+            let mut it = mesh.face_loops(middle);
+            while let Some(l) = it.next(&mesh) {
+                let p = mesh.vertex_position(mesh.loop_vertex(l));
+                if (p - Vec3::new(0.15, -0.1, 0.0)).length() < 1.0e-9 {
+                    middle_hub_loop = Some(l);
+                }
+            }
+        }
+        let middle_hub_loop = middle_hub_loop.unwrap();
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let got = mesh
+            .loop_attribs()
+            .get_vec2(uv, middle_hub_loop.as_usize())
+            .unwrap();
+        // The two arc-end hub loops merged to one value (steps 1–3). The lone
+        // interior hub loop keeps its own §7-rebaked UV — step 4 early-returned
+        // because the three-triangle fan's behind-faces are coincident or
+        // edge-adjacent, so no propagation forced the midpoint onto it.
+        let end_uvs = tagged_corner_uvs_at(
+            &mesh,
+            mesh.loop_vertex(middle_hub_loop),
+            &[triangles[2], triangles[4]],
+            uv,
+        );
+        assert_eq!(end_uvs.len(), 2);
+        let merged = end_uvs[0];
+        assert!(
+            (got[0] - merged[0]).abs() > 1.0e-6 || (got[1] - merged[1]).abs() > 1.0e-6,
+            "low-valence corner must not propagate the midpoint onto the interior \
+             hub loop; got {got:?} merged {merged:?}"
+        );
     }
 }
