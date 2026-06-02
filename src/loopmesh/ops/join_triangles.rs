@@ -149,6 +149,11 @@ struct DelimitConfig {
     /// when `cmp_materials` is off or no material layer exists — in the latter
     /// case every face reads as the default `0`.
     material_layer: Option<crate::loopmesh::ElementAttributeKey>,
+    /// The resolved per-edge `seam` layer key consulted by the §4.1 `cmp_seam`
+    /// gate, resolved once per run (mirroring `material_layer`) so the per-edge
+    /// check needs no descriptor scan. `None` when `cmp_seam` is off or no seam
+    /// layer exists — in the latter case every edge reads as "no seam".
+    seam_layer: Option<crate::loopmesh::ElementAttributeKey>,
 }
 
 /// The per-face attribute layer name carrying each face's material index, the
@@ -158,7 +163,50 @@ struct DelimitConfig {
 /// §3 (the `MATERIAL` delimiter) and `JOIN_TRIANGLES.md` §4.1.
 pub const MATERIAL_INDEX_ATTRIBUTE: &str = "material_index";
 
+/// The per-edge attribute layer name carrying each edge's seam flag, the
+/// convention the §4.1 `cmp_seam` gate reads. Stored as a single-component
+/// `I32` numeric layer (mirroring the per-face material-index choice): a
+/// non-zero value means "this edge is a seam", and an edge with no stored value
+/// (or no layer at all) is not a seam. The per-domain boolean-attribute model
+/// for persistent edge state such as seams is the one endorsed in
+/// `radial-mesh-guides/BMESH.md` §6; see `JOIN_TRIANGLES.md` §4.1.
+pub const SEAM_ATTRIBUTE: &str = "seam";
+
 impl LoopMesh {
+    /// Whether `edge` carries the seam flag, or the default `false` when no
+    /// per-edge seam layer exists or the edge has no stored value.
+    ///
+    /// The seam flag is a per-edge attribute under the [`SEAM_ATTRIBUTE`]
+    /// convention; the §4.1 `cmp_seam` gate of [`LoopMesh::join_triangles`]
+    /// rejects an edge that carries it.
+    pub fn edge_seam(&self, edge: EdgeKey) -> bool {
+        let attribs = self.edge_attribs();
+        match attribs.find(&AttributeKey::custom(SEAM_ATTRIBUTE)) {
+            Some(layer) => attribs.get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            None => false,
+        }
+    }
+
+    /// Set `edge`'s seam flag under the [`SEAM_ATTRIBUTE`] convention,
+    /// registering the per-edge `I32` layer on first use.
+    ///
+    /// Idempotent in the layer: repeated calls reuse the single registered
+    /// layer. Edges never assigned a value keep the default `false`.
+    pub fn set_edge_seam(&mut self, edge: EdgeKey, seam: bool) {
+        let key = AttributeKey::custom(SEAM_ATTRIBUTE);
+        let layer = match self.edge_attribs().find(&key) {
+            Some(layer) => layer,
+            None => self
+                .register_edge_attribute(ElementAttributeDesc::numeric(
+                    key,
+                    Format::new(ComponentType::I32, 1),
+                ))
+                .expect("I32x1 is a supported edge attribute format"),
+        };
+        self.edge_attribs_mut()
+            .set_i32(layer, edge.as_usize(), seam as i32);
+    }
+
     /// The material index assigned to `face`, or the default `0` when no
     /// per-face material layer exists or the face has no stored value.
     ///
@@ -214,11 +262,12 @@ impl LoopMesh {
     /// The §4.2 UV / vertex-colour island gates read loop customdata, which
     /// loopmesh stores directly. The §4.1 material gate reads the per-face
     /// material attribute layer ([`LoopMesh::face_material_index`] /
-    /// [`LoopMesh::set_face_material_index`]). The §4.1 seam / sharp gates read
-    /// per-edge header state loopmesh does not yet expose; their accessors
-    /// ([`LoopMesh::join_triangles_edge_is_seam`],
-    /// [`LoopMesh::join_triangles_edge_is_sharp`]) currently report "no seam /
-    /// smooth", so those gates never fire until that state lands.
+    /// [`LoopMesh::set_face_material_index`]). The §4.1 seam gate reads the
+    /// per-edge seam attribute layer ([`LoopMesh::edge_seam`] /
+    /// [`LoopMesh::set_edge_seam`]). The §4.1 sharp gate reads per-edge
+    /// smooth-header state loopmesh does not yet expose; its accessor
+    /// ([`LoopMesh::join_triangles_edge_is_sharp`]) currently reports "smooth",
+    /// so the `cmp_sharp` gate never fires until that state lands.
     ///
     /// - **§6** — when `topology_influence` is non-zero, pre-existing input
     ///   quads (§6.1) and each freshly-merged quad (§6.2) discount their
@@ -415,6 +464,12 @@ impl LoopMesh {
             None
         };
 
+        let seam_layer = if params.cmp_seam {
+            self.edge_attribs().find(&AttributeKey::custom(SEAM_ATTRIBUTE))
+        } else {
+            None
+        };
+
         DelimitConfig {
             cmp_seam: params.cmp_seam,
             cmp_sharp: params.cmp_sharp,
@@ -426,6 +481,7 @@ impl LoopMesh {
             uv_layers,
             vcol_layers,
             material_layer,
+            seam_layer,
         }
     }
 
@@ -487,7 +543,7 @@ impl LoopMesh {
         delimit: &DelimitConfig,
     ) -> bool {
         // §4.1 — flag and material gates.
-        if delimit.cmp_seam && self.join_triangles_edge_is_seam(edge) {
+        if delimit.cmp_seam && self.join_triangles_edge_is_seam_cached(delimit.seam_layer, edge) {
             return true;
         }
         if delimit.cmp_sharp && self.join_triangles_edge_is_sharp(edge) {
@@ -626,11 +682,22 @@ impl LoopMesh {
         self.faces_join(&[face_a, face_b])
     }
 
-    /// §4.1 — whether `edge` carries the seam flag. loopmesh has no per-edge
-    /// seam header today, so this always reports "no seam"; the `cmp_seam` gate
-    /// never fires until a per-edge seam attribute lands.
-    fn join_triangles_edge_is_seam(&self, _edge: EdgeKey) -> bool {
-        false
+    /// §4.1 — whether `edge` carries the seam flag, read through the layer key
+    /// resolved once per run in [`Self::join_triangles_build_delimit`]. A `None`
+    /// key (no seam layer registered) or an edge with no stored value reports
+    /// the default `false`, so the `cmp_seam` gate only fires on a genuinely
+    /// seam-flagged edge. This is the hot-path equivalent of the public
+    /// [`LoopMesh::edge_seam`], avoiding the per-call descriptor scan and
+    /// `AttributeKey` allocation that accessor performs.
+    fn join_triangles_edge_is_seam_cached(
+        &self,
+        seam_layer: Option<crate::loopmesh::ElementAttributeKey>,
+        edge: EdgeKey,
+    ) -> bool {
+        match seam_layer {
+            Some(layer) => self.edge_attribs().get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            None => false,
+        }
     }
 
     /// §4.1 — whether `edge` is sharp (the smooth bit cleared). loopmesh has no
@@ -1196,6 +1263,106 @@ mod tests {
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "material difference ignored when gate is off");
+        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_len(result.joined[0]), 4);
+        mesh.validate_topology();
+    }
+
+    /// The shared diagonal edge of the `two_tris_shared_edge` fixture (the
+    /// `0-2` edge between the lower and upper triangles).
+    fn shared_diagonal(mesh: &LoopMesh, verts: [VertexKey; 4]) -> EdgeKey {
+        mesh.query_edge_exists(verts[0], verts[2])
+            .expect("the two triangles share the 0-2 diagonal")
+    }
+
+    #[test]
+    fn edge_seam_round_trips_with_default_false() {
+        let mut mesh = LoopMesh::new();
+        let (_lower, _upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        let perimeter = mesh
+            .query_edge_exists(verts[0], verts[1])
+            .expect("perimeter edge 0-1 exists");
+
+        // Unflagged edges are not seams (no layer registered yet).
+        assert!(!mesh.edge_seam(diagonal));
+        assert!(!mesh.edge_seam(perimeter));
+
+        mesh.set_edge_seam(diagonal, true);
+        // The second assignment reuses the registered layer (idempotent layer).
+        mesh.set_edge_seam(perimeter, false);
+
+        assert!(mesh.edge_seam(diagonal));
+        assert!(!mesh.edge_seam(perimeter), "explicit false reads as no seam");
+
+        // Clearing a previously-set seam round-trips back to false.
+        mesh.set_edge_seam(diagonal, false);
+        assert!(!mesh.edge_seam(diagonal));
+    }
+
+    #[test]
+    fn cmp_seam_blocks_merge_across_seam_edge() {
+        // §4.1 — a seam-flagged shared edge must not be merged across when
+        // `cmp_seam` is enabled.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        mesh.set_edge_seam(diagonal, true);
+
+        let result = mesh.join_triangles(
+            &[lower, upper],
+            JoinTrianglesParams {
+                cmp_seam: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.joined.is_empty(), "the seam blocks the merge");
+        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_len(lower), 3);
+        assert_eq!(mesh.face_len(upper), 3);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn cmp_seam_allows_merge_when_no_seam() {
+        // With `cmp_seam` on, an edge with no seam (unset → default false, or
+        // explicit false) merges exactly as the no-seam case does.
+        for assign_false in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+            if assign_false {
+                let diagonal = shared_diagonal(&mesh, verts);
+                mesh.set_edge_seam(diagonal, false);
+            }
+
+            let result = mesh.join_triangles(
+                &[lower, upper],
+                JoinTrianglesParams {
+                    cmp_seam: true,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(result.joined.len(), 1, "no seam merges (assigned={assign_false})");
+            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_len(result.joined[0]), 4);
+            mesh.validate_topology();
+        }
+    }
+
+    #[test]
+    fn cmp_seam_false_ignores_seam_flag() {
+        // The default path: with `cmp_seam` off, a seam-flagged edge is
+        // irrelevant and the pair merges exactly as the no-seam case does.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, verts) = two_tris_shared_edge(&mut mesh);
+        let diagonal = shared_diagonal(&mesh, verts);
+        mesh.set_edge_seam(diagonal, true);
+
+        let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
+
+        assert_eq!(result.joined.len(), 1, "seam ignored when gate is off");
         assert_eq!(mesh.totface(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
