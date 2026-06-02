@@ -10,6 +10,7 @@
 
 mod bisect_plane;
 mod collapse;
+mod connect_vert_pair;
 mod connect_verts;
 mod delete;
 mod dissolve_degenerate;
