@@ -218,6 +218,15 @@ impl LoopMesh {
 
     /// §5.1 edge pass — substitute every edge's endpoints, collapsing edges
     /// that pinch to a point and re-pointing the rest onto a survivor edge.
+    ///
+    /// The walk re-visits the edges it *creates* (§5.1.1): a freshly minted
+    /// survivor edge is pushed onto the work list, so a re-pointed endpoint that
+    /// is itself a source (a chained map, §7) fires the rule again and the
+    /// surviving edge is carried step-by-step to the chain's terminal value.
+    /// Each intermediate edge along the way is delete-marked. This is *not* a
+    /// transitive map lookup — it is the one-step rule iterated over the pass's
+    /// own output — and it is specific to the edge pass; the §5.2 ring rebuild
+    /// stays strictly direct-once.
     fn weld_phase_edge_pass(
         &mut self,
         target_of: &HashMap<VertexKey, VertexKey>,
@@ -225,8 +234,15 @@ impl LoopMesh {
         collapse_edge: crate::op_flags::EdgeOpFlagLayer,
         bit: u8,
     ) {
-        let edges: SmallVec<[EdgeKey; 32]> = collect_iter::<_, 32>(self, MeshEdges::default());
-        for edge in edges {
+        // Seeded with the live edge set; survivor edges created below are
+        // appended so the same walk re-visits them (§5.1.1). A cursor advances
+        // through the list rather than `pop`ping so the order matches a single
+        // forward walk over the growing edge set.
+        let mut pending: SmallVec<[EdgeKey; 32]> = collect_iter::<_, 32>(self, MeshEdges::default());
+        let mut cursor = 0;
+        while cursor < pending.len() {
+            let edge = pending[cursor];
+            cursor += 1;
             if self.edges.try_get(edge).is_none() {
                 continue;
             }
@@ -235,6 +251,9 @@ impl LoopMesh {
             let v2_sub = target_of.get(&v2).copied().unwrap_or(v2);
 
             if v1_sub == v1 && v2_sub == v2 {
+                // Neither endpoint is a source — covers a terminal created edge
+                // whose re-pointed endpoint was a non-source vert, which is left
+                // alone and survives (§5.1.1 step 3).
                 continue;
             }
             if v1_sub == v2_sub {
@@ -252,6 +271,10 @@ impl LoopMesh {
                 None => {
                     let created = self.create_edge([v1_sub, v2_sub], EdgeCreateFlags::NONE);
                     self.edge_attribs.copy_into(created.as_usize(), edge.as_usize());
+                    // §5.1.1 — re-visit the created edge: if either substituted
+                    // endpoint is itself a source, the rule fires again and
+                    // chain-flattens the surviving edge forward.
+                    pending.push(created);
                     created
                 }
             };
@@ -260,6 +283,9 @@ impl LoopMesh {
             if self.edges.get(edge).eflags.contains(ElementFlags::SELECTED) {
                 self.edges.get_mut(survivor).eflags |= ElementFlags::SELECTED;
             }
+            // §5.1 / §5.1.1 — the old edge's role is taken over by the survivor;
+            // an intermediate created edge re-pointed again is itself marked
+            // here on its re-visit.
             self.edge_op_flag_set(delete_edge, edge, bit);
         }
     }
@@ -820,6 +846,91 @@ mod tests {
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&v1), "the target survives");
         assert!(!live.contains(&v0), "the source is gone");
+        mesh.validate_topology();
+    }
+
+    /// §5.1.1 / §7 worked example — a chained map `{0 → 1, 1 → 2}` on the
+    /// pentagon. The edge pass re-visits the edges it creates and chain-flattens
+    /// the perimeter edge `{4,0}` forward: `0→1` mints `{4,1}`, the re-visit
+    /// sees `1` is itself a source and mints `{4,2}`, which terminates. The face
+    /// rebuild stays direct-once, so its `(1,2,3,4)` ring leans on still-marked
+    /// vert `1` and edges `{4,1}`/`{1,2}`, and the §6 cascade reaps it. Net:
+    /// F = 0 surviving faces; 3 surviving edges including the chain-flattened
+    /// `{4,2}`; 3 surviving verts `{2,3,4}`.
+    #[test]
+    fn weld_verts_chained_map_chain_flattens_edges_but_reaps_face() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = polygon(
+            &mut mesh,
+            &[(0.0, 0.0), (2.0, 0.0), (2.5, 1.5), (1.0, 2.5), (-0.5, 1.5)],
+        );
+        let [v0, v1, v2, v3, v4] = [verts[0], verts[1], verts[2], verts[3], verts[4]];
+
+        // Chained map: 1 is both the value of 0's entry and the key of its own.
+        mesh.weld_verts(&[(v0, v1), (v1, v2)], false);
+
+        assert_eq!(mesh.totface(), 0, "the rebuilt face leans on marked geometry and is reaped");
+
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert_eq!(mesh.totvert(), 3, "verts 0 and 1 are both removed");
+        assert!(!live.contains(&v0) && !live.contains(&v1), "both chain sources gone");
+        assert!(
+            live.contains(&v2) && live.contains(&v3) && live.contains(&v4),
+            "the non-source verts survive"
+        );
+
+        assert_eq!(mesh.totedge(), 3, "three surviving edges incl. the chain-flatten");
+        let norm = |a: VertexKey, b: VertexKey| {
+            if a.as_usize() <= b.as_usize() { [a, b] } else { [b, a] }
+        };
+        let surviving: std::collections::HashSet<[VertexKey; 2]> = mesh
+            .edge_keys()
+            .into_iter()
+            .map(|e| {
+                let [a, b] = mesh.edge_vert_keys(e);
+                norm(a, b)
+            })
+            .collect();
+        assert!(surviving.contains(&norm(v2, v3)), "ring edge {{2,3}} survives");
+        assert!(surviving.contains(&norm(v3, v4)), "ring edge {{3,4}} survives");
+        assert!(
+            surviving.contains(&norm(v4, v2)),
+            "the chain-flattened edge {{4,2}} survives — {{4,0}} re-pointed 0->1 then 1->2"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §7 contrast — the *flattened* single-entry map `{0 → 1}` on the same
+    /// pentagon. Vert `1` is now a value only, so the edge pass's re-visit of
+    /// the created `{4,1}` finds `1` is not a source and stops: `{4,1}` is the
+    /// terminal survivor. The rebuilt `(1,2,3,4)` ring now leans on no marked
+    /// geometry, so the face survives (F = 1) with the closed ring.
+    #[test]
+    fn weld_verts_single_entry_map_keeps_closed_ring_face() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = polygon(
+            &mut mesh,
+            &[(0.0, 0.0), (2.0, 0.0), (2.5, 1.5), (1.0, 2.5), (-0.5, 1.5)],
+        );
+        let [v0, v1, v2, v3, v4] = [verts[0], verts[1], verts[2], verts[3], verts[4]];
+
+        mesh.weld_verts(&[(v0, v1)], false);
+
+        assert_eq!(mesh.totface(), 1, "the single-entry weld keeps a closed-ring face");
+        let survivor = mesh.face_keys()[0];
+        assert_eq!(mesh.face_len(survivor), 4, "the survivor is the (1,2,3,4) quad");
+        let ring: std::collections::HashSet<VertexKey> =
+            mesh.face_vert_keys(survivor).into_iter().collect();
+        assert_eq!(
+            ring,
+            [v1, v2, v3, v4].into_iter().collect(),
+            "surviving ring is (1,2,3,4)"
+        );
+
+        assert_eq!(mesh.totvert(), 4, "only vert 0 is removed");
+        let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(!live.contains(&v0), "the sole source vert is gone");
+        assert_eq!(mesh.totedge(), 4, "the full ring of four edges survives");
         mesh.validate_topology();
     }
 
