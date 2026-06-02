@@ -65,6 +65,6 @@ pub use mirror::{Axis, MirrorParams, MirrorResult};
 pub use rotate_edges::RotateEdgesResult;
 pub use split::SplitResult;
 pub use subdivide_edges::{
-    QuadCornerType, SubdivideGeom, SubdivideParams, SubdivideResult,
+    QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};

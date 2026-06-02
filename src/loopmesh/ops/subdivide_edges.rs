@@ -25,6 +25,63 @@ impl Default for QuadCornerType {
     }
 }
 
+/// Falloff curve applied to the `smooth` offset
+/// ([`SUBDIVIDE_EDGES.md`](../../../../radial-mesh-guides/operators/SUBDIVIDE_EDGES.md)
+/// §9.1.3 step 1). Shapes the per-midpoint offset magnitude as a function of
+/// the cut parameter `t` via a tent-and-curve. `Linear` is special-cased: it
+/// bypasses the tent entirely and pins the falloff base at `1.0` (the full
+/// offset, on-target at every midpoint); every other curve maps `[0,1] → [0,1]`
+/// monotonically and adds `1.0` to its tent value, so a centre cut overshoots
+/// `co_curved` ~2× (§9.1.3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SmoothFalloff {
+    /// Smoothstep `3v² − 2v³` — the default gentle S-curve taper.
+    Smooth,
+    /// `sqrt(2v − v²)` — rounder, fuller near the ends.
+    Sphere,
+    /// `sqrt(v)` — fast rise, full early.
+    Root,
+    /// `v²` — slow rise, pinched.
+    Sharp,
+    /// Bypassed — the falloff base is held at `1.0`, a uniform full offset with
+    /// no taper (the only curve that lands a centre cut exactly on `co_curved`).
+    Linear,
+    /// `v·(2 − v)` — similar to `Sphere`, slightly fuller.
+    InverseSquare,
+}
+
+impl Default for SmoothFalloff {
+    fn default() -> Self {
+        SmoothFalloff::Smooth
+    }
+}
+
+impl SmoothFalloff {
+    /// The §9.1.3 step-1 falloff base for a cut parameter `t`. `Linear` returns
+    /// `1.0` outright (the tent is skipped); every other curve shapes the tent
+    /// value `tent = 1 − 2·|0.5 − t|` and adds the `1.0 +` base.
+    fn base(self, t: f32) -> f32 {
+        if self == SmoothFalloff::Linear {
+            return 1.0;
+        }
+        let tent = 1.0 - 2.0 * (0.5 - t).abs();
+        1.0 + self.curve(tent)
+    }
+
+    /// The §9.1.3 shaping curve `falloff_curve(val)`, each `[0,1] → [0,1]`,
+    /// monotonic, fixing `0 ↦ 0` and `1 ↦ 1`.
+    fn curve(self, v: f32) -> f32 {
+        match self {
+            SmoothFalloff::Smooth => v * v * (3.0 - 2.0 * v),
+            SmoothFalloff::Sphere => (2.0 * v - v * v).max(0.0).sqrt(),
+            SmoothFalloff::Root => v.max(0.0).sqrt(),
+            SmoothFalloff::Sharp => v * v,
+            SmoothFalloff::Linear => v,
+            SmoothFalloff::InverseSquare => v * (2.0 - v),
+        }
+    }
+}
+
 /// Parameters for [`LoopMesh::subdivide_edges`].
 ///
 /// Mirrors the BMOP set-input shape described in
@@ -58,6 +115,17 @@ pub struct SubdivideParams {
     /// on, triangles and n-gons keep their inserted midpoints but are left as
     /// flat-cornered n-gons — only quads re-split. Used by loop-cut.
     pub use_only_quads: bool,
+    /// Catmull–Clark smoothing offset (§9.1). The master gain on the
+    /// off-chord displacement: `0.0` (default) leaves every midpoint exactly on
+    /// its §3 chord position, and the offset scales linearly in this value.
+    pub smooth: f32,
+    /// The falloff curve applied to the `smooth` offset (§9.1.3 step 1). No
+    /// effect when `smooth == 0`.
+    pub smooth_falloff: SmoothFalloff,
+    /// Maintain an even offset *height* (rather than a fraction) when smoothing
+    /// by multiplying in the §9.1.3 step-2 shell factor. No effect when
+    /// `smooth == 0` or on a flat edge (parallel endpoint normals).
+    pub use_smooth_even: bool,
 }
 
 impl Default for SubdivideParams {
@@ -68,6 +136,9 @@ impl Default for SubdivideParams {
             use_grid_fill: true,
             quad_corner_type: QuadCornerType::StraightCut,
             use_only_quads: false,
+            smooth: 0.0,
+            smooth_falloff: SmoothFalloff::Smooth,
+            use_smooth_even: false,
         }
     }
 }
@@ -129,6 +200,39 @@ impl SubdivideParams {
         self.use_only_quads = enabled;
         self
     }
+
+    /// Set the Catmull–Clark smoothing offset (§9.1). Defaults to `0.0` (the
+    /// core: every midpoint stays on its §3 chord). A non-zero value pushes each
+    /// inserted midpoint off the chord toward the normal-guided curved target
+    /// (§9.1.2), scaled by the falloff curve and (optionally) the shell factor
+    /// (§9.1.3). The displacement is purely positional — topology and per-vert /
+    /// per-loop customdata are unchanged (§9.1.4).
+    #[must_use]
+    pub fn smooth(mut self, smooth: f32) -> Self {
+        self.smooth = smooth;
+        self
+    }
+
+    /// Select the falloff curve applied to the `smooth` offset (§9.1.3 step 1).
+    /// Defaults to [`SmoothFalloff::Smooth`]. No effect when `smooth == 0`. At a
+    /// single centre cut every non-linear curve overshoots `co_curved` ~2×;
+    /// only [`SmoothFalloff::Linear`] lands the midpoint on-target.
+    #[must_use]
+    pub fn smooth_falloff(mut self, falloff: SmoothFalloff) -> Self {
+        self.smooth_falloff = falloff;
+        self
+    }
+
+    /// Toggle the even-offset shell factor (§9.1.3 step 2). Off by default. When
+    /// on, the `smooth` offset is multiplied by `1 / cos(half-angle between the
+    /// endpoint normals)` so the bulge keeps a consistent *height* across edges
+    /// of differing crease angle. A no-op when `smooth == 0` or on a flat edge
+    /// (parallel normals give a shell factor of `1.0`).
+    #[must_use]
+    pub fn use_smooth_even(mut self, enabled: bool) -> Self {
+        self.use_smooth_even = enabled;
+        self
+    }
 }
 
 /// Outcome of [`LoopMesh::subdivide_edges`]. Distinguishes a real run from a
@@ -185,6 +289,14 @@ impl LoopMesh {
 
         let mut geom = SubdivideGeom::default();
 
+        // §9.1.1 — the off-chord offset reads the cut edge's endpoint vertex
+        // normals, which must be current before placement. Freshen all cached
+        // normals once up front; the chord-only core (`smooth == 0`) skips this
+        // and stays bit-identical to the no-displacement path.
+        if params.smooth != 0.0 {
+            self.mesh_normals_update();
+        }
+
         // A vert op-flag layer tags the freshly-inserted midpoints so phase two
         // can tell original corners from inserted midpoints when it walks a
         // face's loop cycle (§3.1 / §4.1).
@@ -198,7 +310,16 @@ impl LoopMesh {
         let mut touched_faces: Vec<FaceKey> = Vec::new();
         for &edge in edges {
             let [near, _far] = self.edge_vert_keys(edge);
+            // §9.1 — snapshot the endpoint positions and vertex normals *before*
+            // the split (the split rewrites the edge's far endpoint). `t = 0.5`
+            // is the §3.2 directional cut parameter, measured from `near`.
+            let placement = (params.smooth != 0.0)
+                .then(|| self.smooth_placement(edge, near, 0.5, &params));
             let (m, _e_new) = self.edge_split(edge, near, 0.5);
+            if let Some(co_final) = placement {
+                self.set_vertex_position(m, co_final);
+                self.vert_normal_update(m);
+            }
             self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
             geom.verts.push(m);
             for f in self.vert_face_keys(m) {
@@ -215,6 +336,37 @@ impl LoopMesh {
 
         self.pop_vert_op_flag_layer(midpoint_layer);
         SubdivideResult::Ran(geom)
+    }
+
+    /// Read the §9.1 smooth-placement context for the cut edge `e = {near, far}`
+    /// — the two endpoint positions and (current) vertex normals. `near` is the
+    /// edge's first endpoint `v_a`, so the directional cut parameter `t` (§3.2 /
+    /// §3.3) is measured from it.
+    fn smooth_endpoint_context(&self, edge: EdgeKey, near: VertexKey) -> SmoothEndpointContext {
+        let far = self
+            .edges
+            .get(edge)
+            .other_vertex(near)
+            .expect("near_vertex must belong to edge");
+        SmoothEndpointContext {
+            co_a: self.vertex_position(near),
+            co_b: self.vertex_position(far),
+            no_a: self.vertex_normal(near),
+            no_b: self.vertex_normal(far),
+        }
+    }
+
+    /// The §9.1 off-chord position for a single midpoint cut at parameter `t`
+    /// on edge `e = {near, far}`. Convenience wrapper over
+    /// [`Self::smooth_endpoint_context`] + [`SmoothEndpointContext::placement`].
+    fn smooth_placement(
+        &self,
+        edge: EdgeKey,
+        near: VertexKey,
+        t: f32,
+        params: &SubdivideParams,
+    ) -> Vec3 {
+        self.smooth_endpoint_context(edge, near).placement(t, params)
     }
 
     /// Dispatch and apply the §5 / §6 re-split pattern for one touched face.
@@ -759,6 +911,12 @@ impl LoopMesh {
         let cuts = params.cuts;
         let mut geom = SubdivideGeom::default();
 
+        // §9.1.1 — endpoint vertex normals must be current before any off-chord
+        // placement. Freshen once; `smooth == 0` keeps the chord-only path.
+        if params.smooth != 0.0 {
+            self.mesh_normals_update();
+        }
+
         let midpoint_layer = self.push_vert_op_flag_layer();
         const MIDPOINT: u8 = 1;
 
@@ -769,7 +927,21 @@ impl LoopMesh {
         let mut touched_faces: Vec<FaceKey> = Vec::new();
         for &edge in edges {
             let [near, _far] = self.edge_vert_keys(edge);
+            // §9.1 — capture the smooth endpoint context before the split. Each
+            // of the N midpoints lands at the directional cut parameter
+            // t = i/(N+1) (§3.3), measured from `near`.
+            let smooth_ctx = (params.smooth != 0.0)
+                .then(|| self.smooth_endpoint_context(edge, near));
             let mids = self.edge_split_n(edge, near, cuts);
+            if let Some(ctx) = &smooth_ctx {
+                let denom = cuts as f32 + 1.0;
+                for (i, &m) in mids.iter().enumerate() {
+                    let t = (i as f32 + 1.0) / denom;
+                    let co_final = ctx.placement(t, &params);
+                    self.set_vertex_position(m, co_final);
+                    self.vert_normal_update(m);
+                }
+            }
             for &m in &mids {
                 self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
                 geom.verts.push(m);
@@ -1125,6 +1297,137 @@ impl LoopMesh {
     }
 }
 
+/// The §9.1 smooth-placement inputs for one cut edge: the endpoint positions
+/// and (current) vertex normals. Pure geometry — independent of the mesh, so
+/// the offset can be evaluated after the edge is split without re-reading the
+/// rewritten edge.
+#[derive(Clone, Copy, Debug)]
+struct SmoothEndpointContext {
+    co_a: Vec3,
+    co_b: Vec3,
+    no_a: Vec3,
+    no_b: Vec3,
+}
+
+/// A near-zero edge direction guard. Below this the edge is degenerate and the
+/// offset collapses to the chord.
+const SMOOTH_DIR_EPS: f32 = 1.0e-9;
+
+impl SmoothEndpointContext {
+    /// The final §9.1 placement at cut parameter `t`: lerp from the chord
+    /// position `co_flat` toward the curved target `co_curved` (§9.1.2) by the
+    /// assembled `factor` (§9.1.3). At `smooth == 0`, or where the endpoint
+    /// normals are parallel and perpendicular to the edge, this returns exactly
+    /// `co_flat` — the §3 chord midpoint.
+    fn placement(&self, t: f32, params: &SubdivideParams) -> Vec3 {
+        let co_flat = self.co_a.lerp(self.co_b, t);
+        let co_curved = self.curved_target(t);
+
+        // §9.1.3 — factor = falloff_base · [shell_factor] · smooth.
+        let mut factor = params.smooth_falloff.base(t);
+        if params.use_smooth_even {
+            factor *= shell_factor(self.no_a, self.no_b);
+        }
+        factor *= params.smooth;
+
+        co_flat.lerp(co_curved, factor)
+    }
+
+    /// §9.1.2 — the curved target: the dual-blended normal-guided arc. Each
+    /// single-sided arc reflects the *other* endpoint's normal across the edge
+    /// direction, then the two are blended at `t`. A flat endpoint (normal ⊥
+    /// `dir`) makes its arc collapse to the straight lerp, so a uniformly flat
+    /// edge returns `co_flat` and `smooth` is a no-op there.
+    fn curved_target(&self, t: f32) -> Vec3 {
+        let chord = self.co_a - self.co_b;
+        if chord.length_squared() < SMOOTH_DIR_EPS {
+            return self.co_a.lerp(self.co_b, t);
+        }
+        let dir = chord.normalize();
+
+        let co_toward_a =
+            spherical_interp(self.co_a, self.no_a, self.co_b, reflect(self.no_b, dir), t);
+        let co_toward_b =
+            spherical_interp(self.co_a, reflect(self.no_a, dir), self.co_b, self.no_b, t);
+
+        co_toward_a.lerp(co_toward_b, t)
+    }
+}
+
+/// Reflect `n` across the plane whose normal is `dir` (a unit edge direction):
+/// `n − 2·(n·dir)·dir`. Used by §9.1.2 to build each single-sided arc.
+fn reflect(n: Vec3, dir: Vec3) -> Vec3 {
+    n - 2.0 * n.dot(dir) * dir
+}
+
+/// §9.1.2 single-sided normal-guided arc. Sweeps from `co_a` to `co_b` along a
+/// circular arc whose tangents are constrained perpendicular to the endpoint
+/// normals `na`, `nb`. When a normal is perpendicular to the chord (the flat
+/// case) its tangent contribution vanishes and the arc is the straight lerp;
+/// when a reflected normal coincides with its source (a degenerate fold) the
+/// per-side tangent collapses to the chord for numerical safety.
+///
+/// The arc is the cubic Hermite through `co_a`, `co_b` whose endpoint tangents
+/// are the chord projected into each endpoint's tangent plane. This bows the
+/// path off the chord on the side the normals lean away from, by an amount that
+/// grows with the angle between the normals — matching the §9.1.2 contract.
+fn spherical_interp(co_a: Vec3, na: Vec3, co_b: Vec3, nb: Vec3, t: f32) -> Vec3 {
+    let chord = co_b - co_a;
+    if chord.length_squared() < SMOOTH_DIR_EPS {
+        return co_a.lerp(co_b, t);
+    }
+
+    // Each endpoint tangent is the chord projected onto the plane ⊥ that
+    // endpoint's normal. A normal ⊥ chord leaves the tangent equal to the chord
+    // (flat — no bow); a normal leaning toward the chord shortens the tangent's
+    // chord-aligned part and tilts it off-chord (the bow).
+    let tan_a = tangent_in_plane(chord, na);
+    let tan_b = tangent_in_plane(chord, nb);
+
+    // Cubic Hermite with P0=co_a, P1=co_b, tangents tan_a (out of a) and tan_b
+    // (into b). h00..h11 are the standard Hermite basis weights.
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+
+    co_a * h00 + tan_a * h10 + co_b * h01 + tan_b * h11
+}
+
+/// Project `chord` onto the plane perpendicular to the (assumed unit-ish)
+/// endpoint normal `n`. Returns `chord` unchanged when `n` is perpendicular to
+/// the chord (flat) and collapses toward `chord` as `n` aligns with it.
+fn tangent_in_plane(chord: Vec3, n: Vec3) -> Vec3 {
+    let n2 = n.length_squared();
+    if n2 < SMOOTH_DIR_EPS {
+        return chord;
+    }
+    let unit_n = n / n2.sqrt();
+    chord - unit_n * chord.dot(unit_n)
+}
+
+/// §9.1.3 step 2 shell factor: `1 / cos(half-angle between na and nb)`. `1.0`
+/// for parallel normals (a flat edge — `use_smooth_even` is a no-op there),
+/// growing as the normals diverge so the bulge keeps a consistent *height*.
+fn shell_factor(na: Vec3, nb: Vec3) -> f32 {
+    let a = na.normalize_or_zero();
+    let b = nb.normalize_or_zero();
+    if a.length_squared() < 0.5 || b.length_squared() < 0.5 {
+        return 1.0;
+    }
+    // The averaged endpoint normal foreshortens by cos(half-angle); the shell
+    // factor is its reciprocal. half = normalize((a + b)/2); cos = a·half.
+    let half = (a + b).normalize_or_zero();
+    let cosine = a.dot(half);
+    if cosine.abs() < 1.0e-6 {
+        1.0
+    } else {
+        1.0 / cosine.abs()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
@@ -1157,6 +1460,42 @@ mod tests {
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
         (mesh.totvert(), mesh.totedge(), mesh.totface())
+    }
+
+    /// A dihedral fold of two quads hinged about the edge `{v1, v2}` (§9.1.5).
+    /// Quad A lies flat in `z = 0`; quad B folds up by `angle` about the hinge.
+    /// The hinge verts `v1`/`v2` get bisector normals (divergent from the flat
+    /// face normal), so the edge `{v0, v1}` — flat endpoint `v0`, hinge endpoint
+    /// `v1` — has the divergent endpoint normals §9.1 needs to bow a midpoint
+    /// off the chord. Returns `(mesh, [v0,v1,v2,v3,v4,v5], e01)`.
+    fn folded_two_quads(angle: f32) -> (LoopMesh, [VertexKey; 6], EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let (c, s) = (angle.cos(), angle.sin());
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // Quad B folds about the hinge {v1, v2} (the y-axis line at x = 1).
+        let v4 = mesh.create_vertex(Vec3::new(1.0 + c, 0.0, s));
+        let v5 = mesh.create_vertex(Vec3::new(1.0 + c, 1.0, s));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+
+        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        (mesh, [v0, v1, v2, v3, v4, v5], e01)
+    }
+
+    fn midpoint_pos_after_cut(mesh: &LoopMesh, geom: &SubdivideGeom) -> Vec3 {
+        // The single cut edge inserts exactly one midpoint; it is the first
+        // vert recorded in geom.verts (§3 phase one runs before the re-split).
+        mesh.vertex_position(geom.verts[0])
     }
 
     #[test]
@@ -2238,5 +2577,146 @@ mod tests {
         let (v, _e, f) = counts(&mesh);
         assert_eq!(v, 7, "two shared midpoints inserted once");
         assert_eq!(f, 4, "quad fans to 3, triangle left flat (1)");
+    }
+
+    // ---- §9.1 smooth displacement ----------------------------------------
+
+    use std::f32::consts::FRAC_PI_3;
+
+    #[test]
+    fn smooth_displaces_midpoint_off_chord_on_fold() {
+        // §9.1.2 / §9.1.4 — on a 60° fold, cutting the edge {v0, v1} (flat
+        // endpoint v0, hinge endpoint v1 with a divergent bisector normal) with
+        // smooth = 1.0 pushes the midpoint off the chord. Topology is unchanged
+        // (the §9.1.4 invariance): the displacement only moves the inserted vert.
+        let (mut mesh, _v, e01) = folded_two_quads(FRAC_PI_3);
+        let before = counts(&mesh);
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().smooth(1.0));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        // Same element deltas as a smooth = 0 single-edge quad cut (§9.1.4):
+        // the cut quad re-splits into 3, the flat neighbour is untouched.
+        let after = counts(&mesh);
+        assert_eq!(
+            (after.0 - before.0, after.2 - before.2),
+            (1, 2),
+            "smooth changes positions, not topology (§9.1.4)"
+        );
+
+        // The midpoint moved off the chord midpoint (0.5, 0, 0).
+        let chord_mid = Vec3::new(0.5, 0.0, 0.0);
+        let placed = midpoint_pos_after_cut(&mesh, &geom);
+        assert!(
+            placed.distance(chord_mid) > 1.0e-4,
+            "smooth bows the midpoint off the chord (got {placed:?})"
+        );
+    }
+
+    #[test]
+    fn smooth_zero_keeps_chord_midpoint() {
+        // The smooth = 0 contrast: identical fixture, identical topology, but the
+        // midpoint stays exactly on the chord (bit-identical to the core path).
+        let (mut mesh, _v, e01) = folded_two_quads(FRAC_PI_3);
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().smooth(0.0));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let placed = midpoint_pos_after_cut(&mesh, &geom);
+        assert!(
+            placed.distance(Vec3::new(0.5, 0.0, 0.0)) < 1.0e-6,
+            "smooth = 0 leaves the midpoint on the chord (got {placed:?})"
+        );
+    }
+
+    #[test]
+    fn smooth_falloff_linear_vs_smooth_overshoot() {
+        // §9.1.3 step 1 — at a single centre cut LINEAR pins factor = 1.0
+        // (lands on co_curved) while the non-linear SMOOTH curve reaches
+        // factor = 2.0 (overshoots co_curved ~2×). The two therefore land the
+        // midpoint at distinct positions, with SMOOTH twice as far off the chord
+        // as LINEAR along the same bow direction.
+        let chord_mid = Vec3::new(0.5, 0.0, 0.0);
+
+        let (mut lin_mesh, _v, e_lin) = folded_two_quads(FRAC_PI_3);
+        let lin_geom = match lin_mesh.subdivide_edges(
+            &[e_lin],
+            SubdivideParams::default().smooth(1.0).smooth_falloff(SmoothFalloff::Linear),
+        ) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let lin = midpoint_pos_after_cut(&lin_mesh, &lin_geom);
+
+        let (mut sm_mesh, _v, e_sm) = folded_two_quads(FRAC_PI_3);
+        let sm_geom = match sm_mesh.subdivide_edges(
+            &[e_sm],
+            SubdivideParams::default().smooth(1.0).smooth_falloff(SmoothFalloff::Smooth),
+        ) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let sm = midpoint_pos_after_cut(&sm_mesh, &sm_geom);
+
+        let off_lin = lin - chord_mid;
+        let off_sm = sm - chord_mid;
+        assert!(off_lin.length() > 1.0e-4, "LINEAR still displaces");
+        assert!(
+            lin.distance(sm) > 1.0e-4,
+            "LINEAR and SMOOTH land in different positions at a centre cut"
+        );
+        // SMOOTH overshoots ~2× along the same direction as LINEAR.
+        assert!(
+            (off_sm.length() / off_lin.length() - 2.0).abs() < 1.0e-3,
+            "SMOOTH centre-cut offset is ~2× LINEAR's (factor 2.0 vs 1.0): ratio {}",
+            off_sm.length() / off_lin.length()
+        );
+    }
+
+    #[test]
+    fn use_smooth_even_scales_offset_up() {
+        // §9.1.3 step 2 — on the non-parallel fold edge the shell factor is > 1,
+        // so use_smooth_even moves the midpoint further off the chord than the
+        // flag-off run (same LINEAR falloff, same smooth gain).
+        let chord_mid = Vec3::new(0.5, 0.0, 0.0);
+
+        let (mut off_mesh, _v, e_off) = folded_two_quads(FRAC_PI_3);
+        let off_geom = match off_mesh.subdivide_edges(
+            &[e_off],
+            SubdivideParams::default()
+                .smooth(1.0)
+                .smooth_falloff(SmoothFalloff::Linear)
+                .use_smooth_even(false),
+        ) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let off = midpoint_pos_after_cut(&off_mesh, &off_geom);
+
+        let (mut on_mesh, _v, e_on) = folded_two_quads(FRAC_PI_3);
+        let on_geom = match on_mesh.subdivide_edges(
+            &[e_on],
+            SubdivideParams::default()
+                .smooth(1.0)
+                .smooth_falloff(SmoothFalloff::Linear)
+                .use_smooth_even(true),
+        ) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let on = midpoint_pos_after_cut(&on_mesh, &on_geom);
+
+        let d_off = off.distance(chord_mid);
+        let d_on = on.distance(chord_mid);
+        assert!(d_off > 1.0e-4, "flag-off run still displaces");
+        assert!(
+            d_on > d_off * (1.0 + 1.0e-3),
+            "use_smooth_even shell factor (>1) pushes the midpoint further \
+             (on {d_on} vs off {d_off})"
+        );
     }
 }

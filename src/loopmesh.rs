@@ -75,7 +75,7 @@ pub use ops::{
     InsetIndividualResult, InsetRegionParams, InsetRegionResult, Axis, MirrorParams, MirrorResult,
     JoinTrianglesParams, JoinTrianglesResult,
     MixedSeed, NgonMethod, QuadCornerType,
-    QuadMethod, RotateEdgesResult, SubdivideGeom, SubdivideParams, SubdivideResult,
+    QuadMethod, RotateEdgesResult, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
     SymmetrizeDirection, SymmetrizeResult,
     DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };
