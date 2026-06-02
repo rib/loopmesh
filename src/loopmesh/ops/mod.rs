@@ -43,6 +43,7 @@ mod split;
 mod split_edges;
 mod subdivide_edges;
 mod symmetrize;
+mod transform;
 mod weld_verts;
 
 pub use bisect_edges::BisectGeom;
@@ -72,3 +73,4 @@ pub use subdivide_edges::{
     QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
+pub use transform::TransformParams;
