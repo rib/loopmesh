@@ -74,7 +74,7 @@ pub use ops::{
     DissolveVertsParams, DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams,
     InsetIndividualResult, InsetRegionParams, InsetRegionResult, Axis, MirrorParams, MirrorResult,
     MixedSeed, NgonMethod, QuadCornerType,
-    QuadMethod, SubdivideGeom, SubdivideParams, SubdivideResult,
+    QuadMethod, RotateEdgesResult, SubdivideGeom, SubdivideParams, SubdivideResult,
     SymmetrizeDirection, SymmetrizeResult,
     DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };

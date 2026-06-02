@@ -47,6 +47,36 @@ impl LoopMesh {
         Some(new_edge)
     }
 
+    /// Compute the corner pair the rotation of `edge` (with direction `ccw`)
+    /// would connect — the endpoints of the "other diagonal" of the union
+    /// quad. Returns `None` if the edge is not 2-manifold or the geometry does
+    /// not yield a well-defined diagonal. This is the read-only counterpart of
+    /// the corner selection inside [`Self::edge_rotate`], exposed so the
+    /// rotate-edges operator can run its eligibility guards without committing
+    /// the surgery.
+    pub(crate) fn edge_rotate_diagonal(
+        &self,
+        edge: EdgeKey,
+        ccw: bool,
+    ) -> Option<(VertexKey, VertexKey)> {
+        let mut radial = self.edge_radial_iter(edge);
+        let l_a = radial.next()?;
+        let l_b = radial.next()?;
+        if radial.next().is_some() {
+            return None;
+        }
+        let f_a = self.loops.get(l_a).face;
+        let f_b = self.loops.get(l_b).face;
+        if f_a == f_b {
+            return None;
+        }
+        let [v1, v2] = self.edges.get(edge).vertices;
+        let (fa, fb) = if ccw { (f_a, f_b) } else { (f_b, f_a) };
+        let diag_for_v1 = self.face_step_away_from(fb, v1, v2)?;
+        let diag_for_v2 = self.face_step_away_from(fa, v2, v1)?;
+        Some((diag_for_v1, diag_for_v2))
+    }
+
     /// In `face`'s loop cycle, find the loop at vertex `v`, then return the
     /// vertex of the *adjacent* loop that is **not** `v_other`. This is the
     /// "walk one step in the face cycle away from v_other" primitive.
