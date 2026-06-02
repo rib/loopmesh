@@ -73,6 +73,7 @@ pub use ops::{
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
     DissolveVertsParams, DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams,
     InsetIndividualResult, InsetRegionParams, InsetRegionResult, Axis, MirrorParams, MirrorResult,
+    JoinTrianglesParams, JoinTrianglesResult,
     MixedSeed, NgonMethod, QuadCornerType,
     QuadMethod, RotateEdgesResult, SubdivideGeom, SubdivideParams, SubdivideResult,
     SymmetrizeDirection, SymmetrizeResult,
