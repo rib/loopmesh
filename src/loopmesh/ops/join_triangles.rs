@@ -9,6 +9,26 @@ use crate::loopmesh::*;
 /// `radial-mesh-guides/operators/JOIN_TRIANGLES.md` §5.1 term 1.
 const NORMAL_EPS: f32 = 0.0001;
 
+/// §6.3 cap. The influence discount can drive a candidate's error toward a
+/// good neighbour quad's error but never *all the way* to it: a sliver of the
+/// original error is always kept so the relative ordering among influenced
+/// candidates survives, and so a non-zero-error competitor can never be
+/// out-pulled by a candidate against a perfect (zero-error) rival (§6.4
+/// mechanism 1). The multiplier `topology_influence × alignment` is clamped to
+/// this cap.
+const INFLUENCE_CAP: f32 = 0.95;
+
+/// §6.1 seed over-prioritisation. A pre-existing input quad's own §5.1 error is
+/// scaled *down* by this factor before it seeds its neighbours, so "a good
+/// existing quad is treated as near-perfect" and influences strongly — a lower
+/// `err_q` makes the §6.3 discount `(err_q − err_e) × multiplier` more negative,
+/// pulling grid-continuing candidates harder than a freshly-merged quad
+/// (§6.2, which uses the raw error). The guide pins the *direction and intent*
+/// of this scaling (over-prioritise toward near-perfect) but not the exact
+/// scalar; this fraction is the loopmesh approximation and the precise value is
+/// a parity surface the A/B un-stub must confirm.
+const SEED_ERROR_SCALE: f32 = 0.25;
+
 /// Parameters controlling [`LoopMesh::join_triangles`].
 ///
 /// Mirrors the operator's BMOP slot set described in
@@ -34,8 +54,11 @@ pub struct JoinTrianglesParams {
     /// would deviate from a rectangle at any corner by more than this angle, or
     /// whose quad would be flipped (self-overlapping). At `π` disabled.
     pub angle_shape_threshold: f32,
-    /// §6 — grid-flow re-prioritisation strength (0–2). At `0` the merge order
-    /// is pure quad-quality. Non-zero is not implemented this cycle.
+    /// §6 — grid-flow re-prioritisation strength (0–2). At `0` (default) the
+    /// merge order is pure quad-quality (§5.1). When non-zero, pre-existing and
+    /// freshly-merged good quads discount their grid-continuing neighbour
+    /// candidate edges so the merge front flows into existing grid topology; a
+    /// purely *ordering* heuristic that can flip which contested candidate wins.
     pub topology_influence: f32,
     /// §7 — output-selection control. When `false` (default) the result's
     /// `joined` carries the merged quads; when `true` it instead reports the
@@ -150,8 +173,11 @@ impl LoopMesh {
     /// smooth / default material", so those gates never fire until that state
     /// lands.
     ///
-    /// `topology_influence` (§6) is not implemented; a non-zero value runs the
-    /// pure quad-quality order (§5.1) unchanged.
+    /// - **§6** — when `topology_influence` is non-zero, pre-existing input
+    ///   quads (§6.1) and each freshly-merged quad (§6.2) discount their
+    ///   grid-continuing neighbour candidate edges (§6.3), reordering the heap
+    ///   so the merge front flows into existing grid topology. At `0` (default)
+    ///   none of §6 runs and the order is pure §5.1 quality.
     pub fn join_triangles(
         &mut self,
         faces: &[FaceKey],
@@ -173,8 +199,15 @@ impl LoopMesh {
             }
         }
 
-        // §3.2 — gather candidate edges into the merge heap.
+        let influence_active = params.topology_influence != 0.0;
+
+        // §3.2 — gather candidate edges into the merge heap. When §6 is active
+        // we also keep an edge→error map of the *authoritative* score for each
+        // queued candidate; a re-score (§6.3) lowers that score and pushes a
+        // fresh heap entry, and a stale (superseded) entry is dropped on pop.
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+        let mut current_error: std::collections::HashMap<EdgeKey, (f32, u32)> =
+            std::collections::HashMap::new();
         let mut insertion_order: u32 = 0;
         {
             let mut edge_iter = self.mesh_edges();
@@ -192,7 +225,35 @@ impl LoopMesh {
                         insertion_order,
                         edge,
                     });
+                    if influence_active {
+                        current_error.insert(edge, (error, insertion_order));
+                    }
                     insertion_order += 1;
+                }
+            }
+        }
+
+        // §6.1 — seed the influence from pre-existing input quads, before any
+        // merge, so a good existing quad pulls its grid-continuing neighbour
+        // candidates toward the front of the queue.
+        if influence_active && !heap.is_empty() {
+            for &face in faces {
+                if self.faces.try_get(face).is_some() && self.face_len(face) == 4 {
+                    // §6.1 — seed quads are over-prioritised: their error is
+                    // scaled toward near-perfect so they pull harder than a
+                    // freshly-merged quad (§6.2) does.
+                    let seed_error =
+                        join_triangles_quad_error(&self.join_triangles_quad_corners_of_face(face))
+                            * SEED_ERROR_SCALE;
+                    self.join_triangles_reprioritise_quad(
+                        face,
+                        seed_error,
+                        params.topology_influence,
+                        input_tag,
+                        INPUT_BIT,
+                        &mut heap,
+                        &mut current_error,
+                    );
                 }
             }
         }
@@ -200,8 +261,39 @@ impl LoopMesh {
         // §5.2 — greedy pop-and-merge.
         let mut joined: Vec<FaceKey> = Vec::new();
         while let Some(candidate) = heap.pop() {
+            // §6 lazy-deletion: skip an entry whose score has since been
+            // superseded by a lower re-scored entry for the same edge.
+            if influence_active {
+                match current_error.get(&candidate.edge) {
+                    Some(&(error, order))
+                        if error == candidate.error
+                            && order == candidate.insertion_order => {}
+                    _ => continue,
+                }
+            }
             if let Some(quad) = self.join_triangles_try_merge(candidate.edge) {
                 joined.push(quad);
+                if influence_active {
+                    current_error.remove(&candidate.edge);
+                    // §6.2 — the freshly-built quad re-scores its neighbours so
+                    // a clean merge propagates the grid front. Unlike the §6.1
+                    // seed pass, the post-merge re-score uses the quad's *raw*
+                    // §5.1 error (no over-prioritisation scaling).
+                    let quad_error = join_triangles_quad_error(
+                        &self.join_triangles_quad_corners_of_face(quad),
+                    );
+                    self.join_triangles_reprioritise_quad(
+                        quad,
+                        quad_error,
+                        params.topology_influence,
+                        input_tag,
+                        INPUT_BIT,
+                        &mut heap,
+                        &mut current_error,
+                    );
+                }
+            } else if influence_active {
+                current_error.remove(&candidate.edge);
             }
         }
 
@@ -497,6 +589,266 @@ impl LoopMesh {
     /// until a per-face material attribute lands.
     fn join_triangles_face_material(&self, _face: FaceKey) -> u32 {
         0
+    }
+
+    /// §6.1 / §6.2 — re-score the candidate edges of `quad`'s neighbouring
+    /// input triangles, discounting each grid-continuing candidate toward
+    /// `quad_error` (the seed quad's scaled error in §6.1, the freshly-merged
+    /// quad's raw error in §6.2).
+    ///
+    /// For every perimeter edge of `quad`, the face on the other side of that
+    /// edge — when it is an input triangle — is a neighbour whose mergeable
+    /// candidate edges should be pulled toward the front of the queue (§6.1).
+    /// Each such candidate is discounted per §6.3, with grid alignment measured
+    /// between the two quads across the shared edge.
+    ///
+    /// §10 budgets this as a constant (≤ 8 neighbours) with no allocation, so
+    /// the walk is over lending iterators: the quad's loop cycle and each
+    /// neighbour's loop cycle, never a heap-`Vec` of keys.
+    fn join_triangles_reprioritise_quad(
+        &self,
+        quad: FaceKey,
+        quad_error: f32,
+        topology_influence: f32,
+        input_tag: crate::op_flags::FaceOpFlagLayer,
+        input_bit: u8,
+        heap: &mut BinaryHeap<Candidate>,
+        current_error: &mut std::collections::HashMap<EdgeKey, (f32, u32)>,
+    ) {
+        let mut quad_loops = self.face_loops(quad);
+        while let Some(quad_loop) = quad_loops.next(self) {
+            let shared_edge = self.loop_edge(quad_loop);
+            let Some(neighbour) = self.join_triangles_edge_other_face(shared_edge, quad) else {
+                continue;
+            };
+            if self.face_len(neighbour) != 3
+                || !self.face_op_flag_test(input_tag, neighbour, input_bit)
+            {
+                continue;
+            }
+            let mut neighbour_loops = self.face_loops(neighbour);
+            while let Some(neighbour_loop) = neighbour_loops.next(self) {
+                let candidate_edge = self.loop_edge(neighbour_loop);
+                if candidate_edge == shared_edge {
+                    continue;
+                }
+                let Some(&(error_e, order_e)) = current_error.get(&candidate_edge) else {
+                    continue; // not a live queued candidate (merged, gated, or non-manifold)
+                };
+                if quad_error >= error_e {
+                    continue; // a re-score that would raise error is ignored (§6.3)
+                }
+                let alignment =
+                    self.join_triangles_grid_alignment(quad, shared_edge, candidate_edge);
+                if alignment <= 0.0 {
+                    continue;
+                }
+                let multiplier = (topology_influence * alignment).min(INFLUENCE_CAP);
+                let new_error = error_e + (quad_error - error_e) * multiplier;
+                if new_error < error_e {
+                    current_error.insert(candidate_edge, (new_error, order_e));
+                    heap.push(Candidate {
+                        error: new_error,
+                        insertion_order: order_e,
+                        edge: candidate_edge,
+                    });
+                }
+            }
+        }
+    }
+
+    /// The face on the radial-opposite side of a manifold `edge` from `face`,
+    /// or `None` when the edge is not shared by exactly two distinct faces.
+    fn join_triangles_edge_other_face(&self, edge: EdgeKey, face: FaceKey) -> Option<FaceKey> {
+        let mut radial = self.radial_loops(edge);
+        let first = radial.next(self)?;
+        let second = radial.next(self)?;
+        if radial.next(self).is_some() {
+            return None;
+        }
+        let face_a = self.loops.get(first).face;
+        let face_b = self.loops.get(second).face;
+        if face_a == face {
+            Some(face_b)
+        } else if face_b == face {
+            Some(face_a)
+        } else {
+            None
+        }
+    }
+
+    /// §6.3 alignment — how well the candidate's would-be quad lines up with
+    /// the `neighbour_quad` once both are rotated into a common plane about
+    /// their `shared_edge`. A candidate that continues the neighbour quad's
+    /// grid row aligns near `1`; a diagonal or mismatched candidate near `0`.
+    ///
+    /// The measure compares the two quads' edge-direction *flows* across the
+    /// shared edge, and is **fold-invariant** by construction: for each quad it
+    /// takes the direction of the edge opposite the shared edge (the quad's
+    /// "far rail" — the row the grid continues into) and decomposes it about the
+    /// shared-edge axis into (a) its component *along* the shared edge and (b)
+    /// the magnitude of its component *perpendicular* to the shared edge within
+    /// that quad's own plane. Both parts are invariant under rotation about the
+    /// shared-edge axis, so unfolding the natural fold between the two quads
+    /// into a common plane leaves the measure unchanged (§6.3). The two quads'
+    /// (along, perp) flow vectors are compared by cosine similarity; a grid
+    /// continuation makes them parallel, giving `1`.
+    ///
+    /// Returns `0.0` (no influence) when the candidate edge is no longer
+    /// manifold — a post-merge re-score (§6.2) runs after topology has mutated,
+    /// so the candidate quad may have become unreconstructable; falling back to
+    /// zero matches the non-manifold handling of
+    /// [`Self::join_triangles_edge_other_face`] and avoids panicking on an
+    /// invariant that now spans a mutation.
+    fn join_triangles_grid_alignment(
+        &self,
+        neighbour_quad: FaceKey,
+        shared_edge: EdgeKey,
+        candidate_edge: EdgeKey,
+    ) -> f32 {
+        let [s_a, s_b] = self.edges.get(shared_edge).vertices;
+        let pos_s_a = self.vertices.get(s_a).position;
+        let pos_s_b = self.vertices.get(s_b).position;
+        let axis = (pos_s_b - pos_s_a).normalize_or_zero();
+        if axis == Vec3::ZERO {
+            return 0.0;
+        }
+
+        let neighbour_corners = self.join_triangles_face_corners_verts(neighbour_quad);
+        let Some(candidate_corners) = self.join_triangles_quad_corners_verts(candidate_edge) else {
+            return 0.0;
+        };
+
+        let Some(neighbour_flow) =
+            self.join_triangles_far_rail_flow(&neighbour_corners, s_a, s_b, axis)
+        else {
+            return 0.0;
+        };
+        let Some(candidate_flow) =
+            self.join_triangles_far_rail_flow(&candidate_corners, s_a, s_b, axis)
+        else {
+            return 0.0;
+        };
+
+        let neighbour_dir = neighbour_flow.normalize_or_zero();
+        let candidate_dir = candidate_flow.normalize_or_zero();
+        if neighbour_dir == glam::Vec2::ZERO || candidate_dir == glam::Vec2::ZERO {
+            return 0.0;
+        }
+        neighbour_dir.dot(candidate_dir).clamp(0.0, 1.0)
+    }
+
+    /// §6.3 helper — the fold-invariant, winding-consistent 2D flow of a quad's
+    /// far rail about the shared edge. `corners` is the quad's 4-cycle of
+    /// vertices; `s_a`/`s_b` are the shared-edge endpoints (which must appear
+    /// consecutively in the cycle); `axis` is the unit shared-edge direction.
+    ///
+    /// The far rail is the cycle edge opposite the shared edge. To make the two
+    /// quads' flows directly comparable regardless of each cycle's winding
+    /// sense, the rail is oriented relative to **this quad's own traversal of
+    /// the shared edge** (the direction `corners[i] → corners[i+1]`, always
+    /// `±axis`): `along` is the far rail's component along that per-quad
+    /// traversal, `perp` is its component along the in-plane direction pointing
+    /// from the shared edge out toward the far rail. Both are invariant under
+    /// rotation about the shared-edge axis (the fold-invariance §6.3 requires)
+    /// and both are sign-consistent between the two quads. Returns `None` if the
+    /// shared edge is not an edge of the cycle or the quad is degenerate.
+    fn join_triangles_far_rail_flow(
+        &self,
+        corners: &[VertexKey; 4],
+        s_a: VertexKey,
+        s_b: VertexKey,
+        axis: Vec3,
+    ) -> Option<glam::Vec2> {
+        let mut shared_index = None;
+        for i in 0..4 {
+            let a = corners[i];
+            let b = corners[(i + 1) % 4];
+            if (a == s_a && b == s_b) || (a == s_b && b == s_a) {
+                shared_index = Some(i);
+                break;
+            }
+        }
+        let shared_index = shared_index?;
+
+        // The cycle traverses the shared edge corners[si] → corners[si+1]; this
+        // is ±axis and fixes the orientation against which the far rail is read.
+        let shared_start = self.vertices.get(corners[shared_index]).position;
+        let shared_end = self.vertices.get(corners[(shared_index + 1) % 4]).position;
+        let traverse = (shared_end - shared_start).normalize_or_zero();
+        if traverse == Vec3::ZERO {
+            return None;
+        }
+
+        let far_a = corners[(shared_index + 2) % 4];
+        let far_b = corners[(shared_index + 3) % 4];
+        let far_dir = self.vertices.get(far_b).position - self.vertices.get(far_a).position;
+
+        // The perpendicular reference points from the shared edge toward the far
+        // rail (out into the quad), so the perpendicular sign is consistent
+        // between the two quads being compared.
+        let shared_mid = (shared_start + shared_end) * 0.5;
+        let far_mid = (self.vertices.get(far_a).position + self.vertices.get(far_b).position) * 0.5;
+        let outward = far_mid - shared_mid;
+        let outward_perp = (outward - axis * outward.dot(axis)).normalize_or_zero();
+        if outward_perp == Vec3::ZERO {
+            return None;
+        }
+
+        let along = far_dir.dot(traverse);
+        let perp = far_dir.dot(outward_perp);
+        Some(glam::Vec2::new(along, perp))
+    }
+
+    /// §3.3 corner reconstruction returning the four corner *vertices* (cycle
+    /// order) of the quad a merge across `edge` would build, or `None` when the
+    /// edge is no longer manifold (a post-merge §6.2 re-score may reach an edge
+    /// whose radial cycle has changed). Mirrors the graceful non-manifold path
+    /// of [`Self::join_triangles_edge_other_face`].
+    fn join_triangles_quad_corners_verts(&self, edge: EdgeKey) -> Option<[VertexKey; 4]> {
+        let loop_a = self.edges.try_get(edge).and_then(|e| e.radial_link)?;
+        let loop_op = self.loop_radial_next(loop_a);
+        Some([
+            self.loops.get(loop_a).vertex,
+            self.loops.get(self.loop_prev(loop_op)).vertex,
+            self.loops.get(self.loop_next(loop_a)).vertex,
+            self.loops.get(self.loop_prev(loop_a)).vertex,
+        ])
+    }
+
+    /// The four corner *vertices* of an existing quad `face` in cycle order, for
+    /// the §6.3 alignment comparison. Uses the face-loop lending iterator (no
+    /// allocation), matching the §10 constant-cost budget.
+    fn join_triangles_face_corners_verts(&self, face: FaceKey) -> [VertexKey; 4] {
+        let mut loops = self.face_loops(face);
+        // A re-prioritise seed/merge target is always a 4-cycle (face_len == 4),
+        // so the cycle yields exactly four loops; seed the array with the first
+        // loop's vertex as a placeholder rather than carry a sentinel constant.
+        let placeholder = self.loops.get(self.face_first_loop(face)).vertex;
+        let mut corners = [placeholder; 4];
+        let mut index = 0;
+        while let Some(loop_key) = loops.next(self) {
+            if index < 4 {
+                corners[index] = self.loops.get(loop_key).vertex;
+            }
+            index += 1;
+        }
+        corners
+    }
+
+    /// The four corner positions of an existing quad `face` in cycle order, for
+    /// scoring its §5.1 quad-error as an influence seed (§6.1 / §6.2).
+    fn join_triangles_quad_corners_of_face(&self, face: FaceKey) -> [Vec3; 4] {
+        let mut positions = [Vec3::ZERO; 4];
+        let mut loops = self.face_loops(face);
+        let mut index = 0;
+        while let Some(loop_key) = loops.next(self) {
+            if index < 4 {
+                positions[index] = self.vertices.get(self.loops.get(loop_key).vertex).position;
+            }
+            index += 1;
+        }
+        positions
     }
 }
 
@@ -970,6 +1322,262 @@ mod tests {
         let allowed_result = allowed.join_triangles(&[l, u], JoinTrianglesParams::default());
         assert_eq!(allowed_result.joined.len(), 1, "cmp_vcols off merges across the seam");
         allowed.validate_topology();
+    }
+
+    /// Build the §6.4 contested-influence fixture: a pre-existing quad `Q`
+    /// plus a contested apex triangle `Ta` whose two candidate partners (`Tc`
+    /// on the grid-aligned left, `Tb` on the unaligned right) build *congruent*
+    /// quads (equal §5.1 error). Returns `(faces, [Q, Tc, Ta, Tb])`.
+    ///
+    /// Layout (XY plane):
+    /// ```text
+    ///   3 ------- 4 ------------ 5
+    ///   |    Q    |\    Ta      /|
+    ///   |         | \    ___---/ |
+    ///   0 ------- 1 -- 2 ------- 6
+    /// ```
+    /// `Q = [0,1,4,3]`, `Tc = [1,2,4]`, `Ta = [2,5,4]`, `Tb = [2,6,5]`.
+    /// Candidate edges: `{2,4}` (Tc|Ta) and `{2,5}` (Ta|Tb).
+    ///
+    /// The shared `{2,5}` edge is created *before* `{2,4}` so that, at
+    /// `topology_influence == 0`, the equal-error tie is broken by insertion
+    /// order toward the unaligned `{2,5}` merge (consuming Ta+Tb, leaving Tc).
+    /// The influence then has to flip the tie the *other* way to be observable.
+    fn build_contested_influence(mesh: &mut LoopMesh) -> (Vec<FaceKey>, [FaceKey; 4]) {
+        let p = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let v: Vec<VertexKey> = [
+            p(0.0, 0.0), // 0
+            p(1.0, 0.0), // 1
+            p(2.0, 0.0), // 2
+            p(0.0, 1.0), // 3
+            p(1.0, 1.0), // 4
+            p(3.0, 1.0), // 5
+            p(3.0, 0.0), // 6
+        ]
+        .iter()
+        .map(|&pos| mesh.create_vertex(pos))
+        .collect();
+
+        // Pre-create the two contested edges in the order that gives the
+        // unaligned {2,5} merge the earlier insertion tiebreak at influence 0.
+        mesh.create_edge([v[2], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.create_edge([v[2], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+
+        let make_face = |mesh: &mut LoopMesh, idx: &[usize]| -> FaceKey {
+            let verts: Vec<VertexKey> = idx.iter().map(|&i| v[i]).collect();
+            let edges: Vec<EdgeKey> = (0..verts.len())
+                .map(|i| {
+                    mesh.create_edge(
+                        [verts[i], verts[(i + 1) % verts.len()]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
+                })
+                .collect();
+            mesh.face_create(&verts, &edges, FaceCreateFlags::NONE)
+        };
+
+        let q = make_face(mesh, &[0, 1, 4, 3]);
+        let tc = make_face(mesh, &[1, 2, 4]);
+        let ta = make_face(mesh, &[2, 5, 4]);
+        let tb = make_face(mesh, &[2, 6, 5]);
+        (vec![q, tc, ta, tb], [q, tc, ta, tb])
+    }
+
+    /// The §6.4 tie-break flip: at `topology_influence == 0` the congruent-quad
+    /// tie is decided by insertion order and one triangle survives; at
+    /// `topology_influence == 2` the pre-existing quad `Q`'s grid-pull discounts
+    /// the aligned candidate below the tie and a *different* triangle survives.
+    #[test]
+    fn topology_influence_flips_contested_tie_break() {
+        // Influence 0 — pure §5.1 order; the insertion-order tiebreak merges the
+        // unaligned {2,5} pair (Ta+Tb), leaving Tc = [1,2,4].
+        let mut zero = LoopMesh::new();
+        let (faces, [_q, tc, _ta, _tb]) = build_contested_influence(&mut zero);
+        let zero_result = zero.join_triangles(&faces, JoinTrianglesParams::default());
+
+        assert_eq!((zero.totvert(), zero.totedge(), zero.totface()), (7, 9, 3));
+        assert_eq!(zero_result.joined.len(), 1, "one tri-pair merges at influence 0");
+        assert_eq!(zero_result.unmerged, vec![tc], "Tc survives at influence 0");
+        assert!(zero.faces.try_get(tc).is_some());
+        assert_eq!(zero.face_len(tc), 3);
+        zero.validate_topology();
+
+        // Influence 2 — Q discounts its grid-continuing neighbour candidate
+        // {2,4} below the tie; it now pops first, merges Tc+Ta, leaving Tb.
+        let mut two = LoopMesh::new();
+        let (faces, [_q, tc2, _ta2, tb2]) = build_contested_influence(&mut two);
+        let two_result = two.join_triangles(
+            &faces,
+            JoinTrianglesParams {
+                topology_influence: 2.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!((two.totvert(), two.totedge(), two.totface()), (7, 9, 3));
+        assert_eq!(two_result.joined.len(), 1, "one tri-pair merges at influence 2");
+        assert_eq!(two_result.unmerged, vec![tb2], "Tb survives at influence 2");
+        assert!(two.faces.try_get(tb2).is_some());
+        assert_eq!(two.face_len(tb2), 3, "Tb is still a triangle at influence 2");
+        let _ = tc2;
+        two.validate_topology();
+    }
+
+    /// Build the contested-influence fixture but with the candidate-side
+    /// geometry **folded 90° about the shared `{1,4}` edge** (the line `x = 1`):
+    /// the region `x > 1` is rotated into `z`, so verts 2,5,6 leave the `Q`
+    /// plane. `Q` stays flat; the fold is exactly the natural fold across the
+    /// shared edge that §6.3 says alignment must *not* penalise.
+    ///
+    /// This pins the §6.3 structural contract two ways: alignment is a quad-vs-
+    /// quad measure (it consults the now-out-of-plane candidate quad against the
+    /// flat `Q`), and it is fold-invariant (the 90° fold leaves the influence
+    /// outcome identical to the flat fixture). A candidate-only far-rail proxy
+    /// would have scored the folded candidate's intrinsic rail unchanged and so
+    /// could not distinguish this — but neither could it have produced the flat
+    /// fixture's correct flip, which the quad-vs-quad measure does.
+    fn build_contested_influence_folded(mesh: &mut LoopMesh) -> (Vec<FaceKey>, [FaceKey; 4]) {
+        // Fold the candidate plane up about x = 1: (x, y, 0) with x > 1 maps to
+        // (1, y, x - 1). Q's verts (x <= 1) stay in the z = 0 plane.
+        let fold = |x: f32, y: f32| {
+            if x > 1.0 {
+                Vec3::new(1.0, y, x - 1.0)
+            } else {
+                Vec3::new(x, y, 0.0)
+            }
+        };
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0), // 0
+            (1.0, 0.0), // 1
+            (2.0, 0.0), // 2
+            (0.0, 1.0), // 3
+            (1.0, 1.0), // 4
+            (3.0, 1.0), // 5
+            (3.0, 0.0), // 6
+        ]
+        .iter()
+        .map(|&(x, y)| mesh.create_vertex(fold(x, y)))
+        .collect();
+
+        mesh.create_edge([v[2], v[5]], EdgeCreateFlags::NO_DUPLICATE);
+        mesh.create_edge([v[2], v[4]], EdgeCreateFlags::NO_DUPLICATE);
+
+        let make_face = |mesh: &mut LoopMesh, idx: &[usize]| -> FaceKey {
+            let verts: Vec<VertexKey> = idx.iter().map(|&i| v[i]).collect();
+            let edges: Vec<EdgeKey> = (0..verts.len())
+                .map(|i| {
+                    mesh.create_edge(
+                        [verts[i], verts[(i + 1) % verts.len()]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
+                })
+                .collect();
+            mesh.face_create(&verts, &edges, FaceCreateFlags::NONE)
+        };
+
+        let q = make_face(mesh, &[0, 1, 4, 3]);
+        let tc = make_face(mesh, &[1, 2, 4]);
+        let ta = make_face(mesh, &[2, 5, 4]);
+        let tb = make_face(mesh, &[2, 6, 5]);
+        (vec![q, tc, ta, tb], [q, tc, ta, tb])
+    }
+
+    /// §6.3 fold-invariance: folding the candidate side 90° about the shared
+    /// edge must leave the influence outcome unchanged. At `topology_influence
+    /// == 2` the folded fixture must still flip the contested tie toward the
+    /// grid-continuing candidate and leave Tb surviving — exactly as the flat
+    /// fixture does — proving alignment compares the two quads' flows in a
+    /// common plane rather than penalising the natural fold.
+    #[test]
+    fn topology_influence_alignment_is_fold_invariant() {
+        let mut folded = LoopMesh::new();
+        let (faces, [_q, _tc, _ta, tb]) = build_contested_influence_folded(&mut folded);
+        let result = folded.join_triangles(
+            &faces,
+            JoinTrianglesParams {
+                topology_influence: 2.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!((folded.totvert(), folded.totedge(), folded.totface()), (7, 9, 3));
+        assert_eq!(result.joined.len(), 1, "one tri-pair merges across the fold");
+        assert_eq!(
+            result.unmerged,
+            vec![tb],
+            "the fold does not change the flip: Tb still survives at influence 2"
+        );
+        assert_eq!(folded.face_len(tb), 3);
+        folded.validate_topology();
+    }
+
+    /// The two settings reach the *same* V/E/F counts but a different survivor,
+    /// i.e. a non-isomorphic divergence — the cleanest observable signature of
+    /// the parameter (§6.4). This is the in-crate analogue of the A/B
+    /// `assert_topology_influence_diverges` backstop.
+    #[test]
+    fn topology_influence_divergence_is_non_isomorphic() {
+        let mut zero = LoopMesh::new();
+        let (faces, _) = build_contested_influence(&mut zero);
+        let zero_survivor = {
+            let r = zero.join_triangles(&faces, JoinTrianglesParams::default());
+            assert_eq!(r.unmerged.len(), 1);
+            zero.face_vert_keys(r.unmerged[0])
+        };
+
+        let mut two = LoopMesh::new();
+        let (faces, _) = build_contested_influence(&mut two);
+        let two_survivor = {
+            let r = two.join_triangles(
+                &faces,
+                JoinTrianglesParams {
+                    topology_influence: 2.0,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(r.unmerged.len(), 1);
+            two.face_vert_keys(r.unmerged[0])
+        };
+
+        // Same counts both ways.
+        assert_eq!(zero.totvert(), two.totvert());
+        assert_eq!(zero.totedge(), two.totedge());
+        assert_eq!(zero.totface(), two.totface());
+        // Different surviving triangle ⇒ non-isomorphic.
+        assert_ne!(
+            zero_survivor, two_survivor,
+            "the leftover triangle must differ between influence 0 and 2"
+        );
+    }
+
+    /// `topology_influence` is an *ordering* heuristic: where no triangle is
+    /// contested, every candidate merges regardless of order, so a non-zero
+    /// influence changes nothing observable. Default (`0`) and `2` agree here.
+    #[test]
+    fn topology_influence_unobservable_without_contention() {
+        let build = |mesh: &mut LoopMesh| {
+            let (lower, upper, _) = two_tris_shared_edge(mesh);
+            vec![lower, upper]
+        };
+
+        let mut zero = LoopMesh::new();
+        let faces = build(&mut zero);
+        let zero_result = zero.join_triangles(&faces, JoinTrianglesParams::default());
+
+        let mut two = LoopMesh::new();
+        let faces = build(&mut two);
+        let two_result = two.join_triangles(
+            &faces,
+            JoinTrianglesParams {
+                topology_influence: 2.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(zero_result.joined.len(), two_result.joined.len());
+        assert_eq!(zero.totface(), two.totface());
+        assert_eq!((zero.totvert(), zero.totedge(), zero.totface()), (4, 4, 1));
+        two.validate_topology();
     }
 
     fn register_uv_layer(mesh: &mut LoopMesh, name: &'static str) -> ElementAttributeKey {
