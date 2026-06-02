@@ -25,8 +25,9 @@ use crate::loopmesh::*;
 
 /// The guard set chosen per §3.2 by selection size. The `exists` guard
 /// (decline a rotation whose target diagonal already joins the two corners) is
-/// always on; the `degenerate` guard (decline a rotation whose re-split faces
-/// fold to zero area / bow-tie) is added only for multi-edge selections.
+/// always on; the `degenerate` guard (decline a rotation that fails the §3.3
+/// per-arrival-corner orientation test — an inside-out fold or a collinear
+/// sliver) is added only for multi-edge selections.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct GuardSet {
     degenerate: bool,
@@ -248,8 +249,8 @@ impl LoopMesh {
     /// The §3 eligibility predicate: an edge is rotatable iff it is 2-manifold
     /// (a well-defined other diagonal exists), its target diagonal does not
     /// already exist (the `exists` guard), and — when the `degenerate` guard
-    /// is on — the rotation would not produce a degenerate (folded / bow-tie)
-    /// re-split face.
+    /// is on — the rotation passes the §3.3 per-arrival-corner orientation
+    /// test (no inside-out fold, no collinear sliver).
     fn is_rotatable(&self, edge: EdgeKey, use_ccw: bool, guards: GuardSet) -> bool {
         let Some((a, c)) = self.edge_rotate_diagonal(edge, use_ccw) else {
             return false;
@@ -284,39 +285,95 @@ impl LoopMesh {
         self.edge_rotate(edge, use_ccw)
     }
 
-    /// §3 cond 3 — would the rotation onto diagonal `(a, c)` fold a re-split
-    /// face to zero area or a bow-tie? The union quad has corners `a`, `b`,
-    /// `c`, `d` where `(b, d)` is the input edge; the new diagonal `(a, c)`
-    /// splits it into triangles `(a, b, c)` and `(a, c, d)`. The rotation is
-    /// degenerate iff either triangle has (near-)zero signed area in the
-    /// quad's own plane, or the two triangles wind opposite ways (a bow-tie /
-    /// fold across the new diagonal).
+    /// §3.3 — the degenerate guard's **corner-orientation test**. Would
+    /// re-chording the union quad onto the new diagonal turn either re-split
+    /// face inside-out (arm (i)) or collapse an arrival corner to a
+    /// near-collinear sliver (arm (ii))?
+    ///
+    /// The test is fully local, 3-D (no projection to a plane — it stays
+    /// correct on a folded quad), and **per-arrival-corner**: each arrival
+    /// corner is judged independently, with no step comparing the two re-split
+    /// faces to each other. A whole-face opposite-winding / bow-tie test is
+    /// strictly coarser and wrongly accepts a same-winding *folded* quad whose
+    /// single arrival corner flips; this per-corner form catches it.
+    ///
+    /// Labelling (§2 / §3.3): the input edge `e` leaves corners `b`, `d` and
+    /// arrives at corners `a`, `c` (the new diagonal's endpoints). The corner
+    /// produced by stepping in `e`'s first endpoint's face is paired with that
+    /// endpoint as its *old* partner; the *other* endpoint is its *new*
+    /// partner. [`Self::edge_rotate_diagonal`] returns `(a, c)` in exactly the
+    /// `(step-from-v1, step-from-v2)` order, so `a`'s old partner is `v1` (its
+    /// new partner `v2`) and `c`'s old partner is `v2` (its new partner `v1`).
     fn rotation_is_degenerate(&self, edge: EdgeKey, a: VertexKey, c: VertexKey) -> bool {
-        let [b, d] = self.edges.get(edge).vertices;
-        let pa = self.vertex_position(a);
-        let pb = self.vertex_position(b);
-        let pc = self.vertex_position(c);
-        let pd = self.vertex_position(d);
+        // §2/§3.3 labels: `b = v1`, `d = v2` (the corners `e` leaves).
+        let [b_vertex, d_vertex] = self.edges.get(edge).vertices;
+        let position_a = self.vertex_position(a);
+        let position_c = self.vertex_position(c);
+        let position_b = self.vertex_position(b_vertex);
+        let position_d = self.vertex_position(d_vertex);
 
-        // Orient the area test in the union quad's own plane via its normal.
-        let normal = (pb - pa).cross(pc - pa) + (pc - pa).cross(pd - pa);
-        let len = normal.length();
-        if len <= AREA_EPS {
+        // Both arms share two normalized direction vectors (§3.3): the old
+        // diagonal `b → d` and the new diagonal `a → c`.
+        let dir_old = (position_d - position_b).normalize_or_zero();
+        let dir_new = (position_c - position_a).normalize_or_zero();
+        if dir_old == Vec3::ZERO || dir_new == Vec3::ZERO {
+            // A zero-length diagonal is itself degenerate.
             return true;
         }
-        let axis = normal / len;
 
-        let signed_area = |p0: Vec3, p1: Vec3, p2: Vec3| -> f32 {
-            (p1 - p0).cross(p2 - p0).dot(axis)
-        };
-        let area_abc = signed_area(pa, pb, pc);
-        let area_acd = signed_area(pa, pc, pd);
-
-        if area_abc.abs() <= AREA_EPS || area_acd.abs() <= AREA_EPS {
+        // Arrival corner `a`: old partner `b_a = b_vertex` (`v1`), new partner
+        // `d_a = d_vertex` (`v2`); `step_a = d_a → a` reads *into* `a`.
+        let to_old_partner_a = (position_b - position_a).normalize_or_zero();
+        let step_a = (position_a - position_d).normalize_or_zero();
+        // Arrival corner `c`: old partner `b_c = d_vertex` (`v2`), new partner
+        // `d_c = b_vertex` (`v1`); `step_c = d_c → c` reads *into* `c`.
+        let to_old_partner_c = (position_d - position_c).normalize_or_zero();
+        let step_c = (position_c - position_b).normalize_or_zero();
+        if to_old_partner_a == Vec3::ZERO
+            || step_a == Vec3::ZERO
+            || to_old_partner_c == Vec3::ZERO
+            || step_c == Vec3::ZERO
+        {
             return true;
         }
-        // Opposite winding across the new diagonal — a fold / bow-tie.
-        area_abc.signum() != area_acd.signum()
+
+        // Arm (i): per-corner orientation preservation. The deliberate
+        // asymmetry — old term reads *out of* the corner toward the old
+        // partner, new term reads *into* the corner from the new partner — is
+        // load-bearing; it makes the dot's sign track the corner's *turn
+        // reversal*, not a fixed handedness.
+        let cross_old_a = dir_old.cross(to_old_partner_a);
+        let cross_new_a = dir_new.cross(step_a);
+        if cross_old_a.dot(cross_new_a) < 0.0 {
+            return true;
+        }
+        let cross_old_c = dir_old.cross(to_old_partner_c);
+        let cross_new_c = dir_new.cross(step_c);
+        if cross_old_c.dot(cross_new_c) < 0.0 {
+            return true;
+        }
+
+        // Arm (ii): thinness / collinear-grazing sliver. Reject when the new
+        // diagonal lies almost *along* the post-rotation edge an arrival corner
+        // brings in, so that re-split face collapses to a near-zero-area sliver.
+        // "Along" is direction-agnostic: a near-parallel `dir_new`/`step`
+        // pinches the corner to ~0°, a near-anti-parallel pair straightens it to
+        // ~180°; both are vanishing-area slivers the guard rejects. (§3.3 states
+        // each clause one-sided — `dir_new·step_a ≈ +1`, `−dir_new·step_c ≈ +1`
+        // — to name the ~180° "arrival corner straightens" form; the magnitude
+        // test below subsumes those and additionally rejects the ~0° form, which
+        // is the same vanishing-area sliver presenting when the collinear vertex
+        // is an *original* edge endpoint rather than the arrival corner. Without
+        // it, an exactly-flat re-split triangle is accepted and §5's order-
+        // independence breaks on a region that produces one mid-sweep.)
+        if dir_new.dot(step_a).abs() >= COLLINEAR_COS {
+            return true;
+        }
+        if dir_new.dot(step_c).abs() >= COLLINEAR_COS {
+            return true;
+        }
+
+        false
     }
 
     /// §4.0 — does any face flank two input edges? Only manifold input edges
@@ -419,8 +476,11 @@ impl LoopMesh {
     }
 }
 
-/// Float-noise floor for the degenerate-guard area tests (§3 cond 3).
-const AREA_EPS: f32 = 1e-9;
+/// Direction-cosine tolerance for the §3.3 arm (ii) thinness / collinear-
+/// grazing sliver check (~2.5° of separation). The exact value is not
+/// parity-observable so long as both sides reject the same near-collinear
+/// slivers and the canonical position quantum is well below the gap it leaves.
+const COLLINEAR_COS: f32 = 0.999;
 
 /// The width that lifts interior re-evaluation keys above every boundary seed
 /// key (§4.2 invariant 2). Any value past the largest squared length any
@@ -858,6 +918,180 @@ mod tests {
         }
         expected.sort_unstable();
         assert_eq!(edges, expected, "pinned landed diagonals (raw-cost all-pass order)");
+    }
+
+    /// Build two tris sharing diagonal {p1,p3} of an explicit quad
+    /// p0,p1,p2,p3 (cyclic). Tris (p0,p1,p3) and (p1,p2,p3) share {p1,p3}.
+    /// Returns the shared edge and the 4 verts in cyclic order.
+    fn quad_on_diag(
+        mesh: &mut LoopMesh,
+        p: [Vec3; 4],
+    ) -> (EdgeKey, [VertexKey; 4]) {
+        let v: Vec<VertexKey> = p.iter().map(|&pp| mesh.create_vertex(pp)).collect();
+        tri(mesh, [v[0], v[1], v[3]]);
+        tri(mesh, [v[1], v[2], v[3]]);
+        let diag = edge_between(mesh, v[1], v[3]);
+        (diag, [v[0], v[1], v[2], v[3]])
+    }
+
+    /// §3.3 positive control — a convex quad (even a skewed kite) preserves
+    /// every arrival corner's orientation and stays clear of the thinness
+    /// tolerance, so the degenerate guard *accepts* it in both directions.
+    #[test]
+    fn convex_quad_is_not_degenerate() {
+        let cases: &[[Vec3; 4]] = &[
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.3, 0.0),
+                Vec3::new(2.5, 2.0, 0.0),
+                Vec3::new(0.2, 1.7, 0.0),
+            ],
+        ];
+        for p in cases {
+            let mut mesh = LoopMesh::new();
+            let (diag, _v) = quad_on_diag(&mut mesh, *p);
+            for &ccw in &[true, false] {
+                let (a, c) = mesh.edge_rotate_diagonal(diag, ccw).unwrap();
+                assert!(
+                    !mesh.rotation_is_degenerate(diag, a, c),
+                    "convex quad rotation must be accepted (ccw={ccw})"
+                );
+            }
+        }
+    }
+
+    /// Append a disjoint convex unit-square patch far in +x and return its
+    /// shared diagonal edge plus the corner pair the rotation will lay.
+    fn disjoint_convex_patch(mesh: &mut LoopMesh) -> (EdgeKey, [VertexKey; 2]) {
+        let w0 = mesh.create_vertex(Vec3::new(50.0, 0.0, 0.0));
+        let w1 = mesh.create_vertex(Vec3::new(51.0, 0.0, 0.0));
+        let w2 = mesh.create_vertex(Vec3::new(51.0, 1.0, 0.0));
+        let w3 = mesh.create_vertex(Vec3::new(50.0, 1.0, 0.0));
+        tri(mesh, [w0, w1, w2]);
+        tri(mesh, [w0, w2, w3]);
+        (edge_between(mesh, w0, w2), [w1, w3])
+    }
+
+    fn signed_normal(pa: Vec3, pb: Vec3, pc: Vec3) -> Vec3 {
+        (pb - pa).cross(pc - pa)
+    }
+
+    /// §3.3 arm (i) — a *planar concave* (reflex-notch) quad. Its rotation
+    /// would lay the new diagonal *outside* the polygon, reversing one arrival
+    /// corner's turn; both re-split faces stay non-zero-area. Selected alongside
+    /// a disjoint convex patch (so the selection is multi-edge and the
+    /// degenerate guard is on, §3.2): the concave diagonal is skipped, the
+    /// convex diagonal rotates. A zero-area-only shortcut would wrongly commit
+    /// the concave rotation (no face is degenerate by area).
+    #[test]
+    fn concave_quad_degenerate_guard_declines() {
+        let mut mesh = LoopMesh::new();
+        // Arrowhead: cyclic p0,p1,p2,p3 with p3 the reflex notch.
+        let concave = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.9, 1.0, 0.0),
+        ];
+        let (concave_diag, cverts) = quad_on_diag(&mut mesh, concave);
+        let (convex_diag, [cw1, cw3]) = disjoint_convex_patch(&mut mesh);
+        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        let out = mesh.rotate_edges(&[concave_diag, convex_diag], true);
+
+        // Concave skipped: its shared diagonal survives, the would-be new
+        // diagonal {p0,p2} was not laid.
+        assert!(
+            mesh.query_edge_exists(cverts[1], cverts[3]).is_some(),
+            "concave shared diagonal survives — rotation declined"
+        );
+        assert!(
+            mesh.query_edge_exists(cverts[0], cverts[2]).is_none(),
+            "concave new diagonal was not laid"
+        );
+        // Convex rotated.
+        assert!(mesh.query_edge_exists(cw1, cw3).is_some(), "convex diagonal rotated");
+        assert_eq!(out.len(), 1, "only the convex rotation contributes to edges.out");
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            counts,
+            "rotations are count-preserving"
+        );
+    }
+
+    /// §3.3 arm (i) — the load-bearing *folded* (non-planar) quad. Its rotation
+    /// reverses exactly one arrival corner's old-vs-new turn (arm (i) fires)
+    /// **yet the two re-split faces wind the same way** (same-sign 3-D normals
+    /// *and* same-sign projected areas), with both faces non-zero-area. A
+    /// bow-tie / opposite-winding shortcut would wrongly accept this rotation;
+    /// a zero-area-only shortcut would too. Only the full per-corner arm (i)
+    /// declines it. The fold geometry was found by sweeping the dihedral and is
+    /// well inside the (declined ∧ same-winding) plateau.
+    #[test]
+    fn folded_same_winding_quad_arm_i_declines() {
+        let folded = [
+            Vec3::new(0.0, -1.5, 0.6),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, -0.5, -0.36),
+            Vec3::new(1.0, 0.0, 0.0),
+        ];
+
+        // First assert the fixture really is "same-winding + non-zero-area" —
+        // the property that makes this case distinguish arm (i) from a bow-tie
+        // shortcut. (Done on a throwaway mesh so the predicate sees the same
+        // geometry the operator will.)
+        {
+            let mut probe = LoopMesh::new();
+            let (diag, [pa_v, _pb_v, pc_v, _pd_v]) = quad_on_diag(&mut probe, folded);
+            let (a, c) = probe.edge_rotate_diagonal(diag, true).unwrap();
+            let [b_v, d_v] = probe.edges.get(diag).vertices;
+            let pa = probe.vertex_position(a);
+            let pc = probe.vertex_position(c);
+            let pb = probe.vertex_position(b_v);
+            let pd = probe.vertex_position(d_v);
+            let n_abc = signed_normal(pa, pb, pc);
+            let n_acd = signed_normal(pa, pc, pd);
+            assert!(
+                n_abc.dot(n_acd) > 0.0,
+                "re-split faces must wind the SAME way (bow-tie guard would accept)"
+            );
+            assert!(
+                n_abc.length() > 0.3 && n_acd.length() > 0.3,
+                "both re-split faces non-zero-area (zero-area guard would accept)"
+            );
+            assert!(
+                probe.rotation_is_degenerate(diag, a, c),
+                "arm (i) must decline this same-winding folded rotation"
+            );
+            let _ = (pa_v, pc_v);
+        }
+
+        // Now the operator-level behaviour: multi-edge selection (guard on),
+        // folded diagonal skipped, disjoint convex diagonal rotated.
+        let mut mesh = LoopMesh::new();
+        let (folded_diag, fverts) = quad_on_diag(&mut mesh, folded);
+        let (convex_diag, [cw1, cw3]) = disjoint_convex_patch(&mut mesh);
+        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        let out = mesh.rotate_edges(&[folded_diag, convex_diag], true);
+
+        assert!(
+            mesh.query_edge_exists(fverts[1], fverts[3]).is_some(),
+            "folded shared diagonal survives — arm (i) declined the rotation"
+        );
+        assert!(
+            mesh.query_edge_exists(fverts[0], fverts[2]).is_none(),
+            "folded new diagonal was not laid"
+        );
+        assert!(mesh.query_edge_exists(cw1, cw3).is_some(), "convex diagonal rotated");
+        assert_eq!(out.len(), 1, "only the convex rotation contributes to edges.out");
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
     }
 
     /// §6 — `edges.out` carries one live new edge per successful rotation and
