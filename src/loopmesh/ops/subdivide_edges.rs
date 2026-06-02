@@ -126,6 +126,14 @@ pub struct SubdivideParams {
     /// by multiplying in the §9.1.3 step-2 shell factor. No effect when
     /// `smooth == 0` or on a flat edge (parallel endpoint normals).
     pub use_smooth_even: bool,
+    /// Project each inserted vert radially onto the origin-centred sphere of
+    /// radius `smooth` (§9.4). The dome / to-sphere placement rule: every
+    /// inserted vert (rim midpoint or interior/lattice node) is snapped to
+    /// `normalize(co_chord) * smooth`; pre-existing corners are never moved.
+    /// Mutually exclusive with the §9.1 `smooth` off-chord offset — when set,
+    /// the §9.1 machinery is skipped and `smooth` is overloaded as the sphere
+    /// radius (§9.4.3). `smooth_falloff` / `use_smooth_even` become inert.
+    pub use_sphere: bool,
 }
 
 impl Default for SubdivideParams {
@@ -139,6 +147,7 @@ impl Default for SubdivideParams {
             smooth: 0.0,
             smooth_falloff: SmoothFalloff::Smooth,
             use_smooth_even: false,
+            use_sphere: false,
         }
     }
 }
@@ -233,6 +242,21 @@ impl SubdivideParams {
         self.use_smooth_even = enabled;
         self
     }
+
+    /// Toggle the dome / to-sphere projection (§9.4). Off by default. When on,
+    /// every inserted vert (rim midpoint and interior/lattice node) is snapped
+    /// radially onto the origin-centred sphere whose radius is the `smooth`
+    /// parameter: `co_sphere = normalize(co_chord) * smooth`. Pre-existing
+    /// corners are never moved (§9.4.2). This is **mutually exclusive** with the
+    /// §9.1 off-chord offset and wins — the §9.1 machinery is skipped and
+    /// `smooth_falloff` / `use_smooth_even` become inert (§9.4.3); `smooth` is
+    /// reused as the sphere radius. Feed a coarse cage whose corners already sit
+    /// on the sphere of radius `smooth` and every cut bulges outward onto it.
+    #[must_use]
+    pub fn use_sphere(mut self, enabled: bool) -> Self {
+        self.use_sphere = enabled;
+        self
+    }
 }
 
 /// Outcome of [`LoopMesh::subdivide_edges`]. Distinguishes a real run from a
@@ -312,14 +336,18 @@ impl LoopMesh {
             let [near, _far] = self.edge_vert_keys(edge);
             // §9.1 — snapshot the endpoint positions and vertex normals *before*
             // the split (the split rewrites the edge's far endpoint). `t = 0.5`
-            // is the §3.2 directional cut parameter, measured from `near`.
-            let placement = (params.smooth != 0.0)
+            // is the §3.2 directional cut parameter, measured from `near`. The
+            // §9.1 offset is skipped under `use_sphere` (§9.4.3, sphere wins).
+            let placement = (!params.use_sphere && params.smooth != 0.0)
                 .then(|| self.smooth_placement(edge, near, 0.5, &params));
             let (m, _e_new) = self.edge_split(edge, near, 0.5);
             if let Some(co_final) = placement {
                 self.set_vertex_position(m, co_final);
                 self.vert_normal_update(m);
             }
+            // §9.4.1 — radial snap onto the origin-centred sphere of radius
+            // `smooth`, taken from the inserted midpoint's chord position.
+            self.maybe_sphere_project(m, &params);
             self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
             geom.verts.push(m);
             for f in self.vert_face_keys(m) {
@@ -412,6 +440,19 @@ impl LoopMesh {
         self.smooth_endpoint_context(edge, near).placement(t, params)
     }
 
+    /// §9.4.1 — when `use_sphere` is set, snap the inserted vert `v` radially
+    /// onto the origin-centred sphere of radius `smooth`, reading the direction
+    /// from `v`'s *current* (chord / centroid / lattice) position. A no-op when
+    /// the flag is clear, so the chord and §9.1-smooth paths are untouched. Only
+    /// the verts the operator *creates* are ever passed here; pre-existing
+    /// corners are never projected (§9.4.2).
+    fn maybe_sphere_project(&mut self, v: VertexKey, params: &SubdivideParams) {
+        if params.use_sphere {
+            let co_sphere = sphere_project(self.vertex_position(v), params.smooth);
+            self.set_vertex_position(v, co_sphere);
+        }
+    }
+
     /// Dispatch and apply the §5 / §6 re-split pattern for one touched face.
     fn resplit_face(
         &mut self,
@@ -476,7 +517,7 @@ impl LoopMesh {
             }
             (4, 4) => {
                 if params.use_grid_fill {
-                    self.quad_four_cut(face, &ring, geom);
+                    self.quad_four_cut(face, &ring, params, geom);
                 }
             }
             (4, 2) if Self::quad_two_cut_is_opposite(&ring) => {
@@ -493,7 +534,7 @@ impl LoopMesh {
                         self.quad_two_adjacent_straight_cut(face, &ring, geom)
                     }
                     QuadCornerType::InnerVert => {
-                        self.quad_two_adjacent_inner_vert(face, &ring, geom)
+                        self.quad_two_adjacent_inner_vert(face, &ring, params, geom)
                     }
                     QuadCornerType::Path => self.quad_two_adjacent_path(face, &ring, geom),
                     QuadCornerType::Fan => self.quad_two_adjacent_fan(face, &ring, geom),
@@ -741,6 +782,7 @@ impl LoopMesh {
         &mut self,
         face: FaceKey,
         ring: &[(VertexKey, bool)],
+        params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
         let [m01, _v1, m12, _v2, v3, _v0] = Self::adjacent_two_cut_corners(ring);
@@ -756,6 +798,9 @@ impl LoopMesh {
         //    of the cut's endpoints (m01, m12) — exactly the documented inner-
         //    vert rule, *not* the §5.4 face-wide centroid.
         let (c, _e_new) = self.edge_split(corner_cut_edge, m01, 0.5);
+        // §9.4.2 — the operator-created inner vert is snapped onto the sphere
+        // under `use_sphere`, outward from its chord (corner-cut midpoint).
+        self.maybe_sphere_project(c, params);
         geom.verts.push(c);
 
         // 3. Spoke c -> v3, splitting the pentagon into the two filling quads.
@@ -881,6 +926,7 @@ impl LoopMesh {
         &mut self,
         face: FaceKey,
         ring: &[(VertexKey, bool)],
+        params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
         let (v, _) = Self::rotate_to_first_midpoint(ring);
@@ -915,6 +961,11 @@ impl LoopMesh {
             (w, c3.as_usize()),
         ];
         self.vertex_attribs.interpolate_into(c.as_usize(), &sources);
+
+        // §9.4.4 — under `use_sphere`, the inner vert is snapped onto the sphere
+        // outward from its centroid chord position (the rim midpoints were
+        // already snapped in phase one). Attribute interpolation is unchanged.
+        self.maybe_sphere_project(c, params);
 
         // Connect the remaining two rim midpoints to c, finishing the four
         // spokes (m01-c and m23-c already exist as the halved diagonal).
@@ -973,7 +1024,8 @@ impl LoopMesh {
             // §9.1 — capture the smooth endpoint context before the split. Each
             // of the N midpoints lands at the directional cut parameter
             // t = i/(N+1) (§3.3), measured from `near`.
-            let smooth_ctx = (params.smooth != 0.0)
+            // §9.4.3 — the §9.1 offset is skipped under `use_sphere` (sphere wins).
+            let smooth_ctx = (!params.use_sphere && params.smooth != 0.0)
                 .then(|| self.smooth_endpoint_context(edge, near));
             let mids = self.edge_split_n(edge, near, cuts);
             if let Some(ctx) = &smooth_ctx {
@@ -986,6 +1038,8 @@ impl LoopMesh {
                 }
             }
             for &m in &mids {
+                // §9.4.1 — radial snap each rim midpoint from its chord position.
+                self.maybe_sphere_project(m, &params);
                 self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
                 geom.verts.push(m);
             }
@@ -1079,12 +1133,12 @@ impl LoopMesh {
         match (corner_count, cut_sides) {
             (4, 4) => {
                 if params.use_grid_fill {
-                    self.quad_grid_fill(face, &corners, &sides, n, geom);
+                    self.quad_grid_fill(face, &corners, &sides, n, params, geom);
                 }
             }
             (3, 3) => {
                 if params.use_grid_fill {
-                    self.tri_lattice_fill(face, &corners, &sides, n, geom);
+                    self.tri_lattice_fill(face, &corners, &sides, n, params, geom);
                 }
             }
             (4, 1) => {
@@ -1131,6 +1185,7 @@ impl LoopMesh {
         corners: &[VertexKey],
         sides: &[Vec<VertexKey>],
         n: usize,
+        params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
         let (v0, v1, v2, v3) = (corners[0], corners[1], corners[2], corners[3]);
@@ -1175,6 +1230,8 @@ impl LoopMesh {
                     ((1.0 - u) * v, v3.as_usize()),
                 ];
                 self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                // §9.4.4 — snap each interior lattice node onto the sphere.
+                self.maybe_sphere_project(vk, params);
                 node[r][c] = vk;
                 geom.verts.push(vk);
             }
@@ -1206,6 +1263,7 @@ impl LoopMesh {
         corners: &[VertexKey],
         sides: &[Vec<VertexKey>],
         n: usize,
+        params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
         let (v0, v1, v2) = (corners[0], corners[1], corners[2]);
@@ -1247,6 +1305,8 @@ impl LoopMesh {
                         (w2, v2.as_usize()),
                     ];
                     self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                    // §9.4.4 — snap each interior lattice node onto the sphere.
+                    self.maybe_sphere_project(vk, params);
                     geom.verts.push(vk);
                     vk
                 };
@@ -1410,6 +1470,18 @@ impl SmoothEndpointContext {
 
         toward_start.lerp(toward_end, t)
     }
+}
+
+/// §9.4.1 — the dome / to-sphere radial snap: keep an inserted vert's direction
+/// from the origin and reset its distance to `radius`, i.e.
+/// `co_sphere = normalize(co_chord) * radius`, origin-centred. A pure radial
+/// function of the chord position and the radius — no normal, no tangent, no arc
+/// (§9.4.5). A vert whose chord position is at the origin has no defined radial
+/// direction (§9.4.1 degeneracy); `normalize_or_zero` leaves it at the origin in
+/// that case, which the documented usage avoids by keeping the origin off every
+/// cut chord and lattice node.
+fn sphere_project(co_chord: Vec3, radius: f32) -> Vec3 {
+    co_chord.normalize_or_zero() * radius
 }
 
 /// Reflect `n` across the plane whose normal is `dir` (a unit chord direction):
@@ -2955,5 +3027,213 @@ mod tests {
             "use_smooth_even shell factor (>1) pushes the midpoint further \
              (on {d_on} vs off {d_off})"
         );
+    }
+
+    // ---- §9.4 use_sphere (dome / to-sphere projection) -------------------
+
+    /// A cage quad sitting on the cube face `x = 1`: its four corners
+    /// `(1,±1,±1)` each lie on the origin-centred sphere of radius √3 (the
+    /// §9.4 "corners already on the hull" cage). Loop order
+    /// `[(1,1,1),(1,1,-1),(1,-1,-1),(1,-1,1)]`, so the edge `{v0,v1}` runs
+    /// `(1,1,1)→(1,1,-1)` with chord midpoint `(1,1,0)` (radius √2). Returns the
+    /// mesh and the face; the sphere radius is √3.
+    fn sphere_cage_quad(mesh: &mut LoopMesh) -> FaceKey {
+        create_face_from_verts(
+            mesh,
+            &[
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, -1.0),
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(1.0, -1.0, 1.0),
+            ],
+        )
+    }
+
+    const SPHERE_R: f32 = 1.732_050_8; // √3, the cage-corner radius
+
+    #[test]
+    fn use_sphere_projects_single_midpoint() {
+        // §9.4.1 — cut one cage edge with use_sphere and smooth = √3. The §3
+        // chord midpoint (1,1,0) (radius √2) is snapped radially out to radius
+        // √3 (no normals, no arc), while the four corners stay put.
+        let mut mesh = LoopMesh::new();
+        let face = sphere_cage_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(
+            &[e01],
+            SubdivideParams::default().smooth(SPHERE_R).use_sphere(true),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        // §9.4 topology-invariance: same fragment graph as the chord run (§5.1
+        // one-edge quad re-split, 1 quad -> 3 faces).
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (5, 7, 3), "use_sphere is topology-invariant (§9.4)");
+
+        // The midpoint is the single inserted vert. Its direction is the chord
+        // midpoint (1,1,0) and its distance from the origin is now exactly √3.
+        let m = geom.verts[0];
+        let pos = mesh.vertex_position(m);
+        assert!(
+            (pos.length() - SPHERE_R).abs() < 1e-5,
+            "midpoint snapped to radius √3, got {}",
+            pos.length()
+        );
+        // Direction preserved: (1,1,0) normalised, scaled to √3 -> (1.2247..,
+        // 1.2247.., 0).
+        let expected = Vec3::new(1.0, 1.0, 0.0).normalize() * SPHERE_R;
+        assert!(pos.distance(expected) < 1e-5, "projected along the chord radial");
+
+        // §9.4.2 — pre-existing corners are never moved. The corner at (1,1,1)
+        // is still exactly there (the rule never touches originals).
+        let corner = find_vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
+        assert!(
+            mesh.vertex_position(corner).distance(Vec3::new(1.0, 1.0, 1.0)) < 1e-9,
+            "original corner unmoved"
+        );
+    }
+
+    #[test]
+    fn use_sphere_off_keeps_chord_midpoint() {
+        // §9.4.3 contrast — with use_sphere off (and no smooth offset) the same
+        // cut leaves the midpoint on its chord at (1,1,0), radius √2.
+        let mut mesh = LoopMesh::new();
+        let face = sphere_cage_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().use_sphere(false));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        let m = geom.verts[0];
+        let pos = mesh.vertex_position(m);
+        assert!(
+            pos.distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5,
+            "chord midpoint stays at (1,1,0)"
+        );
+        assert!(
+            (pos.length() - std::f32::consts::SQRT_2).abs() < 1e-5,
+            "chord midpoint is at radius √2, not √3"
+        );
+    }
+
+    #[test]
+    fn use_sphere_skips_smooth_offset() {
+        // §9.4.3 — use_sphere and the §9.1 smooth offset are mutually exclusive;
+        // sphere wins. A non-flat fold edge would bow under §9.1, but with
+        // use_sphere on the midpoint must land on the sphere of radius `smooth`
+        // (the radial snap), NOT on the §9.1 curved target.
+        let (mut mesh, _v, e) = folded_two_quads(FRAC_PI_3);
+        let res = mesh.subdivide_edges(
+            &[e],
+            SubdivideParams::default()
+                .smooth(SPHERE_R)
+                .smooth_falloff(SmoothFalloff::Linear)
+                .use_sphere(true),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let pos = midpoint_pos_after_cut(&mesh, &geom);
+        // The radial snap pins the midpoint exactly on the sphere of radius √3.
+        assert!(
+            (pos.length() - SPHERE_R).abs() < 1e-5,
+            "use_sphere snaps to the radius, ignoring the §9.1 offset (r = {})",
+            pos.length()
+        );
+    }
+
+    #[test]
+    fn use_sphere_all_four_edges_dome() {
+        // §9.4.4 + §5.4 — cut all four cage edges with use_sphere and smooth =
+        // √3. All four rim midpoints (chord radius √2) and the §5.4 inner vert
+        // (chord = face centroid (1,0,0), radius 1) snap onto the sphere of
+        // radius √3. Topology is the unchanged §5.4 plus-split (2x2 grid).
+        let mut mesh = LoopMesh::new();
+        let face = sphere_cage_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let edges: Vec<_> = (0..4)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
+            .collect();
+
+        let res = mesh.subdivide_edges(
+            &edges,
+            SubdivideParams::default().smooth(SPHERE_R).use_sphere(true),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (9, 12, 4), "use_sphere four-cut is the §5.4 plus-split");
+
+        // Every inserted vert (4 rim midpoints + 1 inner) lands on the sphere.
+        assert_eq!(geom.verts.len(), 5, "4 rim midpoints + 1 inner vert");
+        for &iv in &geom.verts {
+            let r = mesh.vertex_position(iv).length();
+            assert!(
+                (r - SPHERE_R).abs() < 1e-5,
+                "inserted vert projected onto the sphere (r = {r})"
+            );
+        }
+
+        // The inner vert (geom's last) is the centroid (1,0,0) snapped to
+        // (√3,0,0): its direction is +x and its radius is √3.
+        let inner = *geom.verts.last().unwrap();
+        let inner_pos = mesh.vertex_position(inner);
+        assert!(
+            inner_pos.distance(Vec3::new(SPHERE_R, 0.0, 0.0)) < 1e-5,
+            "inner vert snapped outward from the centroid along +x, got {inner_pos:?}"
+        );
+
+        // The four corners are untouched (still at radius √3 where they began).
+        let corner = find_vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
+        assert!(mesh.vertex_position(corner).distance(Vec3::new(1.0, 1.0, 1.0)) < 1e-9);
+    }
+
+    #[test]
+    fn use_sphere_multicut_lattice_dome() {
+        // §9.4.4 — multi-cut composes with the radial snap: cut all four cage
+        // edges at cuts = 2 (the §9.5.1 3x3 grid). Every inserted vert (8 rim
+        // midpoints + 4 interior bilinear nodes) is snapped onto the sphere.
+        let mut mesh = LoopMesh::new();
+        let face = sphere_cage_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let edges: Vec<_> = (0..4)
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
+            .collect();
+
+        let res = mesh.subdivide_edges(
+            &edges,
+            SubdivideParams::default().cuts(2).smooth(SPHERE_R).use_sphere(true),
+        );
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        // §9.5.1 3x3 grid topology is unchanged by use_sphere: V 16 / E 24 / F 9.
+        let (v, e, f) = counts(&mesh);
+        assert_eq!((v, e, f), (16, 24, 9), "cuts=2 grid topology unchanged (§9.5.1)");
+
+        // 8 rim midpoints + 4 interior lattice nodes, all on the sphere.
+        assert_eq!(geom.verts.len(), 12, "8 rim midpoints + 4 interior nodes");
+        for &iv in &geom.verts {
+            let r = mesh.vertex_position(iv).length();
+            assert!(
+                (r - SPHERE_R).abs() < 1e-5,
+                "lattice node projected onto the sphere (r = {r})"
+            );
+        }
     }
 }
