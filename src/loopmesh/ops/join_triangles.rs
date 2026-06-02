@@ -143,9 +143,56 @@ struct DelimitConfig {
     uv_layers: Vec<crate::loopmesh::ElementAttributeKey>,
     /// The colour (Vec4) loop layers consulted by the §4.2 `cmp_vcols` gate.
     vcol_layers: Vec<crate::loopmesh::ElementAttributeKey>,
+    /// The resolved per-face `material_index` layer key consulted by the §4.1
+    /// `cmp_materials` gate, resolved once per run (mirroring `uv_layers` /
+    /// `vcol_layers`) so the per-edge check needs no descriptor scan. `None`
+    /// when `cmp_materials` is off or no material layer exists — in the latter
+    /// case every face reads as the default `0`.
+    material_layer: Option<crate::loopmesh::ElementAttributeKey>,
 }
 
+/// The per-face attribute layer name carrying each face's material index, the
+/// convention the §4.1 `cmp_materials` gate reads. Stored as a single-component
+/// `I32` numeric layer; a face with no stored value (or no layer at all) is
+/// material `0`, the default. See `radial-mesh-guides/operators/DISSOLVE_LIMIT.md`
+/// §3 (the `MATERIAL` delimiter) and `JOIN_TRIANGLES.md` §4.1.
+pub const MATERIAL_INDEX_ATTRIBUTE: &str = "material_index";
+
 impl LoopMesh {
+    /// The material index assigned to `face`, or the default `0` when no
+    /// per-face material layer exists or the face has no stored value.
+    ///
+    /// The material index is a per-face integer attribute under the
+    /// [`MATERIAL_INDEX_ATTRIBUTE`] convention; the §4.1 `cmp_materials` gate of
+    /// [`LoopMesh::join_triangles`] rejects an edge whose two faces disagree on
+    /// this value.
+    pub fn face_material_index(&self, face: FaceKey) -> i32 {
+        let attribs = self.face_attribs();
+        match attribs.find(&AttributeKey::custom(MATERIAL_INDEX_ATTRIBUTE)) {
+            Some(layer) => attribs.get_i32(layer, face.as_usize()).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Assign `face`'s material index under the [`MATERIAL_INDEX_ATTRIBUTE`]
+    /// convention, registering the per-face `I32` layer on first use.
+    ///
+    /// Idempotent in the layer: repeated calls reuse the single registered
+    /// layer. Faces never assigned a value keep the default `0`.
+    pub fn set_face_material_index(&mut self, face: FaceKey, index: i32) {
+        let key = AttributeKey::custom(MATERIAL_INDEX_ATTRIBUTE);
+        let layer = match self.face_attribs().find(&key) {
+            Some(layer) => layer,
+            None => self
+                .register_face_attribute(ElementAttributeDesc::numeric(
+                    key,
+                    Format::new(ComponentType::I32, 1),
+                ))
+                .expect("I32x1 is a supported face attribute format"),
+        };
+        self.face_attribs_mut().set_i32(layer, face.as_usize(), index);
+    }
+
     /// Merge adjacent input triangles back into quads.
     ///
     /// Implements `radial-mesh-guides/operators/JOIN_TRIANGLES.md`:
@@ -165,13 +212,13 @@ impl LoopMesh {
     ///   `deselect_joined`, the un-merged input triangles.
     ///
     /// The §4.2 UV / vertex-colour island gates read loop customdata, which
-    /// loopmesh stores directly. The §4.1 seam / sharp / material gates read
-    /// per-element header state loopmesh does not yet expose; their accessors
+    /// loopmesh stores directly. The §4.1 material gate reads the per-face
+    /// material attribute layer ([`LoopMesh::face_material_index`] /
+    /// [`LoopMesh::set_face_material_index`]). The §4.1 seam / sharp gates read
+    /// per-edge header state loopmesh does not yet expose; their accessors
     /// ([`LoopMesh::join_triangles_edge_is_seam`],
-    /// [`LoopMesh::join_triangles_edge_is_sharp`],
-    /// [`LoopMesh::join_triangles_face_material`]) currently report "no seam /
-    /// smooth / default material", so those gates never fire until that state
-    /// lands.
+    /// [`LoopMesh::join_triangles_edge_is_sharp`]) currently report "no seam /
+    /// smooth", so those gates never fire until that state lands.
     ///
     /// - **§6** — when `topology_influence` is non-zero, pre-existing input
     ///   quads (§6.1) and each freshly-merged quad (§6.2) discount their
@@ -361,6 +408,13 @@ impl LoopMesh {
             Vec::new()
         };
 
+        let material_layer = if params.cmp_materials {
+            self.face_attribs()
+                .find(&AttributeKey::custom(MATERIAL_INDEX_ATTRIBUTE))
+        } else {
+            None
+        };
+
         DelimitConfig {
             cmp_seam: params.cmp_seam,
             cmp_sharp: params.cmp_sharp,
@@ -371,6 +425,7 @@ impl LoopMesh {
             angle_shape_threshold,
             uv_layers,
             vcol_layers,
+            material_layer,
         }
     }
 
@@ -439,7 +494,8 @@ impl LoopMesh {
             return true;
         }
         if delimit.cmp_materials
-            && self.join_triangles_face_material(face_a) != self.join_triangles_face_material(face_b)
+            && self.join_triangles_face_material_cached(delimit.material_layer, face_a)
+                != self.join_triangles_face_material_cached(delimit.material_layer, face_b)
         {
             return true;
         }
@@ -584,11 +640,22 @@ impl LoopMesh {
         false
     }
 
-    /// §4.1 — the face's material index. loopmesh has no per-face material
-    /// today, so every face reports `0`; the `cmp_materials` gate never fires
-    /// until a per-face material attribute lands.
-    fn join_triangles_face_material(&self, _face: FaceKey) -> u32 {
-        0
+    /// §4.1 — the face's material index, read through the layer key resolved
+    /// once per run in [`Self::join_triangles_build_delimit`]. A `None` key (no
+    /// material layer registered) or a face with no stored value reports the
+    /// default `0`, so the `cmp_materials` gate only fires when two adjacent
+    /// faces carry *different* indices. This is the hot-path equivalent of the
+    /// public [`LoopMesh::face_material_index`], avoiding the per-call
+    /// descriptor scan and `AttributeKey` allocation that accessor performs.
+    fn join_triangles_face_material_cached(
+        &self,
+        material_layer: Option<crate::loopmesh::ElementAttributeKey>,
+        face: FaceKey,
+    ) -> i32 {
+        match material_layer {
+            Some(layer) => self.face_attribs().get_i32(layer, face.as_usize()).unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// §6.1 / §6.2 — re-score the candidate edges of `quad`'s neighbouring
@@ -1017,6 +1084,120 @@ mod tests {
         assert_eq!(result.joined.len(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         assert!(result.unmerged.is_empty());
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn material_index_round_trips_with_default_zero() {
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
+
+        // Unassigned faces are material 0 (no layer registered yet).
+        assert_eq!(mesh.face_material_index(lower), 0);
+        assert_eq!(mesh.face_material_index(upper), 0);
+
+        mesh.set_face_material_index(lower, 2);
+        // The second assignment reuses the registered layer (idempotent layer).
+        mesh.set_face_material_index(upper, 5);
+
+        assert_eq!(mesh.face_material_index(lower), 2);
+        assert_eq!(mesh.face_material_index(upper), 5);
+    }
+
+    #[test]
+    fn cmp_materials_blocks_merge_across_material_boundary() {
+        // §4.1 — two adjacent triangles carrying different material indices must
+        // not be merged when `cmp_materials` is enabled.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
+        mesh.set_face_material_index(lower, 0);
+        mesh.set_face_material_index(upper, 1);
+
+        let result = mesh.join_triangles(
+            &[lower, upper],
+            JoinTrianglesParams {
+                cmp_materials: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.joined.is_empty(), "the material boundary blocks the merge");
+        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_len(lower), 3);
+        assert_eq!(mesh.face_len(upper), 3);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn cmp_materials_blocks_explicit_nonzero_vs_unset_default() {
+        // The asymmetry the cached-key path must preserve: one face carries an
+        // explicit non-zero index, the other is never assigned (default 0). The
+        // material layer exists (registered by the first assignment) but the
+        // unset face has no stored value, so the gate must still read it as 0
+        // and fire on the mismatch.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
+        mesh.set_face_material_index(lower, 5);
+        // `upper` deliberately left unset → default 0.
+
+        let result = mesh.join_triangles(
+            &[lower, upper],
+            JoinTrianglesParams {
+                cmp_materials: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            result.joined.is_empty(),
+            "explicit 5 vs default 0 is a material boundary"
+        );
+        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_material_index(upper), 0, "unset face reads default 0");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn cmp_materials_allows_merge_for_equal_materials() {
+        // Equal explicit materials, and the default (unset → 0) case, both let
+        // the edge merge with `cmp_materials` enabled.
+        for assign_equal in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
+            if assign_equal {
+                mesh.set_face_material_index(lower, 3);
+                mesh.set_face_material_index(upper, 3);
+            }
+
+            let result = mesh.join_triangles(
+                &[lower, upper],
+                JoinTrianglesParams {
+                    cmp_materials: true,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(result.joined.len(), 1, "equal materials merge (assigned={assign_equal})");
+            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_len(result.joined[0]), 4);
+            mesh.validate_topology();
+        }
+    }
+
+    #[test]
+    fn cmp_materials_false_ignores_material_difference() {
+        // The default path: with `cmp_materials` off, differing materials are
+        // irrelevant and the edge merges exactly as the no-material case does.
+        let mut mesh = LoopMesh::new();
+        let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
+        mesh.set_face_material_index(lower, 0);
+        mesh.set_face_material_index(upper, 7);
+
+        let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
+
+        assert_eq!(result.joined.len(), 1, "material difference ignored when gate is off");
+        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
     }
 
