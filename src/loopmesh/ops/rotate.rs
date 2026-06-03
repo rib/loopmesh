@@ -271,6 +271,65 @@ mod tests {
         }
     }
 
+    /// §5 / §8: a rotation is a pure position edit, so it leaves every customdata
+    /// layer byte-identical on every element — sibling of translate's and
+    /// transform's CD-untouched pins. A vert weight layer and a loop UV layer must
+    /// survive a non-trivial rotate (about a non-origin centre) unchanged.
+    #[test]
+    fn customdata_is_untouched() {
+        let mut mesh = LoopMesh::new();
+        let verts = unit_cube(&mut mesh);
+
+        let weight = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("weight"),
+                Format::new(ComponentType::F32, 1),
+            ))
+            .expect("vert weight layer registers");
+        for (corner, &vert) in verts.iter().enumerate() {
+            mesh.vertex_attribs_mut()
+                .set_f32(weight, vert.as_usize(), 0.1 * (corner as f32 + 1.0));
+        }
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .expect("uv layer registers");
+        let face = mesh.face_keys()[0];
+        let loop_uvs: Vec<(LoopKey, [f32; 2])> = mesh
+            .face_loop_keys(face)
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let value = [0.1 * i as f32, 0.2 * i as f32];
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+                (l, value)
+            })
+            .collect();
+
+        let rotation = Mat4::from_quat(Quat::from_rotation_z(std::f32::consts::FRAC_PI_3));
+        mesh.rotate(&verts, params(rotation, Vec3::new(1.0, 1.0, 1.0)));
+
+        for (corner, &vert) in verts.iter().enumerate() {
+            let stored = mesh
+                .vertex_attribs()
+                .get_f32(weight, vert.as_usize())
+                .unwrap();
+            assert!(
+                (stored - 0.1 * (corner as f32 + 1.0)).abs() < 1e-6,
+                "vert weight survives the rotate"
+            );
+        }
+        for (l, before) in loop_uvs {
+            let after = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert_eq!(after, before, "loop UV survives the rotate");
+        }
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        mesh.validate_topology();
+    }
+
     /// §4: empty input is an accepted no-op even with a non-trivial rotation and
     /// centre — no position or topology change.
     #[test]
