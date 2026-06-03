@@ -516,33 +516,49 @@ impl LoopMesh {
     }
 
     /// Resolve the merged-face customdata winner for `v`'s fan: the face on
-    /// `(v.e).l`, per `DISSOLVE_VERTS.md` §3.1 / §6.3 / §11.
+    /// `(v.e).l` of the **first edge that qualifies for the join**, per
+    /// `DISSOLVE_VERTS.md` §3.1 / §6.3 / §11.
     ///
-    /// `v.e` is `v`'s representative disk edge — the head of its disk cycle,
-    /// which (because [`Self::vertex_disk_append_edge`] splices new edges in
-    /// behind the head without displacing it) is `v`'s first-created incident
-    /// edge. `(v.e).l` is that edge's representative radial loop.
+    /// Per §6.3, phase 3 enumerates `v`'s edges in disk-cycle order starting at
+    /// the representative disk edge `v.e`, and "the first edge that qualifies —
+    /// the first radial-2 (loop-pair) edge in that order — drives the first
+    /// join." The merged face inherits that firing edge's representative loop's
+    /// face. For a fully-interior fan every spoke is radial-2 so the firing
+    /// edge is `v.e` itself; for a **boundary** fan whose disk head is a
+    /// non-qualifying radial-1 boundary edge (or a radial-0 wire), the walk
+    /// steps forward past it to the first interior spoke.
     ///
-    /// One build-convention twist matters here. §3.1 defines `e.l` as the loop
-    /// **appended last** to the edge's radial cycle (the second-built of the
-    /// two flanking faces for an interior edge). loopmesh's radial append
-    /// ([`Self::face_loop_connect_edge`]) instead keeps the *first*-appended
-    /// loop as the stored cycle head (`edge.radial_link`) and inserts later
-    /// loops as its `next`. So the loop §3.1 calls `e.l` is, in loopmesh, the
-    /// radial head's `next` (the last-appended loop), **not** the head itself.
-    /// Anchoring at `edge.radial_link` directly would pick the first-built
-    /// face and diverge; anchoring at its `next` picks the same face §3.1 does.
+    /// `v.e` is the head of `v`'s disk cycle, and because
+    /// [`Self::vertex_disk_append_edge`] splices new edges in behind the head
+    /// without displacing it, the disk's forward (`next`) walk visits the
+    /// incident edges in creation order (§3.1, "Disk order is build order").
     ///
-    /// For a boundary disk-head edge (a single radial loop) there is no second
-    /// loop, so the sole loop's face is the anchor.
+    /// One build-convention twist fixes which radial side wins. §3.1 / §6.5
+    /// define `e.l` as the loop **appended last** to the edge's radial cycle
+    /// (the second-built of the two flanking faces). loopmesh's radial cycle
+    /// keeps the *first*-appended loop as the stored head (`edge.radial_link`)
+    /// and splices each later loop in immediately before it, so the
+    /// last-appended loop is the head's radial-`prev`. This is the same
+    /// last-attached convention [`Self::fan_first_loop`] implements
+    /// (RADIAL_EDGE_STRUCTURE.md §6.5); reading the head directly, or its
+    /// `next`, picks the first-built face and diverges.
+    ///
+    /// Returns `None` only when no incident edge qualifies (no radial-2 spoke),
+    /// which the manifold-fan precondition rules out for callers.
     fn dissolve_verts_fan_anchor_face(&self, v: VertexKey) -> Option<FaceKey> {
-        let disk_head = self.vertices.get(v).disk_loop_start?;
-        let radial_head = self.edges.get(disk_head).radial_link?;
-        // §3.1 `e.l` = last-appended radial loop = the head's `next`. For a
-        // single-loop (boundary) radial the cycle self-points, so `next` is the
-        // head itself, which is the correct sole-loop fallback.
-        let representative_loop = self.loops.get(radial_head).edge_radial_links.next;
-        Some(self.loops.get(representative_loop).face)
+        let mut disk = self.disk_edges(v);
+        while let Some(edge) = disk.next(self) {
+            // §6.3 — only a radial-2 (loop-pair) edge qualifies as the firing
+            // edge; step past wire (radial-0) heads and radial-1 boundary heads.
+            if self.edge_radial_count_capped(edge, 2) != 2 {
+                continue;
+            }
+            let radial_head = self.edges.get(edge).radial_link?;
+            // §6.5 `e.l` = last-attached radial loop = the head's radial-`prev`.
+            let representative_loop = self.loop_radial_prev(radial_head);
+            return Some(self.loops.get(representative_loop).face);
+        }
+        None
     }
 
     /// True iff `edge`'s radial fan carries no loops (a wire edge). Cheap
@@ -1590,6 +1606,116 @@ mod tests {
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&h[0]), "boundary fan corner dissolves (has interior spoke)");
         assert!(live.contains(&hub), "bowtie hub no-ops (no interior spoke)");
+        mesh.validate_topology();
+    }
+
+    /// As [`build_hexagon_with_two_triangle_tabs`], but each face is minted
+    /// through [`LoopMesh::face_create_verts`] (closing-edge-first perimeter
+    /// contract, §3.1) rather than from pre-created ring edges. This mirrors the
+    /// §11 `hexagon_with_two_triangle_tabs` A/B fixture's element-creation order:
+    /// the hexagon body face mints its **closing** edge `{h5,h0}` *first*, so
+    /// corner `h0`'s disk head is that **boundary radial-1** edge, not the
+    /// interior spoke `{h0,h1}`. The first **radial-2** spoke in disk order is
+    /// `{h0,h1}` (shared with the tab built second), so the §6.3 anchor must
+    /// step the disk past the radial-1 head to it. Returns
+    /// `(h[0..6], [tab_a_face, tab_b_face], hexagon_body_face)`.
+    fn build_hexagon_with_two_triangle_tabs_minted(
+        mesh: &mut LoopMesh,
+    ) -> ([VertexKey; 6], [FaceKey; 2], FaceKey) {
+        use std::f32::consts::TAU;
+        let h: [VertexKey; 6] = std::array::from_fn(|i| {
+            let angle = TAU * (i as f32) / 6.0;
+            mesh.create_vertex(Vec3::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0))
+        });
+        let body = mesh.face_create_verts(&h, FaceCreateFlags::NONE);
+
+        // Tab A on hexagon edge (h0, h1): ring [h0, t0, h1] closes on {h1,h0},
+        // re-adopting the body's {h0,h1} edge (NO_DUPLICATE) as a radial-2 spoke.
+        let t0 = mesh.create_vertex(Vec3::new(2.0, -1.5, 0.0));
+        let tab_a = mesh.face_create_verts(&[h[0], t0, h[1]], FaceCreateFlags::NONE);
+
+        // Tab B on hexagon edge (h2, h3).
+        let t1 = mesh.create_vertex(Vec3::new(-2.0, -1.5, 0.0));
+        let tab_b = mesh.face_create_verts(&[h[2], t1, h[3]], FaceCreateFlags::NONE);
+
+        (h, [tab_a, tab_b], body)
+    }
+
+    /// §3.1 / §6.3 / §6.5 / §11 — customdata identity on the merged face for a
+    /// **boundary** fan. Corner `h0`'s disk head is a non-qualifying radial-1
+    /// boundary edge (`{h5,h0}`, minted closing-edge-first); the §6.3 firing
+    /// edge is the first **radial-2** spoke in disk order (`{h0,h1}`), whose
+    /// last-attached (`radial_link.prev`) loop sits on the **second-built**
+    /// flanking face — the tab. So the fused face must inherit the tab's
+    /// per-face customdata, not the hexagon body's. Pins the corrected
+    /// boundary-fan anchor: stepping past the radial-1 head and reading
+    /// last-attached, not the raw disk head or `radial_link.next`.
+    #[test]
+    fn dissolve_verts_boundary_fan_merged_face_keeps_tab_customdata() {
+        let mut mesh = LoopMesh::new();
+        let (h, tabs, body) = build_hexagon_with_two_triangle_tabs_minted(&mut mesh);
+
+        let mat = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("material_color"),
+                Format::new(ComponentType::F32, 3),
+            ))
+            .unwrap();
+
+        // Body face 0 → [1,0,0]; tab A face 1 → [0,1,0]; tab B → [0,0,1].
+        let body_colour = [1.0f32, 0.0, 0.0];
+        let tab_a_colour = [0.0f32, 1.0, 0.0];
+        mesh.face_attribs_mut()
+            .set_vec3(mat, body.as_usize(), body_colour);
+        mesh.face_attribs_mut()
+            .set_vec3(mat, tabs[0].as_usize(), tab_a_colour);
+        mesh.face_attribs_mut()
+            .set_vec3(mat, tabs[1].as_usize(), [0.0, 0.0, 1.0]);
+
+        // h0's disk head must be the radial-1 boundary edge, with the first
+        // radial-2 spoke reached only by stepping the disk forward.
+        let disk_head = mesh.vertices.get(h[0]).disk_loop_start.unwrap();
+        assert_eq!(
+            mesh.edge_radial_count_capped(disk_head, 3),
+            1,
+            "h0's disk head is a boundary radial-1 edge (closing-edge-first mint)"
+        );
+
+        assert_eq!(mesh.vert_edge_keys(h[0]).len(), 3, "h0 is a 3-edge boundary fan");
+
+        mesh.dissolve_verts(&[h[0]]);
+
+        // After fusing tab A into the body and collapsing the corner, the body
+        // gains the tab's apex: it is the only face touching t0's old position.
+        // The fused face is the lone face carrying h1..h5 plus t0 (6 corners).
+        let mut fused: Option<FaceKey> = None;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            // The body-derived face is the hexagon-sized survivor (6 corners),
+            // distinct from the still-intact tab B triangle (3 corners).
+            if mesh.face_len(f) == 6 {
+                fused = Some(f);
+            }
+        }
+        let fused = fused.expect("a 6-corner fused face exists");
+
+        let merged_colour = mesh
+            .face_attribs()
+            .get_vec3(mat, fused.as_usize())
+            .expect("fused face carries the material colour");
+
+        for c in 0..3 {
+            assert!(
+                (merged_colour[c] - tab_a_colour[c]).abs() < 1e-6,
+                "boundary-fan merged face must keep the tab (second-built flanker) \
+                 customdata {tab_a_colour:?}, got {merged_colour:?}"
+            );
+        }
+        // It is specifically NOT the hexagon body's customdata.
+        assert!(
+            (0..3).any(|c| (merged_colour[c] - body_colour[c]).abs() >= 1e-6),
+            "merged face must NOT carry the hexagon body customdata {body_colour:?}"
+        );
         mesh.validate_topology();
     }
 
