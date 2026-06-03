@@ -204,4 +204,31 @@ mod tests {
         }
         mesh.validate_topology();
     }
+
+    /// §3 / TRANSFORM.md §7: a partial vert selection moves only the named
+    /// corners — no closure pulls in the rest of a shared face. Naming a subset
+    /// of the cube's verts shears the touching faces without changing topology;
+    /// the un-named verts stay put and the counts are invariant.
+    #[test]
+    fn partial_selection_moves_only_named_verts() {
+        let mut mesh = LoopMesh::new();
+        let verts = unit_cube(&mut mesh);
+        let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+
+        let offset = Vec3::new(10.0, 0.0, 0.0);
+        // Name only the four bottom corners (verts 0..4). Each lives on three
+        // faces, so a closure bug would drag the top ring along.
+        let named = &verts[..4];
+        mesh.translate(named, params(offset));
+
+        for corner in 0..4 {
+            assert_close(mesh.vertex_position(verts[corner]), before[corner] + offset);
+        }
+        for corner in 4..8 {
+            assert_close(mesh.vertex_position(verts[corner]), before[corner]);
+        }
+        // Sheared side faces, but no topology change.
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        mesh.validate_topology();
+    }
 }
