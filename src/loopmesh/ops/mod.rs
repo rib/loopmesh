@@ -38,6 +38,7 @@ mod mean_value;
 mod mirror;
 mod pointmerge;
 mod remove_doubles;
+mod rotate;
 mod rotate_edges;
 mod split;
 mod split_edges;
@@ -68,6 +69,7 @@ pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
 pub use join_triangles::{JoinTrianglesParams, JoinTrianglesResult};
 pub use mirror::{Axis, MirrorParams, MirrorResult};
+pub use rotate::RotateParams;
 pub use rotate_edges::RotateEdgesResult;
 pub use split::SplitResult;
 pub use subdivide_edges::{
