@@ -485,6 +485,114 @@ impl LoopMesh {
         }
     }
 
+    /// Standalone "average one snap vertex's corner customdata and stamp the
+    /// averaged corner onto a set of target verts" operator. Computes the
+    /// arithmetic mean of `vert_snap`'s incident corners — per has-math per-loop
+    /// layer — parks it on the snap vertex's first corner, then broadcasts that
+    /// first corner's entire customdata block onto every loop incident to any
+    /// vert in `verts`. No topology changes.
+    ///
+    /// Implements `radial-mesh-guides/operators/POINTMERGE_FACEDATA.md`. It is
+    /// the sibling of [`Self::average_vert_facedata`] and differs from it on four
+    /// independent axes (the guide's §0 table); a correct implementation must
+    /// match all four:
+    ///
+    /// - **§2 arithmetic mean, not bbox midpoint** — phase one reduces the snap
+    ///   vertex's corners to their true `(Σ value) / tot` per-component mean, not
+    ///   the `(min + max) / 2` midpoint [`Self::average_vert_facedata`] and the
+    ///   collapse blend use. The mean depends on every corner's value and on how
+    ///   many corners there are, not only on the extremes.
+    /// - **§3 single-pivot pool** — the average is computed only over
+    ///   `vert_snap`'s own corners. The `verts` set never feeds the average.
+    /// - **§4 broadcast to a separately-named target set** — the averaged corner
+    ///   is written onto the corners of the `verts` set, a different slot from
+    ///   `vert_snap`. The two need not coincide.
+    /// - **§4.1 whole-block copy** — phase two copies the snap vertex's first
+    ///   corner's *entire* customdata block onto each target corner, every
+    ///   per-loop layer including the non-has-math ones (scalar floats, integers,
+    ///   bytes). Those layers are not averaged but are flattened to the first
+    ///   corner's raw value verbatim.
+    ///
+    /// Edge cases:
+    ///
+    /// - **§2.1 divisor guard** — a loop-less snap vertex (`tot == 0`) is a whole
+    ///   operator no-op: nothing averaged, nothing broadcast, no layer created.
+    ///   This fires before any layer is touched, regardless of what `verts`
+    ///   names.
+    /// - **§7 single-corner snap (`tot == 1`)** — the lone corner is its own
+    ///   mean (scaled by 1), so phase one is a pass-through and the broadcast is
+    ///   the only observable effect.
+    /// - **§3.2 / §5 transient snap fan** — phase one scales *every* snap-vertex
+    ///   corner down by `1 / tot` in place, leaving the corners other than the
+    ///   first holding `value / tot`. Those corners are restored to the mean only
+    ///   if phase two later visits them, i.e. only when `vert_snap` is a member
+    ///   of `verts`. When `vert_snap` is not a target the transient fraction is
+    ///   left in place — an observable the operator must not "tidy up".
+    pub fn pointmerge_facedata(&mut self, verts: &[VertexKey], vert_snap: VertexKey) {
+        let snap_corners = self.corners_at_vertex(vert_snap);
+        let tot = snap_corners.len();
+
+        // §2.1 divisor guard — a loop-less snap vertex is a whole-operator
+        // no-op, regardless of what `verts` names. It fires before any layer is
+        // touched, so no layer is created.
+        if tot == 0 {
+            return;
+        }
+
+        let participating: SmallVec<[ElementAttributeKey; 4]> = self
+            .loop_attribs()
+            .iter_descriptors()
+            .filter_map(|(key, _)| {
+                if loop_layer_participates_in_collapse_blend(self.loop_attribs(), key) {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let first_corner = snap_corners[0];
+        let scale = 1.0 / tot as f32;
+
+        // §3 phase one — for each has-math layer, scale every snap-vertex corner
+        // by 1/tot in place, then accumulate the scaled non-first corners into
+        // the first corner. The first corner ends holding the per-component mean.
+        // The non-first corners are left holding value/tot (§3.2), corrected only
+        // if phase two visits them (§5).
+        for &layer in &participating {
+            for &corner in &snap_corners {
+                let mut value = self.loop_value(layer, corner);
+                for component in &mut value.components {
+                    *component *= scale;
+                }
+                self.set_loop_value(layer, corner, value);
+            }
+
+            let mut mean = self.loop_value(layer, first_corner);
+            for &corner in &snap_corners[1..] {
+                let scaled = self.loop_value(layer, corner);
+                for component in 0..4 {
+                    mean.components[component] += scaled.components[component];
+                }
+            }
+            self.set_loop_value(layer, first_corner, mean);
+        }
+
+        // §4 phase two — broadcast the first corner's whole customdata block onto
+        // every loop incident to any target vert, except the first corner itself
+        // (it is the source and already holds the mean — §4.2). The block copy
+        // overwrites every per-loop layer (§4.1), including non-has-math ones.
+        for &vert in verts {
+            for target_corner in self.corners_at_vertex(vert) {
+                if target_corner == first_corner {
+                    continue;
+                }
+                self.loop_attribs_mut()
+                    .copy_into(target_corner.as_usize(), first_corner.as_usize());
+            }
+        }
+    }
+
     /// Every face corner anchored at `vertex` — the vert's gateless loop fan,
     /// one loop per face incident to `vertex` (the loop whose own corner sits at
     /// `vertex`). A wire/isolated vert with no incident face yields none. This
@@ -1772,5 +1880,357 @@ mod tests {
         mesh.validate_topology();
 
         assert_eq!(uv_snapshot(&mesh, uv), before, "empty input leaves UVs untouched");
+    }
+
+    // ---- pointmerge_facedata (POINTMERGE_FACEDATA.md) ----
+
+    fn register_loop_i32(mesh: &mut LoopMesh) -> ElementAttributeKey {
+        mesh.register_loop_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("int"),
+            Format::new(ComponentType::I32, 1),
+        ))
+        .expect("int layer registers")
+    }
+
+    /// The loops whose corner sits at `vert`, ordered as the mesh yields them.
+    fn hub_corner_keys(mesh: &LoopMesh, vert: VertexKey) -> Vec<LoopKey> {
+        mesh.loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == vert)
+            .collect()
+    }
+
+    /// §2 / §3 / §4 headline — the snap vertex's corners are reduced to their
+    /// arithmetic mean and that mean is broadcast onto every corner of the
+    /// target cluster.
+    #[test]
+    fn pointmerge_facedata_fan_hub_averaged_broadcast_to_cluster() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, 6);
+
+        let hub_corners = hub_corner_keys(&mesh, hub);
+        assert_eq!(hub_corners.len(), 6, "fan hub has one corner per face");
+        let values = [
+            [0.0, 0.5],
+            [0.4, 0.1],
+            [0.2, 0.9],
+            [0.8, 0.3],
+            [0.6, 0.7],
+            [0.1, 0.2],
+        ];
+        for (l, v) in hub_corners.iter().zip(values) {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+        // Arithmetic mean of the six hub corners.
+        let mean = [
+            values.iter().map(|v| v[0]).sum::<f32>() / 6.0,
+            values.iter().map(|v| v[1]).sum::<f32>() / 6.0,
+        ];
+
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+        mesh.pointmerge_facedata(&cluster, hub);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, hub) {
+            assert!(approx_uv(got, mean), "hub corner carries the mean {mean:?}, got {got:?}");
+        }
+    }
+
+    /// §2 — the averaged value is the arithmetic mean, NOT the bbox midpoint a
+    /// clustered-plus-outlier spread would land for the sibling operator.
+    #[test]
+    fn pointmerge_facedata_arithmetic_mean_not_midpoint() {
+        let n = 6usize;
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, n);
+
+        // n-1 corners at (0,0), one outlier at (1,1): mean = (1/n, 1/n);
+        // bbox midpoint = (0.5, 0.5).
+        let hub_corners = hub_corner_keys(&mesh, hub);
+        for (i, l) in hub_corners.iter().enumerate() {
+            let v = if i + 1 == n { [1.0, 1.0] } else { [0.0, 0.0] };
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+        let mean = 1.0 / n as f32;
+
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+        mesh.pointmerge_facedata(&cluster, hub);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, hub) {
+            assert!(approx_uv(got, [mean, mean]), "mean ({mean}, {mean}), got {got:?}");
+            assert!(!approx_uv(got, [0.5, 0.5]), "must not land the bbox midpoint");
+        }
+    }
+
+    /// §1.1 / §3 single-pivot pool — the average derives only from `vert_snap`'s
+    /// corners and is written to a *different* target vert. A whole-pool
+    /// implementation that averaged the target instead would land a different
+    /// value.
+    #[test]
+    fn pointmerge_facedata_single_pivot_pool_snap_only() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (_hub, rim) = build_triangle_fan(&mut mesh, 6);
+        // Two non-adjacent rim verts (share no face): snap = rim[0], target = rim[3].
+        let snap = rim[0];
+        let target = rim[3];
+
+        let set_corners = |mesh: &mut LoopMesh, vert: VertexKey, base: [f32; 2]| {
+            let corners = hub_corner_keys(mesh, vert);
+            for (k, l) in corners.iter().enumerate() {
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [base[0] + 0.1 * k as f32, base[1] + 0.2 * k as f32]);
+            }
+        };
+        set_corners(&mut mesh, snap, [0.0, 0.0]);
+        set_corners(&mut mesh, target, [5.0, 6.0]);
+
+        // snap's two corners: (0.0,0.0),(0.1,0.2) -> mean (0.05,0.1).
+        let snap_mean = [0.05, 0.1];
+        // target's own mean (5.05,6.1) would be the whole-pool mistake.
+        let target_own_mean = [5.05, 6.1];
+
+        mesh.pointmerge_facedata(&[target], snap);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, target) {
+            assert!(approx_uv(got, snap_mean), "target carries the SNAP's mean, got {got:?}");
+            assert!(!approx_uv(got, target_own_mean), "must not average the target pool");
+        }
+    }
+
+    /// §4.1 whole-block copy — phase two copies the entire customdata block, so a
+    /// non-has-math integer layer is flattened to the first snap corner's raw
+    /// integer, even though it was never averaged.
+    #[test]
+    fn pointmerge_facedata_whole_block_copy_flattens_non_has_math() {
+        let n = 6usize;
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let int_layer = register_loop_i32(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, n);
+
+        let hub_corners = hub_corner_keys(&mesh, hub);
+        for (i, l) in hub_corners.iter().enumerate() {
+            let t = i as f32 / n as f32;
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.2 + 0.6 * t, 0.3]);
+            mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), 100 + i as i32);
+        }
+        // Decorate the rim corners with their own distinct integers, so a missing
+        // broadcast would leave them visibly distinct.
+        for (i, l) in mesh.loop_keys().into_iter().enumerate() {
+            if mesh.loop_vertex(l) != hub {
+                mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), 200 + i as i32);
+            }
+        }
+
+        let first_corner = hub_corners[0];
+        let first_int = mesh.loop_attribs().get_i32(int_layer, first_corner.as_usize()).unwrap();
+
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+        mesh.pointmerge_facedata(&cluster, hub);
+        mesh.validate_topology();
+
+        // Every target corner (except the source, which keeps its own value) now
+        // carries the first corner's raw integer.
+        for l in mesh.loop_keys() {
+            let vert = mesh.loop_vertex(l);
+            if !cluster.contains(&vert) || l == first_corner {
+                continue;
+            }
+            assert_eq!(
+                mesh.loop_attribs().get_i32(int_layer, l.as_usize()).unwrap(),
+                first_int,
+                "the whole-block copy flattens the integer layer to the first corner's value"
+            );
+        }
+    }
+
+    /// §3 / §4 — a per-loop colour layer participates: it is averaged by the same
+    /// arithmetic mean as UVs and the mean colour is broadcast.
+    #[test]
+    fn pointmerge_facedata_color_layer_averaged_and_broadcast() {
+        let n = 4usize;
+        let mut mesh = LoopMesh::new();
+        let _uv = register_uv(&mut mesh);
+        let color = register_color(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, n);
+
+        let hub_corners = hub_corner_keys(&mesh, hub);
+        let colors = [
+            [0.1, 0.8, 0.5, 1.0],
+            [0.3, 0.6, 0.5, 1.0],
+            [0.5, 0.4, 0.5, 1.0],
+            [0.7, 0.2, 0.5, 1.0],
+        ];
+        for (l, c) in hub_corners.iter().zip(colors) {
+            mesh.loop_attribs_mut().set_vec4(color, l.as_usize(), c);
+        }
+        let mut mean_color = [0.0f32; 4];
+        for component in 0..4 {
+            mean_color[component] = colors.iter().map(|c| c[component]).sum::<f32>() / n as f32;
+        }
+
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+        mesh.pointmerge_facedata(&cluster, hub);
+        mesh.validate_topology();
+
+        for l in hub_corner_keys(&mesh, hub) {
+            let got = mesh.loop_attribs().get_vec4(color, l.as_usize()).unwrap();
+            for component in 0..4 {
+                assert!(
+                    (got[component] - mean_color[component]).abs() < 1e-6,
+                    "colour component {component} is the mean {}, got {}",
+                    mean_color[component],
+                    got[component]
+                );
+            }
+        }
+    }
+
+    /// §2.1 / §7 divisor guard — a loop-less snap vertex is a whole-operator
+    /// no-op: nothing averaged, nothing broadcast, no layer created.
+    #[test]
+    fn pointmerge_facedata_loose_snap_noop() {
+        let mut mesh = LoopMesh::new();
+        let loose = mesh.create_vertex(Vec3::ZERO);
+        let (hub, rim) = build_triangle_fan(&mut mesh, 4);
+        let uv = register_uv(&mut mesh);
+        for l in mesh.loop_keys() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.3 * l.as_usize() as f32, 0.1]);
+        }
+        let before = uv_snapshot(&mesh, uv);
+
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+        mesh.pointmerge_facedata(&cluster, loose);
+        mesh.validate_topology();
+
+        assert_eq!(uv_snapshot(&mesh, uv), before, "loose snap vertex is a no-op");
+    }
+
+    /// §7 single-corner snap (`tot == 1`) — phase one is a pass-through and the
+    /// broadcast stamps the lone corner's value onto the target corners.
+    #[test]
+    fn pointmerge_facedata_single_corner_snap_pass_through() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let verts = [a, b, c];
+        let edges: Vec<EdgeKey> = (0..3)
+            .map(|k| mesh.create_edge([verts[k], verts[(k + 1) % 3]], EdgeCreateFlags::NO_DUPLICATE))
+            .collect();
+        mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+
+        let snap_corner = hub_corner_keys(&mesh, a)[0];
+        let snap_uv = [0.1, 0.2];
+        mesh.loop_attribs_mut().set_vec2(uv, snap_corner.as_usize(), snap_uv);
+        for l in hub_corner_keys(&mesh, b) {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.7, 0.3]);
+        }
+
+        mesh.pointmerge_facedata(&[b], a);
+        mesh.validate_topology();
+
+        // Pass-through: the snap corner keeps its value; the target receives it.
+        assert!(approx_uv(
+            mesh.loop_attribs().get_vec2(uv, snap_corner.as_usize()).unwrap(),
+            snap_uv
+        ));
+        for got in corner_uvs_at(&mesh, uv, b) {
+            assert!(approx_uv(got, snap_uv), "target receives the pass-through value, got {got:?}");
+        }
+    }
+
+    /// §3.2 / §5 — `vert_snap ∉ verts` leaves the snap fan transient: the snap
+    /// vertex's non-first corners keep the `value / tot` fraction; only the named
+    /// target corners receive the mean. Differs from the overlap regime.
+    #[test]
+    fn pointmerge_facedata_snap_not_in_verts_leaves_fan_transient() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (_hub, rim) = build_triangle_fan(&mut mesh, 6);
+        let snap = rim[0];
+        let target = rim[3];
+
+        // Two corners at the snap vertex with a non-zero, non-2:1 spread so the
+        // second corner's transient half differs from the mean.
+        let snap_corners = hub_corner_keys(&mesh, snap);
+        assert_eq!(snap_corners.len(), 2, "rim vert borders two faces");
+        let snap_values = [[1.0, 2.0], [1.3, 2.5]];
+        for (l, v) in snap_corners.iter().zip(snap_values) {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+        for l in hub_corner_keys(&mesh, target) {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [5.0, 6.0]);
+        }
+
+        let mean = [
+            (snap_values[0][0] + snap_values[1][0]) / 2.0,
+            (snap_values[0][1] + snap_values[1][1]) / 2.0,
+        ];
+        // The half-state of each corner, were it the non-first (transient) one.
+        let transient = |v: [f32; 2]| [v[0] / 2.0, v[1] / 2.0];
+
+        mesh.pointmerge_facedata(&[target], snap);
+        mesh.validate_topology();
+
+        // Exactly one snap corner holds the mean (the first); the other holds its
+        // own value/tot fraction. Which corner is "first" is fixed by the
+        // operator's fan order, so accept either assignment.
+        let after: Vec<[f32; 2]> = snap_corners
+            .iter()
+            .map(|l| mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap())
+            .collect();
+        let mean_count = after.iter().filter(|got| approx_uv(**got, mean)).count();
+        assert_eq!(mean_count, 1, "exactly one snap corner holds the mean (the first)");
+        let transient_present = snap_values
+            .iter()
+            .any(|&v| after.iter().any(|got| approx_uv(*got, transient(v))));
+        assert!(transient_present, "the non-first snap corner keeps its value/tot fraction (§3.2)");
+        // The non-first corner must NOT have been restored to the mean — that is
+        // the divergence from the overlap regime (§5).
+        assert!(
+            after.iter().any(|got| !approx_uv(*got, mean)),
+            "the snap fan is left transient, not re-averaged (§5)"
+        );
+
+        // The target received the mean.
+        for got in corner_uvs_at(&mesh, uv, target) {
+            assert!(approx_uv(got, mean), "target receives the mean, got {got:?}");
+        }
+    }
+
+    /// §6 idempotence (overlap case) — with `vert_snap ∈ verts`, a second pass
+    /// finds every corner already on the first corner's block and reproduces it.
+    #[test]
+    fn pointmerge_facedata_idempotent_double_application() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, 6);
+        for (i, l) in hub_corner_keys(&mesh, hub).into_iter().enumerate() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.1 * i as f32, 0.2 * i as f32]);
+        }
+        let mut cluster = vec![hub];
+        cluster.extend_from_slice(&rim);
+
+        mesh.pointmerge_facedata(&cluster, hub);
+        let once = uv_snapshot(&mesh, uv);
+        mesh.pointmerge_facedata(&cluster, hub);
+        let twice = uv_snapshot(&mesh, uv);
+
+        assert_eq!(once, twice, "second application reproduces the first (idempotent)");
+        mesh.validate_topology();
     }
 }
