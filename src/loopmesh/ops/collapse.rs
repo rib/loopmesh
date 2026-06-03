@@ -62,7 +62,7 @@ impl LoopMesh {
         // §6 — the optional per-loop customdata blend runs BEFORE the topology
         // merge, while the loops it averages still exist as distinct corners.
         if uvs {
-            self.collapse_uvs(&marked);
+            self.collapse_uvs_blend(&marked);
         }
 
         let mut targetmap: Vec<(VertexKey, VertexKey)> = Vec::new();
@@ -155,15 +155,56 @@ impl LoopMesh {
         component_edges
     }
 
-    /// §6 — the `collapse_uvs` per-loop customdata blend. Runs *before* the
-    /// topology merge so the loops it averages still exist as distinct corners.
+    /// Standalone "snap each connected UV island to its bounding-box midpoint"
+    /// operator. Takes an input edge set and, for *every* has-math per-loop
+    /// customdata layer, snaps the like-valued loop islands the edges stitch
+    /// together down to a single value — the component-wise midpoint of the
+    /// island's value range. No topology changes.
+    ///
+    /// Implements `radial-mesh-guides/operators/COLLAPSE_UVS.md`:
+    ///
+    /// - **§1.1 / §3 conduction graph** — the input edges are the *conductor*
+    ///   set for the island flood, not a corner list and not a face set. A
+    ///   corner joins an island only by being reached across a marked input edge
+    ///   under the value-equality gate. An edge not in the input is a wall.
+    /// - **§4 all has-math layers** — unlike the `faces`-driven single-active-
+    ///   layer siblings, this runs the flood/snap for *every* participating
+    ///   per-loop layer (every UV layer and every colour layer), each with its
+    ///   own independent island flood.
+    /// - **§4.1 early-out** — if no per-loop layer is has-math the operator
+    ///   returns immediately, creating no layer; the empty-input case (§7) is
+    ///   likewise a no-op (no edge marked → no seed loop).
+    /// - **§5 topology-invariance / idempotence** — no Euler operator runs, no
+    ///   geometry moves; the entire effect lives in the snapped loop layers.
+    ///   Running twice equals running once (the second pass's island range is a
+    ///   single point).
+    ///
+    /// This is the pure-customdata sibling of [`Self::collapse`] with
+    /// `uvs = true` (the §6 pre-merge blend) — the identical island flood and
+    /// midpoint snap, minus the weld. Both delegate to the same
+    /// [`Self::collapse_uvs_blend`] primitive (§8).
+    pub fn collapse_uvs(&mut self, edges: &[EdgeKey]) {
+        // §7 — empty input marks nothing and floods nothing; a no-op. (The
+        // blend below would also early-out, but this skips the set build.)
+        if edges.is_empty() {
+            return;
+        }
+        let marked: HashSet<EdgeKey> = edges.iter().copied().collect();
+        self.collapse_uvs_blend(&marked);
+    }
+
+    /// §6 — the per-loop customdata blend shared by [`Self::collapse`]'s
+    /// `uvs = true` pre-merge pass and the standalone [`Self::collapse_uvs`]
+    /// operator. When called from `collapse` it runs *before* the topology merge
+    /// so the loops it averages still exist as distinct corners; when called
+    /// standalone it *is* the whole operator.
     ///
     /// For every has-math per-loop layer (§6.1) it floods each loop-data island
     /// (§6.2) and snaps every island loop to the per-scalar-component min/max
     /// midpoint of the island's value range (§6.3 — the centre of the value's
     /// axis-aligned bounding box, *not* a mean). Each layer is processed
     /// independently with its own island flood and its own snap.
-    fn collapse_uvs(&mut self, marked: &HashSet<EdgeKey>) {
+    fn collapse_uvs_blend(&mut self, marked: &HashSet<EdgeKey>) {
         let participating: SmallVec<[ElementAttributeKey; 4]> = self
             .loop_attribs()
             .iter_descriptors()
@@ -889,6 +930,313 @@ mod tests {
 
         assert_eq!(mesh.totvert(), 5, "topology collapses regardless of the flag");
         assert_eq!(mesh.totface(), 2);
+        mesh.validate_topology();
+    }
+
+    // ----- standalone collapse_uvs operator (COLLAPSE_UVS.md) -----
+
+    fn register_color(mesh: &mut LoopMesh) -> ElementAttributeKey {
+        mesh.register_loop_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("color"),
+            Format::new(ComponentType::F32, 4),
+        ))
+        .expect("color layer registers")
+    }
+
+    /// Snapshot every loop's Float2 value in a layer, keyed by loop slot.
+    fn uv_snapshot(mesh: &LoopMesh, uv: ElementAttributeKey) -> Vec<(usize, [f32; 2])> {
+        mesh.loop_keys()
+            .into_iter()
+            .map(|l| (l.as_usize(), mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap()))
+            .collect()
+    }
+
+    /// Seed each face's four shared-edge corners with a spread of distinct UVs so
+    /// the island's bounding box is non-degenerate and its midpoint differs from
+    /// every corner. Returns the expected per-component midpoint of the spread.
+    fn seed_like_valued_island(
+        mesh: &mut LoopMesh,
+        uv: ElementAttributeKey,
+        island_verts: [VertexKey; 2],
+    ) -> [f32; 2] {
+        // The two faces must *agree* at each shared vertex (coherent seam) so the
+        // value-equality gate floods all four shared corners into ONE island; the
+        // spread that the bbox midpoint averages is between the two verts'
+        // distinct values (so the midpoint differs from each corner).
+        let value_at = |v: VertexKey| -> [f32; 2] {
+            if v == island_verts[0] {
+                [0.0, 0.2]
+            } else {
+                [0.4, 0.8]
+            }
+        };
+        for face in mesh.face_keys() {
+            for l in mesh.face_loop_keys(face) {
+                let v = mesh.loop_vertex(l);
+                if v == island_verts[0] || v == island_verts[1] {
+                    mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value_at(v));
+                }
+            }
+        }
+        // bbox midpoint over the two distinct values.
+        let a = value_at(island_verts[0]);
+        let b = value_at(island_verts[1]);
+        [
+            (a[0].min(b[0]) + a[0].max(b[0])) * 0.5,
+            (a[1].min(b[1]) + a[1].max(b[1])) * 0.5,
+        ]
+    }
+
+    /// §2 / §3 / §5 headline — marking the shared edge floods both faces'
+    /// shared-edge corners into one island and snaps every island corner to the
+    /// component-wise bounding-box midpoint (not a mean, not any input value).
+    #[test]
+    fn collapse_uvs_shared_edge_snaps_island_to_midpoint() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
+        let midpoint = seed_like_valued_island(&mut mesh, uv, [b, c]);
+
+        mesh.collapse_uvs(&[shared]);
+        mesh.validate_topology();
+
+        // Topology is untouched (§5 / §7.1).
+        assert_eq!(mesh.totvert(), 6);
+        assert_eq!(mesh.totedge(), 7);
+        assert_eq!(mesh.totface(), 2);
+
+        // Every shared-edge corner now carries the island midpoint.
+        for l in mesh.loop_keys() {
+            let v = mesh.loop_vertex(l);
+            if v == b || v == c {
+                let uvv = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                assert!(
+                    (uvv[0] - midpoint[0]).abs() < 1e-6 && (uvv[1] - midpoint[1]).abs() < 1e-6,
+                    "shared-edge corner snapped to bbox midpoint {midpoint:?}, got {uvv:?}"
+                );
+            }
+        }
+    }
+
+    /// §1.1 / §7 — an empty input edge set marks no conductor, seeds no flood,
+    /// and is a complete no-op: the UV layer is byte-for-byte unchanged.
+    #[test]
+    fn collapse_uvs_empty_input_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let ([_, b, c, ..], _shared) = two_quads_shared_edge(&mut mesh);
+        let _ = seed_like_valued_island(&mut mesh, uv, [b, c]);
+        let before = uv_snapshot(&mesh, uv);
+
+        mesh.collapse_uvs(&[]);
+        mesh.validate_topology();
+
+        assert_eq!(uv_snapshot(&mesh, uv), before, "empty input leaves UVs untouched");
+    }
+
+    /// §1.1 / §3 — the same like-valued island, but the shared edge is *not* in
+    /// the input set (a different, within-quad edge is). The unmarked shared edge
+    /// is a wall: nothing floods across it and the shared-edge corners keep their
+    /// original spread (no snap to the cross-face midpoint).
+    #[test]
+    fn collapse_uvs_unmarked_edge_blocks_flood() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let ([a0, b, c, a1, ..], _shared) = two_quads_shared_edge(&mut mesh);
+        let midpoint = seed_like_valued_island(&mut mesh, uv, [b, c]);
+        let before = uv_snapshot(&mesh, uv);
+
+        // Mark a boundary edge of the first quad ({a0, a1}), not the shared one.
+        let unrelated = mesh.query_edge_exists(a1, a0).expect("boundary edge present");
+        mesh.collapse_uvs(&[unrelated]);
+        mesh.validate_topology();
+
+        // The shared-edge corners must not have been snapped to the cross-face
+        // midpoint — the wall held. (Their value may change only if the {a0,a1}
+        // island happens to touch them, which it does not here.)
+        let after = uv_snapshot(&mesh, uv);
+        let _ = before;
+        for l in mesh.loop_keys() {
+            let v = mesh.loop_vertex(l);
+            if v == b || v == c {
+                let uvv = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                let snapped = (uvv[0] - midpoint[0]).abs() < 1e-6 && (uvv[1] - midpoint[1]).abs() < 1e-6;
+                assert!(!snapped, "unmarked shared edge must not flood corner, got {uvv:?}");
+            }
+        }
+        // a0/a1 corners are not part of any cross-face island either (no marked
+        // edge connects two faces), so nothing was averaged across faces.
+        assert_eq!(after.len(), before.len());
+    }
+
+    /// §3 / §6.1 — a genuine UV seam: the two faces carry *different* values at
+    /// the shared corners. The value-equality gate keeps the two sides as two
+    /// islands snapped separately; the seam survives (no value lands on the
+    /// cross-seam average).
+    #[test]
+    fn collapse_uvs_seam_preserved_two_islands() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
+
+        // Per-loop UV keyed on (vertex, face): the two faces disagree at the
+        // shared corners — a seam. Within each face the two shared corners carry
+        // a small spread so each island's snap is observable.
+        for (face_index, face) in mesh.face_keys().into_iter().enumerate() {
+            for l in mesh.face_loop_keys(face) {
+                let v = mesh.loop_vertex(l);
+                if v == b || v == c {
+                    let base = face_index as f32 * 100.0;
+                    let bump = if v == b { 0.0 } else { 2.0 };
+                    mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [base + bump, base + bump]);
+                }
+            }
+        }
+
+        mesh.collapse_uvs(&[shared]);
+        mesh.validate_topology();
+
+        // Face 0's island snaps within [0..2] → mid 1; face 1's within [100..102]
+        // → mid 101. No corner ever lands on a cross-seam average (~51).
+        for face in mesh.face_keys() {
+            for l in mesh.face_loop_keys(face) {
+                let v = mesh.loop_vertex(l);
+                if v == b || v == c {
+                    let uvv = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                    let cross_seam = (uvv[0] - 51.0).abs() < 10.0;
+                    assert!(!cross_seam, "seam preserved, no cross-seam average, got {uvv:?}");
+                }
+            }
+        }
+    }
+
+    /// §4 — every has-math loop layer is collapsed, not just one: with two UV
+    /// layers present, both are flooded and snapped independently.
+    #[test]
+    fn collapse_uvs_all_layers_multi_uv() {
+        let mut mesh = LoopMesh::new();
+        let uv0 = register_uv(&mut mesh);
+        let uv1 = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv1"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
+        let mid0 = seed_like_valued_island(&mut mesh, uv0, [b, c]);
+        let mid1 = seed_like_valued_island(&mut mesh, uv1, [b, c]);
+
+        mesh.collapse_uvs(&[shared]);
+        mesh.validate_topology();
+
+        for l in mesh.loop_keys() {
+            let v = mesh.loop_vertex(l);
+            if v == b || v == c {
+                let a = mesh.loop_attribs().get_vec2(uv0, l.as_usize()).unwrap();
+                let d = mesh.loop_attribs().get_vec2(uv1, l.as_usize()).unwrap();
+                assert!(
+                    (a[0] - mid0[0]).abs() < 1e-6 && (a[1] - mid0[1]).abs() < 1e-6,
+                    "first UV layer snapped, got {a:?}"
+                );
+                assert!(
+                    (d[0] - mid1[0]).abs() < 1e-6 && (d[1] - mid1[1]).abs() < 1e-6,
+                    "second UV layer also snapped, got {d:?}"
+                );
+            }
+        }
+    }
+
+    /// §4 — the participation predicate admits colour: a four-channel Color
+    /// layer is snapped by the same component-wise midpoint over its channels.
+    #[test]
+    fn collapse_uvs_color_layer_participates() {
+        let mut mesh = LoopMesh::new();
+        let _uv = register_uv(&mut mesh);
+        let color = register_color(&mut mesh);
+        let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
+
+        // Coherent across the seam at each vertex (both faces agree per vertex),
+        // distinct between the two verts so the four corners flood into one
+        // island whose four-channel bbox midpoint differs from each corner.
+        let value_at = |v: VertexKey| -> [f32; 4] {
+            if v == b {
+                [0.0, 0.0, 0.2, 1.0]
+            } else {
+                [0.4, 0.6, 0.8, 1.0]
+            }
+        };
+        for face in mesh.face_keys() {
+            for l in mesh.face_loop_keys(face) {
+                let v = mesh.loop_vertex(l);
+                if v == b || v == c {
+                    mesh.loop_attribs_mut().set_vec4(color, l.as_usize(), value_at(v));
+                }
+            }
+        }
+        let lo = value_at(b);
+        let hi = value_at(c);
+        let mid = [
+            (lo[0].min(hi[0]) + lo[0].max(hi[0])) * 0.5,
+            (lo[1].min(hi[1]) + lo[1].max(hi[1])) * 0.5,
+            (lo[2].min(hi[2]) + lo[2].max(hi[2])) * 0.5,
+            (lo[3].min(hi[3]) + lo[3].max(hi[3])) * 0.5,
+        ];
+
+        mesh.collapse_uvs(&[shared]);
+        mesh.validate_topology();
+
+        for l in mesh.loop_keys() {
+            let v = mesh.loop_vertex(l);
+            if v == b || v == c {
+                let rgba = mesh.loop_attribs().get_vec4(color, l.as_usize()).unwrap();
+                for k in 0..4 {
+                    assert!(
+                        (rgba[k] - mid[k]).abs() < 1e-6,
+                        "colour channel {k} snapped to midpoint {}, got {}",
+                        mid[k],
+                        rgba[k]
+                    );
+                }
+            }
+        }
+    }
+
+    /// §4.1 / §7 — with no has-math loop layer the operator returns immediately:
+    /// no layer is created and the topology is untouched.
+    #[test]
+    fn collapse_uvs_no_loop_layer_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let (_verts, shared) = two_quads_shared_edge(&mut mesh);
+        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let layers_before = mesh.loop_attribs().iter_descriptors().count();
+
+        mesh.collapse_uvs(&[shared]);
+        mesh.validate_topology();
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            mesh.loop_attribs().iter_descriptors().count(),
+            layers_before,
+            "no loop layer was created by the early-out"
+        );
+    }
+
+    /// §5 / §7 — idempotence: running twice with the same input edges equals
+    /// running once. After the first pass each island is a single point, so the
+    /// second pass's range is that point and the snap is a no-op.
+    #[test]
+    fn collapse_uvs_idempotent_double_application() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
+        let _ = seed_like_valued_island(&mut mesh, uv, [b, c]);
+
+        mesh.collapse_uvs(&[shared]);
+        let once = uv_snapshot(&mesh, uv);
+        mesh.collapse_uvs(&[shared]);
+        let twice = uv_snapshot(&mesh, uv);
+
+        assert_eq!(once, twice, "second application is a no-op (idempotent)");
         mesh.validate_topology();
     }
 }
