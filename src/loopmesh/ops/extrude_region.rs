@@ -386,6 +386,12 @@ impl LoopMesh {
             adjacent_loop_vert: Option<VertexKey>,
         }
         let mut edge_info: Vec<Option<EdgeInfo>> = (0..edge_watermark).map(|_| None).collect();
+        // EXTRUDE.md §3.2.1: the single global `any_external` verdict — true iff
+        // at least one in-region edge carries a non-selected (surround) face on
+        // its radial cycle. It governs whether the delete pass runs at all; a
+        // surround-free input keeps (and flips) its originals exactly as the
+        // `use_keep_orig` path does.
+        let mut any_external = false;
         for slot in 0..edge_watermark {
             if !edge_in_region[slot] {
                 continue;
@@ -453,6 +459,11 @@ impl LoopMesh {
             //   - radial of N > 2 with at least one unselected: non-
             //     manifold boundary; one wall per selected loop.
             let is_boundary = has_unselected || selected_loop_verts.len() < 2;
+            // §3.2.1: a surround face on *any* input edge flips the global gate.
+            // A radial-1 mesh-boundary edge is not a surround (its "outside" is
+            // empty, not a non-input face), so only an actual unselected radial
+            // face counts here.
+            any_external |= has_unselected;
             edge_info[slot] = Some(EdgeInfo {
                 is_boundary,
                 selected_loop_verts,
@@ -503,8 +514,14 @@ impl LoopMesh {
         // face and per-corner loop customdata. Both copies then share their
         // boundary edges via the walls; the originals are flipped after wall
         // construction per §6.1. ----
+        //
+        // §3.2.1: the delete pass (re-anchor) runs only when the input touches a
+        // surround on some edge. A surround-free input (`any_external == false`)
+        // keeps its originals in place even under `use_keep_orig = false`,
+        // producing the same kept-and-flipped topology the shell path gives.
+        let keep_originals = use_keep_orig || !any_external;
         let mut cap_faces: Vec<FaceKey> = Vec::new();
-        if use_keep_orig {
+        if keep_originals {
             for (f, loops) in &per_face_loops {
                 let mut cap_verts: SmallVec<[VertexKey; 8]> = SmallVec::new();
                 let mut cap_edges: SmallVec<[EdgeKey; 8]> = SmallVec::new();
@@ -651,10 +668,12 @@ impl LoopMesh {
         // on the outside of where the originals used to live, so the originals'
         // outward normals would point into the cavity the walls enclose. Flip
         // each kept original's winding so its normal points back outward,
-        // consistent with a closed double-shell. Skipped entirely in the
-        // default (`use_keep_orig=false`) path, where phase 5 would otherwise
-        // remove the originals and the flip question never arises.
-        if use_keep_orig {
+        // consistent with a closed double-shell. The precise gate is "the
+        // delete pass did not run" (`keep_originals`), not the `use_keep_orig`
+        // parameter — so a surround-free input under `use_keep_orig = false` is
+        // flipped too (§3.2.1). When the delete pass runs the originals are gone
+        // (re-anchored) and the flip question never arises.
+        if keep_originals {
             for &f in faces {
                 self.euler_loop_reverse(f);
             }
@@ -733,8 +752,10 @@ mod tests {
 
     #[test]
     fn extrude_region_single_quad_isolated() {
-        // A single quad sitting alone in the mesh. Extruding it produces 4 new
-        // verts + 4 wall quads + 1 top cap (the original face, re-anchored).
+        // A single quad sitting alone in the mesh — surround-free, so EXTRUDE.md
+        // §3.2.1 keeps (and flips) the original even under use_keep_orig=false.
+        // Result: 4 new verts + 4 wall quads + 1 duplicate cap + 1 kept original
+        // = 6 faces.
         let mut mesh = LoopMesh::new();
         let verts = [
             Vec3::new(0.0, 0.0, 0.0),
@@ -758,9 +779,14 @@ mod tests {
             4,
             "4 wall quads, one per boundary edge"
         );
+        assert_eq!(
+            result.cap_faces.len(),
+            1,
+            "surround-free input builds a separate duplicate cap"
+        );
 
         assert_eq!(mesh.totvert(), 8);
-        assert_eq!(mesh.totface(), 5); // 4 walls + 1 top cap
+        assert_eq!(mesh.totface(), 6); // 4 walls + 1 cap + 1 kept original
         mesh.validate_topology();
 
         // Displace the new verts upward and verify the top cap still has the
@@ -774,8 +800,9 @@ mod tests {
 
     #[test]
     fn extrude_region_isolated_face_keeps_boundary() {
-        // After extrude, the source verts of an isolated face should still be
-        // referenced by the *wall* faces (not the top cap).
+        // After extrude, the source verts of an isolated (surround-free) face
+        // are still referenced by the *wall* faces and the kept original; the
+        // duplicate cap (§3.2.1) references the duplicates.
         let mut mesh = LoopMesh::new();
         let verts = [
             Vec3::new(0.0, 0.0, 0.0),
@@ -788,12 +815,21 @@ mod tests {
 
         let result = mesh.extrude_region(&[face]);
 
-        // Top cap's perimeter uses the duplicated verts.
-        let top_verts: Vec<VertexKey> = mesh.face_vert_keys(face);
+        // The duplicate cap's perimeter uses the duplicated verts.
+        let cap = result.cap_faces[0];
+        let top_verts: Vec<VertexKey> = mesh.face_vert_keys(cap);
         for v in &top_verts {
             assert!(
                 !source_verts.contains(v),
-                "top cap should now reference duplicates, not source verts"
+                "duplicate cap should reference duplicates, not source verts"
+            );
+        }
+        // The original face is kept in place, still on the source verts.
+        let kept_verts: Vec<VertexKey> = mesh.face_vert_keys(face);
+        for v in &kept_verts {
+            assert!(
+                source_verts.contains(v),
+                "kept original must stay on its source verts"
             );
         }
         // Wall faces collectively touch every source vert.
@@ -849,10 +885,12 @@ mod tests {
 
     #[test]
     fn extrude_region_two_adjacent_faces_shares_interior_edge() {
-        // Two triangles sharing one edge. Both selected → the shared edge is
-        // *interior* to the selection. After extrude, the original shared edge
-        // becomes a wire edge (no faces); both new triangles share a single
-        // duplicate edge.
+        // Two triangles sharing one edge, alone in the mesh. Both selected → the
+        // selection is surround-free (the shared edge is interior, the four outer
+        // edges are mesh-boundary). Per EXTRUDE.md §3.2.1 the originals are kept
+        // (and flipped) and a duplicate cap is built for each triangle; the
+        // shared interior edge keeps both original triangles on it, while its
+        // duplicate carries both duplicate caps.
         let mut mesh = LoopMesh::new();
         let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
@@ -877,12 +915,15 @@ mod tests {
         // mesh", i.e. boundary edges). The interior edge (e02, radial=2 both
         // selected) gets no wall.
         assert_eq!(result.wall_faces.len(), 4);
+        // §3.2.1: surround-free → originals kept, a cap per triangle built.
+        assert_eq!(result.cap_faces.len(), 2);
         mesh.validate_topology();
 
-        // The interior edge e02 is now a wire edge (no faces on its radial).
-        assert!(
-            mesh.edge_radial_iter(e02).count() == 0,
-            "interior edge of selection becomes wire after extrude"
+        // The original interior edge e02 keeps both kept original triangles.
+        assert_eq!(
+            mesh.edge_radial_iter(e02).count(),
+            2,
+            "surround-free input keeps its originals on the interior edge"
         );
     }
 
@@ -1654,19 +1695,34 @@ mod tests {
 
     #[test]
     fn extrude_region_keep_orig_vs_default_face_delta() {
-        // The load-bearing delta: keep_orig keeps the original alive, the
-        // default replaces it by re-anchoring. Same fixture, +1 face under
-        // keep_orig.
+        // The load-bearing delta: on a *surround-touching* input keep_orig keeps
+        // the original alive while the default re-anchors (deletes) it. Per
+        // EXTRUDE.md §3.2.1 the delta only exists when the input has a surround
+        // on some edge — so the fixture must be surround-touching (the cube top),
+        // not a surround-free isolated quad (where both settings coincide; that
+        // coincidence is pinned in `extrude_region_surround_free_keeps_original`).
+        let cube_top = |mesh: &mut LoopMesh| -> FaceKey {
+            mesh_add_cube(mesh);
+            mesh.all_indices_ensure();
+            mesh.calc_face_normals();
+            mesh.face_keys()
+                .into_iter()
+                .find(|&f| mesh.face_normal(f).z > 0.9)
+                .expect("cube has a +Z face")
+        };
+
         let mut mesh_default = LoopMesh::new();
-        let f_default = unit_quad(&mut mesh_default);
+        let f_default = cube_top(&mut mesh_default);
         mesh_default.extrude_region_exclude(&[f_default], &[], false, false);
 
         let mut mesh_keep = LoopMesh::new();
-        let f_keep = unit_quad(&mut mesh_keep);
+        let f_keep = cube_top(&mut mesh_keep);
         mesh_keep.extrude_region_exclude(&[f_keep], &[], true, false);
 
-        assert_eq!(mesh_default.totface(), 5);
-        assert_eq!(mesh_keep.totface(), 6);
+        // Default deletes the original top: 5 cube + 1 cap + 4 walls = 10.
+        // keep_orig retains it: 6 cube + 1 cap + 4 walls = 11.
+        assert_eq!(mesh_default.totface(), 10);
+        assert_eq!(mesh_keep.totface(), 11);
         assert_eq!(mesh_keep.totface(), mesh_default.totface() + 1);
         // Vertex counts match — keep_orig adds no extra verts, only the cap face.
         assert_eq!(mesh_keep.totvert(), mesh_default.totvert());
@@ -2158,5 +2214,84 @@ mod tests {
                 "cap face must copy the original's attribs: got {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn extrude_region_surround_free_keeps_original() {
+        // EXTRUDE.md §3.2.1: the default `extrude_region` (use_keep_orig=false)
+        // on a surround-free input (an isolated quad — no input edge has a
+        // non-input face on its radial) does *not* delete the original. The
+        // delete pass is gated on the global `any_external` verdict, which is
+        // false here, so the original is kept (and flipped, §6.1) and a separate
+        // duplicate cap is built. Discriminator: 4 walls + 1 cap + 1 kept
+        // original = 6 faces, 8 verts. This is the same topology
+        // use_keep_orig=true would give for this input.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let normal_before = mesh.face_normal(face);
+        assert!(normal_before.z > 0.9, "unit quad starts +Z");
+
+        let result = mesh.extrude_region(&[face]);
+
+        assert_eq!(mesh.totface(), 6, "4 walls + 1 cap + 1 kept original");
+        assert_eq!(mesh.totvert(), 8, "4 original + 4 duplicate verts");
+        assert_eq!(result.wall_faces.len(), 4);
+        assert_eq!(
+            result.cap_faces.len(),
+            1,
+            "surround-free input builds a separate duplicate cap rather than re-anchoring"
+        );
+
+        // §6.1 flip — load-bearing because CanonicalMesh is winding-blind, so an
+        // un-flipped original would still A/B-match topologically. The kept
+        // original must read -Z (flipped), the fresh cap keeps the original +Z.
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let kept_normal = mesh.face_normal(face);
+        assert!(
+            kept_normal.z < -0.9,
+            "surround-free kept original must be flipped per §6.1: got {kept_normal:?}"
+        );
+        let cap_normal = mesh.face_normal(result.cap_faces[0]);
+        assert!(
+            cap_normal.z > 0.9,
+            "duplicate cap keeps the original +Z orientation: got {cap_normal:?}"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_surround_touching_deletes_original() {
+        // EXTRUDE.md §3.2.1 contrast: a surround-touching input (the top face of
+        // a cube — each of its four edges shares a side face) makes
+        // `any_external == true`, so the default `extrude_region` deletes
+        // (re-anchors) the original top. Discriminator: 5 remaining cube faces +
+        // 1 cap + 4 walls = 10 faces — *not* 11. cap_faces is empty because the
+        // original is re-anchored into the cap rather than duplicated.
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let top = mesh
+            .face_keys()
+            .into_iter()
+            .find(|&f| mesh.face_normal(f).z > 0.9)
+            .expect("cube has a +Z face");
+
+        let result = mesh.extrude_region(&[top]);
+
+        assert_eq!(
+            mesh.totface(),
+            10,
+            "surround-touching input deletes its original: 5 cube + 1 cap + 4 walls"
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        assert!(
+            result.cap_faces.is_empty(),
+            "surround-touching input re-anchors the original instead of duplicating a cap"
+        );
+        mesh.validate_topology();
     }
 }

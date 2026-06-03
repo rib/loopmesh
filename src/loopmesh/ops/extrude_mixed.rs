@@ -413,11 +413,13 @@ mod tests {
         assert_eq!(result.side_edges.len(), 6);
         // One wire edge from the isolated vert.
         assert_eq!(result.wire_edges.len(), 1);
-        // Default path: original face re-anchored as cap, so no fresh cap.
-        assert_eq!(result.cap_faces.len(), 0);
+        // The face is surround-free (all its edges mesh-boundary), so per
+        // EXTRUDE.md §3.2.1 the region pass keeps the original and builds a
+        // separate duplicate cap.
+        assert_eq!(result.cap_faces.len(), 1);
 
-        // Total faces: original quad becomes a cap (5 walls + 1 cap = 6).
-        assert_eq!(mesh.totface(), 6);
+        // Total faces: kept original + duplicate cap + 5 walls = 7.
+        assert_eq!(mesh.totface(), 7);
         mesh.validate_topology();
     }
 
@@ -463,7 +465,9 @@ mod tests {
         assert_eq!(result_named.edge_map.len(), result_plain.edge_map.len());
         assert_eq!(result_named.edge_map.len(), 4);
         assert_eq!(mesh_named.totface(), mesh_plain.totface());
-        assert_eq!(mesh_named.totface(), 5);
+        // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
+        // walls = 6.
+        assert_eq!(mesh_named.totface(), 6);
         mesh_named.validate_topology();
     }
 
@@ -529,8 +533,9 @@ mod tests {
         assert_eq!(result.vert_map.len(), 4, "only the 4 face verts survive in the map");
         // No wire wall, no contribution from the excluded wire edge.
         assert_eq!(result.wall_faces.len(), 4, "4 face walls, no wire wall");
-        // 1 cap (re-anchored original quad) + 4 walls = 5 faces.
-        assert_eq!(mesh.totface(), 5, "5 faces after the wire kill");
+        // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
+        // walls = 6 faces after the wire kill.
+        assert_eq!(mesh.totface(), 6, "6 faces after the wire kill");
 
         // The original wire edge is still present and faceless.
         let [w0, w1] = mesh.edge_vertices(wire);
@@ -562,8 +567,9 @@ mod tests {
         assert_eq!(result.vert_map.len(), 6);
         // 4 face walls + 1 wire wall.
         assert_eq!(result.wall_faces.len(), 5, "wire contributes a wall");
-        // 1 cap + 4 face walls + 1 wire wall = 6 faces.
-        assert_eq!(mesh.totface(), 6);
+        // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
+        // face walls + 1 wire wall = 7 faces.
+        assert_eq!(mesh.totface(), 7);
         mesh.validate_topology();
     }
 
@@ -592,8 +598,9 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 3, "one wall suppressed");
         // All four quad verts still duplicated (no kill).
         assert_eq!(result.vert_map.len(), 4);
-        // 1 cap + 3 walls = 4 faces.
-        assert_eq!(mesh.totface(), 4);
+        // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 3
+        // walls = 5 faces.
+        assert_eq!(mesh.totface(), 5);
         mesh.validate_topology();
     }
 
