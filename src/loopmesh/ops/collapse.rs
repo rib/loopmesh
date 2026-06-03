@@ -401,6 +401,111 @@ impl LoopMesh {
         }
     }
 
+    /// Standalone "flatten the face-corner customdata around a set of vertices
+    /// to one value" operator. Takes an input *vertex* set and, for every
+    /// has-math per-loop customdata layer, gathers every corner sitting at any
+    /// selected vert — the gateless per-vert loop fan — and overwrites them all
+    /// with one value per layer: the component-wise midpoint of the gathered
+    /// corners' value range. No topology changes.
+    ///
+    /// Implements `radial-mesh-guides/operators/AVERAGE_VERT_FACEDATA.md`:
+    ///
+    /// - **§3 gateless per-vert fan** — for each selected vert, every face
+    ///   corner anchored at it is gathered. There is *no* edge mask and *no*
+    ///   value-equality gate: a corner is gathered solely because it sits at a
+    ///   selected vert. So a UV/colour seam meeting at a selected vert is
+    ///   *flattened* (both sides pooled together), the opposite of
+    ///   [`Self::collapse_uvs`]'s seam-preserving island flood (§4.2).
+    /// - **§4 / §4.1 one global pool per layer** — the min/max accumulator is
+    ///   built *once per layer* over the union of all selected verts' corners,
+    ///   *not* reset between verts. Every gathered corner across every selected
+    ///   vert lands on the single shared bounding-box midpoint. Calling once
+    ///   with two verts differs from calling twice with one vert each.
+    /// - **§2 bbox midpoint, not mean** — the snapped value is the
+    ///   per-component `(min + max) / 2` of the pool, the identical
+    ///   [`Self::collapse_uvs_snap_island`] snap collapse uses (§6.3 there);
+    ///   independent of how many corners carry intermediate values.
+    /// - **§5 every has-math loop layer** — every UV layer and every colour
+    ///   layer is pooled and snapped independently, each with its own pool. The
+    ///   same has-math participation predicate as the collapse blend (§6.1).
+    /// - **§5.2 / §7 edge cases** — no has-math loop layer is a whole-operator
+    ///   no-op (no layer created). An empty input vert set, or one naming only
+    ///   loop-less (wire/isolated) verts, gathers no corners and is a no-op for
+    ///   that layer. Idempotent: a second pass finds the pool a single point.
+    ///
+    /// This is the pure-customdata sibling of [`Self::collapse_uvs`] — it shares
+    /// the identical midpoint snap and the all-has-math-layers iteration, but
+    /// gathers corners by a vert's *gateless* loop fan and pools them into *one*
+    /// global accumulator rather than per-island.
+    pub fn average_vert_facedata(&mut self, verts: &[VertexKey]) {
+        // §7 — no verts named gathers nothing; a complete no-op.
+        if verts.is_empty() {
+            return;
+        }
+
+        let participating: SmallVec<[ElementAttributeKey; 4]> = self
+            .loop_attribs()
+            .iter_descriptors()
+            .filter_map(|(key, _)| {
+                if loop_layer_participates_in_collapse_blend(self.loop_attribs(), key) {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // §5.2 early-out: no has-math layer means the whole operator is a no-op
+        // and creates no layer.
+        if participating.is_empty() {
+            return;
+        }
+
+        for layer in participating {
+            // §4 / §4.1 — one pool over the union of all selected verts'
+            // corners, NOT reset between verts. Each corner appears once.
+            let mut pool: SmallVec<[LoopKey; 32]> = SmallVec::new();
+            for &vert in verts {
+                for corner in self.corners_at_vertex(vert) {
+                    if !pool.contains(&corner) {
+                        pool.push(corner);
+                    }
+                }
+            }
+
+            // §6.1 — an empty pool (every selected vert loop-less) writes
+            // nothing for this layer.
+            if pool.is_empty() {
+                continue;
+            }
+
+            // §2 / §6.2 / §6.3 — one component-wise bbox midpoint over the whole
+            // pool, written back to every gathered corner.
+            self.collapse_uvs_snap_island(layer, &pool);
+        }
+    }
+
+    /// Every face corner anchored at `vertex` — the vert's gateless loop fan,
+    /// one loop per face incident to `vertex` (the loop whose own corner sits at
+    /// `vertex`). A wire/isolated vert with no incident face yields none. This
+    /// is the gather of `AVERAGE_VERT_FACEDATA.md` §3 (and the loops-of-vert
+    /// fan the collapse blend walks around a pivot, §6.2 there) *without* any
+    /// edge mask or value-equality gate.
+    fn corners_at_vertex(&self, vertex: VertexKey) -> SmallVec<[LoopKey; 16]> {
+        let mut corners: SmallVec<[LoopKey; 16]> = SmallVec::new();
+        for edge in self.vertex_disk_iter(vertex).collect::<SmallVec<[EdgeKey; 16]>>() {
+            for loop_key in self.edge_radial_iter(edge).collect::<SmallVec<[LoopKey; 8]>>() {
+                if self.loop_vertex(loop_key) != vertex {
+                    continue;
+                }
+                if !corners.contains(&loop_key) {
+                    corners.push(loop_key);
+                }
+            }
+        }
+        corners
+    }
+
     /// Every loop incident to `vertex` — the full disk fan of corners, in both
     /// directions across every face meeting there. A loop is incident either
     /// because its own corner sits at `vertex` (its edge leaves `vertex`) or
@@ -1238,5 +1343,434 @@ mod tests {
 
         assert_eq!(once, twice, "second application is a no-op (idempotent)");
         mesh.validate_topology();
+    }
+
+    // ---- average_vert_facedata (AVERAGE_VERT_FACEDATA.md) ----
+
+    /// A triangle fan of `n` faces sharing one central hub vertex. Triangle `i`
+    /// is wound `[hub, rim_i, rim_{(i+1)%n}]`, so the hub corner of face `i` is
+    /// the loop anchored at the hub. Returns `(hub, rim_verts)`.
+    fn build_triangle_fan(mesh: &mut LoopMesh, n: usize) -> (VertexKey, Vec<VertexKey>) {
+        use std::f32::consts::TAU;
+        let hub = mesh.create_vertex(Vec3::ZERO);
+        let rim: Vec<VertexKey> = (0..n)
+            .map(|i| {
+                let a = TAU * i as f32 / n as f32;
+                mesh.create_vertex(Vec3::new(a.cos(), a.sin(), 0.0))
+            })
+            .collect();
+        for i in 0..n {
+            let vs = [hub, rim[i], rim[(i + 1) % n]];
+            let es: Vec<EdgeKey> = (0..3)
+                .map(|k| mesh.create_edge([vs[k], vs[(k + 1) % 3]], EdgeCreateFlags::NO_DUPLICATE))
+                .collect();
+            mesh.face_create(&vs, &es, FaceCreateFlags::NONE);
+        }
+        (hub, rim)
+    }
+
+    /// All loops whose corner sits at `vert`, as `(slot, uv)` pairs.
+    fn corner_uvs_at(mesh: &LoopMesh, uv: ElementAttributeKey, vert: VertexKey) -> Vec<[f32; 2]> {
+        mesh.loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == vert)
+            .map(|l| mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap())
+            .collect()
+    }
+
+    fn approx_uv(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6
+    }
+
+    /// §2 / §3 / §4 headline — selecting the hub of a fan whose hub corners carry
+    /// a distinct UV spread gathers all hub corners into one pool and snaps them
+    /// to the component-wise bbox midpoint (not a mean, not any input value).
+    #[test]
+    fn average_vert_facedata_fan_hub_snaps_to_bbox_midpoint() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+
+        // Assign each hub corner a distinct UV; record the bbox the pool spans.
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        assert_eq!(hub_corners.len(), 6, "fan hub has one corner per face");
+        let values = [
+            [0.0, 0.5],
+            [0.4, 0.1],
+            [0.2, 0.9],
+            [0.8, 0.3],
+            [0.6, 0.7],
+            [0.1, 0.2],
+        ];
+        for (l, v) in hub_corners.iter().zip(values) {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+        // bbox: u in [0.0..0.8] -> 0.4 ; v in [0.1..0.9] -> 0.5
+        let expected = [0.4, 0.5];
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, hub) {
+            assert!(approx_uv(got, expected), "hub corner snapped to {expected:?}, got {got:?}");
+        }
+    }
+
+    /// §2 — the snapped value is the bbox midpoint `(min+max)/2`, NOT the
+    /// arithmetic mean: a clustered spread with one outlier lands the midpoint,
+    /// which the cluster would pull the mean away from.
+    #[test]
+    fn average_vert_facedata_bbox_midpoint_not_mean() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+
+        // Five corners clustered near the origin, one outlier at (1,1).
+        // min=(0,0), max=(1,1) -> midpoint (0.5,0.5); mean is pulled near origin.
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        for (i, l) in hub_corners.iter().enumerate() {
+            let v = if i + 1 == hub_corners.len() {
+                [1.0, 1.0]
+            } else {
+                [0.01 * i as f32, 0.02 * i as f32]
+            };
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, hub) {
+            assert!(approx_uv(got, [0.5, 0.5]), "midpoint (0.5,0.5), not mean, got {got:?}");
+        }
+    }
+
+    /// §4 / §4.1 — the discriminating case: two verts with disjoint corner
+    /// spreads pool into ONE global bbox, so all four corners land on one shared
+    /// midpoint. A per-vertex implementation would land each vert's corners on
+    /// its own midpoint (two different values). Verified by contrast against the
+    /// per-vert midpoints.
+    #[test]
+    fn average_vert_facedata_global_single_pool_multi_vert() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (_hub, rim) = build_triangle_fan(&mut mesh, 6);
+        // Two non-adjacent rim verts (share no face): rim[0] and rim[3].
+        let a = rim[0];
+        let b = rim[3];
+
+        // a's corners near origin, b's corners far offset; disjoint ranges.
+        let set_corners = |mesh: &mut LoopMesh, vert: VertexKey, base: [f32; 2]| {
+            let slots: Vec<usize> = mesh
+                .loop_keys()
+                .into_iter()
+                .filter(|&l| mesh.loop_vertex(l) == vert)
+                .map(|l| l.as_usize())
+                .collect();
+            for (k, slot) in slots.iter().enumerate() {
+                mesh.loop_attribs_mut().set_vec2(
+                    uv,
+                    *slot,
+                    [base[0] + 0.1 * k as f32, base[1] + 0.2 * k as f32],
+                );
+            }
+        };
+        set_corners(&mut mesh, a, [0.0, 0.0]);
+        set_corners(&mut mesh, b, [5.0, 6.0]);
+
+        // a's own spread: each rim vert is shared by two faces -> two corners.
+        // a: (0.0,0.0),(0.1,0.2) -> per-vert mid (0.05,0.1)
+        // b: (5.0,6.0),(5.1,6.2) -> per-vert mid (5.05,6.1)
+        // global pool min=(0,0) max=(5.1,6.2) -> mid (2.55,3.1) — distinct from both.
+        let global_mid = [2.55, 3.1];
+        let per_vert_a = [0.05, 0.1];
+        let per_vert_b = [5.05, 6.1];
+
+        mesh.average_vert_facedata(&[a, b]);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv, a).into_iter().chain(corner_uvs_at(&mesh, uv, b)) {
+            assert!(approx_uv(got, global_mid), "global pool midpoint {global_mid:?}, got {got:?}");
+            assert!(!approx_uv(got, per_vert_a), "not vert a's own midpoint");
+            assert!(!approx_uv(got, per_vert_b), "not vert b's own midpoint");
+        }
+    }
+
+    /// §4 / §4.1 contrast — one call with both verts differs from two calls with
+    /// one vert each. Pins the not-reset-per-vert accumulator at the call level.
+    #[test]
+    fn average_vert_facedata_one_call_two_verts_differs_from_two_calls() {
+        let build = || {
+            let mut mesh = LoopMesh::new();
+            let uv = register_uv(&mut mesh);
+            let (_hub, rim) = build_triangle_fan(&mut mesh, 6);
+            let (a, b) = (rim[0], rim[3]);
+            for (vert, base) in [(a, [0.0, 0.0]), (b, [5.0, 6.0])] {
+                let slots: Vec<usize> = mesh
+                    .loop_keys()
+                    .into_iter()
+                    .filter(|&l| mesh.loop_vertex(l) == vert)
+                    .map(|l| l.as_usize())
+                    .collect();
+                for (k, slot) in slots.iter().enumerate() {
+                    mesh.loop_attribs_mut().set_vec2(
+                        uv,
+                        *slot,
+                        [base[0] + 0.1 * k as f32, base[1] + 0.2 * k as f32],
+                    );
+                }
+            }
+            (mesh, uv, a, b)
+        };
+
+        let (mut one_call, uv1, a1, b1) = build();
+        one_call.average_vert_facedata(&[a1, b1]);
+
+        let (mut two_calls, uv2, a2, b2) = build();
+        two_calls.average_vert_facedata(&[a2]);
+        two_calls.average_vert_facedata(&[b2]);
+
+        assert_ne!(
+            corner_uvs_at(&one_call, uv1, a1),
+            corner_uvs_at(&two_calls, uv2, a2),
+            "global pool (one call) must differ from per-vert pools (two calls)"
+        );
+    }
+
+    /// §3 / §4.2 — a UV seam meeting at the selected vert is FLATTENED, not
+    /// preserved: both seam corners are pooled and land on the one midpoint
+    /// (opposite of collapse_uvs's value-equality gate).
+    #[test]
+    fn average_vert_facedata_seam_flattened_not_preserved() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+
+        // Two adjacent hub corners disagree (a seam at the hub) at the extremes;
+        // the rest coherent in the middle. min=(0,0) max=(0.8,0.8) -> mid 0.4.
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        for (i, l) in hub_corners.iter().enumerate() {
+            let v = match i {
+                0 => [0.0, 0.0],
+                1 => [0.8, 0.8],
+                _ => [0.4, 0.4],
+            };
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
+        }
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        // Every hub corner now reads the same value (seam welded to one midpoint).
+        let got = corner_uvs_at(&mesh, uv, hub);
+        for v in &got {
+            assert!(approx_uv(*v, [0.4, 0.4]), "seam flattened to midpoint, got {v:?}");
+        }
+    }
+
+    /// §5 — every has-math layer is flattened, each with its own independent
+    /// pool: two UV layers are both snapped to their own bbox midpoints.
+    #[test]
+    fn average_vert_facedata_all_has_math_layers_flattened() {
+        let mut mesh = LoopMesh::new();
+        let uv0 = register_uv(&mut mesh);
+        let uv1 = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv1"),
+                Format::new(ComponentType::F32, 2),
+            ))
+            .unwrap();
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 4);
+
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        // uv0 spread in [0..1]^2 -> mid (0.5,0.5); uv1 offset by +10 -> mid (10.5,10.5).
+        let v0 = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        for (l, v) in hub_corners.iter().zip(v0) {
+            mesh.loop_attribs_mut().set_vec2(uv0, l.as_usize(), v);
+            mesh.loop_attribs_mut().set_vec2(uv1, l.as_usize(), [v[0] + 10.0, v[1] + 10.0]);
+        }
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        for got in corner_uvs_at(&mesh, uv0, hub) {
+            assert!(approx_uv(got, [0.5, 0.5]), "uv0 snapped, got {got:?}");
+        }
+        for l in mesh.loop_keys().into_iter().filter(|&l| mesh.loop_vertex(l) == hub) {
+            let got = mesh.loop_attribs().get_vec2(uv1, l.as_usize()).unwrap();
+            assert!(approx_uv(got, [10.5, 10.5]), "uv1 snapped independently, got {got:?}");
+        }
+    }
+
+    /// §5 — the participation predicate admits colour: a four-channel Color
+    /// layer is snapped by the same component-wise midpoint.
+    #[test]
+    fn average_vert_facedata_color_layer_participates() {
+        let mut mesh = LoopMesh::new();
+        let color = register_color(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 4);
+
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        let cols = [
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.5, 1.0],
+            [0.0, 1.0, 0.5, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        for (l, c) in hub_corners.iter().zip(cols) {
+            mesh.loop_attribs_mut().set_vec4(color, l.as_usize(), c);
+        }
+        // bbox: r[0..1]->0.5, g[0..1]->0.5, b[0..1]->0.5, a[1..1]->1.0
+        let expected = [0.5, 0.5, 0.5, 1.0];
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        for l in mesh.loop_keys().into_iter().filter(|&l| mesh.loop_vertex(l) == hub) {
+            let rgba = mesh.loop_attribs().get_vec4(color, l.as_usize()).unwrap();
+            for k in 0..4 {
+                assert!(
+                    (rgba[k] - expected[k]).abs() < 1e-6,
+                    "colour channel {k} snapped to {}, got {}",
+                    expected[k],
+                    rgba[k]
+                );
+            }
+        }
+    }
+
+    /// §3 / §8.2 — corners at unselected verts keep their values exactly: the
+    /// gather is by corner-vertex membership, not whole-face.
+    #[test]
+    fn average_vert_facedata_unselected_corners_untouched() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, rim) = build_triangle_fan(&mut mesh, 6);
+
+        // Hub corners get a spread; rim corners get a far-offset band.
+        for l in mesh.loop_keys() {
+            let v = mesh.loop_vertex(l);
+            let value = if v == hub {
+                [0.1 * (l.as_usize() % 7) as f32, 0.1 * (l.as_usize() % 5) as f32]
+            } else {
+                [100.0 + l.as_usize() as f32, 200.0 + l.as_usize() as f32]
+            };
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+        }
+        let rim_before: Vec<Vec<[f32; 2]>> =
+            rim.iter().map(|&v| corner_uvs_at(&mesh, uv, v)).collect();
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        let rim_after: Vec<Vec<[f32; 2]>> =
+            rim.iter().map(|&v| corner_uvs_at(&mesh, uv, v)).collect();
+        assert_eq!(rim_before, rim_after, "rim corners at unselected verts untouched (§3)");
+    }
+
+    /// §5.2 / §7 — no has-math loop layer is a whole-operator no-op: nothing
+    /// changes and no layer is created.
+    #[test]
+    fn average_vert_facedata_no_loop_layer_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let layers_before = mesh.loop_attribs().iter_descriptors().count();
+
+        mesh.average_vert_facedata(&[hub]);
+        mesh.validate_topology();
+
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            mesh.loop_attribs().iter_descriptors().count(),
+            layers_before,
+            "no loop layer created by the early-out"
+        );
+    }
+
+    /// §7 — selecting a loop-less (wire/isolated) vert gathers no corners and is
+    /// a no-op: a present UV layer is left byte-for-byte unchanged.
+    #[test]
+    fn average_vert_facedata_wire_vert_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+        for l in mesh.loop_keys() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.1 * l.as_usize() as f32, 0.2 * l.as_usize() as f32]);
+        }
+        // An isolated vert with no incident face.
+        let loose = mesh.create_vertex(Vec3::new(9.0, 9.0, 9.0));
+        let before = uv_snapshot(&mesh, uv);
+
+        mesh.average_vert_facedata(&[loose]);
+        mesh.validate_topology();
+
+        assert_eq!(uv_snapshot(&mesh, uv), before, "loose vert gathers nothing");
+        let _ = hub;
+    }
+
+    /// §6 / §7 — idempotence: a second pass with the same verts finds the pool a
+    /// single point and snaps it to itself.
+    #[test]
+    fn average_vert_facedata_idempotent_double_application() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
+        let hub_corners: Vec<LoopKey> = mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+            .collect();
+        for (i, l) in hub_corners.iter().enumerate() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.1 * i as f32, 0.2 * i as f32]);
+        }
+
+        mesh.average_vert_facedata(&[hub]);
+        let once = uv_snapshot(&mesh, uv);
+        mesh.average_vert_facedata(&[hub]);
+        let twice = uv_snapshot(&mesh, uv);
+
+        assert_eq!(once, twice, "second application is a no-op (idempotent)");
+        mesh.validate_topology();
+    }
+
+    /// §7 — an empty input vert set gathers nothing and is a complete no-op.
+    #[test]
+    fn average_vert_facedata_empty_input_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let (_hub, _rim) = build_triangle_fan(&mut mesh, 6);
+        for l in mesh.loop_keys() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.3 * l.as_usize() as f32, 0.4 * l.as_usize() as f32]);
+        }
+        let before = uv_snapshot(&mesh, uv);
+
+        mesh.average_vert_facedata(&[]);
+        mesh.validate_topology();
+
+        assert_eq!(uv_snapshot(&mesh, uv), before, "empty input leaves UVs untouched");
     }
 }
