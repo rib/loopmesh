@@ -551,7 +551,19 @@ impl LoopMesh {
             })
             .collect();
 
-        let first_corner = snap_corners[0];
+        // §4.1 / §3.2 — the corner the operator keys phase one's accumulator and
+        // phase two's broadcast off is the construction-determined *first loop* of
+        // `vert_snap`'s fan, NOT merely the first element `corners_at_vertex`
+        // happens to gather. For a closed fan the two differ: the fan's first
+        // loop is the hub corner of the *last* face to adopt the disk-entry
+        // spoke, which `fan_first_loop` resolves from the disk-entry (first-
+        // attached) / radial-entry (last-attached) conventions (see
+        // RADIAL_EDGE_STRUCTURE.md §6.5). Gathering's first element would be the
+        // earliest-built face's corner — the classic open-fan mistake applied to
+        // a closed fan.
+        let first_corner = self
+            .fan_first_loop(vert_snap)
+            .expect("tot > 0 guarantees a fan corner");
         let scale = 1.0 / tot as f32;
 
         // §3 phase one — for each has-math layer, scale every snap-vertex corner
@@ -569,7 +581,10 @@ impl LoopMesh {
             }
 
             let mut mean = self.loop_value(layer, first_corner);
-            for &corner in &snap_corners[1..] {
+            for &corner in &snap_corners {
+                if corner == first_corner {
+                    continue;
+                }
                 let scaled = self.loop_value(layer, corner);
                 for component in 0..4 {
                     mean.components[component] += scaled.components[component];
@@ -591,6 +606,43 @@ impl LoopMesh {
                     .copy_into(target_corner.as_usize(), first_corner.as_usize());
             }
         }
+    }
+
+    /// The construction-determined *first loop* of `vertex`'s loops-of-vert fan
+    /// — the corner an order-sensitive customdata operator must key off to match
+    /// this model bit-for-bit. Implements `fan_first_loop` from
+    /// `radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md` §6.5:
+    ///
+    /// - Walk `vertex`'s disk in insertion order (the disk-entry pointer stays
+    ///   pinned to the first-attached edge) and stop at the first non-wire edge
+    ///   `e0` — the disk-entry spoke.
+    /// - Take `e0`'s radial-entry loop. §6.5 fixes the radial entry on the
+    ///   *last*-attached loop of an edge (the disk/radial asymmetry). This
+    ///   crate's radial cycle keeps its `radial_link` pointer on the *first*-
+    ///   attached loop and splices each new loop in immediately *before* it, so
+    ///   the last-attached loop is `radial_link`'s radial-prev. For a closed fan
+    ///   that is the wrap face's loop, not the earliest-built face's.
+    /// - Land on the corner at `vertex`: that loop if its own corner sits at
+    ///   `vertex`, else one step forward along its face (its loop-next), which by
+    ///   the core loop↔edge invariant (§5.1) sits at `e0`'s other endpoint.
+    ///
+    /// Returns `None` only for an empty fan (every incident edge is a wire, or
+    /// `vertex` is isolated).
+    fn fan_first_loop(&self, vertex: VertexKey) -> Option<LoopKey> {
+        for edge in self.vertex_disk_iter(vertex) {
+            let Some(radial_entry) = self.edges.get(edge).radial_link else {
+                continue; // wire edge — skip in disk insertion order.
+            };
+            // §6.5 radial entry == last-attached loop == radial-prev of the
+            // first-attached `radial_link` pointer this crate keeps.
+            let last_attached = self.loop_radial_prev(radial_entry);
+            return Some(if self.loop_vertex(last_attached) == vertex {
+                last_attached
+            } else {
+                self.loop_next(last_attached)
+            });
+        }
+        None
     }
 
     /// Every face corner anchored at `vertex` — the vert's gateless loop fan,
@@ -1900,6 +1952,61 @@ mod tests {
             .collect()
     }
 
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 — on the closed `disk_fan(n)` (case (b),
+    /// shared/manifold hub spokes) the fan's first loop is the hub corner of the
+    /// *last* face to adopt the disk-entry spoke `hub–rim[0]` — the wrap face
+    /// `(hub, rim[n-1], rim[0])`, built last. Tagging hub corner `i` as
+    /// `100 + i`, the §6.5 walkthrough's `disk_fan(8)` predicts `107`. This pins
+    /// `fan_first_loop` directly against that worked example, independent of the
+    /// broadcast operator.
+    #[test]
+    fn fan_first_loop_closed_disk_fan_is_wrap_face_hub_corner() {
+        for n in [3usize, 6, 8] {
+            let mut mesh = LoopMesh::new();
+            let int_layer = register_loop_i32(&mut mesh);
+            let (hub, _rim) = build_triangle_fan(&mut mesh, n);
+
+            // Hub corner created during face `i`'s `face_create` is the `i`-th in
+            // creation (slot) order; tag it `100 + i`.
+            for (face_index, l) in hub_corner_keys(&mesh, hub).into_iter().enumerate() {
+                mesh.loop_attribs_mut()
+                    .set_i32(int_layer, l.as_usize(), 100 + face_index as i32);
+            }
+
+            let first = mesh.fan_first_loop(hub).expect("non-empty closed fan");
+            let value = mesh.loop_attribs().get_i32(int_layer, first.as_usize()).unwrap();
+            assert_eq!(
+                value,
+                100 + (n as i32 - 1),
+                "closed disk_fan({n}) first loop is the wrap face's hub corner"
+            );
+            assert_eq!(mesh.loop_vertex(first), hub, "first loop is anchored at the hub");
+        }
+    }
+
+    /// §6.5 — `fan_first_loop` lands the first loop *at* the queried vertex even
+    /// when the disk-entry spoke's radial-entry loop sits at the far endpoint;
+    /// the `loop_next` step of the rule must place it on the hub corner.
+    #[test]
+    fn fan_first_loop_lands_at_queried_vertex() {
+        let mut mesh = LoopMesh::new();
+        let (hub, _rim) = build_triangle_fan(&mut mesh, 5);
+        let first = mesh.fan_first_loop(hub).expect("non-empty fan");
+        assert_eq!(
+            mesh.loop_vertex(first),
+            hub,
+            "the fan-first loop's own corner sits at the queried vertex"
+        );
+    }
+
+    /// §6.5 — an isolated (loop-less) vertex has an empty fan and yields `None`.
+    #[test]
+    fn fan_first_loop_isolated_vertex_is_none() {
+        let mut mesh = LoopMesh::new();
+        let loose = mesh.create_vertex(Vec3::ZERO);
+        assert!(mesh.fan_first_loop(loose).is_none(), "isolated vert: empty fan");
+    }
+
     /// §2 / §3 / §4 headline — the snap vertex's corners are reduced to their
     /// arithmetic mean and that mean is broadcast onto every corner of the
     /// target cluster.
@@ -2005,21 +2112,38 @@ mod tests {
     }
 
     /// §4.1 whole-block copy — phase two copies the entire customdata block, so a
-    /// non-has-math integer layer is flattened to the first snap corner's raw
-    /// integer, even though it was never averaged.
+    /// non-has-math integer layer is flattened to the snap vertex's *first fan
+    /// loop*'s raw integer, even though it was never averaged.
+    ///
+    /// The closed `build_triangle_fan(n)` is the `disk_fan(n)` fixture of
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 case (b): every hub spoke is a manifold
+    /// (radial-2) edge shared by two adjacent triangles, and the wrap face
+    /// `(hub, rim[n-1], rim[0])` — the *last* triangle built — adopts the
+    /// disk-entry spoke `hub–rim[0]` (minted by face 0) last. By the radial
+    /// last-attached-wins entry rule the fan's first loop is therefore the wrap
+    /// face's hub corner, NOT face 0's. Encoding each hub corner as `100 + face`,
+    /// the §6.5 walkthrough's `disk_fan(8)` predicts `107`; this `n`-fan predicts
+    /// `100 + (n - 1)`. Reproducing face 0's `100` would be the classic mistake
+    /// of applying the open-fan corollary (a) to a closed fan.
     #[test]
     fn pointmerge_facedata_whole_block_copy_flattens_non_has_math() {
-        let n = 6usize;
+        let n = 8usize;
         let mut mesh = LoopMesh::new();
         let uv = register_uv(&mut mesh);
         let int_layer = register_loop_i32(&mut mesh);
         let (hub, rim) = build_triangle_fan(&mut mesh, n);
 
+        // Tag each hub corner with `100 + face` so the broadcast source is
+        // identifiable by value. `build_triangle_fan` builds face `i` last among
+        // its own corners, so the hub loop created during face `i`'s
+        // `face_create` is the `i`-th hub loop in creation (slot) order.
         let hub_corners = hub_corner_keys(&mesh, hub);
-        for (i, l) in hub_corners.iter().enumerate() {
-            let t = i as f32 / n as f32;
+        assert_eq!(hub_corners.len(), n, "closed fan has one hub corner per face");
+        for (face_index, l) in hub_corners.iter().enumerate() {
+            let t = face_index as f32 / n as f32;
             mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.2 + 0.6 * t, 0.3]);
-            mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), 100 + i as i32);
+            mesh.loop_attribs_mut()
+                .set_i32(int_layer, l.as_usize(), 100 + face_index as i32);
         }
         // Decorate the rim corners with their own distinct integers, so a missing
         // broadcast would leave them visibly distinct.
@@ -2029,8 +2153,19 @@ mod tests {
             }
         }
 
-        let first_corner = hub_corners[0];
-        let first_int = mesh.loop_attribs().get_i32(int_layer, first_corner.as_usize()).unwrap();
+        // The §6.5 fan-first loop is the wrap face's hub corner — value
+        // `100 + (n - 1)` — NOT the gather-first `hub_corners[0]`'s `100`.
+        let first_corner = mesh.fan_first_loop(hub).expect("non-empty fan");
+        let first_int = mesh
+            .loop_attribs()
+            .get_i32(int_layer, first_corner.as_usize())
+            .unwrap();
+        assert_eq!(
+            first_int,
+            100 + (n as i32 - 1),
+            "§6.5 closed-fan first loop is the wrap face's hub corner (last adopter \
+             of the disk-entry spoke), not face 0's"
+        );
 
         let mut cluster = vec![hub];
         cluster.extend_from_slice(&rim);
@@ -2038,7 +2173,7 @@ mod tests {
         mesh.validate_topology();
 
         // Every target corner (except the source, which keeps its own value) now
-        // carries the first corner's raw integer.
+        // carries the §6.5 first corner's raw integer.
         for l in mesh.loop_keys() {
             let vert = mesh.loop_vertex(l);
             if !cluster.contains(&vert) || l == first_corner {
@@ -2047,7 +2182,8 @@ mod tests {
             assert_eq!(
                 mesh.loop_attribs().get_i32(int_layer, l.as_usize()).unwrap(),
                 first_int,
-                "the whole-block copy flattens the integer layer to the first corner's value"
+                "the whole-block copy flattens the integer layer to the §6.5 \
+                 fan-first corner's value"
             );
         }
     }
