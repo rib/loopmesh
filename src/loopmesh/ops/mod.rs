@@ -44,6 +44,7 @@ mod reverse_faces;
 mod reverse_uvs;
 mod rotate;
 mod rotate_edges;
+mod rotate_uvs;
 mod scale;
 mod split;
 mod split_edges;
