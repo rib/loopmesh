@@ -4505,6 +4505,38 @@ impl LoopMesh {
         None
     }
 
+    /// Create a face from a vertex ring, minting any missing perimeter edges
+    /// itself. The edges are minted **closing-edge-first**: for verts
+    /// `[v0, v1, .., v_{k-1}]` the closing edge `(v_{k-1}, v0)` is created first,
+    /// then the leading edges `(v0, v1), (v1, v2), ..` in listed order. That
+    /// order is load-bearing for parity: it fixes which incident edge each
+    /// vertex sees *first*, i.e. its disk anchor, and therefore the
+    /// construction-determined first loop of the vertex's fan (see
+    /// `radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md` §6.5 — a hub vertex listed
+    /// first anchors on its closing spoke, not its leading one). A face builder
+    /// that minted leading-edge-first would seat a different anchor and surface a
+    /// different first corner on a shared spoke.
+    ///
+    /// Existing edges are reused (`NO_DUPLICATE`), so a shared spoke is minted
+    /// once by the first face that needs it and merely re-adopted afterward.
+    pub fn face_create_verts(&mut self, verts: &[VertexKey], flags: FaceCreateFlags) -> FaceKey {
+        let len = verts.len();
+        assert!(len >= 1);
+
+        // Closing edge (v_{len-1}, v0) first, then the leading edges in order.
+        // The per-vertex edge slot the face loop expects is edge i == (v_i, v_{i+1});
+        // mint into a slot-indexed buffer so face_create still receives edges in
+        // perimeter (loop) order while the *creation* order is closing-first.
+        let mut edges: SmallVec<[EdgeKey; 8]> = smallvec::smallvec![EdgeKey::NULL; len];
+        let closing = self.create_edge([verts[len - 1], verts[0]], EdgeCreateFlags::NO_DUPLICATE);
+        edges[len - 1] = closing;
+        for i in 0..(len - 1) {
+            edges[i] = self.create_edge([verts[i], verts[i + 1]], EdgeCreateFlags::NO_DUPLICATE);
+        }
+
+        self.face_create(verts, &edges, flags)
+    }
+
     pub fn face_create(
         &mut self,
         verts: &[VertexKey],
@@ -5428,13 +5460,7 @@ fn create_face_from_verts(mesh: &mut LoopMesh, coords: &[Vec3]) -> FaceKey {
     for v in coords {
         verts.push(mesh.create_vertex(*v));
     }
-    let mut edges = vec![];
-    for i in 0..(verts.len() - 1) {
-        edges.push(mesh.create_edge([verts[i], verts[i + 1]], EdgeCreateFlags::NONE));
-    }
-    edges.push(mesh.create_edge([verts[verts.len() - 1], verts[0]], EdgeCreateFlags::NONE));
-
-    mesh.face_create(&verts, &edges, FaceCreateFlags::NONE)
+    mesh.face_create_verts(&verts, FaceCreateFlags::NONE)
 }
 
 #[test]

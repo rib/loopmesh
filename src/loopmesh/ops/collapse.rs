@@ -555,12 +555,12 @@ impl LoopMesh {
         // phase two's broadcast off is the construction-determined *first loop* of
         // `vert_snap`'s fan, NOT merely the first element `corners_at_vertex`
         // happens to gather. For a closed fan the two differ: the fan's first
-        // loop is the hub corner of the *last* face to adopt the disk-entry
-        // spoke, which `fan_first_loop` resolves from the disk-entry (first-
-        // attached) / radial-entry (last-attached) conventions (see
-        // RADIAL_EDGE_STRUCTURE.md §6.5). Gathering's first element would be the
-        // earliest-built face's corner — the classic open-fan mistake applied to
-        // a closed fan.
+        // loop is the hub corner of the *last* face to re-adopt the hub's
+        // closing-spoke anchor, which `fan_first_loop` resolves from the
+        // disk-entry (first-attached) / radial-entry (last-attached) conventions
+        // (see RADIAL_EDGE_STRUCTURE.md §6.5). Gathering's first element would be
+        // the earliest-built face's corner — the classic open-fan mistake
+        // applied to a closed fan.
         let first_corner = self
             .fan_first_loop(vert_snap)
             .expect("tot > 0 guarantees a fan corner");
@@ -613,15 +613,20 @@ impl LoopMesh {
     /// this model bit-for-bit. Implements `fan_first_loop` from
     /// `radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md` §6.5:
     ///
-    /// - Walk `vertex`'s disk in insertion order (the disk-entry pointer stays
-    ///   pinned to the first-attached edge) and stop at the first non-wire edge
-    ///   `e0` — the disk-entry spoke.
-    /// - Take `e0`'s radial-entry loop. §6.5 fixes the radial entry on the
-    ///   *last*-attached loop of an edge (the disk/radial asymmetry). This
-    ///   crate's radial cycle keeps its `radial_link` pointer on the *first*-
-    ///   attached loop and splices each new loop in immediately *before* it, so
-    ///   the last-attached loop is `radial_link`'s radial-prev. For a closed fan
-    ///   that is the wrap face's loop, not the earliest-built face's.
+    /// - **Anchor + forward disk walk.** Walk `vertex`'s disk forward from its
+    ///   anchor (the disk-entry pointer stays pinned to the first-attached edge,
+    ///   and forward `next` visits edges in attachment order) and stop at the
+    ///   first non-wire edge `e0`. Because a face create mints its perimeter
+    ///   closing-edge-first, a hub vertex listed first anchors on its *closing*
+    ///   spoke, so `e0` is that closing spoke rather than the leading one.
+    /// - **Radial pick — last-attached.** Take the loop *last* attached to `e0`.
+    ///   §6.5 fixes the pick on the last-attached loop (the disk/radial
+    ///   asymmetry). This crate's radial cycle keeps its `radial_link` pointer
+    ///   on the *first*-attached loop and splices each new loop in immediately
+    ///   *before* it, so the last-attached loop is `radial_link`'s radial-prev.
+    ///   For the closed `disk_fan` that is the face that *re-adopts* the anchor
+    ///   spoke last (build-face 1 for the canonical builder, for every n), not
+    ///   the wrap face and not the earliest-built face.
     /// - Land on the corner at `vertex`: that loop if its own corner sits at
     ///   `vertex`, else one step forward along its face (its loop-next), which by
     ///   the core loop↔edge invariant (§5.1) sits at `e0`'s other endpoint.
@@ -1521,10 +1526,10 @@ mod tests {
             .collect();
         for i in 0..n {
             let vs = [hub, rim[i], rim[(i + 1) % n]];
-            let es: Vec<EdgeKey> = (0..3)
-                .map(|k| mesh.create_edge([vs[k], vs[(k + 1) % 3]], EdgeCreateFlags::NO_DUPLICATE))
-                .collect();
-            mesh.face_create(&vs, &es, FaceCreateFlags::NONE);
+            // Closing-edge-first mint (RADIAL_EDGE_STRUCTURE.md §6.5): the hub,
+            // listed first, anchors on its closing spoke, so the closed fan's
+            // first loop resolves to build-face 1 for every n.
+            mesh.face_create_verts(&vs, FaceCreateFlags::NONE);
         }
         (hub, rim)
     }
@@ -1952,15 +1957,21 @@ mod tests {
             .collect()
     }
 
-    /// RADIAL_EDGE_STRUCTURE.md §6.5 — on the closed `disk_fan(n)` (case (b),
-    /// shared/manifold hub spokes) the fan's first loop is the hub corner of the
-    /// *last* face to adopt the disk-entry spoke `hub–rim[0]` — the wrap face
-    /// `(hub, rim[n-1], rim[0])`, built last. Tagging hub corner `i` as
-    /// `100 + i`, the §6.5 walkthrough's `disk_fan(8)` predicts `107`. This pins
-    /// `fan_first_loop` directly against that worked example, independent of the
-    /// broadcast operator.
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 worked example A — on the closed
+    /// `disk_fan(n)` the hub, listed first in every face, anchors on its
+    /// *closing* spoke (closing-edge-first mint). For face 0 `[hub, r0, r1]`
+    /// the closing spoke is `hub–r1`, adopted by face 0 first and *re-adopted*
+    /// by face 1 `[hub, r1, r2]` last, so the last-attached pick is build-face
+    /// 1's hub corner. Tagging hub corner `i` as `100 + i`, the fan's first loop
+    /// is **101 for every n** — n-independent, neither face 0 (100) nor the wrap
+    /// face (`100 + (n-1)`). This pins `fan_first_loop` against the corrected
+    /// §6.5 walkthrough, independent of the broadcast operator.
+    ///
+    /// (Radial-2 spokes make `radial_prev == radial_next`, so this closed fan
+    /// does *not* discriminate the last-vs-first-attached pick; the `book`
+    /// discriminator below is the prev-vs-next pin.)
     #[test]
-    fn fan_first_loop_closed_disk_fan_is_wrap_face_hub_corner() {
+    fn fan_first_loop_closed_disk_fan_is_build_face_one() {
         for n in [3usize, 6, 8] {
             let mut mesh = LoopMesh::new();
             let int_layer = register_loop_i32(&mut mesh);
@@ -1976,12 +1987,74 @@ mod tests {
             let first = mesh.fan_first_loop(hub).expect("non-empty closed fan");
             let value = mesh.loop_attribs().get_i32(int_layer, first.as_usize()).unwrap();
             assert_eq!(
-                value,
-                100 + (n as i32 - 1),
-                "closed disk_fan({n}) first loop is the wrap face's hub corner"
+                value, 101,
+                "closed disk_fan({n}) first loop is build-face 1's hub corner (n-independent)"
             );
             assert_eq!(mesh.loop_vertex(first), hub, "first loop is anchored at the hub");
         }
+    }
+
+    /// A non-manifold "book" of `n` triangular pages hinged on one shared spine
+    /// edge. Page `i` is wound `[0, 1, 2+i]`, so all `n` pages share the spine
+    /// `0–1` (its radial cycle has valence `n`). Returns the two spine verts
+    /// `(v0, v1)` and the page-tip verts. Built closing-edge-first per §6.5.
+    fn build_nonmanifold_book(mesh: &mut LoopMesh, n: usize) -> (VertexKey, VertexKey, Vec<VertexKey>) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let tips: Vec<VertexKey> = (0..n)
+            .map(|i| mesh.create_vertex(Vec3::new(1.0 + i as f32, 0.5, 0.0)))
+            .collect();
+        for &tip in &tips {
+            mesh.face_create_verts(&[v0, v1, tip], FaceCreateFlags::NONE);
+        }
+        (v0, v1, tips)
+    }
+
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 worked example B — the `book(n)` spine pair
+    /// is the prev-vs-next discriminator. The two spine verts share *every*
+    /// face yet resolve to different first faces because their anchors differ:
+    ///
+    /// - Vertex 0 anchors on the *private* spoke `0–tip0` (face 0's closing
+    ///   edge `(tip0, 0)`, radial length 1) → its sole face, build-face 0.
+    /// - Vertex 1 anchors on the *shared spine* `0–1` (the first-minted of its
+    ///   two touching edges), adopted by all `n` pages; the **last-attached**
+    ///   page is build-face `n-1`.
+    ///
+    /// Had the radial pick used the *first*-attached loop, vertex 1 would land
+    /// on build-face 0 — so this is the discriminator the radial-2 closed fan
+    /// cannot provide. For `book(5)`: v0 → build-face 0, v1 → build-face 4.
+    #[test]
+    fn fan_first_loop_book_spine_pair_discriminates_last_attached() {
+        let n = 5usize;
+        let mut mesh = LoopMesh::new();
+        let int_layer = register_loop_i32(&mut mesh);
+        let (v0, v1, _tips) = build_nonmanifold_book(&mut mesh, n);
+
+        // Tag each page's spine corners by build order. Within a face_create,
+        // the corner at the queried spine vertex is created in face (build)
+        // order, so the k-th corner at a spine vert belongs to build-face k.
+        let tag = |mesh: &mut LoopMesh, spine: VertexKey, base: i32| {
+            for (k, l) in hub_corner_keys(mesh, spine).into_iter().enumerate() {
+                mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), base + k as i32);
+            }
+        };
+        tag(&mut mesh, v0, 0);
+        tag(&mut mesh, v1, 1000);
+
+        let first0 = mesh.fan_first_loop(v0).expect("v0 fan non-empty");
+        let first1 = mesh.fan_first_loop(v1).expect("v1 fan non-empty");
+
+        assert_eq!(mesh.loop_vertex(first0), v0, "v0 first loop anchored at v0");
+        assert_eq!(mesh.loop_vertex(first1), v1, "v1 first loop anchored at v1");
+
+        let val0 = mesh.loop_attribs().get_i32(int_layer, first0.as_usize()).unwrap();
+        let val1 = mesh.loop_attribs().get_i32(int_layer, first1.as_usize()).unwrap();
+        assert_eq!(val0, 0, "book spine v0 → build-face 0 (private spoke anchor)");
+        assert_eq!(
+            val1,
+            1000 + (n as i32 - 1),
+            "book spine v1 → build-face n-1 (shared spine, last-attached)"
+        );
     }
 
     /// §6.5 — `fan_first_loop` lands the first loop *at* the queried vertex even
@@ -2116,15 +2189,13 @@ mod tests {
     /// loop*'s raw integer, even though it was never averaged.
     ///
     /// The closed `build_triangle_fan(n)` is the `disk_fan(n)` fixture of
-    /// RADIAL_EDGE_STRUCTURE.md §6.5 case (b): every hub spoke is a manifold
-    /// (radial-2) edge shared by two adjacent triangles, and the wrap face
-    /// `(hub, rim[n-1], rim[0])` — the *last* triangle built — adopts the
-    /// disk-entry spoke `hub–rim[0]` (minted by face 0) last. By the radial
-    /// last-attached-wins entry rule the fan's first loop is therefore the wrap
-    /// face's hub corner, NOT face 0's. Encoding each hub corner as `100 + face`,
-    /// the §6.5 walkthrough's `disk_fan(8)` predicts `107`; this `n`-fan predicts
-    /// `100 + (n - 1)`. Reproducing face 0's `100` would be the classic mistake
-    /// of applying the open-fan corollary (a) to a closed fan.
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 worked example A. With closing-edge-first
+    /// mint the hub anchors on its *closing* spoke `hub–rim[1]` (face 0's
+    /// closing edge), adopted by face 0 first and re-adopted by face 1 last; by
+    /// the last-attached rule the fan's first loop is build-face 1's hub corner.
+    /// Encoding each hub corner as `100 + face`, the §6.5 walkthrough's
+    /// `disk_fan(8)` flattens the integer layer to **101** — n-independently —
+    /// not face 0's `100` and not the wrap face's `100 + (n - 1)`.
     #[test]
     fn pointmerge_facedata_whole_block_copy_flattens_non_has_math() {
         let n = 8usize;
@@ -2153,18 +2224,18 @@ mod tests {
             }
         }
 
-        // The §6.5 fan-first loop is the wrap face's hub corner — value
-        // `100 + (n - 1)` — NOT the gather-first `hub_corners[0]`'s `100`.
+        // The §6.5 fan-first loop is build-face 1's hub corner — value `101`,
+        // n-independently — NOT the gather-first `hub_corners[0]`'s `100` nor
+        // the wrap face's `100 + (n - 1)`.
         let first_corner = mesh.fan_first_loop(hub).expect("non-empty fan");
         let first_int = mesh
             .loop_attribs()
             .get_i32(int_layer, first_corner.as_usize())
             .unwrap();
         assert_eq!(
-            first_int,
-            100 + (n as i32 - 1),
-            "§6.5 closed-fan first loop is the wrap face's hub corner (last adopter \
-             of the disk-entry spoke), not face 0's"
+            first_int, 101,
+            "§6.5 closed-fan first loop is build-face 1's hub corner (last re-adopter \
+             of the closing-spoke anchor), not face 0's and not the wrap face's"
         );
 
         let mut cluster = vec![hub];
