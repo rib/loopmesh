@@ -41,6 +41,7 @@ mod pointmerge;
 mod recalc_face_normals;
 mod remove_doubles;
 mod reverse_faces;
+mod reverse_uvs;
 mod rotate;
 mod rotate_edges;
 mod scale;
