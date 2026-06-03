@@ -29,6 +29,24 @@ pub struct TransformParams {
     pub use_shapekey: bool,
 }
 
+/// Determinant magnitude at or below which a `space` matrix is treated as
+/// singular and given a zeroed inverse rather than a NaN/inf-laden one
+/// (TRANSFORM.md §4.1).
+const SINGULAR_SPACE_EPSILON: f32 = 1e-12;
+
+/// Invert `matrix`, clamping a singular (zero / near-zero determinant) input to
+/// the all-zeros 4×4 instead of propagating a NaN/inf inverse (TRANSFORM.md
+/// §4.1). A singular `space` fed through the conjugation therefore collapses the
+/// effective transform to the zero matrix, sending every named vert to the
+/// origin — a finite result, never NaN.
+fn invert_or_zero(matrix: Mat4) -> Mat4 {
+    if matrix.determinant().abs() <= SINGULAR_SPACE_EPSILON {
+        Mat4::ZERO
+    } else {
+        matrix.inverse()
+    }
+}
+
 impl LoopMesh {
     /// Apply a 4×4 affine matrix to the positions of `verts` (TRANSFORM.md §6).
     ///
@@ -68,7 +86,11 @@ impl LoopMesh {
         let effective = if params.space == Mat4::ZERO {
             params.matrix
         } else {
-            params.space.inverse() * params.matrix * params.space
+            // §4.1 — a non-zero but singular `space` is NOT the sentinel, so it
+            // takes the conjugation branch. Its inverse is the zeroed 4×4 by
+            // convention (never a NaN/inf-laden result), so the product collapses
+            // to the zero matrix and every named vert maps to the origin.
+            invert_or_zero(params.space) * params.matrix * params.space
         };
 
         // §3 — apply the effective affine map to each named vert's homogeneous
@@ -331,6 +353,48 @@ mod tests {
         // the map's fixed point analytically: 2·(−c) + c = −c.
         let fixed = -c;
         assert_close(2.0 * fixed + c, fixed);
+        mesh.validate_topology();
+    }
+
+    /// §4.1: a non-zero but singular `space` (e.g. `diag(1,1,0)`, det 0) is NOT
+    /// the all-zeros sentinel, so the conjugation branch runs with a zeroed
+    /// inverse — collapsing every named vert to a finite origin `(0,0,0)`, never
+    /// to NaN. A naive `space.inverse()` would write NaN here.
+    #[test]
+    fn singular_nonzero_space_collapses_to_origin() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = unit_quad(&mut mesh);
+
+        // diag(1,1,0): non-zero entries (not the sentinel) but determinant 0.
+        let singular_space = Mat4::from_scale(Vec3::new(1.0, 1.0, 0.0));
+        assert_ne!(singular_space, Mat4::ZERO, "fixture must not be the sentinel");
+        assert_eq!(singular_space.determinant(), 0.0, "fixture must be singular");
+
+        // A non-trivial matrix: the convention must collapse to the origin
+        // regardless of `matrix` (and regardless of each vert's input position).
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 0.5, 1.5),
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_3),
+            Vec3::new(3.0, -1.0, 2.0),
+        );
+
+        mesh.transform(
+            &verts,
+            TransformParams {
+                matrix,
+                space: singular_space,
+                use_shapekey: false,
+            },
+        );
+
+        for &v in &verts {
+            let position = mesh.vertex_position(v);
+            assert!(
+                position.is_finite(),
+                "singular space must yield finite coords, got {position:?}"
+            );
+            assert_close(position, Vec3::ZERO);
+        }
         mesh.validate_topology();
     }
 
