@@ -37,6 +37,7 @@ mod join_triangles;
 mod mean_value;
 mod mirror;
 mod pointmerge;
+mod recalc_face_normals;
 mod remove_doubles;
 mod reverse_faces;
 mod rotate;
