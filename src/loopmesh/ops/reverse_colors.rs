@@ -72,7 +72,7 @@ impl LoopMesh {
     /// semantic is preferred for index `0` when present, otherwise selection is
     /// by position among the 4-component loop layers. `None` when the index does
     /// not resolve to a colour layer (none present, or out of range).
-    fn active_color_layer(&self, color_index: usize) -> Option<ElementAttributeKey> {
+    pub(crate) fn active_color_layer(&self, color_index: usize) -> Option<ElementAttributeKey> {
         let attribs = self.loop_attribs();
 
         if color_index == 0 {

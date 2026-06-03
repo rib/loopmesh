@@ -44,6 +44,7 @@ mod reverse_colors;
 mod reverse_faces;
 mod reverse_uvs;
 mod rotate;
+mod rotate_colors;
 mod rotate_edges;
 mod rotate_uvs;
 mod scale;
