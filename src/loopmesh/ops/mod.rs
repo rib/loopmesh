@@ -38,6 +38,7 @@ mod mean_value;
 mod mirror;
 mod pointmerge;
 mod remove_doubles;
+mod reverse_faces;
 mod rotate;
 mod rotate_edges;
 mod scale;
