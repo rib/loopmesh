@@ -79,7 +79,7 @@ pub use ops::{
     MixedSeed, NgonMethod, QuadCornerType,
     QuadMethod, RotateEdgesResult, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
     SymmetrizeDirection, SymmetrizeResult,
-    TransformParams,
+    TransformParams, TranslateParams,
     DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };
 

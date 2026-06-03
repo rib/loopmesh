@@ -44,6 +44,7 @@ mod split_edges;
 mod subdivide_edges;
 mod symmetrize;
 mod transform;
+mod translate;
 mod weld_verts;
 
 pub use bisect_edges::BisectGeom;
@@ -74,3 +75,4 @@ pub use subdivide_edges::{
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;
+pub use translate::TranslateParams;
