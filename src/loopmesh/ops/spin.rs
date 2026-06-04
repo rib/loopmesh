@@ -154,13 +154,35 @@ impl LoopMesh {
                 let is_last_merge_step = do_merge && k == steps;
                 if is_last_merge_step {
                     // §5 / §5.5 — the final ring is welded back onto the
-                    // originals instead of being rotated into the seam. The weld
-                    // runs on the extrude's *own* output list (a scratch set) and
-                    // must NOT re-write the returned slot: it is left frozen at
-                    // the penultimate ring (`leading`, the step `steps-1` ring),
-                    // which the weld never disturbs (§5.5). So return `leading`,
-                    // not the weld remainder.
+                    // originals instead of being rotated into the seam: the step
+                    // rotation is skipped, so its frame matrix is the identity
+                    // (§4.4). The weld runs on the extrude's *own* output list (a
+                    // scratch set) and must NOT re-write the returned slot, which
+                    // stays frozen at the penultimate ring (`leading`, the step
+                    // `steps-1` ring) the weld never disturbs.
                     self.weld_final_ring(&ring, &origin_of);
+
+                    // §4.3 / §4.4 — the `dvec` screw translate is NOT skipped on
+                    // the merge step. Per the §4.4 pseudocode it is applied in the
+                    // identity step frame to whatever the returned slot currently
+                    // names — and on the merge step that is the **penultimate**
+                    // ring (`leading`), not the welded-away closing ring. This is
+                    // the one extra screw step that carries the penultimate ring
+                    // up from its interior height of `(steps-1)*dvec` to the full
+                    // `steps*dvec` rise, matching the leading edge a non-merge
+                    // sweep would have returned. The welded-away closing ring is
+                    // gone, so lifting it would be inert; the survivor that
+                    // observes the lift is the penultimate ring.
+                    if use_dvec {
+                        self.translate(
+                            &leading.verts,
+                            TranslateParams {
+                                offset: dvec,
+                                space: Mat4::ZERO,
+                                use_shapekey: false,
+                            },
+                        );
+                    }
                     return leading.into_geom_out();
                 }
 
@@ -838,6 +860,115 @@ mod tests {
             final_z[1]
         );
         mesh.validate_topology();
+    }
+
+    /// §4.3 / §4.4 / §5.5 screw + full-revolution merge — the **penultimate-ring
+    /// lift**. On the merge step the step matrix is the identity and the `dvec`
+    /// post-step translate is applied to whatever the returned slot names. Per the
+    /// §4.4 pseudocode that slot is the **penultimate** ring (the welded-away
+    /// closing ring is gone, so a lift on *it* would be inert). The lift carries
+    /// the penultimate ring up one extra screw step — from its interior height of
+    /// `(steps-1)*h` to the full `steps*h` rise — so the returned leading edge
+    /// matches the height a non-merge sweep's last ring would report.
+    ///
+    /// The discriminating assertion is on the returned `geom_last.out` verts: they
+    /// must sit at z = steps*h (bottom) and z = 1 + steps*h (top). A port that
+    /// skipped the merge-step `dvec` would under-lift them by exactly one step to
+    /// z = (steps-1)*h and z = 1 + (steps-1)*h — which is the divergence the
+    /// deferred A/B oracle pins. (The seam survivors and the rest of the swept
+    /// surface are covered by `full_rev_merge_closes_seam`; here we target only
+    /// the merge-step lift the previous fix located in the wrong place.)
+    #[test]
+    fn full_rev_screw_merge_lifts_penultimate_ring() {
+        let steps = 4;
+        let h = 0.5_f32;
+
+        let mut mesh = LoopMesh::new();
+        let (e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+        let out = mesh.spin(
+            &[e.into()],
+            CENT,
+            AXIS,
+            Some(Vec3::new(0.0, 0.0, h)),
+            std::f32::consts::TAU,
+            steps,
+            true,
+            false,
+            false,
+        );
+        mesh.validate_topology();
+
+        // §5.5 leading-edge contract: the returned slot is the penultimate ring —
+        // one profile-shaped ring (2 verts + 1 edge), not the empty weld remainder.
+        assert_eq!(out.len(), 3, "penultimate ring: 2 verts + 1 edge");
+
+        // The returned penultimate-ring verts: assert they were lifted by the FULL
+        // steps*h screw rise (the merge-step `dvec` carried them up one extra step
+        // from their interior (steps-1)*h height). This is the quantity the A/B
+        // oracle disagrees on; skipping the merge-step lift would leave them at
+        // (steps-1)*h / 1+(steps-1)*h and fail here.
+        let mut returned_z: Vec<f32> = out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Edge(edge) => Some(*edge),
+                _ => None,
+            })
+            .flat_map(|edge| mesh.edge_vertices(edge))
+            .map(|v| mesh.vertex_position(v).z)
+            .collect();
+        returned_z.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(returned_z.len(), 2, "penultimate ring has 2 verts");
+
+        let full_bottom = steps as f32 * h; // 2.0
+        let full_top = 1.0 + steps as f32 * h; // 3.0
+        let under_bottom = (steps - 1) as f32 * h; // 1.5 — the un-lifted (buggy) height
+        assert!(
+            (returned_z[0] - full_bottom).abs() < 1e-4,
+            "penultimate ring lifted by full steps*h={full_bottom} (not under-lifted \
+             to {under_bottom}): got {}",
+            returned_z[0]
+        );
+        assert!(
+            (returned_z[1] - full_top).abs() < 1e-4,
+            "penultimate ring top lifted by full steps*h: want {full_top}, got {}",
+            returned_z[1]
+        );
+
+        // The seam survivors are the welded-onto originals at z = 0 and z = 1 — the
+        // identity weld (§5.3) keeps them at the un-lifted originals' height, so
+        // those heights still exist somewhere in the mesh and the merge closed the
+        // tube (one ring fewer than the merge-off doubled seam).
+        let all_z: Vec<f32> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v).z)
+            .collect();
+        assert!(
+            all_z.iter().any(|z| z.abs() < 1e-4),
+            "a seam survivor sits at the original bottom (z = 0): {all_z:?}"
+        );
+        assert!(
+            all_z.iter().any(|z| (z - 1.0).abs() < 1e-4),
+            "a seam survivor sits at the original top (z = 1): {all_z:?}"
+        );
+
+        let mut off = LoopMesh::new();
+        let (e2, _, _) = edge_profile(&mut off, 1.0, 0.0, 1.0);
+        off.spin(
+            &[e2.into()],
+            CENT,
+            AXIS,
+            Some(Vec3::new(0.0, 0.0, h)),
+            std::f32::consts::TAU,
+            steps,
+            false,
+            false,
+            false,
+        );
+        // Merge fuses one ring of 2 verts / 1 edge onto the originals by identity.
+        assert_eq!(off.totvert() - mesh.totvert(), 2, "merge fuses one ring of 2 verts");
+        assert_eq!(off.totedge() - mesh.totedge(), 1, "merge fuses one ring edge");
+        assert_eq!(mesh.totface(), steps as usize, "closed tube: `steps` wall bands");
     }
 
     /// §2 / §6 face profile arity: a quad face swept a quarter turn becomes a
