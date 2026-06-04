@@ -712,7 +712,7 @@ impl LoopMesh {
             if self.face_len(face) <= 3 {
                 continue;
             }
-            if self.dissolve_limit_face_collapse_is_degenerate(face, v, far_a, far_b) {
+            if self.dissolve_limit_face_collapse_is_degenerate(face, v) {
                 return true;
             }
         }
@@ -720,80 +720,106 @@ impl LoopMesh {
     }
 
     /// §6.3 step 3 — the per-face 2D degeneracy test. The collapsed corner is
-    /// `v` between `far_a` and `far_b`; the new edge runs `far_a – far_b`. The
-    /// test projects the face into its dominant axis plane and rejects the
-    /// collapse when (a) the cut-off corner triangle winds *against* the face
-    /// (a corner flip), or (b) any other face vertex falls inside the cut-off
-    /// triangle `(far_a, v, far_b)` (a self-intersection).
-    fn dissolve_limit_face_collapse_is_degenerate(
-        &self,
-        face: FaceKey,
-        v: VertexKey,
-        far_a: VertexKey,
-        far_b: VertexKey,
-    ) -> bool {
+    /// `v`; in this face's loop cycle its ear-adjacent corners are `prev` and
+    /// `next` (the loop-neighbours of `v`), and the weld replaces the two edges
+    /// `prev → v` and `v → next` with the single edge `prev → next`. The cut-off
+    /// **ear triangle** is `(prev, v, next)`. The test projects the face into
+    /// its dominant axis plane and rejects the collapse when:
+    ///
+    /// - **Adjacent-corner non-flip.** For each ear-adjacent corner (`prev` /
+    ///   `next`) that is *not* itself an edge-pair vert, the corner must keep
+    ///   its orientation across the weld: the cross-product sign of its other
+    ///   arm against the *old* corner edge (toward `v`) must match its sign
+    ///   against the *new* weld edge (`prev → next`). A sign change folds that
+    ///   neighbouring corner inside-out.
+    /// - **Point-in-triangle.** Any other perimeter vert lying inside the ear
+    ///   triangle `(prev, v, next)` would be trapped by the weld → a
+    ///   self-intersection.
+    fn dissolve_limit_face_collapse_is_degenerate(&self, face: FaceKey, v: VertexKey) -> bool {
         let normal = self.faces.get(face).normal;
         let axis = dominant_axis(normal);
 
+        // Locate `v`'s loop within this face so the ear-adjacent corners are the
+        // loop-neighbours in the face's own winding order, not the disk order.
+        let Some(loop_v) = self.dissolve_limit_face_loop_at_vertex(face, v) else {
+            return false;
+        };
+        let loop_prev = self.loop_prev(loop_v);
+        let loop_next = self.loop_next(loop_v);
+        let prev_vert = self.loops.get(loop_prev).vertex;
+        let next_vert = self.loops.get(loop_next).vertex;
+
         let pivot = project_to_axis(self.vertices.get(v).position, axis);
-        let corner_prev = project_to_axis(self.vertices.get(far_a).position, axis);
-        let corner_next = project_to_axis(self.vertices.get(far_b).position, axis);
+        let prev = project_to_axis(self.vertices.get(prev_vert).position, axis);
+        let next = project_to_axis(self.vertices.get(next_vert).position, axis);
 
-        // Face winding sign in the projected plane: positive when the face's
-        // loop order is CCW about the +normal-axis. The projection drops the
-        // dominant axis, so a face with a negative dominant-axis normal winds
-        // clockwise in the kept plane — sample the winding directly rather than
-        // assuming a sign.
-        let face_winding = self.dissolve_limit_projected_face_winding(face, axis);
-
-        // Corner-flip: the cut-off corner triangle (far_a → v → far_b) must
-        // wind the same way as the face. A flipped sign inverts the corner.
-        let corner_winding = signed_area(corner_prev, pivot, corner_next);
-        if face_winding != 0.0 && corner_winding * face_winding < 0.0 {
-            return true;
+        // Adjacent-corner non-flip for the `prev` corner. Its other arm runs to
+        // the vert before `prev`; the old corner edge points at `v`, the new
+        // weld edge points at `next`.
+        if !self.dissolve_limit_vert_is_edge_pair(prev_vert) {
+            let prev_prev = project_to_axis(
+                self.vertices
+                    .get(self.loops.get(self.loop_prev(loop_prev)).vertex)
+                    .position,
+                axis,
+            );
+            let old_side = signed_area(prev, prev_prev, pivot);
+            let new_side = signed_area(prev, prev_prev, next);
+            if old_side * new_side < 0.0 {
+                return true;
+            }
         }
 
-        // Self-intersection: no other corner may sit inside the cut-off
-        // triangle.
+        // Adjacent-corner non-flip for the `next` corner. Its other arm runs to
+        // the vert after `next`; the old corner edge points at `v`, the new weld
+        // edge points at `prev`.
+        if !self.dissolve_limit_vert_is_edge_pair(next_vert) {
+            let next_next = project_to_axis(
+                self.vertices
+                    .get(self.loops.get(self.loop_next(loop_next)).vertex)
+                    .position,
+                axis,
+            );
+            let old_side = signed_area(next, next_next, pivot);
+            let new_side = signed_area(next, next_next, prev);
+            if old_side * new_side < 0.0 {
+                return true;
+            }
+        }
+
+        // Self-intersection: no other corner may sit inside the ear triangle.
         let mut loops = self.face_loops(face);
         while let Some(loop_key) = loops.next(self) {
             let corner_vert = self.loops.get(loop_key).vertex;
-            if corner_vert == v || corner_vert == far_a || corner_vert == far_b {
+            if corner_vert == v || corner_vert == prev_vert || corner_vert == next_vert {
                 continue;
             }
             let point = project_to_axis(self.vertices.get(corner_vert).position, axis);
-            if point_in_triangle(point, corner_prev, pivot, corner_next) {
+            if point_in_triangle(point, prev, pivot, next) {
                 return true;
             }
         }
         false
     }
 
-    /// §6.3 — the signed area of the face's perimeter projected onto the kept
-    /// plane (the dominant axis dropped). Its sign is the face's winding
-    /// direction in that plane, used to validate the cut-corner orientation.
-    fn dissolve_limit_projected_face_winding(&self, face: FaceKey, axis: usize) -> f32 {
-        let mut area = 0.0f32;
+    /// Find the loop in `face`'s cycle whose vertex is `v`, or `None` if `v` is
+    /// not a corner of `face`.
+    fn dissolve_limit_face_loop_at_vertex(&self, face: FaceKey, v: VertexKey) -> Option<LoopKey> {
         let mut loops = self.face_loops(face);
-        let mut first: Option<glam::Vec2> = None;
-        let mut prev: Option<glam::Vec2> = None;
         while let Some(loop_key) = loops.next(self) {
-            let point = project_to_axis(
-                self.vertices.get(self.loops.get(loop_key).vertex).position,
-                axis,
-            );
-            if first.is_none() {
-                first = Some(point);
+            if self.loops.get(loop_key).vertex == v {
+                return Some(loop_key);
             }
-            if let Some(previous) = prev {
-                area += previous.x * point.y - point.x * previous.y;
-            }
-            prev = Some(point);
         }
-        if let (Some(last), Some(start)) = (prev, first) {
-            area += last.x * start.y - start.x * last.y;
-        }
-        area
+        None
+    }
+
+    /// §6.3 — an edge-pair vert has exactly two incident edges. Used by the
+    /// adjacent-corner non-flip check: an ear-adjacent corner that is itself an
+    /// edge-pair vert is exempt from the flip test (it has its own collapse
+    /// candidacy and no third arm to fold).
+    fn dissolve_limit_vert_is_edge_pair(&self, v: VertexKey) -> bool {
+        self.dissolve_limit_vert_edge_count(v) == 2
     }
 
     /// True when `edge`'s two radial loops traverse it in opposite directions
@@ -2055,6 +2081,136 @@ mod tests {
         assert!(matches!(result, DissolveLimitResult::Ran { .. }), "UV bit auto-clears, runs");
         assert_eq!(mesh.totface(), 1, "no UV layers ⇒ UV bit inert ⇒ full collapse");
         assert_eq!(mesh.totvert(), 4);
+        mesh.validate_topology();
+    }
+
+    /// Build a single CCW face in the XY plane from `positions` and return
+    /// `(vert keys in order, face)`.
+    fn build_single_face(mesh: &mut LoopMesh, positions: &[Vec3]) -> (Vec<VertexKey>, FaceKey) {
+        let verts: Vec<VertexKey> = positions.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let mut edges: Vec<EdgeKey> = Vec::with_capacity(verts.len());
+        for i in 0..verts.len() {
+            let a = verts[i];
+            let b = verts[(i + 1) % verts.len()];
+            edges.push(mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE));
+        }
+        let face = mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+        (verts, face)
+    }
+
+    #[test]
+    fn reflex_empty_ear_corner_collapses() {
+        // §6.3 step 3 — a reflex corner whose ear triangle is empty must be
+        // allowed to collapse. The ear of a reflex corner winds *opposite* to a
+        // CCW face; the degeneracy guard must not reject it on that basis alone.
+        //
+        // Pentagon, CCW in XY. `r` = (2, 0.1) is a near-collinear reflex vertex
+        // (pushed slightly into the interior off the straight bottom edge), so
+        // its corner cost is small (passes the angle gate) and its ear triangle
+        // (v0, r, v2) is a thin outward sliver containing no other vertex.
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = build_single_face(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0), // v0  (ear-prev of r)
+                Vec3::new(2.0, 0.1, 0.0), // r   (reflex, near-collinear)
+                Vec3::new(4.0, 0.0, 0.0), // v2  (ear-next of r)
+                Vec3::new(4.0, 3.0, 0.0), // v3
+                Vec3::new(0.0, 3.0, 0.0), // v4
+            ],
+        );
+        let r = verts[1];
+
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[], &[r], &params);
+
+        assert_eq!(mesh.totvert(), 4, "the reflex empty-ear vert collapses away");
+        assert_eq!(mesh.totface(), 1, "the face survives as a quad");
+        assert!(
+            mesh.query_edge_exists(verts[0], verts[2]).is_some(),
+            "the weld edge v0–v2 replaces the two arms through r"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn guard_fires_when_witness_in_ear() {
+        // §6.3 step 3 — contrast to the reflex-empty-ear case: a wide-open corner
+        // whose ear triangle traps another vertex must be rejected by the
+        // point-in-triangle sub-check. The candidate passes the angle gate but
+        // the guard demotes it, so nothing collapses.
+        //
+        // CCW hexagon in XY. `c` = (6, 3) is a wide-open corner (corner cost
+        // ≈ 0.927 < π/2); its loop-neighbours are (12, 0) and (0, 0), so its ear
+        // triangle is ((12,0), (6,3), (0,0)). The witness `w` = (6, 2) — a sharp
+        // spike rising from below the base — sits inside that ear.
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = build_single_face(
+            &mut mesh,
+            &[
+                Vec3::new(2.0, -3.0, 0.0),  // 0
+                Vec3::new(6.0, 2.0, 0.0),   // 1  w  (witness inside c's ear)
+                Vec3::new(10.0, -3.0, 0.0), // 2
+                Vec3::new(12.0, 0.0, 0.0),  // 3  ear-next of c
+                Vec3::new(6.0, 3.0, 0.0),   // 4  c  (wide-open candidate)
+                Vec3::new(0.0, 0.0, 0.0),   // 5  ear-prev of c
+            ],
+        );
+        let c = verts[4];
+
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[], &[c], &params);
+
+        assert_eq!(mesh.totvert(), 6, "the guard fires; nothing collapses");
+        assert_eq!(mesh.totface(), 1);
+        assert!(
+            mesh.query_edge_exists(verts[3], verts[5]).is_none(),
+            "the would-be weld edge is never created"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn clear_ear_corner_collapses() {
+        // §6.3 step 3 — the contrast partner to `guard_fires_when_witness_in_ear`:
+        // the same wide-open corner with the witness lifted out of the ear
+        // collapses normally. Isolates the guard's firing to ear occupancy.
+        // Witness `w` = (6, -1) now sits below the base, outside c's ear.
+        let mut mesh = LoopMesh::new();
+        let (verts, _face) = build_single_face(
+            &mut mesh,
+            &[
+                Vec3::new(2.0, -3.0, 0.0),  // 0
+                Vec3::new(6.0, -1.0, 0.0),  // 1  w  (witness below the base)
+                Vec3::new(10.0, -3.0, 0.0), // 2
+                Vec3::new(12.0, 0.0, 0.0),  // 3  ear-next of c
+                Vec3::new(6.0, 3.0, 0.0),   // 4  c  (wide-open candidate)
+                Vec3::new(0.0, 0.0, 0.0),   // 5  ear-prev of c
+            ],
+        );
+        let c = verts[4];
+
+        let params = DissolveLimitParams {
+            angle_limit: FRAC_PI_2,
+            use_dissolve_boundaries: false,
+            delimit: 0,
+        };
+        mesh.dissolve_limit(&[], &[c], &params);
+
+        assert_eq!(mesh.totvert(), 5, "clear ear ⇒ the corner collapses");
+        assert_eq!(mesh.totface(), 1);
+        assert!(
+            mesh.query_edge_exists(verts[3], verts[5]).is_some(),
+            "weld edge (ear-prev)–(ear-next) replaces the arms through c"
+        );
         mesh.validate_topology();
     }
 }
