@@ -108,10 +108,15 @@ impl LoopMesh {
         use_normal_flip: bool,
         use_duplicate: bool,
     ) -> Vec<GeomKey> {
-        // §7: empty profile or non-positive step count is a no-op; the leading
-        // edge is empty.
+        // §7 / §4.4 — the returned `geom_last.out` slot is seeded with a verbatim
+        // copy of the input `geom` *before* the per-step loop, and overwritten only
+        // by an ordinary step. When the loop never runs — non-positive `steps` — or
+        // never emits — an empty profile — the seed survives and is passed straight
+        // back. So an empty profile returns the (empty) seed, and `steps = 0`
+        // returns the input profile set unchanged (count = the input buffer size,
+        // not a swept ring and not zero), leaving the mesh untouched either way.
         if geom.is_empty() || steps <= 0 {
-            return Vec::new();
+            return geom.to_vec();
         }
 
         let axis = axis.normalize_or_zero();
@@ -1132,30 +1137,216 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §7 empty profile and zero steps are no-ops with an empty leading edge.
+    /// §7 `steps = 0`: the per-step loop never runs, so the mesh is left exactly
+    /// untouched. The returned `geom_last.out` is NOT empty: it is the seed — a
+    /// verbatim copy of the input `geom` — passed straight back (§4.4 seeds the
+    /// slot with `p.geom.clone()` before the loop). For a single-edge profile
+    /// handed in as one `geom` element the returned count is `1` (that input
+    /// edge), not `0` and not a swept ring.
     #[test]
-    fn empty_and_zero_steps_are_noops() {
+    fn spin_steps_zero_leaves_profile_untouched() {
         let mut mesh = LoopMesh::new();
-        let (e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+        let (e, v0, v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
         let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
 
-        let out_empty = mesh.spin(&[], CENT, AXIS, None, std::f32::consts::TAU, 4, false, false, false);
-        assert!(out_empty.is_empty());
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
-
-        let out_zero = mesh.spin(
+        let out = mesh.spin(
             &[e.into()],
             CENT,
             AXIS,
             None,
-            std::f32::consts::TAU,
+            std::f32::consts::FRAC_PI_2,
             0,
             false,
             false,
             false,
         );
-        assert!(out_zero.is_empty());
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+
+        // The mesh is untouched — no swept geometry at all.
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            before,
+            "steps=0 leaves the mesh exactly as supplied"
+        );
+
+        // The returned slot is the seeded input `geom` passed straight back: the
+        // one input edge (count 1, NOT the swept-ring count and NOT 0).
+        assert_eq!(out.len(), 1, "geom_last.out is the input geom buffer (count 1)");
+        assert_eq!(out[0], e.into(), "the returned element is the verbatim input edge");
+
+        // The input edge and its endpoints are unchanged and still live.
+        assert!(mesh.edges.try_get(e).is_some(), "input edge survives untouched");
+        assert_eq!(mesh.vertex_position(v0), Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(mesh.vertex_position(v1), Vec3::new(1.0, 0.0, 1.0));
+        mesh.validate_topology();
+    }
+
+    /// §7 `angle = 0`, `steps > 0`: every step rotates by `angle / steps = 0`, a
+    /// well-defined identity rotation. The extrude loop still runs in full — it
+    /// emits `steps` genuine rings, but each lands **coincident** with the profile
+    /// and every other ring (a connected band folded flat onto the profile). The
+    /// rings being coincident does not shrink the slot: `geom_last.out` holds the
+    /// last (coincident) ring, count = one profile-shaped ring `V + E = 2 + 1 = 3`
+    /// for the headline edge profile. Stacked verts are disambiguated by incidence,
+    /// not position.
+    #[test]
+    fn spin_angle_zero_stacks_coincident_rings() {
+        let mut mesh = LoopMesh::new();
+        let (e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+
+        let out = mesh.spin(
+            &[e.into()],
+            CENT,
+            AXIS,
+            None,
+            0.0,
+            4,
+            false,
+            false,
+            false,
+        );
+
+        // The full loop ran: 4 coincident rings stitched by (zero-length) walls.
+        // Same connectivity as the non-degenerate quarter-pipe (§6.1): 10 V, 13 E,
+        // 4 F — only the positions collapse onto the profile.
+        assert_eq!(mesh.totvert(), 10, "steps=4 rings emitted, no merge");
+        assert_eq!(mesh.totedge(), 13);
+        assert_eq!(mesh.totface(), 4);
+
+        // The swept verts all sit at the profile's angular position (angle 0,
+        // i.e. the +X half-plane) — the zero rotation never moves them off it.
+        for v in mesh.vert_keys() {
+            let p = mesh.vertex_position(v);
+            assert!(
+                p.y.abs() < 1e-5 && p.x > 0.0,
+                "every ring is coincident with the profile (on +X, y≈0): {p:?}"
+            );
+        }
+
+        // §7 leading-edge count: the last (coincident) ring is one profile-shaped
+        // ring — 2 verts + 1 edge = 3, not collapsed by the coincidence.
+        assert_eq!(out.len(), 3, "last ring V+E = 2+1 = 3 (coincidence does not shrink it)");
+        assert_eq!(
+            out.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count(),
+            2,
+            "last ring has 2 verts"
+        );
+        assert_eq!(
+            out.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count(),
+            1,
+            "last ring has 1 edge"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §7 negative `angle`: sweeps the other way around the axis. The sign flows
+    /// through the per-step matrices (§4.1), NOT through the winding flags — so a
+    /// `-θ` sweep is the `+θ` sweep reflected across the axis: same element counts,
+    /// same one-ring `geom_last.out`, the band on the opposite side with the *same*
+    /// consistent (not inside-out) facing. We pin (a) the mirror geometry: verts at
+    /// negated angle, (b) consistent winding: every wall is wound the same way as
+    /// its `+θ` mirror, not reversed.
+    #[test]
+    fn spin_negative_angle_mirror_sweep_consistent_winding() {
+        // Build the +θ and -θ quarter sweeps and capture each wall's loop-cycle
+        // vertex positions (rounded), with the y-coordinate mirrored on the +θ
+        // side so the two should match cycle-for-cycle iff winding is consistent.
+        let build = |angle: f32| -> Vec<Vec<[i32; 3]>> {
+            let mut mesh = LoopMesh::new();
+            let (e, _, _) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+            let out = mesh.spin(
+                &[e.into()],
+                CENT,
+                AXIS,
+                None,
+                angle,
+                4,
+                false,
+                false,
+                false,
+            );
+            // Same leading-edge contract as the positive sweep: one ring, 1 edge.
+            assert_eq!(out.len(), 3, "negative-angle leading edge is one ring (V+E=3)");
+            assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (10, 13, 4));
+            mesh.validate_topology();
+            let quant = |p: Vec3| {
+                [
+                    (p.x * 1000.0).round() as i32,
+                    (p.y * 1000.0).round() as i32,
+                    (p.z * 1000.0).round() as i32,
+                ]
+            };
+            let mut faces: Vec<Vec<[i32; 3]>> = mesh
+                .face_keys()
+                .into_iter()
+                .map(|f| {
+                    mesh.face_vert_keys(f)
+                        .into_iter()
+                        .map(|v| quant(mesh.vertex_position(v)))
+                        .collect()
+                })
+                .collect();
+            faces.sort();
+            faces
+        };
+
+        let positive = build(std::f32::consts::FRAC_PI_2);
+        let negative = build(-std::f32::consts::FRAC_PI_2);
+
+        // Mirror the positive sweep across the axis plane (negate y) and preserve
+        // the loop-cycle ORDER. A consistent (mirror, not inside-out) negative
+        // sweep yields the same cyclic order; an inside-out one would reverse it.
+        let mut positive_mirrored: Vec<Vec<[i32; 3]>> = positive
+            .iter()
+            .map(|cycle| cycle.iter().map(|p| [p[0], -p[1], p[2]]).collect())
+            .collect();
+        positive_mirrored.sort();
+
+        let cycles_equal_rotation = |a: &[[i32; 3]], b: &[[i32; 3]]| -> bool {
+            let n = a.len();
+            n == b.len() && (0..n).any(|shift| (0..n).all(|i| a[i] == b[(i + shift) % n]))
+        };
+
+        assert_eq!(negative.len(), 4, "negative sweep has 4 walls");
+        for neg_cycle in &negative {
+            assert!(
+                positive_mirrored
+                    .iter()
+                    .any(|mir| cycles_equal_rotation(neg_cycle, mir)),
+                "each negative wall is the y-mirror of a positive wall with the SAME \
+                 cyclic winding (consistent, not inside-out)"
+            );
+        }
+    }
+
+    /// §7 empty `geom`: no profile to sweep. The mesh is left intact and
+    /// `geom_last.out` is empty (count `0`) — the seeded-empty slot returned
+    /// unchanged. Pinned on a *non-empty* mesh so the no-op leaving the rest of the
+    /// mesh untouched is observable.
+    #[test]
+    fn spin_empty_geom_is_noop() {
+        let mut mesh = LoopMesh::new();
+        // A non-empty mesh whose geometry must survive untouched.
+        let (_e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+
+        let out = mesh.spin(
+            &[],
+            CENT,
+            AXIS,
+            None,
+            std::f32::consts::FRAC_PI_2,
+            4,
+            false,
+            false,
+            false,
+        );
+
+        assert!(out.is_empty(), "empty geom returns the seeded-empty slot (count 0)");
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            before,
+            "empty geom leaves the non-empty mesh untouched"
+        );
         mesh.validate_topology();
     }
 }
