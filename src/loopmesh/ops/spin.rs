@@ -89,6 +89,17 @@ impl LoopMesh {
     /// revolution, closing the seam — honoured only when `steps >= 3` (SPIN.md
     /// §5 / §5.2). It is meaningful only in extrude mode.
     ///
+    /// `space`, when `Some`, is the coordinate frame in which `cent`, `axis`, the
+    /// per-step rotation, and the `dvec` translation are all expressed (SPIN.md
+    /// §1 / §4) — typically an object matrix. It is a **column-major** 4×4 matrix
+    /// (`m[col*4 + row]`, each group of four floats a basis column, the
+    /// translation in the last four). `None` is the identity / world frame and
+    /// reproduces a world-space sweep byte-for-byte. `space` is threaded straight
+    /// through to every per-step `rotate` / `translate`, where it drives the
+    /// conjugation `space⁻¹ · M · space` (ROTATE.md §3 / TRANSLATE.md §3); it
+    /// changes the frame the rotate/translate act in, not the angle schedule, the
+    /// merge identity-carry, or the arity routing.
+    ///
     /// The returned buffer is `geom_last.out` (SPIN.md §1): the leading edge of
     /// the sweep — the final extruded/duplicated ring, or the merge-survivor set
     /// after a 360° weld. It is *not* the whole swept surface.
@@ -107,6 +118,7 @@ impl LoopMesh {
         use_merge: bool,
         use_normal_flip: bool,
         use_duplicate: bool,
+        space: Option<[f32; 16]>,
     ) -> Vec<GeomKey> {
         // §7 / §4.4 — the returned `geom_last.out` slot is seeded with a verbatim
         // copy of the input `geom` *before* the per-step loop, and overwritten only
@@ -118,6 +130,13 @@ impl LoopMesh {
         if geom.is_empty() || steps <= 0 {
             return geom.to_vec();
         }
+
+        // SPIN.md §1 / §4 — the coordinate frame `cent`, `axis`, the rotation, and
+        // the `dvec` translation are expressed in. `None` is the world frame: the
+        // all-zeros `Mat4::ZERO` sentinel the rotate/translate sub-operators read as
+        // "no space, apply the matrix directly". A `Some(m)` column-major `[f32;16]`
+        // is the frame they conjugate through (ROTATE.md §3 / TRANSLATE.md §3).
+        let space = space.map_or(Mat4::ZERO, |m| Mat4::from_cols_array(&m));
 
         let axis = axis.normalize_or_zero();
         let dvec = dvec.unwrap_or(Vec3::ZERO);
@@ -164,7 +183,7 @@ impl LoopMesh {
                     RotateParams {
                         matrix,
                         cent,
-                        space: Mat4::ZERO,
+                        space,
                         use_shapekey: false,
                     },
                 );
@@ -217,7 +236,7 @@ impl LoopMesh {
                             &leading.verts,
                             TranslateParams {
                                 offset: dvec,
-                                space: Mat4::ZERO,
+                                space,
                                 use_shapekey: false,
                             },
                         );
@@ -234,7 +253,7 @@ impl LoopMesh {
                     RotateParams {
                         matrix,
                         cent,
-                        space: Mat4::ZERO,
+                        space,
                         use_shapekey: false,
                     },
                 );
@@ -248,7 +267,7 @@ impl LoopMesh {
                     &new_ring.verts,
                     TranslateParams {
                         offset: effective,
-                        space: Mat4::ZERO,
+                        space,
                         use_shapekey: false,
                     },
                 );
@@ -426,7 +445,7 @@ impl LoopMesh {
 mod tests {
     use std::collections::HashSet;
 
-    use glam::Vec3;
+    use glam::{Mat4, Quat, Vec3};
 
     use crate::loopmesh::*;
 
@@ -488,6 +507,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // §6.1: edge profile, B=1 open chain → Bv=2. Each step adds 2 verts,
@@ -536,6 +556,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // Collect the distinct angular positions of the bottom-row verts (z≈0).
@@ -575,6 +596,7 @@ mod tests {
             false,
             false,
             true,
+            None,
         );
 
         // §6.3: duplicate mode adds steps*(V,E,F). Profile 2V/1E/0F; +4*(2,1,0).
@@ -621,6 +643,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
 
         // Merged tube: 8 spokes * 2 verts = 16 V, 8 wall quads = 8 F, and
@@ -643,6 +666,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         // Merge-off doubles the seam: one extra ring of verts and an extra
         // (degenerate) wall band relative to the merged tube.
@@ -676,6 +700,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
 
         // The returned slot is one profile-shaped ring: 2 verts + 1 edge. Crucially
@@ -739,6 +764,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(out_off.len(), 3, "merge-off final ring: 2 verts + 1 edge");
         for g in &out_off {
@@ -768,6 +794,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
         let gated_counts = (gated.totvert(), gated.totedge(), gated.totface());
 
@@ -785,6 +812,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(
             gated_counts,
@@ -815,6 +843,7 @@ mod tests {
                 false,
                 flip,
                 false,
+                None,
             );
             // For each face, capture its loop-cycle vertex positions (rounded).
             let mut faces: Vec<Vec<[u32; 3]>> = mesh
@@ -881,6 +910,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // The final ring (4th) is lifted by 4*h above the profile bottom (z=0)
@@ -941,6 +971,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
         mesh.validate_topology();
 
@@ -1010,6 +1041,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         // Merge fuses one ring of 2 verts / 1 edge onto the originals by identity.
         assert_eq!(off.totvert() - mesh.totvert(), 2, "merge fuses one ring of 2 verts");
@@ -1036,6 +1068,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // Face profile: a closed 4-edge boundary loop. Each step adds 4 verts,
@@ -1091,6 +1124,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // The wire polyline: steps+1 verts, steps wire edges, no faces.
@@ -1159,6 +1193,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // The mesh is untouched — no swept geometry at all.
@@ -1203,6 +1238,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         // The full loop ran: 4 coincident rings stitched by (zero-length) walls.
@@ -1263,6 +1299,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             );
             // Same leading-edge contract as the positive sweep: one ring, 1 edge.
             assert_eq!(out.len(), 3, "negative-angle leading edge is one ring (V+E=3)");
@@ -1339,6 +1376,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(out.is_empty(), "empty geom returns the seeded-empty slot (count 0)");
@@ -1348,5 +1386,185 @@ mod tests {
             "empty geom leaves the non-empty mesh untouched"
         );
         mesh.validate_topology();
+    }
+
+    /// SPIN.md §1 / §4 `space` coordinate frame: the per-step rotate (and the
+    /// `dvec` translate) act in the supplied frame, driving the conjugation
+    /// `space⁻¹ · M · space` (ROTATE.md §3 / TRANSLATE.md §3) rather than the
+    /// bare world rotation. We sweep an edge profile a single step (`steps = 1`,
+    /// `angle = π/2`, no merge) through a **non-identity** space — a rotation
+    /// about X by 90° composed with a Y translation — and pin the resulting ring
+    /// verts to positions hand-derived from that same conjugation formula,
+    /// independently of spin's internal path.
+    ///
+    /// Three things are checked: (a) the swept ring lands exactly where the
+    /// documented `space⁻¹ · M_pivoted · space` map sends the profile verts;
+    /// (b) the non-identity-space result *differs* from the identity (`None`)
+    /// sweep of the same input (non-vacuity — `space` is genuinely consulted);
+    /// and (c) a `None` space reproduces the plain world sweep byte-for-byte.
+    #[test]
+    fn space_frame_conjugates_per_step_rotation() {
+        // The space frame: Rx(90°) composed with a translation along +Y. Built as
+        // a glam `Mat4` and handed to `spin` in its column-major `[f32;16]` form,
+        // exactly the convention the operator documents.
+        let space_mat = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2)
+            * Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
+        let space_cols = space_mat.to_cols_array();
+
+        // Single-step quarter sweep of the headline edge profile through the space
+        // frame. One step means one delta rotation by the full angle and no
+        // accumulation, so each new ring vert is one matrix application of the
+        // effective map on its profile source.
+        let angle = std::f32::consts::FRAC_PI_2;
+        let p_bottom = Vec3::new(1.0, 0.0, 0.0);
+        let p_top = Vec3::new(1.0, 0.0, 1.0);
+
+        let mut mesh = LoopMesh::new();
+        let (e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+        let out = mesh.spin(
+            &[e.into()],
+            CENT,
+            AXIS,
+            None,
+            angle,
+            1,
+            false,
+            false,
+            false,
+            Some(space_cols),
+        );
+
+        // §6.1 single-step edge sweep: profile (2V/1E) + one ring (2V) + one wall
+        // (1E dup + 2 vertical, 1 quad). geom_last.out is the single final ring edge.
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 4, 1));
+        assert_eq!(
+            out.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count(),
+            1,
+            "leading edge is the single final ring edge"
+        );
+        mesh.validate_topology();
+
+        // Hand-derived expected positions: the effective world map is the
+        // conjugation `space⁻¹ · M_pivoted · space`, with `M_pivoted` the rotation
+        // about the axis through `cent` (here cent = origin, so M_pivoted is the
+        // bare Rz(angle)). This is the documented ROTATE.md §3 frame semantics,
+        // computed here independently of spin's own composition.
+        let m_pivoted = Mat4::from_quat(Quat::from_axis_angle(AXIS, angle));
+        let effective = space_mat.inverse() * m_pivoted * space_mat;
+        let want_bottom = effective.transform_point3(p_bottom);
+        let want_top = effective.transform_point3(p_top);
+
+        // Collect the swept ring verts (the non-profile verts: those that are not
+        // at the two profile positions).
+        let ring_positions: Vec<Vec3> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .filter(|p| {
+                p.distance(p_bottom) > 1e-4 && p.distance(p_top) > 1e-4
+            })
+            .collect();
+        assert_eq!(ring_positions.len(), 2, "two swept ring verts");
+
+        let matches_expected = |target: Vec3| {
+            ring_positions.iter().any(|p| p.distance(target) < 1e-4)
+        };
+        assert!(
+            matches_expected(want_bottom),
+            "swept bottom vert at the conjugated position {want_bottom:?}; got {ring_positions:?}"
+        );
+        assert!(
+            matches_expected(want_top),
+            "swept top vert at the conjugated position {want_top:?}; got {ring_positions:?}"
+        );
+
+        // Non-vacuity: the same sweep with the *identity* (None) space lands the
+        // ring at the plain world rotation — a different place than the space sweep.
+        let mut world = LoopMesh::new();
+        let (e2, _, _) = edge_profile(&mut world, 1.0, 0.0, 1.0);
+        world.spin(
+            &[e2.into()],
+            CENT,
+            AXIS,
+            None,
+            angle,
+            1,
+            false,
+            false,
+            false,
+            None,
+        );
+        let world_ring: Vec<Vec3> = world
+            .vert_keys()
+            .into_iter()
+            .map(|v| world.vertex_position(v))
+            .filter(|p| p.distance(p_bottom) > 1e-4 && p.distance(p_top) > 1e-4)
+            .collect();
+        // The world sweep ring sits at Rz(π/2)·p = (0,1,*) — distinct from the
+        // space-frame ring above.
+        let world_bottom = m_pivoted.transform_point3(p_bottom);
+        assert!(
+            world_ring.iter().any(|p| p.distance(world_bottom) < 1e-4),
+            "world sweep ring at the bare-rotation position {world_bottom:?}; got {world_ring:?}"
+        );
+        assert!(
+            world_ring
+                .iter()
+                .all(|wp| ring_positions.iter().all(|sp| wp.distance(*sp) > 1e-3)),
+            "non-identity space ring differs from the identity (None) sweep ring"
+        );
+    }
+
+    /// SPIN.md §4 `space` identity equivalence: a `None` space and an explicit
+    /// identity-matrix space must both reproduce the plain world sweep exactly —
+    /// `None` is a behavioural no-op. Re-runs the headline quarter-pipe through
+    /// `None` and through `Mat4::IDENTITY` as the space and asserts identical
+    /// counts and ring geometry.
+    #[test]
+    fn space_none_reproduces_world_sweep() {
+        let angle = std::f32::consts::FRAC_PI_2;
+
+        let run = |space: Option<[f32; 16]>| -> (Vec<Vec3>, (usize, usize, usize)) {
+            let mut mesh = LoopMesh::new();
+            let (e, _, _) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+            mesh.spin(
+                &[e.into()],
+                CENT,
+                AXIS,
+                None,
+                angle,
+                4,
+                false,
+                false,
+                false,
+                space,
+            );
+            let mut ps: Vec<Vec3> = mesh
+                .vert_keys()
+                .into_iter()
+                .map(|v| mesh.vertex_position(v))
+                .collect();
+            ps.sort_by(|a, b| {
+                (a.x, a.y, a.z)
+                    .partial_cmp(&(b.x, b.y, b.z))
+                    .unwrap()
+            });
+            (ps, (mesh.totvert(), mesh.totedge(), mesh.totface()))
+        };
+
+        let (none_ps, none_counts) = run(None);
+        let (ident_ps, ident_counts) = run(Some(Mat4::IDENTITY.to_cols_array()));
+
+        assert_eq!(none_counts, ident_counts, "identity space matches None counts");
+        assert_eq!(none_ps.len(), ident_ps.len());
+        for (a, b) in none_ps.iter().zip(ident_ps.iter()) {
+            assert!(
+                a.distance(*b) < 1e-5,
+                "identity-space vert {b:?} matches None-space vert {a:?}"
+            );
+        }
+        // Confirm this is the genuine world quarter-pipe (matches the headline
+        // counts), so "reproduces world sweep" is anchored, not vacuous.
+        assert_eq!(none_counts, (10, 13, 4), "world quarter-pipe counts");
     }
 }
