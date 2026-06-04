@@ -48,6 +48,7 @@ mod rotate_colors;
 mod rotate_edges;
 mod rotate_uvs;
 mod scale;
+mod smooth_vert;
 mod split;
 mod split_edges;
 mod subdivide_edges;
@@ -80,6 +81,7 @@ pub use mirror::{Axis, MirrorParams, MirrorResult};
 pub use rotate::RotateParams;
 pub use rotate_edges::RotateEdgesResult;
 pub use scale::ScaleParams;
+pub use smooth_vert::SmoothVertParams;
 pub use split::SplitResult;
 pub use subdivide_edges::{
     QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
