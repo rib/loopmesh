@@ -15,6 +15,35 @@ struct LeadingRing {
     faces: Vec<FaceKey>,
 }
 
+/// The arity of the original profile (SPIN.md §2 / §6), captured once before the
+/// sweep begins and held constant across every step. The per-step extrude must
+/// dispatch on this rather than on the *running* leading ring: a vert profile's
+/// first step emits a wire edge into the running ring, and inspecting that ring
+/// on later steps would mis-route the bare-vert polyline path into the
+/// edge-extrude branch (turning the intended polyline into a ribbon). §6 fixes
+/// the path by the profile's `B` boundary: faces → region, edges → edge-only,
+/// verts (`B = 0`) → per-vertex-extrude on *every* step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileArity {
+    Face,
+    Edge,
+    Vert,
+}
+
+impl ProfileArity {
+    /// Classify the original profile selection (SPIN.md §6): a face present makes
+    /// it a face sweep, else an edge an edge sweep, else a bare-vert sweep.
+    fn of(profile: &LeadingRing) -> ProfileArity {
+        if !profile.faces.is_empty() {
+            ProfileArity::Face
+        } else if !profile.edges.is_empty() {
+            ProfileArity::Edge
+        } else {
+            ProfileArity::Vert
+        }
+    }
+}
+
 impl LeadingRing {
     /// Flatten the ring into the mixed `geom_last.out` buffer (SPIN.md §1): faces
     /// first, then edges, then verts, mirroring the duplicate/extrude result
@@ -96,6 +125,10 @@ impl LoopMesh {
         // partitioned by kind. The profile faces/edges/verts seed the first
         // step's input; in duplicate mode the original is re-read every step.
         let profile = self.partition_profile(geom);
+        // §6 — fix the extrude path by the *original* profile arity for the whole
+        // sweep, so a vert profile stays on the per-vertex-extrude polyline path
+        // even after its first step seeds a wire edge into the running ring.
+        let arity = ProfileArity::of(&profile);
 
         // §5.3 — before stepping, snapshot each original profile vert's identity
         // so the final ring can name (and weld onto) the original it came from.
@@ -139,7 +172,8 @@ impl LoopMesh {
                 // so the region path is the only one that needs the explicit
                 // after-first `use_normal_from_adjacent`.
                 let step_flip = use_normal_flip && k == 1;
-                let (extruded, ring) = self.extrude_leading_ring(&leading, step_flip, k != 1);
+                let (extruded, ring) =
+                    self.extrude_leading_ring(arity, &leading, step_flip, k != 1);
 
                 // §5.3 — propagate the original-vert identity onto this step's
                 // duplicates so the final ring can name its source.
@@ -282,20 +316,24 @@ impl LoopMesh {
     }
 
     /// Extrude the running leading ring one step (SPIN.md §3.1), routing by the
-    /// ring's element kinds, and return both the extrude result (for the §5.3
-    /// identity propagation) and the new leading ring (the duplicates).
+    /// *original profile arity* (not the running ring's kinds) and return both
+    /// the extrude result (for the §5.3 identity propagation) and the new leading
+    /// ring (the duplicates).
     ///
-    /// A face ring routes through the region extrude with the after-first
-    /// adjacent winding cue; a (faceless) edge ring through edge-only extrude,
-    /// which reads its adjacent cue from the previous wall automatically; a bare
-    /// vert ring through the per-vertex extrude.
+    /// A face profile routes through the region extrude with the after-first
+    /// adjacent winding cue; an edge profile through edge-only extrude, which
+    /// reads its adjacent cue from the previous wall automatically; a bare-vert
+    /// profile through the per-vertex extrude on *every* step (§6). Dispatching on
+    /// the captured arity rather than the running ring keeps the vert profile on
+    /// the polyline path after its first step seeds a wire edge into that ring.
     fn extrude_leading_ring(
         &mut self,
+        arity: ProfileArity,
         leading: &LeadingRing,
         use_normal_flip: bool,
         use_normal_from_adjacent: bool,
     ) -> (ExtrudeResult, LeadingRing) {
-        if !leading.faces.is_empty() {
+        if arity == ProfileArity::Face {
             let result = self.extrude_region_ex_normal_from_adjacent(
                 &leading.faces,
                 use_normal_flip,
@@ -317,28 +355,31 @@ impl LoopMesh {
                 result.cap_faces.clone()
             };
             (result, ring)
-        } else if !leading.edges.is_empty() {
+        } else if arity == ProfileArity::Edge {
             let result = self.extrude_edge_only_ex(&leading.edges, use_normal_flip);
             let mut ring = LeadingRing::default();
             ring.verts = result.vert_map.iter().map(|&(_, dup)| dup).collect();
             ring.edges = result.edge_map.iter().map(|&(_, dup)| dup).collect();
             (result, ring)
         } else {
-            // Vert-only profile: per-vertex extrude grows a wire polyline.
+            // Vert-only profile (§6, `B = 0`): per-vertex extrude grows a wire
+            // polyline — one duplicate vert per step joined to the running vert
+            // by a fresh wire edge, no walls, no faces.
             let vresult = self.extrude_vert_indiv(&leading.verts);
-            let mut result = ExtrudeResult {
+            let result = ExtrudeResult {
                 vert_map: vresult.vert_map.clone(),
                 edge_map: Vec::new(),
                 side_edges: vresult.wire_edges.clone(),
                 wall_faces: Vec::new(),
                 cap_faces: Vec::new(),
             };
-            // The per-vertex extrude reports the lifted wire as a side edge; the
-            // new leading ring is the duplicate verts and those wires.
+            // §6.4 — the new leading ring is the duplicate verts ONLY. The wire
+            // edge is part of the polyline, not the leading edge: a vert
+            // profile's `geom_last.out` is one profile-shaped ring (1 vert, 0
+            // edges, 0 faces). Carrying the wire here would both overcount the
+            // returned slot and, before the arity dispatch, mis-route later steps.
             let mut ring = LeadingRing::default();
             ring.verts = vresult.vert_map.iter().map(|&(_, dup)| dup).collect();
-            ring.edges = vresult.wire_edges.clone();
-            result.edge_map.clear();
             (result, ring)
         }
     }
@@ -1015,6 +1056,78 @@ mod tests {
                     );
                 }
             }
+        }
+        mesh.validate_topology();
+    }
+
+    /// §6 / §6.4 vert profile arity: a lone off-axis vert swept a quarter turn
+    /// (`steps = 4`, extrude mode, no merge) grows a **wire polyline**, not a
+    /// ribbon. The vert profile is `B = 0`, so every step takes the per-vertex
+    /// extrude path: one duplicate vert + one wire edge, no walls, no faces. Over
+    /// 4 steps the polyline is `steps + 1 = 5` verts joined by `steps = 4` wire
+    /// edges with 0 faces, and `geom_last.out` is the single leading vert (1
+    /// element) per the §6.4 leading-edge contract. Dispatching on the running
+    /// ring (rather than the captured profile arity) would let step 1's wire edge
+    /// pull steps 2+ into the edge-extrude branch — the 8 V / 10 E / 3 F ribbon.
+    #[test]
+    fn vert_quarter_polyline_extrude_no_merge() {
+        let mut mesh = LoopMesh::new();
+        // A lone off-axis vert: 1 V / 0 E / 0 F.
+        let v = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (1, 0, 0));
+
+        let out = mesh.spin(
+            &[v.into()],
+            CENT,
+            AXIS,
+            None,
+            std::f32::consts::FRAC_PI_2,
+            4,
+            false,
+            false,
+            false,
+        );
+
+        // The wire polyline: steps+1 verts, steps wire edges, no faces.
+        assert_eq!(mesh.totvert(), 5, "steps+1 = 5 polyline verts");
+        assert_eq!(mesh.totedge(), 4, "steps = 4 wire edges joining the polyline");
+        assert_eq!(mesh.totface(), 0, "vert profile grows no walls");
+
+        // §6.4 — the leading edge is the single last extruded vert: 1 element,
+        // a vert, with no edge or face in the returned slot.
+        assert_eq!(out.len(), 1, "geom_last.out is one profile-shaped ring: 1 vert");
+        assert!(
+            matches!(out[0], GeomKey::Vert(_)),
+            "the leading slot names the single last extruded vert"
+        );
+        assert_eq!(
+            out.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count(),
+            0,
+            "no wire edge leaks into the leading slot"
+        );
+
+        // The five spokes land at evenly spaced angles 0, π/8, π/4, 3π/8, π/2.
+        let mut angles: Vec<f32> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| angle_of(&mesh, v))
+            .collect();
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let expected: Vec<f32> = (0..=4)
+            .map(|k| std::f32::consts::FRAC_PI_2 * k as f32 / 4.0)
+            .collect();
+        assert_eq!(angles.len(), expected.len(), "five evenly spaced polyline verts");
+        for (got, want) in angles.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-4, "polyline vert angle {got} != {want}");
+        }
+
+        // The leading vert sits at the total sweep angle π/2.
+        if let GeomKey::Vert(lv) = out[0] {
+            let a = angle_of(&mesh, lv);
+            assert!(
+                (a - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+                "leading vert at angle π/2, got {a}"
+            );
         }
         mesh.validate_topology();
     }
