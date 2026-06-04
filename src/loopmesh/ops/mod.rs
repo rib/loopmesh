@@ -59,7 +59,7 @@ mod transform;
 mod translate;
 mod weld_verts;
 
-pub use bevel::{BevelAffect, BevelOptions, BevelResult, OffsetType};
+pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult};
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
 pub use connect_verts_nonplanar::ConnectVertsNonplanarOut;

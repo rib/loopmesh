@@ -68,7 +68,7 @@ mod ops;
 
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    BevelAffect, BevelOptions, BevelResult, OffsetType,
+    BevelAffect, BevelOffsetType, BevelOptions, BevelResult,
     BisectGeom, BisectParams, BisectResult,
     BridgeLoopsParams, BridgeLoopsResult,
     ConnectVertsNonplanarOut,

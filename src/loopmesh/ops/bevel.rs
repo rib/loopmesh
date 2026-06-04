@@ -20,18 +20,33 @@ impl Default for BevelAffect {
     }
 }
 
-/// How `offset` is interpreted (BEVEL.md §1.2 / §4). Only [`OffsetType::Offset`]
-/// — the plain slide-along-the-edge distance — is implemented (BEVEL.md §4); the
-/// other four modes re-measure the slide from a different target quantity and
-/// are §7 stubs.
+/// How `offset` is interpreted (BEVEL.md §1.2 / §4 / §4.3). Each mode changes
+/// only how the per-edge ring-vert slide distance `d_i` is derived from `offset`
+/// and the local corner geometry; the ring / cap / re-stitch surgery downstream
+/// is mode-agnostic (BEVEL.md §4.3).
+///
+/// All five are implemented for the foundational single-segment vertex bevel:
+/// [`BevelOffsetType::Offset`] is the plain slide-along-the-edge distance
+/// (`d_i = offset`, BEVEL.md §4); the other four re-measure that slide from a
+/// different target quantity (BEVEL.md §4.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OffsetType {
+pub enum BevelOffsetType {
+    /// `d_i = offset` — distance slid along each incident edge (BEVEL.md §4).
     Offset,
+    /// `d_i = offset / |2·sin φ_i|` — straight-line chamfer-width target.
+    Width,
+    /// `d_i = offset / |cos φ_i|` — perpendicular-depth target.
+    Depth,
+    /// `d_i = |A_i − v| · offset / 100` — per-edge fraction of edge length.
+    Percent,
+    /// `d_i = offset` — fixed slide independent of angle (= `Offset` at the
+    /// foundational no-weights level, BEVEL.md §4.3).
+    Absolute,
 }
 
-impl Default for OffsetType {
+impl Default for BevelOffsetType {
     fn default() -> Self {
-        OffsetType::Offset
+        BevelOffsetType::Offset
     }
 }
 
@@ -43,7 +58,7 @@ pub struct BevelOptions {
     /// How much material the bevel consumes, measured per `offset_type`. A
     /// non-positive offset is a no-op (BEVEL.md §2.1).
     pub offset: f32,
-    pub offset_type: OffsetType,
+    pub offset_type: BevelOffsetType,
     pub segments: u32,
     pub affect: BevelAffect,
 }
@@ -52,7 +67,7 @@ impl Default for BevelOptions {
     fn default() -> Self {
         BevelOptions {
             offset: 0.0,
-            offset_type: OffsetType::Offset,
+            offset_type: BevelOffsetType::Offset,
             segments: 1,
             affect: BevelAffect::Vertices,
         }
@@ -89,11 +104,11 @@ impl LoopMesh {
     /// A boundary (open-fan) corner gets no cap (§6.2). The original vertex is
     /// then removed as a now-loose vertex (§5.1.1).
     ///
-    /// Only the foundational case is implemented: `affect = Vertices`,
-    /// `segments = 1`, `offset_type = Offset`. Edge bevel, multiple segments,
-    /// the other offset modes, profiles, miters, overlap clamping, and flag
-    /// propagation are documented-as-future stubs (BEVEL.md §7) and are ignored
-    /// here.
+    /// Implemented for the foundational case: `affect = Vertices`,
+    /// `segments = 1`, any `offset_type` (all five modes re-measure the per-edge
+    /// slide per BEVEL.md §4 / §4.3). Edge bevel, multiple segments, profiles,
+    /// miters, overlap clamping, and flag propagation are documented-as-future
+    /// stubs (BEVEL.md §7) and are ignored here.
     ///
     /// A non-positive `offset`, or a beveled vertex with fewer than two incident
     /// edges, is a no-op for that vertex (BEVEL.md §2.1).
@@ -104,7 +119,6 @@ impl LoopMesh {
 
         if options.affect != BevelAffect::Vertices
             || options.segments != 1
-            || options.offset_type != OffsetType::Offset
             || options.offset <= 0.0
         {
             return result;
@@ -112,14 +126,20 @@ impl LoopMesh {
 
         for entry in geom {
             if let GeomKey::Vert(vertex) = *entry {
-                self.bevel_one_vertex(vertex, options.offset, &mut result);
+                self.bevel_one_vertex(vertex, options.offset, options.offset_type, &mut result);
             }
         }
 
         result
     }
 
-    fn bevel_one_vertex(&mut self, vertex: VertexKey, offset: f32, result: &mut BevelResult) {
+    fn bevel_one_vertex(
+        &mut self,
+        vertex: VertexKey,
+        offset: f32,
+        offset_type: BevelOffsetType,
+        result: &mut BevelResult,
+    ) {
         // §3.2 / §5: gather the incident edges (the disk cycle) and a ring vertex
         // per edge, slid `offset` toward the edge's far endpoint (§4).
         let incident_edges: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
@@ -128,13 +148,33 @@ impl LoopMesh {
         }
 
         let vertex_position = self.vertex_position(vertex);
+
+        // §4.3: gather each incident edge's far endpoint and inward direction
+        // `u_i = normalize(v − A_i)`, then derive the corner axis `Σ u_i`. The
+        // angle modes measure each edge against this axis; the length modes do
+        // not, but a single pre-pass keeps the per-edge slide derivation uniform.
+        let far_positions: Vec<Vec3> = incident_edges
+            .iter()
+            .map(|&edge| {
+                let [a, b] = self.edge_vert_keys(edge);
+                let far = if a == vertex { b } else { a };
+                self.vertex_position(far)
+            })
+            .collect();
+
+        let corner_axis = corner_axis(vertex_position, &far_positions);
+
         let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
             Vec::with_capacity(incident_edges.len());
-        for &edge in &incident_edges {
-            let [a, b] = self.edge_vert_keys(edge);
-            let far = if a == vertex { b } else { a };
-            let far_position = self.vertex_position(far);
-            let ring_position = ring_vert_position(vertex_position, far_position, offset);
+        for (&edge, &far_position) in incident_edges.iter().zip(&far_positions) {
+            let slide = slide_distance(
+                offset,
+                offset_type,
+                vertex_position,
+                far_position,
+                corner_axis,
+            );
+            let ring_position = ring_vert_position(vertex_position, far_position, slide);
             let ring_vertex = self.create_vertex(ring_position);
             ring_vert_for_edge.push((edge, ring_vertex));
             result.verts.push(ring_vertex);
@@ -533,6 +573,148 @@ mod tests {
         assert!(multi_segment.verts.is_empty());
         mesh.validate_topology();
     }
+
+    /// Bevel cube-corner vert `(1, -1, -1)` under `offset_type`, returning each
+    /// ring vert's slide distance from the original corner.
+    fn cube_corner_slides(offset: f32, offset_type: BevelOffsetType) -> Vec<f32> {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let origin = Vec3::new(1.0, -1.0, -1.0);
+        let corner = mesh
+            .vert_keys()
+            .into_iter()
+            .find(|&v| mesh.vertex_position(v) == origin)
+            .unwrap();
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset,
+                offset_type,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        result
+            .verts
+            .iter()
+            .map(|&v| (mesh.vertex_position(v) - origin).length())
+            .collect()
+    }
+
+    /// BEVEL.md §4.3: `offset_type` changes only the slide distance, never the
+    /// topology. Every mode produces the same +2 V / +3 E / +1 F cube-corner
+    /// delta.
+    #[test]
+    fn offset_type_modes_are_topology_invariant() {
+        for offset_type in [
+            BevelOffsetType::Offset,
+            BevelOffsetType::Width,
+            BevelOffsetType::Depth,
+            BevelOffsetType::Percent,
+            BevelOffsetType::Absolute,
+        ] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let corner = mesh
+                .vert_keys()
+                .into_iter()
+                .find(|&v| mesh.vertex_position(v) == Vec3::new(1.0, -1.0, -1.0))
+                .unwrap();
+            mesh.bevel(
+                &[corner.into()],
+                BevelOptions {
+                    offset: 0.3,
+                    offset_type,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                counts(&mesh),
+                (10, 15, 7),
+                "{offset_type:?}: topology is mode-agnostic",
+            );
+        }
+    }
+
+    /// BEVEL.md §4.3 / §8: at the cube corner every edge's axis-relative angle is
+    /// `φ = arccos(1/√3) ≈ 54.74°`, so `WIDTH` slides by
+    /// `offset / |2·sin φ| ≈ 0.612·offset`, distinct from `OFFSET`'s `offset`.
+    #[test]
+    fn width_slide_chamfer_width_target() {
+        let offset = 0.3;
+        let phi = (1.0_f32 / 3.0_f32.sqrt()).acos();
+        let expected = offset / (2.0 * phi.sin()).abs();
+        for slide in cube_corner_slides(offset, BevelOffsetType::Width) {
+            assert!(
+                (slide - expected).abs() < 1.0e-5,
+                "WIDTH slide {slide} should be {expected}",
+            );
+            assert!(
+                (slide - offset).abs() > 1.0e-3,
+                "WIDTH must differ from OFFSET at the cube corner",
+            );
+        }
+    }
+
+    /// BEVEL.md §4.3 / §8: `DEPTH` slides by `offset / |cos φ| ≈ 1.73·offset` at
+    /// the cube corner, distinct from `OFFSET`.
+    #[test]
+    fn depth_slide_perpendicular_depth_target() {
+        let offset = 0.3;
+        let phi = (1.0_f32 / 3.0_f32.sqrt()).acos();
+        let expected = offset / phi.cos().abs();
+        for slide in cube_corner_slides(offset, BevelOffsetType::Depth) {
+            assert!(
+                (slide - expected).abs() < 1.0e-5,
+                "DEPTH slide {slide} should be {expected}",
+            );
+            assert!(
+                (slide - offset).abs() > 1.0e-3,
+                "DEPTH must differ from OFFSET at the cube corner",
+            );
+        }
+    }
+
+    /// BEVEL.md §4.3: `PERCENT` slides a fraction of each edge's length,
+    /// `d_i = |A_i − v| · offset / 100`. The cube's incident edges have length
+    /// `2.0`, so `PERCENT(25)` lands at `2.0 · 25 / 100 = 0.5` — the same as
+    /// `OFFSET(0.5)` — yet differs from `OFFSET(25)`.
+    #[test]
+    fn percent_slide_scales_by_edge_length() {
+        let edge_length = 2.0_f32;
+        let percent = 25.0_f32;
+        let expected = edge_length * percent / 100.0;
+        for slide in cube_corner_slides(percent, BevelOffsetType::Percent) {
+            assert!(
+                (slide - expected).abs() < 1.0e-5,
+                "PERCENT slide {slide} should be {expected}",
+            );
+        }
+        // Equivalence to OFFSET(0.5) is the length-scaling pin of §8.
+        let offset_equivalent = cube_corner_slides(expected, BevelOffsetType::Offset);
+        for slide in offset_equivalent {
+            assert!((slide - expected).abs() < 1.0e-5);
+        }
+    }
+
+    /// BEVEL.md §4.3: `ABSOLUTE` is a fixed slide equal to `offset`, numerically
+    /// identical to `OFFSET` at the foundational no-weights level.
+    #[test]
+    fn absolute_slide_coincides_with_offset() {
+        let offset = 0.3;
+        let absolute = cube_corner_slides(offset, BevelOffsetType::Absolute);
+        let offset_slides = cube_corner_slides(offset, BevelOffsetType::Offset);
+        assert_eq!(absolute.len(), offset_slides.len());
+        for slide in &absolute {
+            assert!(
+                (slide - offset).abs() < 1.0e-5,
+                "ABSOLUTE slide {slide} should equal offset {offset}",
+            );
+        }
+        for (a, o) in absolute.iter().zip(&offset_slides) {
+            assert!((a - o).abs() < 1.0e-6, "ABSOLUTE coincides with OFFSET");
+        }
+    }
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
@@ -546,6 +728,81 @@ fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
     }
     let clamped = offset.min(length);
     vertex + (direction / length) * clamped
+}
+
+/// The corner axis `Σ_i normalize(v − A_i)` (BEVEL.md §4.3): the un-normalised
+/// sum of the inward edge directions. Only its direction matters — it is the
+/// reference each edge's angle `φ_i` is measured against.
+fn corner_axis(vertex: Vec3, far_positions: &[Vec3]) -> Vec3 {
+    far_positions.iter().fold(Vec3::ZERO, |axis, &far| {
+        let inward = vertex - far;
+        let length = inward.length();
+        if length <= f32::EPSILON {
+            axis
+        } else {
+            axis + inward / length
+        }
+    })
+}
+
+/// The smallest slide a near-degenerate angle mode is allowed to produce
+/// (BEVEL.md §4.3): a hundredth of `offset`, the established fallback when the
+/// `WIDTH` / `DEPTH` denominator underflows rather than dividing by ~0.
+const DEGENERATE_SLIDE_FRACTION: f32 = 0.01;
+
+/// Per-edge slide distance `d_i` for a single-segment vertex bevel (BEVEL.md
+/// §4 / §4.3). Each `offset_type` interprets `offset` as a different physical
+/// quantity and solves for the slide that realises it; the surgery downstream
+/// is mode-agnostic.
+fn slide_distance(
+    offset: f32,
+    offset_type: BevelOffsetType,
+    vertex: Vec3,
+    far: Vec3,
+    corner_axis: Vec3,
+) -> f32 {
+    match offset_type {
+        // §4 / §4.3: plain and fixed slide — `d_i = offset`. The two coincide at
+        // the foundational no-weights level (§4.3).
+        BevelOffsetType::Offset | BevelOffsetType::Absolute => offset,
+
+        // §4.3: a per-edge fraction of that edge's own length, no angle term.
+        BevelOffsetType::Percent => (far - vertex).length() * offset / 100.0,
+
+        // §4.3 angle modes: re-measure against `φ_i`, the angle between the
+        // edge's inward direction and the corner axis.
+        BevelOffsetType::Width => {
+            let phi = inward_axis_angle(vertex, far, corner_axis);
+            let denominator = (2.0 * phi.sin()).abs();
+            if denominator <= f32::EPSILON {
+                offset * DEGENERATE_SLIDE_FRACTION
+            } else {
+                offset / denominator
+            }
+        }
+        BevelOffsetType::Depth => {
+            let phi = inward_axis_angle(vertex, far, corner_axis);
+            let denominator = phi.cos().abs();
+            if denominator <= f32::EPSILON {
+                offset * DEGENERATE_SLIDE_FRACTION
+            } else {
+                offset / denominator
+            }
+        }
+    }
+}
+
+/// `φ_i` — the angle in `0..π` between edge `e_i`'s inward direction
+/// `normalize(v − A_i)` and the corner axis (BEVEL.md §4.3).
+fn inward_axis_angle(vertex: Vec3, far: Vec3, corner_axis: Vec3) -> f32 {
+    let inward = vertex - far;
+    let inward_length = inward.length();
+    let axis_length = corner_axis.length();
+    if inward_length <= f32::EPSILON || axis_length <= f32::EPSILON {
+        return 0.0;
+    }
+    let cosine = (inward / inward_length).dot(corner_axis / axis_length);
+    cosine.clamp(-1.0, 1.0).acos()
 }
 
 /// Order the ring verts into a cycle by following the chamfer edges (BEVEL.md
