@@ -8,6 +8,7 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod bevel;
 mod bisect_edges;
 mod bisect_plane;
 mod bridge_loops;
@@ -58,6 +59,7 @@ mod transform;
 mod translate;
 mod weld_verts;
 
+pub use bevel::{BevelAffect, BevelOptions, BevelResult, OffsetType};
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
 pub use connect_verts_nonplanar::ConnectVertsNonplanarOut;
