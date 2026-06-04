@@ -170,24 +170,45 @@ impl LoopMesh {
 
         let mut leading = profile.clone();
 
+        // §4.3 — the running screw-translation vector. Seeded with the input
+        // `dvec` and rotated IN PLACE by each step's TOTAL-angle matrix, so the
+        // translation actually applied at step `k` is the cumulative product
+        // `R_total(k) · … · R_total(1) · dvec`. It is NOT recomputed from `dvec`
+        // each step, and the advancing matrix is the total-angle matrix even in
+        // extrude mode (where the *geometry* is instead carried by the per-step
+        // delta). For an axial `dvec` every total-angle matrix fixes it, so the
+        // running vector stays constant and the advance reduces to the clean
+        // per-step axial rise.
+        let mut dvec_running = dvec;
+
         for k in 1..=steps {
             let total_k = angle * (k as f32) / (steps as f32);
+            // §4.3 — the TOTAL-angle matrix for this step. Drives the duplicate-mode
+            // geometry rotation AND (in every mode) the `dvec` advance below.
+            let total_matrix = Mat4::from_quat(Quat::from_axis_angle(axis, total_k));
 
-            let (new_ring, step_matrix) = if use_duplicate {
+            // §4.3 — advance the running screw vector in place by this step's
+            // total-angle matrix, accumulating all prior steps' rotations. Done
+            // once per step regardless of mode or branch so the merge step (which
+            // returns early) still advances it for its penultimate-ring lift.
+            if use_dvec {
+                dvec_running = total_matrix.transform_vector3(dvec_running);
+            }
+
+            let new_ring = if use_duplicate {
                 // §3.2 — clone the *original* profile, rotate by the TOTAL angle.
                 let dup = self.duplicate(geom, false);
                 let ring = self.ring_from_duplicate(&dup);
-                let matrix = Mat4::from_quat(Quat::from_axis_angle(axis, total_k));
                 self.rotate(
                     &ring.verts,
                     RotateParams {
-                        matrix,
+                        matrix: total_matrix,
                         cent,
                         space,
                         use_shapekey: false,
                     },
                 );
-                (ring, matrix)
+                ring
             } else {
                 // §3.1 — extrude the *running* ring. The first step takes the
                 // user's flip; later steps inherit winding from the adjacent
@@ -221,21 +242,22 @@ impl LoopMesh {
                     self.weld_final_ring(&ring, &origin_of);
 
                     // §4.3 / §4.4 — the `dvec` screw translate is NOT skipped on
-                    // the merge step. Per the §4.4 pseudocode it is applied in the
-                    // identity step frame to whatever the returned slot currently
-                    // names — and on the merge step that is the **penultimate**
-                    // ring (`leading`), not the welded-away closing ring. This is
-                    // the one extra screw step that carries the penultimate ring
-                    // up from its interior height of `(steps-1)*dvec` to the full
-                    // `steps*dvec` rise, matching the leading edge a non-merge
-                    // sweep would have returned. The welded-away closing ring is
-                    // gone, so lifting it would be inert; the survivor that
+                    // the merge step. Per the §4.4 pseudocode it is applied to
+                    // whatever the returned slot currently names — and on the merge
+                    // step that is the **penultimate** ring (`leading`), not the
+                    // welded-away closing ring. The running screw vector was already
+                    // advanced by this step's total-angle matrix above, so the lift
+                    // uses the same cumulative `dvec_running` as an ordinary step
+                    // would. This carries the penultimate ring up from its interior
+                    // height to the full sweep rise, matching the leading edge a
+                    // non-merge sweep would have returned. The welded-away closing
+                    // ring is gone, so lifting it would be inert; the survivor that
                     // observes the lift is the penultimate ring.
                     if use_dvec {
                         self.translate(
                             &leading.verts,
                             TranslateParams {
-                                offset: dvec,
+                                offset: dvec_running,
                                 space,
                                 use_shapekey: false,
                             },
@@ -257,16 +279,19 @@ impl LoopMesh {
                         use_shapekey: false,
                     },
                 );
-                (ring, matrix)
+                ring
             };
 
             if use_dvec {
-                // §4.3 — translate by dvec rotated into the step's frame.
-                let effective = step_matrix.transform_vector3(dvec);
+                // §4.3 — translate this step's new ring by the cumulative running
+                // screw vector (already advanced by the total-angle matrix above).
+                // Threading the translated ring into the next step's extrude input
+                // is what builds the running *sum* of the per-step screw offsets
+                // across the chain.
                 self.translate(
                     &new_ring.verts,
                     TranslateParams {
-                        offset: effective,
+                        offset: dvec_running,
                         space,
                         use_shapekey: false,
                     },
@@ -936,6 +961,105 @@ mod tests {
             final_z[1]
         );
         mesh.validate_topology();
+    }
+
+    /// §4.3 `dvec` screw, **non-axial** — the distinguishing pin. With a `dvec`
+    /// carrying an in-plane component (`[0.3, 0, 0.5]` about +z) the running screw
+    /// vector genuinely rotates each step, so the translation applied at step `k`
+    /// is the cumulative product `R_total(k)·…·R_total(1)·dvec`, not `R_total(k)`
+    /// or `R_delta(k)` on a *fresh* `dvec`. This catches the old arithmetic
+    /// (`R_delta * dvec` on a fresh vector) which collapses to the same answer
+    /// only for an axial `dvec`.
+    ///
+    /// The independent oracle simulates the exact extrude-mode threading the
+    /// operator performs — each step's delta rotation acts on the *whole* prior
+    /// ring (its rotated position plus its accumulated screw offset), and the
+    /// step's own running-vector offset is then added — using glam matrices on the
+    /// abstract profile points, with no reference to spin's internal path.
+    #[test]
+    fn dvec_non_axial_traces_cumulative_product() {
+        let dvec = Vec3::new(0.3, 0.0, 0.5);
+        let angle = std::f32::consts::FRAC_PI_2;
+        let steps = 3;
+
+        let mut mesh = LoopMesh::new();
+        let (e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
+        let out = mesh.spin(
+            &[e.into()],
+            CENT,
+            AXIS,
+            Some(dvec),
+            angle,
+            steps,
+            false,
+            false,
+            false,
+            None,
+        );
+        mesh.validate_topology();
+
+        // Independent oracle: thread two profile points through `steps` extrude
+        // steps. At step k the prior ring (position + accumulated offset) is
+        // carried by the DELTA rotation, then the step's running-vector offset
+        // (advanced by the TOTAL-angle matrix, cumulative across steps) is added.
+        let advance = |start: Vec3| -> Vec3 {
+            let mut point = start;
+            let mut dvec_running = dvec;
+            for k in 1..=steps {
+                let total_k = angle * k as f32 / steps as f32;
+                let total_prev = angle * (k - 1) as f32 / steps as f32;
+                let r_total = Mat4::from_quat(Quat::from_axis_angle(AXIS, total_k));
+                let r_delta = Mat4::from_quat(Quat::from_axis_angle(AXIS, total_k - total_prev));
+                dvec_running = r_total.transform_vector3(dvec_running);
+                point = r_delta.transform_point3(point) + dvec_running;
+            }
+            point
+        };
+        let want_bottom = advance(Vec3::new(1.0, 0.0, 0.0));
+        let want_top = advance(Vec3::new(1.0, 0.0, 1.0));
+
+        let final_positions: Vec<Vec3> = out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Edge(edge) => Some(*edge),
+                _ => None,
+            })
+            .flat_map(|edge| mesh.edge_vertices(edge))
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        assert_eq!(final_positions.len(), 2, "final ring has 2 verts");
+
+        let hits = |target: Vec3| final_positions.iter().any(|p| p.distance(target) < 1e-4);
+        assert!(
+            hits(want_bottom),
+            "final ring bottom at cumulative-product position {want_bottom:?}; got {final_positions:?}"
+        );
+        assert!(
+            hits(want_top),
+            "final ring top at cumulative-product position {want_top:?}; got {final_positions:?}"
+        );
+
+        // Discriminator: the old (buggy) arithmetic translated each step's ring by
+        // `R_delta(k) * dvec` on a *fresh* `dvec`, accumulating a different sum.
+        // Confirm that shortcut lands the final ring somewhere ELSE, so this test
+        // genuinely fails against the old code (and any non-cumulative shortcut).
+        let shortcut = |start: Vec3| -> Vec3 {
+            let mut point = start;
+            for k in 1..=steps {
+                let total_k = angle * k as f32 / steps as f32;
+                let total_prev = angle * (k - 1) as f32 / steps as f32;
+                let r_delta = Mat4::from_quat(Quat::from_axis_angle(AXIS, total_k - total_prev));
+                point = r_delta.transform_point3(point) + r_delta.transform_vector3(dvec);
+            }
+            point
+        };
+        let shortcut_bottom = shortcut(Vec3::new(1.0, 0.0, 0.0));
+        assert!(
+            want_bottom.distance(shortcut_bottom) > 1e-3,
+            "the cumulative-product target must differ from the fresh-delta shortcut \
+             (non-axial dvec is the distinguishing case); cumulative={want_bottom:?} \
+             shortcut={shortcut_bottom:?}"
+        );
     }
 
     /// §4.3 / §4.4 / §5.5 screw + full-revolution merge — the **penultimate-ring
