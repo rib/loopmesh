@@ -153,10 +153,15 @@ impl LoopMesh {
 
                 let is_last_merge_step = do_merge && k == steps;
                 if is_last_merge_step {
-                    // §5 — the final ring is welded back onto the originals
-                    // instead of being rotated into the seam.
-                    let survivors = self.weld_final_ring(&ring, &origin_of);
-                    return survivors.into_geom_out();
+                    // §5 / §5.5 — the final ring is welded back onto the
+                    // originals instead of being rotated into the seam. The weld
+                    // runs on the extrude's *own* output list (a scratch set) and
+                    // must NOT re-write the returned slot: it is left frozen at
+                    // the penultimate ring (`leading`, the step `steps-1` ring),
+                    // which the weld never disturbs (§5.5). So return `leading`,
+                    // not the weld remainder.
+                    self.weld_final_ring(&ring, &origin_of);
+                    return leading.into_geom_out();
                 }
 
                 // §4.1 — rotate the new ring by the per-step DELTA angle.
@@ -319,24 +324,22 @@ impl LoopMesh {
     /// §5.3–§5.4 — weld the final extruded ring back onto the original profile.
     /// Each final vert is paired with its originating profile vert via the
     /// carried identity map (`origin_of`), and the pairs are welded so the
-    /// originals survive. The surviving (un-welded) leading-ring elements are
-    /// returned as `geom_last.out`.
+    /// originals survive. This mutates the swept mesh (closing the seam) but does
+    /// not produce the returned slot: per §5.5 the returned `geom_last.out` is the
+    /// penultimate ring, which this weld never touches.
     fn weld_final_ring(
         &mut self,
         ring: &LeadingRing,
         origin_of: &HashMap<VertexKey, VertexKey>,
-    ) -> LeadingRing {
+    ) {
         // §5.4 stage 1 — pair each final vert with its identified original and
         // weld onto it (the original survives). A vert whose identity resolves to
-        // itself (no distinct original) is left as a survivor.
+        // itself (no distinct original) is not a weld target.
         let mut weld_pairs: Vec<(VertexKey, VertexKey)> = Vec::new();
-        let mut welded_away: std::collections::HashSet<VertexKey> =
-            std::collections::HashSet::new();
         for &final_v in &ring.verts {
             if let Some(&origin) = origin_of.get(&final_v) {
                 if origin != final_v {
                     weld_pairs.push((final_v, origin));
-                    welded_away.insert(final_v);
                 }
             }
         }
@@ -348,26 +351,6 @@ impl LoopMesh {
         // face. `use_centroid = false` keeps the survivor (original) in place so
         // the seam sits on the originals.
         self.weld_verts(&weld_pairs, false);
-
-        // §5.4 — the surviving leading-edge set: ring elements that still exist
-        // after the weld and were not themselves welded away.
-        let mut survivors = LeadingRing::default();
-        for &v in &ring.verts {
-            if !welded_away.contains(&v) && self.vertices.try_get(v).is_some() {
-                survivors.verts.push(v);
-            }
-        }
-        for &e in &ring.edges {
-            if self.edges.try_get(e).is_some() {
-                survivors.edges.push(e);
-            }
-        }
-        for &f in &ring.faces {
-            if self.faces.try_get(f).is_some() {
-                survivors.faces.push(f);
-            }
-        }
-        survivors
     }
 }
 
@@ -602,6 +585,102 @@ mod tests {
             merged.totvert()
         );
         unmerged.validate_topology();
+    }
+
+    /// §5.5 / §6.4 leading-edge contract: after a full-revolution merge the
+    /// returned `geom_last.out` is the **penultimate** ring (the ring emitted at
+    /// step `steps-1`), NOT the empty post-fuse weld remainder. For the headline
+    /// edge profile that is 2 verts + 1 edge = 3 elements, sitting at the
+    /// cumulative angle of step `steps-1`. Contrast: the merge-off full sweep
+    /// returns the genuine *final* ring at the seam angle.
+    #[test]
+    fn full_rev_merge_geom_last_is_penultimate_ring() {
+        let steps = 8;
+        let mut merged = LoopMesh::new();
+        let (e, _v0, _v1) = edge_profile(&mut merged, 1.0, 0.0, 1.0);
+        let out = merged.spin(
+            &[e.into()],
+            CENT,
+            AXIS,
+            None,
+            std::f32::consts::TAU,
+            steps,
+            true,
+            false,
+            false,
+        );
+
+        // The returned slot is one profile-shaped ring: 2 verts + 1 edge. Crucially
+        // it is NOT empty (a port returning the emptied weld working set reports 0).
+        let verts: Vec<VertexKey> = out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Vert(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        let edges: Vec<EdgeKey> = out
+            .iter()
+            .filter_map(|g| match g {
+                GeomKey::Edge(e) => Some(*e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(out.len(), 3, "penultimate ring: 2 verts + 1 edge = 3 elements");
+        assert_eq!(verts.len(), 2, "penultimate ring has 2 verts");
+        assert_eq!(edges.len(), 1, "penultimate ring has 1 edge");
+
+        // Identity: every returned element is a genuine, still-live survivor — the
+        // weld at the final step touches the last ring and the seam originals, never
+        // this penultimate ring.
+        for &v in &verts {
+            assert!(
+                merged.vertices.try_get(v).is_some(),
+                "returned penultimate vert is live"
+            );
+        }
+        assert!(
+            merged.edges.try_get(edges[0]).is_some(),
+            "returned penultimate edge is live"
+        );
+
+        // Position: the penultimate ring sits at the cumulative angle of step
+        // steps-1 = 2π * (steps-1)/steps, distinct from the seam (angle 0).
+        let want = std::f32::consts::TAU * (steps - 1) as f32 / steps as f32;
+        let want_wrapped = want.rem_euclid(std::f32::consts::TAU);
+        for &v in &verts {
+            let a = angle_of(&merged, v).rem_euclid(std::f32::consts::TAU);
+            assert!(
+                (a - want_wrapped).abs() < 1e-4,
+                "penultimate vert at angle {want_wrapped}, got {a}"
+            );
+        }
+        merged.validate_topology();
+
+        // Contrast: merge-off returns the genuine final ring at the seam angle
+        // (cumulative(steps) = 2π ≡ 0), still 3 elements but a different identity.
+        let mut unmerged = LoopMesh::new();
+        let (e2, _, _) = edge_profile(&mut unmerged, 1.0, 0.0, 1.0);
+        let out_off = unmerged.spin(
+            &[e2.into()],
+            CENT,
+            AXIS,
+            None,
+            std::f32::consts::TAU,
+            steps,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(out_off.len(), 3, "merge-off final ring: 2 verts + 1 edge");
+        for g in &out_off {
+            if let GeomKey::Vert(v) = g {
+                let a = angle_of(&unmerged, *v).rem_euclid(std::f32::consts::TAU);
+                let at_seam = a.abs() < 1e-4
+                    || (a - std::f32::consts::TAU).abs() < 1e-4;
+                assert!(at_seam, "merge-off final ring sits at the seam angle, got {a}");
+            }
+        }
     }
 
     /// §5.2 gate: `steps = 2` full revolution with `use_merge = true` must behave
