@@ -49,6 +49,7 @@ mod rotate_edges;
 mod rotate_uvs;
 mod scale;
 mod smooth_vert;
+mod spin;
 mod split;
 mod split_edges;
 mod subdivide_edges;
