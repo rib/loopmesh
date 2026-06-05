@@ -54,6 +54,7 @@ mod spin;
 mod split;
 mod split_edges;
 mod subdivide_edges;
+mod subdivide_edgering;
 mod symmetrize;
 mod transform;
 mod translate;
@@ -88,6 +89,9 @@ pub use smooth_vert::SmoothVertParams;
 pub use split::SplitResult;
 pub use subdivide_edges::{
     QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
+};
+pub use subdivide_edgering::{
+    RingInterp, SubdivideEdgeRingParams, SubdivideEdgeRingResult,
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;
