@@ -233,12 +233,43 @@ impl RailColoring {
     }
 }
 
-/// A handle-length estimate for the §6.2 splines: scales the off-chord bow, not
-/// its direction (multiplied by `smooth`, so it is irrelevant at `smooth = 0`).
-/// A "how far apart, projected onto the handle directions' span" length that
-/// approximates a circular blend across the gap.
-fn handle_length(a: Vec3, b: Vec3, _dir_a: Vec3, _dir_b: Vec3) -> f32 {
-    (b - a).length() / 3.0
+/// The shared Bézier handle length for the §6.2 splines (§6.2.1.1). Scales the
+/// off-chord bow, not its direction (multiplied by `smooth` at the call site, so
+/// it never affects the `smooth = 0` geometry). Generic in its two anchor points
+/// `a`, `b` and two **unit** end directions `dir_a`, `dir_b` (each already
+/// leaning the way its handle will): PATH feeds it the rim centres + reconciled
+/// normals, SURFACE the cut ring's rim verts + surface tangents.
+///
+/// `H = (L_proj / 2) · fac`:
+///
+/// - `fac = 4/3` (the quarter-circle handle length) when the two directions are
+///   not opposed (`dot ≥ 0`), eased linearly down toward `3/4` as they oppose
+///   (`dot → −1`) via `t = 1 + dot`, so a tight fold does not overshoot.
+/// - `L_proj` is the chord `a → b` measured **only in the plane the two
+///   directions span** — the component along their cross axis (the fold's hinge)
+///   is discarded, so `H` tracks the bow rather than the span. When the
+///   directions are parallel there is no bend plane; fall back to the full chord
+///   length.
+fn handle_length(a: Vec3, b: Vec3, dir_a: Vec3, dir_b: Vec3) -> f32 {
+    let dot = dir_a.dot(dir_b);
+    let mut fac = 4.0 / 3.0;
+    if dot < 0.0 {
+        let t = 1.0 + dot;
+        fac = fac * t + 0.75 * (1.0 - t);
+    }
+
+    let chord = b - a;
+    let axis = dir_a.cross(dir_b);
+    let len = if axis.length_squared() > 1e-12 {
+        // Perpendicular distance from `b` to the line through `a` along `axis`:
+        // the chord with its hinge-axis component removed.
+        let axis = axis.normalize();
+        (chord - chord.dot(axis) * axis).length()
+    } else {
+        chord.length()
+    };
+
+    (len * 0.5) * fac
 }
 
 /// Edge-length-weighted centre of a rim ring (§6.2.1). `ring` holds the ring's
@@ -798,58 +829,119 @@ impl LoopMesh {
     }
 
     /// §6.2.3 step 1: snapshot each rim vert's surrounding-surface tangent — the
-    /// "off-the-rim, into the surface" direction, built from the faces *outside*
-    /// the subdivided band that meet the rim vert. Each such face contributes
-    /// its edge-tangent at the rim edge; these are averaged. Verts with no
-    /// outside face (a lone band) fall back to the chord direction toward the
-    /// other rail, leaving the per-ring cubic chord-aligned (vacuous, §6.2.4).
+    /// unit "off-the-rim, into the surface" direction, pointing across the strip
+    /// toward the other rail. It is accumulated from a per-face primitive over the
+    /// rim vert's **rail edges** (the edges running *along* the strip — §2's
+    /// rails — that meet the vert, not the rungs being cut), bucketed by whether
+    /// each face belongs to the subdivided band (inner) or surrounds it (outer).
+    ///
+    /// The snapshot is taken **before** any split: once the band starts cutting,
+    /// the faces around a rim vert change, so a tangent estimated mid-operation
+    /// would read the half-built mesh (the §6.2.3 feedback hazard).
     fn rim_surface_tangents(
         &self,
         rungs: &HashMap<EdgeKey, (VertexKey, VertexKey)>,
         rail_a_verts: &HashSet<VertexKey>,
         band_faces: &HashSet<FaceKey>,
     ) -> HashMap<VertexKey, Vec3> {
+        let rung_set: HashSet<EdgeKey> = rungs.keys().copied().collect();
         let mut tangents: HashMap<VertexKey, Vec3> = HashMap::new();
         for (&_rung, &(v_a, v_b)) in rungs {
             // Chord fallback direction: from each rim vert across the strip
-            // toward the other rail.
+            // toward the other rail. Used only when the bucketed accumulation
+            // degenerates (e.g. stale/zero stored face normals, §6.2.3 trap).
             let chord_a = (self.vertex_position(v_b) - self.vertex_position(v_a))
                 .normalize_or_zero();
             let chord_b = -chord_a;
-            tangents.insert(v_a, self.surface_tangent_at(v_a, band_faces, chord_a));
-            tangents.insert(v_b, self.surface_tangent_at(v_b, band_faces, chord_b));
+            tangents.insert(
+                v_a,
+                self.surface_tangent_at(v_a, &rung_set, band_faces, chord_a),
+            );
+            tangents.insert(
+                v_b,
+                self.surface_tangent_at(v_b, &rung_set, band_faces, chord_b),
+            );
         }
         let _ = rail_a_verts;
         tangents
     }
 
-    /// The averaged off-the-rim tangent at one rim vert, summed over the edges
-    /// of faces *outside* the band that emanate from it. Falls back to
-    /// `chord_dir` when no outside face touches the vert.
+    /// The surrounding-surface tangent at one rim vert (§6.2.3 step 1). Walks the
+    /// vert's **rail edges** — its incident edges that are not rungs and border
+    /// the subdivided band — and, for each face on such an edge, accumulates the
+    /// in-face edge tangent `normalize((v_first − v_second) × face_normal)` (the
+    /// edge taken in the face's loop-winding order so the sign points into the
+    /// face). The contributions are bucketed:
+    ///
+    /// - **inner** — the band faces themselves, and
+    /// - **outer** — the surrounding faces outside the band.
+    ///
+    /// The final tangent is `normalize(−t_outer)` when any outer face is present
+    /// (the negation flips it from "out of the strip" to "across toward the other
+    /// rail"); otherwise — a boundary rim vert with only its band face — the
+    /// normalised inner sum `normalize(t_inner)`.
+    ///
+    /// **Reads stored face normals** (§6.2.3 trap): in a mesh whose normals are
+    /// stale/zero every primitive is zero and the accumulation collapses; the
+    /// `chord_dir` fallback then keeps the handle direction defined.
     fn surface_tangent_at(
         &self,
         vert: VertexKey,
+        rung_set: &HashSet<EdgeKey>,
         band_faces: &HashSet<FaceKey>,
         chord_dir: Vec3,
     ) -> Vec3 {
-        let p = self.vertex_position(vert);
-        let mut accum = Vec3::ZERO;
-        for edge in self.vertex_disk_iter(vert).collect::<Vec<_>>() {
-            let touches_outside = self
-                .edge_face_keys(edge)
-                .iter()
-                .any(|f| !band_faces.contains(f));
-            if !touches_outside {
+        let mut t_inner = Vec3::ZERO;
+        let mut t_outer = Vec3::ZERO;
+        let mut has_outer = false;
+        for rail_edge in self.vertex_disk_iter(vert).collect::<Vec<_>>() {
+            if rung_set.contains(&rail_edge) {
                 continue;
             }
-            let other = self.edge_other_vert(edge, vert);
-            accum += (self.vertex_position(other) - p).normalize_or_zero();
+            // A rail edge borders the band; rungs are skipped above. Edges that
+            // touch no band face are not rails of this strip — ignore them.
+            let touches_band = self
+                .edge_face_keys(rail_edge)
+                .iter()
+                .any(|f| band_faces.contains(f));
+            if !touches_band {
+                continue;
+            }
+            for loop_key in self.edge_radial_iter(rail_edge).collect::<Vec<_>>() {
+                let tangent = self.in_face_edge_tangent(loop_key);
+                let face = self.loop_face(loop_key);
+                if band_faces.contains(&face) {
+                    t_inner += tangent;
+                } else {
+                    t_outer += tangent;
+                    has_outer = true;
+                }
+            }
         }
-        if accum.length_squared() > 1e-12 {
-            accum.normalize()
+
+        let tan = if has_outer {
+            (-t_outer).normalize_or_zero()
+        } else {
+            t_inner.normalize_or_zero()
+        };
+        if tan.length_squared() > 0.5 {
+            tan
         } else {
             chord_dir
         }
+    }
+
+    /// The in-face edge tangent at one loop (§6.2.3 step 1 primitive): the unit
+    /// vector in the loop's face plane, perpendicular to the loop's edge, pointing
+    /// into the face interior — `normalize((v_first − v_second) × face_normal)`,
+    /// with `v_first → v_second` the loop's edge in face-winding order and
+    /// `face_normal` the face's **stored** normal.
+    fn in_face_edge_tangent(&self, loop_key: LoopKey) -> Vec3 {
+        let v_first = self.loop_vertex(loop_key);
+        let v_second = self.loop_vertex(self.loop_next(loop_key));
+        let edge_vec = self.vertex_position(v_first) - self.vertex_position(v_second);
+        let face = self.loop_face(loop_key);
+        edge_vec.cross(self.face_normal(face)).normalize_or_zero()
     }
 
     /// Apply the §6.2 PATH / SURFACE placement, overwriting the LINEAR chord
@@ -1781,6 +1873,146 @@ mod tests {
             max_div > 1e-3,
             "SURFACE cuts=2 must re-space off LINEAR even at smooth=0 (smoothstep); \
              max divergence {max_div}"
+        );
+    }
+
+    /// Build the §6.2.1.1 / §6.2.3 barrel tube: `k = 6` hexagonal rings stacked
+    /// along +z at `z = 0..4` with radii `[1.0, 1.5, 1.7, 1.5, 1.0]`, the rings
+    /// bridged by `4` bands of quads. The rungs are the vertical edges; the rails
+    /// run around each hexagon. Returns the mesh together with the rung edges of
+    /// the **interior band between ring 1 (z = 1, r = 1.5) and ring 2 (z = 2,
+    /// r = 1.7)** — the band the worked SURFACE example subdivides. Those rungs'
+    /// rim verts each carry a surrounding band (band 0 below ring 1, band 2 above
+    /// ring 2), so the surface tangents lean radially off the chord.
+    fn barrel_tube() -> (LoopMesh, Vec<EdgeKey>, Vec<VertexKey>) {
+        let radii = [1.0_f32, 1.5, 1.7, 1.5, 1.0];
+        let k = 6usize;
+        let mut mesh = LoopMesh::new();
+        // rings[z][i] vert key.
+        let mut rings: Vec<Vec<VertexKey>> = Vec::with_capacity(radii.len());
+        for (z, &r) in radii.iter().enumerate() {
+            let ring: Vec<VertexKey> = (0..k)
+                .map(|i| {
+                    let theta = i as f32 / k as f32 * std::f32::consts::TAU;
+                    mesh.create_vertex(Vec3::new(r * theta.cos(), r * theta.sin(), z as f32))
+                })
+                .collect();
+            rings.push(ring);
+        }
+        // Vertical rung edges per level boundary: rung_edges[z][i] joins
+        // rings[z][i] → rings[z+1][i].
+        let mut rung_edges: Vec<Vec<EdgeKey>> = Vec::with_capacity(radii.len() - 1);
+        for z in 0..radii.len() - 1 {
+            let level: Vec<EdgeKey> = (0..k)
+                .map(|i| mesh.create_edge([rings[z][i], rings[z + 1][i]], EdgeCreateFlags::NONE))
+                .collect();
+            rung_edges.push(level);
+        }
+        // Horizontal ring edges per ring: ring_edges[z][i] joins
+        // rings[z][i] → rings[z][(i+1)%k].
+        let mut ring_edges: Vec<Vec<EdgeKey>> = Vec::with_capacity(radii.len());
+        for z in 0..radii.len() {
+            let level: Vec<EdgeKey> = (0..k)
+                .map(|i| {
+                    mesh.create_edge(
+                        [rings[z][i], rings[z][(i + 1) % k]],
+                        EdgeCreateFlags::NONE,
+                    )
+                })
+                .collect();
+            ring_edges.push(level);
+        }
+        // Quad bands. Quad (z, i) has corners ring z..z+1, angle i..i+1, wound so
+        // its stored normal (once refreshed) points radially outward.
+        for z in 0..radii.len() - 1 {
+            for i in 0..k {
+                let i1 = (i + 1) % k;
+                let v00 = rings[z][i];
+                let v01 = rings[z][i1];
+                let v11 = rings[z + 1][i1];
+                let v10 = rings[z + 1][i];
+                let e_bottom = ring_edges[z][i];
+                let e_right = rung_edges[z][i1];
+                let e_top = ring_edges[z + 1][i];
+                let e_left = rung_edges[z][i];
+                mesh.face_create(
+                    &[v00, v01, v11, v10],
+                    &[e_bottom, e_right, e_top, e_left],
+                    FaceCreateFlags::NONE,
+                );
+            }
+        }
+        // Refresh stored face normals so the §6.2.3 tangent primitive reads a
+        // non-degenerate normal (the stored-normals trap, §6.2.3 step 1 / §6.2.4).
+        let all_faces = mesh.face_keys();
+        mesh.recalc_face_normals(&all_faces, false);
+
+        let band_rungs = rung_edges[1].clone();
+        (mesh, band_rungs, rings[1].clone())
+    }
+
+    #[test]
+    fn surface_smooth_barrel_matches_worked_example() {
+        // §6.2.3 step 2 / §6.2.1.1 — the worked SURFACE `smooth = 0.6`, `cuts = 2`
+        // barrel: the angle-0 rung (v_A = (1.5,0,1), v_B = (1.7,0,2)) lands its two
+        // inserted ring verts at the *normals-current* oracle coordinates
+        // (1.59948, 0, 1.30874) at t = 1/3 and (1.68442, 0, 1.68242) at t = 2/3.
+        let (mut mesh, rungs, _ring1) = barrel_tube();
+        let result = mesh.subdivide_edgering(&rungs, params(RingInterp::Surface, 2, 0.6));
+
+        let target_third = Vec3::new(1.59948, 0.0, 1.30874);
+        let target_two_thirds = Vec3::new(1.68442, 0.0, 1.68242);
+
+        // The angle-0 rung's two cut verts are the ones whose (x, z) sit closest
+        // to the two targets; y must stay ≈ 0 (the angle-0 plane).
+        let mut nearest_third = f32::INFINITY;
+        let mut nearest_two_thirds = f32::INFINITY;
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            nearest_third = nearest_third.min(p.distance(target_third));
+            nearest_two_thirds = nearest_two_thirds.min(p.distance(target_two_thirds));
+        }
+        assert!(
+            nearest_third < 1e-3,
+            "SURFACE smooth=0.6 t=1/3 vert must hit the worked barrel coordinate \
+             {target_third}; nearest was {nearest_third}"
+        );
+        assert!(
+            nearest_two_thirds < 1e-3,
+            "SURFACE smooth=0.6 t=2/3 vert must hit the worked barrel coordinate \
+             {target_two_thirds}; nearest was {nearest_two_thirds}"
+        );
+    }
+
+    #[test]
+    fn surface_smooth_barrel_bows_off_chord() {
+        // §6.2.3 — the `smooth = 0.6` SURFACE cut bows the angle-0 ring verts
+        // *off* the chord line v_A → v_B by ≈ 0.037 (t = 1/3) and ≈ 0.047
+        // (t = 2/3). Pin the off-chord magnitude directly so a regression that
+        // collapses the bow (e.g. zero tangents) is caught even though it would
+        // still leave SURFACE ≠ LINEAR via the smoothstep re-spacing.
+        let (mut mesh, rungs, _ring1) = barrel_tube();
+        let result = mesh.subdivide_edgering(&rungs, params(RingInterp::Surface, 2, 0.6));
+
+        let v_a = Vec3::new(1.5, 0.0, 1.0);
+        let v_b = Vec3::new(1.7, 0.0, 2.0);
+        let chord_dir = (v_b - v_a).normalize();
+        let off_chord = |p: Vec3| -> f32 {
+            let rel = p - v_a;
+            (rel - rel.dot(chord_dir) * chord_dir).length()
+        };
+
+        let mut max_bow = 0.0f32;
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            if p.y.abs() < 1e-3 {
+                max_bow = max_bow.max(off_chord(p));
+            }
+        }
+        assert!(
+            max_bow > 0.03,
+            "SURFACE smooth=0.6 must bow the angle-0 ring off the chord line \
+             (≈0.037..0.049); max off-chord was {max_bow}"
         );
     }
 
