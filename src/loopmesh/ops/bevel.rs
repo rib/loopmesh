@@ -222,17 +222,24 @@ impl LoopMesh {
 
     /// Foundational single-segment edge bevel (BEVEL.md §7).
     ///
-    /// Bevels each **isolated** manifold edge in `geom`: an edge with exactly two
-    /// incident faces whose endpoints are shared with no *second* beveled edge
-    /// (§7.2). Each such edge `E = {a, b}` is replaced by four strip verts (two
-    /// per endpoint, slid perpendicular into each adjacent face, §7.3), one strip
-    /// quad `aL–bL–bR–aR` (§7.1), with each valence-3 terminal endpoint absorbed
-    /// into its surviving third face (quad → pentagon, §7.4 / §7.5). The two
-    /// original endpoints are then freed as loose verts (§7.1 item 5).
+    /// Bevels each manifold edge in `geom`. An edge `E = {a, b}` is replaced by
+    /// four strip verts (two per endpoint, slid perpendicular into each adjacent
+    /// face, §7.3) and one strip quad `aL–bL–bR–aR` (§7.1). How each endpoint is
+    /// closed depends on how many beveled edges meet there:
     ///
-    /// A non-manifold edge, a non-isolated edge (sharing an endpoint with another
-    /// beveled edge — the junction case), or an endpoint of valence ≠ 3 is skipped
-    /// here: those are the §7.6 / §8 stubs.
+    /// - **Terminal endpoint** (`s == 1`, exactly one beveled edge): the two
+    ///   strip verts are absorbed by the surviving valence-3 third face (quad →
+    ///   pentagon, §7.4 / §7.5).
+    /// - **Junction endpoint** (`s ≥ 2`, two or more beveled edges meeting): the
+    ///   arriving strips share a ring of `s` **boundverts** (one per disk sector
+    ///   between consecutive beveled edges, §7.6.1), each placed by the
+    ///   constrained meet of the two adjacent strips' offset lines (§7.6.2). A
+    ///   `s ≥ 3` junction caps the ring with one flat **patch face** (§7.6.3); a
+    ///   `s == 2` "through" junction adds no patch face.
+    ///
+    /// Single segment / symmetric `offset` only. A non-manifold edge or an
+    /// endpoint whose terminal close needs valence ≥ 4 (the on-edge-vert fill of
+    /// §7.5) is skipped — those remain §7.5 / §8 stubs.
     fn bevel_edges(&mut self, geom: &[GeomKey], offset: f32) -> BevelResult {
         let mut result = BevelResult::default();
 
@@ -245,34 +252,34 @@ impl LoopMesh {
             }
         }
 
-        // §7.2: the isolated restriction — an endpoint shared by two beveled edges
-        // is a junction (§7.6), out of scope. Count endpoint incidences across the
-        // selection and drop any edge whose endpoint is shared with another.
-        let mut endpoint_uses: Vec<(VertexKey, usize)> = Vec::new();
+        // Count how many beveled edges meet at each endpoint: `s == 1` is a
+        // terminal close (§7.5), `s ≥ 2` a junction (§7.6).
+        let mut beveled_at: Vec<(VertexKey, usize)> = Vec::new();
         for &edge in &beveled {
             for endpoint in self.edge_vert_keys(edge) {
-                match endpoint_uses.iter_mut().find(|(v, _)| *v == endpoint) {
+                match beveled_at.iter_mut().find(|(v, _)| *v == endpoint) {
                     Some((_, count)) => *count += 1,
-                    None => endpoint_uses.push((endpoint, 1)),
+                    None => beveled_at.push((endpoint, 1)),
                 }
             }
         }
-        let endpoint_shared = |vertex: VertexKey| -> bool {
-            endpoint_uses
-                .iter()
-                .find(|(v, _)| *v == vertex)
-                .map(|(_, count)| *count > 1)
-                .unwrap_or(false)
-        };
+        // The set of endpoints that are junctions (≥ 2 beveled edges meeting).
+        let junctions: Vec<VertexKey> = beveled_at
+            .iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(v, _)| *v)
+            .collect();
 
-        for &edge in &beveled {
-            let [a, b] = self.edge_vert_keys(edge);
-            if endpoint_shared(a) || endpoint_shared(b) {
-                continue; // junction endpoint — §7.6 stub
+        if junctions.is_empty() {
+            // No shared endpoint: every edge is isolated, every endpoint terminal
+            // — the foundational §7 path, unchanged.
+            for &edge in &beveled {
+                self.bevel_single_edge(edge, offset, &mut result);
             }
-            self.bevel_single_edge(edge, offset, &mut result);
+            return result;
         }
 
+        self.bevel_edges_with_junctions(&beveled, &junctions, offset, &mut result);
         result
     }
 
@@ -408,8 +415,615 @@ impl LoopMesh {
         result.edges.extend(strip.edges);
 
         // §7.1 item 5 / §6.3: both endpoints are now loose. Free them.
-        self.vertex_kill(a);
-        self.vertex_kill(b);
+        self.free_loose_vertex(a);
+        self.free_loose_vertex(b);
+    }
+
+    /// Free a beveled endpoint after re-stitch (BEVEL.md §5.1.1 / §6.3). The
+    /// re-stitch rebuilds every incident face off the endpoint, leaving only
+    /// **loose** incident edges (orphaned legs with no remaining loop) on its disk;
+    /// this guards that no edge still on the disk carries a face before draining
+    /// the disk and freeing the vertex. A surviving *surface* edge (one still on a
+    /// face) means the re-stitch left the endpoint attached to live geometry — the
+    /// invariant the old blind `vertex_kill` relied on, now checked rather than
+    /// assumed.
+    fn free_loose_vertex(&mut self, vertex: VertexKey) {
+        for edge in self.iter_disk_edges(vertex).collect::<Vec<_>>() {
+            assert!(
+                self.edge_radial_iter(edge).next().is_none(),
+                "free_loose_vertex: endpoint {vertex:?} still on a face via edge {edge:?}",
+            );
+        }
+        self.vertex_kill(vertex);
+    }
+
+    /// Edge bevel where two or more beveled edges meet at one or more **junction**
+    /// vertices (BEVEL.md §7.6). Places every near-corner vert (boundverts at
+    /// junctions, strip verts at terminal endpoints) and far-corner strip vert
+    /// against the *pristine* mesh (§7.5 placement-before-surgery), then re-stitches
+    /// every incident face, builds the per-edge strip quads and the per-junction
+    /// patch faces, and frees the consumed original endpoints.
+    fn bevel_edges_with_junctions(
+        &mut self,
+        beveled: &[EdgeKey],
+        junctions: &[VertexKey],
+        offset: f32,
+        result: &mut BevelResult,
+    ) {
+        // Drop any non-manifold beveled edge (§2.1): a junction strip needs each
+        // arriving edge to carry exactly two faces.
+        let mut beveled_manifold: Vec<EdgeKey> = Vec::new();
+        for &edge in beveled {
+            if self.edge_radial_iter(edge).count() == 2 {
+                beveled_manifold.push(edge);
+            }
+        }
+        if beveled_manifold.is_empty() {
+            return;
+        }
+
+        let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
+
+        // The original endpoints to consume: every endpoint of a beveled edge.
+        let mut endpoints: Vec<VertexKey> = Vec::new();
+        for &edge in &beveled_manifold {
+            for endpoint in self.edge_vert_keys(edge) {
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+
+        // Phase 1 (pristine mesh): for every (beveled edge, endpoint, adjacent
+        // face) corner, decide which *near-corner vertex* the strip lands on. At a
+        // terminal endpoint each face-side gets its own fresh strip vert; at a
+        // junction the two strip verts flanking a shared face collapse to that
+        // sector's single boundvert (§7.6.1). `corner_vert` maps
+        // (edge, endpoint, face) → the vertex the strip corner uses.
+        let mut corner_vert: Vec<CornerVert> = Vec::new();
+        let mut substitutions: Vec<FaceSubstitution> = Vec::new();
+        let mut junction_patches: Vec<JunctionPatch> = Vec::new();
+
+        for &endpoint in &endpoints {
+            if junctions.contains(&endpoint) {
+                self.place_junction_boundverts(
+                    endpoint,
+                    &is_beveled,
+                    offset,
+                    &mut corner_vert,
+                    &mut substitutions,
+                    &mut junction_patches,
+                    result,
+                );
+            } else {
+                self.place_terminal_strip_verts(
+                    endpoint,
+                    &beveled_manifold,
+                    offset,
+                    &mut corner_vert,
+                    &mut substitutions,
+                    result,
+                );
+            }
+        }
+
+        // Phase 2: re-stitch every incident face, swapping each consumed endpoint
+        // corner for the ordered near-corner vert(s) recorded for that (vertex,
+        // face) corner (§7.4 / §7.6.1). A terminal third face swaps its corner for
+        // two strip verts (1-for-2); a strip's radial face and every junction
+        // sector face swap for one (1-for-1).
+        let mut incident_faces: Vec<FaceKey> = Vec::new();
+        for &endpoint in &endpoints {
+            for face in self.vert_face_keys(endpoint) {
+                if !incident_faces.contains(&face) {
+                    incident_faces.push(face);
+                }
+            }
+        }
+        for face in incident_faces {
+            self.restitch_junction_face(face, &endpoints, &substitutions);
+        }
+
+        // Phase 3: one strip quad per beveled edge over its four near/far corner
+        // verts (§7.1 item 2).
+        for &edge in &beveled_manifold {
+            self.build_junction_strip(edge, &corner_vert, result);
+        }
+
+        // Phase 4: cap each `s ≥ 3` junction with one flat patch face over its
+        // boundvert ring (§7.6.3). `s == 2` adds no patch.
+        for patch in &junction_patches {
+            if patch.boundverts.len() >= 3 {
+                self.build_patch_face(&patch.boundverts, result);
+            }
+        }
+
+        // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
+        for &endpoint in &endpoints {
+            self.free_loose_vertex(endpoint);
+        }
+    }
+
+    /// Place the boundverts of one junction vertex (BEVEL.md §7.6.1 / §7.6.2).
+    ///
+    /// Walks the faces around `vertex` to recover the rotational sector structure,
+    /// groups them into sectors delimited by consecutive beveled edges, places one
+    /// boundvert per sector at the constrained meet of the two flanking strips'
+    /// offset lines, and records (edge, vertex, face) → boundvert for every corner
+    /// in the sector. The ordered boundvert ring is stored for the patch face.
+    fn place_junction_boundverts(
+        &mut self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+        corner_vert: &mut Vec<CornerVert>,
+        substitutions: &mut Vec<FaceSubstitution>,
+        junction_patches: &mut Vec<JunctionPatch>,
+        result: &mut BevelResult,
+    ) {
+        // Rotational corner ring: each incident face contributes the pair of its
+        // two edges meeting at `vertex`. Chain them edge-to-edge into the disk
+        // walk order around the vertex.
+        let corners = self.vertex_corner_ring(vertex);
+
+        // Split the ring into sectors at beveled edges. A sector runs from one
+        // beveled edge, through any unbeveled edges and their faces, to the next
+        // beveled edge. Each sector yields one boundvert (§7.6.1).
+        let sectors = sector_split(&corners, is_beveled);
+
+        let vertex_position = self.vertex_position(vertex);
+        let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors.len());
+
+        for sector in &sectors {
+            let boundvert_position =
+                self.solve_meet_point(vertex, vertex_position, sector, offset);
+            let boundvert = self.create_vertex(boundvert_position);
+            result.verts.push(boundvert);
+            boundverts.push(boundvert);
+
+            // Every face in this sector terminates on this single boundvert: the
+            // two bounding beveled edges' strips and any absorbed unbeveled leg's
+            // faces all join here (§7.6.1). Record (vertex, face) → boundvert for
+            // each distinct face so the re-stitch collapses each sector corner to
+            // one vert, and keep the per-edge record for the strip builder.
+            for &(edge, face) in &sector.corners {
+                set_face_substitution(substitutions, vertex, face, vec![boundvert]);
+                if is_beveled(edge) {
+                    corner_vert.push(CornerVert {
+                        edge,
+                        vertex,
+                        face,
+                        near_vert: boundvert,
+                    });
+                }
+            }
+        }
+
+        junction_patches.push(JunctionPatch { boundverts });
+    }
+
+    /// Place the two strip verts of a terminal endpoint (BEVEL.md §7.3 / §7.4 /
+    /// §7.5): one per adjacent face of the single beveled edge there, slid
+    /// perpendicular into the face. Each strip's radial face swaps its corner for
+    /// the one strip vert on its side (1-for-1); the surviving **third** face(s)
+    /// between the unbeveled legs swap their corner for *both* strip verts ordered
+    /// so the strip vert sharing the incoming leg stays adjacent to `prev`
+    /// (1-for-2, the absorbed valence-3 corner of §7.4 / §7.5).
+    fn place_terminal_strip_verts(
+        &mut self,
+        vertex: VertexKey,
+        beveled: &[EdgeKey],
+        offset: f32,
+        corner_vert: &mut Vec<CornerVert>,
+        substitutions: &mut Vec<FaceSubstitution>,
+        result: &mut BevelResult,
+    ) {
+        // The single beveled edge at this terminal endpoint.
+        let edge = self
+            .iter_disk_edges(vertex)
+            .find(|&e| beveled.contains(&e))
+            .expect("a terminal endpoint has its one beveled edge");
+
+        let radial_faces: Vec<FaceKey> = self
+            .edge_loop_keys(edge)
+            .iter()
+            .map(|&l| self.loop_face(l))
+            .collect();
+        if radial_faces.len() != 2 {
+            return;
+        }
+        let face_left = radial_faces[0];
+        let face_right = radial_faces[1];
+
+        let [a, b] = self.edge_vert_keys(edge);
+        let far = if a == vertex { b } else { a };
+        let direction = {
+            let segment = self.vertex_position(far) - self.vertex_position(vertex);
+            let length = segment.length();
+            if length <= f32::EPSILON {
+                return;
+            }
+            segment / length
+        };
+
+        // §7.5 foundational pin: only the valence-3 terminal close is implemented
+        // — the surviving third face absorbs the corner. Valence ≥ 4 needs the
+        // on-edge-vert fill (§7.5), still a stub; skip it.
+        if self.iter_disk_edges(vertex).count() != 3 {
+            return;
+        }
+
+        let strip_for_face = |this: &mut Self, face: FaceKey, result: &mut BevelResult| {
+            let normal = this.face_plane_normal(face);
+            let center = this.face_center_of_mass(face);
+            let position = strip_vert_position(
+                this.vertex_position(vertex),
+                direction,
+                normal,
+                center,
+                offset,
+            );
+            let strip_vert = this.create_vertex(position);
+            result.verts.push(strip_vert);
+            strip_vert
+        };
+
+        let strip_left = strip_for_face(self, face_left, result);
+        let strip_right = strip_for_face(self, face_right, result);
+
+        // 1-for-1 on each radial face, plus the per-edge record for the strip.
+        for &(face, strip_vert) in &[(face_left, strip_left), (face_right, strip_right)] {
+            set_face_substitution(substitutions, vertex, face, vec![strip_vert]);
+            corner_vert.push(CornerVert {
+                edge,
+                vertex,
+                face,
+                near_vert: strip_vert,
+            });
+        }
+
+        // The third face(s): each swaps the corner for both strip verts, ordered so
+        // the one sharing the incoming leg sits next to `prev` (§7.4).
+        let left_other = self.face_other_edge_at(face_left, vertex, edge);
+        let right_other = self.face_other_edge_at(face_right, vertex, edge);
+        for face in self.vert_face_keys(vertex) {
+            if face == face_left || face == face_right {
+                continue;
+            }
+            let ordered =
+                self.order_third_face_strip(face, vertex, left_other, right_other, strip_left, strip_right);
+            set_face_substitution(substitutions, vertex, face, ordered);
+        }
+    }
+
+    /// Order a terminal third face's two strip verts so the one sharing the
+    /// face's incoming leg at `vertex` comes first (BEVEL.md §7.4). The third face
+    /// shares the unbeveled leg `left_other` with the strip's left face and
+    /// `right_other` with its right face.
+    fn order_third_face_strip(
+        &self,
+        face: FaceKey,
+        vertex: VertexKey,
+        left_other: EdgeKey,
+        right_other: EdgeKey,
+        strip_left: VertexKey,
+        strip_right: VertexKey,
+    ) -> Vec<VertexKey> {
+        let cycle_verts = self.face_vert_keys(face);
+        let cycle_length = cycle_verts.len();
+        let index = cycle_verts
+            .iter()
+            .position(|&w| w == vertex)
+            .expect("third face has the endpoint as a corner");
+        let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
+        let incoming_edge = self
+            .query_edge_exists(prev_vertex, vertex)
+            .expect("third face's incoming corner edge exists");
+        if incoming_edge == left_other {
+            vec![strip_left, strip_right]
+        } else if incoming_edge == right_other {
+            vec![strip_right, strip_left]
+        } else {
+            vec![strip_left, strip_right]
+        }
+    }
+
+    /// The rotational ring of (edge-pair, face) corners around `vertex`: each
+    /// incident face contributes its two edges meeting at `vertex`. Returned as a
+    /// cyclic sequence of `VertexCorner { incoming_edge, face, outgoing_edge }`
+    /// chained so consecutive corners share an edge — the disk walk order.
+    fn vertex_corner_ring(&self, vertex: VertexKey) -> Vec<VertexCorner> {
+        // Per incident face: its two edges at `vertex`.
+        let mut face_edges: Vec<(FaceKey, EdgeKey, EdgeKey)> = Vec::new();
+        for face in self.vert_face_keys(vertex) {
+            let mut at_vertex: Vec<EdgeKey> = Vec::new();
+            for loop_key in self.face_loop_keys(face) {
+                let edge = self.loop_edge(loop_key);
+                let [p, q] = self.edge_vert_keys(edge);
+                if (p == vertex || q == vertex) && !at_vertex.contains(&edge) {
+                    at_vertex.push(edge);
+                }
+            }
+            if at_vertex.len() == 2 {
+                face_edges.push((face, at_vertex[0], at_vertex[1]));
+            }
+        }
+
+        // Chain faces edge-to-edge. Start anywhere; follow the shared edge into
+        // the next face until the ring closes.
+        let mut ring: Vec<VertexCorner> = Vec::with_capacity(face_edges.len());
+        if face_edges.is_empty() {
+            return ring;
+        }
+
+        let mut used = vec![false; face_edges.len()];
+        let (start_face, start_e0, start_e1) = face_edges[0];
+        used[0] = true;
+        ring.push(VertexCorner {
+            incoming_edge: start_e0,
+            face: start_face,
+            outgoing_edge: start_e1,
+        });
+        let mut frontier_edge = start_e1;
+
+        while ring.len() < face_edges.len() {
+            let next = face_edges.iter().enumerate().find(|(index, (_, e0, e1))| {
+                !used[*index] && (*e0 == frontier_edge || *e1 == frontier_edge)
+            });
+            match next {
+                Some((index, &(face, e0, e1))) => {
+                    used[index] = true;
+                    let outgoing = if e0 == frontier_edge { e1 } else { e0 };
+                    ring.push(VertexCorner {
+                        incoming_edge: frontier_edge,
+                        face,
+                        outgoing_edge: outgoing,
+                    });
+                    frontier_edge = outgoing;
+                }
+                None => break, // open fan or non-manifold — stop chaining
+            }
+        }
+
+        ring
+    }
+
+    /// Solve a boundvert's constrained meet point (BEVEL.md §7.6.2). Assembles the
+    /// offset-line rows (one per face in the sector, "stay at perpendicular
+    /// `offset` from my bounding beveled edge in my plane") plus, for a single
+    /// planar face, an embedding row (membership in the face plane, zero
+    /// out-of-plane rise), and solves the normal equations `AᵀA·x = Aᵀc`. The
+    /// least-squares form subsumes the exact 2-line intersection of the planar
+    /// case.
+    fn solve_meet_point(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        sector: &Sector,
+        offset: f32,
+    ) -> Vec3 {
+        // Each face in the sector that is bounded by a beveled edge contributes an
+        // offset row: the unit in-plane perpendicular to that edge, pointing into
+        // the face, with target `offset` (measured relative to `vertex`).
+        let mut rows: Vec<(Vec3, f32)> = Vec::new();
+        let mut sector_normal = Vec3::ZERO;
+
+        for &(edge, face) in &sector.corners {
+            if !sector.bounding_edges.contains(&edge) {
+                continue;
+            }
+            let [a, b] = self.edge_vert_keys(edge);
+            let far = if a == vertex { b } else { a };
+            let direction = {
+                let segment = self.vertex_position(far) - vertex_position;
+                let length = segment.length();
+                if length <= f32::EPSILON {
+                    continue;
+                }
+                segment / length
+            };
+            let normal = self.face_plane_normal(face);
+            let center = self.face_center_of_mass(face);
+            let mut into_face = direction.cross(normal);
+            let into_len = into_face.length();
+            if into_len <= f32::EPSILON {
+                continue;
+            }
+            into_face /= into_len;
+            if into_face.dot(center - vertex_position) < 0.0 {
+                into_face = -into_face;
+            }
+            rows.push((into_face, offset));
+            sector_normal += normal;
+        }
+
+        // Embedding row for a planar (single-face) sector: pin membership in the
+        // face plane (no out-of-plane rise for a flat chamfer). Without it two
+        // coplanar offset rows leave the meet free along a whole line (§7.6.2).
+        if sector.corners.len() == 1 && sector_normal.length() > f32::EPSILON {
+            rows.push((sector_normal.normalize(), 0.0));
+        }
+
+        solve_normal_equations(&rows, vertex_position).unwrap_or(vertex_position)
+    }
+
+    /// Re-stitch one face incident to a consumed endpoint (BEVEL.md §7.4 /
+    /// §7.6.1). Each consumed-endpoint corner of `face` is replaced by the ordered
+    /// near-corner vert(s) recorded for that (vertex, face) corner: one vert for a
+    /// strip's radial face or a junction sector face (1-for-1), two for a terminal
+    /// third face (1-for-2). A corner with no recorded substitution is left as-is.
+    fn restitch_junction_face(
+        &mut self,
+        face: FaceKey,
+        endpoints: &[VertexKey],
+        substitutions: &[FaceSubstitution],
+    ) {
+        let cycle_verts = self.face_vert_keys(face);
+
+        let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_verts.len() + 1);
+        let mut changed = false;
+        for &w in &cycle_verts {
+            if !endpoints.contains(&w) {
+                new_cycle.push(w);
+                continue;
+            }
+            match face_substitution(substitutions, w, face) {
+                Some(replacement) => {
+                    new_cycle.extend_from_slice(replacement);
+                    changed = true;
+                }
+                None => new_cycle.push(w),
+            }
+        }
+
+        if !changed {
+            return;
+        }
+
+        self.face_kill(face);
+        let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
+        self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+    }
+
+    /// Build one beveled edge's strip quad over its four near/far corner verts
+    /// (BEVEL.md §7.1 item 2). The four corners are the edge's two near corners
+    /// (one per adjacent face, at each endpoint) — at a junction these are shared
+    /// boundverts, at a terminal they are the endpoint's fresh strip verts. Wound
+    /// opposite the left face's traversal so each strip edge stays radial-2 (§5.1).
+    fn build_junction_strip(
+        &mut self,
+        edge: EdgeKey,
+        corner_vert: &[CornerVert],
+        result: &mut BevelResult,
+    ) {
+        let [a, b] = self.edge_vert_keys(edge);
+
+        // The edge's two radial faces give its left/right sides. The strip quad is
+        // a-left, b-left, b-right, a-right.
+        let radial_faces: Vec<FaceKey> = {
+            let mut faces = Vec::new();
+            for record in corner_vert {
+                if record.edge == edge && !faces.contains(&record.face) {
+                    faces.push(record.face);
+                }
+            }
+            faces
+        };
+        if radial_faces.len() != 2 {
+            return; // a non-manifold edge produced no strip
+        }
+        let face_left = radial_faces[0];
+        let face_right = radial_faces[1];
+
+        let a_left = near_corner(corner_vert, edge, a, face_left);
+        let a_right = near_corner(corner_vert, edge, a, face_right);
+        let b_left = near_corner(corner_vert, edge, b, face_left);
+        let b_right = near_corner(corner_vert, edge, b, face_right);
+
+        // A through-junction (s == 2) collapses an edge's two near corners on a
+        // side into one boundvert; the strip quad can then degenerate. Skip a strip
+        // whose four corners are not four distinct verts in a proper ring.
+        let ring = [a_left, b_left, b_right, a_right];
+        if ring_has_repeat(&ring) {
+            // The strip ran into a coincident boundvert pair; emit a triangle by
+            // dropping the duplicate so the strip still closes (§7.6.3 seam).
+            self.build_collapsed_strip(&ring, result);
+            return;
+        }
+
+        // Adopt the left face's near long edge orientation: the re-stitched left
+        // face traverses a_left–b_left, so wind the quad the opposite way.
+        let mut quad = ring.to_vec();
+        if let Some(long_edge) = self.query_edge_exists(a_left, b_left) {
+            let face_runs_forward = self
+                .edge_loop_keys(long_edge)
+                .first()
+                .map(|&l| {
+                    let start = self.loop_vertex(l);
+                    let end = self.loop_vertex(self.loop_next(l));
+                    start == a_left && end == b_left
+                })
+                .unwrap_or(false);
+            if face_runs_forward {
+                quad.reverse();
+            }
+        }
+
+        let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
+        result.faces.push(face);
+        for i in 0..quad.len() {
+            let p = quad[i];
+            let q = quad[(i + 1) % quad.len()];
+            if let Some(strip_edge) = self.query_edge_exists(p, q) {
+                if !result.edges.contains(&strip_edge) {
+                    result.edges.push(strip_edge);
+                }
+            }
+        }
+    }
+
+    /// Build a degenerate strip whose ring has a repeated vert (a through-junction
+    /// seam where two near corners coincide, §7.6.3): drop the duplicate and build
+    /// the surviving triangle, or skip entirely if fewer than three distinct verts.
+    fn build_collapsed_strip(&mut self, ring: &[VertexKey; 4], result: &mut BevelResult) {
+        let mut distinct: Vec<VertexKey> = Vec::with_capacity(4);
+        for &v in ring {
+            if !distinct.contains(&v) {
+                distinct.push(v);
+            }
+        }
+        if distinct.len() < 3 {
+            return;
+        }
+        let face = self.face_create_verts(&distinct, FaceCreateFlags::NONE);
+        result.faces.push(face);
+        for i in 0..distinct.len() {
+            let p = distinct[i];
+            let q = distinct[(i + 1) % distinct.len()];
+            if let Some(edge) = self.query_edge_exists(p, q) {
+                if !result.edges.contains(&edge) {
+                    result.edges.push(edge);
+                }
+            }
+        }
+    }
+
+    /// Cap a junction's boundvert ring with one flat patch face (BEVEL.md §7.6.3).
+    /// The patch adopts the strip edges already minted between consecutive
+    /// boundverts (`B_(k-1)`–`B_k` is the near edge of edge `g_k`'s strip), wound
+    /// opposite the arriving strips so each patch edge stays radial-2.
+    fn build_patch_face(&mut self, boundverts: &[VertexKey], result: &mut BevelResult) {
+        // The patch boundary is the boundvert ring, already in sector order. Wind
+        // it opposite the strip face traversal on the first shared edge.
+        let first_a = boundverts[0];
+        let first_b = boundverts[1];
+        let mut ring = boundverts.to_vec();
+        if let Some(shared_edge) = self.query_edge_exists(first_a, first_b) {
+            let strip_runs_forward = self
+                .edge_loop_keys(shared_edge)
+                .first()
+                .map(|&l| {
+                    let start = self.loop_vertex(l);
+                    let end = self.loop_vertex(self.loop_next(l));
+                    start == first_a && end == first_b
+                })
+                .unwrap_or(false);
+            if strip_runs_forward {
+                ring.reverse();
+            }
+        }
+
+        let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+        result.faces.push(face);
+        for i in 0..ring.len() {
+            let p = ring[i];
+            let q = ring[(i + 1) % ring.len()];
+            if let Some(edge) = self.query_edge_exists(p, q) {
+                if !result.edges.contains(&edge) {
+                    result.edges.push(edge);
+                }
+            }
+        }
     }
 
     /// Re-stitch one face incident to a beveled edge's endpoint(s) (BEVEL.md §7.4
@@ -851,6 +1465,212 @@ impl LoopMesh {
 struct CapFace {
     face: FaceKey,
     chamfer_edges: Vec<EdgeKey>,
+}
+
+/// One (beveled edge, endpoint, adjacent face) corner of an edge-bevel junction
+/// group and the **near-corner vert** its strip lands on there (BEVEL.md §7.6.1):
+/// a fresh strip vert at a terminal endpoint, or a shared sector boundvert at a
+/// junction.
+struct CornerVert {
+    edge: EdgeKey,
+    vertex: VertexKey,
+    face: FaceKey,
+    near_vert: VertexKey,
+}
+
+/// One junction vertex's ordered boundvert ring (BEVEL.md §7.6.1), capped by the
+/// patch face when `s ≥ 3` (§7.6.3).
+struct JunctionPatch {
+    boundverts: Vec<VertexKey>,
+}
+
+/// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
+/// §7.6.1): the ordered near-corner vert(s) the re-stitch substitutes for the
+/// single corner vertex `vertex` on `face`. One vert for a 1-for-1 swap (a strip's
+/// radial face or a junction sector face), two for a terminal third face's
+/// 1-for-2 absorbed corner.
+struct FaceSubstitution {
+    vertex: VertexKey,
+    face: FaceKey,
+    verts: Vec<VertexKey>,
+}
+
+/// Record (or overwrite) the ordered substitution for `(vertex, face)`.
+fn set_face_substitution(
+    substitutions: &mut Vec<FaceSubstitution>,
+    vertex: VertexKey,
+    face: FaceKey,
+    verts: Vec<VertexKey>,
+) {
+    match substitutions
+        .iter_mut()
+        .find(|s| s.vertex == vertex && s.face == face)
+    {
+        Some(existing) => existing.verts = verts,
+        None => substitutions.push(FaceSubstitution { vertex, face, verts }),
+    }
+}
+
+/// The ordered substitution recorded for `(vertex, face)`, if any.
+fn face_substitution(
+    substitutions: &[FaceSubstitution],
+    vertex: VertexKey,
+    face: FaceKey,
+) -> Option<&[VertexKey]> {
+    substitutions
+        .iter()
+        .find(|s| s.vertex == vertex && s.face == face)
+        .map(|s| s.verts.as_slice())
+}
+
+/// One corner of the rotational ring around a vertex: an incident face flanked by
+/// its two edges meeting at that vertex (BEVEL.md §7.6.1 disk walk). Consecutive
+/// ring entries share an edge.
+#[derive(Clone, Copy)]
+struct VertexCorner {
+    incoming_edge: EdgeKey,
+    face: FaceKey,
+    outgoing_edge: EdgeKey,
+}
+
+/// One angular sector of a junction (BEVEL.md §7.6.1): the run of faces between
+/// two consecutive beveled edges around the disk. `bounding_edges` are the two
+/// beveled edges delimiting it (the offset-line sources for the meet solve);
+/// `corners` are every (edge, face) pair inside it.
+struct Sector {
+    bounding_edges: Vec<EdgeKey>,
+    corners: Vec<(EdgeKey, FaceKey)>,
+}
+
+/// The near-corner vert recorded for the (edge, vertex, face) corner.
+fn near_corner(
+    corner_vert: &[CornerVert],
+    edge: EdgeKey,
+    vertex: VertexKey,
+    face: FaceKey,
+) -> VertexKey {
+    corner_vert
+        .iter()
+        .find(|c| c.edge == edge && c.vertex == vertex && c.face == face)
+        .map(|c| c.near_vert)
+        .expect("every beveled corner has a recorded near-corner vert")
+}
+
+/// True if `ring` contains the same vertex twice (a collapsed strip side, §7.6.3).
+fn ring_has_repeat(ring: &[VertexKey]) -> bool {
+    for i in 0..ring.len() {
+        for j in (i + 1)..ring.len() {
+            if ring[i] == ring[j] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Split a vertex's rotational corner ring into sectors at the beveled edges
+/// (BEVEL.md §7.6.1). Each sector runs from one beveled edge, through any unbeveled
+/// edges/faces, to the next beveled edge, and yields one boundvert. Returns one
+/// `Sector` per gap between consecutive beveled edges in disk order.
+fn sector_split(corners: &[VertexCorner], is_beveled: &dyn Fn(EdgeKey) -> bool) -> Vec<Sector> {
+    if corners.is_empty() {
+        return Vec::new();
+    }
+
+    // Find a starting corner whose incoming edge is beveled, so the first sector
+    // opens on a beveled edge. (A closed junction always has ≥ 2 beveled edges.)
+    let start = corners
+        .iter()
+        .position(|c| is_beveled(c.incoming_edge))
+        .unwrap_or(0);
+    let count = corners.len();
+
+    let mut sectors: Vec<Sector> = Vec::new();
+    let mut current = Sector {
+        bounding_edges: vec![corners[start].incoming_edge],
+        corners: Vec::new(),
+    };
+
+    for step in 0..count {
+        let corner = corners[(start + step) % count];
+        current.corners.push((corner.incoming_edge, corner.face));
+        // A different (outgoing) beveled edge closes the current sector and opens
+        // the next.
+        if is_beveled(corner.outgoing_edge) {
+            current.corners.push((corner.outgoing_edge, corner.face));
+            if !current.bounding_edges.contains(&corner.outgoing_edge) {
+                current.bounding_edges.push(corner.outgoing_edge);
+            }
+            sectors.push(current);
+            current = Sector {
+                bounding_edges: vec![corner.outgoing_edge],
+                corners: Vec::new(),
+            };
+        }
+    }
+
+    sectors
+}
+
+/// Solve the small constrained meet system by the normal equations
+/// `AᵀA·x = Aᵀc` (BEVEL.md §7.6.2). Each row is `(direction, target)` meaning
+/// `dot(x − anchor, direction) = target`. Returns the solution as
+/// `anchor + offset`, or `None` if `AᵀA` is singular and no minimum-norm fallback
+/// is available.
+fn solve_normal_equations(rows: &[(Vec3, f32)], anchor: Vec3) -> Option<Vec3> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    // Build the symmetric 3×3 normal matrix M = AᵀA and rhs = Aᵀc, with x measured
+    // relative to `anchor` (so the right-hand targets are already relative).
+    let mut m = [[0.0f32; 3]; 3];
+    let mut rhs = [0.0f32; 3];
+    for &(dir, target) in rows {
+        let d = [dir.x, dir.y, dir.z];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] += d[i] * d[j];
+            }
+            rhs[i] += d[i] * target;
+        }
+    }
+
+    if let Some(solution) = solve_3x3(&m, &rhs) {
+        return Some(anchor + Vec3::new(solution[0], solution[1], solution[2]));
+    }
+
+    // Rank-deficient AᵀA (§7.6.2 degeneracy): fall back to the minimum-norm point,
+    // which anchored at the vertex is the solution nearest the vertex. A
+    // Tikhonov-regularised solve (M + εI) recovers exactly that as ε → 0.
+    let epsilon = 1.0e-6;
+    let mut regularised = m;
+    for i in 0..3 {
+        regularised[i][i] += epsilon;
+    }
+    solve_3x3(&regularised, &rhs).map(|s| anchor + Vec3::new(s[0], s[1], s[2]))
+}
+
+/// Solve a 3×3 linear system by Cramer's rule; `None` when the matrix is singular.
+fn solve_3x3(m: &[[f32; 3]; 3], rhs: &[f32; 3]) -> Option<[f32; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det.abs() <= 1.0e-12 {
+        return None;
+    }
+    let mut solution = [0.0f32; 3];
+    for column in 0..3 {
+        let mut replaced = *m;
+        for row in 0..3 {
+            replaced[row][column] = rhs[row];
+        }
+        let det_c = replaced[0][0] * (replaced[1][1] * replaced[2][2] - replaced[1][2] * replaced[2][1])
+            - replaced[0][1] * (replaced[1][0] * replaced[2][2] - replaced[1][2] * replaced[2][0])
+            + replaced[0][2] * (replaced[1][0] * replaced[2][1] - replaced[1][1] * replaced[2][0]);
+        solution[column] = det_c / det;
+    }
+    Some(solution)
 }
 
 /// The new strip face and its edges (BEVEL.md §7.1 item 2).
@@ -1397,6 +2217,162 @@ mod tests {
         assert_eq!(result.verts.len(), 4, "four strip verts");
         assert_eq!(result.faces.len(), 1, "single strip quad");
         assert_eq!(mesh.face_vert_keys(result.faces[0]).len(), 4, "strip quad");
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.6.3 (`s = 2`, through junction): beveling the two cube edges
+    /// {0,1} and {0,3} that share vertex 0 makes vertex 0 a two-edge junction. The
+    /// two arriving strips share a pair of boundverts (§7.6.1) and run into each
+    /// other with **no** patch face (§7.6.3). Far endpoints 1 and 3 are valence-3
+    /// terminals. Count delta over the cube (8 V / 12 E / 6 F): +3 V / +5 E / +2 F
+    /// → 11 V / 17 E / 8 F.
+    #[test]
+    fn edge_bevel_two_edge_junction_no_patch() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            counts(&mesh),
+            (11, 17, 8),
+            "s=2 through-junction +3 V / +5 E / +2 F",
+        );
+        // Two strip quads, no patch face.
+        assert_eq!(result.faces.len(), 2, "two strip faces, no s=2 patch");
+
+        // The Front-side sector is a single planar face: its boundvert is the exact
+        // 2-line meet at (1-offset, -1+offset, -1) = (0.75, -0.75, -1).
+        let front_meet = Vec3::new(0.75, -0.75, -1.0);
+        let near = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - front_meet).length() < 1.0e-5)
+            .count();
+        assert_eq!(near, 1, "the planar Front sector boundvert is the exact meet");
+
+        // Vertex 0 and the two far endpoints are consumed.
+        for removed in [Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)] {
+            assert!(
+                !mesh.vert_keys().into_iter().any(|v| mesh.vertex_position(v) == removed),
+                "original endpoint {removed:?} removed",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.6.3 (`s = 3`, true junction): beveling all three of cube vertex
+    /// 0's edges {0,1}, {0,3}, {0,4} makes vertex 0 a three-edge junction with no
+    /// unbeveled legs (the cleanest junction, §7.6.5). Its three boundverts — one
+    /// per planar sector face (Front, Left, Bottom) — form a ring closed by one
+    /// flat **patch face** (§7.6.3). Far endpoints 1, 3, 4 are valence-3 terminals.
+    /// Count delta over the cube: +5 V / +9 E / +4 F → 13 V / 21 E / 10 F.
+    #[test]
+    fn edge_bevel_three_edge_junction_one_patch() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            counts(&mesh),
+            (13, 21, 10),
+            "s=3 junction +5 V / +9 E / +4 F",
+        );
+        // Three strip quads + one patch face.
+        assert_eq!(result.faces.len(), 4, "three strips + one patch");
+
+        // The patch face is the triangle over the three boundverts. Each sector is
+        // a single planar cube face, so each boundvert is an exact 2-line meet at
+        // distance offset·√2 from the original corner (1,-1,-1).
+        let patch = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_vert_keys(f).len() == 3)
+            .expect("the s=3 junction patch is a triangle");
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let expected = 0.25 * 2.0_f32.sqrt();
+        for v in mesh.face_vert_keys(patch) {
+            let distance = (mesh.vertex_position(v) - corner).length();
+            assert!(
+                (distance - expected).abs() < 1.0e-5,
+                "patch boundvert {distance} should sit offset·√2 from the corner",
+            );
+        }
+
+        // Vertex 0 and all three far endpoints are consumed.
+        for removed in [
+            corner,
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ] {
+            assert!(
+                !mesh.vert_keys().into_iter().any(|v| mesh.vertex_position(v) == removed),
+                "original endpoint {removed:?} removed",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.6.3: every edge of the `s = 3` junction patch face is shared
+    /// with exactly one arriving strip (radial count 2) — the manifold condition
+    /// the patch winding (§5.1) preserves.
+    #[test]
+    fn edge_bevel_three_edge_junction_patch_manifold() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let patch = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_vert_keys(f).len() == 3)
+            .expect("patch triangle");
+        for loop_key in mesh.face_loop_keys(patch) {
+            let edge = mesh.loop_edge(loop_key);
+            assert_eq!(
+                mesh.edge_radial_iter(edge).count(),
+                2,
+                "each patch edge is manifold (shared with one strip)",
+            );
+        }
         mesh.validate_topology();
     }
 
