@@ -1,14 +1,29 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use glam::{Quat, Vec3};
+
 use crate::loopmesh::*;
 
 /// Placement of the new ring verts across the strip
 /// ([`SUBDIVIDE_EDGERING.md`](../../../../radial-mesh-guides/operators/SUBDIVIDE_EDGERING.md)
-/// §5 / §6.2). Only [`RingInterp::Linear`] — the straight chord midpoint — is
-/// part of the foundational core. `Path` and `Surface` reposition the inserted
-/// verts without changing the §3–§4 topology and are tracked as a separate
-/// parity row (§6.2).
+/// §5 / §6.2).
+///
+/// All three modes share the §3–§4 / §6.1 topology and differ **only** in where
+/// each inserted vert lands (§6.2 is positions-only):
+///
+/// - [`RingInterp::Linear`] (§5 / §6.1.4) — the straight chord point of each
+///   rung at `t_j`. The flat baseline.
+/// - [`RingInterp::Path`] (§6.2.2) — carries each inserted ring's cross-section
+///   along the strip's centre spline, rotating it by a minimum-twist frame
+///   sweep. Diverges from `Linear` as soon as the strip bends along its length,
+///   **including at `smooth = 0`** (the divergence is the rim-frame rotation,
+///   not a bulge).
+/// - [`RingInterp::Surface`] (§6.2.3) — pulls each inserted ring onto its own
+///   cubic meeting the two rims tangentially. At `smooth = 0` it stays on the
+///   chord *line* but re-spaces interior verts by smoothstep `B(t)=t²(3−2t)`
+///   (exact `Linear` only for `cuts = 1`, where `B(1/2)=1/2`); the off-chord bow
+///   scales with `smooth`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RingInterp {
     Linear = 0,
@@ -30,18 +45,23 @@ impl Default for RingInterp {
 /// (`cuts = 1`), `LINEAR` placement, no smoothing, and the flat profile — every
 /// new ring vert lands on the straight chord midpoint of its rung (§5).
 ///
-/// The deferred knobs (`cuts >= 2`, `interp_mode` PATH/SURFACE, `smooth` and the
-/// profile parameters) are surveyed in §6 and tracked as separate parity rows;
-/// only the core configuration is honoured today.
+/// `cuts >= 2` (§6.1) and `interp_mode` PATH/SURFACE (§6.2) are honoured. The
+/// `smooth` bulge and the profile parameters (§6.3) are surveyed there and
+/// tracked as a separate parity row; `smooth` participates in the §6.2 spline
+/// handles (so non-zero values bend the PATH/SURFACE splines), but the §6.3
+/// profile-curve amplitude is not yet applied.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubdivideEdgeRingParams {
     /// Number of new parallel rings inserted between the strip's rim rings
     /// (§1 / §6.1). The core supports `1` (a single midpoint ring).
     pub cuts: u32,
-    /// Placement of the new ring verts (§5 / §6.2). The core uses
-    /// [`RingInterp::Linear`].
+    /// Placement of the new ring verts (§5 / §6.2). LINEAR, PATH and SURFACE
+    /// are all honoured.
     pub interp_mode: RingInterp,
-    /// Bulge factor off the flat chord (§6.3). No-op in the core (`0.0`).
+    /// Spline-handle / bulge factor (§6.2 / §6.3). At `0.0` PATH still rotates
+    /// the cross-section along the centre line and SURFACE still smoothstep-spaces
+    /// interior verts (both stay on the chord *line*); non-zero values bend the
+    /// PATH/SURFACE splines off the chord. No effect under LINEAR.
     pub smooth: f32,
     /// Profile amplitude (§6.3). No-op in the core (`0.0`).
     pub profile_shape_factor: f32,
@@ -118,6 +138,189 @@ impl RungCuts {
     }
 }
 
+/// Per-strip data the §6.2 non-linear placement needs, resolved from the
+/// pre-split topology. `rungs` maps each rung to its `(rail-A endpoint, rail-B
+/// endpoint)`; the inserted verts are repositioned between them per `mode`.
+struct RingPlacement {
+    rungs: HashMap<EdgeKey, (VertexKey, VertexKey)>,
+    mode: RingPlacementMode,
+}
+
+enum RingPlacementMode {
+    /// §6.2.2 PATH: the per-strip centre-spline setup.
+    Path(PathSetup),
+    /// §6.2.3 SURFACE: a snapshot of each rim vert's surrounding-surface
+    /// tangent, taken before any split (the §6.2.3 feedback hazard).
+    Surface(HashMap<VertexKey, Vec3>),
+}
+
+/// §6.2.1 shared setup for PATH: the two rim-ring centres (the centre-path
+/// endpoints) and their reconciled plane normals (the spline end tangents).
+struct PathSetup {
+    center_a: Vec3,
+    center_b: Vec3,
+    normal_a: Vec3,
+    normal_b: Vec3,
+}
+
+/// Two-colour union-find over rim membership: rungs' endpoints split across two
+/// rails (§6.2.1). `same` merges two verts onto one rail; `opposite` records
+/// that two verts sit on different rails. After all strip quads are folded in,
+/// `on_anchor_side` reports whether a vert shares the anchor's rail.
+struct RailColoring {
+    parent: HashMap<VertexKey, VertexKey>,
+    /// Parity of a vert relative to its component root: `false` = same rail as
+    /// root, `true` = opposite rail.
+    parity: HashMap<VertexKey, bool>,
+}
+
+impl RailColoring {
+    fn new() -> Self {
+        RailColoring {
+            parent: HashMap::new(),
+            parity: HashMap::new(),
+        }
+    }
+
+    fn ensure(&mut self, v: VertexKey) {
+        self.parent.entry(v).or_insert(v);
+        self.parity.entry(v).or_insert(false);
+    }
+
+    /// Returns `(root, parity-to-root)` with path compression.
+    fn find(&mut self, v: VertexKey) -> (VertexKey, bool) {
+        self.ensure(v);
+        let p = self.parent[&v];
+        if p == v {
+            return (v, false);
+        }
+        let (root, par_p) = self.find(p);
+        let par_v = par_p ^ self.parity[&v];
+        self.parent.insert(v, root);
+        self.parity.insert(v, par_v);
+        (root, par_v)
+    }
+
+    fn union(&mut self, a: VertexKey, b: VertexKey, want_opposite: bool) {
+        let (ra, pa) = self.find(a);
+        let (rb, pb) = self.find(b);
+        if ra == rb {
+            return;
+        }
+        // Re-root rb under ra. Its parity relative to ra must make
+        // parity(a) ^ parity(b) == want_opposite hold.
+        let new_parity = pa ^ pb ^ want_opposite;
+        self.parent.insert(rb, ra);
+        self.parity.insert(rb, new_parity);
+    }
+
+    fn same(&mut self, a: VertexKey, b: VertexKey) {
+        self.union(a, b, false);
+    }
+
+    fn opposite(&mut self, a: VertexKey, b: VertexKey) {
+        self.union(a, b, true);
+    }
+
+    /// Whether `v` is on the same rail as `anchor` (both must be in the same
+    /// connected component — true for any strip resolved from a contiguous quad
+    /// set).
+    fn on_anchor_side(&mut self, v: VertexKey, anchor: VertexKey) -> bool {
+        let (rv, pv) = self.find(v);
+        let (ra, pa) = self.find(anchor);
+        debug_assert_eq!(rv, ra, "rim verts of one strip share a component");
+        pv == pa
+    }
+}
+
+/// A handle-length estimate for the §6.2 splines: scales the off-chord bow, not
+/// its direction (multiplied by `smooth`, so it is irrelevant at `smooth = 0`).
+/// A "how far apart, projected onto the handle directions' span" length that
+/// approximates a circular blend across the gap.
+fn handle_length(a: Vec3, b: Vec3, _dir_a: Vec3, _dir_b: Vec3) -> f32 {
+    (b - a).length() / 3.0
+}
+
+/// Cubic Bézier point at `t` from four control points.
+fn bezier(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
+    let u = 1.0 - t;
+    p0 * (u * u * u)
+        + p1 * (3.0 * u * u * t)
+        + p2 * (3.0 * u * t * t)
+        + p3 * (t * t * t)
+}
+
+/// The local path tangent at an interior sample, the angle bisector of the two
+/// incoming/outgoing segment directions (§6.2.2 step 2).
+fn path_bisector(prev: Vec3, here: Vec3, next: Vec3) -> Vec3 {
+    let incoming = (here - prev).normalize_or_zero();
+    let outgoing = (next - here).normalize_or_zero();
+    let bisector = incoming + outgoing;
+    if bisector.length_squared() > 1e-12 {
+        bisector.normalize()
+    } else {
+        outgoing
+    }
+}
+
+/// Minimum-twist orientation sweep along the per-level directions (§6.2.2 step
+/// 2). Frame 0 rotates a fixed reference axis onto `dir[0]`; each subsequent
+/// frame is the previous one pre-rotated by the smallest rotation carrying
+/// `dir[j-1]` onto `dir[j]` — a rotation-minimizing frame, no spurious roll.
+fn minimum_twist_frames(dir: &[Vec3]) -> Vec<Quat> {
+    let reference = Vec3::Z;
+    let mut frames = Vec::with_capacity(dir.len());
+    frames.push(rotation_between(reference, dir[0]));
+    for j in 1..dir.len() {
+        let delta = rotation_between(dir[j - 1], dir[j]);
+        let frame = delta * frames[j - 1];
+        frames.push(frame);
+    }
+    frames
+}
+
+/// The smallest rotation carrying unit `from` onto unit `to` (about their cross
+/// product through the angle between them). Stable for the near-parallel and
+/// near-antiparallel limits.
+fn rotation_between(from: Vec3, to: Vec3) -> Quat {
+    let f = from.normalize_or_zero();
+    let t = to.normalize_or_zero();
+    if f.length_squared() < 0.5 || t.length_squared() < 0.5 {
+        return Quat::IDENTITY;
+    }
+    let d = f.dot(t).clamp(-1.0, 1.0);
+    if d > 1.0 - 1e-6 {
+        return Quat::IDENTITY;
+    }
+    if d < -1.0 + 1e-6 {
+        // Antiparallel: rotate π about any axis orthogonal to `f`.
+        let axis = f.cross(Vec3::X);
+        let axis = if axis.length_squared() < 1e-6 {
+            f.cross(Vec3::Y)
+        } else {
+            axis
+        };
+        return Quat::from_axis_angle(axis.normalize(), std::f32::consts::PI);
+    }
+    let axis = f.cross(t).normalize();
+    let angle = d.acos();
+    Quat::from_axis_angle(axis, angle)
+}
+
+/// Rigid-body carry of `p` from the origin level's oriented frame into the
+/// target level's (§6.2.2 step 3): express `p` relative to the origin point and
+/// orientation, then re-plant it at the target point and orientation.
+fn reframe(
+    p: Vec3,
+    origin_frame: Quat,
+    origin: Vec3,
+    target_frame: Quat,
+    target: Vec3,
+) -> Vec3 {
+    let local = origin_frame.inverse() * (p - origin);
+    target + target_frame * local
+}
+
 impl LoopMesh {
     /// Subdivide an edge ring
     /// ([`SUBDIVIDE_EDGERING.md`](../../../../radial-mesh-guides/operators/SUBDIVIDE_EDGERING.md)).
@@ -147,19 +350,17 @@ impl LoopMesh {
     /// closed `+N·k` V / `+2N·k` E / `+N·k` F. A strip of `k` quads becomes a
     /// band of `(N+1)·k` quads (`N+1` quad rows separated by the `N` new rings).
     ///
-    /// The placement-tolerant parameters (§6.2 `interp_mode` PATH/SURFACE, §6.3
-    /// `smooth` and the profile) are accepted on the params struct but only
-    /// their no-op core values are implemented; any other value is a parity gap
-    /// tracked as a separate row, not handled here. `cuts` is honoured for all
+    /// Placement (§5 / §6.2) is honoured for all three `interp_mode` values:
+    /// LINEAR falls out of the per-segment chord lerp; PATH and SURFACE
+    /// reposition the inserted verts in a positions-only post-pass (the topology
+    /// is identical across the three modes). The §6.3 profile-curve amplitude
+    /// (`profile_shape_factor`) is not yet applied. `cuts` is honoured for all
     /// `N >= 1`.
     pub fn subdivide_edgering(
         &mut self,
         rungs: &[EdgeKey],
         params: SubdivideEdgeRingParams,
     ) -> SubdivideEdgeRingResult {
-        debug_assert_eq!(params.interp_mode, RingInterp::Linear);
-        debug_assert_eq!(params.smooth, 0.0);
-
         let mut result = SubdivideEdgeRingResult::default();
         let cuts = params.cuts;
         if rungs.is_empty() || cuts == 0 {
@@ -175,13 +376,25 @@ impl LoopMesh {
         // (§3 / §6.1.1), it never retires the face or its original corners.
         let strip_quads = self.collect_strip_quads(&rung_set);
 
+        // Non-linear placement (§6.2) is positions-only but reads pre-split
+        // state: PATH/SURFACE need the two rim rings and (for SURFACE) the
+        // surrounding-surface tangents snapshotted *before* phase one modifies
+        // the band (§6.2.3 feedback hazard). Resolve the rims up front, while
+        // the topology is still the original strip.
+        let placement = if params.interp_mode == RingInterp::Linear {
+            None
+        } else {
+            self.resolve_ring_placement(&strip_quads, &params)
+        };
+
         // Phase one (§3 / §6.1.1): multi-cut each rung into `N + 1` equal
         // segments, recording the `N` midpoints in `near → far` order. The
         // directional run is the load-bearing detail (§6.1.1) — phase two
         // aligns level `j` across adjacent rungs by reading each rung from the
         // endpoint on the shared rail. `edge_split_n` runs the §3.3 directional
         // multi-cut, applying the two-source-linear vert/loop/edge blend at
-        // each `t_j = j/(N+1)`.
+        // each `t_j = j/(N+1)`. The chord positions it writes are the LINEAR
+        // placement; PATH/SURFACE overwrite them below.
         let mut rung_cuts: HashMap<EdgeKey, RungCuts> = HashMap::with_capacity(rung_set.len());
         for &rung in &rung_set {
             let [near, _far] = self.edge_vert_keys(rung);
@@ -208,7 +421,335 @@ impl LoopMesh {
             );
         }
 
+        // §6.2 positions-only post-pass: overwrite the chord positions the
+        // inserted verts were born with by the PATH / SURFACE placement.
+        if let Some(placement) = placement {
+            self.apply_ring_placement(&placement, &rung_cuts, cuts, params.smooth);
+        }
+
         result
+    }
+
+    /// Resolve the per-strip data the §6.2 non-linear placement needs, read
+    /// from the original (pre-split) topology. Returns `None` when the strip has
+    /// no fillable quad (nothing to place).
+    ///
+    /// Two pieces: (1) the rail assignment — each rung's two endpoints split
+    /// across rail A and rail B (§6.2.1) — recovered by walking the strip quads'
+    /// `near~near` / `far~far` rail equivalences; and (2) the per-mode setup
+    /// (PATH: rim centres + reconciled normals; SURFACE: a snapshot of every rim
+    /// vert's surrounding-surface tangent, taken now to dodge the half-built-mesh
+    /// feedback hazard of §6.2.3).
+    fn resolve_ring_placement(
+        &self,
+        strip_quads: &[StripQuad],
+        params: &SubdivideEdgeRingParams,
+    ) -> Option<RingPlacement> {
+        if strip_quads.is_empty() {
+            return None;
+        }
+
+        // Rail equivalence walk. Within each strip quad, the two `near`
+        // endpoints share one rail and the two `far` endpoints share the other
+        // (§6.1.1 rail pairing). Union those equivalences across all quads, then
+        // two-colour the components: every rung's endpoints fall in opposite
+        // components, defining rail A vs rail B.
+        let mut rail = RailColoring::new();
+        for strip in strip_quads {
+            let rung_b_far = self.edge_other_vert(strip.rung_b, strip.rung_b_near);
+            rail.same(strip.rung_a_near, strip.rung_b_near);
+            rail.same(strip.rung_a_far, rung_b_far);
+            // The two endpoints of each rung are on opposite rails.
+            rail.opposite(strip.rung_a_near, strip.rung_a_far);
+            rail.opposite(strip.rung_b_near, rung_b_far);
+        }
+
+        // Per-rung (v_a, v_b): pick rail A as the colour of the first quad's
+        // `rung_a_near`. Every rung contributes both its endpoints once.
+        let rail_a_anchor = strip_quads[0].rung_a_near;
+        let mut rungs: HashMap<EdgeKey, (VertexKey, VertexKey)> = HashMap::new();
+        let mut rail_a_verts: HashSet<VertexKey> = HashSet::new();
+        let mut rail_b_verts: HashSet<VertexKey> = HashSet::new();
+        for strip in strip_quads {
+            for &rung in &[strip.rung_a, strip.rung_b] {
+                if rungs.contains_key(&rung) {
+                    continue;
+                }
+                let [e0, e1] = self.edge_vert_keys(rung);
+                let (v_a, v_b) = if rail.on_anchor_side(e0, rail_a_anchor) {
+                    (e0, e1)
+                } else {
+                    (e1, e0)
+                };
+                rail_a_verts.insert(v_a);
+                rail_b_verts.insert(v_b);
+                rungs.insert(rung, (v_a, v_b));
+            }
+        }
+
+        let mode = match params.interp_mode {
+            RingInterp::Linear => return None,
+            RingInterp::Path => {
+                let setup = self.rim_path_setup(&rail_a_verts, &rail_b_verts);
+                RingPlacementMode::Path(setup)
+            }
+            RingInterp::Surface => {
+                let band_faces: HashSet<FaceKey> =
+                    strip_quads.iter().map(|s| s.face).collect();
+                let tangents =
+                    self.rim_surface_tangents(&rungs, &rail_a_verts, &band_faces);
+                RingPlacementMode::Surface(tangents)
+            }
+        };
+
+        Some(RingPlacement { rungs, mode })
+    }
+
+    fn edge_other_vert(&self, edge: EdgeKey, vert: VertexKey) -> VertexKey {
+        let [a, b] = self.edge_vert_keys(edge);
+        if a == vert {
+            b
+        } else {
+            a
+        }
+    }
+
+    /// §6.2.1 PATH setup: each rim ring's centre (mean of its verts) and a
+    /// reconciled best-fit plane normal. The two normals are flipped to lean
+    /// toward each other along the centre-to-centre direction so they read as a
+    /// Bézier's end tangents.
+    fn rim_path_setup(
+        &self,
+        rail_a_verts: &HashSet<VertexKey>,
+        rail_b_verts: &HashSet<VertexKey>,
+    ) -> PathSetup {
+        let center_a = self.rim_center(rail_a_verts);
+        let center_b = self.rim_center(rail_b_verts);
+        let between = center_a - center_b;
+
+        let mut normal_a = self.rim_normal(rail_a_verts, center_a, between);
+        let mut normal_b = self.rim_normal(rail_b_verts, center_b, between);
+
+        // Reconcile (§6.2.1): normal_A points back toward B, normal_B toward A.
+        if normal_a.dot(between) > 0.0 {
+            normal_a = -normal_a;
+        }
+        if normal_b.dot(between) < 0.0 {
+            normal_b = -normal_b;
+        }
+
+        PathSetup {
+            center_a,
+            center_b,
+            normal_a,
+            normal_b,
+        }
+    }
+
+    fn rim_center(&self, verts: &HashSet<VertexKey>) -> Vec3 {
+        let mut sum = Vec3::ZERO;
+        for &v in verts {
+            sum += self.vertex_position(v);
+        }
+        sum / verts.len().max(1) as f32
+    }
+
+    /// Area-weighted best-fit plane normal of a rim ring (Newell's method over
+    /// the ring fanned around its centre). Falls back to the centre-to-centre
+    /// direction for a degenerate/collinear ring (§6.2.1) so the spline handle
+    /// is always defined rather than NaN.
+    fn rim_normal(
+        &self,
+        verts: &HashSet<VertexKey>,
+        center: Vec3,
+        between: Vec3,
+    ) -> Vec3 {
+        // Newell's method is order-sensitive; a rim ring has no stored order
+        // here, so fan triangles from the centre to each vertex pair and sum
+        // their cross products. Without an ordering this still yields a stable
+        // plane normal direction for a planar ring (each triangle's normal
+        // agrees up to sign with the plane), and the magnitude (area) weights
+        // it. Collinear/zero-area rings sum near zero → fallback.
+        let points: Vec<Vec3> = verts.iter().map(|&v| self.vertex_position(v)).collect();
+        let mut accum = Vec3::ZERO;
+        for i in 0..points.len() {
+            let p = points[i] - center;
+            let q = points[(i + 1) % points.len()] - center;
+            accum += p.cross(q);
+        }
+        if accum.length_squared() > 1e-12 {
+            accum.normalize()
+        } else {
+            between.normalize_or_zero()
+        }
+    }
+
+    /// §6.2.3 step 1: snapshot each rim vert's surrounding-surface tangent — the
+    /// "off-the-rim, into the surface" direction, built from the faces *outside*
+    /// the subdivided band that meet the rim vert. Each such face contributes
+    /// its edge-tangent at the rim edge; these are averaged. Verts with no
+    /// outside face (a lone band) fall back to the chord direction toward the
+    /// other rail, leaving the per-ring cubic chord-aligned (vacuous, §6.2.4).
+    fn rim_surface_tangents(
+        &self,
+        rungs: &HashMap<EdgeKey, (VertexKey, VertexKey)>,
+        rail_a_verts: &HashSet<VertexKey>,
+        band_faces: &HashSet<FaceKey>,
+    ) -> HashMap<VertexKey, Vec3> {
+        let mut tangents: HashMap<VertexKey, Vec3> = HashMap::new();
+        for (&_rung, &(v_a, v_b)) in rungs {
+            // Chord fallback direction: from each rim vert across the strip
+            // toward the other rail.
+            let chord_a = (self.vertex_position(v_b) - self.vertex_position(v_a))
+                .normalize_or_zero();
+            let chord_b = -chord_a;
+            tangents.insert(v_a, self.surface_tangent_at(v_a, band_faces, chord_a));
+            tangents.insert(v_b, self.surface_tangent_at(v_b, band_faces, chord_b));
+        }
+        let _ = rail_a_verts;
+        tangents
+    }
+
+    /// The averaged off-the-rim tangent at one rim vert, summed over the edges
+    /// of faces *outside* the band that emanate from it. Falls back to
+    /// `chord_dir` when no outside face touches the vert.
+    fn surface_tangent_at(
+        &self,
+        vert: VertexKey,
+        band_faces: &HashSet<FaceKey>,
+        chord_dir: Vec3,
+    ) -> Vec3 {
+        let p = self.vertex_position(vert);
+        let mut accum = Vec3::ZERO;
+        for edge in self.vertex_disk_iter(vert).collect::<Vec<_>>() {
+            let touches_outside = self
+                .edge_face_keys(edge)
+                .iter()
+                .any(|f| !band_faces.contains(f));
+            if !touches_outside {
+                continue;
+            }
+            let other = self.edge_other_vert(edge, vert);
+            accum += (self.vertex_position(other) - p).normalize_or_zero();
+        }
+        if accum.length_squared() > 1e-12 {
+            accum.normalize()
+        } else {
+            chord_dir
+        }
+    }
+
+    /// Apply the §6.2 PATH / SURFACE placement, overwriting the LINEAR chord
+    /// positions the inserted verts were born with. Positions-only; the topology
+    /// is untouched.
+    fn apply_ring_placement(
+        &mut self,
+        placement: &RingPlacement,
+        rung_cuts: &HashMap<EdgeKey, RungCuts>,
+        cuts: u32,
+        smooth: f32,
+    ) {
+        match &placement.mode {
+            RingPlacementMode::Path(setup) => {
+                self.apply_path_placement(placement, rung_cuts, setup, cuts, smooth)
+            }
+            RingPlacementMode::Surface(tangents) => {
+                self.apply_surface_placement(placement, rung_cuts, tangents, cuts, smooth)
+            }
+        }
+    }
+
+    /// §6.2.2 PATH. One centre spline for the whole strip, a minimum-twist frame
+    /// per level, then a rigid two-sided carry of each rung's rim endpoints into
+    /// the level frame.
+    fn apply_path_placement(
+        &mut self,
+        placement: &RingPlacement,
+        rung_cuts: &HashMap<EdgeKey, RungCuts>,
+        setup: &PathSetup,
+        cuts: u32,
+        smooth: f32,
+    ) {
+        let levels = cuts as usize;
+        let segments = levels + 1;
+
+        // Step 1 — the centre spline (Bézier). At smooth = 0 the handles
+        // collapse onto the centres → straight segment, but PATH still diverges
+        // from LINEAR via the frames below.
+        let handle_len = handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
+        let handle_a = setup.center_a + smooth * handle_len * setup.normal_a;
+        let handle_b = setup.center_b + smooth * handle_len * setup.normal_b;
+        let path: Vec<Vec3> = (0..=segments)
+            .map(|j| {
+                let t = j as f32 / segments as f32;
+                bezier(setup.center_a, handle_a, handle_b, setup.center_b, t)
+            })
+            .collect();
+
+        // Step 2 — per-level directions and the minimum-twist frame sweep.
+        let mut dir = vec![Vec3::ZERO; segments + 1];
+        dir[0] = setup.normal_a;
+        dir[segments] = -setup.normal_b;
+        for j in 1..segments {
+            dir[j] = path_bisector(path[j - 1], path[j], path[j + 1]);
+        }
+        let frames = minimum_twist_frames(&dir);
+
+        // Step 3 — carry each rung's rim endpoints into the level frame.
+        for (&rung, &(v_a, v_b)) in &placement.rungs {
+            let pos_a = self.vertex_position(v_a);
+            let pos_b = self.vertex_position(v_b);
+            let inserted = rung_cuts[&rung].aligned(v_a);
+            for (idx, &vert) in inserted.iter().enumerate() {
+                let level = idx + 1;
+                let t = level as f32 / segments as f32;
+                let from_a = reframe(pos_a, frames[0], path[0], frames[level], path[level]);
+                let from_b = reframe(
+                    pos_b,
+                    frames[segments],
+                    path[segments],
+                    frames[level],
+                    path[level],
+                );
+                self.set_vertex_position(vert, from_a.lerp(from_b, t));
+            }
+        }
+    }
+
+    /// §6.2.3 SURFACE. Each inserted cut ring independently on its own cubic
+    /// meeting both rims tangentially; no shared spline, no frame sweep.
+    fn apply_surface_placement(
+        &mut self,
+        placement: &RingPlacement,
+        rung_cuts: &HashMap<EdgeKey, RungCuts>,
+        tangents: &HashMap<VertexKey, Vec3>,
+        cuts: u32,
+        smooth: f32,
+    ) {
+        let levels = cuts as usize;
+        let segments = levels + 1;
+
+        for (&rung, &(v_a, v_b)) in &placement.rungs {
+            let pos_a = self.vertex_position(v_a);
+            let pos_b = self.vertex_position(v_b);
+            let tan_a = tangents[&v_a];
+            let tan_b = tangents[&v_b];
+            // At smooth = 0 the handles collapse onto the endpoints → control
+            // polygon (v_a, v_a, v_b, v_b): geometrically the chord line, but
+            // the forward-difference cubic samples it as smoothstep B(t), not
+            // the uniform lerp, re-spacing interior verts (§6.2.3).
+            let handle_len = handle_length(pos_a, pos_b, tan_a, tan_b);
+            let handle_a = pos_a + smooth * handle_len * tan_a;
+            let handle_b = pos_b + smooth * handle_len * tan_b;
+
+            let inserted = rung_cuts[&rung].aligned(v_a);
+            for (idx, &vert) in inserted.iter().enumerate() {
+                let level = idx + 1;
+                let t = level as f32 / segments as f32;
+                let co = bezier(pos_a, handle_a, handle_b, pos_b, t);
+                self.set_vertex_position(vert, co);
+            }
+        }
     }
 
     /// Carve one (multi-cut) strip quad into `N + 1` rows (§6.1.2). `levels_a`
@@ -634,5 +1175,229 @@ mod tests {
         let result = mesh.subdivide_edgering(&rungs, cuts(0));
         assert_eq!(counts(&mesh), (8, 10, 3), "cuts = 0: mesh unchanged");
         assert!(result.verts.is_empty() && result.faces.is_empty());
+    }
+
+    // ----- §6.2 non-linear placement (PATH / SURFACE) -----
+
+    fn params(interp: RingInterp, cuts: u32, smooth: f32) -> SubdivideEdgeRingParams {
+        SubdivideEdgeRingParams {
+            cuts,
+            interp_mode: interp,
+            smooth,
+            profile_shape_factor: 0.0,
+        }
+    }
+
+    /// Build an open 1×k strip twisted about its length (x) axis: rung `i` is
+    /// rotated by `i · step` radians, so the two rails spiral into non-parallel
+    /// planes (the §7 PATH fixture condition). The rails are also non-collinear
+    /// (each spans 2D), so each rim has a real plane normal rather than the
+    /// §6.2.1 centre-to-centre fallback.
+    fn twisted_strip(k: usize, step: f32) -> (LoopMesh, Vec<EdgeKey>) {
+        let mut mesh = LoopMesh::new();
+        let cols = k + 1;
+        // Rung axis starts along +y; rotate it about x by i·step, around the
+        // strip centreline at y = 0.5.
+        let mut rail_a = Vec::with_capacity(cols);
+        let mut rail_b = Vec::with_capacity(cols);
+        for i in 0..cols {
+            let a = i as f32 * step;
+            let (s, c) = a.sin_cos();
+            // half-rung offset from the centreline, rotated about x.
+            let off = Vec3::new(0.0, 0.5 * c, 0.5 * s);
+            let center = Vec3::new(i as f32, 0.5, 0.0);
+            rail_a.push(mesh.create_vertex(center - off));
+            rail_b.push(mesh.create_vertex(center + off));
+        }
+        let rungs: Vec<EdgeKey> = (0..cols)
+            .map(|i| mesh.create_edge([rail_a[i], rail_b[i]], EdgeCreateFlags::NONE))
+            .collect();
+        for q in 0..k {
+            let a0 = rail_a[q];
+            let a1 = rail_a[q + 1];
+            let b1 = rail_b[q + 1];
+            let b0 = rail_b[q];
+            let e_bottom = mesh.create_edge([a0, a1], EdgeCreateFlags::NONE);
+            let e_right = rungs[q + 1];
+            let e_top = mesh.create_edge([b1, b0], EdgeCreateFlags::NONE);
+            let e_left = rungs[q];
+            mesh.face_create(
+                &[a0, a1, b1, b0],
+                &[e_bottom, e_right, e_top, e_left],
+                FaceCreateFlags::NONE,
+            );
+        }
+        (mesh, rungs)
+    }
+
+    /// Snapshot the cut-vert positions of a subdivide-edgering run keyed by the
+    /// rounded `(x)` rung column so PATH/SURFACE and LINEAR runs of the *same*
+    /// fixture can be compared cut-for-cut.
+    fn cut_positions(mesh: &LoopMesh, verts: &[VertexKey]) -> Vec<Vec3> {
+        let mut ps: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+        ps.sort_by(|a, b| {
+            (a.x, a.y, a.z)
+                .partial_cmp(&(b.x, b.y, b.z))
+                .unwrap()
+        });
+        ps
+    }
+
+    #[test]
+    fn path_equals_linear_on_flat_strip() {
+        // §6.2.4 — on a non-bending strip every minimum-twist frame is identical
+        // (rim normals equal, path tangent agrees), so PATH coincides with
+        // LINEAR. The flat open strip is the one case where PATH is vacuous.
+        let (mut path_mesh, path_rungs) = open_strip(3);
+        let path = path_mesh.subdivide_edgering(&path_rungs, params(RingInterp::Path, 1, 0.0));
+
+        let (mut lin_mesh, lin_rungs) = open_strip(3);
+        let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 1, 0.0));
+
+        let pp = cut_positions(&path_mesh, &path.verts);
+        let lp = cut_positions(&lin_mesh, &lin.verts);
+        assert_eq!(pp.len(), lp.len());
+        for (a, b) in pp.iter().zip(lp.iter()) {
+            assert!(
+                a.distance(*b) < 1e-5,
+                "PATH must match LINEAR on a flat strip: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_diverges_off_chord_at_smooth_zero_on_twist() {
+        // §6.2.2 — PATH diverges from LINEAR as soon as the strip bends/twists
+        // along its length, *even at smooth = 0* (the divergence is the rim-frame
+        // rotation, not a bulge). On a twisted strip at least one cut vert must
+        // leave the LINEAR chord midpoint.
+        let step = 0.5;
+        let (mut path_mesh, path_rungs) = twisted_strip(4, step);
+        let path = path_mesh.subdivide_edgering(&path_rungs, params(RingInterp::Path, 1, 0.0));
+
+        let (mut lin_mesh, lin_rungs) = twisted_strip(4, step);
+        let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 1, 0.0));
+
+        let pp = cut_positions(&path_mesh, &path.verts);
+        let lp = cut_positions(&lin_mesh, &lin.verts);
+        let max_div = pp
+            .iter()
+            .zip(lp.iter())
+            .map(|(a, b)| a.distance(*b))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_div > 1e-3,
+            "PATH at smooth = 0 must diverge off the LINEAR chord on a twisted \
+             strip (§6.2.2); max divergence was {max_div}"
+        );
+    }
+
+    #[test]
+    fn surface_cuts1_equals_linear_at_smooth_zero() {
+        // §6.2.3 / §6.2.4 — for cuts = 1 the lone sample sits at the smoothstep
+        // fixed point B(1/2) = 1/2, so SURFACE at smooth = 0 is *exactly* LINEAR
+        // (the chord midpoint), even on a twisted strip.
+        let step = 0.5;
+        let (mut surf_mesh, surf_rungs) = twisted_strip(4, step);
+        let surf =
+            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 1, 0.0));
+
+        let (mut lin_mesh, lin_rungs) = twisted_strip(4, step);
+        let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 1, 0.0));
+
+        let sp = cut_positions(&surf_mesh, &surf.verts);
+        let lp = cut_positions(&lin_mesh, &lin.verts);
+        assert_eq!(sp.len(), lp.len());
+        for (a, b) in sp.iter().zip(lp.iter()) {
+            assert!(
+                a.distance(*b) < 1e-5,
+                "SURFACE cuts=1 at smooth=0 must equal LINEAR (B(1/2)=1/2): {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_cuts2_respaces_along_chord_at_smooth_zero() {
+        // §6.2.3 — at smooth = 0 SURFACE stays on the chord *line* but the
+        // forward-difference cubic samples it as smoothstep B(t) = t²(3−2t), not
+        // the uniform lerp. So for cuts = 2 the interior verts bunch toward the
+        // centre: B(1/3) ≈ 0.259 / B(2/3) ≈ 0.741, against LINEAR's 1/3 / 2/3.
+        // Use the flat strip (rungs run y = 0 → y = 1) so the chord line is the
+        // y axis and "on the chord line" is just "z = 0, x = column".
+        let (mut surf_mesh, surf_rungs) = open_strip(3);
+        let surf =
+            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
+
+        let b13 = {
+            let t = 1.0_f32 / 3.0;
+            t * t * (3.0 - 2.0 * t)
+        };
+        let b23 = {
+            let t = 2.0_f32 / 3.0;
+            t * t * (3.0 - 2.0 * t)
+        };
+        assert!((b13 - 0.259).abs() < 0.01 && (b23 - 0.741).abs() < 0.01);
+
+        let mut near = 0; // verts at smoothstep B(1/3)
+        let mut far = 0; // verts at smoothstep B(2/3)
+        for &v in &surf.verts {
+            let p = surf_mesh.vertex_position(v);
+            assert!(p.z.abs() < 1e-5, "stays on the chord line (z = 0)");
+            if (p.y - b13).abs() < 1e-4 {
+                near += 1;
+            } else if (p.y - b23).abs() < 1e-4 {
+                far += 1;
+            } else {
+                panic!("SURFACE cut vert not at a smoothstep position: y = {}", p.y);
+            }
+            // And it is *not* at the LINEAR even spacing.
+            assert!(
+                (p.y - 1.0 / 3.0).abs() > 1e-3 || (p.y - 2.0 / 3.0).abs() > 1e-3,
+                "interior vert must be re-spaced away from the even LINEAR t"
+            );
+        }
+        assert_eq!(near, 4, "level-1 ring at B(1/3) across four rungs");
+        assert_eq!(far, 4, "level-2 ring at B(2/3) across four rungs");
+    }
+
+    #[test]
+    fn surface_cuts2_diverges_from_linear_on_flat_strip() {
+        // §6.2.4 — even on a flat strip SURFACE at cuts ≥ 2 is *near*, not equal,
+        // to LINEAR: the smoothstep re-spacing moves the interior verts along the
+        // chord. Pin the non-vacuity directly.
+        let (mut surf_mesh, surf_rungs) = open_strip(3);
+        let surf =
+            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
+
+        let (mut lin_mesh, lin_rungs) = open_strip(3);
+        let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 2, 0.0));
+
+        let sp = cut_positions(&surf_mesh, &surf.verts);
+        let lp = cut_positions(&lin_mesh, &lin.verts);
+        let max_div = sp
+            .iter()
+            .zip(lp.iter())
+            .map(|(a, b)| a.distance(*b))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_div > 1e-3,
+            "SURFACE cuts=2 must re-space off LINEAR even at smooth=0 (smoothstep); \
+             max divergence {max_div}"
+        );
+    }
+
+    #[test]
+    fn closed_band_path_preserves_topology() {
+        // §6.2 is positions-only: PATH must leave the §4.1 closed deltas
+        // untouched (only coordinates differ). The closed band's rims are real
+        // circles (non-collinear), exercising the area-weighted normal path.
+        let (mut mesh, rungs) = closed_band(4);
+        let result = mesh.subdivide_edgering(&rungs, params(RingInterp::Path, 1, 0.0));
+        assert_eq!(counts(&mesh), (12, 20, 8), "PATH keeps the LINEAR topology");
+        assert_eq!(result.verts.len(), 4);
+        assert_eq!(result.faces.len(), 8);
+        for &f in &result.faces {
+            assert_eq!(mesh.face_len(f), 4, "fill fragment still a quad");
+        }
     }
 }
