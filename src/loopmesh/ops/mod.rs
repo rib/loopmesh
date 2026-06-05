@@ -91,7 +91,7 @@ pub use subdivide_edges::{
     QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
 };
 pub use subdivide_edgering::{
-    RingInterp, SubdivideEdgeRingParams, SubdivideEdgeRingResult,
+    ProfileShape, RingInterp, SubdivideEdgeRingParams, SubdivideEdgeRingResult,
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;

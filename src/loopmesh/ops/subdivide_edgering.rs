@@ -37,6 +37,66 @@ impl Default for RingInterp {
     }
 }
 
+/// The profile falloff curve
+/// ([`SUBDIVIDE_EDGERING.md`](../../../../radial-mesh-guides/operators/SUBDIVIDE_EDGERING.md)
+/// §6.3.2). It maps the symmetric tent height of a level (`0` at the rims, `1`
+/// at the band centre) to the shaped height the §6.3.1 amplitude blend drives
+/// off unity. Each variant is a pure scalar `f(v): [0, 1] → [0, 1]`.
+///
+/// This is the same six-curve family `subdivide_edges` shapes its `smooth`
+/// offset with (`SUBDIVIDE_EDGES.md` §9.1.3); only the quantity shaped differs.
+/// Note [`ProfileShape::Linear`] here is the **identity falloff** (the tent
+/// passes through unchanged) — unrelated to [`RingInterp::Linear`], which is a
+/// *placement* mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProfileShape {
+    /// Smoothstep `3v² − 2v³` — the default gentle S, flat at both ends.
+    Smooth,
+    /// `√(2v − v²)` — bulges hard early (the upper quarter-circle).
+    Sphere,
+    /// `√v` — rises fast then flattens.
+    Root,
+    /// `v²` — stays low then rises (a sharp peak).
+    Sharp,
+    /// `v` — identity; the tent passes through unchanged.
+    Linear,
+    /// `v·(2 − v)` — eased rise, a downward-parabola arc.
+    InverseSquare,
+}
+
+impl Default for ProfileShape {
+    fn default() -> Self {
+        ProfileShape::Smooth
+    }
+}
+
+impl ProfileShape {
+    /// The §6.3.2 shaping curve `f(v)`, mapping the tent height `v ∈ [0, 1]` to
+    /// the shaped height. Monotonic, fixing `0 ↦ 0` and `1 ↦ 1`. The `√` curves
+    /// clamp their radicand at `0` for safety outside `[0, 1]` (in-range tent
+    /// heights never need it — §6.3.2).
+    fn curve(self, v: f32) -> f32 {
+        match self {
+            ProfileShape::Smooth => v * v * (3.0 - 2.0 * v),
+            ProfileShape::Sphere => (2.0 * v - v * v).max(0.0).sqrt(),
+            ProfileShape::Root => v.max(0.0).sqrt(),
+            ProfileShape::Sharp => v * v,
+            ProfileShape::Linear => v,
+            ProfileShape::InverseSquare => v * (2.0 - v),
+        }
+    }
+
+    /// The per-level shape size `shape_size[i]` (§6.3.1): fold the level fraction
+    /// into a symmetric tent (`0` at rims, `1` at centre), shape it through this
+    /// curve, then blend off unity by `factor`. Returns `1.0` at the rim levels
+    /// for every curve (their tent is `0`).
+    fn shape_size_at(self, level_i: usize, resolu: usize, factor: f32) -> f32 {
+        let u = level_i as f32 / (resolu - 1) as f32;
+        let tent = 1.0 - 2.0 * (0.5 - u).abs();
+        1.0 + self.curve(tent) * factor
+    }
+}
+
 /// Parameters for [`LoopMesh::subdivide_edgering`].
 ///
 /// Mirrors the BMOP parameter surface
@@ -63,7 +123,15 @@ pub struct SubdivideEdgeRingParams {
     /// interior verts (both stay on the chord *line*); non-zero values bend the
     /// PATH/SURFACE splines off the chord. No effect under LINEAR.
     pub smooth: f32,
-    /// Profile amplitude (§6.3). No-op in the core (`0.0`).
+    /// The falloff curve shaping the per-level profile amplitude across the cut
+    /// span (§6.3.2). Active whenever `profile_shape_factor != 0`; inert at the
+    /// no-op factor. Independent of `smooth`.
+    pub profile_shape: ProfileShape,
+    /// Profile amplitude (§6.3). The per-level `shape_size` is `1.0` at `0.0`
+    /// (bit-identical to the no-profile placement); a positive factor pushes the
+    /// interior rings radially out from the strip's centre axis, a negative one
+    /// pulls them in. Not gated on `smooth` — it re-scales positions even at
+    /// `smooth = 0`.
     pub profile_shape_factor: f32,
 }
 
@@ -73,6 +141,7 @@ impl Default for SubdivideEdgeRingParams {
             cuts: 1,
             interp_mode: RingInterp::Linear,
             smooth: 0.0,
+            profile_shape: ProfileShape::Smooth,
             profile_shape_factor: 0.0,
         }
     }
@@ -147,11 +216,20 @@ struct RingPlacement {
 }
 
 enum RingPlacementMode {
+    /// LINEAR placement with the §6.3 profile active. The chord positions are
+    /// already correct; the post-pass only re-scales each interior ring radially
+    /// from the strip's straight centre axis, so it needs just the two rim
+    /// centres (the centre-path endpoints). Reached only when
+    /// `profile_shape_factor != 0` (plain LINEAR takes no post-pass).
+    Linear(PathSetup),
     /// §6.2.2 PATH: the per-strip centre-spline setup.
     Path(PathSetup),
     /// §6.2.3 SURFACE: a snapshot of each rim vert's surrounding-surface
-    /// tangent, taken before any split (the §6.2.3 feedback hazard).
-    Surface(HashMap<VertexKey, Vec3>),
+    /// tangent, taken before any split (the §6.2.3 feedback hazard). When the
+    /// §6.3 profile is active the optional `PathSetup` carries the per-strip
+    /// centre spline the profile blends each ring against (§6.3.3); it is `None`
+    /// for plain SURFACE (no profile), which needs no centre reference.
+    Surface(HashMap<VertexKey, Vec3>, Option<PathSetup>),
 }
 
 /// §6.2.1 shared setup for PATH: the two rim-ring centres (the centre-path
@@ -560,9 +638,13 @@ impl LoopMesh {
     /// Placement (§5 / §6.2) is honoured for all three `interp_mode` values:
     /// LINEAR falls out of the per-segment chord lerp; PATH and SURFACE
     /// reposition the inserted verts in a positions-only post-pass (the topology
-    /// is identical across the three modes). The §6.3 profile-curve amplitude
-    /// (`profile_shape_factor`) is not yet applied. `cuts` is honoured for all
-    /// `N >= 1`.
+    /// is identical across the three modes). The §6.3 profile amplitude
+    /// (`profile_shape` curve + `profile_shape_factor`) is honoured too: a
+    /// non-zero factor re-scales each interior ring's radial offset from the
+    /// strip's centre axis (LINEAR/SURFACE by a lerp toward the centre-axis
+    /// reference, PATH by scaling the per-level reference-triangle legs). At
+    /// `factor = 0` the profile is skipped entirely, bit-identical to the
+    /// no-profile placement. `cuts` is honoured for all `N >= 1`.
     pub fn subdivide_edgering(
         &mut self,
         rungs: &[EdgeKey],
@@ -588,7 +670,13 @@ impl LoopMesh {
         // surrounding-surface tangents snapshotted *before* phase one modifies
         // the band (§6.2.3 feedback hazard). Resolve the rims up front, while
         // the topology is still the original strip.
-        let placement = if params.interp_mode == RingInterp::Linear {
+        // The profile (§6.3) re-scales the inserted verts radially from the
+        // strip's centre axis; under LINEAR that needs the rim centres, so a
+        // non-zero `profile_shape_factor` engages the post-pass even in LINEAR
+        // mode. At factor 0 LINEAR stays a pure chord lerp with no post-pass,
+        // keeping factor 0 bit-identical to the no-profile placement (§6.3.1).
+        let profile_active = params.profile_shape_factor != 0.0;
+        let placement = if params.interp_mode == RingInterp::Linear && !profile_active {
             None
         } else {
             self.resolve_ring_placement(&strip_quads, &params)
@@ -631,7 +719,7 @@ impl LoopMesh {
         // §6.2 positions-only post-pass: overwrite the chord positions the
         // inserted verts were born with by the PATH / SURFACE placement.
         if let Some(placement) = placement {
-            self.apply_ring_placement(&placement, &rung_cuts, cuts, params.smooth);
+            self.apply_ring_placement(&placement, &rung_cuts, cuts, &params);
         }
 
         result
@@ -694,8 +782,17 @@ impl LoopMesh {
             }
         }
 
+        let profile_active = params.profile_shape_factor != 0.0;
         let mode = match params.interp_mode {
-            RingInterp::Linear => return None,
+            RingInterp::Linear => {
+                // Only reached with the profile active (plain LINEAR returns
+                // `None` upstream and never resolves a placement). The profile's
+                // centre-axis reference is the straight rim-centre line (§6.3.3),
+                // so the rim-centre setup is all the LINEAR post-pass needs.
+                debug_assert!(profile_active, "plain LINEAR takes no post-pass");
+                let setup = self.rim_path_setup(&rungs, &rail_a_verts);
+                RingPlacementMode::Linear(setup)
+            }
             RingInterp::Path => {
                 let setup = self.rim_path_setup(&rungs, &rail_a_verts);
                 RingPlacementMode::Path(setup)
@@ -705,7 +802,15 @@ impl LoopMesh {
                     strip_quads.iter().map(|s| s.face).collect();
                 let tangents =
                     self.rim_surface_tangents(&rungs, &rail_a_verts, &band_faces);
-                RingPlacementMode::Surface(tangents)
+                // §6.3.3: SURFACE's profile reference is the centre *spline*
+                // (same rim centres + reconciled normals PATH samples), built
+                // only when the profile is active.
+                let centre = if profile_active {
+                    Some(self.rim_path_setup(&rungs, &rail_a_verts))
+                } else {
+                    None
+                };
+                RingPlacementMode::Surface(tangents, centre)
             }
         };
 
@@ -952,14 +1057,61 @@ impl LoopMesh {
         placement: &RingPlacement,
         rung_cuts: &HashMap<EdgeKey, RungCuts>,
         cuts: u32,
-        smooth: f32,
+        params: &SubdivideEdgeRingParams,
     ) {
         match &placement.mode {
-            RingPlacementMode::Path(setup) => {
-                self.apply_path_placement(placement, rung_cuts, setup, cuts, smooth)
+            RingPlacementMode::Linear(setup) => {
+                self.apply_linear_profile(placement, rung_cuts, setup, cuts, params)
             }
-            RingPlacementMode::Surface(tangents) => {
-                self.apply_surface_placement(placement, rung_cuts, tangents, cuts, smooth)
+            RingPlacementMode::Path(setup) => {
+                self.apply_path_placement(placement, rung_cuts, setup, cuts, params)
+            }
+            RingPlacementMode::Surface(tangents, centre) => self.apply_surface_placement(
+                placement,
+                rung_cuts,
+                tangents,
+                centre.as_ref(),
+                cuts,
+                params,
+            ),
+        }
+    }
+
+    /// §6.3.3 LINEAR profile post-pass. The inserted verts already sit at their
+    /// even-spacing chord points (`placed_co`); the profile re-scales each
+    /// interior ring's radial offset from the strip's straight centre axis. The
+    /// reference for level `i` is the rim-centre line point
+    /// `(1 − t_i)·center_A + t_i·center_B` — **not** the rung's own chord point,
+    /// which would make the lerp a no-op. The final position is
+    /// `lerp(ref_co, placed_co, shape_size[i])`, so `shape_size > 1` pushes the
+    /// ring radially out from the axis and `< 1` pulls it in.
+    fn apply_linear_profile(
+        &mut self,
+        placement: &RingPlacement,
+        rung_cuts: &HashMap<EdgeKey, RungCuts>,
+        setup: &PathSetup,
+        cuts: u32,
+        params: &SubdivideEdgeRingParams,
+    ) {
+        let resolu = cuts as usize + 2;
+        let last = resolu - 1;
+        let factor = params.profile_shape_factor;
+        let shape = params.profile_shape;
+        // ref_co[i] is the level-i point on the straight rim-centre line.
+        let ref_co: Vec<Vec3> = (0..resolu)
+            .map(|i| {
+                let t = i as f32 / last as f32;
+                setup.center_a.lerp(setup.center_b, t)
+            })
+            .collect();
+        for (&rung, &(v_a, v_b)) in &placement.rungs {
+            let inserted = rung_cuts[&rung].aligned(v_a);
+            let _ = v_b;
+            for (idx, &vert) in inserted.iter().enumerate() {
+                let i = idx + 1;
+                let size = shape.shape_size_at(i, resolu, factor);
+                let placed = self.vertex_position(vert);
+                self.set_vertex_position(vert, ref_co[i].lerp(placed, size));
             }
         }
     }
@@ -979,8 +1131,9 @@ impl LoopMesh {
         rung_cuts: &HashMap<EdgeKey, RungCuts>,
         setup: &PathSetup,
         cuts: u32,
-        smooth: f32,
+        params: &SubdivideEdgeRingParams,
     ) {
+        let smooth = params.smooth;
         let levels = cuts as usize;
         let resolu = levels + 2;
         let last = resolu - 1;
@@ -1011,13 +1164,25 @@ impl LoopMesh {
         }
         let frames = minimum_twist_frames(&dir);
 
-        // Step 3 — one reference triangle per level (unit legs along local +X
-        // then +Y at `path[i]`; `s = 1` at the default profile). The triangle
-        // carries the frame's position and orientation; its vertex order pins the
-        // handedness of the transport.
-        let shape_size = 1.0;
+        // Step 3 — one reference triangle per level (legs along local +X then +Y
+        // at `path[i]`). The leg length is the per-level shape size `s`: `1.0` at
+        // the default profile, or the §6.3.1 `shape_size[i]` when the profile is
+        // active (§6.3.3 PATH). With `s != 1` the level triangles stop being
+        // congruent to the rim triangles, engaging `tri_transform`'s `sqrt(area)`
+        // term to widen/pinch the carried cross-section. The triangle carries the
+        // frame's position and orientation; its vertex order pins the transport
+        // handedness.
+        let factor = params.profile_shape_factor;
+        let shape = params.profile_shape;
         let tris: Vec<RefTriangle> = (0..resolu)
-            .map(|i| reference_triangle(frames[i], path[i], shape_size))
+            .map(|i| {
+                let s = if factor != 0.0 {
+                    shape.shape_size_at(i, resolu, factor)
+                } else {
+                    1.0
+                };
+                reference_triangle(frames[i], path[i], s)
+            })
             .collect();
 
         // Transport each rung's rim endpoints into each interior level's triangle
@@ -1045,11 +1210,33 @@ impl LoopMesh {
         placement: &RingPlacement,
         rung_cuts: &HashMap<EdgeKey, RungCuts>,
         tangents: &HashMap<VertexKey, Vec3>,
+        centre: Option<&PathSetup>,
         cuts: u32,
-        smooth: f32,
+        params: &SubdivideEdgeRingParams,
     ) {
+        let smooth = params.smooth;
+        let factor = params.profile_shape_factor;
+        let shape = params.profile_shape;
         let levels = cuts as usize;
         let segments = levels + 1;
+        let resolu = levels + 2;
+        let last = resolu - 1;
+
+        // §6.3.3 SURFACE reference: the level points on the per-strip centre
+        // spline (the same rim-centre Bézier PATH samples). At smooth = 0 the
+        // handles collapse and it degenerates to the straight centre axis. Built
+        // only when the profile is active (`centre` is `Some`).
+        let ref_co: Option<Vec<Vec3>> = centre.map(|setup| {
+            let h = handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
+            let h_a = setup.center_a + smooth * h * setup.normal_a;
+            let h_b = setup.center_b + smooth * h * setup.normal_b;
+            (0..resolu)
+                .map(|i| {
+                    let t = i as f32 / last as f32;
+                    bezier(setup.center_a, h_a, h_b, setup.center_b, t)
+                })
+                .collect()
+        });
 
         for (&rung, &(v_a, v_b)) in &placement.rungs {
             let pos_a = self.vertex_position(v_a);
@@ -1068,7 +1255,16 @@ impl LoopMesh {
             for (idx, &vert) in inserted.iter().enumerate() {
                 let level = idx + 1;
                 let t = level as f32 / segments as f32;
-                let co = bezier(pos_a, handle_a, handle_b, pos_b, t);
+                let placed = bezier(pos_a, handle_a, handle_b, pos_b, t);
+                // §6.3.3: re-scale the placed cubic sample toward/away from the
+                // centre-spline reference by the per-level shape size.
+                let co = match &ref_co {
+                    Some(refs) => {
+                        let size = shape.shape_size_at(level, resolu, factor);
+                        refs[level].lerp(placed, size)
+                    }
+                    None => placed,
+                };
                 self.set_vertex_position(vert, co);
             }
         }
@@ -1506,6 +1702,7 @@ mod tests {
             cuts,
             interp_mode: interp,
             smooth,
+            profile_shape: ProfileShape::Smooth,
             profile_shape_factor: 0.0,
         }
     }
@@ -2013,6 +2210,143 @@ mod tests {
             max_bow > 0.03,
             "SURFACE smooth=0.6 must bow the angle-0 ring off the chord line \
              (≈0.037..0.049); max off-chord was {max_bow}"
+        );
+    }
+
+    /// Radial distance of a point from the closed band's y-axis (the §6.3.4
+    /// centre axis of the unit cylinder `closed_band` builds).
+    fn radius_xz(p: Vec3) -> f32 {
+        (p.x * p.x + p.z * p.z).sqrt()
+    }
+
+    fn profile(
+        interp: RingInterp,
+        cuts: u32,
+        shape: ProfileShape,
+        factor: f32,
+    ) -> SubdivideEdgeRingParams {
+        SubdivideEdgeRingParams {
+            cuts,
+            interp_mode: interp,
+            smooth: 0.0,
+            profile_shape: shape,
+            profile_shape_factor: factor,
+        }
+    }
+
+    #[test]
+    fn profile_factor_zero_is_bit_identical_to_no_profile() {
+        // §6.3.1: at factor 0 the shape-size cache is skipped and the placement
+        // must be bit-identical to the no-profile run. Compare the inserted vert
+        // positions of factor=0 against the plain default, across interp modes.
+        for interp in [RingInterp::Linear, RingInterp::Surface] {
+            let (mut a, rungs_a) = closed_band(6);
+            let res_a = a.subdivide_edgering(&rungs_a, params(interp, 2, 0.0));
+
+            let (mut b, rungs_b) = closed_band(6);
+            // SMOOTH curve, factor 0 — the profile gate is off, so this must
+            // reproduce `params(...)` exactly (bit-for-bit, not just close).
+            let res_b = b.subdivide_edgering(&rungs_b, profile(interp, 2, ProfileShape::Smooth, 0.0));
+
+            let mut pos_a: Vec<[u32; 3]> = res_a
+                .verts
+                .iter()
+                .map(|&v| a.vertex_position(v).to_array().map(f32::to_bits))
+                .collect();
+            let mut pos_b: Vec<[u32; 3]> = res_b
+                .verts
+                .iter()
+                .map(|&v| b.vertex_position(v).to_array().map(f32::to_bits))
+                .collect();
+            pos_a.sort();
+            pos_b.sort();
+            assert_eq!(pos_a, pos_b, "factor=0 must be bit-identical ({interp:?})");
+        }
+    }
+
+    #[test]
+    fn linear_profile_rescales_interior_rings_radially() {
+        // §6.3.4 worked check: flat unit cylinder, LINEAR, cuts=2, SMOOTH,
+        // factor=0.5 → shape_size 1.3704. The two interior rings move from
+        // radius 1.0 (even-spacing chord) out to radius 1.3704, purely radially
+        // (the y/axis coordinate is untouched: rung chord ∥ centre axis).
+        let (mut mesh, rungs) = closed_band(6);
+        let result =
+            mesh.subdivide_edgering(&rungs, profile(RingInterp::Linear, 2, ProfileShape::Smooth, 0.5));
+
+        // Contrast: the same fixture/params at factor 0 stays at radius 1.0.
+        let (mut flat, flat_rungs) = closed_band(6);
+        let flat_res = flat.subdivide_edgering(&flat_rungs, params(RingInterp::Linear, 2, 0.0));
+        for &v in &flat_res.verts {
+            assert!(
+                (radius_xz(flat.vertex_position(v)) - 1.0).abs() < 1e-5,
+                "factor=0 interior ring stays on the chord (radius 1.0)"
+            );
+        }
+
+        assert_eq!(result.verts.len(), 12, "N·k = 2·6 interior verts");
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            assert!(
+                (radius_xz(p) - 1.3704).abs() < 1e-3,
+                "interior ring re-scaled to radius 1.3704; got {}",
+                radius_xz(p)
+            );
+            // y is the cut level (1/3 or 2/3): untouched by the radial re-scale.
+            assert!(
+                (p.y - 1.0 / 3.0).abs() < 1e-5 || (p.y - 2.0 / 3.0).abs() < 1e-5,
+                "axis coordinate untouched; y = {}",
+                p.y
+            );
+        }
+    }
+
+    #[test]
+    fn linear_negative_factor_pulls_rings_inward() {
+        // §6.3.1/§6.3.4: a negative factor pulls the interior rings *in* toward
+        // the centre axis. SMOOTH at factor=-0.5 → shape_size 0.6296.
+        let (mut mesh, rungs) = closed_band(6);
+        let result = mesh.subdivide_edgering(
+            &rungs,
+            profile(RingInterp::Linear, 2, ProfileShape::Smooth, -0.5),
+        );
+        for &v in &result.verts {
+            assert!(
+                (radius_xz(mesh.vertex_position(v)) - 0.6296).abs() < 1e-3,
+                "negative factor pulls the ring in to radius 0.6296; got {}",
+                radius_xz(mesh.vertex_position(v))
+            );
+        }
+    }
+
+    #[test]
+    fn profile_curve_axis_sharp_differs_from_sphere() {
+        // §6.3.5 curve-axis non-vacuity: hold factor fixed, vary only the curve.
+        // SHARP and SPHERE give different f(2/3) (§6.3.4: 0.4444 vs 0.9428) →
+        // different interior shape_size (1.2222 vs 1.4714) → different radii.
+        let (mut sharp_mesh, sharp_rungs) = closed_band(6);
+        let sharp = sharp_mesh
+            .subdivide_edgering(&sharp_rungs, profile(RingInterp::Linear, 2, ProfileShape::Sharp, 0.5));
+
+        let (mut sphere_mesh, sphere_rungs) = closed_band(6);
+        let sphere = sphere_mesh.subdivide_edgering(
+            &sphere_rungs,
+            profile(RingInterp::Linear, 2, ProfileShape::Sphere, 0.5),
+        );
+
+        let sharp_r = radius_xz(sharp_mesh.vertex_position(sharp.verts[0]));
+        let sphere_r = radius_xz(sphere_mesh.vertex_position(sphere.verts[0]));
+        assert!(
+            (sharp_r - 1.2222).abs() < 1e-3,
+            "SHARP shape_size 1.2222; got radius {sharp_r}"
+        );
+        assert!(
+            (sphere_r - 1.4714).abs() < 1e-3,
+            "SPHERE shape_size 1.4714; got radius {sphere_r}"
+        );
+        assert!(
+            (sharp_r - sphere_r).abs() > 0.1,
+            "two curves must place the interior ring at different radii"
         );
     }
 
