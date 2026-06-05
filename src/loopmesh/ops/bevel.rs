@@ -5,9 +5,11 @@ use crate::loopmesh::*;
 
 /// Which elements the bevel replaces (BEVEL.md §1.2 / §2.2).
 ///
-/// Only [`BevelAffect::Vertices`] is implemented today — the foundational
-/// single-segment vertex bevel of BEVEL.md §3–§6. [`BevelAffect::Edges`] is a
-/// documented-as-future stub (BEVEL.md §7).
+/// [`BevelAffect::Vertices`] is the foundational single-segment vertex bevel of
+/// BEVEL.md §3–§6. [`BevelAffect::Edges`] is the foundational single-segment edge
+/// bevel of BEVEL.md §7 — implemented for the **isolated** single manifold edge
+/// (no two beveled edges share a vertex); the multi-edge junction is a
+/// documented-as-future stub (BEVEL.md §7.6).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BevelAffect {
     Vertices,
@@ -135,9 +137,11 @@ impl LoopMesh {
     ///
     /// Implemented for the foundational case: `affect = Vertices`,
     /// `segments = 1`, any `offset_type` (all five modes re-measure the per-edge
-    /// slide per BEVEL.md §4 / §4.3). Edge bevel, multiple segments, profiles,
-    /// miters, overlap clamping, and flag propagation are documented-as-future
-    /// stubs (BEVEL.md §7) and are ignored here.
+    /// slide per BEVEL.md §4 / §4.3). Single-segment `affect = Edges` is supported
+    /// for the foundational **isolated** manifold edge (BEVEL.md §7), measured with
+    /// `offset_type = Offset`. Multiple segments, profiles, miters, overlap
+    /// clamping, flag propagation, and the multi-edge junction are
+    /// documented-as-future stubs (BEVEL.md §7.6 / §8) and are ignored here.
     ///
     /// A non-positive `offset`, or a beveled vertex with fewer than two incident
     /// edges, is a no-op for that vertex (BEVEL.md §2.1).
@@ -146,10 +150,15 @@ impl LoopMesh {
     pub fn bevel(&mut self, geom: &[GeomKey], options: BevelOptions) -> BevelResult {
         let mut result = BevelResult::default();
 
-        if options.affect != BevelAffect::Vertices
-            || options.segments != 1
-            || options.offset <= 0.0
-        {
+        if options.segments != 1 || options.offset <= 0.0 {
+            return result;
+        }
+
+        if options.affect == BevelAffect::Edges {
+            return self.bevel_edges(geom, options.offset);
+        }
+
+        if options.affect != BevelAffect::Vertices {
             return result;
         }
 
@@ -209,6 +218,350 @@ impl LoopMesh {
         }
 
         result
+    }
+
+    /// Foundational single-segment edge bevel (BEVEL.md §7).
+    ///
+    /// Bevels each **isolated** manifold edge in `geom`: an edge with exactly two
+    /// incident faces whose endpoints are shared with no *second* beveled edge
+    /// (§7.2). Each such edge `E = {a, b}` is replaced by four strip verts (two
+    /// per endpoint, slid perpendicular into each adjacent face, §7.3), one strip
+    /// quad `aL–bL–bR–aR` (§7.1), with each valence-3 terminal endpoint absorbed
+    /// into its surviving third face (quad → pentagon, §7.4 / §7.5). The two
+    /// original endpoints are then freed as loose verts (§7.1 item 5).
+    ///
+    /// A non-manifold edge, a non-isolated edge (sharing an endpoint with another
+    /// beveled edge — the junction case), or an endpoint of valence ≠ 3 is skipped
+    /// here: those are the §7.6 / §8 stubs.
+    fn bevel_edges(&mut self, geom: &[GeomKey], offset: f32) -> BevelResult {
+        let mut result = BevelResult::default();
+
+        let mut beveled: Vec<EdgeKey> = Vec::new();
+        for entry in geom {
+            if let GeomKey::Edge(edge) = *entry {
+                if !beveled.contains(&edge) {
+                    beveled.push(edge);
+                }
+            }
+        }
+
+        // §7.2: the isolated restriction — an endpoint shared by two beveled edges
+        // is a junction (§7.6), out of scope. Count endpoint incidences across the
+        // selection and drop any edge whose endpoint is shared with another.
+        let mut endpoint_uses: Vec<(VertexKey, usize)> = Vec::new();
+        for &edge in &beveled {
+            for endpoint in self.edge_vert_keys(edge) {
+                match endpoint_uses.iter_mut().find(|(v, _)| *v == endpoint) {
+                    Some((_, count)) => *count += 1,
+                    None => endpoint_uses.push((endpoint, 1)),
+                }
+            }
+        }
+        let endpoint_shared = |vertex: VertexKey| -> bool {
+            endpoint_uses
+                .iter()
+                .find(|(v, _)| *v == vertex)
+                .map(|(_, count)| *count > 1)
+                .unwrap_or(false)
+        };
+
+        for &edge in &beveled {
+            let [a, b] = self.edge_vert_keys(edge);
+            if endpoint_shared(a) || endpoint_shared(b) {
+                continue; // junction endpoint — §7.6 stub
+            }
+            self.bevel_single_edge(edge, offset, &mut result);
+        }
+
+        result
+    }
+
+    /// Bevel one isolated manifold edge (BEVEL.md §7). Places the four strip verts
+    /// against the pristine local geometry (§7.5 placement-before-surgery), then
+    /// re-stitches every incident face and builds the strip quad.
+    fn bevel_single_edge(&mut self, edge: EdgeKey, offset: f32, result: &mut BevelResult) {
+        let [a, b] = self.edge_vert_keys(edge);
+
+        // §7.1: the two radial faces of the manifold edge. A non-manifold edge
+        // (radial count != 2) has no well-defined left/right strip and is skipped.
+        let radial_faces: Vec<FaceKey> = self
+            .edge_loop_keys(edge)
+            .iter()
+            .map(|&l| self.loop_face(l))
+            .collect();
+        if radial_faces.len() != 2 {
+            return;
+        }
+        let face_left = radial_faces[0];
+        let face_right = radial_faces[1];
+
+        // §7.5 foundational pin: only the valence-3 terminal endpoint close is
+        // documented (the surviving third face absorbs the corner). A valence ≥ 4
+        // endpoint needs the on-edge-vert fill (§7.5) / junction patch (§7.6).
+        let valence = |vertex: VertexKey| self.iter_disk_edges(vertex).count();
+        if valence(a) != 3 || valence(b) != 3 {
+            return;
+        }
+
+        let direction = {
+            let segment = self.vertex_position(b) - self.vertex_position(a);
+            let length = segment.length();
+            if length <= f32::EPSILON {
+                return; // degenerate zero-length edge
+            }
+            segment / length
+        };
+
+        let left_normal = self.face_plane_normal(face_left);
+        let right_normal = self.face_plane_normal(face_right);
+        let left_center = self.face_center_of_mass(face_left);
+        let right_center = self.face_center_of_mass(face_right);
+
+        // §7.3: strip vert = endpoint + offset · (in-face perpendicular to E),
+        // the perpendicular chosen to point into the face interior (toward its
+        // centroid). The face normal disambiguates the in-plane perpendicular.
+        let strip_a_left =
+            self.create_vertex(strip_vert_position(
+                self.vertex_position(a),
+                direction,
+                left_normal,
+                left_center,
+                offset,
+            ));
+        let strip_a_right =
+            self.create_vertex(strip_vert_position(
+                self.vertex_position(a),
+                direction,
+                right_normal,
+                right_center,
+                offset,
+            ));
+        let strip_b_left =
+            self.create_vertex(strip_vert_position(
+                self.vertex_position(b),
+                direction,
+                left_normal,
+                left_center,
+                offset,
+            ));
+        let strip_b_right =
+            self.create_vertex(strip_vert_position(
+                self.vertex_position(b),
+                direction,
+                right_normal,
+                right_center,
+                offset,
+            ));
+        result
+            .verts
+            .extend([strip_a_left, strip_a_right, strip_b_left, strip_b_right]);
+
+        // The non-`E` edge of each radial face at each endpoint. These are the
+        // edges shared between a radial face and the endpoint's *third* face; the
+        // re-stitch re-points them onto the strip verts, so the third face must
+        // place the matching strip vert next to that edge's far end (§7.4).
+        let left_other_a = self.face_other_edge_at(face_left, a, edge);
+        let right_other_a = self.face_other_edge_at(face_right, a, edge);
+        let left_other_b = self.face_other_edge_at(face_left, b, edge);
+        let right_other_b = self.face_other_edge_at(face_right, b, edge);
+
+        let substitutions = EdgeBevelSubstitutions {
+            a,
+            b,
+            face_left,
+            face_right,
+            strip_a_left,
+            strip_a_right,
+            strip_b_left,
+            strip_b_right,
+            left_other_a,
+            right_other_a,
+            left_other_b,
+            right_other_b,
+        };
+
+        // §7.1 item 4 / §7.4: re-stitch every face incident to a or b. fL/fR swap
+        // their endpoint corners 1-for-1 (a→aL/aR, b→bL/bR), staying the same
+        // size and adopting the strip's near long edge as their new `E` side. Each
+        // third face replaces its single endpoint corner with the endpoint's two
+        // strip verts (1-for-2), growing by one side.
+        let mut incident_faces: Vec<FaceKey> = self.vert_face_keys(a);
+        for face in self.vert_face_keys(b) {
+            if !incident_faces.contains(&face) {
+                incident_faces.push(face);
+            }
+        }
+        for face in incident_faces {
+            self.restitch_edge_bevel_face(face, &substitutions);
+        }
+
+        // §7.1 item 2 / §5.1 winding: build the strip quad over the four strip
+        // verts, wound opposite to how fL traverses its new `aL–bL` long edge so
+        // the quad and fL share that edge with consistent (radial-2) traversal.
+        let strip = self.build_strip_quad(
+            strip_a_left,
+            strip_b_left,
+            strip_b_right,
+            strip_a_right,
+        );
+        result.faces.push(strip.face);
+        result.edges.extend(strip.edges);
+
+        // §7.1 item 5 / §6.3: both endpoints are now loose. Free them.
+        self.vertex_kill(a);
+        self.vertex_kill(b);
+    }
+
+    /// Re-stitch one face incident to a beveled edge's endpoint(s) (BEVEL.md §7.4
+    /// / §7.5). The two radial faces swap each beveled-edge endpoint corner for the
+    /// single matching strip vert (1-for-1); every other face swaps an endpoint
+    /// corner for that endpoint's two strip verts (1-for-2), ordered so the strip
+    /// vert sharing the re-pointed incoming edge stays adjacent to that edge.
+    fn restitch_edge_bevel_face(&mut self, face: FaceKey, sub: &EdgeBevelSubstitutions) {
+        let cycle_verts = self.face_vert_keys(face);
+        let cycle_length = cycle_verts.len();
+
+        let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_length + 1);
+        for (index, &w) in cycle_verts.iter().enumerate() {
+            if w != sub.a && w != sub.b {
+                new_cycle.push(w);
+                continue;
+            }
+
+            if face == sub.face_left {
+                new_cycle.push(if w == sub.a { sub.strip_a_left } else { sub.strip_b_left });
+            } else if face == sub.face_right {
+                new_cycle.push(if w == sub.a { sub.strip_a_right } else { sub.strip_b_right });
+            } else {
+                // Third face: replace the corner with both strip verts, ordered so
+                // the one sharing the incoming edge sits next to `prev`.
+                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
+                let incoming_edge = self
+                    .query_edge_exists(prev_vertex, w)
+                    .expect("third face's incoming corner edge exists");
+                let (left_other, right_other, strip_left, strip_right) = if w == sub.a {
+                    (sub.left_other_a, sub.right_other_a, sub.strip_a_left, sub.strip_a_right)
+                } else {
+                    (sub.left_other_b, sub.right_other_b, sub.strip_b_left, sub.strip_b_right)
+                };
+                if incoming_edge == left_other {
+                    new_cycle.push(strip_left);
+                    new_cycle.push(strip_right);
+                } else if incoming_edge == right_other {
+                    new_cycle.push(strip_right);
+                    new_cycle.push(strip_left);
+                } else {
+                    // Defensive: an incident face that is neither radial face nor
+                    // a genuine third face touching one of the shared edges should
+                    // not arise for an isolated valence-3 edge.
+                    new_cycle.push(strip_left);
+                    new_cycle.push(strip_right);
+                }
+            }
+        }
+
+        self.face_kill(face);
+        let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
+        self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+    }
+
+    /// Build the strip quad over the four strip verts in the cyclic order
+    /// `aL → bL → bR → aR` (BEVEL.md §7.1 item 2), reversing it when needed so the
+    /// quad runs the `aL–bL` long edge opposite to the re-stitched left face's
+    /// traversal — the §5.1 winding rule that keeps the shared edge radial-2.
+    fn build_strip_quad(
+        &mut self,
+        a_left: VertexKey,
+        b_left: VertexKey,
+        b_right: VertexKey,
+        a_right: VertexKey,
+    ) -> StripQuad {
+        let long_edge = self
+            .query_edge_exists(a_left, b_left)
+            .expect("re-stitched left face minted the strip's long edge aL–bL");
+        let face_runs_forward = self
+            .edge_loop_keys(long_edge)
+            .first()
+            .map(|&l| {
+                let start = self.loop_vertex(l);
+                let end = self.loop_vertex(self.loop_next(l));
+                start == a_left && end == b_left
+            })
+            .unwrap_or(false);
+
+        let mut ring = vec![a_left, b_left, b_right, a_right];
+        if face_runs_forward {
+            ring.reverse();
+        }
+
+        let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+
+        let mut edges: Vec<EdgeKey> = (0..ring.len())
+            .map(|i| {
+                let p = ring[i];
+                let q = ring[(i + 1) % ring.len()];
+                self.query_edge_exists(p, q).expect("strip quad edge exists")
+            })
+            .collect();
+        edges.sort_by_key(|e| e.as_usize());
+        edges.dedup();
+
+        StripQuad { face, edges }
+    }
+
+    /// The edge of `face` incident to `vertex` that is **not** `exclude` (BEVEL.md
+    /// §7.4): a face corner sits on exactly two of its edges, so excluding the
+    /// beveled edge leaves the single other one.
+    fn face_other_edge_at(
+        &self,
+        face: FaceKey,
+        vertex: VertexKey,
+        exclude: EdgeKey,
+    ) -> EdgeKey {
+        let mut found = None;
+        for loop_key in self.face_loop_keys(face) {
+            let loop_edge = self.loop_edge(loop_key);
+            if loop_edge == exclude {
+                continue;
+            }
+            let [p, q] = self.edge_vert_keys(loop_edge);
+            if p == vertex || q == vertex {
+                found = Some(loop_edge);
+            }
+        }
+        found.expect("face has a non-excluded edge at the corner vertex")
+    }
+
+    /// A face's geometric normal, computed on the fly from its loop cycle by
+    /// Newell's method (BEVEL.md §7.3 needs an in-plane perpendicular; the stored
+    /// face normal may be stale during surgery, so this reads positions directly).
+    fn face_plane_normal(&self, face: FaceKey) -> Vec3 {
+        let verts = self.face_vert_keys(face);
+        let mut normal = Vec3::ZERO;
+        for i in 0..verts.len() {
+            let current = self.vertex_position(verts[i]);
+            let next = self.vertex_position(verts[(i + 1) % verts.len()]);
+            normal.x += (current.y - next.y) * (current.z + next.z);
+            normal.y += (current.z - next.z) * (current.x + next.x);
+            normal.z += (current.x - next.x) * (current.y + next.y);
+        }
+        let length = normal.length();
+        if length <= f32::EPSILON {
+            Vec3::Z
+        } else {
+            normal / length
+        }
+    }
+
+    /// A face's centroid (mean of its corner positions), used to orient the
+    /// in-face strip-slide direction toward the face interior (BEVEL.md §7.3).
+    fn face_center_of_mass(&self, face: FaceKey) -> Vec3 {
+        let verts = self.face_vert_keys(face);
+        let mut sum = Vec3::ZERO;
+        for &v in &verts {
+            sum += self.vertex_position(v);
+        }
+        sum / verts.len() as f32
     }
 
     /// Phase 1a (BEVEL.md §6.4.1): capture each beveled vertex's per-edge
@@ -498,6 +851,31 @@ impl LoopMesh {
 struct CapFace {
     face: FaceKey,
     chamfer_edges: Vec<EdgeKey>,
+}
+
+/// The new strip face and its edges (BEVEL.md §7.1 item 2).
+struct StripQuad {
+    face: FaceKey,
+    edges: Vec<EdgeKey>,
+}
+
+/// The per-edge frame an edge bevel's re-stitch reads: the beveled edge, its two
+/// endpoints, its two radial faces, the four strip verts, and each radial face's
+/// non-`E` edge at each endpoint (BEVEL.md §7.4). Captured against the pristine
+/// local geometry before any face is cut (§7.5).
+struct EdgeBevelSubstitutions {
+    a: VertexKey,
+    b: VertexKey,
+    face_left: FaceKey,
+    face_right: FaceKey,
+    strip_a_left: VertexKey,
+    strip_a_right: VertexKey,
+    strip_b_left: VertexKey,
+    strip_b_right: VertexKey,
+    left_other_a: EdgeKey,
+    right_other_a: EdgeKey,
+    left_other_b: EdgeKey,
+    right_other_b: EdgeKey,
 }
 
 #[cfg(test)]
@@ -845,25 +1223,15 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// BEVEL.md §7: edge bevel and multi-segment are unimplemented stubs — they
-    /// are no-ops here, not silent wrong results.
+    /// BEVEL.md §7.6 / §8: multi-segment is an unimplemented stub — a no-op, not a
+    /// silent wrong result. (Edge bevel `affect = Edges` *is* implemented for the
+    /// isolated single edge, §7; see the edge-bevel tests below.)
     #[test]
     fn unsupported_modes_are_noops() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let before = counts(&mesh);
         let corner = mesh.vert_keys()[0];
-
-        let edges_mode = mesh.bevel(
-            &[corner.into()],
-            BevelOptions {
-                offset: 0.25,
-                affect: BevelAffect::Edges,
-                ..Default::default()
-            },
-        );
-        assert_eq!(counts(&mesh), before);
-        assert!(edges_mode.verts.is_empty());
 
         let multi_segment = mesh.bevel(
             &[corner.into()],
@@ -875,6 +1243,181 @@ mod tests {
         );
         assert_eq!(counts(&mesh), before);
         assert!(multi_segment.verts.is_empty());
+        mesh.validate_topology();
+    }
+
+    /// The cube edge between the verts at `pa` and `pb`.
+    fn cube_edge(mesh: &LoopMesh, pa: Vec3, pb: Vec3) -> EdgeKey {
+        let a = vert_at(mesh, pa);
+        let b = vert_at(mesh, pb);
+        mesh.query_edge_exists(a, b).expect("cube edge exists")
+    }
+
+    /// BEVEL.md §7.4: beveling one isolated manifold cube edge ({0,1}) with
+    /// `affect = Edges` replaces the crease with four strip verts and one strip
+    /// quad, each valence-3 endpoint absorbed into its third face. Count delta
+    /// +2 V / +3 E / +1 F over the cube's 8 V / 12 E / 6 F.
+    #[test]
+    fn edge_bevel_isolated_cube_edge_count_delta() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let a = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let b = vert_at(&mesh, Vec3::new(-1.0, -1.0, -1.0));
+        let edge = mesh.query_edge_exists(a, b).expect("edge {0,1}");
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(counts(&mesh), (10, 15, 7), "isolated edge +2 V / +3 E / +1 F");
+        assert_eq!(result.verts.len(), 4, "four strip verts");
+        assert_eq!(result.faces.len(), 1, "the strip quad is the only new face");
+
+        // The strip face is a quad.
+        let strip = result.faces[0];
+        assert_eq!(mesh.face_vert_keys(strip).len(), 4, "strip quad");
+
+        // Both original endpoints are removed.
+        assert!(
+            !mesh.vert_keys().into_iter().any(|v| v == a || v == b),
+            "both beveled-edge endpoints removed",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.4: the strip quad's four corners sit a perpendicular `offset`
+    /// from the original edge line — two per endpoint, one into each adjacent
+    /// face. For edge {0,1} (the front/bottom crease along −Y/−Z) the strip verts
+    /// land in the front (z = −1) and bottom (y = −1) planes, `offset` off the
+    /// crease.
+    #[test]
+    fn edge_bevel_strip_verts_perpendicular_offset() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+
+        let offset = 0.25_f32;
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        // The crease line is x ∈ [−1,1], y = −1, z = −1. Each strip vert keeps the
+        // endpoint's x, and slides `offset` along exactly one of −Y/−Z into a face:
+        // the front face (z = −1) strip verts move in +Y (to y = −1+offset, z = −1),
+        // the bottom face (y = −1) strip verts move in +Z (to y = −1, z = −1+offset).
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            assert!(p.x.abs() <= 1.0 + 1.0e-5, "strip vert keeps endpoint x");
+            let into_front = (p - Vec3::new(p.x, -1.0 + offset, -1.0)).length();
+            let into_bottom = (p - Vec3::new(p.x, -1.0, -1.0 + offset)).length();
+            assert!(
+                into_front < 1.0e-5 || into_bottom < 1.0e-5,
+                "strip vert at {p:?} must lie {offset} into the front or bottom face",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.4: after the bevel, the two `E`-adjacent faces (fL/fR) stay
+    /// quads (swapping their `E` side for the strip's long edge) and the two
+    /// third faces grow by one corner (quad → pentagon). The strip quad shares
+    /// each of its four edges with exactly one other face (radial count 2).
+    #[test]
+    fn edge_bevel_face_sizes_and_strip_manifold() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        // Two pentagons (the third faces, originally quads, each +1 corner); the
+        // remaining four pre-existing faces stay quads, plus the new strip quad.
+        let sizes: Vec<usize> = mesh
+            .face_keys()
+            .into_iter()
+            .map(|f| mesh.face_vert_keys(f).len())
+            .collect();
+        let pentagons = sizes.iter().filter(|&&n| n == 5).count();
+        let quads = sizes.iter().filter(|&&n| n == 4).count();
+        assert_eq!(pentagons, 2, "two third faces grew quad → pentagon");
+        assert_eq!(quads, 5, "fL, fR, two untouched faces, and the strip quad");
+
+        // Every strip-quad edge is shared with exactly one other face.
+        let strip = result.faces[0];
+        for loop_key in mesh.face_loop_keys(strip) {
+            let strip_edge = mesh.loop_edge(loop_key);
+            assert_eq!(
+                mesh.edge_radial_iter(strip_edge).count(),
+                2,
+                "each strip edge is manifold (radial count 2)",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §9: the §7 placement is not specific to one edge's orientation —
+    /// the differently-oriented edge {3,7} (the front∩... rim along +Z) yields the
+    /// same +2 V / +3 E / +1 F delta and strip-quad topology.
+    #[test]
+    fn edge_bevel_other_orientation_same_delta() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        // vert 3 = (1,1,-1), vert 7 = (1,1,1).
+        let edge = cube_edge(&mesh, Vec3::new(1.0, 1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(counts(&mesh), (10, 15, 7), "same +2 V / +3 E / +1 F delta");
+        assert_eq!(result.verts.len(), 4, "four strip verts");
+        assert_eq!(result.faces.len(), 1, "single strip quad");
+        assert_eq!(mesh.face_vert_keys(result.faces[0]).len(), 4, "strip quad");
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §2.1: a non-positive offset is a no-op for edge bevel too.
+    #[test]
+    fn edge_bevel_non_positive_offset_is_noop() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let before = counts(&mesh);
+        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.0,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "offset <= 0 changes nothing");
+        assert!(result.verts.is_empty() && result.faces.is_empty());
         mesh.validate_topology();
     }
 
@@ -1032,6 +1575,31 @@ fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
     }
     let clamped = offset.min(length);
     vertex + (direction / length) * clamped
+}
+
+/// Place one edge-bevel strip vert (BEVEL.md §7.3): slide `offset` from the
+/// endpoint, perpendicular to the beveled edge and in the adjacent face's plane,
+/// into the face interior. `face_normal` fixes the in-plane perpendicular
+/// (`cross(direction, normal)`); `face_center` disambiguates its sign so the
+/// vert moves toward the face's interior, away from the crease.
+fn strip_vert_position(
+    endpoint: Vec3,
+    direction: Vec3,
+    face_normal: Vec3,
+    face_center: Vec3,
+    offset: f32,
+) -> Vec3 {
+    let mut into_face = direction.cross(face_normal);
+    let length = into_face.length();
+    if length <= f32::EPSILON {
+        return endpoint; // degenerate: edge parallel to the normal
+    }
+    into_face /= length;
+    // Orient toward the face interior: the centroid lies on the interior side.
+    if into_face.dot(face_center - endpoint) < 0.0 {
+        into_face = -into_face;
+    }
+    endpoint + into_face * offset
 }
 
 /// The corner axis `Σ_i normalize(v − A_i)` (BEVEL.md §4.3): the un-normalised
