@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use glam::{Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 
 use crate::loopmesh::*;
 
@@ -241,6 +241,86 @@ fn handle_length(a: Vec3, b: Vec3, _dir_a: Vec3, _dir_b: Vec3) -> f32 {
     (b - a).length() / 3.0
 }
 
+/// Edge-length-weighted centre of a rim ring (§6.2.1). `ring` holds the ring's
+/// verts in loop order (treated as closed). Each vert is weighted by the sum of
+/// the lengths of its two incident ring edges, so longer spans pull the centre
+/// toward them and an unevenly-spaced ring is not biased toward its densely
+/// sampled side. Reduces to the plain mean only for an equal-edge ring.
+fn rim_center(ring: &[Vec3]) -> Vec3 {
+    if ring.is_empty() {
+        return Vec3::ZERO;
+    }
+    let mut weighted_sum = Vec3::ZERO;
+    let mut total_weight = 0.0f32;
+    let n = ring.len();
+    for i in 0..n {
+        let prev = ring[(i + n - 1) % n];
+        let curr = ring[i];
+        let next = ring[(i + 1) % n];
+        let weight = (curr - prev).length() + (next - curr).length();
+        weighted_sum += weight * curr;
+        total_weight += weight;
+    }
+    if total_weight > 0.0 {
+        weighted_sum / total_weight
+    } else {
+        ring.iter().fold(Vec3::ZERO, |a, &v| a + v) / n as f32
+    }
+}
+
+/// Area-weighted (Newell) ring normal of a rim ring (§6.2.1). `ring` holds the
+/// ring's verts in loop order; the ring is treated as a *closed* polygon (the
+/// last vert wraps back to the first). Each consecutive pair contributes the
+/// Newell edge term — the 3D shoelace / signed-projected-area contribution — so
+/// each edge weighs in proportion to the area it sweeps and the result stays
+/// robust on a non-planar (twisted) ring rather than snapping to a least-variance
+/// axis. The accumulated vector's sign follows the ring's winding; the caller's
+/// reconciliation fixes the two rims' signs relative to each other. Returns
+/// `None` when the ring is degenerate/collinear (near-zero swept area), letting
+/// the caller substitute the centre-aligned fallback.
+fn newell_ring_normal(ring: &[Vec3]) -> Option<Vec3> {
+    if ring.len() < 3 {
+        return None;
+    }
+    let mut no = Vec3::ZERO;
+    for i in 0..ring.len() {
+        let v_prev = ring[i];
+        let v_curr = ring[(i + 1) % ring.len()];
+        no.x += (v_prev.y - v_curr.y) * (v_prev.z + v_curr.z);
+        no.y += (v_prev.z - v_curr.z) * (v_prev.x + v_curr.x);
+        no.z += (v_prev.x - v_curr.x) * (v_prev.y + v_curr.y);
+    }
+    let n = no.normalize_or_zero();
+    if n.length_squared() < 0.5 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// Fallback rim normal for a degenerate/collinear ring (§6.2.1): the ring sweeps
+/// no area, so the Newell construction is undefined. Build an axis in the same
+/// edge-summed spirit — for each ring edge, accumulate the component of that
+/// edge's perpendicular lying in the plane normal to the centre-to-centre
+/// `axis` (`(edge × axis) × edge`, summed over the closed ring), then normalise.
+/// Falls back to the bare `axis` direction if even that accumulation vanishes
+/// (a ring collinear *with* the axis).
+fn centre_aligned_fallback_normal(ring: &[Vec3], axis: Vec3) -> Vec3 {
+    let mut accum = Vec3::ZERO;
+    if ring.len() >= 2 {
+        for i in 0..ring.len() {
+            let edge = ring[(i + 1) % ring.len()] - ring[i];
+            accum += edge.cross(axis).cross(edge);
+        }
+    }
+    let n = accum.normalize_or_zero();
+    if n.length_squared() < 0.5 {
+        axis.normalize_or_zero()
+    } else {
+        n
+    }
+}
+
 /// Cubic Bézier point at `t` from four control points.
 fn bezier(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
     let u = 1.0 - t;
@@ -264,19 +344,46 @@ fn path_bisector(prev: Vec3, here: Vec3, next: Vec3) -> Vec3 {
 }
 
 /// Minimum-twist orientation sweep along the per-level directions (§6.2.2 step
-/// 2). Frame 0 rotates a fixed reference axis onto `dir[0]`; each subsequent
-/// frame is the previous one pre-rotated by the smallest rotation carrying
-/// `dir[j-1]` onto `dir[j]` — a rotation-minimizing frame, no spurious roll.
+/// 2). Frame 0 is the curve-framing seed (`seed_frame`: local +Z aligned to
+/// `dir[0]`, local +Y the up reference) — **not** a free shortest-arc rotation,
+/// because the up choice pins the roll about `dir[0]` and that roll is carried
+/// through every level. Each subsequent frame is the previous one pre-rotated by
+/// the smallest rotation carrying `dir[j-1]` onto `dir[j]` — a
+/// rotation-minimizing frame, no spurious roll beyond the seed's.
 fn minimum_twist_frames(dir: &[Vec3]) -> Vec<Quat> {
-    let reference = Vec3::Z;
     let mut frames = Vec::with_capacity(dir.len());
-    frames.push(rotation_between(reference, dir[0]));
+    frames.push(seed_frame(dir[0]));
     for j in 1..dir.len() {
         let delta = rotation_between(dir[j - 1], dir[j]);
         let frame = delta * frames[j - 1];
         frames.push(frame);
     }
     frames
+}
+
+/// The curve-framing seed orientation (§6.2.2 step 2 "Seed"): the rotation that
+/// aligns the frame's local **+Z axis to `dir`** while keeping its local **+Y
+/// axis** as close as possible to the **up reference** (world +Y). This is the
+/// align-one-axis-to-the-tangent / pick-a-second-axis-as-up convention; the up
+/// choice fixes the roll about `dir`, so it must not be a free
+/// shortest-arc rotation onto `dir`.
+///
+/// Construction: with `z = dir`, `x = normalize(up × z)`, `y = z × x`, the
+/// frame is the rotation whose columns are `(x, y, z)`. When `dir` is parallel
+/// to the up reference the cross product degenerates; a secondary up reference
+/// (world +X) is substituted so the roll stays deterministic.
+fn seed_frame(dir: Vec3) -> Quat {
+    let z = dir.normalize_or_zero();
+    if z.length_squared() < 0.5 {
+        return Quat::IDENTITY;
+    }
+    let mut up = Vec3::Y;
+    if z.cross(up).length_squared() < 1e-6 {
+        up = Vec3::X;
+    }
+    let x = up.cross(z).normalize();
+    let y = z.cross(x);
+    Quat::from_mat3(&Mat3::from_cols(x, y, z))
 }
 
 /// The smallest rotation carrying unit `from` onto unit `to` (about their cross
@@ -307,18 +414,87 @@ fn rotation_between(from: Vec3, to: Vec3) -> Quat {
     Quat::from_axis_angle(axis, angle)
 }
 
-/// Rigid-body carry of `p` from the origin level's oriented frame into the
-/// target level's (§6.2.2 step 3): express `p` relative to the origin point and
-/// orientation, then re-plant it at the target point and orientation.
-fn reframe(
-    p: Vec3,
-    origin_frame: Quat,
-    origin: Vec3,
-    target_frame: Quat,
-    target: Vec3,
-) -> Vec3 {
-    let local = origin_frame.inverse() * (p - origin);
-    target + target_frame * local
+/// A reference triangle for one level (§6.2.2 step 3): the origin and the tips
+/// of two unit legs along the frame's local +X then +Y axes, rotated by `frame`
+/// and anchored at `path`. The vertex order pins the handedness and axis pairing
+/// of the triangle-to-triangle transport (`p0` = origin, `p1` = local-X leg,
+/// `p2` = local-Y leg), so it is **not** an ad-hoc rigid reframe.
+///
+/// `size` is the per-level shape size `s` (§6.2.2 step 3 / §6.3): `1.0` at the
+/// default, scaled by the (out-of-scope) profile falloff when set. At `s = 1`
+/// every level's triangle is the same unit right-isosceles triangle merely
+/// rotated and translated, so the transport reduces to a rigid motion.
+struct RefTriangle {
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    /// Unit plane normal (= the frame's local +Z up to construction sign).
+    normal: Vec3,
+    /// Triangle area (for the `sqrt(area)` out-of-plane scaling).
+    area: f32,
+}
+
+fn reference_triangle(frame: Quat, path: Vec3, size: f32) -> RefTriangle {
+    let p0 = path;
+    let p1 = frame * Vec3::new(size, 0.0, 0.0) + path;
+    let p2 = frame * Vec3::new(0.0, size, 0.0) + path;
+    let cross = (p1 - p0).cross(p2 - p0);
+    let area = 0.5 * cross.length();
+    let normal = cross.normalize_or_zero();
+    RefTriangle {
+        p0,
+        p1,
+        p2,
+        normal,
+        area,
+    }
+}
+
+/// The triangle-to-triangle affine transport `tri_transform(p, src, dst)`
+/// (§6.2.2 step 3). Maps `p` from the plane/orientation of `src` into that of
+/// `dst`. **Affine, not rigid**: it is the in-plane barycentric image plus the
+/// out-of-plane offset scaled by `sqrt(area_dst / area_src)`.
+///
+/// 1. Project `p` into `src`'s plane and express the projection in barycentric
+///    weights `(w0, w1, w2)` of `src`'s three vertices.
+/// 2. Apply the same weights to `dst`'s vertices for the in-plane image.
+/// 3. Offset along `dst`'s normal by `z · sqrt(area_dst / area_src)`, where `z`
+///    is `p`'s signed height above `src`'s plane.
+///
+/// When `src` and `dst` are congruent (`s = 1` for all levels — the `smooth = 0`
+/// default regime) the area ratio is 1 and the in-plane part is an isometry, so
+/// the transport reduces to the rigid motion carrying `src`'s frame onto `dst`'s.
+fn tri_transform(p: Vec3, src: &RefTriangle, dst: &RefTriangle) -> Vec3 {
+    let rel = p - src.p0;
+    let height = rel.dot(src.normal);
+    let in_plane = rel - height * src.normal;
+
+    // Barycentric of the in-plane point against src's two legs (e1, e2 from p0).
+    let e1 = src.p1 - src.p0;
+    let e2 = src.p2 - src.p0;
+    let d11 = e1.dot(e1);
+    let d12 = e1.dot(e2);
+    let d22 = e2.dot(e2);
+    let denom = d11 * d22 - d12 * d12;
+    let (u, v) = if denom.abs() > 1e-12 {
+        let p1c = in_plane.dot(e1);
+        let p2c = in_plane.dot(e2);
+        (
+            (p1c * d22 - p2c * d12) / denom,
+            (p2c * d11 - p1c * d12) / denom,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    let image = dst.p0 + u * (dst.p1 - dst.p0) + v * (dst.p2 - dst.p0);
+
+    let scale = if src.area > 1e-12 {
+        (dst.area / src.area).sqrt()
+    } else {
+        1.0
+    };
+    image + dst.normal * (height * scale)
 }
 
 impl LoopMesh {
@@ -490,7 +666,7 @@ impl LoopMesh {
         let mode = match params.interp_mode {
             RingInterp::Linear => return None,
             RingInterp::Path => {
-                let setup = self.rim_path_setup(&rail_a_verts, &rail_b_verts);
+                let setup = self.rim_path_setup(&rungs, &rail_a_verts);
                 RingPlacementMode::Path(setup)
             }
             RingInterp::Surface => {
@@ -514,21 +690,39 @@ impl LoopMesh {
         }
     }
 
-    /// §6.2.1 PATH setup: each rim ring's centre (mean of its verts) and a
-    /// reconciled best-fit plane normal. The two normals are flipped to lean
+    /// §6.2.1 PATH setup: each rim ring's edge-length-weighted centre and its
+    /// area-weighted (Newell) ring normal, computed over the ring's verts walked
+    /// in loop order. The two normals are then reconciled — flipped to lean
     /// toward each other along the centre-to-centre direction so they read as a
     /// Bézier's end tangents.
     fn rim_path_setup(
         &self,
+        rungs: &HashMap<EdgeKey, (VertexKey, VertexKey)>,
         rail_a_verts: &HashSet<VertexKey>,
-        rail_b_verts: &HashSet<VertexKey>,
     ) -> PathSetup {
-        let center_a = self.rim_center(rail_a_verts);
-        let center_b = self.rim_center(rail_b_verts);
+        // Order the two rim rings *consistently*: walk rail A into loop order,
+        // then read rail B column-for-column off the rung pairing. Winding the
+        // two rings the same way (both ride the strip in the same direction)
+        // makes their raw Newell normals comparably oriented, which is what lets
+        // the reconciliation step settle their relative sign even when a normal
+        // lands near-perpendicular to the centre-to-centre axis (§6.2.1).
+        let mate: HashMap<VertexKey, VertexKey> =
+            rungs.values().map(|&(a, b)| (a, b)).collect();
+        let ordered_a = self.ordered_rail(rail_a_verts);
+        let ring_a: Vec<Vec3> = ordered_a.iter().map(|&v| self.vertex_position(v)).collect();
+        let ring_b: Vec<Vec3> = ordered_a
+            .iter()
+            .map(|&v| self.vertex_position(mate[&v]))
+            .collect();
+
+        let center_a = rim_center(&ring_a);
+        let center_b = rim_center(&ring_b);
         let between = center_a - center_b;
 
-        let mut normal_a = self.rim_normal(rail_a_verts, center_a, between);
-        let mut normal_b = self.rim_normal(rail_b_verts, center_b, between);
+        let mut normal_a = newell_ring_normal(&ring_a)
+            .unwrap_or_else(|| centre_aligned_fallback_normal(&ring_a, between));
+        let mut normal_b = newell_ring_normal(&ring_b)
+            .unwrap_or_else(|| centre_aligned_fallback_normal(&ring_b, between));
 
         // Reconcile (§6.2.1): normal_A points back toward B, normal_B toward A.
         if normal_a.dot(between) > 0.0 {
@@ -546,42 +740,61 @@ impl LoopMesh {
         }
     }
 
-    fn rim_center(&self, verts: &HashSet<VertexKey>) -> Vec3 {
-        let mut sum = Vec3::ZERO;
+    /// Walk one rail into loop order. The rail verts are joined to each other by
+    /// the mesh edges running *along* the rail (each such edge has both endpoints
+    /// in `verts`); chaining those edges gives the closed (or, for an open strip,
+    /// the open) sequence the §6.2.1 Newell normal and edge-length-weighted
+    /// centre walk over.
+    ///
+    /// The start vert and winding direction are pinned by a stable key order
+    /// (smallest-key endpoint of an open rail / smallest-key vert of a closed
+    /// rail, stepping to the smallest-key unvisited rail neighbour) so the walk
+    /// is deterministic rather than `HashSet`-iteration-order-dependent. The
+    /// absolute winding direction does not affect the reconciled normal away from
+    /// the perpendicular boundary (reversing it negates the raw Newell normal,
+    /// which the reconciliation flip then re-aligns) and never affects the
+    /// edge-length-weighted centre; pinning it only removes run-to-run jitter in
+    /// the near-perpendicular tie-break.
+    fn ordered_rail(&self, verts: &HashSet<VertexKey>) -> Vec<VertexKey> {
+        let mut neighbours: HashMap<VertexKey, Vec<VertexKey>> = HashMap::new();
         for &v in verts {
-            sum += self.vertex_position(v);
+            let entry = neighbours.entry(v).or_default();
+            for edge in self.vertex_disk_iter(v).collect::<Vec<_>>() {
+                let other = self.edge_other_vert(edge, v);
+                if verts.contains(&other) && !entry.contains(&other) {
+                    entry.push(other);
+                }
+            }
         }
-        sum / verts.len().max(1) as f32
-    }
+        for adj in neighbours.values_mut() {
+            adj.sort_by_key(|v| v.as_usize());
+        }
 
-    /// Area-weighted best-fit plane normal of a rim ring (Newell's method over
-    /// the ring fanned around its centre). Falls back to the centre-to-centre
-    /// direction for a degenerate/collinear ring (§6.2.1) so the spline handle
-    /// is always defined rather than NaN.
-    fn rim_normal(
-        &self,
-        verts: &HashSet<VertexKey>,
-        center: Vec3,
-        between: Vec3,
-    ) -> Vec3 {
-        // Newell's method is order-sensitive; a rim ring has no stored order
-        // here, so fan triangles from the centre to each vertex pair and sum
-        // their cross products. Without an ordering this still yields a stable
-        // plane normal direction for a planar ring (each triangle's normal
-        // agrees up to sign with the plane), and the magnitude (area) weights
-        // it. Collinear/zero-area rings sum near zero → fallback.
-        let points: Vec<Vec3> = verts.iter().map(|&v| self.vertex_position(v)).collect();
-        let mut accum = Vec3::ZERO;
-        for i in 0..points.len() {
-            let p = points[i] - center;
-            let q = points[(i + 1) % points.len()] - center;
-            accum += p.cross(q);
+        // Start at the smallest-key open end (degree-1 rail vert) if the rail is
+        // an open polyline; otherwise the smallest-key vert seeds the closed walk.
+        let start = verts
+            .iter()
+            .copied()
+            .filter(|v| neighbours.get(v).map_or(0, |n| n.len()) == 1)
+            .min_by_key(|v| v.as_usize())
+            .or_else(|| verts.iter().copied().min_by_key(|v| v.as_usize()))
+            .expect("non-empty rail ring");
+
+        let mut ordered = Vec::with_capacity(verts.len());
+        let mut visited: HashSet<VertexKey> = HashSet::new();
+        let mut current = start;
+        loop {
+            ordered.push(current);
+            visited.insert(current);
+            let next = neighbours
+                .get(&current)
+                .and_then(|n| n.iter().copied().find(|c| !visited.contains(c)));
+            match next {
+                Some(v) => current = v,
+                None => break,
+            }
         }
-        if accum.length_squared() > 1e-12 {
-            accum.normalize()
-        } else {
-            between.normalize_or_zero()
-        }
+        ordered
     }
 
     /// §6.2.3 step 1: snapshot each rim vert's surrounding-surface tangent — the
@@ -660,8 +873,14 @@ impl LoopMesh {
     }
 
     /// §6.2.2 PATH. One centre spline for the whole strip, a minimum-twist frame
-    /// per level, then a rigid two-sided carry of each rung's rim endpoints into
-    /// the level frame.
+    /// per level, a per-level reference triangle, and a two-sided
+    /// **triangle-to-triangle** carry of each rung's rim endpoints into the level
+    /// triangle (`v_A` from the A-end triangle, `v_B` from the B-end triangle),
+    /// blended at the level parameter `t_i`.
+    ///
+    /// `resolu = N + 2` is the number of levels including the two ends; levels
+    /// run `i = 0 .. resolu - 1`, with `i = 0` the A end, `i = resolu - 1` the B
+    /// end, and `i = 1 .. N` the inserted interior levels.
     fn apply_path_placement(
         &mut self,
         placement: &RingPlacement,
@@ -671,47 +890,58 @@ impl LoopMesh {
         smooth: f32,
     ) {
         let levels = cuts as usize;
-        let segments = levels + 1;
+        let resolu = levels + 2;
+        let last = resolu - 1;
 
-        // Step 1 — the centre spline (Bézier). At smooth = 0 the handles
-        // collapse onto the centres → straight segment, but PATH still diverges
-        // from LINEAR via the frames below.
-        let handle_len = handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
+        // Step 1 — the centre spline (Bézier), sampled at the `resolu` even
+        // parameters. At smooth = 0 the handles collapse onto the centres → the
+        // straight chord of centres, but PATH still diverges from LINEAR via the
+        // frames and the triangle transport below.
+        let handle_len =
+            handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
         let handle_a = setup.center_a + smooth * handle_len * setup.normal_a;
         let handle_b = setup.center_b + smooth * handle_len * setup.normal_b;
-        let path: Vec<Vec3> = (0..=segments)
-            .map(|j| {
-                let t = j as f32 / segments as f32;
+        let path: Vec<Vec3> = (0..resolu)
+            .map(|i| {
+                let t = i as f32 / last as f32;
                 bezier(setup.center_a, handle_a, handle_b, setup.center_b, t)
             })
             .collect();
 
-        // Step 2 — per-level directions and the minimum-twist frame sweep.
-        let mut dir = vec![Vec3::ZERO; segments + 1];
+        // Step 2 — per-level directions and the minimum-twist frame sweep. The
+        // end directions are the reconciled rim normals; the interior ones are
+        // the path's local tangents.
+        let mut dir = vec![Vec3::ZERO; resolu];
         dir[0] = setup.normal_a;
-        dir[segments] = -setup.normal_b;
-        for j in 1..segments {
-            dir[j] = path_bisector(path[j - 1], path[j], path[j + 1]);
+        dir[last] = -setup.normal_b;
+        for i in 1..last {
+            dir[i] = path_bisector(path[i - 1], path[i], path[i + 1]);
         }
         let frames = minimum_twist_frames(&dir);
 
-        // Step 3 — carry each rung's rim endpoints into the level frame.
+        // Step 3 — one reference triangle per level (unit legs along local +X
+        // then +Y at `path[i]`; `s = 1` at the default profile). The triangle
+        // carries the frame's position and orientation; its vertex order pins the
+        // handedness of the transport.
+        let shape_size = 1.0;
+        let tris: Vec<RefTriangle> = (0..resolu)
+            .map(|i| reference_triangle(frames[i], path[i], shape_size))
+            .collect();
+
+        // Transport each rung's rim endpoints into each interior level's triangle
+        // and blend. `v_A` is read in the A-end triangle (level 0), `v_B` in the
+        // B-end triangle (level `last`), each replanted into level `i`'s triangle,
+        // then lerped at `t_i = i / (resolu - 1)`.
         for (&rung, &(v_a, v_b)) in &placement.rungs {
             let pos_a = self.vertex_position(v_a);
             let pos_b = self.vertex_position(v_b);
             let inserted = rung_cuts[&rung].aligned(v_a);
             for (idx, &vert) in inserted.iter().enumerate() {
-                let level = idx + 1;
-                let t = level as f32 / segments as f32;
-                let from_a = reframe(pos_a, frames[0], path[0], frames[level], path[level]);
-                let from_b = reframe(
-                    pos_b,
-                    frames[segments],
-                    path[segments],
-                    frames[level],
-                    path[level],
-                );
-                self.set_vertex_position(vert, from_a.lerp(from_b, t));
+                let i = idx + 1;
+                let t = i as f32 / last as f32;
+                let co_a = tri_transform(pos_a, &tris[0], &tris[i]);
+                let co_b = tri_transform(pos_b, &tris[last], &tris[i]);
+                self.set_vertex_position(vert, co_a.lerp(co_b, t));
             }
         }
     }
@@ -1290,6 +1520,174 @@ mod tests {
             "PATH at smooth = 0 must diverge off the LINEAR chord on a twisted \
              strip (§6.2.2); max divergence was {max_div}"
         );
+    }
+
+    /// Independent, from-the-guide reimplementation of the §6.2.2 PATH placement
+    /// at `smooth = 0`, `cuts = 1`: rebuild the centre spline (straight chord of
+    /// centres at smooth = 0), the per-level directions, the curve-framing seed +
+    /// minimum-twist sweep, the per-level unit reference triangles, and the
+    /// two-sided triangle transport blended at `t = 1/2`. Computed entirely from
+    /// the rim vert positions, with no call into the operator's own placement
+    /// helpers — so a regression in the operator's PATH math is caught by a
+    /// second, independent realisation of the same recipe.
+    fn reference_path_midpoint(
+        rail_a: &[Vec3],
+        rail_b: &[Vec3],
+        rung_a: Vec3,
+        rung_b: Vec3,
+    ) -> Vec3 {
+        // Edge-length-weighted ring centre (§6.2.1), recomputed here from the
+        // ring's loop-ordered verts independently of the operator: each vert is
+        // weighted by the sum of its two incident ring edges' lengths (closed
+        // ring, last wraps to first).
+        let weighted_center = |vs: &[Vec3]| -> Vec3 {
+            let n = vs.len();
+            let mut sum = Vec3::ZERO;
+            let mut total = 0.0f32;
+            for i in 0..n {
+                let prev = vs[(i + n - 1) % n];
+                let curr = vs[i];
+                let next = vs[(i + 1) % n];
+                let w = (curr - prev).length() + (next - curr).length();
+                sum += w * curr;
+                total += w;
+            }
+            sum / total
+        };
+        let center_a = weighted_center(rail_a);
+        let center_b = weighted_center(rail_b);
+        let between = center_a - center_b;
+
+        // Area-weighted Newell ring normal (§6.2.1), recomputed here independently
+        // of the operator: accumulate the Newell edge term around the closed ring,
+        // then normalise.
+        let newell = |vs: &[Vec3]| -> Vec3 {
+            let n = vs.len();
+            let mut no = Vec3::ZERO;
+            for i in 0..n {
+                let p = vs[i];
+                let q = vs[(i + 1) % n];
+                no.x += (p.y - q.y) * (p.z + q.z);
+                no.y += (p.z - q.z) * (p.x + q.x);
+                no.z += (p.x - q.x) * (p.y + q.y);
+            }
+            no.normalize_or_zero()
+        };
+        let mut normal_a = newell(rail_a);
+        let mut normal_b = newell(rail_b);
+        if normal_a.dot(between) > 0.0 {
+            normal_a = -normal_a;
+        }
+        if normal_b.dot(between) < 0.0 {
+            normal_b = -normal_b;
+        }
+
+        // smooth = 0: straight chord of centres at resolu = 3 levels.
+        let path = [center_a, 0.5 * (center_a + center_b), center_b];
+        let dir = [normal_a, (center_b - center_a).normalize(), -normal_b];
+
+        // Curve-framing seed (+Z to dir[0], +Y up) then minimum-twist sweep.
+        let seed = |d: Vec3| -> Quat {
+            let z = d.normalize();
+            let up = if z.cross(Vec3::Y).length_squared() < 1e-6 {
+                Vec3::X
+            } else {
+                Vec3::Y
+            };
+            let x = up.cross(z).normalize();
+            let y = z.cross(x);
+            Quat::from_mat3(&Mat3::from_cols(x, y, z))
+        };
+        let arc = |from: Vec3, to: Vec3| -> Quat {
+            let f = from.normalize();
+            let t = to.normalize();
+            let d = f.dot(t).clamp(-1.0, 1.0);
+            if d > 1.0 - 1e-6 {
+                Quat::IDENTITY
+            } else {
+                Quat::from_axis_angle(f.cross(t).normalize(), d.acos())
+            }
+        };
+        let frame0 = seed(dir[0]);
+        let frame1 = arc(dir[0], dir[1]) * frame0;
+        let frame2 = arc(dir[1], dir[2]) * frame1;
+        let frames = [frame0, frame1, frame2];
+
+        // Unit reference triangles (legs along local +X then +Y).
+        let tri = |f: Quat, p: Vec3| -> [Vec3; 3] {
+            [p, f * Vec3::X + p, f * Vec3::Y + p]
+        };
+        let tris = [
+            tri(frames[0], path[0]),
+            tri(frames[1], path[1]),
+            tri(frames[2], path[2]),
+        ];
+
+        // Congruent unit triangles → rigid transport: barycentric image of the
+        // legs is an isometry, area ratio 1. Carry via the frame change directly
+        // (equivalent to tri_transform at s = 1): local = frame_src^-1·(p - p0_src),
+        // image = p0_dst + frame_dst·local.
+        let carry = |p: Vec3, src: usize, dst: usize| -> Vec3 {
+            let local = frames[src].inverse() * (p - path[src]);
+            path[dst] + frames[dst] * local
+        };
+        let co_a = carry(rung_a, 0, 1);
+        let co_b = carry(rung_b, 2, 1);
+        co_a.lerp(co_b, 0.5)
+    }
+
+    #[test]
+    fn path_placement_matches_guide_recipe_at_smooth_zero() {
+        // §6.2.2 — pin the *actual* PATH placement (not merely PATH ≠ LINEAR)
+        // against an independent from-the-guide reimplementation of the corrected
+        // recipe (curve-framing seed roll + per-level reference-triangle transport).
+        // This is the in-crate analogue of the cross-backend A/B pin; it catches
+        // a regression in either the seed-roll convention or the triangle map.
+        let step = 0.5;
+        let (mut mesh, rungs) = twisted_strip(4, step);
+
+        // Rim verts in column order: rail A = each rung's first endpoint, rail B
+        // the second (twisted_strip builds rail_a[i]/rail_b[i] in that order).
+        let mut rail_a = Vec::new();
+        let mut rail_b = Vec::new();
+        let mut rung_pts = Vec::new();
+        for &r in &rungs {
+            let [a, b] = mesh.edge_vert_keys(r);
+            let pa = mesh.vertex_position(a);
+            let pb = mesh.vertex_position(b);
+            rail_a.push(pa);
+            rail_b.push(pb);
+            rung_pts.push((pa, pb));
+        }
+
+        let result = mesh.subdivide_edgering(&rungs, params(RingInterp::Path, 1, 0.0));
+
+        // Which rail the operator labels "A" is a construction choice (it walks
+        // the strip quads with a union-find; §6.2.1). The §6.2.2 recipe is
+        // orientation-deterministic *given* a rail labelling, so compute the
+        // expected placement under both labellings and require the operator to
+        // match one consistently (the cross-backend A/B test pins the exact one).
+        for &(pa, pb) in &rung_pts {
+            let expect_ab = reference_path_midpoint(&rail_a, &rail_b, pa, pb);
+            let expect_ba = reference_path_midpoint(&rail_b, &rail_a, pb, pa);
+            let chord_mid = 0.5 * (pa + pb);
+            let actual = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .min_by(|p, q| {
+                    p.distance(chord_mid)
+                        .partial_cmp(&q.distance(chord_mid))
+                        .unwrap()
+                })
+                .unwrap();
+            let best = actual.distance(expect_ab).min(actual.distance(expect_ba));
+            assert!(
+                best < 1e-4,
+                "PATH cut must match the §6.2.2 recipe (either rail labelling): \
+                 expected {expect_ab} or {expect_ba}, got {actual}"
+            );
+        }
     }
 
     #[test]
