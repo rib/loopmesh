@@ -61,6 +61,11 @@ pub struct BevelOptions {
     pub offset_type: BevelOffsetType,
     pub segments: u32,
     pub affect: BevelAffect,
+    /// When set, the effective offset is reduced just far enough that no ring
+    /// vert ever slides past a collision point on its edge, so the result never
+    /// self-overlaps (BEVEL.md §4.4). A global, uniform pre-pass on the resolved
+    /// slide distances; it changes no topology, only the slide magnitudes.
+    pub clamp_overlap: bool,
 }
 
 impl Default for BevelOptions {
@@ -70,6 +75,7 @@ impl Default for BevelOptions {
             offset_type: BevelOffsetType::Offset,
             segments: 1,
             affect: BevelAffect::Vertices,
+            clamp_overlap: false,
         }
     }
 }
@@ -84,13 +90,36 @@ pub struct BevelResult {
     pub faces: Vec<FaceKey>,
 }
 
-/// One incident face of the beveled vertex, captured before any surgery: its
-/// loop-cycle vertices in winding order and the index at which the beveled
-/// vertex `v` sits in that cycle.
-struct IncidentFaceCorner {
-    face: FaceKey,
-    cycle_verts: Vec<VertexKey>,
-    corner_index: usize,
+/// One beveled vertex's local frame, captured against the *pristine* mesh
+/// before any surgery (BEVEL.md §6.4.1: place every ring vert before cutting any
+/// face, so a shared edge's original direction and length are still readable
+/// when the second corner is placed). Holds the disk-ordered incident edges, the
+/// ring vert minted on each (paired with that edge), the incident faces, and the
+/// interior/boundary fan classification.
+struct BeveledCorner {
+    vertex: VertexKey,
+    ring_vert_for_edge: Vec<(EdgeKey, VertexKey)>,
+    incident_faces: Vec<FaceKey>,
+    interior_fan: bool,
+}
+
+/// Per-incident-edge placement record gathered in the slide pre-pass: the edge,
+/// its far endpoint position, and the *unclamped* resolved slide distance and
+/// per-offset slide rate `k` (BEVEL.md §4.3 / §4.4.2).
+struct EdgePlacement {
+    edge: EdgeKey,
+    far_vertex: VertexKey,
+    far_position: Vec3,
+    slide: f32,
+    rate: f32,
+}
+
+/// One beveled vertex's placement frame, captured against the pristine mesh
+/// (BEVEL.md §6.4.1): its position and the per-incident-edge placements.
+struct BevelFrame {
+    vertex: VertexKey,
+    vertex_position: Vec3,
+    placements: Vec<EdgePlacement>,
 }
 
 impl LoopMesh {
@@ -124,137 +153,222 @@ impl LoopMesh {
             return result;
         }
 
+        // The set of beveled verts, de-duplicated and order-preserved. A vert is
+        // beveled at most once even if it appears twice in `geom`.
+        let mut beveled: Vec<VertexKey> = Vec::new();
         for entry in geom {
             if let GeomKey::Vert(vertex) = *entry {
-                self.bevel_one_vertex(vertex, options.offset, options.offset_type, &mut result);
+                if !beveled.contains(&vertex) {
+                    beveled.push(vertex);
+                }
             }
+        }
+
+        // §6.4.1 — place-before-surgery. Two phases against the pristine mesh:
+        //
+        //   1. Capture each beveled vertex's local frame (disk-ordered incident
+        //      edges, far positions, per-edge slide distances) while the mesh is
+        //      still pristine, so an edge shared by two beveled verts is measured
+        //      from its *original* direction/length at both ends. The slide
+        //      pre-pass also feeds the §4.4 global `clamp_overlap` reduction.
+        //   2. Mint every ring vert (§4), then run all face surgery and caps.
+        //
+        // Doing surgery per-vertex inline would re-point a shared edge after the
+        // first corner and slide the second corner off the recreated chamfer
+        // (§6.4.1), so the two phases must stay separated.
+        let frames = self.gather_bevel_frames(&beveled, options.offset, options.offset_type);
+        let clamp_factor = if options.clamp_overlap {
+            clamp_factor(options.offset, &beveled, &frames)
+        } else {
+            1.0
+        };
+
+        let corners = self.place_ring_verts(&frames, clamp_factor, &mut result);
+
+        // §6.4.3: re-stitch each incident face exactly once, swapping *every*
+        // beveled corner of that face at the same time. A face straddling a
+        // shared edge has two beveled corners and must not be killed twice.
+        self.restitch_incident_faces(&beveled, &corners);
+
+        // §5 / §6.2 / §6.4.4: build each corner's cap over its own ring only —
+        // the caps are independent across a shared edge.
+        for corner in &corners {
+            if corner.interior_fan {
+                if let Some(cap) = self.build_cap_face(&corner.ring_vert_for_edge) {
+                    result.faces.push(cap.face);
+                    result.edges.extend(cap.chamfer_edges);
+                }
+            } else {
+                self.collect_chamfer_edges(&corner.ring_vert_for_edge, &mut result);
+            }
+        }
+
+        // §5.1.1 / §6.3: every beveled vertex is now loose. Free each.
+        for corner in &corners {
+            self.vertex_kill(corner.vertex);
         }
 
         result
     }
 
-    fn bevel_one_vertex(
-        &mut self,
-        vertex: VertexKey,
+    /// Phase 1a (BEVEL.md §6.4.1): capture each beveled vertex's per-edge
+    /// placement frame against the pristine mesh — disk-ordered incident edges,
+    /// far-endpoint positions, the resolved (unclamped) slide distance and the
+    /// per-offset slide rate `k` each edge contributes. A vertex with fewer than
+    /// two incident edges has no corner to round (§2.1) and is dropped here.
+    fn gather_bevel_frames(
+        &self,
+        beveled: &[VertexKey],
         offset: f32,
         offset_type: BevelOffsetType,
-        result: &mut BevelResult,
-    ) {
-        // §3.2 / §5: gather the incident edges (the disk cycle) and a ring vertex
-        // per edge, slid `offset` toward the edge's far endpoint (§4).
-        let incident_edges: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
-        if incident_edges.len() < 2 {
-            return;
-        }
+    ) -> Vec<BevelFrame> {
+        let mut frames = Vec::with_capacity(beveled.len());
+        for &vertex in beveled {
+            let incident_edges: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
+            if incident_edges.len() < 2 {
+                continue;
+            }
 
-        let vertex_position = self.vertex_position(vertex);
+            let vertex_position = self.vertex_position(vertex);
+            let far_verts: Vec<VertexKey> = incident_edges
+                .iter()
+                .map(|&edge| {
+                    let [a, b] = self.edge_vert_keys(edge);
+                    if a == vertex { b } else { a }
+                })
+                .collect();
+            let far_positions: Vec<Vec3> =
+                far_verts.iter().map(|&f| self.vertex_position(f)).collect();
+            let corner_axis = corner_axis(vertex_position, &far_positions);
 
-        // §4.3: gather each incident edge's far endpoint and inward direction
-        // `u_i = normalize(v − A_i)`, then derive the corner axis `Σ u_i`. The
-        // angle modes measure each edge against this axis; the length modes do
-        // not, but a single pre-pass keeps the per-edge slide derivation uniform.
-        let far_positions: Vec<Vec3> = incident_edges
-            .iter()
-            .map(|&edge| {
-                let [a, b] = self.edge_vert_keys(edge);
-                let far = if a == vertex { b } else { a };
-                self.vertex_position(far)
-            })
-            .collect();
-
-        let corner_axis = corner_axis(vertex_position, &far_positions);
-
-        let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
-            Vec::with_capacity(incident_edges.len());
-        for (&edge, &far_position) in incident_edges.iter().zip(&far_positions) {
-            let slide = slide_distance(
-                offset,
-                offset_type,
+            frames.push(BevelFrame {
+                vertex,
                 vertex_position,
-                far_position,
-                corner_axis,
-            );
-            let ring_position = ring_vert_position(vertex_position, far_position, slide);
-            let ring_vertex = self.create_vertex(ring_position);
-            ring_vert_for_edge.push((edge, ring_vertex));
-            result.verts.push(ring_vertex);
+                placements: incident_edges
+                    .iter()
+                    .zip(&far_verts)
+                    .zip(&far_positions)
+                    .map(|((&edge, &far_vertex), &far_position)| {
+                        let slide = slide_distance(
+                            offset,
+                            offset_type,
+                            vertex_position,
+                            far_position,
+                            corner_axis,
+                        );
+                        // §4.4.2: the per-offset slide rate `k = d_i / offset`,
+                        // the §4.3 `offset_type` factor used by the collision
+                        // clamp. Derived from the resolved slide so every mode
+                        // (including the angle modes and PERCENT) feeds the same
+                        // collision computation.
+                        let rate = if offset != 0.0 { slide / offset } else { 0.0 };
+                        EdgePlacement {
+                            edge,
+                            far_vertex,
+                            far_position,
+                            slide,
+                            rate,
+                        }
+                    })
+                    .collect(),
+            });
+        }
+        frames
+    }
+
+    /// Phase 1b: mint every ring vert (§4) at its clamp-scaled slide position,
+    /// and capture each beveled vertex's interior/boundary classification and
+    /// incident-face set. No face surgery happens here — only vertex creation.
+    fn place_ring_verts(
+        &mut self,
+        frames: &[BevelFrame],
+        clamp_factor: f32,
+        result: &mut BevelResult,
+    ) -> Vec<BeveledCorner> {
+        let mut corners = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let incident_edges: Vec<EdgeKey> =
+                frame.placements.iter().map(|p| p.edge).collect();
+            let incident_faces = self.vert_face_keys(frame.vertex);
+            let interior_fan =
+                self.is_interior_fan(frame.vertex, &incident_edges, &incident_faces);
+
+            let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
+                Vec::with_capacity(frame.placements.len());
+            for placement in &frame.placements {
+                let slide = placement.slide * clamp_factor;
+                let ring_position =
+                    ring_vert_position(frame.vertex_position, placement.far_position, slide);
+                let ring_vertex = self.create_vertex(ring_position);
+                ring_vert_for_edge.push((placement.edge, ring_vertex));
+                result.verts.push(ring_vertex);
+            }
+
+            corners.push(BeveledCorner {
+                vertex: frame.vertex,
+                ring_vert_for_edge,
+                incident_faces,
+                interior_fan,
+            });
+        }
+        corners
+    }
+
+    /// Phase 2 (BEVEL.md §6.1 / §6.4.3): re-stitch every face incident to any
+    /// beveled vertex, swapping *all* of that face's beveled corners at once.
+    /// Each beveled corner `v` becomes the pair (ring vert of `v`'s incoming
+    /// edge, ring vert of `v`'s outgoing edge), keeping the face winding; the
+    /// chamfer edge between the pair is minted by the rebuild. A loop edge
+    /// between two beveled corners (a shared edge `E`, §6.4.3) is re-pointed from
+    /// `{a, b}` to `{r_a, r_b}` — the surviving inner segment — by virtue of both
+    /// its endpoints being swapped in the same rebuild.
+    fn restitch_incident_faces(&mut self, beveled: &[VertexKey], corners: &[BeveledCorner]) {
+        // Collect each distinct incident face once, regardless of how many
+        // beveled corners it has, so a shared-edge face is rebuilt a single time.
+        let mut faces: Vec<FaceKey> = Vec::new();
+        for corner in corners {
+            for &face in &corner.incident_faces {
+                if !faces.contains(&face) {
+                    faces.push(face);
+                }
+            }
         }
 
-        // §6: every face that has `v` as a corner. Snapshot each face's loop
-        // cycle before any surgery, since the rebuild below frees the old faces.
-        let incident_faces: Vec<FaceKey> = self.vert_face_keys(vertex);
-        let interior_fan = self.is_interior_fan(vertex, &incident_edges, &incident_faces);
-
-        let corners: Vec<IncidentFaceCorner> = incident_faces
-            .iter()
-            .filter_map(|&face| {
-                let cycle_verts = self.face_vert_keys(face);
-                cycle_verts
-                    .iter()
-                    .position(|&w| w == vertex)
-                    .map(|corner_index| IncidentFaceCorner {
-                        face,
-                        cycle_verts,
-                        corner_index,
-                    })
-            })
-            .collect();
-
-        // §6.1: re-stitch each incident face. The single corner `v` becomes the
-        // pair (ring vert of the incoming edge, ring vert of the outgoing edge),
-        // in the order that keeps the face's winding. The chamfer edge between
-        // those two ring verts is minted here as the face's new corner side.
-        for corner in &corners {
-            let cycle_length = corner.cycle_verts.len();
-            let prev_vertex = corner.cycle_verts[(corner.corner_index + cycle_length - 1)
-                % cycle_length];
-            let next_vertex = corner.cycle_verts[(corner.corner_index + 1) % cycle_length];
-
-            let incoming_edge = self
-                .query_edge_exists(prev_vertex, vertex)
-                .expect("incident face's incoming corner edge exists");
-            let outgoing_edge = self
-                .query_edge_exists(vertex, next_vertex)
-                .expect("incident face's outgoing corner edge exists");
-
-            let ring_incoming = self.ring_vertex_of(&ring_vert_for_edge, incoming_edge);
-            let ring_outgoing = self.ring_vertex_of(&ring_vert_for_edge, outgoing_edge);
+        for face in faces {
+            let cycle_verts = self.face_vert_keys(face);
+            let cycle_length = cycle_verts.len();
 
             let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_length + 1);
-            for (index, &w) in corner.cycle_verts.iter().enumerate() {
-                if index == corner.corner_index {
-                    new_cycle.push(ring_incoming);
-                    new_cycle.push(ring_outgoing);
+            for (index, &w) in cycle_verts.iter().enumerate() {
+                if beveled.contains(&w) {
+                    let corner = corners
+                        .iter()
+                        .find(|c| c.vertex == w)
+                        .expect("a beveled corner vertex has a ring");
+                    let prev_vertex =
+                        cycle_verts[(index + cycle_length - 1) % cycle_length];
+                    let next_vertex = cycle_verts[(index + 1) % cycle_length];
+
+                    let incoming_edge = self
+                        .query_edge_exists(prev_vertex, w)
+                        .expect("incident face's incoming corner edge exists");
+                    let outgoing_edge = self
+                        .query_edge_exists(w, next_vertex)
+                        .expect("incident face's outgoing corner edge exists");
+
+                    new_cycle
+                        .push(self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge));
+                    new_cycle
+                        .push(self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge));
                 } else {
                     new_cycle.push(w);
                 }
             }
 
-            self.face_kill(corner.face);
+            self.face_kill(face);
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-            self.face_attribs.copy_into(new_face.as_usize(), corner.face.as_usize());
+            self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
         }
-
-        // §5 / §6.2: close an interior fan with a cap over the ring. The cap
-        // adopts the chamfer edges the re-stitch already built — never mints a
-        // second coincident edge (§5.1) — and is wound opposite the incident
-        // faces so each shared chamfer edge ends with a manifold radial count of
-        // two. A boundary open fan gets no cap.
-        if interior_fan {
-            if let Some(cap) = self.build_cap_face(&ring_vert_for_edge, &corners, vertex) {
-                result.faces.push(cap.face);
-                result.edges.extend(cap.chamfer_edges);
-            }
-        } else {
-            // The open fan still produced chamfer edges during the re-stitch;
-            // surface them as new geometry.
-            self.collect_chamfer_edges(&ring_vert_for_edge, result);
-        }
-
-        // §5.1.1 / §6.3: every incident face is now re-stitched onto ring verts
-        // and each original incident edge was re-pointed off `v`, so `v` is
-        // loose. Free it (an empty-disk vertex removal, not an Euler join).
-        self.vertex_kill(vertex);
     }
 
     fn ring_vertex_of(
@@ -291,14 +405,15 @@ impl LoopMesh {
     fn build_cap_face(
         &mut self,
         ring_vert_for_edge: &[(EdgeKey, VertexKey)],
-        corners: &[IncidentFaceCorner],
-        vertex: VertexKey,
     ) -> Option<CapFace> {
-        let _ = (corners, vertex);
         let ring_verts: Vec<VertexKey> = ring_vert_for_edge.iter().map(|&(_, r)| r).collect();
 
         // The chamfer edges minted by the re-stitch connect ring verts pairwise.
         // For an interior fan they form one closed cycle through all ring verts.
+        // §6.4.4: only this corner's own ring verts are considered, so the
+        // surviving inner segment of a shared edge (which joins a ring vert of
+        // *this* corner to a ring vert of the *other* corner) is never mistaken
+        // for a chamfer edge of this cap.
         let chamfer_edges = self.chamfer_edges_among(&ring_verts);
         if chamfer_edges.len() != ring_verts.len() {
             return None;
@@ -394,6 +509,195 @@ mod tests {
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
         (mesh.totvert(), mesh.totedge(), mesh.totface())
+    }
+
+    fn vert_at(mesh: &LoopMesh, position: Vec3) -> VertexKey {
+        mesh.vert_keys()
+            .into_iter()
+            .find(|&v| mesh.vertex_position(v) == position)
+            .expect("vertex at position exists")
+    }
+
+    /// A ring vert is "at" `position` within tolerance; returns whether any
+    /// new vert from the result landed there.
+    fn result_has_vert_near(mesh: &LoopMesh, result: &BevelResult, position: Vec3) -> usize {
+        result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - position).length() < 1.0e-5)
+            .count()
+    }
+
+    /// BEVEL.md §4.4.3: beveling the two shared-edge endpoints of the cube with
+    /// `clamp_overlap = true` at `offset = 1.5` reduces the effective offset to
+    /// `1.0` (clamp factor `1.0 / 1.5`), so every ring vert slides exactly `1.0`
+    /// — not the requested `1.5`.
+    #[test]
+    fn clamp_overlap_reduces_slide_to_collision_offset() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        // v0 = (1,-1,-1), v1 = (-1,-1,-1): the two endpoints of edge {0,1}.
+        let a = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let b = vert_at(&mesh, Vec3::new(-1.0, -1.0, -1.0));
+        let pos_a = mesh.vertex_position(a);
+        let pos_b = mesh.vertex_position(b);
+
+        let result = mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 1.5,
+                clamp_overlap: true,
+                ..Default::default()
+            },
+        );
+
+        // Each ring vert slid from its own corner; the clamp pins the slide to
+        // 1.0, the §4.4.3 collision offset, on every beveled edge.
+        for &ring in &result.verts {
+            let ring_position = mesh.vertex_position(ring);
+            let slide = (ring_position - pos_a).length().min((ring_position - pos_b).length());
+            assert!(
+                (slide - 1.0).abs() < 1.0e-5,
+                "clamped slide {slide} should be 1.0 (effective offset), not 1.5",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.4.1: with `clamp_overlap = false` and `offset = 1.5`, the two
+    /// shared-edge ring verts each slide the full `1.5` and cross past each other:
+    /// `r_a` (from the `a = (1,-1,-1)` end) lands at `(-0.5,-1,-1)` and `r_b`
+    /// (from `b = (-1,-1,-1)`) at `(0.5,-1,-1)`. Each is placed off the *original*
+    /// edge — the place-before-surgery ordering.
+    #[test]
+    fn unclamped_adjacent_pair_crosses_past() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let a = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let b = vert_at(&mesh, Vec3::new(-1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 1.5,
+                clamp_overlap: false,
+                ..Default::default()
+            },
+        );
+
+        // The two ring verts on the shared edge land at the crossed-past
+        // positions; each is a distinct ring vert.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(-0.5, -1.0, -1.0)),
+            1,
+            "a-side ring vert at (-0.5,-1,-1)",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.5, -1.0, -1.0)),
+            1,
+            "b-side ring vert at (0.5,-1,-1)",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.4.2: the clamped-collapse degenerate. At the exact collision
+    /// (`offset = 1.5` clamped to effective `1.0`, `d_a + d_b == L == 2`), the
+    /// two shared-edge ring verts land *coincident* at the edge midpoint
+    /// `(0,-1,-1)` — but remain **two distinct ring verts** joined by a
+    /// zero-length inner segment, with no weld / merge.
+    #[test]
+    fn clamped_collapse_is_coincident_pair_not_merge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let a = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let b = vert_at(&mesh, Vec3::new(-1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 1.5,
+                clamp_overlap: true,
+                ..Default::default()
+            },
+        );
+
+        // Exactly two distinct ring verts coincide at the midpoint (one from each
+        // corner) — not one merged vertex.
+        let midpoint = Vec3::new(0.0, -1.0, -1.0);
+        let coincident: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - midpoint).length() < 1.0e-5)
+            .collect();
+        assert_eq!(
+            coincident.len(),
+            2,
+            "two distinct ring verts coincide at the midpoint, no merge",
+        );
+        assert_ne!(coincident[0], coincident[1], "the pair is two distinct verts");
+
+        // They are joined by a real (zero-length) inner-segment edge.
+        let segment = mesh.query_edge_exists(coincident[0], coincident[1]);
+        assert!(
+            segment.is_some(),
+            "the surviving inner segment edge joins the coincident pair",
+        );
+        let length = {
+            let [p, q] = mesh.edge_vert_keys(segment.unwrap());
+            (mesh.vertex_position(p) - mesh.vertex_position(q)).length()
+        };
+        assert!(length < 1.0e-5, "the inner segment is zero-length");
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.4.3: the original shared edge survives as the inner segment
+    /// `r_a`–`r_b` between the two corners' chamfer edges, and (being an interior
+    /// manifold edge) keeps radial count 2 — both straddling faces re-stitched
+    /// onto it.
+    #[test]
+    fn shared_edge_survives_as_inner_segment_radial_two() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let a = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let b = vert_at(&mesh, Vec3::new(-1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 0.5,
+                clamp_overlap: false,
+                ..Default::default()
+            },
+        );
+
+        // r_a slid 0.5 from (1,-1,-1) toward (-1,-1,-1) -> (0.5,-1,-1).
+        // r_b slid 0.5 from (-1,-1,-1) toward (1,-1,-1) -> (-0.5,-1,-1).
+        let r_a = vert_at(&mesh, Vec3::new(0.5, -1.0, -1.0));
+        let r_b = vert_at(&mesh, Vec3::new(-0.5, -1.0, -1.0));
+        let segment = mesh
+            .query_edge_exists(r_a, r_b)
+            .expect("the shared edge survives as the r_a-r_b inner segment");
+
+        assert_eq!(
+            mesh.edge_radial_iter(segment).count(),
+            2,
+            "the surviving inner segment keeps radial count 2 (both straddling faces)",
+        );
+
+        // The two caps are independent (§6.4.4): the inner segment is on the
+        // re-stitched faces, never on either cap, so it is not a chamfer edge.
+        // Two distinct triangular caps were produced.
+        assert_eq!(result.faces.len(), 2, "two independent corner caps");
+        for &cap in &result.faces {
+            assert_eq!(mesh.face_vert_keys(cap).len(), 3, "each cap is a triangle");
+            assert!(
+                !mesh.face_vert_keys(cap).contains(&r_a)
+                    || !mesh.face_vert_keys(cap).contains(&r_b),
+                "no single cap spans both r_a and r_b",
+            );
+        }
+        mesh.validate_topology();
     }
 
     /// BEVEL.md §6.1 / §2.3: an interior valence-3 cube corner is replaced by
@@ -743,6 +1047,71 @@ fn corner_axis(vertex: Vec3, far_positions: &[Vec3]) -> Vec3 {
             axis + inward / length
         }
     })
+}
+
+/// The largest offset a single beveled edge can tolerate before its two ring
+/// verts collide (BEVEL.md §4.4.2): `L / (k_a + k_b)`, where `k_a`, `k_b` are the
+/// per-offset slide rates at the two ends (`k_b = 0` when the far end is not
+/// beveled). When neither end slides, the edge never limits.
+fn edge_collision_offset(length: f32, rate_near: f32, rate_far: f32) -> f32 {
+    let rate_sum = rate_near + rate_far;
+    if rate_sum <= 0.0 {
+        f32::INFINITY
+    } else {
+        length / rate_sum
+    }
+}
+
+/// The §4.4 global clamp factor: gather every beveled edge's collision offset,
+/// take the smallest, and shrink everything by `min_collision / requested` if
+/// that minimum falls below the requested offset (BEVEL.md §4.4.2). A shared
+/// edge contributes both endpoints' slide rates; an edge beveled at one end only
+/// contributes its near rate (far rate 0). Returns a factor in `(0, 1]`: every
+/// beveled vertex's resolved slide is multiplied by it uniformly (§4.4.3).
+fn clamp_factor(requested_offset: f32, beveled: &[VertexKey], frames: &[BevelFrame]) -> f32 {
+    let mut min_collision = f32::INFINITY;
+    for frame in frames {
+        for placement in &frame.placements {
+            let length = (placement.far_position - frame.vertex_position).length();
+            let rate_near = placement.rate;
+            // §4.4.2: a two-ended collision. If the far endpoint is also beveled,
+            // look up *its* slide rate on this same edge so both ends' slides are
+            // summed; otherwise the far rate is 0 and the edge collides only at
+            // its own far endpoint.
+            let rate_far = if beveled.contains(&placement.far_vertex) {
+                far_end_rate(frames, placement.edge, frame.vertex)
+            } else {
+                0.0
+            };
+            let collision = edge_collision_offset(length, rate_near, rate_far);
+            if collision < min_collision {
+                min_collision = collision;
+            }
+        }
+    }
+
+    if min_collision < requested_offset && requested_offset > 0.0 {
+        min_collision / requested_offset
+    } else {
+        1.0
+    }
+}
+
+/// The slide rate at the far end of `edge`: the rate the beveled frame whose
+/// vertex is *not* `near_vertex` assigns to `edge`. Returns 0 if no other frame
+/// bevels `edge` (BEVEL.md §4.4.2).
+fn far_end_rate(frames: &[BevelFrame], edge: EdgeKey, near_vertex: VertexKey) -> f32 {
+    for frame in frames {
+        if frame.vertex == near_vertex {
+            continue;
+        }
+        for placement in &frame.placements {
+            if placement.edge == edge {
+                return placement.rate;
+            }
+        }
+    }
+    0.0
 }
 
 /// The smallest slide a near-degenerate angle mode is allowed to produce
