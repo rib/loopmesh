@@ -554,6 +554,97 @@ mod tests {
         assert_eq!(stepwise.totface(), batched.totface());
     }
 
+    /// §6 partial-selection scope: tagging only a sub-region coarsens that
+    /// region in place and walls the flood fill at the untagged border.
+    ///
+    /// Here exactly the two horizontally-adjacent interior-cross verts at grid
+    /// positions (1,1) and (2,1) of a `grid_n_faces(3)` lattice (16 V / 24 E /
+    /// 9 F) are tagged. Per §5.1/§5.2 they form a single eligible edge, so the
+    /// fill keeps the seed and removes exactly **one** of them (§4.3 lone-edge
+    /// component: seed kept, its one eligible neighbour removed). The removed
+    /// vert is an interior cross, so the n-gon pre-pass re-triangulates its four
+    /// surrounding quads — its four spokes are replaced by pre-pass diagonals
+    /// (edges net-unchanged) and faces net +1. Measured delta:
+    /// 16/24/9 → 15/24/10 (Δ −1 V / 0 E / +1 F). Euler-consistent: 15−24+10 = 1.
+    #[test]
+    fn unsubdivide_grid3_partial_two_interior_verts_one_step() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_grid_n_faces(&mut mesh, 3);
+
+        assert_eq!(mesh.totvert(), 16);
+        assert_eq!(mesh.totedge(), 24);
+        assert_eq!(mesh.totface(), 9);
+
+        // stride = n + 1 = 4; verts[r * 4 + c] sits at Vec3(c, r, 0).
+        // (1,1) = idx 5, (2,1) = idx 6 — two horizontally-adjacent interior
+        // verts of the 4×4 lattice, matching the A/B scaffold's tag set.
+        let partial = [verts[1 * 4 + 1], verts[1 * 4 + 2]];
+
+        // Snapshot every untagged vert's position to prove survivors are
+        // bit-stable: no vertex is created (§8), and only one tagged vert is
+        // removed, so every untagged vert must keep its exact coordinate.
+        let untagged_positions: Vec<(VertexKey, Vec3)> = verts
+            .iter()
+            .filter(|&&v| v != partial[0] && v != partial[1])
+            .map(|&v| (v, mesh.vertex_position(v)))
+            .collect();
+
+        mesh.unsubdivide(&partial, 1);
+
+        assert_eq!(mesh.totvert(), 15, "one of the two tagged verts removed");
+        assert_eq!(mesh.totedge(), 24, "edges net-unchanged (spokes → diagonals)");
+        assert_eq!(mesh.totface(), 10, "n-gon pre-pass nets +1 face");
+        // Euler-consistent planar surface with one boundary loop.
+        assert_eq!(
+            mesh.totvert() as i64 - mesh.totedge() as i64 + mesh.totface() as i64,
+            1,
+        );
+
+        // Exactly one of the two tagged verts survives; the untagged border is
+        // untouched and every untagged vert keeps its exact position.
+        let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        let tagged_survivors = partial.iter().filter(|&&v| live.contains(&v)).count();
+        assert_eq!(tagged_survivors, 1, "seed kept, its one neighbour removed");
+        for (v, pos) in untagged_positions {
+            assert!(live.contains(&v), "untagged border vert {v:?} survives");
+            assert_eq!(
+                mesh.vertex_position(v),
+                pos,
+                "untagged vert {v:?} kept its exact input position"
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// §4.3 / §6 partial-selection no-op: a tagged set with no eligible pair
+    /// dissolves nothing. Here the two tagged interior-cross verts are
+    /// **diagonally** adjacent — not joined by a mesh edge — so the eligible
+    /// subgraph has no edge: each is its own single-vert component, coloured
+    /// *kept*, removing nothing. The mesh is unchanged.
+    #[test]
+    fn unsubdivide_grid3_partial_no_eligible_pair_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_grid_n_faces(&mut mesh, 3);
+
+        let v0 = mesh.totvert();
+        let e0 = mesh.totedge();
+        let f0 = mesh.totface();
+
+        // (1,1) = idx 5 and (2,2) = idx 10 are diagonal interior verts: both
+        // eligible, but not joined by an edge, so the eligible subgraph is two
+        // isolated nodes and nothing is removed.
+        let diagonal = [verts[1 * 4 + 1], verts[2 * 4 + 2]];
+        mesh.unsubdivide(&diagonal, 1);
+
+        assert_eq!(mesh.totvert(), v0, "no-op: V unchanged");
+        assert_eq!(mesh.totedge(), e0, "no-op: E unchanged");
+        assert_eq!(mesh.totface(), f0, "no-op: F unchanged");
+        let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(live.contains(&diagonal[0]) && live.contains(&diagonal[1]));
+        mesh.validate_topology();
+    }
+
     /// §1 — `iterations` is clamped to at least 1: a zero (or negative) count
     /// still runs one step.
     #[test]
