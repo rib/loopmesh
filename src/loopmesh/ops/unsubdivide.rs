@@ -475,6 +475,85 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// §5.3 convergence pin: `grid_n_faces(4)` whole-mesh, `iterations = 2`.
+    /// The second step re-runs eligibility over the *coarsened* topology and
+    /// removes two more verts, stabilising at 14 V / 25 E / 12 F
+    /// (10 triangles + 2 quads).
+    #[test]
+    fn unsubdivide_grid4_two_steps_converge() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_grid_n_faces(&mut mesh, 4);
+
+        mesh.unsubdivide(&verts, 2);
+
+        assert_eq!(mesh.totvert(), 14, "14 V after the second step (§5.3)");
+        assert_eq!(mesh.totedge(), 25, "25 E after the second step (§5.3)");
+        assert_eq!(mesh.totface(), 12, "12 F after the second step (§5.3)");
+
+        let (triangles, quads) = face_corner_histogram(&mesh);
+        assert_eq!(triangles, 10, "10 triangles in the converged coarsening");
+        assert_eq!(quads, 2, "2 quads in the converged coarsening");
+
+        mesh.validate_topology();
+    }
+
+    /// §5.3 early termination: an `iterations` count past the grid's actual
+    /// coarsening depth is harmless — the step that finds nothing to remove
+    /// fires the early-out, so the result equals the two-step converged grid
+    /// (14 V / 25 E / 12 F), unchanged by the excess steps.
+    ///
+    /// This also exercises stale-key safety: the caller's `verts` slice is
+    /// tagged against the *original* mesh, so after step 1 removes ~9 of those
+    /// keys the slice is full of freed keys. Each step must re-evaluate
+    /// eligibility on the current topology and skip freed keys without panic or
+    /// corruption (§5.3).
+    #[test]
+    fn unsubdivide_grid4_iterations_past_convergence_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_grid_n_faces(&mut mesh, 4);
+
+        mesh.unsubdivide(&verts, 4);
+
+        assert_eq!(mesh.totvert(), 14, "converged V unchanged by excess steps");
+        assert_eq!(mesh.totedge(), 25, "converged E unchanged by excess steps");
+        assert_eq!(mesh.totface(), 12, "converged F unchanged by excess steps");
+
+        let (triangles, quads) = face_corner_histogram(&mesh);
+        assert_eq!(triangles, 10);
+        assert_eq!(quads, 2);
+
+        mesh.validate_topology();
+    }
+
+    /// §5.3 stale-key direct check: running the operator one step at a time
+    /// over the *same* original `verts` slice converges to the identical
+    /// fixed point as a single two-step call, proving the stale keys left in
+    /// the slice after each step are skipped (not dereferenced) and that
+    /// eligibility is re-derived from current topology.
+    #[test]
+    fn unsubdivide_grid4_stepwise_matches_batched() {
+        let mut stepwise = LoopMesh::new();
+        let stepwise_verts = build_grid_n_faces(&mut stepwise, 4);
+        // The slice is tagged against the original mesh; after the first call
+        // most of its keys are freed. The second call must tolerate that.
+        stepwise.unsubdivide(&stepwise_verts, 1);
+        stepwise.unsubdivide(&stepwise_verts, 1);
+        stepwise.unsubdivide(&stepwise_verts, 1);
+
+        assert_eq!(stepwise.totvert(), 14);
+        assert_eq!(stepwise.totedge(), 25);
+        assert_eq!(stepwise.totface(), 12);
+        stepwise.validate_topology();
+
+        let mut batched = LoopMesh::new();
+        let batched_verts = build_grid_n_faces(&mut batched, 4);
+        batched.unsubdivide(&batched_verts, 2);
+
+        assert_eq!(stepwise.totvert(), batched.totvert());
+        assert_eq!(stepwise.totedge(), batched.totedge());
+        assert_eq!(stepwise.totface(), batched.totface());
+    }
+
     /// §1 — `iterations` is clamped to at least 1: a zero (or negative) count
     /// still runs one step.
     #[test]
