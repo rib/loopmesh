@@ -74,10 +74,48 @@ pub struct SubdivideEdgeRingResult {
 /// (§2 / §4). Captured before phase one so the face identity survives the rung
 /// splits (the split-edge-make-vert Euler op only adds rim corners — it never
 /// retires the face).
+///
+/// The four corner verts are recorded in the quad's loop-cycle order with the
+/// rung pair at `(rung_a_near → rung_a_far)` and `(rung_b_near → rung_b_far)`,
+/// where `rung_a_near` and `rung_b_near` are the two endpoints joined by one
+/// rail (the "A-rail" side). Phase two aligns each rung's midpoint run to this
+/// near→far direction so level `j` on `rung_a` pairs one-for-one with level `j`
+/// on `rung_b` (§6.1.1 "the directional parameter is the load-bearing detail").
 struct StripQuad {
     face: FaceKey,
     rung_a: EdgeKey,
     rung_b: EdgeKey,
+    /// Endpoint of `rung_a` on the shared rail with `rung_b_near`.
+    rung_a_near: VertexKey,
+    /// Endpoint of `rung_b` rail-joined to `rung_a_near` — the level-0 mate.
+    rung_b_near: VertexKey,
+    /// Far endpoint of `rung_a` (the B-rail corner). Phase two uses it to tell
+    /// the deeper (B-rail-side) fragment from the freshly peeled row.
+    rung_a_far: VertexKey,
+}
+
+/// Phase-one record for one rung: the new midpoints in `near → far` order
+/// (§3.3 directional), together with the `near` endpoint they were measured
+/// from. Phase two reverses this run when a quad reads the rung from its far
+/// endpoint so the level index stays a consistent cross-strip position.
+struct RungCuts {
+    near: VertexKey,
+    /// `midpoints[j]` is the level-`(j+1)` cut vert (`t = (j+1)/(N+1)` from
+    /// `near`); `len() == N`.
+    midpoints: Vec<VertexKey>,
+}
+
+impl RungCuts {
+    /// The midpoint run as seen from `from_near`, i.e. level 0..N in cross-strip
+    /// order when read starting at `from_near`. Reverses the stored run when the
+    /// quad reads this rung from the far endpoint.
+    fn aligned(&self, from_near: VertexKey) -> Vec<VertexKey> {
+        if from_near == self.near {
+            self.midpoints.clone()
+        } else {
+            self.midpoints.iter().rev().copied().collect()
+        }
+    }
 }
 
 impl LoopMesh {
@@ -102,25 +140,29 @@ impl LoopMesh {
     ///   quad into an A-side and a B-side quad and stitching the midpoints into
     ///   a continuous ring.
     ///
-    /// Element-count deltas (§4.1): an open strip of `k` quads gains `k + 1`
-    /// verts, `2k + 1` edges and `k` faces; a closed band of `k` quads gains
-    /// `k` verts, `2k` edges and `k` faces (the wrap-around connecting edge
-    /// closes the new ring).
+    /// Element-count deltas. For `cuts = 1` (§4.1): an open strip of `k` quads
+    /// gains `k + 1` verts, `2k + 1` edges and `k` faces; a closed band gains
+    /// `k` verts, `2k` edges and `k` faces. For `cuts = N` (§6.1.3) the deltas
+    /// are `N` times those: open `+N·(k+1)` V / `+N·(2k+1)` E / `+N·k` F;
+    /// closed `+N·k` V / `+2N·k` E / `+N·k` F. A strip of `k` quads becomes a
+    /// band of `(N+1)·k` quads (`N+1` quad rows separated by the `N` new rings).
     ///
-    /// The deferred parameters (§6) are accepted on the params struct but only
+    /// The placement-tolerant parameters (§6.2 `interp_mode` PATH/SURFACE, §6.3
+    /// `smooth` and the profile) are accepted on the params struct but only
     /// their no-op core values are implemented; any other value is a parity gap
-    /// tracked as a separate row, not handled here.
+    /// tracked as a separate row, not handled here. `cuts` is honoured for all
+    /// `N >= 1`.
     pub fn subdivide_edgering(
         &mut self,
         rungs: &[EdgeKey],
         params: SubdivideEdgeRingParams,
     ) -> SubdivideEdgeRingResult {
-        debug_assert_eq!(params.cuts, 1, "core supports cuts = 1 only");
         debug_assert_eq!(params.interp_mode, RingInterp::Linear);
         debug_assert_eq!(params.smooth, 0.0);
 
         let mut result = SubdivideEdgeRingResult::default();
-        if rungs.is_empty() {
+        let cuts = params.cuts;
+        if rungs.is_empty() || cuts == 0 {
             return result;
         }
 
@@ -129,38 +171,105 @@ impl LoopMesh {
         // Identify the strip quads before phase one. A strip quad is a quad
         // face flanked by two *opposite* rungs of the set (§2 / §4); the fill
         // fires only on those. Capturing before the splits keeps the face keys
-        // valid: split-edge-make-vert only inserts rim corners (§3), it never
-        // retires the face.
+        // and corner verts valid: split-edge-make-vert only inserts rim corners
+        // (§3 / §6.1.1), it never retires the face or its original corners.
         let strip_quads = self.collect_strip_quads(&rung_set);
 
-        // Phase one (§3): one chord-midpoint cut per rung. `edge_split` at
-        // t = 0.5 applies the §3 two-source-linear vert/loop/edge blend.
-        let mut rung_midpoint: HashMap<EdgeKey, VertexKey> = HashMap::with_capacity(rungs.len());
+        // Phase one (§3 / §6.1.1): multi-cut each rung into `N + 1` equal
+        // segments, recording the `N` midpoints in `near → far` order. The
+        // directional run is the load-bearing detail (§6.1.1) — phase two
+        // aligns level `j` across adjacent rungs by reading each rung from the
+        // endpoint on the shared rail. `edge_split_n` runs the §3.3 directional
+        // multi-cut, applying the two-source-linear vert/loop/edge blend at
+        // each `t_j = j/(N+1)`.
+        let mut rung_cuts: HashMap<EdgeKey, RungCuts> = HashMap::with_capacity(rung_set.len());
         for &rung in &rung_set {
             let [near, _far] = self.edge_vert_keys(rung);
-            let (midpoint, _new_edge) = self.edge_split(rung, near, 0.5);
-            rung_midpoint.insert(rung, midpoint);
-            result.verts.push(midpoint);
+            let midpoints = self.edge_split_n(rung, near, cuts);
+            result.verts.extend_from_slice(&midpoints);
+            rung_cuts.insert(rung, RungCuts { near, midpoints });
         }
 
-        // Phase two (§4): one straight-cross fill per strip quad, connecting the
-        // two midpoints. face_split copies the source face's per-face customdata
-        // onto the new fragment (§4) and interpolates the new diagonal's loops.
+        // Phase two (§4 / §6.1.2): the level-aligned ladder fill. For each strip
+        // quad, connect level `j` on `rung_a` to level `j` on `rung_b` with one
+        // straight cross-cut (split-face-make-edge), carving the `(2N+2)`-gon
+        // into `N + 1` quad rows from the A-rail toward the B-rail.
         for strip in &strip_quads {
-            let m_a = rung_midpoint[&strip.rung_a];
-            let m_b = rung_midpoint[&strip.rung_b];
-            if let Some((new_face, _new_edge)) = self.face_split(strip.face, m_a, m_b) {
-                result.faces.push(strip.face);
-                result.faces.push(new_face);
-            }
+            let levels_a = rung_cuts[&strip.rung_a].aligned(strip.rung_a_near);
+            let levels_b = rung_cuts[&strip.rung_b].aligned(strip.rung_b_near);
+            debug_assert_eq!(levels_a.len(), levels_b.len(), "rungs cut to same N");
+
+            self.fill_strip_quad(
+                strip.face,
+                &levels_a,
+                &levels_b,
+                strip.rung_a_far,
+                &mut result.faces,
+            );
         }
 
         result
     }
 
+    /// Carve one (multi-cut) strip quad into `N + 1` rows (§6.1.2). `levels_a`
+    /// and `levels_b` are the `N` midpoints of the two rungs in cross-strip
+    /// order (level 0 nearest the A-rail). Each level's cross-cut peels one quad
+    /// row off the A-rail end; the remaining fragment — the one still carrying
+    /// the deeper levels and the B-rail — is split again. `b_rail_corner` is the
+    /// B-rail-side corner (`rung_a`'s far endpoint) used to tell the deeper
+    /// fragment from the freshly peeled row at every level, including the last.
+    /// The carved-off rows and the final B-rail remainder are pushed to
+    /// `out_faces` (`N + 1` quads).
+    fn fill_strip_quad(
+        &mut self,
+        face: FaceKey,
+        levels_a: &[VertexKey],
+        levels_b: &[VertexKey],
+        b_rail_corner: VertexKey,
+        out_faces: &mut Vec<FaceKey>,
+    ) {
+        let mut remaining = face;
+        for (&m_a, &m_b) in levels_a.iter().zip(levels_b.iter()) {
+            // face_split returns None only when a corner is absent from the
+            // face — an invariant violation here, since every level vert was
+            // inserted onto this quad's rim in phase one (§6.1.1). Guard it so
+            // an unexpected None surfaces rather than silently dropping a row.
+            let split = self.face_split(remaining, m_a, m_b);
+            debug_assert!(
+                split.is_some(),
+                "level cross-cut corner missing from strip quad"
+            );
+            let Some((new_face, _new_edge)) = split else {
+                return;
+            };
+
+            // One of {remaining, new_face} is the freshly peeled A-side row; the
+            // other still holds the deeper levels + the B-rail. The deeper
+            // fragment is the one carrying the B-rail corner; the row is the
+            // other. This probe is independent of which side SFME keeps as the
+            // surviving face, and works at every level (no special last-level
+            // case).
+            let (row, deeper) = if self.face_contains_vert(new_face, b_rail_corner) {
+                (remaining, new_face)
+            } else {
+                (new_face, remaining)
+            };
+            out_faces.push(row);
+            remaining = deeper;
+        }
+        // The final remainder is the B-rail row.
+        out_faces.push(remaining);
+    }
+
+    /// Whether `vert` is a corner of `face`.
+    fn face_contains_vert(&self, face: FaceKey, vert: VertexKey) -> bool {
+        self.face_vert_keys(face).contains(&vert)
+    }
+
     /// Gather the strip quads of the resolved ring (§2 / §4): the quad faces
     /// flanked by two *opposite* rungs of `rung_set`. Each such face is
-    /// captured once, with the two rungs that flank it.
+    /// captured once, with the two rungs that flank it and the rail pairing of
+    /// their endpoints (§6.1.1) so phase two can align cut levels.
     fn collect_strip_quads(&self, rung_set: &HashSet<EdgeKey>) -> Vec<StripQuad> {
         // Candidate faces: every face incident to a rung. A strip quad is seen
         // from both its rungs, so dedupe before classifying.
@@ -176,22 +285,40 @@ impl LoopMesh {
             if self.face_len(face) != 4 {
                 continue;
             }
-            // A quad's edges sit at loop positions 0..4; positions 0 and 2 are
-            // one opposite pair, 1 and 3 the other. A strip quad is flanked by
-            // exactly one opposite pair of rungs.
+            // A quad's verts/edges sit at loop positions 0..4; edge `i` joins
+            // vert `i` to vert `i+1`. Edge positions 0 and 2 are one opposite
+            // pair, 1 and 3 the other. A strip quad is flanked by exactly one
+            // opposite pair of rungs. The rail joining the two rungs' "near"
+            // endpoints pins the level-0 alignment for phase two: with rungs at
+            // edge 0 (verts v0→v1) and edge 2 (verts v2→v3), rail edge 3
+            // (v3→v0) joins rung_a's v0 to rung_b's v3, so those are the
+            // rail-mate near endpoints. (The symmetric tie-break — rungs at
+            // edges 1/3 — pairs v1↔v2 the same way. Choosing edge-0/2 first when
+            // both pairs are rungs is arbitrary but safe: a strip quad can be
+            // flanked by only one opposite rung pair, so the branches are
+            // mutually exclusive in practice and the choice never observably
+            // matters.)
+            let verts = self.face_vert_keys(face);
             let edges = self.face_edge_keys(face);
             debug_assert_eq!(edges.len(), 4, "quad has four edges");
+            debug_assert_eq!(verts.len(), 4, "quad has four verts");
             if rung_set.contains(&edges[0]) && rung_set.contains(&edges[2]) {
                 strip_quads.push(StripQuad {
                     face,
                     rung_a: edges[0],
                     rung_b: edges[2],
+                    rung_a_near: verts[0],
+                    rung_b_near: verts[3],
+                    rung_a_far: verts[1],
                 });
             } else if rung_set.contains(&edges[1]) && rung_set.contains(&edges[3]) {
                 strip_quads.push(StripQuad {
                     face,
                     rung_a: edges[1],
                     rung_b: edges[3],
+                    rung_a_near: verts[1],
+                    rung_b_near: verts[0],
+                    rung_a_far: verts[2],
                 });
             }
         }
@@ -366,6 +493,146 @@ mod tests {
         let (mut mesh, _rungs) = open_strip(3);
         let result = mesh.subdivide_edgering(&[], SubdivideEdgeRingParams::default());
         assert_eq!(counts(&mesh), (8, 10, 3), "empty set: mesh unchanged");
+        assert!(result.verts.is_empty() && result.faces.is_empty());
+    }
+
+    fn cuts(n: u32) -> SubdivideEdgeRingParams {
+        SubdivideEdgeRingParams {
+            cuts: n,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn open_strip_cuts2_deltas() {
+        // §6.1.3 open (k = 3, N = 2): 2× the §4.1 open deltas.
+        // 8 V / 10 E / 3 F → 16 V / 24 E / 9 F (+8 V / +14 E / +6 F).
+        let (mut mesh, rungs) = open_strip(3);
+        assert_eq!(counts(&mesh), (8, 10, 3));
+
+        let result = mesh.subdivide_edgering(&rungs, cuts(2));
+
+        assert_eq!(counts(&mesh), (16, 24, 9), "open k=3, N=2");
+        assert_eq!(result.verts.len(), 8, "N midpoints per rung: 2 × 4 rungs");
+        // (N+1)·k fill quads = 3 × 3 = 9.
+        assert_eq!(result.faces.len(), 9, "(N+1)·k fill quads");
+        for &f in &result.faces {
+            assert_eq!(mesh.face_len(f), 4, "every fill fragment is a quad");
+        }
+    }
+
+    #[test]
+    fn open_strip_cuts3_deltas() {
+        // §6.1.3 open (k = 3, N = 3): 8 V / 10 E / 3 F → 20 V / 31 E / 12 F.
+        let (mut mesh, rungs) = open_strip(3);
+        let result = mesh.subdivide_edgering(&rungs, cuts(3));
+        assert_eq!(counts(&mesh), (20, 31, 12), "open k=3, N=3");
+        assert_eq!(result.verts.len(), 12, "3 × 4 rungs");
+        assert_eq!(result.faces.len(), 12, "(N+1)·k = 4 × 3");
+    }
+
+    #[test]
+    fn open_strip_cuts2_rings_on_chord() {
+        // §6.1.4 — the N interior chord points land at t = 1/3 and t = 2/3 along
+        // each rung. Rungs run y = 0 → y = 1, so the cut verts split into a ring
+        // at y = 1/3 and a ring at y = 2/3, each spanning the four columns.
+        let (mut mesh, rungs) = open_strip(3);
+        let result = mesh.subdivide_edgering(&rungs, cuts(2));
+
+        let mut at_third = 0;
+        let mut at_two_thirds = 0;
+        for &m in &result.verts {
+            let p = mesh.vertex_position(m);
+            assert!(p.z.abs() < 1e-6, "stays in the strip plane");
+            if (p.y - 1.0 / 3.0).abs() < 1e-6 {
+                at_third += 1;
+            } else if (p.y - 2.0 / 3.0).abs() < 1e-6 {
+                at_two_thirds += 1;
+            } else {
+                panic!("cut vert off the expected chord rings: y = {}", p.y);
+            }
+        }
+        assert_eq!(at_third, 4, "first ring: one vert per rung column");
+        assert_eq!(at_two_thirds, 4, "second ring: one vert per rung column");
+    }
+
+    #[test]
+    fn closed_band_cuts3_deltas() {
+        // §6.1.3 closed (k = 4, N = 3): 2×§4.1-closed scaled by N.
+        // 8 V / 12 E / 4 F → 20 V / 36 E / 16 F (+12 V / +24 E / +12 F).
+        let (mut mesh, rungs) = closed_band(4);
+        assert_eq!(counts(&mesh), (8, 12, 4));
+
+        let result = mesh.subdivide_edgering(&rungs, cuts(3));
+
+        assert_eq!(counts(&mesh), (20, 36, 16), "closed k=4, N=3");
+        assert_eq!(result.verts.len(), 12, "N × k = 3 × 4");
+        assert_eq!(result.faces.len(), 16, "(N+1)·k = 4 × 4");
+        for &f in &result.faces {
+            assert_eq!(mesh.face_len(f), 4, "every fill fragment is a quad");
+        }
+    }
+
+    #[test]
+    fn closed_band_cuts2_rings_continuous() {
+        // §6.1.2 — the N midpoint families stitch into N continuous closed
+        // rings, one per cut level. Each ring's connecting edges join two cut
+        // verts at the *same* level (same chord fraction, hence same y here);
+        // inter-level rung sub-edges join cut verts at *different* levels and
+        // are not ring edges. For N = 2 closed rings over k = 4: each ring has
+        // k = 4 connecting edges. Each ring vertex must have degree 2 within
+        // its own level (a closed loop), confirming continuity.
+        let (mut mesh, rungs) = closed_band(4);
+        let result = mesh.subdivide_edgering(&rungs, cuts(2));
+
+        let level_of = |y: f32| -> Option<u8> {
+            if (y - 1.0 / 3.0).abs() < 1e-6 {
+                Some(0)
+            } else if (y - 2.0 / 3.0).abs() < 1e-6 {
+                Some(1)
+            } else {
+                None
+            }
+        };
+
+        let mut ring_edges = [0usize; 2];
+        let mut same_level_degree: HashMap<VertexKey, usize> = HashMap::new();
+        for &m in &result.verts {
+            let m_level = level_of(mesh.vertex_position(m).y).expect("cut vert on a ring");
+            for e in mesh.vertex_disk_iter(m).collect::<Vec<_>>() {
+                let [a, b] = mesh.edge_vert_keys(e);
+                let other = if a == m { b } else { a };
+                if let Some(other_level) = level_of(mesh.vertex_position(other).y) {
+                    if other_level == m_level {
+                        ring_edges[m_level as usize] += 1;
+                        *same_level_degree.entry(m).or_default() += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(ring_edges[0] / 2, 4, "ring 0 has k connecting edges");
+        assert_eq!(ring_edges[1] / 2, 4, "ring 1 has k connecting edges");
+        for (&_v, &deg) in &same_level_degree {
+            assert_eq!(deg, 2, "each ring vert has degree 2 (closed loop)");
+        }
+    }
+
+    #[test]
+    fn cuts1_matches_core_path() {
+        // N = 1 must collapse onto the §4 single-cut fill: open k = 3 lands the
+        // same 12 V / 17 E / 6 F as the default-params core.
+        let (mut mesh, rungs) = open_strip(3);
+        let result = mesh.subdivide_edgering(&rungs, cuts(1));
+        assert_eq!(counts(&mesh), (12, 17, 6), "N=1 ≡ core single cut");
+        assert_eq!(result.verts.len(), 4);
+        assert_eq!(result.faces.len(), 6);
+    }
+
+    #[test]
+    fn cuts_zero_is_noop() {
+        let (mut mesh, rungs) = open_strip(3);
+        let result = mesh.subdivide_edgering(&rungs, cuts(0));
+        assert_eq!(counts(&mesh), (8, 10, 3), "cuts = 0: mesh unchanged");
         assert!(result.verts.is_empty() && result.faces.is_empty());
     }
 }
