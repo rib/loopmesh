@@ -58,6 +58,7 @@ mod subdivide_edgering;
 mod symmetrize;
 mod transform;
 mod translate;
+mod unsubdivide;
 mod weld_verts;
 
 pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult};
