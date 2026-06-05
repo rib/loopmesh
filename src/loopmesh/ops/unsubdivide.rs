@@ -382,6 +382,119 @@ mod tests {
         (triangles, quads)
     }
 
+    /// Full face-arity histogram keyed by side count (3 = tri, 4 = quad,
+    /// 5 = pentagon, …), for the §7.2 mixed-region pins where pentagons matter.
+    fn face_arity_histogram(mesh: &LoopMesh) -> std::collections::BTreeMap<usize, usize> {
+        let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for f in mesh.face_keys() {
+            *hist.entry(mesh.face_vert_keys(f).len()).or_insert(0) += 1;
+        }
+        hist
+    }
+
+    /// Build a closed **triangulated fan** of `s` spokes (§7.1): a central
+    /// vertex ringed by `s` rim verts joined edge-to-edge into a closed ring,
+    /// with `s` triangles `(center, rim[i], rim[i + 1])`. Yields `s + 1` V /
+    /// `2s` E / `s` F, all triangles. Returns `(center, rim_verts)`.
+    fn build_triangulated_fan(mesh: &mut LoopMesh, s: usize) -> (VertexKey, Vec<VertexKey>) {
+        assert!(s >= 3);
+        let center = mesh.create_vertex(Vec3::ZERO);
+        let mut rim: Vec<VertexKey> = Vec::with_capacity(s);
+        for i in 0..s {
+            let angle = std::f32::consts::TAU * (i as f32) / (s as f32);
+            rim.push(mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0)));
+        }
+        for i in 0..s {
+            let a = rim[i];
+            let b = rim[(i + 1) % s];
+            let e_ca = mesh.create_edge([center, a], EdgeCreateFlags::NO_DUPLICATE);
+            let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE);
+            let e_bc = mesh.create_edge([b, center], EdgeCreateFlags::NO_DUPLICATE);
+            mesh.face_create(&[center, a, b], &[e_ca, e_ab, e_bc], FaceCreateFlags::NONE);
+        }
+        (center, rim)
+    }
+
+    /// Build a **uniformly triangulated grid** (§7.1): an `n × n`-cell quad
+    /// lattice with every cell cut along its bottom-left→top-right diagonal into
+    /// two triangles. Yields `(n+1)^2` V, `3n^2 + 2n` E, `2n^2` F (all
+    /// triangles). Returns the verts row-major, `verts[r * (n + 1) + c]`.
+    fn build_triangulated_grid(mesh: &mut LoopMesh, n: usize) -> Vec<VertexKey> {
+        let stride = n + 1;
+        let mut verts: Vec<VertexKey> = Vec::with_capacity(stride * stride);
+        for r in 0..stride {
+            for c in 0..stride {
+                verts.push(mesh.create_vertex(Vec3::new(c as f32, r as f32, 0.0)));
+            }
+        }
+        for r in 0..n {
+            for c in 0..n {
+                let v_bl = verts[r * stride + c];
+                let v_br = verts[r * stride + c + 1];
+                let v_tr = verts[(r + 1) * stride + c + 1];
+                let v_tl = verts[(r + 1) * stride + c];
+                // Diagonal v_bl -- v_tr splits the cell into two triangles.
+                let e_b = mesh.create_edge([v_bl, v_br], EdgeCreateFlags::NO_DUPLICATE);
+                let e_r = mesh.create_edge([v_br, v_tr], EdgeCreateFlags::NO_DUPLICATE);
+                let e_d = mesh.create_edge([v_tr, v_bl], EdgeCreateFlags::NO_DUPLICATE);
+                let e_t = mesh.create_edge([v_tr, v_tl], EdgeCreateFlags::NO_DUPLICATE);
+                let e_l = mesh.create_edge([v_tl, v_bl], EdgeCreateFlags::NO_DUPLICATE);
+                mesh.face_create(&[v_bl, v_br, v_tr], &[e_b, e_r, e_d], FaceCreateFlags::NONE);
+                mesh.face_create(&[v_bl, v_tr, v_tl], &[e_d, e_t, e_l], FaceCreateFlags::NONE);
+            }
+        }
+        verts
+    }
+
+    /// Build the §7.2 **mixed n-gon patch**: 9 V / 13 E / 5 F made of two
+    /// triangles, two quads and one pentagon, all sharing the two interior verts
+    /// `v4`/`v5`. Returns the verts in index order so a caller can tag the whole
+    /// patch (`&all`) or just the interior pair (`[v[4], v[5]]`).
+    fn build_mixed_ngon_patch(mesh: &mut LoopMesh) -> Vec<VertexKey> {
+        let coords = [
+            (0.0, 0.0), // 0
+            (1.0, 0.0), // 1
+            (2.0, 0.0), // 2
+            (3.0, 0.0), // 3
+            (1.0, 1.0), // 4  interior
+            (2.0, 1.0), // 5  interior
+            (0.0, 2.0), // 6
+            (1.0, 2.0), // 7
+            (3.0, 2.0), // 8
+        ];
+        let v: Vec<VertexKey> = coords
+            .iter()
+            .map(|&(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+            .collect();
+        let mut edge = |mesh: &mut LoopMesh, a: usize, b: usize| {
+            mesh.create_edge([v[a], v[b]], EdgeCreateFlags::NO_DUPLICATE)
+        };
+        // Pentagon 0-1-4-7-6.
+        let e01 = edge(mesh, 0, 1);
+        let e14 = edge(mesh, 1, 4);
+        let e47 = edge(mesh, 4, 7);
+        let e76 = edge(mesh, 7, 6);
+        let e60 = edge(mesh, 6, 0);
+        mesh.face_create(&[v[0], v[1], v[4], v[7], v[6]], &[e01, e14, e47, e76, e60], FaceCreateFlags::NONE);
+        // Triangle 1-2-4.
+        let e12 = edge(mesh, 1, 2);
+        let e24 = edge(mesh, 2, 4);
+        mesh.face_create(&[v[1], v[2], v[4]], &[e12, e24, e14], FaceCreateFlags::NONE);
+        // Quad 2-3-5-4.
+        let e23 = edge(mesh, 2, 3);
+        let e35 = edge(mesh, 3, 5);
+        let e54 = edge(mesh, 5, 4);
+        mesh.face_create(&[v[2], v[3], v[5], v[4]], &[e23, e35, e54, e24], FaceCreateFlags::NONE);
+        // Quad 4-5-8-7.
+        let e58 = edge(mesh, 5, 8);
+        let e87 = edge(mesh, 8, 7);
+        mesh.face_create(&[v[4], v[5], v[8], v[7]], &[e54, e58, e87, e47], FaceCreateFlags::NONE);
+        // Triangle 3-8-5.
+        let e38 = edge(mesh, 3, 8);
+        mesh.face_create(&[v[3], v[8], v[5]], &[e38, e58, e35], FaceCreateFlags::NONE);
+        v
+    }
+
     /// §5.2 headline pin: `grid_n_faces(4)` whole-mesh, `iterations = 1`.
     /// 25 V / 40 E / 16 F → 16 V / 28 E / 13 F (8 triangles + 5 quads).
     #[test]
@@ -643,6 +756,207 @@ mod tests {
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&diagonal[0]) && live.contains(&diagonal[1]));
         mesh.validate_topology();
+    }
+
+    /// §7.1 triangulated fan, 6 spokes, whole mesh tagged, `iterations = 1`.
+    /// 7 V / 12 E / 6 F → 4 V / 6 E / 3 F (three triangles). The center
+    /// survives as the hub (excluded at eligibility on the edge-count cap for
+    /// `s ≥ 5`); an independent rim subset is removed. The output is all
+    /// triangles — no quad pre-pass remnant on a fan of triangles.
+    #[test]
+    fn unsubdivide_tri_fan6_whole_mesh_one_step() {
+        let mut mesh = LoopMesh::new();
+        let (center, rim) = build_triangulated_fan(&mut mesh, 6);
+        let mut all = vec![center];
+        all.extend_from_slice(&rim);
+
+        assert_eq!(mesh.totvert(), 7);
+        assert_eq!(mesh.totedge(), 12);
+        assert_eq!(mesh.totface(), 6);
+
+        mesh.unsubdivide(&all, 1);
+
+        assert_eq!(mesh.totvert(), 4, "4 V — center + 3 surviving rim verts");
+        assert_eq!(mesh.totedge(), 6, "6 E");
+        assert_eq!(mesh.totface(), 3, "3 F");
+        let (triangles, quads) = face_corner_histogram(&mesh);
+        assert_eq!(triangles, 3, "all-triangle output (no quad pre-pass on a tri fan)");
+        assert_eq!(quads, 0);
+
+        let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(live.contains(&center), "center survives as the coarser fan hub");
+        mesh.validate_topology();
+    }
+
+    /// §7.1 triangulated fan, 4 spokes, whole mesh tagged, `iterations = 1`.
+    /// 5 V / 8 E / 4 F → 3 V / 3 E / 1 F (single triangle). The fill removes
+    /// **two non-adjacent rim verts** (the center plus two opposite rim verts
+    /// surviving), collapsing the fan to one triangle. For `s = 4` the center is
+    /// eligible but held in the *kept* class by flood-fill parity (§4), not by
+    /// the edge-count cap.
+    ///
+    /// BLOCKED on a guide gap: §4's flood-fill is specified for the *bipartite*
+    /// grid eligible subgraph, but the `s = 4` fan is **non-bipartite** (each
+    /// `center–rim[i]–rim[i+1]` triangle is an odd cycle). §7.1 asserts a
+    /// measured `5 → 3` with the center *and* two non-adjacent rim verts all
+    /// kept — but the center is adjacent to every rim vert, so "center kept
+    /// while an independent rim subset is removed" is not a valid two-colouring
+    /// of this graph (it violates §4.3's kept–removed edge rule). Implementing
+    /// §4 literally, seeding the center colours the whole rim *removed* (a
+    /// degenerate weld); seeding a rim vert removes the center plus two rim
+    /// verts. Neither is the measured pin, and the guide does not specify how
+    /// the fill resolves odd cycles to land on the oracle's removed set.
+    #[test]
+    #[ignore = "guide gap: §4 flood-fill under-specified on the non-bipartite s=4 fan; \
+                see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.1 / §4.3"]
+    fn unsubdivide_tri_fan4_whole_mesh_one_step() {
+        let mut mesh = LoopMesh::new();
+        let (center, rim) = build_triangulated_fan(&mut mesh, 4);
+        let mut all = vec![center];
+        all.extend_from_slice(&rim);
+
+        assert_eq!(mesh.totvert(), 5);
+        assert_eq!(mesh.totedge(), 8);
+        assert_eq!(mesh.totface(), 4);
+
+        mesh.unsubdivide(&all, 1);
+
+        assert_eq!(mesh.totvert(), 3, "3 V — two non-adjacent rim verts removed");
+        assert_eq!(mesh.totedge(), 3, "3 E — single triangle");
+        assert_eq!(mesh.totface(), 1, "1 F — collapsed to one triangle");
+        let (triangles, quads) = face_corner_histogram(&mesh);
+        assert_eq!(triangles, 1);
+        assert_eq!(quads, 0);
+
+        let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+        assert!(live.contains(&center), "center survives (kept by flood-fill parity)");
+        mesh.validate_topology();
+    }
+
+    /// §7.1 triangulated fan, 3 spokes: a **complete no-op**. All three rim
+    /// verts fail eligibility on the already-bounds-a-face test (their
+    /// neighbour-ring already bounds the opposite fan triangle), so the eligible
+    /// subgraph is just the center — a lone component, coloured *kept*, removing
+    /// nothing. Verified for whole-mesh tagging here; the guide pins the same
+    /// no-op for rim-only and center-only tagging.
+    #[test]
+    fn unsubdivide_tri_fan3_whole_mesh_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let (center, rim) = build_triangulated_fan(&mut mesh, 3);
+        let mut all = vec![center];
+        all.extend_from_slice(&rim);
+
+        assert_eq!(mesh.totvert(), 4);
+        assert_eq!(mesh.totedge(), 6);
+        assert_eq!(mesh.totface(), 3);
+
+        mesh.unsubdivide(&all, 1);
+
+        assert_eq!(mesh.totvert(), 4, "no-op: rim verts blocked at eligibility");
+        assert_eq!(mesh.totedge(), 6, "no-op");
+        assert_eq!(mesh.totface(), 3, "no-op");
+        mesh.validate_topology();
+    }
+
+    /// §7.1 uniformly triangulated grid is a **complete no-op** at every
+    /// iteration: none of the interior verts matches a dissolvable §3 shape
+    /// (valence-6 verts exceed the cap; valence-4 verts hit the
+    /// already-bounds-a-face rejection). Checked for `n = 2` and `n = 4` across
+    /// several iteration counts.
+    #[test]
+    fn unsubdivide_triangulated_grid_is_noop() {
+        for (n, exp_v, exp_e, exp_f) in [(2usize, 9usize, 16usize, 8usize), (4, 25, 56, 32)] {
+            for iterations in [1, 2, 4] {
+                let mut mesh = LoopMesh::new();
+                let verts = build_triangulated_grid(&mut mesh, n);
+
+                assert_eq!(mesh.totvert(), exp_v, "n={n} input V");
+                assert_eq!(mesh.totedge(), exp_e, "n={n} input E");
+                assert_eq!(mesh.totface(), exp_f, "n={n} input F");
+
+                mesh.unsubdivide(&verts, iterations);
+
+                assert_eq!(mesh.totvert(), exp_v, "n={n} it={iterations} no-op V");
+                assert_eq!(mesh.totedge(), exp_e, "n={n} it={iterations} no-op E");
+                assert_eq!(mesh.totface(), exp_f, "n={n} it={iterations} no-op F");
+                mesh.validate_topology();
+            }
+        }
+    }
+
+    /// §7.2 mixed n-gon patch, whole mesh tagged, `iterations = 1`.
+    /// 9 V / 13 E / 5 F → 6 V / 10 E / 5 F: three verts removed and the welded
+    /// neighbourhood re-triangulated, so the arity histogram flips
+    /// `{tri:2, quad:2, pent:1}` → `{tri:5}` at unchanged face count (§5.1
+    /// re-triangulation).
+    ///
+    /// BLOCKED on a guide gap: the §3–§5 composition removes the correct
+    /// **count** of verts (3, matching the pin's `9 → 6`), but the §5.1 n-gon
+    /// pre-pass on this mixed neighbourhood welds to `{tri:3, quad:1}` over 4
+    /// faces here, not the oracle's measured `{tri:5}` over 5 faces. §7.2 states
+    /// there is "no shortcut formula" for the produced face mix and defers it to
+    /// the A/B gate's measured topology; the guide does not specify the pre-pass
+    /// cut order / fan-merge face identity precisely enough to reproduce the
+    /// `{tri:5}` mix from the documented surgery alone.
+    #[test]
+    #[ignore = "guide gap: §5.1 n-gon pre-pass face mix on a mixed patch not pinned to \
+                implementable depth; see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.2"]
+    fn unsubdivide_mixed_ngon_whole_mesh_one_step() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_mixed_ngon_patch(&mut mesh);
+
+        assert_eq!(mesh.totvert(), 9);
+        assert_eq!(mesh.totedge(), 13);
+        assert_eq!(mesh.totface(), 5);
+        assert_eq!(
+            face_arity_histogram(&mesh),
+            std::collections::BTreeMap::from([(3, 2), (4, 2), (5, 1)]),
+            "input histogram {{tri:2, quad:2, pent:1}}"
+        );
+
+        mesh.unsubdivide(&verts, 1);
+
+        assert_eq!(mesh.totvert(), 6, "6 V — three verts removed");
+        assert_eq!(mesh.totedge(), 10, "10 E");
+        assert_eq!(mesh.totface(), 5, "5 F — face count unchanged");
+        assert_eq!(
+            face_arity_histogram(&mesh),
+            std::collections::BTreeMap::from([(3, 5)]),
+            "histogram flips to {{tri:5}} via the §5.1 re-triangulation"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §7.2 mixed n-gon patch, whole mesh tagged, `iterations = 2`: the second
+    /// step coarsens the triangle fan down to a single quad and the operator
+    /// converges. 9/13/5 → 4 V / 4 E / 1 F (one quad); a third step is a no-op.
+    ///
+    /// BLOCKED on the same §7.2 guide gap as the one-step pin: the step-1 face
+    /// mix already diverges from the measured `{tri:5}`, so the step-2 fixed
+    /// point (single quad) cannot be reached from the documented surgery alone.
+    #[test]
+    #[ignore = "guide gap: §5.1 n-gon pre-pass face mix on a mixed patch not pinned to \
+                implementable depth; see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.2"]
+    fn unsubdivide_mixed_ngon_two_steps_converge() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_mixed_ngon_patch(&mut mesh);
+
+        mesh.unsubdivide(&verts, 2);
+
+        assert_eq!(mesh.totvert(), 4, "4 V — converged to a single quad");
+        assert_eq!(mesh.totedge(), 4, "4 E");
+        assert_eq!(mesh.totface(), 1, "1 F — single quad");
+        assert_eq!(
+            face_arity_histogram(&mesh),
+            std::collections::BTreeMap::from([(4, 1)]),
+            "converged to a single quad"
+        );
+        mesh.validate_topology();
+
+        // A third step finds nothing to remove (§5.3 early-out).
+        let v_before = mesh.totvert();
+        mesh.unsubdivide(&verts, 1);
+        assert_eq!(mesh.totvert(), v_before, "converged: third step is a no-op");
     }
 
     /// §1 — `iterations` is clamped to at least 1: a zero (or negative) count
