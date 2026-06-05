@@ -188,7 +188,95 @@ impl LoopMesh {
             }
         }
 
-        Some(e_old)
+        // Weld any coincident doubled face the collapse produced. When the
+        // collapsed corner sat on a face that does *not* bottom out at a 2-gon
+        // (it had 4+ sides, so it survives at 3+) but whose re-pointed side now
+        // duplicates a pre-existing edge between the same two verts, the face
+        // can land coincident with the face already on that edge — a doubled
+        // face. This is the join-then-split / weld endgame of
+        // `BM_vert_collapse_faces`: `kill_duplicate_faces` splices the parallel
+        // edges and reaps the redundant coincident face (`DISSOLVE_VERTS.md`
+        // §6.6, §8 — the single-vert-helper path that closes a degenerating fan
+        // onto one clean face rather than keeping the duplicate).
+        let mut surviving = e_old;
+        if flags.kill_duplicate_faces && self.edges.try_get(e_old).is_some() {
+            if let Some(welded) = self.weld_duplicate_edge_face(e_old, v_target, v_old) {
+                surviving = welded;
+            }
+        }
+
+        Some(surviving)
+    }
+
+    /// After a corner collapse, fold a re-pointed edge that now duplicates a
+    /// pre-existing edge between the same two verts into one, welding any face
+    /// that thereby becomes coincident with its neighbour. Reaps the redundant
+    /// doubled face so a degenerating fan closes onto a single clean face
+    /// (`DISSOLVE_VERTS.md` §6.6 `kill_duplicate_faces`). Returns the surviving
+    /// edge after the splice (the kept sibling), or `None` if no duplicate was
+    /// found and `repointed` is left as-is.
+    fn weld_duplicate_edge_face(
+        &mut self,
+        repointed: EdgeKey,
+        va: VertexKey,
+        vb: VertexKey,
+    ) -> Option<EdgeKey> {
+        // Find a sibling edge spanning the same vertex pair as `repointed`.
+        let sibling = {
+            let mut found: Option<EdgeKey> = None;
+            let mut disk = self.disk_edges(va);
+            while let Some(edge) = disk.next(self) {
+                if edge == repointed {
+                    continue;
+                }
+                if self.edges.get(edge).other_vertex(va) == Some(vb) {
+                    found = Some(edge);
+                    break;
+                }
+            }
+            found
+        };
+        let sibling = sibling?;
+
+        // Splice the re-pointed duplicate onto the pre-existing sibling, keeping
+        // the sibling (the older edge) as the survivor. Both edges' loops now
+        // share one radial cycle.
+        if !self.edge_splice(sibling, repointed) {
+            return None;
+        }
+
+        // Any two faces that are now coincident — same loop vertex set, same
+        // edges — are a doubled face; reap the extra one. Collect the faces on
+        // the merged edge's radial cycle and compare their vertex sets.
+        let radial_faces: SmallVec<[FaceKey; 4]> = {
+            let mut out: SmallVec<[FaceKey; 4]> = SmallVec::new();
+            let mut radial = self.radial_loops(sibling);
+            while let Some(l) = radial.next(self) {
+                let face = self.loops.get(l).face;
+                if !out.contains(&face) {
+                    out.push(face);
+                }
+            }
+            out
+        };
+        for outer in 0..radial_faces.len() {
+            let face_a = radial_faces[outer];
+            if self.faces.try_get(face_a).is_none() {
+                continue;
+            }
+            let set_a: SmallVec<[VertexKey; 6]> = self.face_vert_keys(face_a).into_iter().collect();
+            for &face_b in radial_faces.iter().skip(outer + 1) {
+                if face_b == face_a || self.faces.try_get(face_b).is_none() {
+                    continue;
+                }
+                let set_b: SmallVec<[VertexKey; 6]> =
+                    self.face_vert_keys(face_b).into_iter().collect();
+                if set_a.len() == set_b.len() && set_a.iter().all(|v| set_b.contains(v)) {
+                    self.face_kill(face_b);
+                }
+            }
+        }
+        Some(sibling)
     }
 
     /// Kill a sub-triangle face produced by an edge collapse and, when

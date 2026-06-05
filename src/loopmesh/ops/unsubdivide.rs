@@ -150,10 +150,17 @@ impl LoopMesh {
 
     /// §5 — dissolve the *removed* class, one vert at a time (§5.1: "for one
     /// removed vert `v` … then dissolve `v`"). Face-bearing shapes (interior
-    /// cross / interior tri-fan / boundary tee) are routed through the
-    /// dissolve-family fan-merge with the n-gon corner-cut pre-pass on (§5.1);
-    /// wire pairs are collapsed edge-into-edge so the two neighbours weld into
-    /// one longer wire (§5.1).
+    /// cross / interior tri-fan / boundary tee) lay the n-gon corner-cut
+    /// pre-pass first (§5.1) and are then routed through the **single-vert
+    /// dissolve helper**, whose endgame is a reaping-enabled collapse: a
+    /// triangle-corner collapse is reaped to nothing so a degenerating fan
+    /// closes onto a single clean face rather than a doubled / 2-gon remnant
+    /// (§5.1.1; DISSOLVE_VERTS.md §6.6). This is the load-bearing distinction
+    /// from the set-input dissolve-verts join, which would keep that doubled
+    /// face live (DISSOLVE_VERTS.md §8) and stall one removal short of the
+    /// oracle on the `triangulated_fan(4)` → 3/3/1 and `mixed_ngon_patch`
+    /// step-2 → 4/4/1 endgames. Wire pairs are collapsed edge-into-edge so the
+    /// two neighbours weld into one longer wire (§5.1).
     ///
     /// The removals are edge-independent (§4.3) but not face-independent: two
     /// removed verts can be diagonal corners of one quad and so share that
@@ -163,12 +170,30 @@ impl LoopMesh {
     /// triangles and quads (and the −12 E / −3 F net) rather than nine
     /// disjoint per-vert merges.
     fn unsubdivide_dissolve_removed(&mut self, removed: &[VertexKey]) {
-        let params = DissolveVertsParams {
-            use_face_split: true,
-            use_boundary_tear: false,
-        };
+        // §5.1 / §4.1 removed-set membership wall for the n-gon pre-pass skip:
+        // a corner diagonal is wasted (and would only be re-walked) when one of
+        // its endpoints is itself about to be dissolved.
+        let removed_set = self.push_vert_op_flag_layer();
+        const REMOVED_BIT: u8 = 0;
+        for &v in removed {
+            if self.vertices.try_get(v).is_some() {
+                self.vert_op_flag_set(removed_set, v, REMOVED_BIT);
+            }
+        }
+
         for &v in removed {
             if self.vertices.try_get(v).is_none() {
+                continue;
+            }
+            // §4.4 / §5.1 live-revalidation gate. The two-colour fill (§4) is an
+            // over-approximation on a non-bipartite component (an odd cycle): it
+            // can mark two adjacent verts for removal. Re-confirm the §3 shape
+            // against the *current* topology — after the preceding removals in
+            // this pass — and skip any vert whose fan no longer matches. On a
+            // bipartite component this never fires (the removed set is genuinely
+            // independent); on an odd cycle it is what prunes the over-marked set
+            // down to the maximal non-interfering subset the oracle removes.
+            if !self.unsubdivide_shape_still_dissolvable(v) {
                 continue;
             }
             if self.unsubdivide_is_wire_pair(v) {
@@ -177,8 +202,65 @@ impl LoopMesh {
                     let _ = self.vert_collapse_edge(edge, v);
                 }
             } else {
-                self.dissolve_verts_ex(&[v], &params);
+                // §5.1 n-gon pre-pass: cut each surrounding face larger than a
+                // triangle down to a clean corner triangle at `v`, so the fan
+                // join sweeps those corner triangles into the merged face.
+                self.unsubdivide_face_split_pre_pass(v, removed_set, REMOVED_BIT);
+                // §5.1 / §5.1.1: dissolve `v` through the single-vert helper.
+                // Its boundary-tee endgame is a reaping-enabled collapse, so a
+                // triangle corner is reaped to nothing and the degenerating fan
+                // lands on a single clean face — not a doubled-face remnant.
+                self.vert_dissolve(v);
             }
+        }
+
+        self.pop_vert_op_flag_layer(removed_set);
+    }
+
+    /// §5.1 — the per-vert n-gon corner pre-pass. For every face incident at
+    /// `v` whose corner count is larger than a triangle, slice the diagonal
+    /// `v_prev – v_next` (the two perimeter neighbours of `v` on that face) so
+    /// `v`'s corner becomes a clean triangle that the subsequent fan join can
+    /// peel off. The diagonal is skipped when either endpoint is itself a
+    /// removed vert (§5.1 / §4.1): that diagonal would be wasted work and only
+    /// re-walked once the neighbour dissolves. The diagonal never touches `v`,
+    /// so the per-face targets are gathered up front and the splits applied
+    /// afterwards (a split of one fan face does not move `v`'s loop on another).
+    fn unsubdivide_face_split_pre_pass(
+        &mut self,
+        v: VertexKey,
+        removed_set: crate::op_flags::VertOpFlagLayer,
+        removed_bit: u8,
+    ) {
+        let mut diagonals: SmallVec<[(FaceKey, VertexKey, VertexKey); 8]> = SmallVec::new();
+        let mut seen_faces: SmallVec<[FaceKey; 8]> = SmallVec::new();
+        let mut disk = self.disk_edges(v);
+        while let Some(edge) = disk.next(self) {
+            let mut radial = self.radial_loops(edge);
+            while let Some(loop_key) = radial.next(self) {
+                if self.loops.get(loop_key).vertex != v {
+                    continue;
+                }
+                let face = self.loops.get(loop_key).face;
+                if seen_faces.contains(&face) {
+                    continue;
+                }
+                seen_faces.push(face);
+                if self.face_len(face) <= 3 {
+                    continue;
+                }
+                let v_next = self.loops.get(self.loop_next(loop_key)).vertex;
+                let v_prev = self.loops.get(self.loop_prev(loop_key)).vertex;
+                if self.vert_op_flag_test(removed_set, v_next, removed_bit)
+                    || self.vert_op_flag_test(removed_set, v_prev, removed_bit)
+                {
+                    continue;
+                }
+                diagonals.push((face, v_prev, v_next));
+            }
+        }
+        for (face, v_prev, v_next) in diagonals {
+            let _ = self.face_split(face, v_prev, v_next);
         }
     }
 
@@ -200,6 +282,22 @@ impl LoopMesh {
             UnsubdivideShape::WirePair => true,
             _ => !self.unsubdivide_neighbour_ring_bounds_face(v),
         }
+    }
+
+    /// §4.4 / §5.1 — the live-revalidation predicate. A marked vert is dissolved
+    /// only if its fan *still* presents one of the dissolvable §3 **radial-mix
+    /// shapes** against the current topology (§4.4: "no longer match a
+    /// boundary-tee against the now-collapsed fan"). The gate re-checks only the
+    /// radial-mix classification, deliberately **not** the already-bounds-a-face
+    /// rejection: that rejection is an *eligibility-stage* guard (it keeps a 3-fan
+    /// from ever marking its rim verts, §7.1), whereas at dissolve time the
+    /// over-marked odd-cycle verts are pruned purely by whether their fan still
+    /// presents a dissolvable spoke shape after the preceding removals collapsed
+    /// it. On a bipartite component every marked vert still matches, so this gate
+    /// never fires; on an odd cycle it is what lands the achieved removed set on
+    /// the maximal non-interfering subset (§4.4).
+    fn unsubdivide_shape_still_dissolvable(&self, v: VertexKey) -> bool {
+        self.unsubdivide_classify(v) != UnsubdivideShape::Ineligible
     }
 
     /// §3 — classify `v` by counting its incident edges' radial lengths into
@@ -446,21 +544,28 @@ mod tests {
         verts
     }
 
-    /// Build the §7.2 **mixed n-gon patch**: 9 V / 13 E / 5 F made of two
-    /// triangles, two quads and one pentagon, all sharing the two interior verts
-    /// `v4`/`v5`. Returns the verts in index order so a caller can tag the whole
-    /// patch (`&all`) or just the interior pair (`[v[4], v[5]]`).
+    /// Build the §7.2 canonical **mixed n-gon patch**: 9 V / 13 E / 5 F made of
+    /// two triangles, two quads and one pentagon sharing the two interior verts
+    /// `v4`/`v5`. Built vertex-for-vertex and face-for-face to the exact §7.2
+    /// adjacency so it matches the canonical fixture topology (a patch with the
+    /// same arity histogram but a different hub valence or pentagon cycle would
+    /// coarsen differently). Returns the verts in index order so a caller can tag
+    /// the whole patch (`&all`) or just the interior pair (`[v[4], v[5]]`).
     fn build_mixed_ngon_patch(mesh: &mut LoopMesh) -> Vec<VertexKey> {
+        // §7.2 vertex table: the patch boundary is the heptagon
+        // v0-v1-v2-v8-v7-v6-v3; v4 (hub of qA/qB/pent) and v5 (shared by
+        // qB/triR/triT/pent) are the two interior verts. v2,v5,v8 are collinear
+        // at x = 2, so triR=[2,8,5] is a zero-area but valid face cycle.
         let coords = [
-            (0.0, 0.0), // 0
-            (1.0, 0.0), // 1
-            (2.0, 0.0), // 2
-            (3.0, 0.0), // 3
-            (1.0, 1.0), // 4  interior
-            (2.0, 1.0), // 5  interior
-            (0.0, 2.0), // 6
-            (1.0, 2.0), // 7
-            (3.0, 2.0), // 8
+            (0.0, 0.0), // 0  corner
+            (1.0, 0.0), // 1  bottom-edge midpoint
+            (2.0, 0.0), // 2  corner
+            (0.0, 1.0), // 3  left-edge midpoint
+            (1.0, 1.0), // 4  interior hub  (qA, qB, pent)
+            (2.0, 1.0), // 5  interior       (qB, triR, triT, pent)
+            (0.0, 2.0), // 6  corner
+            (1.0, 2.0), // 7  top-edge midpoint
+            (2.0, 2.0), // 8  corner
         ];
         let v: Vec<VertexKey> = coords
             .iter()
@@ -469,29 +574,32 @@ mod tests {
         let mut edge = |mesh: &mut LoopMesh, a: usize, b: usize| {
             mesh.create_edge([v[a], v[b]], EdgeCreateFlags::NO_DUPLICATE)
         };
-        // Pentagon 0-1-4-7-6.
-        let e01 = edge(mesh, 0, 1);
-        let e14 = edge(mesh, 1, 4);
-        let e47 = edge(mesh, 4, 7);
-        let e76 = edge(mesh, 7, 6);
-        let e60 = edge(mesh, 6, 0);
-        mesh.face_create(&[v[0], v[1], v[4], v[7], v[6]], &[e01, e14, e47, e76, e60], FaceCreateFlags::NONE);
-        // Triangle 1-2-4.
-        let e12 = edge(mesh, 1, 2);
-        let e24 = edge(mesh, 2, 4);
-        mesh.face_create(&[v[1], v[2], v[4]], &[e12, e24, e14], FaceCreateFlags::NONE);
-        // Quad 2-3-5-4.
-        let e23 = edge(mesh, 2, 3);
-        let e35 = edge(mesh, 3, 5);
-        let e54 = edge(mesh, 5, 4);
-        mesh.face_create(&[v[2], v[3], v[5], v[4]], &[e23, e35, e54, e24], FaceCreateFlags::NONE);
-        // Quad 4-5-8-7.
-        let e58 = edge(mesh, 5, 8);
-        let e87 = edge(mesh, 8, 7);
-        mesh.face_create(&[v[4], v[5], v[8], v[7]], &[e54, e58, e87, e47], FaceCreateFlags::NONE);
-        // Triangle 3-8-5.
-        let e38 = edge(mesh, 3, 8);
-        mesh.face_create(&[v[3], v[8], v[5]], &[e38, e58, e35], FaceCreateFlags::NONE);
+        // The 13 §7.2 edges: 7 boundary + 6 interior. Each created once
+        // (NO_DUPLICATE), then reused across the faces that share it.
+        let e01 = edge(mesh, 0, 1); // boundary
+        let e12 = edge(mesh, 1, 2); // boundary
+        let e28 = edge(mesh, 2, 8); // boundary
+        let e87 = edge(mesh, 8, 7); // boundary
+        let e76 = edge(mesh, 7, 6); // boundary
+        let e63 = edge(mesh, 6, 3); // boundary
+        let e30 = edge(mesh, 3, 0); // boundary
+        let e34 = edge(mesh, 3, 4); // interior
+        let e14 = edge(mesh, 1, 4); // interior
+        let e45 = edge(mesh, 4, 5); // interior
+        let e52 = edge(mesh, 5, 2); // interior
+        let e58 = edge(mesh, 5, 8); // interior
+        let e57 = edge(mesh, 5, 7); // interior
+
+        // qA = [0, 1, 4, 3] (quad).
+        mesh.face_create(&[v[0], v[1], v[4], v[3]], &[e01, e14, e34, e30], FaceCreateFlags::NONE);
+        // qB = [1, 2, 5, 4] (quad).
+        mesh.face_create(&[v[1], v[2], v[5], v[4]], &[e12, e52, e45, e14], FaceCreateFlags::NONE);
+        // triR = [2, 8, 5] (triangle, zero-area sliver).
+        mesh.face_create(&[v[2], v[8], v[5]], &[e28, e58, e52], FaceCreateFlags::NONE);
+        // triT = [5, 8, 7] (triangle).
+        mesh.face_create(&[v[5], v[8], v[7]], &[e58, e87, e57], FaceCreateFlags::NONE);
+        // pent = [3, 4, 5, 7, 6] (pentagon).
+        mesh.face_create(&[v[3], v[4], v[5], v[7], v[6]], &[e34, e45, e57, e76, e63], FaceCreateFlags::NONE);
         v
     }
 
@@ -789,26 +897,23 @@ mod tests {
     }
 
     /// §7.1 triangulated fan, 4 spokes, whole mesh tagged, `iterations = 1`.
-    /// 5 V / 8 E / 4 F → 3 V / 3 E / 1 F (single triangle). The fill removes
-    /// **two non-adjacent rim verts** (the center plus two opposite rim verts
-    /// surviving), collapsing the fan to one triangle. For `s = 4` the center is
-    /// eligible but held in the *kept* class by flood-fill parity (§4), not by
-    /// the edge-count cap.
+    /// 5 V / 8 E / 4 F → 3 V / 3 E / 1 F (single triangle). The `s = 4` eligible
+    /// subgraph is the non-bipartite wheel `W₄`, so §4.4 governs: the fill seeds
+    /// the center *kept* and over-marks **all four** rim verts *removed*. The
+    /// dissolve pass's live-revalidation gate (§5.1) then dissolves the first two
+    /// marked rim verts cleanly; the remaining two no longer match a boundary-tee
+    /// against the collapsed fan, so they are skipped and survive. The achieved
+    /// removed set is **two adjacent rim verts** (the surviving two are also
+    /// adjacent) — not edge-independent, which is only possible on an odd cycle.
+    /// The center is held *kept* throughout as the seed.
     ///
-    /// BLOCKED on a guide gap: §4's flood-fill is specified for the *bipartite*
-    /// grid eligible subgraph, but the `s = 4` fan is **non-bipartite** (each
-    /// `center–rim[i]–rim[i+1]` triangle is an odd cycle). §7.1 asserts a
-    /// measured `5 → 3` with the center *and* two non-adjacent rim verts all
-    /// kept — but the center is adjacent to every rim vert, so "center kept
-    /// while an independent rim subset is removed" is not a valid two-colouring
-    /// of this graph (it violates §4.3's kept–removed edge rule). Implementing
-    /// §4 literally, seeding the center colours the whole rim *removed* (a
-    /// degenerate weld); seeding a rim vert removes the center plus two rim
-    /// verts. Neither is the measured pin, and the guide does not specify how
-    /// the fill resolves odd cycles to land on the oracle's removed set.
+    /// The single-triangle pin is reached via the §5.1.1 degenerating-fan
+    /// endgame: removing `r0` lands a clean 3-triangle fan (4/6/3, no doubled
+    /// face); removing `r1` is a triangle-corner collapse whose single-vert-
+    /// helper **reaping** (DISSOLVE_VERTS.md §6.6) drops the fan onto one clean
+    /// triangle (3/3/1); the §5.1 gate then rejects `r2`/`r3` (the live shape is
+    /// a lone triangle corner matching no §3 shape).
     #[test]
-    #[ignore = "guide gap: §4 flood-fill under-specified on the non-bipartite s=4 fan; \
-                see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.1 / §4.3"]
     fn unsubdivide_tri_fan4_whole_mesh_one_step() {
         let mut mesh = LoopMesh::new();
         let (center, rim) = build_triangulated_fan(&mut mesh, 4);
@@ -821,7 +926,7 @@ mod tests {
 
         mesh.unsubdivide(&all, 1);
 
-        assert_eq!(mesh.totvert(), 3, "3 V — two non-adjacent rim verts removed");
+        assert_eq!(mesh.totvert(), 3, "3 V — two adjacent rim verts removed (§4.4)");
         assert_eq!(mesh.totedge(), 3, "3 E — single triangle");
         assert_eq!(mesh.totface(), 1, "1 F — collapsed to one triangle");
         let (triangles, quads) = face_corner_histogram(&mesh);
@@ -829,7 +934,7 @@ mod tests {
         assert_eq!(quads, 0);
 
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(live.contains(&center), "center survives (kept by flood-fill parity)");
+        assert!(live.contains(&center), "center survives (held kept as the seed)");
         mesh.validate_topology();
     }
 
@@ -884,23 +989,14 @@ mod tests {
         }
     }
 
-    /// §7.2 mixed n-gon patch, whole mesh tagged, `iterations = 1`.
-    /// 9 V / 13 E / 5 F → 6 V / 10 E / 5 F: three verts removed and the welded
-    /// neighbourhood re-triangulated, so the arity histogram flips
-    /// `{tri:2, quad:2, pent:1}` → `{tri:5}` at unchanged face count (§5.1
-    /// re-triangulation).
-    ///
-    /// BLOCKED on a guide gap: the §3–§5 composition removes the correct
-    /// **count** of verts (3, matching the pin's `9 → 6`), but the §5.1 n-gon
-    /// pre-pass on this mixed neighbourhood welds to `{tri:3, quad:1}` over 4
-    /// faces here, not the oracle's measured `{tri:5}` over 5 faces. §7.2 states
-    /// there is "no shortcut formula" for the produced face mix and defers it to
-    /// the A/B gate's measured topology; the guide does not specify the pre-pass
-    /// cut order / fan-merge face identity precisely enough to reproduce the
-    /// `{tri:5}` mix from the documented surgery alone.
+    /// §7.2 canonical mixed n-gon patch, whole mesh tagged, `iterations = 1`.
+    /// 9 V / 13 E / 5 F → 6 V / 10 E / 5 F: the three removed verts are `v2`, the
+    /// hub `v4`, and `v7` (survivors `v0, v1, v3, v5, v6, v8`), and the welded
+    /// neighbourhood is re-triangulated by the §5.1 pre-pass cuts, so the arity
+    /// histogram flips `{tri:2, quad:2, pent:1}` → `{tri:5}` at unchanged face
+    /// count. The eligible subgraph here is non-bipartite, so §4.4 over-mark /
+    /// dissolve-time prune governs the achieved removed set.
     #[test]
-    #[ignore = "guide gap: §5.1 n-gon pre-pass face mix on a mixed patch not pinned to \
-                implementable depth; see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.2"]
     fn unsubdivide_mixed_ngon_whole_mesh_one_step() {
         let mut mesh = LoopMesh::new();
         let verts = build_mixed_ngon_patch(&mut mesh);
@@ -927,16 +1023,17 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §7.2 mixed n-gon patch, whole mesh tagged, `iterations = 2`: the second
-    /// step coarsens the triangle fan down to a single quad and the operator
-    /// converges. 9/13/5 → 4 V / 4 E / 1 F (one quad); a third step is a no-op.
+    /// §7.2 canonical mixed n-gon patch, whole mesh tagged, `iterations = 2`: the
+    /// second step coarsens the triangle fan down to a single quad and the
+    /// operator converges. 9/13/5 → 4 V / 4 E / 1 F (one quad); a third step is a
+    /// no-op (§5.3 early-out).
     ///
-    /// BLOCKED on the same §7.2 guide gap as the one-step pin: the step-1 face
-    /// mix already diverges from the measured `{tri:5}`, so the step-2 fixed
-    /// point (single quad) cannot be reached from the documented surgery alone.
+    /// The §7.2 one-step result (6 V / 10 E / 5 F, {tri:5}) is reached, then the
+    /// second step's five-triangle fan degenerates onto a single quad by the
+    /// same §5.1.1 reaping endgame as the `triangulated_fan(4)` case: the final
+    /// per-vert collapses reap their triangle corners rather than leaving doubled
+    /// faces, landing the oracle's clean 4/4/1 single quad.
     #[test]
-    #[ignore = "guide gap: §5.1 n-gon pre-pass face mix on a mixed patch not pinned to \
-                implementable depth; see radial-mesh-guides/operators/UNSUBDIVIDE.md §7.2"]
     fn unsubdivide_mixed_ngon_two_steps_converge() {
         let mut mesh = LoopMesh::new();
         let verts = build_mixed_ngon_patch(&mut mesh);

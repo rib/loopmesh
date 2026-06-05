@@ -130,17 +130,19 @@ impl LoopMesh {
         }
 
         // v is now degree-2 (one face on either side of two co-linear edges,
-        // or a single face that touches v twice). Collapse.
+        // or a single face that touches v twice). Collapse it through the
+        // reaping-enabled primitive so a triangle corner is reaped to a 2-gon
+        // and any coincident doubled face the collapse produces is welded away
+        // (DISSOLVE_VERTS.md §6.6) — this is what closes a degenerating fan onto
+        // a single clean face rather than a doubled-face remnant.
         let final_edges: smallvec::SmallVec<[EdgeKey; 2]> =
             collect_iter::<_, 2>(self, self.disk_edges(v));
         if final_edges.len() != 2 {
             return false;
         }
-        // JEKV kills v plus one of its edges; the other is retargeted to
-        // span the gap. Returns the surviving (retargeted) edge.
         let surviving_edge = self
-            .euler_join_edge_kill_vert(final_edges[0], v)
-            .or_else(|| self.euler_join_edge_kill_vert(final_edges[1], v));
+            .vert_collapse_edge(final_edges[0], v)
+            .or_else(|| self.vert_collapse_edge(final_edges[1], v));
         let Some(surviving_edge) = surviving_edge else {
             return false;
         };
@@ -148,6 +150,9 @@ impl LoopMesh {
         // If the surviving edge is still a 2-manifold interior edge, the two
         // faces it sits between are the residue of the original disk and
         // should be merged.
+        if self.edges.try_get(surviving_edge).is_none() {
+            return true;
+        }
         let mut rl = self.radial_loops(surviving_edge);
         let l0 = rl.next(self);
         let l1 = rl.next(self);
