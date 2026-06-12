@@ -2897,7 +2897,11 @@ impl LoopMesh {
     /// Debug pass: assert every live element's cached `index` matches its
     /// position in the dense table, and that no dirty bit is set. Run after
     /// [`all_indices_ensure`] to verify integrity.
-    #[cfg(debug_assertions)]
+    ///
+    /// Also compiled under `cfg(test)` so the in-crate unit tests still
+    /// build when the harness is compiled with debug assertions off (as
+    /// `cargo bench` does).
+    #[cfg(any(test, debug_assertions))]
     pub fn validate_indices(&self) {
         assert!(
             !self.is_vertices_index_dirty(),
@@ -2954,7 +2958,11 @@ impl LoopMesh {
     /// Not part of the parity contract — it inspects loopmesh's internal
     /// link invariants rather than reproducing any specific BMesh check.
     /// Safe to call on a freshly-constructed mesh; runs in O(V + E + F + L).
-    #[cfg(debug_assertions)]
+    ///
+    /// Also compiled under `cfg(test)` so the in-crate unit tests still
+    /// build when the harness is compiled with debug assertions off (as
+    /// `cargo bench` does).
+    #[cfg(any(test, debug_assertions))]
     pub fn validate_topology(&self) {
         const MAX_CYCLE: usize = 1_000_000;
 
