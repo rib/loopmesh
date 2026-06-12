@@ -775,6 +775,7 @@ pub(crate) trait Element {
 /// (`get(VertexKey)` etc.) is the only thing this adds beyond the bare slab.
 pub(crate) struct ElementSlab<I, T> {
     slab: Slab<T>,
+    watermark: usize,
     _phantom: PhantomData<I>,
 }
 
@@ -785,6 +786,7 @@ where
     pub fn new() -> Self {
         Self {
             slab: Slab::new(),
+            watermark: 0,
             _phantom: PhantomData,
         }
     }
@@ -819,6 +821,7 @@ where
     /// Clear every entry.
     pub(crate) fn clear(&mut self) {
         self.slab.clear();
+        self.watermark = 0;
     }
 
     /// Number of live entries.
@@ -828,15 +831,20 @@ where
     }
 
     /// The slab's high-water-mark key (used by attribute storage to size
-    /// parallel Vecs). Forwards to the patched slab fork.
+    /// parallel Vecs): one past the highest key ever issued. Monotonic
+    /// except for `clear()` — `remove()` leaves vacant slots in place, so
+    /// it never lowers the mark.
     pub(crate) fn key_watermark(&self) -> usize {
-        self.slab.key_watermark()
+        self.watermark
     }
 
-    /// Reserve a vacant slot for a new entry — direct passthrough to the
-    /// underlying slab. The caller fills it via the returned VacantEntry.
+    /// Reserve a vacant slot for a new entry. The caller fills it via the
+    /// returned VacantEntry. Counted against the watermark up front; an
+    /// unfilled entry would over-count, but every caller fills it.
     pub(crate) fn vacant_entry(&mut self) -> slab::VacantEntry<'_, ElementType> {
-        self.slab.vacant_entry()
+        let entry = self.slab.vacant_entry();
+        self.watermark = self.watermark.max(entry.key() + 1);
+        entry
     }
 }
 
