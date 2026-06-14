@@ -818,3 +818,94 @@ impl LoopMesh {
         self.remove_face_slab_entry(face);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loopmesh::test_support::{create_face_from_verts, mesh_add_cube};
+
+    #[test]
+    fn create_vertex_disk() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let edge = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let edge = mesh.create_edge([v0, v2], EdgeCreateFlags::NONE);
+        mesh.vertex_disk_print_edges(v0);
+        assert_eq!(mesh.vertex_disk_count_edges(v0), 2);
+    }
+
+    #[test]
+    fn create_cube_faces() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        for v in mesh.vertices.iter() {
+            assert_eq!(mesh.vertex_disk_count_edges(v), 3);
+        }
+    }
+
+    #[test]
+    fn validate_topology_passes_on_empty_mesh() {
+        LoopMesh::new().validate_topology();
+    }
+
+    #[test]
+    fn validate_topology_passes_on_lone_vertex() {
+        let mut mesh = LoopMesh::new();
+        let _ = mesh.create_vertex(Vec3::ZERO);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn validate_topology_passes_on_quad() {
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let _f = create_face_from_verts(&mut mesh, &verts);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn validate_topology_passes_after_edge_split() {
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let f = create_face_from_verts(&mut mesh, &verts);
+        // Split one edge to exercise SEMV's transient null-edge state.
+        let l = mesh.face_first_loop(f);
+        let e = mesh.loop_edge(l);
+        let v_near = mesh.loop_vertex(l);
+        mesh.edge_split(e, v_near, 0.5);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn validate_topology_passes_after_face_split_and_poke() {
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let f = create_face_from_verts(&mut mesh, &verts);
+        let face_verts = mesh.face_vert_keys(f);
+        let v0 = face_verts[0];
+        let v2 = face_verts[2];
+        let (new_face, _new_edge) = mesh.face_split(f, v0, v2).unwrap();
+        mesh.validate_topology();
+        // Poke one of the halves.
+        mesh.face_poke(new_face);
+        mesh.validate_topology();
+    }
+}

@@ -1,5 +1,6 @@
-//! Shared fixtures for the per-operator unit tests in the `euler` and `ops`
-//! child modules. Compiled only under `#[cfg(test)]`.
+//! Shared fixtures for the unit tests in the `loopmesh` child modules —
+//! `euler` / `mid` / `ops` (operators) and `radial` / `normals` / `index`
+//! (kernel). Compiled only under `#[cfg(test)]`.
 
 use glam::Vec3;
 

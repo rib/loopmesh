@@ -254,3 +254,284 @@ impl LoopMesh {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loopmesh::test_support::{create_face_from_verts, mesh_add_cube};
+
+    #[test]
+    fn update_cube_normals() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        mesh.calc_face_normals();
+
+        let normals: Vec<Vec3> = mesh
+            .faces
+            .iter()
+            .map(|f| mesh.faces.get(f).normal)
+            .collect();
+        assert_eq!(normals[0], Vec3::new(0.0, 0.0, -1.0));
+        assert_eq!(normals[1], Vec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(normals[2], Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(normals[3], Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(normals[4], Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(normals[5], Vec3::new(0.0, -1.0, 0.0));
+    }
+
+    #[test]
+    fn test_calc_tri_quad_poly_area() {
+        let area = LoopMesh::calc_tri_area([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        ]);
+        assert_eq!(area, 0.5);
+
+        let area = LoopMesh::calc_tri_area([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 2.0),
+        ]);
+        assert_eq!(area, 2.0);
+
+        let area = LoopMesh::calc_quad_area([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+        ]);
+        assert_eq!(area, 4.0);
+
+        let area = LoopMesh::calc_poly_area(&[
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+        ]);
+        assert_eq!(area, 4.0);
+
+        //             5        4
+        //             ______________ 3 (2,1)
+        //            /|        |    /
+        //          /  |        |  /
+        // (-1,0) /____|________ /
+        //        0    1        2
+        let area = LoopMesh::calc_poly_area(&[
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]);
+        assert_eq!(area, 2.0);
+    }
+
+    #[test]
+    fn test_calc_tri_quad_poly_normals() {
+        let normal = LoopMesh::calc_tri_normal([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 2.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        let normal = LoopMesh::calc_quad_normal([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        let normal = LoopMesh::calc_poly_normal(&[
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        //             5        4
+        //             ______________ 3 (2,1)
+        //            /|        |    /
+        //          /  |        |  /
+        // (-1,0) /____|________ /
+        //        0    1        2
+        let normal = LoopMesh::calc_poly_normal(&[
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        let normal = LoopMesh::calc_iter_poly_normal(
+            [
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn test_normalize_or_zero_unit_and_degenerate() {
+        // Non-degenerate input normalises to unit length.
+        let n = LoopMesh::normalize_or_zero(Vec3::new(0.0, 0.0, 5.0));
+        assert_eq!(n, Vec3::new(0.0, 0.0, 1.0));
+
+        // True zero falls back to the all-zero vector, never NaN.
+        let n = LoopMesh::normalize_or_zero(Vec3::ZERO);
+        assert_eq!(n, Vec3::ZERO);
+
+        // A NaN component fails the `> 1.0e-35` test and takes the zero branch.
+        let n = LoopMesh::normalize_or_zero(Vec3::new(f32::NAN, 0.0, 0.0));
+        assert_eq!(n, Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_degenerate_tri_normal_is_zero() {
+        // Collinear corners -> zero-area triangle -> zero normal.
+        let normal = LoopMesh::calc_tri_normal([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_degenerate_quad_normal_is_zero() {
+        // Parallel diagonals (both along X) -> zero diagonal cross -> zero normal,
+        // even though the quad's edges are non-zero.
+        let normal = LoopMesh::calc_quad_normal([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::ZERO);
+
+        // Coincident-corner sliver quad (two pairs collapse) -> zero normal.
+        let normal = LoopMesh::calc_quad_normal([
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        ]);
+        assert_eq!(normal, Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_degenerate_poly_normal_is_zero() {
+        // Collinear n-gon -> Newell accumulator is zero -> zero normal.
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+        ];
+        assert_eq!(LoopMesh::calc_poly_normal(&corners), Vec3::ZERO);
+        assert_eq!(
+            LoopMesh::calc_iter_poly_normal(corners.into_iter()),
+            Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn test_calc_face_normals() {
+        let mut mesh = LoopMesh::new();
+
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 2.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        mesh.face_calc_normal(face);
+        let normal = mesh.faces.get(face).normal;
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        mesh.face_calc_normal(face);
+        let normal = mesh.faces.get(face).normal;
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+
+        //             5        4
+        //             ______________ 3 (2,1)
+        //            /|        |    /
+        //          /  |        |  /
+        // (-1,0) /____|________ /
+        //        0    1        2
+        let verts = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        mesh.face_calc_normal(face);
+        let normal = mesh.faces.get(face).normal;
+        assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn test_calc_face_area() {
+        let mut mesh = LoopMesh::new();
+
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        let area = mesh.face_calc_area(face);
+        assert_eq!(area, 0.5);
+
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        let area = mesh.face_calc_area(face);
+        assert_eq!(area, 4.0);
+
+        //             5        4
+        //             ______________ 3 (2,1)
+        //            /|        |    /
+        //          /  |        |  /
+        // (-1,0) /____|________ /
+        //        0    1        2
+        let verts = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        let area = mesh.face_calc_area(face);
+        assert_eq!(area, 2.0);
+    }
+}

@@ -1035,714 +1035,120 @@ impl LoopMesh {
     // without sprinkling `self.flags |= …` everywhere.
 }
 
-#[test]
-fn init_mesh() {
-    let mesh = LoopMesh::new();
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn create_vertex_disk() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
-    let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
-    let v2 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
-    let edge = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
-    let edge = mesh.create_edge([v0, v2], EdgeCreateFlags::NONE);
-    mesh.vertex_disk_print_edges(v0);
-    assert_eq!(mesh.vertex_disk_count_edges(v0), 2);
-}
-
-fn mesh_add_cube(mesh: &mut LoopMesh) {
-    let v0 = mesh.create_vertex(Vec3::new(1.0, -1.0, -1.0));
-    let v1 = mesh.create_vertex(Vec3::new(-1.0, -1.0, -1.0));
-    let v2 = mesh.create_vertex(Vec3::new(-1.0, 1.0, -1.0));
-    let v3 = mesh.create_vertex(Vec3::new(1.0, 1.0, -1.0));
-    let v4 = mesh.create_vertex(Vec3::new(1.0, -1.0, 1.0));
-    let v5 = mesh.create_vertex(Vec3::new(-1.0, -1.0, 1.0));
-    let v6 = mesh.create_vertex(Vec3::new(-1.0, 1.0, 1.0));
-    let v7 = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
-
-    println!("XXX: Creating edge 0");
-    let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
-    println!(
-        "Vertex 0 is connected to {} edges...",
-        mesh.vertex_disk_count_edges(v0)
-    );
-    for e in mesh.vertex_disk_iter(v0) {
-        println!("v0, connected to edge {}", e);
-    }
-    println!("XXX: Creating edge 1");
-    let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
-    let e2 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
-    let e3 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
-    println!(
-        "Vertex 0 is connected to {} edges...",
-        mesh.vertex_disk_count_edges(v0)
-    );
-    for e in mesh.vertex_disk_iter(v0) {
-        println!("v0, connected to edge {}", e);
+    #[test]
+    fn init_mesh() {
+        let mesh = LoopMesh::new();
     }
 
-    let e4 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
-    let e5 = mesh.create_edge([v5, v6], EdgeCreateFlags::NONE);
-    let e6 = mesh.create_edge([v6, v7], EdgeCreateFlags::NONE);
-    let e7 = mesh.create_edge([v7, v4], EdgeCreateFlags::NONE);
+    #[test]
+    fn to_from_indexed_vec3() {
+        let vertices: Vec<f32> = vec![
+            -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0,
+            1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
+        ];
 
-    println!("XXX: Creating edge 2");
-    let e8 = mesh.create_edge([v0, v4], EdgeCreateFlags::NONE);
-    println!(
-        "Vertex 0 is connected to {} edges...",
-        mesh.vertex_disk_count_edges(v0)
-    );
-    for e in mesh.vertex_disk_iter(v0) {
-        println!("v0, connected to edge {}", e);
+        let indices: Vec<u32> = vec![
+            0, 1, 2, 2, 3, 0, 1, 5, 6, 6, 2, 1, 5, 4, 7, 7, 6, 5, 4, 0, 3, 3, 7, 4, 3, 2, 6, 6, 7,
+            3, 0, 4, 5, 5, 1, 0,
+        ];
+
+        let mut mesh =
+            LoopMesh::new_from_pos_f32(&vertices, Some(&indices), PrimitiveTopology::TriangleList)
+                .unwrap();
+
+        let (vertices_out, indices_out) = mesh.into_indexed_vec3_pos_triangles().unwrap();
+
+        assert_eq!(vertices_out.len(), vertices.len());
+        assert_eq!(indices_out.len(), indices.len());
+
+        for i in 0..vertices.len() {
+            assert_eq!(vertices[i], vertices_out[i]);
+        }
+        for i in 0..indices.len() {
+            assert_eq!(indices[i], indices_out[i]);
+        }
     }
-    let e9 = mesh.create_edge([v1, v5], EdgeCreateFlags::NONE);
-    let e10 = mesh.create_edge([v2, v6], EdgeCreateFlags::NONE);
-    let e11 = mesh.create_edge([v3, v7], EdgeCreateFlags::NONE);
 
-    let f0 = mesh.face_create(&[v0, v1, v2, v3], &[e0, e1, e2, e3], FaceCreateFlags::NONE); // Front
-    let f1 = mesh.face_create(&[v1, v5, v6, v2], &[e9, e5, e10, e1], FaceCreateFlags::NONE); // Right
-    let f2 = mesh.face_create(&[v5, v4, v7, v6], &[e4, e7, e6, e5], FaceCreateFlags::NONE); // Back
-    let f3 = mesh.face_create(&[v4, v0, v3, v7], &[e8, e3, e11, e7], FaceCreateFlags::NONE); // Left
-    let f4 = mesh.face_create(
-        &[v3, v2, v6, v7],
-        &[e2, e10, e6, e11],
-        FaceCreateFlags::NONE,
-    ); // Top
-    let f5 = mesh.face_create(&[v0, v4, v5, v1], &[e8, e4, e9, e0], FaceCreateFlags::NONE); // Bottom
+    #[test]
+    fn op_flag_layer_round_trip() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let v2 = mesh.create_vertex(Vec3::Y);
 
-    for (i, v) in [v0, v1, v2, v3, v4, v5, v6, v7].iter().enumerate() {
-        println!(
-            "Vertex {i} is connected to {} edges...",
-            mesh.vertex_disk_count_edges(*v)
-        );
+        let layer = mesh.push_vert_op_flag_layer();
+        assert!(!mesh.vert_op_flag_test(layer, v0, 3));
+        mesh.vert_op_flag_set(layer, v0, 3);
+        mesh.vert_op_flag_set(layer, v2, 3);
+        assert!(mesh.vert_op_flag_test(layer, v0, 3));
+        assert!(!mesh.vert_op_flag_test(layer, v1, 3));
+        assert!(mesh.vert_op_flag_test(layer, v2, 3));
+
+        let marked: Vec<_> = mesh.iter_verts_with_op_flag(layer, 3).collect();
+        assert_eq!(marked, vec![v0, v2]);
+
+        mesh.pop_vert_op_flag_layer(layer);
     }
-}
 
-#[test]
-fn create_cube_faces() {
-    let mut mesh = LoopMesh::new();
-    mesh_add_cube(&mut mesh);
+    #[test]
+    fn op_flag_eager_growth_on_create_vertex() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
 
-    for v in mesh.vertices.iter() {
-        assert_eq!(mesh.vertex_disk_count_edges(v), 3);
+        let layer = mesh.push_vert_op_flag_layer();
+        mesh.vert_op_flag_set(layer, v0, 0);
+
+        // Create more vertices after pushing the layer; eager growth should
+        // extend the active layer so set/test work without panic.
+        let v1 = mesh.create_vertex(Vec3::X);
+        let v2 = mesh.create_vertex(Vec3::Y);
+
+        // v0's bit is still set; v1/v2 default to zero.
+        assert!(mesh.vert_op_flag_test(layer, v0, 0));
+        assert!(!mesh.vert_op_flag_test(layer, v1, 0));
+        mesh.vert_op_flag_set(layer, v2, 0);
+        assert!(mesh.vert_op_flag_test(layer, v2, 0));
+
+        mesh.pop_vert_op_flag_layer(layer);
     }
-}
 
-#[test]
-fn update_cube_normals() {
-    let mut mesh = LoopMesh::new();
-    mesh_add_cube(&mut mesh);
-    mesh.calc_face_normals();
+    #[test]
+    fn op_flag_layer_reuse_zero_initialises() {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
 
-    let normals: Vec<Vec3> = mesh
-        .faces
-        .iter()
-        .map(|f| mesh.faces.get(f).normal)
-        .collect();
-    assert_eq!(normals[0], Vec3::new(0.0, 0.0, -1.0));
-    assert_eq!(normals[1], Vec3::new(-1.0, 0.0, 0.0));
-    assert_eq!(normals[2], Vec3::new(0.0, 0.0, 1.0));
-    assert_eq!(normals[3], Vec3::new(1.0, 0.0, 0.0));
-    assert_eq!(normals[4], Vec3::new(0.0, 1.0, 0.0));
-    assert_eq!(normals[5], Vec3::new(0.0, -1.0, 0.0));
-}
+        let layer_a = mesh.push_vert_op_flag_layer();
+        mesh.vert_op_flag_set(layer_a, v, 5);
+        mesh.pop_vert_op_flag_layer(layer_a);
 
-#[test]
-fn to_from_indexed_vec3() {
-    let vertices: Vec<f32> = vec![
-        -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0,
-        -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
-    ];
-
-    let indices: Vec<u32> = vec![
-        0, 1, 2, 2, 3, 0, 1, 5, 6, 6, 2, 1, 5, 4, 7, 7, 6, 5, 4, 0, 3, 3, 7, 4, 3, 2, 6, 6, 7, 3,
-        0, 4, 5, 5, 1, 0,
-    ];
-
-    let mut mesh =
-        LoopMesh::new_from_pos_f32(&vertices, Some(&indices), PrimitiveTopology::TriangleList)
-            .unwrap();
-
-    let (vertices_out, indices_out) = mesh.into_indexed_vec3_pos_triangles().unwrap();
-
-    assert_eq!(vertices_out.len(), vertices.len());
-    assert_eq!(indices_out.len(), indices.len());
-
-    for i in 0..vertices.len() {
-        assert_eq!(vertices[i], vertices_out[i]);
+        let layer_b = mesh.push_vert_op_flag_layer();
+        // Reused layer must be zero-cleared, regardless of layer-handle equality.
+        assert!(!mesh.vert_op_flag_test(layer_b, v, 5));
+        mesh.pop_vert_op_flag_layer(layer_b);
     }
-    for i in 0..indices.len() {
-        assert_eq!(indices[i], indices_out[i]);
+
+    #[test]
+    fn op_flag_each_axis_is_independent() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let e = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+
+        let vl = mesh.push_vert_op_flag_layer();
+        let el = mesh.push_edge_op_flag_layer();
+
+        mesh.vert_op_flag_set(vl, v0, 0);
+        mesh.edge_op_flag_set(el, e, 0);
+
+        assert!(mesh.vert_op_flag_test(vl, v0, 0));
+        assert!(!mesh.vert_op_flag_test(vl, v1, 0));
+        assert!(mesh.edge_op_flag_test(el, e, 0));
+
+        mesh.pop_edge_op_flag_layer(el);
+        mesh.pop_vert_op_flag_layer(vl);
     }
-}
-
-#[test]
-fn test_calc_tri_quad_poly_area() {
-    let area = LoopMesh::calc_tri_area([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-    ]);
-    assert_eq!(area, 0.5);
-
-    let area = LoopMesh::calc_tri_area([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 2.0, 0.0),
-        Vec3::new(0.0, 2.0, 2.0),
-    ]);
-    assert_eq!(area, 2.0);
-
-    let area = LoopMesh::calc_quad_area([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 2.0, 0.0),
-        Vec3::new(0.0, 2.0, 2.0),
-        Vec3::new(0.0, 0.0, 2.0),
-    ]);
-    assert_eq!(area, 4.0);
-
-    let area = LoopMesh::calc_poly_area(&[
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 2.0, 0.0),
-        Vec3::new(0.0, 2.0, 2.0),
-        Vec3::new(0.0, 0.0, 2.0),
-    ]);
-    assert_eq!(area, 4.0);
-
-    //             5        4
-    //             ______________ 3 (2,1)
-    //            /|        |    /
-    //          /  |        |  /
-    // (-1,0) /____|________ /
-    //        0    1        2
-    let area = LoopMesh::calc_poly_area(&[
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ]);
-    assert_eq!(area, 2.0);
-}
-
-#[test]
-fn test_calc_tri_quad_poly_normals() {
-    let normal = LoopMesh::calc_tri_normal([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(2.0, 2.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    let normal = LoopMesh::calc_quad_normal([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    let normal = LoopMesh::calc_poly_normal(&[
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 2.0, 0.0),
-        Vec3::new(0.0, 2.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    //             5        4
-    //             ______________ 3 (2,1)
-    //            /|        |    /
-    //          /  |        |  /
-    // (-1,0) /____|________ /
-    //        0    1        2
-    let normal = LoopMesh::calc_poly_normal(&[
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    let normal = LoopMesh::calc_iter_poly_normal(
-        [
-            Vec3::new(-1.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(2.0, 1.0, 0.0),
-            Vec3::new(1.0, 1.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-        ]
-        .into_iter(),
-    );
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-}
-
-#[test]
-fn test_normalize_or_zero_unit_and_degenerate() {
-    // Non-degenerate input normalises to unit length.
-    let n = LoopMesh::normalize_or_zero(Vec3::new(0.0, 0.0, 5.0));
-    assert_eq!(n, Vec3::new(0.0, 0.0, 1.0));
-
-    // True zero falls back to the all-zero vector, never NaN.
-    let n = LoopMesh::normalize_or_zero(Vec3::ZERO);
-    assert_eq!(n, Vec3::ZERO);
-
-    // A NaN component fails the `> 1.0e-35` test and takes the zero branch.
-    let n = LoopMesh::normalize_or_zero(Vec3::new(f32::NAN, 0.0, 0.0));
-    assert_eq!(n, Vec3::ZERO);
-}
-
-#[test]
-fn test_degenerate_tri_normal_is_zero() {
-    // Collinear corners -> zero-area triangle -> zero normal.
-    let normal = LoopMesh::calc_tri_normal([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::ZERO);
-}
-
-#[test]
-fn test_degenerate_quad_normal_is_zero() {
-    // Parallel diagonals (both along X) -> zero diagonal cross -> zero normal,
-    // even though the quad's edges are non-zero.
-    let normal = LoopMesh::calc_quad_normal([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(3.0, 0.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::ZERO);
-
-    // Coincident-corner sliver quad (two pairs collapse) -> zero normal.
-    let normal = LoopMesh::calc_quad_normal([
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-    ]);
-    assert_eq!(normal, Vec3::ZERO);
-}
-
-#[test]
-fn test_degenerate_poly_normal_is_zero() {
-    // Collinear n-gon -> Newell accumulator is zero -> zero normal.
-    let corners = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(3.0, 0.0, 0.0),
-        Vec3::new(4.0, 0.0, 0.0),
-    ];
-    assert_eq!(LoopMesh::calc_poly_normal(&corners), Vec3::ZERO);
-    assert_eq!(
-        LoopMesh::calc_iter_poly_normal(corners.into_iter()),
-        Vec3::ZERO
-    );
-}
-
-fn create_face_from_verts(mesh: &mut LoopMesh, coords: &[Vec3]) -> FaceKey {
-    let mut verts = vec![];
-    for v in coords {
-        verts.push(mesh.create_vertex(*v));
-    }
-    mesh.face_create_verts(&verts, FaceCreateFlags::NONE)
-}
-
-#[test]
-fn test_calc_face_normals() {
-    let mut mesh = LoopMesh::new();
-
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(2.0, 2.0, 0.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    mesh.face_calc_normal(face);
-    let normal = mesh.faces.get(face).normal;
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(2.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    mesh.face_calc_normal(face);
-    let normal = mesh.faces.get(face).normal;
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-
-    //             5        4
-    //             ______________ 3 (2,1)
-    //            /|        |    /
-    //          /  |        |  /
-    // (-1,0) /____|________ /
-    //        0    1        2
-    let verts = [
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    mesh.face_calc_normal(face);
-    let normal = mesh.faces.get(face).normal;
-    assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
-}
-
-#[test]
-fn test_calc_face_area() {
-    let mut mesh = LoopMesh::new();
-
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    let area = mesh.face_calc_area(face);
-    assert_eq!(area, 0.5);
-
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 2.0, 0.0),
-        Vec3::new(0.0, 2.0, 2.0),
-        Vec3::new(0.0, 0.0, 2.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    let area = mesh.face_calc_area(face);
-    assert_eq!(area, 4.0);
-
-    //             5        4
-    //             ______________ 3 (2,1)
-    //            /|        |    /
-    //          /  |        |  /
-    // (-1,0) /____|________ /
-    //        0    1        2
-    let verts = [
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(2.0, 1.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let face = create_face_from_verts(&mut mesh, &verts);
-    let area = mesh.face_calc_area(face);
-    assert_eq!(area, 2.0);
-}
-
-// Operator + Euler unit tests now live alongside their implementations
-// in loopmesh/euler/*.rs and loopmesh/ops/*.rs.
-
-// ----- Element-index machinery tests -----
-
-#[test]
-fn is_dirty_starts_set_clears_after_ensure() {
-    let mut mesh = LoopMesh::new();
-    let _v = mesh.create_vertex(Vec3::ZERO);
-
-    assert!(mesh.is_vertices_index_dirty());
-    mesh.vertices_ensure_index();
-    assert!(!mesh.is_vertices_index_dirty());
-
-    // Re-set by a subsequent mutation.
-    let _v2 = mesh.create_vertex(Vec3::X);
-    assert!(mesh.is_vertices_index_dirty());
-}
-
-#[test]
-fn ensure_index_field_clears_only_its_axis() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-    let _e = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
-
-    assert!(mesh.is_vertices_index_dirty());
-    assert!(mesh.is_edges_index_dirty());
-
-    mesh.vertices_ensure_index_field();
-    assert!(!mesh.is_vertices_index_dirty());
-    // Edges still dirty.
-    assert!(mesh.is_edges_index_dirty());
-}
-
-#[test]
-fn ensure_index_field_assigns_dense_indices() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-    let v2 = mesh.create_vertex(Vec3::Y);
-    mesh.vertices_ensure_index_field();
-
-    // Indices are 0..3 in slab order (no holes yet).
-    assert_eq!(mesh.vertex_index(v0), 0);
-    assert_eq!(mesh.vertex_index(v1), 1);
-    assert_eq!(mesh.vertex_index(v2), 2);
-    assert_eq!(mesh.vertex_index_table(), &[v0, v1, v2]);
-}
-
-#[test]
-fn validate_indices_passes_after_full_ensure() {
-    let mut mesh = LoopMesh::new();
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let _face = create_face_from_verts(&mut mesh, &verts);
-
-    mesh.all_indices_ensure();
-    mesh.validate_indices();
-}
-
-#[test]
-#[should_panic(expected = "indices are dirty")]
-fn validate_indices_panics_when_dirty() {
-    let mut mesh = LoopMesh::new();
-    let _v = mesh.create_vertex(Vec3::ZERO);
-    // No ensure call → still dirty.
-    mesh.validate_indices();
-}
-
-// ----- validate_topology tests -----
-
-#[test]
-fn validate_topology_passes_on_empty_mesh() {
-    LoopMesh::new().validate_topology();
-}
-
-#[test]
-fn validate_topology_passes_on_lone_vertex() {
-    let mut mesh = LoopMesh::new();
-    let _ = mesh.create_vertex(Vec3::ZERO);
-    mesh.validate_topology();
-}
-
-#[test]
-fn validate_topology_passes_on_quad() {
-    let mut mesh = LoopMesh::new();
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let _f = create_face_from_verts(&mut mesh, &verts);
-    mesh.validate_topology();
-}
-
-#[test]
-fn validate_topology_passes_after_edge_split() {
-    let mut mesh = LoopMesh::new();
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let f = create_face_from_verts(&mut mesh, &verts);
-    // Split one edge to exercise SEMV's transient null-edge state.
-    let l = mesh.face_first_loop(f);
-    let e = mesh.loop_edge(l);
-    let v_near = mesh.loop_vertex(l);
-    mesh.edge_split(e, v_near, 0.5);
-    mesh.validate_topology();
-}
-
-#[test]
-fn validate_topology_passes_after_face_split_and_poke() {
-    let mut mesh = LoopMesh::new();
-    let verts = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(1.0, 1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    ];
-    let f = create_face_from_verts(&mut mesh, &verts);
-    let face_verts = mesh.face_vert_keys(f);
-    let v0 = face_verts[0];
-    let v2 = face_verts[2];
-    let (new_face, _new_edge) = mesh.face_split(f, v0, v2).unwrap();
-    mesh.validate_topology();
-    // Poke one of the halves.
-    mesh.face_poke(new_face);
-    mesh.validate_topology();
-}
-
-// ----- Op-flag pool integration tests -----
-
-#[test]
-fn op_flag_layer_round_trip() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-    let v2 = mesh.create_vertex(Vec3::Y);
-
-    let layer = mesh.push_vert_op_flag_layer();
-    assert!(!mesh.vert_op_flag_test(layer, v0, 3));
-    mesh.vert_op_flag_set(layer, v0, 3);
-    mesh.vert_op_flag_set(layer, v2, 3);
-    assert!(mesh.vert_op_flag_test(layer, v0, 3));
-    assert!(!mesh.vert_op_flag_test(layer, v1, 3));
-    assert!(mesh.vert_op_flag_test(layer, v2, 3));
-
-    let marked: Vec<_> = mesh.iter_verts_with_op_flag(layer, 3).collect();
-    assert_eq!(marked, vec![v0, v2]);
-
-    mesh.pop_vert_op_flag_layer(layer);
-}
-
-#[test]
-fn op_flag_eager_growth_on_create_vertex() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-
-    let layer = mesh.push_vert_op_flag_layer();
-    mesh.vert_op_flag_set(layer, v0, 0);
-
-    // Create more vertices after pushing the layer; eager growth should
-    // extend the active layer so set/test work without panic.
-    let v1 = mesh.create_vertex(Vec3::X);
-    let v2 = mesh.create_vertex(Vec3::Y);
-
-    // v0's bit is still set; v1/v2 default to zero.
-    assert!(mesh.vert_op_flag_test(layer, v0, 0));
-    assert!(!mesh.vert_op_flag_test(layer, v1, 0));
-    mesh.vert_op_flag_set(layer, v2, 0);
-    assert!(mesh.vert_op_flag_test(layer, v2, 0));
-
-    mesh.pop_vert_op_flag_layer(layer);
-}
-
-#[test]
-fn op_flag_layer_reuse_zero_initialises() {
-    let mut mesh = LoopMesh::new();
-    let v = mesh.create_vertex(Vec3::ZERO);
-
-    let layer_a = mesh.push_vert_op_flag_layer();
-    mesh.vert_op_flag_set(layer_a, v, 5);
-    mesh.pop_vert_op_flag_layer(layer_a);
-
-    let layer_b = mesh.push_vert_op_flag_layer();
-    // Reused layer must be zero-cleared, regardless of layer-handle equality.
-    assert!(!mesh.vert_op_flag_test(layer_b, v, 5));
-    mesh.pop_vert_op_flag_layer(layer_b);
-}
-
-#[test]
-fn op_flag_each_axis_is_independent() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-    let e = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
-
-    let vl = mesh.push_vert_op_flag_layer();
-    let el = mesh.push_edge_op_flag_layer();
-
-    mesh.vert_op_flag_set(vl, v0, 0);
-    mesh.edge_op_flag_set(el, e, 0);
-
-    assert!(mesh.vert_op_flag_test(vl, v0, 0));
-    assert!(!mesh.vert_op_flag_test(vl, v1, 0));
-    assert!(mesh.edge_op_flag_test(el, e, 0));
-
-    mesh.pop_edge_op_flag_layer(el);
-    mesh.pop_vert_op_flag_layer(vl);
-}
-
-// extrude_region tests now live in loopmesh/ops/extrude_region.rs.
-
-#[test]
-fn i32_vertex_attrib_round_trips() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-
-    let material = mesh
-        .register_vertex_attribute(ElementAttributeDesc::numeric(
-            AttributeKey::custom("material"),
-            AttrType::I32,
-        ))
-        .unwrap();
-
-    assert!(mesh
-        .vertex_attribs_mut()
-        .set_i32(material, v0.as_usize(), 7));
-    assert!(mesh
-        .vertex_attribs_mut()
-        .set_i32(material, v1.as_usize(), -3));
-
-    assert_eq!(
-        mesh.vertex_attribs().get_i32(material, v0.as_usize()),
-        Some(7)
-    );
-    assert_eq!(
-        mesh.vertex_attribs().get_i32(material, v1.as_usize()),
-        Some(-3)
-    );
-}
-
-#[test]
-fn i32_loop_attrib_round_trips() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-    let v1 = mesh.create_vertex(Vec3::X);
-    let v2 = mesh.create_vertex(Vec3::Y);
-    let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
-    let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
-    let e2 = mesh.create_edge([v2, v0], EdgeCreateFlags::NONE);
-    let f = mesh.face_create(&[v0, v1, v2], &[e0, e1, e2], FaceCreateFlags::NONE);
-
-    let tag = mesh
-        .register_loop_attribute(ElementAttributeDesc::numeric(
-            AttributeKey::custom("tag"),
-            AttrType::I32,
-        ))
-        .unwrap();
-
-    let loops: Vec<LoopKey> = mesh.iter_face_loops(f).collect();
-    for (i, l) in loops.iter().enumerate() {
-        assert!(mesh
-            .loop_attribs_mut()
-            .set_i32(tag, l.as_usize(), i as i32 * 10));
-    }
-    for (i, l) in loops.iter().enumerate() {
-        assert_eq!(
-            mesh.loop_attribs().get_i32(tag, l.as_usize()),
-            Some(i as i32 * 10)
-        );
-    }
-}
-
-#[test]
-fn i32_setter_rejects_wrong_bucket_and_missing_key() {
-    let mut mesh = LoopMesh::new();
-    let v0 = mesh.create_vertex(Vec3::ZERO);
-
-    // A float-bucket attribute must not accept an i32 write.
-    let color = mesh
-        .register_vertex_attribute(ElementAttributeDesc::numeric(
-            AttributeKey::custom("color"),
-            AttrType::Vec3,
-        ))
-        .unwrap();
-    assert!(!mesh.vertex_attribs_mut().set_i32(color, v0.as_usize(), 1));
-    assert_eq!(mesh.vertex_attribs().get_i32(color, v0.as_usize()), None);
-
-    // An unregistered key resolves to nothing.
-    let bogus = ElementAttributeKey(9999);
-    assert!(!mesh.vertex_attribs_mut().set_i32(bogus, v0.as_usize(), 1));
-    assert_eq!(mesh.vertex_attribs().get_i32(bogus, v0.as_usize()), None);
 }

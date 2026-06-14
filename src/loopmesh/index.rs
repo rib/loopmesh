@@ -212,3 +212,78 @@ impl LoopMesh {
         &self.loops_index
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loopmesh::test_support::create_face_from_verts;
+
+    #[test]
+    fn is_dirty_starts_set_clears_after_ensure() {
+        let mut mesh = LoopMesh::new();
+        let _v = mesh.create_vertex(Vec3::ZERO);
+
+        assert!(mesh.is_vertices_index_dirty());
+        mesh.vertices_ensure_index();
+        assert!(!mesh.is_vertices_index_dirty());
+
+        // Re-set by a subsequent mutation.
+        let _v2 = mesh.create_vertex(Vec3::X);
+        assert!(mesh.is_vertices_index_dirty());
+    }
+
+    #[test]
+    fn ensure_index_field_clears_only_its_axis() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let _e = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+
+        assert!(mesh.is_vertices_index_dirty());
+        assert!(mesh.is_edges_index_dirty());
+
+        mesh.vertices_ensure_index_field();
+        assert!(!mesh.is_vertices_index_dirty());
+        // Edges still dirty.
+        assert!(mesh.is_edges_index_dirty());
+    }
+
+    #[test]
+    fn ensure_index_field_assigns_dense_indices() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let v2 = mesh.create_vertex(Vec3::Y);
+        mesh.vertices_ensure_index_field();
+
+        // Indices are 0..3 in slab order (no holes yet).
+        assert_eq!(mesh.vertex_index(v0), 0);
+        assert_eq!(mesh.vertex_index(v1), 1);
+        assert_eq!(mesh.vertex_index(v2), 2);
+        assert_eq!(mesh.vertex_index_table(), &[v0, v1, v2]);
+    }
+
+    #[test]
+    fn validate_indices_passes_after_full_ensure() {
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let _face = create_face_from_verts(&mut mesh, &verts);
+
+        mesh.all_indices_ensure();
+        mesh.validate_indices();
+    }
+
+    #[test]
+    #[should_panic(expected = "indices are dirty")]
+    fn validate_indices_panics_when_dirty() {
+        let mut mesh = LoopMesh::new();
+        let _v = mesh.create_vertex(Vec3::ZERO);
+        // No ensure call → still dirty.
+        mesh.validate_indices();
+    }
+}
