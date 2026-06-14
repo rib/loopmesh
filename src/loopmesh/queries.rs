@@ -89,40 +89,40 @@ impl LoopMesh {
         r
     }
 
-    pub fn totvert(&self) -> usize {
+    pub fn vertex_count(&self) -> usize {
         self.vertices.len()
     }
 
-    pub fn totedge(&self) -> usize {
+    pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
 
-    pub fn totface(&self) -> usize {
+    pub fn face_count(&self) -> usize {
         self.faces.len()
     }
 
-    pub fn totloop(&self) -> usize {
+    pub fn loop_count(&self) -> usize {
         self.loops.len()
     }
 
     /// Slab-key watermark — one past the highest slab slot ever allocated
-    /// for this element type. Differs from `totvert()` after kills: kills
-    /// reduce `totvert` but the watermark stays high (slot recycling is
+    /// for this element type. Differs from `vertex_count()` after kills: kills
+    /// reduce `vertex_count` but the watermark stays high (slot recycling is
     /// the slab's own concern). Useful for sizing per-element scratch
     /// buffers indexed by `key.as_usize()`.
-    pub fn totvert_watermark(&self) -> usize {
+    pub fn vertex_slot_count(&self) -> usize {
         self.vertices.key_watermark()
     }
 
-    pub fn totedge_watermark(&self) -> usize {
+    pub fn edge_slot_count(&self) -> usize {
         self.edges.key_watermark()
     }
 
-    pub fn totface_watermark(&self) -> usize {
+    pub fn face_slot_count(&self) -> usize {
         self.faces.key_watermark()
     }
 
-    pub fn totloop_watermark(&self) -> usize {
+    pub fn loop_slot_count(&self) -> usize {
         self.loops.key_watermark()
     }
 

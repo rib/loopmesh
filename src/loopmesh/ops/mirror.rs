@@ -372,14 +372,21 @@ mod tests {
     fn seam_strip_welds_into_four_quad_strip() {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = seam_strip(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         let geom = all_geom(&verts, &faces);
         mesh.mirror(&geom, default_params(0.5));
 
-        assert_eq!(mesh.totvert(), 10, "6 originals + 4 surviving clones");
-        assert_eq!(mesh.totedge(), 13, "+6 edges (seam clone edge collapsed)");
-        assert_eq!(mesh.totface(), 4, "original 2 quads + 2 reflected quads");
+        assert_eq!(mesh.vertex_count(), 10, "6 originals + 4 surviving clones");
+        assert_eq!(
+            mesh.edge_count(),
+            13,
+            "+6 edges (seam clone edge collapsed)"
+        );
+        assert_eq!(mesh.face_count(), 4, "original 2 quads + 2 reflected quads");
 
         // The two on-plane originals survive; the reflected half lands on -x.
         let xs: Vec<f32> = mesh
@@ -410,7 +417,10 @@ mod tests {
     fn seam_strip_welds_into_four_quad_strip_axis_y() {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = seam_strip_y(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         let mut params = default_params(0.5);
         params.axis = Axis::Y;
@@ -419,9 +429,13 @@ mod tests {
         let result = mesh.mirror(&geom, params);
 
         // The Y analogue of the X headline's welded counts.
-        assert_eq!(mesh.totvert(), 10, "6 originals + 4 surviving clones");
-        assert_eq!(mesh.totedge(), 13, "+6 edges (seam clone edge collapsed)");
-        assert_eq!(mesh.totface(), 4, "original 2 quads + 2 reflected quads");
+        assert_eq!(mesh.vertex_count(), 10, "6 originals + 4 surviving clones");
+        assert_eq!(
+            mesh.edge_count(),
+            13,
+            "+6 edges (seam clone edge collapsed)"
+        );
+        assert_eq!(mesh.face_count(), 4, "original 2 quads + 2 reflected quads");
 
         // The reflected half lands on −y; the two on-plane originals stay at y=0.
         let ys: Vec<f32> = mesh
@@ -501,14 +515,21 @@ mod tests {
     fn merge_dist_zero_disconnects_offset_strip() {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = offset_strip(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         let geom = all_geom(&verts, &faces);
         let result = mesh.mirror(&geom, default_params(0.0));
 
-        assert_eq!(mesh.totvert(), 12, "full disjoint clone, nothing welded");
-        assert_eq!(mesh.totedge(), 14);
-        assert_eq!(mesh.totface(), 4);
+        assert_eq!(
+            mesh.vertex_count(),
+            12,
+            "full disjoint clone, nothing welded"
+        );
+        assert_eq!(mesh.edge_count(), 14);
+        assert_eq!(mesh.face_count(), 4);
         assert_eq!(
             result
                 .geom_out
@@ -613,8 +634,8 @@ mod tests {
         let geom: Vec<GeomKey> = faces.iter().map(|&f| GeomKey::from(f)).collect();
         mesh.mirror(&geom, default_params(0.5));
 
-        assert_eq!(mesh.totvert(), 12, "no seam weld: full disjoint clone");
-        assert_eq!(mesh.totface(), 4);
+        assert_eq!(mesh.vertex_count(), 12, "no seam weld: full disjoint clone");
+        assert_eq!(mesh.face_count(), 4);
         mesh.validate_topology();
     }
 
@@ -623,12 +644,15 @@ mod tests {
     fn empty_selection_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces) = seam_strip(&mut mesh);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let result = mesh.mirror(&[], default_params(0.5));
 
         assert!(result.geom_out.is_empty());
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -906,7 +930,10 @@ mod tests {
     fn shifted_matrix_reflects_but_welds_nothing() {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = offset_strip(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         // Reflect across the world plane `x = 2`: translate so x=2 maps to the
         // mirror-frame origin; the §3 negate-then-inverse then mirrors about x=2.
@@ -917,9 +944,9 @@ mod tests {
         let result = mesh.mirror(&geom, params);
 
         // Seam test reads raw world x (none on x=0), so nothing welds: doubled.
-        assert_eq!(mesh.totvert(), 12, "no seam weld: full disjoint clone");
-        assert_eq!(mesh.totedge(), 14);
-        assert_eq!(mesh.totface(), 4);
+        assert_eq!(mesh.vertex_count(), 12, "no seam weld: full disjoint clone");
+        assert_eq!(mesh.edge_count(), 14);
+        assert_eq!(mesh.face_count(), 4);
         assert_eq!(
             result
                 .geom_out

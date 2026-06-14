@@ -340,13 +340,13 @@ mod tests {
         // original, leaving exactly one quad. Net counts unchanged (+0/+0/+0).
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let result = mesh.split(&[face.into()], false);
 
-        assert_eq!(mesh.totvert(), v0, "no net vert change");
-        assert_eq!(mesh.totedge(), e0, "no net edge change");
-        assert_eq!(mesh.totface(), f0, "no net face change");
+        assert_eq!(mesh.vertex_count(), v0, "no net vert change");
+        assert_eq!(mesh.edge_count(), e0, "no net edge change");
+        assert_eq!(mesh.face_count(), f0, "no net face change");
         // The original face is gone; the survivor is the clone.
         assert!(mesh.faces.try_get(face).is_none(), "original face torn out");
         let clone_faces: Vec<FaceKey> = result
@@ -379,15 +379,15 @@ mod tests {
         // surviving-source `source -> clone` couples (no self-maps).
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let centre = faces[1 * 3 + 1];
         let result = mesh.split(&[centre.into()], false);
 
-        assert_eq!(mesh.totvert() - v0, 4, "+4 verts (clone corners)");
-        assert_eq!(mesh.totedge() - e0, 4, "+4 edges (clone boundary)");
+        assert_eq!(mesh.vertex_count() - v0, 4, "+4 verts (clone corners)");
+        assert_eq!(mesh.edge_count() - e0, 4, "+4 edges (clone boundary)");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             f0,
             "face count unchanged (clone offsets original)"
         );
@@ -472,9 +472,13 @@ mod tests {
         // The whole-mesh widening also sweeps the clone wire (2V/1E) and clone
         // loose vert (1V), so only the face-bounded clone survives: a single quad,
         // 4 V / 4 E / 1 F.
-        assert_eq!(mesh.totvert(), 4, "only the face-bounded clone survives");
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "only the face-bounded clone survives"
+        );
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.face_count(), 1);
         mesh.validate_topology();
     }
 
@@ -513,9 +517,13 @@ mod tests {
         // Quad clone (4V/4E/1F) + wire clone (2V/1E) + clone loose vert (1V) +
         // the two spared original wire endpoints (now loose) = 4+2+1+2 = 9 V,
         // 4+1 = 5 E, 1 F. Net vs the pre-split mesh (7V/5E/1F): +2 V / +0 E / +0 F.
-        assert_eq!(mesh.totvert(), 9, "two spared wire endpoints survive loose");
-        assert_eq!(mesh.totedge(), 5);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(
+            mesh.vertex_count(),
+            9,
+            "two spared wire endpoints survive loose"
+        );
+        assert_eq!(mesh.edge_count(), 5);
+        assert_eq!(mesh.face_count(), 1);
         mesh.validate_topology();
     }
 
@@ -545,7 +553,7 @@ mod tests {
             "clone loose vert swept too (§4 whole-mesh)"
         );
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             0,
             "both original and clone loose verts swept"
         );

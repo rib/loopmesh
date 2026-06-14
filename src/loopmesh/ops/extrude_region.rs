@@ -836,8 +836,8 @@ mod tests {
             "surround-free input builds a separate duplicate cap"
         );
 
-        assert_eq!(mesh.totvert(), 8);
-        assert_eq!(mesh.totface(), 6); // 4 walls + 1 cap + 1 kept original
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.face_count(), 6); // 4 walls + 1 cap + 1 kept original
         mesh.validate_topology();
 
         // Displace the new verts upward and verify the top cap still has the
@@ -928,9 +928,9 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 4);
         // Cube had 8 verts + 12 edges + 6 faces. After: +4 verts, +4 dup edges
         // + 4 side edges = +8 edges, +4 wall faces.
-        assert_eq!(mesh.totvert(), 12);
-        assert_eq!(mesh.totedge(), 20);
-        assert_eq!(mesh.totface(), 10);
+        assert_eq!(mesh.vertex_count(), 12);
+        assert_eq!(mesh.edge_count(), 20);
+        assert_eq!(mesh.face_count(), 10);
         mesh.validate_topology();
     }
 
@@ -975,7 +975,7 @@ mod tests {
         let neighbour = neighbour.expect("top face has an adjacent face");
         let shared_edge = shared_edge.expect("top and neighbour share an edge");
 
-        let edges_before = mesh.totedge();
+        let edges_before = mesh.edge_count();
         let result = mesh.extrude_region(&[top, neighbour]);
 
         // Surround-touching → originals re-anchored, not kept.
@@ -1003,7 +1003,7 @@ mod tests {
         // original. Assert the interior edge truly removed one edge versus the
         // naive "keep everything" count by checking the shared edge is gone and
         // the count is internally consistent.
-        assert!(mesh.totedge() > edges_before, "duplication added edges");
+        assert!(mesh.edge_count() > edges_before, "duplication added edges");
         mesh.validate_topology();
     }
 
@@ -1830,8 +1830,8 @@ mod tests {
         assert_eq!(result.cap_faces.len(), 1, "1 fresh duplicate cap");
 
         // 8 verts (4 orig + 4 dup); 6 faces (original kept + cap + 4 walls).
-        assert_eq!(mesh.totvert(), 8);
-        assert_eq!(mesh.totface(), 6);
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.face_count(), 6);
 
         // The kept original still references the original (non-duplicated)
         // verts; the cap references only duplicates.
@@ -1882,11 +1882,11 @@ mod tests {
 
         // Default deletes the original top: 5 cube + 1 cap + 4 walls = 10.
         // keep_orig retains it: 6 cube + 1 cap + 4 walls = 11.
-        assert_eq!(mesh_default.totface(), 10);
-        assert_eq!(mesh_keep.totface(), 11);
-        assert_eq!(mesh_keep.totface(), mesh_default.totface() + 1);
+        assert_eq!(mesh_default.face_count(), 10);
+        assert_eq!(mesh_keep.face_count(), 11);
+        assert_eq!(mesh_keep.face_count(), mesh_default.face_count() + 1);
         // Vertex counts match — keep_orig adds no extra verts, only the cap face.
-        assert_eq!(mesh_keep.totvert(), mesh_default.totvert());
+        assert_eq!(mesh_keep.vertex_count(), mesh_default.vertex_count());
         mesh_keep.validate_topology();
     }
 
@@ -1944,7 +1944,7 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 3, "excluded edge builds no wall");
         assert_eq!(result.cap_faces.len(), 1);
         // original + cap + 3 walls.
-        assert_eq!(mesh.totface(), 5);
+        assert_eq!(mesh.face_count(), 5);
         // No wall sits on the excluded edge's endpoints.
         for &wf in &result.wall_faces {
             let wall_verts = mesh.face_vert_keys(wf);
@@ -2018,7 +2018,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (centre, _left, _right) = folded_strip(&mut mesh);
 
-        let faces_before = mesh.totface();
+        let faces_before = mesh.face_count();
         let result = mesh.extrude_region_ex_dissolve_ortho(&[centre], false, true);
 
         // The centre face still has four boundary edges, so four walls were
@@ -2036,12 +2036,12 @@ mod tests {
         // centre is re-anchored, no net change) + 4 walls = 7. Dissolving the two
         // side walls into the neighbours removes 2 faces → 5.
         assert!(
-            mesh.totface() < faces_before + 4,
+            mesh.face_count() < faces_before + 4,
             "ortho dissolve must remove some walls: got {} faces",
-            mesh.totface()
+            mesh.face_count()
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             5,
             "centre cap + 2 neighbours (each absorbed a wall) + 2 retained walls"
         );
@@ -2061,7 +2061,7 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 4, "four walls built");
         // 3 input faces, centre re-anchored to cap (net 0), + 4 walls = 7.
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             7,
             "no dissolve: all four walls retained alongside the 3 originals/cap"
         );
@@ -2119,7 +2119,7 @@ mod tests {
             );
         }
         // 2 originals (one re-anchored cap + neighbour) + 4 walls = 6.
-        assert_eq!(mesh.totface(), 6);
+        assert_eq!(mesh.face_count(), 6);
         mesh.validate_topology();
     }
 
@@ -2218,7 +2218,7 @@ mod tests {
         let mut mesh_on = LoopMesh::new();
         let floor_on = build_cup(&mut mesh_on);
         // Cup starts with 8 verts (4 floor + 4 top rim).
-        assert_eq!(mesh_on.totvert(), 8);
+        assert_eq!(mesh_on.vertex_count(), 8);
         let floor_corner_positions = [
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
@@ -2230,7 +2230,7 @@ mod tests {
         // All four walls absorbed and all four floor corners collapsed into
         // their duplicates: 8 → 12 (floor duplicates) → 8 (corner collapses).
         assert_eq!(
-            mesh_on.totvert(),
+            mesh_on.vertex_count(),
             8,
             "every floor corner must collapse: the cup is not spared (§7.4)"
         );
@@ -2328,7 +2328,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let cap = corner_of_two_ortho_walls(&mut mesh);
         // 4 cap + t0 + a1 + b1 = 7 verts.
-        assert_eq!(mesh.totvert(), 7);
+        assert_eq!(mesh.vertex_count(), 7);
         let shared_corner = Vec3::new(0.0, 0.0, 0.0);
         let declined_corners = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
 
@@ -2336,7 +2336,7 @@ mod tests {
 
         // 7 → 11 (4 cap duplicates) → 10 (the shared corner collapses once).
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             10,
             "exactly the shared corner collapses; the two degree-3 corners do not"
         );
@@ -2410,8 +2410,8 @@ mod tests {
 
         let result = mesh.extrude_region(&[face]);
 
-        assert_eq!(mesh.totface(), 6, "4 walls + 1 cap + 1 kept original");
-        assert_eq!(mesh.totvert(), 8, "4 original + 4 duplicate verts");
+        assert_eq!(mesh.face_count(), 6, "4 walls + 1 cap + 1 kept original");
+        assert_eq!(mesh.vertex_count(), 8, "4 original + 4 duplicate verts");
         assert_eq!(result.wall_faces.len(), 4);
         assert_eq!(
             result.cap_faces.len(),
@@ -2458,7 +2458,7 @@ mod tests {
         let result = mesh.extrude_region(&[top]);
 
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             10,
             "surround-touching input deletes its original: 5 cube + 1 cap + 4 walls"
         );

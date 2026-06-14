@@ -1139,7 +1139,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 4);
 
-        assert_eq!((mesh.totvert(), mesh.totface()), (10, 4));
+        assert_eq!((mesh.vertex_count(), mesh.face_count()), (10, 4));
 
         let params = DissolveLimitParams {
             angle_limit: std::f32::consts::FRAC_PI_4,
@@ -1149,9 +1149,9 @@ mod tests {
         let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
         assert!(matches!(result, DissolveLimitResult::Ran { .. }));
 
-        assert_eq!(mesh.totface(), 1, "all four quads merge into one");
-        assert_eq!(mesh.totvert(), 4, "the rim collapses to a single quad");
-        assert_eq!(mesh.totedge(), 4);
+        assert_eq!(mesh.face_count(), 1, "all four quads merge into one");
+        assert_eq!(mesh.vertex_count(), 4, "the rim collapses to a single quad");
+        assert_eq!(mesh.edge_count(), 4);
         let face = mesh.face_keys()[0];
         assert_eq!(mesh.face_len(face), 4, "the surviving face is a quad");
         mesh.validate_topology();
@@ -1163,9 +1163,9 @@ mod tests {
         // coplanar edges (−1 < −cos(0) = −1 is false). Complete no-op.
         let mut mesh = LoopMesh::new();
         let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 4);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let params = DissolveLimitParams {
             angle_limit: 0.0,
@@ -1180,7 +1180,7 @@ mod tests {
             DissolveLimitResult::Unsupported => panic!("delimit 0 must run"),
         }
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         mesh.validate_topology();
@@ -1236,7 +1236,7 @@ mod tests {
             "the 90° ridge seam survives the angle gate"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "two flat quads merge; the folded one stays"
         );
@@ -1285,7 +1285,7 @@ mod tests {
             };
             mesh.dissolve_limit(&[seam], &[], &params);
             assert_eq!(
-                mesh.totface(),
+                mesh.face_count(),
                 1,
                 "60° fold dissolves at angle_limit {angle_limit} (π clamps to π/2)"
             );
@@ -1332,7 +1332,7 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[seam], &[], &params);
-        assert_eq!(mesh.totface(), 2, "60° fold survives below the π/4 gate");
+        assert_eq!(mesh.face_count(), 2, "60° fold survives below the π/4 gate");
         assert!(mesh.query_edge_exists(v[1], v[2]).is_some());
         mesh.validate_topology();
     }
@@ -1355,8 +1355,8 @@ mod tests {
                 delimit: 0,
             };
             mesh.dissolve_limit(&edges, &[], &params);
-            assert_eq!(mesh.totface(), 1, "edge pass merges three quads to one");
-            assert_eq!(mesh.totvert(), 8, "the four rim verts survive");
+            assert_eq!(mesh.face_count(), 1, "edge pass merges three quads to one");
+            assert_eq!(mesh.vertex_count(), 8, "the four rim verts survive");
         }
 
         // Fresh mesh, both inputs: full collapse to a quad.
@@ -1368,9 +1368,9 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&edges, &interior_verts, &params);
-        assert_eq!(mesh.totface(), 1);
-        assert_eq!(mesh.totvert(), 4, "rim collapses to a quad");
-        assert_eq!(mesh.totedge(), 4);
+        assert_eq!(mesh.face_count(), 1);
+        assert_eq!(mesh.vertex_count(), 4, "rim collapses to a quad");
+        assert_eq!(mesh.edge_count(), 4);
         let _ = interior_verts;
         mesh.validate_topology();
     }
@@ -1427,7 +1427,7 @@ mod tests {
                 delimit: 0,
             };
             probe.dissolve_limit(&[], &p, &params);
-            assert_eq!(probe.totvert(), 4, "heap pass rejects the 90° corners");
+            assert_eq!(probe.vertex_count(), 4, "heap pass rejects the 90° corners");
         }
 
         // true branch: unconditional collapse strips the quad away entirely.
@@ -1438,7 +1438,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[], &v, &params);
         assert!(
-            mesh.totvert() < 4,
+            mesh.vertex_count() < 4,
             "unconditional sweep collapses edge-pair corners regardless of angle"
         );
         mesh.validate_topology();
@@ -1485,7 +1485,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[seam1, seam2], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "both shallow seams dissolve after re-score"
         );
@@ -1569,9 +1569,9 @@ mod tests {
         // touching the mesh.
         let mut mesh = LoopMesh::new();
         let (_verts, edges, interior_verts) = build_coplanar_strip(&mut mesh, 2);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         let undocumented = 1u32 << 5;
         let params = DissolveLimitParams {
             angle_limit: FRAC_PI_2,
@@ -1581,7 +1581,7 @@ mod tests {
         let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
         assert_eq!(result, DissolveLimitResult::Unsupported);
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         mesh.validate_topology();
@@ -1617,7 +1617,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "without MATERIAL the boundary edge dissolves"
         );
@@ -1637,7 +1637,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "DELIMIT_MATERIAL preserves the material boundary"
         );
@@ -1655,7 +1655,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "matching materials are not a boundary; edge dissolves"
         );
@@ -1678,7 +1678,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "without SEAM the flag is inert; edge dissolves"
         );
@@ -1697,7 +1697,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "DELIMIT_SEAM preserves the seam-flagged edge"
         );
@@ -1713,7 +1713,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "an un-flagged edge is not a seam; it dissolves"
         );
@@ -1736,7 +1736,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "without SHARP the flag is inert; edge dissolves"
         );
@@ -1755,7 +1755,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "DELIMIT_SHARP preserves the sharp (non-smooth) edge"
         );
@@ -1772,7 +1772,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "a smooth edge is not sharp; it dissolves"
         );
@@ -1799,7 +1799,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "SEAM | MATERIAL preserves the doubly-delimited edge"
         );
@@ -1818,7 +1818,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "the OR blocks on the material boundary alone"
         );
@@ -1834,7 +1834,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "no seam and matching materials ⇒ edge dissolves"
         );
@@ -1936,7 +1936,7 @@ mod tests {
 
         // delimit = 0: the modulated cost pops v; the vert pass collapses it.
         let (mut mesh, v, _seam_a, _seam_b) = build_folded_seam_with_kinked_vert();
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
         let params = DissolveLimitParams {
             angle_limit,
             use_dissolve_boundaries: false,
@@ -1949,7 +1949,7 @@ mod tests {
             "without a delimiter the modulated cost dissolves the seam vert"
         );
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0 - 1,
             "exactly the one seam vert collapses"
         );
@@ -1959,7 +1959,7 @@ mod tests {
         // vert, takes the un-modulated corner cost (above the gate), survives.
         let (mut mesh, v, seam_a, _seam_b) = build_folded_seam_with_kinked_vert();
         mesh.set_edge_sharp(seam_a, true);
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
         let params = DissolveLimitParams {
             angle_limit,
             use_dissolve_boundaries: false,
@@ -1972,7 +1972,7 @@ mod tests {
             "the §3.3 delimiter vert forgoes the dihedral discount and survives"
         );
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0,
             "no collapse: the delimiter vert is preserved"
         );
@@ -2062,7 +2062,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "DELIMIT_NORMAL preserves the non-contiguous edge"
         );
@@ -2146,7 +2146,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "UV split edge dissolves when delimit = 0"
         );
@@ -2164,7 +2164,7 @@ mod tests {
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "DELIMIT_UV preserves the UV-island boundary"
         );
@@ -2181,7 +2181,7 @@ mod tests {
         };
         mesh.dissolve_limit(&[shared], &[], &params);
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "matching seam UVs are contiguous; the edge dissolves"
         );
@@ -2207,11 +2207,11 @@ mod tests {
             "UV bit auto-clears, runs"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "no UV layers ⇒ UV bit inert ⇒ full collapse"
         );
-        assert_eq!(mesh.totvert(), 4);
+        assert_eq!(mesh.vertex_count(), 4);
         mesh.validate_topology();
     }
 
@@ -2260,11 +2260,11 @@ mod tests {
         mesh.dissolve_limit(&[], &[r], &params);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             4,
             "the reflex empty-ear vert collapses away"
         );
-        assert_eq!(mesh.totface(), 1, "the face survives as a quad");
+        assert_eq!(mesh.face_count(), 1, "the face survives as a quad");
         assert!(
             mesh.query_edge_exists(verts[0], verts[2]).is_some(),
             "the weld edge v0–v2 replaces the two arms through r"
@@ -2304,8 +2304,8 @@ mod tests {
         };
         mesh.dissolve_limit(&[], &[c], &params);
 
-        assert_eq!(mesh.totvert(), 6, "the guard fires; nothing collapses");
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 6, "the guard fires; nothing collapses");
+        assert_eq!(mesh.face_count(), 1);
         assert!(
             mesh.query_edge_exists(verts[3], verts[5]).is_none(),
             "the would-be weld edge is never created"
@@ -2340,8 +2340,8 @@ mod tests {
         };
         mesh.dissolve_limit(&[], &[c], &params);
 
-        assert_eq!(mesh.totvert(), 5, "clear ear ⇒ the corner collapses");
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 5, "clear ear ⇒ the corner collapses");
+        assert_eq!(mesh.face_count(), 1);
         assert!(
             mesh.query_edge_exists(verts[3], verts[5]).is_some(),
             "weld edge (ear-prev)–(ear-next) replaces the arms through c"

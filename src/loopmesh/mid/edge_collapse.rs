@@ -356,9 +356,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let [v0, v1, v2] = build_triangle(&mut mesh);
 
-        assert_eq!(mesh.totvert(), 3);
-        assert_eq!(mesh.totedge(), 3);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.edge_count(), 3);
+        assert_eq!(mesh.face_count(), 1);
 
         let e_kill = mesh.vert_edge_keys(v1)[0];
         let surviving = mesh.vert_collapse_edge(e_kill, v1);
@@ -367,9 +367,9 @@ mod tests {
             "collapse succeeds on a triangle corner"
         );
 
-        assert_eq!(mesh.totvert(), 2, "-1 V (collapsed corner)");
-        assert_eq!(mesh.totedge(), 1, "-2 E (spoke + spliced duplicate)");
-        assert_eq!(mesh.totface(), 0, "-1 F (the 2-gon is reaped)");
+        assert_eq!(mesh.vertex_count(), 2, "-1 V (collapsed corner)");
+        assert_eq!(mesh.edge_count(), 1, "-2 E (spoke + spliced duplicate)");
+        assert_eq!(mesh.face_count(), 0, "-1 F (the 2-gon is reaped)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v1), "the collapsed corner is gone");
@@ -411,17 +411,17 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        assert_eq!(mesh.totvert(), 4);
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.face_count(), 1);
 
         let e_kill = mesh.vert_edge_keys(v[1])[0];
         let surviving = mesh.vert_collapse_edge(e_kill, v[1]);
         assert!(surviving.is_some(), "collapse succeeds on a quad corner");
 
-        assert_eq!(mesh.totvert(), 3, "-1 V (collapsed corner)");
-        assert_eq!(mesh.totedge(), 3, "-1 E (spoke only; no duplicate)");
-        assert_eq!(mesh.totface(), 1, "the face survives as a triangle");
+        assert_eq!(mesh.vertex_count(), 3, "-1 V (collapsed corner)");
+        assert_eq!(mesh.edge_count(), 3, "-1 E (spoke only; no duplicate)");
+        assert_eq!(mesh.face_count(), 1, "the face survives as a triangle");
         assert_eq!(mesh.face_len(face), 3, "quad → triangle, still valid");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
@@ -446,10 +446,10 @@ mod tests {
         let surviving = mesh.vert_collapse_edge_with(e_kill, v1, flags);
         assert!(surviving.is_some());
 
-        assert_eq!(mesh.totvert(), 2, "-1 V");
-        assert_eq!(mesh.totedge(), 2, "-1 E (spoke only; duplicate left)");
+        assert_eq!(mesh.vertex_count(), 2, "-1 V");
+        assert_eq!(mesh.edge_count(), 2, "-1 E (spoke only; duplicate left)");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "the 2-gon is left alive when reaping is off"
         );
@@ -465,9 +465,9 @@ mod tests {
 
         assert!(mesh.vert_dissolve(v1), "single-vert dissolve succeeds");
 
-        assert_eq!(mesh.totvert(), 2);
-        assert_eq!(mesh.totedge(), 1);
-        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.edge_count(), 1);
+        assert_eq!(mesh.face_count(), 0);
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v1));
         assert!(live.contains(&v0) && live.contains(&v2));

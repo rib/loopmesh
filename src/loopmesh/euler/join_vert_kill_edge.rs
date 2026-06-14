@@ -79,9 +79,9 @@ mod tests {
     fn test_euler_join_vert_kill_edge_cube() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let pre_v = mesh.totvert();
-        let pre_e = mesh.totedge();
-        let pre_f = mesh.totface();
+        let pre_v = mesh.vertex_count();
+        let pre_e = mesh.edge_count();
+        let pre_f = mesh.face_count();
 
         // Pick any cube edge; collapse it (v_kill is its first endpoint).
         let e_kill = mesh.edge_keys()[0];
@@ -98,10 +98,10 @@ mod tests {
         //     lose one perimeter edge (degenerate-face cleanup is the caller's
         //     concern, so face count stays the same; counts of edges go down by
         //     1 because two parallel edges may end up merging via the splice).
-        assert_eq!(mesh.totvert(), pre_v - 1, "v_kill killed");
-        assert!(mesh.totedge() < pre_e, "edges should decrease");
+        assert_eq!(mesh.vertex_count(), pre_v - 1, "v_kill killed");
+        assert!(mesh.edge_count() < pre_e, "edges should decrease");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             pre_f,
             "face count unchanged (degenerate-face cleanup is opt-in)"
         );

@@ -535,13 +535,13 @@ mod tests {
         // §6.1: edge profile, B=1 open chain → Bv=2. Each step adds 2 verts,
         // E+Bv = 1+2 = 3 edges, F+B = 0+1 = 1 wall face. Over 4 steps:
         // verts 2 + 4*2 = 10; edges 1 + 4*3 = 13; faces 4.
-        assert_eq!(mesh.totvert(), 10, "2 profile + 4 rings * 2");
+        assert_eq!(mesh.vertex_count(), 10, "2 profile + 4 rings * 2");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             13,
             "1 profile + 4 steps * (1 dup + 2 vertical)"
         );
-        assert_eq!(mesh.totface(), 4, "4 wall quads");
+        assert_eq!(mesh.face_count(), 4, "4 wall quads");
 
         // geom_last.out is the final ring: one edge.
         assert_eq!(
@@ -626,9 +626,9 @@ mod tests {
         );
 
         // §6.3: duplicate mode adds steps*(V,E,F). Profile 2V/1E/0F; +4*(2,1,0).
-        assert_eq!(mesh.totvert(), 10, "2 original + 4 copies * 2");
-        assert_eq!(mesh.totedge(), 5, "1 original + 4 copies * 1");
-        assert_eq!(mesh.totface(), 0, "no walls in duplicate mode");
+        assert_eq!(mesh.vertex_count(), 10, "2 original + 4 copies * 2");
+        assert_eq!(mesh.edge_count(), 5, "1 original + 4 copies * 1");
+        assert_eq!(mesh.face_count(), 0, "no walls in duplicate mode");
 
         // geom_last.out is the final (4th) clone: one edge.
         assert_eq!(
@@ -675,7 +675,11 @@ mod tests {
         // Merged tube: 8 spokes * 2 verts = 16 V, 8 wall quads = 8 F, and
         // 8 (spoke) + 8*2/... edges; assert the seam is closed by checking the
         // vert count is exactly one ring fewer than the merge-off doubled count.
-        let merged_counts = (merged.totvert(), merged.totedge(), merged.totface());
+        let merged_counts = (
+            merged.vertex_count(),
+            merged.edge_count(),
+            merged.face_count(),
+        );
         assert_eq!(
             merged_counts.0, 16,
             "8 distinct spokes * 2 verts, seam fused"
@@ -700,10 +704,10 @@ mod tests {
         // Merge-off doubles the seam: one extra ring of verts and an extra
         // (degenerate) wall band relative to the merged tube.
         assert!(
-            unmerged.totvert() > merged.totvert(),
+            unmerged.vertex_count() > merged.vertex_count(),
             "merge-off keeps the doubled seam ({} > {})",
-            unmerged.totvert(),
-            merged.totvert()
+            unmerged.vertex_count(),
+            merged.vertex_count()
         );
         unmerged.validate_topology();
     }
@@ -831,7 +835,7 @@ mod tests {
             false,
             None,
         );
-        let gated_counts = (gated.totvert(), gated.totedge(), gated.totface());
+        let gated_counts = (gated.vertex_count(), gated.edge_count(), gated.face_count());
 
         // The same input with merge explicitly off must match exactly — the gate
         // makes steps=2 merge a no-op.
@@ -851,7 +855,7 @@ mod tests {
         );
         assert_eq!(
             gated_counts,
-            (off.totvert(), off.totedge(), off.totface()),
+            (off.vertex_count(), off.edge_count(), off.face_count()),
             "steps=2 merge is suppressed and equals merge-off"
         );
         gated.validate_topology();
@@ -1179,17 +1183,17 @@ mod tests {
         );
         // Merge fuses one ring of 2 verts / 1 edge onto the originals by identity.
         assert_eq!(
-            off.totvert() - mesh.totvert(),
+            off.vertex_count() - mesh.vertex_count(),
             2,
             "merge fuses one ring of 2 verts"
         );
         assert_eq!(
-            off.totedge() - mesh.totedge(),
+            off.edge_count() - mesh.edge_count(),
             1,
             "merge fuses one ring edge"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             steps as usize,
             "closed tube: `steps` wall bands"
         );
@@ -1202,7 +1206,10 @@ mod tests {
     fn face_quarter_band_extrude() {
         let mut mesh = LoopMesh::new();
         let face = quad_profile(&mut mesh, 1.0);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 4, 1));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 4, 1)
+        );
 
         let out = mesh.spin(
             &[face.into()],
@@ -1221,7 +1228,7 @@ mod tests {
         // a duplicate cap (4 edges + 4 walls), and 4 vertical edges. The leading
         // edge is the final cap face (a quad). Assert a band of walls grew and a
         // cap face survives.
-        assert!(mesh.totface() > 1, "the face swept into a band of quads");
+        assert!(mesh.face_count() > 1, "the face swept into a band of quads");
         assert_eq!(
             out.iter().filter(|g| matches!(g, GeomKey::Face(_))).count(),
             1,
@@ -1258,7 +1265,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         // A lone off-axis vert: 1 V / 0 E / 0 F.
         let v = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (1, 0, 0));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (1, 0, 0)
+        );
 
         let out = mesh.spin(
             &[v.into()],
@@ -1274,13 +1284,13 @@ mod tests {
         );
 
         // The wire polyline: steps+1 verts, steps wire edges, no faces.
-        assert_eq!(mesh.totvert(), 5, "steps+1 = 5 polyline verts");
+        assert_eq!(mesh.vertex_count(), 5, "steps+1 = 5 polyline verts");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             4,
             "steps = 4 wire edges joining the polyline"
         );
-        assert_eq!(mesh.totface(), 0, "vert profile grows no walls");
+        assert_eq!(mesh.face_count(), 0, "vert profile grows no walls");
 
         // §6.4 — the leading edge is the single last extruded vert: 1 element,
         // a vert, with no edge or face in the returned slot.
@@ -1342,7 +1352,7 @@ mod tests {
     fn spin_steps_zero_leaves_profile_untouched() {
         let mut mesh = LoopMesh::new();
         let (e, v0, v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.spin(
             &[e.into()],
@@ -1359,7 +1369,7 @@ mod tests {
 
         // The mesh is untouched — no swept geometry at all.
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             before,
             "steps=0 leaves the mesh exactly as supplied"
         );
@@ -1416,9 +1426,9 @@ mod tests {
         // The full loop ran: 4 coincident rings stitched by (zero-length) walls.
         // Same connectivity as the non-degenerate quarter-pipe (§6.1): 10 V, 13 E,
         // 4 F — only the positions collapse onto the profile.
-        assert_eq!(mesh.totvert(), 10, "steps=4 rings emitted, no merge");
-        assert_eq!(mesh.totedge(), 13);
-        assert_eq!(mesh.totface(), 4);
+        assert_eq!(mesh.vertex_count(), 10, "steps=4 rings emitted, no merge");
+        assert_eq!(mesh.edge_count(), 13);
+        assert_eq!(mesh.face_count(), 4);
 
         // The swept verts all sit at the profile's angular position (angle 0,
         // i.e. the +X half-plane) — the zero rotation never moves them off it.
@@ -1484,7 +1494,7 @@ mod tests {
                 "negative-angle leading edge is one ring (V+E=3)"
             );
             assert_eq!(
-                (mesh.totvert(), mesh.totedge(), mesh.totface()),
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
                 (10, 13, 4)
             );
             mesh.validate_topology();
@@ -1547,7 +1557,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         // A non-empty mesh whose geometry must survive untouched.
         let (_e, _v0, _v1) = edge_profile(&mut mesh, 1.0, 0.0, 1.0);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.spin(
             &[],
@@ -1567,7 +1577,7 @@ mod tests {
             "empty geom returns the seeded-empty slot (count 0)"
         );
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             before,
             "empty geom leaves the non-empty mesh untouched"
         );
@@ -1622,7 +1632,10 @@ mod tests {
 
         // §6.1 single-step edge sweep: profile (2V/1E) + one ring (2V) + one wall
         // (1E dup + 2 vertical, 1 quad). geom_last.out is the single final ring edge.
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 4, 1));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 4, 1)
+        );
         assert_eq!(
             out.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count(),
             1,
@@ -1728,7 +1741,10 @@ mod tests {
                 .map(|v| mesh.vertex_position(v))
                 .collect();
             ps.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap());
-            (ps, (mesh.totvert(), mesh.totedge(), mesh.totface()))
+            (
+                ps,
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            )
         };
 
         let (none_ps, none_counts) = run(None);

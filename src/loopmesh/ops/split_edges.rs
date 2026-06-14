@@ -325,7 +325,7 @@ mod tests {
     fn split_edges_manifold_single_edge_opens_seam() {
         let mut mesh = LoopMesh::new();
         let (verts, _faces, shared) = build_two_quads(&mut mesh);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!((v0, e0, f0), (6, 7, 2));
         assert_eq!(
             mesh.edge_face_keys(shared).len(),
@@ -335,9 +335,9 @@ mod tests {
 
         mesh.split_edges(&[shared], &[], false);
 
-        assert_eq!(mesh.totvert(), v0 + 2, "+2 V (both endpoints doubled)");
-        assert_eq!(mesh.totedge(), e0 + 1, "+1 E (one coincident duplicate)");
-        assert_eq!(mesh.totface(), f0, "+0 F");
+        assert_eq!(mesh.vertex_count(), v0 + 2, "+2 V (both endpoints doubled)");
+        assert_eq!(mesh.edge_count(), e0 + 1, "+1 E (one coincident duplicate)");
+        assert_eq!(mesh.face_count(), f0, "+0 F");
 
         // The two quads now share no edge and no vert: vert 1 and vert 2 each
         // split, so neither face touches the other.
@@ -391,22 +391,22 @@ mod tests {
         {
             let mut mesh = LoopMesh::new();
             let (verts, _faces, shared) = build_two_quads(&mut mesh);
-            let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
             mesh.split_edges(&[shared], &[verts[1], verts[2]], true);
-            assert_eq!(mesh.totvert(), v0 + 2, "both named -> +2 V");
-            assert_eq!(mesh.totedge(), e0 + 1, "+1 E");
-            assert_eq!(mesh.totface(), f0, "+0 F");
+            assert_eq!(mesh.vertex_count(), v0 + 2, "both named -> +2 V");
+            assert_eq!(mesh.edge_count(), e0 + 1, "+1 E");
+            assert_eq!(mesh.face_count(), f0, "+0 F");
             mesh.validate_topology();
         }
         // Only vert 1 named: rips half, +1 V; vert 2 stays welded.
         {
             let mut mesh = LoopMesh::new();
             let (verts, _faces, shared) = build_two_quads(&mut mesh);
-            let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
             mesh.split_edges(&[shared], &[verts[1]], true);
-            assert_eq!(mesh.totvert(), v0 + 1, "one named -> +1 V (rips half)");
-            assert_eq!(mesh.totedge(), e0 + 1, "+1 E (the duplicate edge stays)");
-            assert_eq!(mesh.totface(), f0, "+0 F");
+            assert_eq!(mesh.vertex_count(), v0 + 1, "one named -> +1 V (rips half)");
+            assert_eq!(mesh.edge_count(), e0 + 1, "+1 E (the duplicate edge stays)");
+            assert_eq!(mesh.face_count(), f0, "+0 F");
             // Vert 2 stays single: both faces still contain it (the surface
             // hinges there), while vert 1 doubled so the faces parted at that
             // end.
@@ -432,13 +432,17 @@ mod tests {
     fn split_edges_use_verts_both_unflagged_guard_forces_full_seam() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces, shared) = build_two_quads(&mut mesh);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.split_edges(&[shared], &[], true);
 
-        assert_eq!(mesh.totvert(), v0 + 2, "guard forced both eligible -> +2 V");
-        assert_eq!(mesh.totedge(), e0 + 1, "+1 E");
-        assert_eq!(mesh.totface(), f0, "+0 F");
+        assert_eq!(
+            mesh.vertex_count(),
+            v0 + 2,
+            "guard forced both eligible -> +2 V"
+        );
+        assert_eq!(mesh.edge_count(), e0 + 1, "+1 E");
+        assert_eq!(mesh.face_count(), f0, "+0 F");
         // No stranded double edge: every live edge connects a unique vert pair.
         let mut pairs: HashSet<(VertexKey, VertexKey)> = HashSet::new();
         for e in mesh.edge_keys() {
@@ -464,23 +468,23 @@ mod tests {
     fn split_edges_nonmanifold_spine_separates_fans() {
         let mut mesh = LoopMesh::new();
         let (_verts, spine) = build_book(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!((v0, e0, f0), (5, 7, 3));
         assert_eq!(mesh.edge_face_keys(spine).len(), 3, "spine is radial-3");
 
         let out = mesh.split_edges_out(&[spine], &[], false);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0 + 4,
             "+4 V (each endpoint fans into three)"
         );
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             e0 + 2,
             "+2 E (spine -> three coincident edges)"
         );
-        assert_eq!(mesh.totface(), f0, "+0 F (three pages survive)");
+        assert_eq!(mesh.face_count(), f0, "+0 F (three pages survive)");
         assert_eq!(out.len(), 3, "edges.out = three coincident spine edges");
 
         // Every face is now a free triangle: each of its three edges is
@@ -506,7 +510,7 @@ mod tests {
     fn split_edges_crossing_seams_at_shared_vert() {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!((v0, e0, f0), (16, 24, 9));
 
         // The middle vertical seam: the three stacked interior edges down
@@ -524,13 +528,17 @@ mod tests {
 
         // Three interior edges duplicated -> +3 E. The four interior verts on
         // the seam (1, 5, 9, 13) each split into two fans (left/right) -> +4 V.
-        assert_eq!(mesh.totedge(), e0 + 3, "+3 E (three duplicated seam edges)");
         assert_eq!(
-            mesh.totvert(),
+            mesh.edge_count(),
+            e0 + 3,
+            "+3 E (three duplicated seam edges)"
+        );
+        assert_eq!(
+            mesh.vertex_count(),
             v0 + 4,
             "+4 V (each seam vert fans into two)"
         );
-        assert_eq!(mesh.totface(), f0, "+0 F");
+        assert_eq!(mesh.face_count(), f0, "+0 F");
         mesh.validate_topology();
     }
 
@@ -546,13 +554,13 @@ mod tests {
             let d = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
             let w0 = mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE);
             let w1 = mesh.create_edge([c, d], EdgeCreateFlags::NO_DUPLICATE);
-            let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
             let out = mesh.split_edges_out(&[w0, w1], &[], false);
 
-            assert_eq!(mesh.totvert(), v0, "wire no-op: V unchanged");
-            assert_eq!(mesh.totedge(), e0, "wire no-op: E unchanged");
-            assert_eq!(mesh.totface(), f0, "wire no-op: F unchanged");
+            assert_eq!(mesh.vertex_count(), v0, "wire no-op: V unchanged");
+            assert_eq!(mesh.edge_count(), e0, "wire no-op: E unchanged");
+            assert_eq!(mesh.face_count(), f0, "wire no-op: F unchanged");
             // Each wire edge contributes only itself to the seam.
             assert_eq!(out.len(), 2, "edges.out = the two wire edges themselves");
             mesh.validate_topology();
@@ -561,14 +569,14 @@ mod tests {
         {
             let mut mesh = LoopMesh::new();
             let (_verts, _faces, _shared) = build_two_quads(&mut mesh);
-            let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
             let out = mesh.split_edges_out(&[], &[], false);
 
             assert!(out.is_empty(), "empty input -> empty edges.out");
-            assert_eq!(mesh.totvert(), v0);
-            assert_eq!(mesh.totedge(), e0);
-            assert_eq!(mesh.totface(), f0);
+            assert_eq!(mesh.vertex_count(), v0);
+            assert_eq!(mesh.edge_count(), e0);
+            assert_eq!(mesh.face_count(), f0);
             mesh.validate_topology();
         }
     }

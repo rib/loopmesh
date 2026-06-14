@@ -103,8 +103,8 @@ mod tests {
 
         assert_eq!(result.vert_map.len(), 1, "one duplicate");
         assert_eq!(result.wire_edges.len(), 1, "one wire edge");
-        assert_eq!(mesh.totvert(), 2, "original + duplicate");
-        assert_eq!(mesh.totedge(), 1, "the joining wire edge");
+        assert_eq!(mesh.vertex_count(), 2, "original + duplicate");
+        assert_eq!(mesh.edge_count(), 1, "the joining wire edge");
 
         let (source, duplicate) = result.vert_map[0];
         assert_eq!(source, v);
@@ -139,8 +139,8 @@ mod tests {
 
         assert_eq!(result.vert_map.len(), 3);
         assert_eq!(result.wire_edges.len(), 3);
-        assert_eq!(mesh.totvert(), 6, "3 originals + 3 duplicates");
-        assert_eq!(mesh.totedge(), 3, "one wire edge per input vert");
+        assert_eq!(mesh.vertex_count(), 6, "3 originals + 3 duplicates");
+        assert_eq!(mesh.edge_count(), 3, "one wire edge per input vert");
 
         for (i, &(source, duplicate)) in result.vert_map.iter().enumerate() {
             assert_eq!(source, verts[i]);
@@ -159,8 +159,8 @@ mod tests {
 
         assert_eq!(result.vert_map.len(), 1, "deduped to one duplicate");
         assert_eq!(result.wire_edges.len(), 1);
-        assert_eq!(mesh.totvert(), 2);
-        assert_eq!(mesh.totedge(), 1);
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.edge_count(), 1);
         mesh.validate_topology();
     }
 
@@ -179,19 +179,23 @@ mod tests {
             ],
         );
         let corner = mesh.face_vert_keys(quad)[0];
-        let edges_before = mesh.totedge();
+        let edges_before = mesh.edge_count();
 
         let result = mesh.extrude_vert_indiv(&[corner]);
 
         assert_eq!(result.vert_map.len(), 1);
         assert_eq!(result.wire_edges.len(), 1);
         // The quad is untouched: still one face, still 4 verts on it.
-        assert_eq!(mesh.totface(), 1, "face is not split");
+        assert_eq!(mesh.face_count(), 1, "face is not split");
         assert_eq!(mesh.face_vert_keys(quad).len(), 4, "face still a quad");
         assert!(mesh.face_keys().contains(&quad), "original face survives");
         // Additive: one new vert, one new edge.
-        assert_eq!(mesh.totvert(), 5, "4 quad verts + 1 duplicate");
-        assert_eq!(mesh.totedge(), edges_before + 1, "only the wire edge added");
+        assert_eq!(mesh.vertex_count(), 5, "4 quad verts + 1 duplicate");
+        assert_eq!(
+            mesh.edge_count(),
+            edges_before + 1,
+            "only the wire edge added"
+        );
 
         // The duplicate is wired to the corner but is NOT part of the face.
         let (_source, duplicate) = result.vert_map[0];

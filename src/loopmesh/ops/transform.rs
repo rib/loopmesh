@@ -203,7 +203,10 @@ mod tests {
             assert_close(mesh.vertex_position(v), matrix.transform_point3(before[i]));
         }
         // Topology untouched: still one quad, four verts.
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 4, 1));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 4, 1)
+        );
         assert_eq!(mesh.face_vert_keys(face).len(), 4);
         mesh.validate_topology();
     }
@@ -264,7 +267,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _face) = unit_quad(&mut mesh);
         let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.transform(
             &[],
@@ -274,7 +277,10 @@ mod tests {
         for (i, &v) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(v), before[i]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         mesh.validate_topology();
     }
 
@@ -434,7 +440,7 @@ mod tests {
         assert_close(mesh.vertex_position(verts[2]), before[2]);
         assert_close(mesh.vertex_position(verts[3]), before[3]);
         // Still one face — no topology change despite the sheared geometry.
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         mesh.validate_topology();
     }
 }

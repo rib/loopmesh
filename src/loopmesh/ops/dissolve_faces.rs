@@ -280,9 +280,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!(v0, 16);
         assert_eq!(e0, 24, "3x3 grid: 4*3 horizontal + 4*3 vertical = 24 edges");
         assert_eq!(f0, 9);
@@ -294,9 +294,9 @@ mod tests {
         assert_eq!(result.region.len(), 1, "one region, one successful merge");
         let merged = result.region[0];
 
-        assert_eq!(mesh.totface(), f0 - 1, "-1 face per §7 row 2");
-        assert_eq!(mesh.totedge(), e0 - 1, "-1 edge per §7 row 2");
-        assert_eq!(mesh.totvert(), v0, "0 verts removed per §7 row 2");
+        assert_eq!(mesh.face_count(), f0 - 1, "-1 face per §7 row 2");
+        assert_eq!(mesh.edge_count(), e0 - 1, "-1 edge per §7 row 2");
+        assert_eq!(mesh.vertex_count(), v0, "0 verts removed per §7 row 2");
 
         let perimeter = mesh.face_vert_keys(merged);
         assert_eq!(
@@ -311,16 +311,16 @@ mod tests {
     fn dissolve_faces_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let result = mesh.dissolve_faces(&[], Default::default());
 
         assert!(result.region.is_empty());
-        assert_eq!(mesh.totvert(), v0);
-        assert_eq!(mesh.totedge(), e0);
-        assert_eq!(mesh.totface(), f0);
+        assert_eq!(mesh.vertex_count(), v0);
+        assert_eq!(mesh.edge_count(), e0);
+        assert_eq!(mesh.face_count(), f0);
         mesh.validate_topology();
     }
 
@@ -330,9 +330,9 @@ mod tests {
         // requires at least one manifold step to open a region.
         let mut mesh = LoopMesh::new();
         let (_verts, faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let result = mesh.dissolve_faces(&[faces[0]], Default::default());
 
@@ -340,9 +340,9 @@ mod tests {
             result.region.is_empty(),
             "singleton region contributes nothing to region.out"
         );
-        assert_eq!(mesh.totvert(), v0);
-        assert_eq!(mesh.totedge(), e0);
-        assert_eq!(mesh.totface(), f0);
+        assert_eq!(mesh.vertex_count(), v0);
+        assert_eq!(mesh.edge_count(), e0);
+        assert_eq!(mesh.face_count(), f0);
         mesh.validate_topology();
     }
 
@@ -410,9 +410,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = build_grid_3x3(&mut mesh);
 
-        let v0_count = mesh.totvert();
-        let e0_count = mesh.totedge();
-        let f0_count = mesh.totface();
+        let v0_count = mesh.vertex_count();
+        let e0_count = mesh.edge_count();
+        let f0_count = mesh.face_count();
         assert_eq!(v0_count, 16);
         assert_eq!(e0_count, 24);
         assert_eq!(f0_count, 9);
@@ -445,17 +445,17 @@ mod tests {
         // The region merge itself is -2 F, -2 E (two interior edges between
         // the three faces), 0 V. Net: -2 F, -4 E, -2 V.
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             f0_count - 2,
             "-2 faces (3 input → 1 merged)"
         );
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             e0_count - 4,
             "-2 from merge, -2 from use_verts collapses"
         );
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0_count - 2,
             "-2 verts: v1 and v2 collapsed by post-pass"
         );
@@ -538,9 +538,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = build_grid_5x5(&mut mesh);
 
-        let v0_count = mesh.totvert();
-        let e0_count = mesh.totedge();
-        let f0_count = mesh.totface();
+        let v0_count = mesh.vertex_count();
+        let e0_count = mesh.edge_count();
+        let f0_count = mesh.face_count();
         assert_eq!(v0_count, 36);
         assert_eq!(f0_count, 25);
 
@@ -569,10 +569,10 @@ mod tests {
         // Post-merge they each lose 1 edge (the one pointing into the
         // dissolved interior), leaving 3 — still not edge-pair, so the
         // post-pass marks but does not collapse them.
-        assert_eq!(mesh.totface(), f0_count - 3);
-        assert_eq!(mesh.totedge(), e0_count - 4);
+        assert_eq!(mesh.face_count(), f0_count - 3);
+        assert_eq!(mesh.edge_count(), e0_count - 4);
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0_count - 1,
             "centre vert killed by merge, no use_verts collapse"
         );
@@ -595,9 +595,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = build_grid_3x3(&mut mesh);
 
-        let v0_count = mesh.totvert();
-        let e0_count = mesh.totedge();
-        let f0_count = mesh.totface();
+        let v0_count = mesh.vertex_count();
+        let e0_count = mesh.edge_count();
+        let f0_count = mesh.face_count();
 
         let v1 = verts[1];
         let v2 = verts[2];
@@ -611,9 +611,9 @@ mod tests {
         // -2 F (3 input → 1 merged), -2 E (two interior edges), 0 V — the
         // post-pass is off, so the mid-rim verts survive as edge-pair
         // boundary nodes of the merged rectangle.
-        assert_eq!(mesh.totface(), f0_count - 2);
-        assert_eq!(mesh.totedge(), e0_count - 2);
-        assert_eq!(mesh.totvert(), v0_count);
+        assert_eq!(mesh.face_count(), f0_count - 2);
+        assert_eq!(mesh.edge_count(), e0_count - 2);
+        assert_eq!(mesh.vertex_count(), v0_count);
 
         assert_eq!(
             mesh.vert_edge_keys(v1).len(),
@@ -677,9 +677,9 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 7);
-        assert_eq!(mesh.totface(), 3);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 7);
+        assert_eq!(mesh.face_count(), 3);
 
         let result = mesh.dissolve_faces(&[f_left, f_right], DissolveFacesOptions::default());
 
@@ -688,9 +688,9 @@ mod tests {
             result.region[0], f_shadow,
             "region.out carries the shadow, not the merge result"
         );
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 6);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 6);
+        assert_eq!(mesh.face_count(), 1);
 
         let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert!(live.contains(&f_shadow));
@@ -754,9 +754,9 @@ mod tests {
         let apex_0 = verts[2];
         let apex_1 = verts[3];
 
-        assert_eq!(mesh.totvert(), 5);
-        assert_eq!(mesh.totedge(), 7);
-        assert_eq!(mesh.totface(), 3);
+        assert_eq!(mesh.vertex_count(), 5);
+        assert_eq!(mesh.edge_count(), 7);
+        assert_eq!(mesh.face_count(), 3);
         let spine = mesh
             .query_edge_exists(v0, v1)
             .expect("spine edge {v0,v1} must exist pre-merge");
@@ -781,16 +781,16 @@ mod tests {
         // edge killed (the spine survives with f2's loop on it); no
         // verts killed (every region vert retains at least one edge).
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "f0 + f1 merged into the kite; f2 untouched"
         );
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             7,
             "spine survives — its radial dropped to 1, not 0"
         );
-        assert_eq!(mesh.totvert(), 5);
+        assert_eq!(mesh.vertex_count(), 5);
 
         // The spine edge is still alive and its radial cycle is now the
         // singleton {f2}.
@@ -1011,9 +1011,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, faces) = build_nonmanifold_book_3(&mut mesh);
 
-        let v0_count = mesh.totvert();
-        let e0_count = mesh.totedge();
-        let f0_count = mesh.totface();
+        let v0_count = mesh.vertex_count();
+        let e0_count = mesh.edge_count();
+        let f0_count = mesh.face_count();
 
         let result = mesh.dissolve_faces(
             &[faces[0], faces[1], faces[2]],
@@ -1024,9 +1024,9 @@ mod tests {
             result.region.is_empty(),
             "every region is a singleton — §3.1 skips them all"
         );
-        assert_eq!(mesh.totvert(), v0_count, "mesh unchanged");
-        assert_eq!(mesh.totedge(), e0_count, "mesh unchanged");
-        assert_eq!(mesh.totface(), f0_count, "mesh unchanged");
+        assert_eq!(mesh.vertex_count(), v0_count, "mesh unchanged");
+        assert_eq!(mesh.edge_count(), e0_count, "mesh unchanged");
+        assert_eq!(mesh.face_count(), f0_count, "mesh unchanged");
         mesh.validate_topology();
     }
 }

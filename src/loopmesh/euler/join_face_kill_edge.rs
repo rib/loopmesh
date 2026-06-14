@@ -146,13 +146,13 @@ mod tests {
             .unwrap();
 
         let (face2, new_edge, _l_new) = mesh.euler_split_face_make_edge(face, l_v0, l_v2);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         let joined = mesh.euler_join_face_kill_edge(face, face2, new_edge);
         assert_eq!(joined, Some(face), "join should return the surviving face");
 
-        assert_eq!(mesh.totface(), 1);
-        assert_eq!(mesh.totedge(), 4, "split edge should have been killed");
+        assert_eq!(mesh.face_count(), 1);
+        assert_eq!(mesh.edge_count(), 4, "split edge should have been killed");
         assert_eq!(mesh.face_len(face), 4, "restored quad");
 
         let verts_after: std::collections::HashSet<VertexKey> =

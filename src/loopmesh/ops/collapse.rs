@@ -793,8 +793,12 @@ mod tests {
 
         mesh.collapse(&[shared], false);
 
-        assert_eq!(mesh.totvert(), 5, "the shared pair fused to one survivor");
-        assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
+        assert_eq!(
+            mesh.vertex_count(),
+            5,
+            "the shared pair fused to one survivor"
+        );
+        assert_eq!(mesh.face_count(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
             assert_eq!(
                 mesh.face_len(face),
@@ -821,8 +825,12 @@ mod tests {
 
         mesh.collapse(&edges, false);
 
-        assert_eq!(mesh.totvert(), 1, "the whole chain fused to one survivor");
-        assert_eq!(mesh.totedge(), 0, "every collapsed chain edge is reaped");
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "the whole chain fused to one survivor"
+        );
+        assert_eq!(mesh.edge_count(), 0, "every collapsed chain edge is reaped");
         mesh.validate_topology();
     }
 
@@ -849,8 +857,12 @@ mod tests {
 
         mesh.collapse(&spokes, false);
 
-        assert_eq!(mesh.totvert(), 1, "the whole star fused to one survivor");
-        assert_eq!(mesh.totedge(), 0, "all four spokes collapsed away");
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "the whole star fused to one survivor"
+        );
+        assert_eq!(mesh.edge_count(), 0, "all four spokes collapsed away");
         mesh.validate_topology();
     }
 
@@ -877,7 +889,7 @@ mod tests {
 
         mesh.collapse(&edges, false);
 
-        assert_eq!(mesh.totvert(), 1, "the chain fused to one survivor");
+        assert_eq!(mesh.vertex_count(), 1, "the chain fused to one survivor");
         let survivor = mesh.vert_keys()[0];
         let pos = mesh.vertex_position(survivor);
         assert!(
@@ -899,9 +911,13 @@ mod tests {
 
         mesh.collapse(&[wire], false);
 
-        assert_eq!(mesh.totvert(), 1, "the wire endpoints fused to one vert");
-        assert_eq!(mesh.totedge(), 0, "the wire edge collapsed away");
-        assert_eq!(mesh.totface(), 0, "no face involved");
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "the wire endpoints fused to one vert"
+        );
+        assert_eq!(mesh.edge_count(), 0, "the wire edge collapsed away");
+        assert_eq!(mesh.face_count(), 0, "no face involved");
         let survivor = mesh.vert_keys()[0];
         assert_eq!(
             mesh.vertex_position(survivor),
@@ -917,11 +933,14 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, shared) = two_quads_shared_edge(&mut mesh);
         let _ = shared;
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.collapse(&[], false);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -939,8 +958,8 @@ mod tests {
 
         mesh.collapse(&[e0, e1], false);
 
-        assert_eq!(mesh.totvert(), 2, "two independent survivors");
-        assert_eq!(mesh.totedge(), 0, "both wire edges collapsed away");
+        assert_eq!(mesh.vertex_count(), 2, "two independent survivors");
+        assert_eq!(mesh.edge_count(), 0, "both wire edges collapsed away");
         let positions: HashSet<[i32; 2]> = mesh
             .vert_keys()
             .into_iter()
@@ -981,7 +1000,7 @@ mod tests {
                 .collect();
             mesh.face_create(&vs, &es, FaceCreateFlags::NONE);
         }
-        assert_eq!(mesh.totface(), 3, "three quads share the spine");
+        assert_eq!(mesh.face_count(), 3, "three quads share the spine");
 
         mesh.collapse(&[spine], false);
 
@@ -991,7 +1010,7 @@ mod tests {
             !live.contains(&spine0) || !live.contains(&spine1),
             "one spine endpoint fused away"
         );
-        assert_eq!(mesh.totface(), 3, "all three wings survive");
+        assert_eq!(mesh.face_count(), 3, "all three wings survive");
         for face in mesh.face_keys() {
             assert_eq!(mesh.face_len(face), 3, "each wing dropped to a triangle");
         }
@@ -1226,11 +1245,11 @@ mod tests {
         mesh.collapse(&[shared], true);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             5,
             "topology collapses regardless of the flag"
         );
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
         mesh.validate_topology();
     }
 
@@ -1308,9 +1327,9 @@ mod tests {
         mesh.validate_topology();
 
         // Topology is untouched (§5 / §7.1).
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 7);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 7);
+        assert_eq!(mesh.face_count(), 2);
 
         // Every shared-edge corner now carries the island midpoint.
         for l in mesh.loop_keys() {
@@ -1529,13 +1548,16 @@ mod tests {
     fn collapse_uvs_no_loop_layer_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, shared) = two_quads_shared_edge(&mut mesh);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let layers_before = mesh.loop_attribs().iter_descriptors().count();
 
         mesh.collapse_uvs(&[shared]);
         mesh.validate_topology();
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         assert_eq!(
             mesh.loop_attribs().iter_descriptors().count(),
             layers_before,
@@ -1944,13 +1966,16 @@ mod tests {
     fn average_vert_facedata_no_loop_layer_is_noop() {
         let mut mesh = LoopMesh::new();
         let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let layers_before = mesh.loop_attribs().iter_descriptors().count();
 
         mesh.average_vert_facedata(&[hub]);
         mesh.validate_topology();
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         assert_eq!(
             mesh.loop_attribs().iter_descriptors().count(),
             layers_before,

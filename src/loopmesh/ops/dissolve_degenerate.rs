@@ -355,12 +355,15 @@ mod tests {
                 Vec3::new(0.0, 1.0, 0.0),
             ],
         );
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.0);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -378,12 +381,15 @@ mod tests {
                 Vec3::new(0.0, 1.0, 0.0),
             ],
         );
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -393,14 +399,21 @@ mod tests {
     fn short_shared_edge_collapses_in_two_quad_strip() {
         let mut mesh = LoopMesh::new();
         let (_v, _shared) = two_quads_shared_edge_short_y(&mut mesh, 0.001);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totvert(), 5, "the short shared pair fused to one vert");
-        assert_eq!(mesh.totedge(), 6, "the short edge is reaped");
-        assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
+        assert_eq!(
+            mesh.vertex_count(),
+            5,
+            "the short shared pair fused to one vert"
+        );
+        assert_eq!(mesh.edge_count(), 6, "the short edge is reaped");
+        assert_eq!(mesh.face_count(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
             assert_eq!(mesh.face_len(face), 3);
         }
@@ -424,9 +437,13 @@ mod tests {
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totvert(), 1, "the tiny triangle fused to one vert");
-        assert_eq!(mesh.totedge(), 0);
-        assert_eq!(mesh.totface(), 0);
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "the tiny triangle fused to one vert"
+        );
+        assert_eq!(mesh.edge_count(), 0);
+        assert_eq!(mesh.face_count(), 0);
         mesh.validate_topology();
     }
 
@@ -445,12 +462,12 @@ mod tests {
                 Vec3::new(2.0, 0.0, 0.0),
             ],
         );
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totface(), 0, "the zero-area triangle is consumed");
+        assert_eq!(mesh.face_count(), 0, "the zero-area triangle is consumed");
         mesh.validate_topology();
     }
 
@@ -468,8 +485,8 @@ mod tests {
 
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totvert(), 1, "the whole chain fused to one vert");
-        assert_eq!(mesh.totedge(), 0);
+        assert_eq!(mesh.vertex_count(), 1, "the whole chain fused to one vert");
+        assert_eq!(mesh.edge_count(), 0);
         mesh.validate_topology();
     }
 
@@ -479,11 +496,14 @@ mod tests {
     fn empty_input_preserves_degeneracy() {
         let mut mesh = LoopMesh::new();
         two_quads_shared_edge_short_y(&mut mesh, 0.001);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.dissolve_degenerate(&[], 0.01);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -498,9 +518,9 @@ mod tests {
 
         mesh.dissolve_degenerate(&[wire], 0.01);
 
-        assert_eq!(mesh.totvert(), 1, "the wire endpoints fused");
-        assert_eq!(mesh.totedge(), 0);
-        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.vertex_count(), 1, "the wire endpoints fused");
+        assert_eq!(mesh.edge_count(), 0);
+        assert_eq!(mesh.face_count(), 0);
         mesh.validate_topology();
     }
 
@@ -514,8 +534,8 @@ mod tests {
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totvert(), 5, "below-threshold edge collapses");
-        assert_eq!(mesh.totedge(), 6);
+        assert_eq!(mesh.vertex_count(), 5, "below-threshold edge collapses");
+        assert_eq!(mesh.edge_count(), 6);
         mesh.validate_topology();
     }
 
@@ -525,12 +545,15 @@ mod tests {
     fn dist_boundary_above_threshold_preserves() {
         let mut mesh = LoopMesh::new();
         two_quads_shared_edge_short_y(&mut mesh, 0.0101);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -559,7 +582,7 @@ mod tests {
 
         // The doubled-back spur at v1 is clipped away; the face survives as a
         // triangle on the off-axis apex.
-        assert_eq!(mesh.totface(), 1, "one face survives");
+        assert_eq!(mesh.face_count(), 1, "one face survives");
         let face = mesh.face_keys()[0];
         assert_eq!(mesh.face_len(face), 3, "the spur corner is gone");
         mesh.validate_topology();
@@ -585,7 +608,7 @@ mod tests {
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
-        assert_eq!(mesh.totface(), 1, "one face survives");
+        assert_eq!(mesh.face_count(), 1, "one face survives");
         let face = mesh.face_keys()[0];
         assert_eq!(mesh.face_len(face), 3, "the spur corner is gone");
         mesh.validate_topology();
@@ -612,14 +635,14 @@ mod tests {
         };
         mk_tri(&mut mesh, [v0, v1, v2]);
         mk_tri(&mut mesh, [v1, v0, v3]);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         let edges = mesh.edge_keys();
         mesh.dissolve_degenerate(&edges, 0.01);
 
         // Both zero-area triangles are consumed; the walk did not loop forever
         // or skip a loop after the radial cycle grew.
-        assert_eq!(mesh.totface(), 0, "both collinear triangles consumed");
+        assert_eq!(mesh.face_count(), 0, "both collinear triangles consumed");
         mesh.validate_topology();
     }
 
@@ -642,12 +665,12 @@ mod tests {
         );
         let e01 = mesh.query_edge_exists(v0, v1).unwrap();
         let e12 = mesh.query_edge_exists(v1, v2).unwrap();
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.dissolve_degenerate(&[e01, e12], 0.01);
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             before,
             "sparse input does not clip the unscoped corners"
         );
@@ -676,17 +699,21 @@ mod tests {
 
         let mut iterations = 0;
         loop {
-            let edge_count_before = mesh.totedge();
+            let edge_count_before = mesh.edge_count();
             let edges = mesh.edge_keys();
             mesh.dissolve_degenerate(&edges, 0.01);
             mesh.validate_topology();
-            if mesh.totedge() == edge_count_before {
+            if mesh.edge_count() == edge_count_before {
                 break;
             }
             iterations += 1;
             assert!(iterations <= 8, "caller fixed-point loop should converge");
         }
 
-        assert_eq!(mesh.totface(), 0, "the degenerate sliver pair is removed");
+        assert_eq!(
+            mesh.face_count(),
+            0,
+            "the degenerate sliver pair is removed"
+        );
     }
 }

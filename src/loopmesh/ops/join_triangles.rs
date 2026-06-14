@@ -1232,13 +1232,16 @@ mod tests {
     fn single_tri_pair_merges_to_quad() {
         let mut mesh = LoopMesh::new();
         let (lower, upper, _) = two_tris_shared_edge(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 5, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 5, 2)
+        );
 
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
-        assert_eq!(mesh.totvert(), 4, "no vert removed");
-        assert_eq!(mesh.totedge(), 4, "the shared diagonal is gone (−1 E)");
-        assert_eq!(mesh.totface(), 1, "one quad (−1 F)");
+        assert_eq!(mesh.vertex_count(), 4, "no vert removed");
+        assert_eq!(mesh.edge_count(), 4, "the shared diagonal is gone (−1 E)");
+        assert_eq!(mesh.face_count(), 1, "one quad (−1 F)");
         assert_eq!(result.joined.len(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         assert!(result.unmerged.is_empty());
@@ -1283,7 +1286,7 @@ mod tests {
             result.joined.is_empty(),
             "the material boundary blocks the merge"
         );
-        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_count(), 2, "both triangles survive");
         assert_eq!(mesh.face_len(lower), 3);
         assert_eq!(mesh.face_len(upper), 3);
         mesh.validate_topology();
@@ -1313,7 +1316,7 @@ mod tests {
             result.joined.is_empty(),
             "explicit 5 vs default 0 is a material boundary"
         );
-        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_count(), 2, "both triangles survive");
         assert_eq!(
             mesh.face_material_index(upper),
             0,
@@ -1347,7 +1350,7 @@ mod tests {
                 1,
                 "equal materials merge (assigned={assign_equal})"
             );
-            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_count(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
         }
@@ -1369,7 +1372,7 @@ mod tests {
             1,
             "material difference ignored when gate is off"
         );
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
     }
@@ -1427,7 +1430,7 @@ mod tests {
         );
 
         assert!(result.joined.is_empty(), "the seam blocks the merge");
-        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_count(), 2, "both triangles survive");
         assert_eq!(mesh.face_len(lower), 3);
         assert_eq!(mesh.face_len(upper), 3);
         mesh.validate_topology();
@@ -1458,7 +1461,7 @@ mod tests {
                 1,
                 "no seam merges (assigned={assign_false})"
             );
-            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_count(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
         }
@@ -1476,7 +1479,7 @@ mod tests {
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "seam ignored when gate is off");
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
     }
@@ -1528,7 +1531,7 @@ mod tests {
         );
 
         assert!(result.joined.is_empty(), "the sharp edge blocks the merge");
-        assert_eq!(mesh.totface(), 2, "both triangles survive");
+        assert_eq!(mesh.face_count(), 2, "both triangles survive");
         assert_eq!(mesh.face_len(lower), 3);
         assert_eq!(mesh.face_len(upper), 3);
         mesh.validate_topology();
@@ -1561,7 +1564,7 @@ mod tests {
                 1,
                 "smooth merges (assigned={assign_smooth})"
             );
-            assert_eq!(mesh.totface(), 1);
+            assert_eq!(mesh.face_count(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
         }
@@ -1579,7 +1582,7 @@ mod tests {
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "sharp ignored when gate is off");
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
     }
@@ -1599,7 +1602,7 @@ mod tests {
 
         // Both input triangles were consumed by the single merge, so the
         // un-merged-triangle set is empty; the quad still formed.
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert!(result.unmerged.is_empty());
         mesh.validate_topology();
     }
@@ -1634,7 +1637,7 @@ mod tests {
             vec![lone],
             "the lone triangle survives un-merged"
         );
-        assert_eq!(mesh.totface(), 2, "merged quad + surviving triangle");
+        assert_eq!(mesh.face_count(), 2, "merged quad + surviving triangle");
         assert_eq!(mesh.face_len(lone), 3);
         mesh.validate_topology();
     }
@@ -1708,18 +1711,21 @@ mod tests {
         let t2 = build_tri_from_verts(&mut mesh, [v[1], v[2], v[4]]);
         let t3 = build_tri_from_verts(&mut mesh, [v[2], v[5], v[4]]);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 9, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 9, 4)
+        );
 
         let result = mesh.join_triangles(&[t0, t1, t2, t3], JoinTrianglesParams::default());
 
-        assert_eq!(mesh.totface(), 2, "two quads form");
+        assert_eq!(mesh.face_count(), 2, "two quads form");
         assert_eq!(result.joined.len(), 2);
         for &quad in &result.joined {
             assert_eq!(mesh.face_len(quad), 4);
         }
         // 6 V, 9 E, 4 F → −2 E, −2 F: 6 V, 7 E, 2 F.
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 7);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 7);
         mesh.validate_topology();
     }
 
@@ -1748,7 +1754,11 @@ mod tests {
         let result = mesh.join_triangles(&[lower, upper, quad], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "only the tri-pair merges");
-        assert_eq!(mesh.totface(), 2, "merged quad + the untouched input quad");
+        assert_eq!(
+            mesh.face_count(),
+            2,
+            "merged quad + the untouched input quad"
+        );
         assert!(
             mesh.faces.try_get(quad).is_some(),
             "the input quad survives"
@@ -1787,7 +1797,7 @@ mod tests {
             blocked_result.joined.is_empty(),
             "tight fold gate blocks merge"
         );
-        assert_eq!(blocked.totface(), 2, "both triangles survive");
+        assert_eq!(blocked.face_count(), 2, "both triangles survive");
         blocked.validate_topology();
 
         // Disabled threshold (π) permits the fold.
@@ -1795,7 +1805,7 @@ mod tests {
         let (l, u) = build(&mut allowed);
         let allowed_result = allowed.join_triangles(&[l, u], JoinTrianglesParams::default());
         assert_eq!(allowed_result.joined.len(), 1, "disabled fold gate merges");
-        assert_eq!(allowed.totface(), 1);
+        assert_eq!(allowed.face_count(), 1);
         allowed.validate_topology();
     }
 
@@ -1827,7 +1837,7 @@ mod tests {
             blocked_result.joined.is_empty(),
             "tight shape gate rejects sliver"
         );
-        assert_eq!(blocked.totface(), 2);
+        assert_eq!(blocked.face_count(), 2);
         blocked.validate_topology();
 
         let mut allowed = LoopMesh::new();
@@ -1868,7 +1878,7 @@ mod tests {
             blocked_result.joined.is_empty(),
             "cmp_uvs gates the UV seam"
         );
-        assert_eq!(blocked.totface(), 2);
+        assert_eq!(blocked.face_count(), 2);
         blocked.validate_topology();
 
         let mut allowed = LoopMesh::new();
@@ -1907,7 +1917,7 @@ mod tests {
             blocked_result.joined.is_empty(),
             "cmp_vcols gates the colour seam"
         );
-        assert_eq!(blocked.totface(), 2);
+        assert_eq!(blocked.face_count(), 2);
         blocked.validate_topology();
 
         let mut allowed = LoopMesh::new();
@@ -1994,7 +2004,10 @@ mod tests {
         let (faces, [_q, tc, _ta, _tb]) = build_contested_influence(&mut zero);
         let zero_result = zero.join_triangles(&faces, JoinTrianglesParams::default());
 
-        assert_eq!((zero.totvert(), zero.totedge(), zero.totface()), (7, 9, 3));
+        assert_eq!(
+            (zero.vertex_count(), zero.edge_count(), zero.face_count()),
+            (7, 9, 3)
+        );
         assert_eq!(
             zero_result.joined.len(),
             1,
@@ -2017,7 +2030,10 @@ mod tests {
             },
         );
 
-        assert_eq!((two.totvert(), two.totedge(), two.totface()), (7, 9, 3));
+        assert_eq!(
+            (two.vertex_count(), two.edge_count(), two.face_count()),
+            (7, 9, 3)
+        );
         assert_eq!(
             two_result.joined.len(),
             1,
@@ -2112,7 +2128,11 @@ mod tests {
         );
 
         assert_eq!(
-            (folded.totvert(), folded.totedge(), folded.totface()),
+            (
+                folded.vertex_count(),
+                folded.edge_count(),
+                folded.face_count()
+            ),
             (7, 9, 3)
         );
         assert_eq!(
@@ -2158,9 +2178,9 @@ mod tests {
         };
 
         // Same counts both ways.
-        assert_eq!(zero.totvert(), two.totvert());
-        assert_eq!(zero.totedge(), two.totedge());
-        assert_eq!(zero.totface(), two.totface());
+        assert_eq!(zero.vertex_count(), two.vertex_count());
+        assert_eq!(zero.edge_count(), two.edge_count());
+        assert_eq!(zero.face_count(), two.face_count());
         // Different surviving triangle ⇒ non-isomorphic.
         assert_ne!(
             zero_survivor, two_survivor,
@@ -2193,8 +2213,11 @@ mod tests {
         );
 
         assert_eq!(zero_result.joined.len(), two_result.joined.len());
-        assert_eq!(zero.totface(), two.totface());
-        assert_eq!((zero.totvert(), zero.totedge(), zero.totface()), (4, 4, 1));
+        assert_eq!(zero.face_count(), two.face_count());
+        assert_eq!(
+            (zero.vertex_count(), zero.edge_count(), zero.face_count()),
+            (4, 4, 1)
+        );
         two.validate_topology();
     }
 

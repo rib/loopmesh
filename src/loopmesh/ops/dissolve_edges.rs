@@ -884,9 +884,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!((v0, e0, f0), (16, 24, 9));
 
         // Vertical interior edge between faces[0] and faces[1]: verts[1]-verts[5].
@@ -896,9 +896,9 @@ mod tests {
 
         mesh.dissolve_edges(&[edge], &Default::default());
 
-        assert_eq!(mesh.totvert(), v0, "0 verts removed (§7 row 3)");
-        assert_eq!(mesh.totedge(), e0 - 1, "-1 edge (§7 row 3)");
-        assert_eq!(mesh.totface(), f0 - 1, "-1 face (§7 row 3)");
+        assert_eq!(mesh.vertex_count(), v0, "0 verts removed (§7 row 3)");
+        assert_eq!(mesh.edge_count(), e0 - 1, "-1 edge (§7 row 3)");
+        assert_eq!(mesh.face_count(), f0 - 1, "-1 face (§7 row 3)");
         assert!(
             mesh.query_edge_exists(verts[1], verts[5]).is_none(),
             "the dissolved edge is gone"
@@ -921,16 +921,16 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, diagonal, _faces) = build_two_tris_shared_diagonal(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!((v0, e0, f0), (4, 5, 2));
 
         mesh.dissolve_edges(&[diagonal], &Default::default());
 
-        assert_eq!(mesh.totvert(), v0, "0 verts removed");
-        assert_eq!(mesh.totedge(), e0 - 1, "-1 edge (the diagonal)");
-        assert_eq!(mesh.totface(), f0 - 1, "-1 face (two tris → one quad)");
+        assert_eq!(mesh.vertex_count(), v0, "0 verts removed");
+        assert_eq!(mesh.edge_count(), e0 - 1, "-1 edge (the diagonal)");
+        assert_eq!(mesh.face_count(), f0 - 1, "-1 face (two tris → one quad)");
 
         let merged = mesh.face_keys();
         assert_eq!(merged.len(), 1);
@@ -1000,14 +1000,14 @@ mod tests {
         let w1 = mesh.create_vertex(Vec3::new(11.0, 0.0, 0.0));
         let wire = mesh.create_edge([w0, w1], EdgeCreateFlags::NO_DUPLICATE);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_edges(&[wire], &Default::default());
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         assert!(
@@ -1024,14 +1024,14 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, edges, _f) = build_triangle(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_edges(&[edges[0]], &Default::default());
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         assert!(
@@ -1049,9 +1049,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         // Edge {1,5} sits between faces[0]/faces[1] (bottom row).
         // Edge {10,14} sits between faces[6]/faces[7] (top row) — disjoint.
@@ -1064,9 +1064,9 @@ mod tests {
 
         mesh.dissolve_edges(&[edge_a, edge_b], &Default::default());
 
-        assert_eq!(mesh.totvert(), v0, "0 verts removed");
-        assert_eq!(mesh.totedge(), e0 - 2, "-2 edges");
-        assert_eq!(mesh.totface(), f0 - 2, "-2 faces");
+        assert_eq!(mesh.vertex_count(), v0, "0 verts removed");
+        assert_eq!(mesh.edge_count(), e0 - 2, "-2 edges");
+        assert_eq!(mesh.face_count(), f0 - 2, "-2 faces");
         mesh.validate_topology();
     }
 
@@ -1076,9 +1076,9 @@ mod tests {
         // is identical, pinning the order-independence claim of §8.
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let edge_a = mesh
             .query_edge_exists(verts[1], verts[5])
@@ -1089,9 +1089,9 @@ mod tests {
 
         mesh.dissolve_edges(&[edge_b, edge_a], &Default::default());
 
-        assert_eq!(mesh.totvert(), v0);
-        assert_eq!(mesh.totedge(), e0 - 2);
-        assert_eq!(mesh.totface(), f0 - 2);
+        assert_eq!(mesh.vertex_count(), v0);
+        assert_eq!(mesh.edge_count(), e0 - 2);
+        assert_eq!(mesh.face_count(), f0 - 2);
         mesh.validate_topology();
     }
 
@@ -1104,9 +1104,9 @@ mod tests {
         // merges run and consume one edge / one face each.
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         // Centre vert is verts[5]. Two interior edges meeting at it:
         // {1,5} (between faces[0]/faces[1]) and {5,6} (between faces[1]/faces[2]).
@@ -1124,9 +1124,13 @@ mod tests {
         // faces[1] (now merged with faces[0]) and faces[2]. The second
         // merge joins that merged face with faces[2]. Net over both edges:
         // -2 E, -2 F, 0 V.
-        assert_eq!(mesh.totvert(), v0, "0 verts removed under default params");
-        assert_eq!(mesh.totedge(), e0 - 2, "-2 edges (both dissolved)");
-        assert_eq!(mesh.totface(), f0 - 2, "-2 faces (both merges ran)");
+        assert_eq!(
+            mesh.vertex_count(),
+            v0,
+            "0 verts removed under default params"
+        );
+        assert_eq!(mesh.edge_count(), e0 - 2, "-2 edges (both dissolved)");
+        assert_eq!(mesh.face_count(), f0 - 2, "-2 faces (both merges ran)");
         assert!(mesh.query_edge_exists(verts[1], verts[5]).is_none());
         assert!(mesh.query_edge_exists(verts[5], verts[6]).is_none());
         mesh.validate_topology();
@@ -1139,14 +1143,14 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (s0, s1, spine) = build_nonmanifold_book(&mut mesh, 3);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_edges(&[spine], &Default::default());
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         assert!(
@@ -1164,14 +1168,14 @@ mod tests {
         // regardless of iteration order.
         let mut mesh = LoopMesh::new();
         let (_verts, edges, _f) = build_triangle(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_edges(&edges, &Default::default());
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         mesh.validate_topology();
@@ -1181,14 +1185,14 @@ mod tests {
     fn dissolve_edges_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_edges(&[], &Default::default());
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         mesh.validate_topology();
@@ -1247,7 +1251,10 @@ mod tests {
     fn dissolve_edges_use_verts_true_collapses_edge_pair_endpoint() {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
 
         let edge = mesh
             .query_edge_exists(verts[1], verts[4])
@@ -1256,9 +1263,9 @@ mod tests {
         let result = mesh.dissolve_edges(&[edge], &use_verts(std::f32::consts::PI));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
-        assert_eq!(mesh.totvert(), 8, "-1 V (vert 1 collapsed)");
-        assert_eq!(mesh.totedge(), 10, "-1 E from merge, -1 E from collapse");
-        assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
+        assert_eq!(mesh.vertex_count(), 8, "-1 V (vert 1 collapsed)");
+        assert_eq!(mesh.edge_count(), 10, "-1 E from merge, -1 E from collapse");
+        assert_eq!(mesh.face_count(), 3, "-1 F (faces 0+1 merged)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(
@@ -1290,9 +1297,9 @@ mod tests {
         let result = mesh.dissolve_edges(&[edge], &use_verts(0.0));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
-        assert_eq!(mesh.totvert(), 9, "0 V removed — use_verts forced off");
-        assert_eq!(mesh.totedge(), 11, "-1 E (only the merge)");
-        assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
+        assert_eq!(mesh.vertex_count(), 9, "0 V removed — use_verts forced off");
+        assert_eq!(mesh.edge_count(), 11, "-1 E (only the merge)");
+        assert_eq!(mesh.face_count(), 3, "-1 F (faces 0+1 merged)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&verts[1]), "vert 1 survives — no collapse");
@@ -1342,12 +1349,12 @@ mod tests {
         // The guard fires at both endpoints: neither collapses. The two tris
         // become one quad; verts unchanged. Same as use_verts = false.
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             4,
             "0 V removed — guard preserved both endpoints"
         );
-        assert_eq!(mesh.totedge(), 4, "-1 E (the diagonal)");
-        assert_eq!(mesh.totface(), 1, "-1 F (two tris → one quad)");
+        assert_eq!(mesh.edge_count(), 4, "-1 E (the diagonal)");
+        assert_eq!(mesh.face_count(), 1, "-1 F (two tris → one quad)");
         let faces = mesh.face_keys();
         assert_eq!(
             mesh.face_len(faces[0]),
@@ -1607,7 +1614,10 @@ mod tests {
     fn dissolve_edges_blended_angle_rejects_ninety_degree_fold() {
         let mut mesh = LoopMesh::new();
         let v = build_folded_two_quads(&mut mesh, Vec3::new(0.0, 0.0, 1.0));
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 2)
+        );
 
         let shared = mesh
             .query_edge_exists(v[1], v[2])
@@ -1617,13 +1627,13 @@ mod tests {
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             6,
             "0 V removed — both candidates rejected by the gate"
         );
-        assert_eq!(mesh.totedge(), 6, "-1 E (only the merge)");
+        assert_eq!(mesh.edge_count(), 6, "-1 E (only the merge)");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "-1 F (the two quads merge into one hexagon)"
         );
@@ -1667,8 +1677,8 @@ mod tests {
             !live.contains(&v[2]),
             "vert 2 collapses — α_raw = π/2 < 2.0"
         );
-        assert_eq!(mesh.totvert(), 4, "-2 V (both endpoints collapsed)");
-        assert_eq!(mesh.totface(), 1, "-1 F (the merge)");
+        assert_eq!(mesh.vertex_count(), 4, "-2 V (both endpoints collapsed)");
+        assert_eq!(mesh.face_count(), 1, "-1 F (the merge)");
         mesh.validate_topology();
     }
 
@@ -1692,9 +1702,9 @@ mod tests {
         let result = mesh.dissolve_edges(&[edge], &use_verts(0.5));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
-        assert_eq!(mesh.totvert(), 8, "-1 V (vert 1, α_raw≈0, collapses)");
-        assert_eq!(mesh.totedge(), 10, "-1 E merge, -1 E collapse");
-        assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
+        assert_eq!(mesh.vertex_count(), 8, "-1 V (vert 1, α_raw≈0, collapses)");
+        assert_eq!(mesh.edge_count(), 10, "-1 E merge, -1 E collapse");
+        assert_eq!(mesh.face_count(), 3, "-1 F (faces 0+1 merged)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(
@@ -1745,7 +1755,10 @@ mod tests {
     fn dissolve_edges_use_face_split_slices_corner_around_shared_vert() {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
         assert_eq!(
             mesh.vert_edge_keys(verts[4]).len(),
             4,
@@ -1764,9 +1777,9 @@ mod tests {
 
         // Pre-pass: +1 E (diag {5,7}) +1 F. Merge {1,4}: -1 E, -1 F. Merge
         // {3,4}: -1 E, -1 F. Net from 9/12/4: 0 V, -1 E, -1 F.
-        assert_eq!(mesh.totvert(), 9, "0 V (pre-pass adds no verts)");
-        assert_eq!(mesh.totedge(), 11, "+1 diagonal, -2 merges");
-        assert_eq!(mesh.totface(), 3, "+1 slice, -2 merges");
+        assert_eq!(mesh.vertex_count(), 9, "0 V (pre-pass adds no verts)");
+        assert_eq!(mesh.edge_count(), 11, "+1 diagonal, -2 merges");
+        assert_eq!(mesh.face_count(), 3, "+1 slice, -2 merges");
 
         assert!(
             mesh.query_edge_exists(verts[5], verts[7]).is_some(),
@@ -1802,9 +1815,9 @@ mod tests {
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         // No pre-pass: 9/12/4 → merge {1,4} → 9/11/3 → merge {3,4} → 9/10/2.
-        assert_eq!(mesh.totvert(), 9, "0 V");
-        assert_eq!(mesh.totedge(), 10, "-2 merges, no diagonal added");
-        assert_eq!(mesh.totface(), 2, "-2 merges, no slice");
+        assert_eq!(mesh.vertex_count(), 9, "0 V");
+        assert_eq!(mesh.edge_count(), 10, "-2 merges, no diagonal added");
+        assert_eq!(mesh.face_count(), 2, "-2 merges, no slice");
 
         assert!(
             mesh.query_edge_exists(verts[5], verts[7]).is_none(),
@@ -1827,15 +1840,18 @@ mod tests {
     fn dissolve_edges_use_face_split_noop_on_triangulated_mesh() {
         let mut mesh = LoopMesh::new();
         let (_verts, diagonal, _faces) = build_two_tris_shared_diagonal(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (4, 5, 2));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 5, 2)
+        );
 
         let result = mesh.dissolve_edges(&[diagonal], &use_face_split());
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         // Same outcome as `use_face_split = false`: -1 E (diagonal), -1 F.
-        assert_eq!(mesh.totvert(), 4, "0 V");
-        assert_eq!(mesh.totedge(), 4, "-1 E (the diagonal), no slice added");
-        assert_eq!(mesh.totface(), 1, "-1 F (two tris → one quad)");
+        assert_eq!(mesh.vertex_count(), 4, "0 V");
+        assert_eq!(mesh.edge_count(), 4, "-1 E (the diagonal), no slice added");
+        assert_eq!(mesh.face_count(), 1, "-1 F (two tris → one quad)");
 
         let faces = mesh.face_keys();
         assert_eq!(faces.len(), 1);
@@ -1855,7 +1871,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (16, 24, 9)
         );
 
@@ -1871,9 +1887,9 @@ mod tests {
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         // Pure merge, no slice: -1 E, -1 F, 0 V.
-        assert_eq!(mesh.totvert(), 16, "0 V");
-        assert_eq!(mesh.totedge(), 23, "-1 E (the merge only)");
-        assert_eq!(mesh.totface(), 8, "-1 F (the merge only)");
+        assert_eq!(mesh.vertex_count(), 16, "0 V");
+        assert_eq!(mesh.edge_count(), 23, "-1 E (the merge only)");
+        assert_eq!(mesh.face_count(), 8, "-1 F (the merge only)");
         assert_eq!(
             count_triangles(&mesh),
             0,
@@ -1900,15 +1916,15 @@ mod tests {
     fn dissolve_edges_use_face_split_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let result = mesh.dissolve_edges(&[], &use_face_split());
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         assert_eq!(count_triangles(&mesh), 0, "no slices on empty input");

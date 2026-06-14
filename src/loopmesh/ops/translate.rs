@@ -134,7 +134,10 @@ mod tests {
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner] + offset);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -150,7 +153,10 @@ mod tests {
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -161,14 +167,17 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = unit_cube(&mut mesh);
         let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.translate(&[], params(Vec3::new(9.0, 9.0, 9.0)));
 
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         mesh.validate_topology();
     }
 
@@ -228,7 +237,10 @@ mod tests {
             assert_close(mesh.vertex_position(verts[corner]), before[corner]);
         }
         // Sheared side faces, but no topology change.
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 }

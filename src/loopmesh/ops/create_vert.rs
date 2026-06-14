@@ -41,7 +41,10 @@ mod tests {
 
         let v = mesh.create_vert(co);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (1, 0, 0));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (1, 0, 0)
+        );
         assert_eq!(mesh.vertex_position(v), co);
         // A loose vertex has no incident faces, so its cached normal is zeroed
         // (§2.2) — not derived from `co`.
@@ -75,14 +78,17 @@ mod tests {
             .collect();
         mesh.face_create(&quad_verts, &quad_edges, FaceCreateFlags::NONE);
 
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!(before, (4, 4, 1));
 
         let co = Vec3::new(5.0, 5.0, 5.0);
         let v = mesh.create_vert(co);
 
         // Exactly one new vertex; edges and faces unchanged.
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (5, 4, 1));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (5, 4, 1)
+        );
         assert_eq!(mesh.vertex_position(v), co);
         // The original corners are where they were.
         for (corner, &vert) in quad_verts.iter().enumerate() {
@@ -102,7 +108,10 @@ mod tests {
         let b = mesh.create_vert(co);
 
         assert_ne!(a, b);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (2, 0, 0));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (2, 0, 0)
+        );
         assert_eq!(mesh.vertex_position(a), co);
         assert_eq!(mesh.vertex_position(b), co);
         mesh.validate_topology();

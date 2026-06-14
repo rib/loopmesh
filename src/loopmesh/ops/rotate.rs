@@ -160,7 +160,10 @@ mod tests {
                 rotation.transform_point3(before[corner]),
             );
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -196,7 +199,10 @@ mod tests {
             "cent != origin must differ from the origin-centred rotation"
         );
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -266,7 +272,10 @@ mod tests {
             for (corner, &vert) in verts.iter().enumerate() {
                 assert_close(mesh.vertex_position(vert), before[corner]);
             }
-            assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+            assert_eq!(
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                (8, 12, 6)
+            );
             mesh.validate_topology();
         }
     }
@@ -326,7 +335,10 @@ mod tests {
             let after = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
             assert_eq!(after, before, "loop UV survives the rotate");
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -337,7 +349,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = unit_cube(&mut mesh);
         let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let rotation = Mat4::from_quat(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4));
         mesh.rotate(&[], params(rotation, Vec3::new(2.0, 2.0, 2.0)));
@@ -345,7 +357,10 @@ mod tests {
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         mesh.validate_topology();
     }
 }

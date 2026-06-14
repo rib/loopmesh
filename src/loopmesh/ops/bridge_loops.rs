@@ -949,16 +949,16 @@ mod tests {
                 Vec3::new(3.0, 0.0, 0.0),
             ],
         );
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let mut selected = ea.clone();
         selected.extend(eb.iter().copied());
         let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
 
         assert!(result.ok);
-        assert_eq!(mesh.totvert() - v0, 0);
-        assert_eq!(mesh.totedge() - e0, 4);
-        assert_eq!(mesh.totface() - f0, 3);
+        assert_eq!(mesh.vertex_count() - v0, 0);
+        assert_eq!(mesh.edge_count() - e0, 4);
+        assert_eq!(mesh.face_count() - f0, 3);
         assert_eq!(result.faces_out.len(), 3);
         // §6.3 — only the four rung edges, not the loop edges.
         assert_eq!(result.edges_out.len(), 4);
@@ -988,16 +988,16 @@ mod tests {
                 Vec3::new(0.0, 1.0, 0.0),
             ],
         );
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let mut selected = ea.clone();
         selected.extend(eb.iter().copied());
         let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
 
         assert!(result.ok);
-        assert_eq!(mesh.totvert() - v0, 0);
-        assert_eq!(mesh.totedge() - e0, 4);
-        assert_eq!(mesh.totface() - f0, 4);
+        assert_eq!(mesh.vertex_count() - v0, 0);
+        assert_eq!(mesh.edge_count() - e0, 4);
+        assert_eq!(mesh.face_count() - f0, 4);
         assert_eq!(result.faces_out.len(), 4);
         assert_eq!(result.edges_out.len(), 4);
     }
@@ -1028,24 +1028,24 @@ mod tests {
         // Cyclic off — open chain of two bands.
         let mut mesh = LoopMesh::new();
         let selected = stacked_open(&mut mesh, 3);
-        let (e0, f0) = (mesh.totedge(), mesh.totface());
+        let (e0, f0) = (mesh.edge_count(), mesh.face_count());
         let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
         assert!(result.ok);
-        assert_eq!(mesh.totedge() - e0, 6);
-        assert_eq!(mesh.totface() - f0, 4);
+        assert_eq!(mesh.edge_count() - e0, 6);
+        assert_eq!(mesh.face_count() - f0, 4);
 
         // Cyclic on — three bands.
         let mut mesh = LoopMesh::new();
         let selected = stacked_open(&mut mesh, 3);
-        let (e0, f0) = (mesh.totedge(), mesh.totface());
+        let (e0, f0) = (mesh.edge_count(), mesh.face_count());
         let params = BridgeLoopsParams {
             use_cyclic: true,
             ..Default::default()
         };
         let result = mesh.bridge_loops(&selected, params);
         assert!(result.ok);
-        assert_eq!(mesh.totedge() - e0, 9);
-        assert_eq!(mesh.totface() - f0, 6);
+        assert_eq!(mesh.edge_count() - e0, 9);
+        assert_eq!(mesh.face_count() - f0, 6);
     }
 
     /// §4.1 — `use_pairs` on a 4-loop stack bridges 2 disjoint pairs
@@ -1054,24 +1054,24 @@ mod tests {
     fn use_pairs_bridges_disjoint_pairs() {
         let mut mesh = LoopMesh::new();
         let selected = stacked_open(&mut mesh, 4);
-        let (e0, f0) = (mesh.totedge(), mesh.totface());
+        let (e0, f0) = (mesh.edge_count(), mesh.face_count());
         let params = BridgeLoopsParams {
             use_pairs: true,
             ..Default::default()
         };
         let result = mesh.bridge_loops(&selected, params);
         assert!(result.ok);
-        assert_eq!(mesh.totedge() - e0, 6);
-        assert_eq!(mesh.totface() - f0, 4);
+        assert_eq!(mesh.edge_count() - e0, 6);
+        assert_eq!(mesh.face_count() - f0, 4);
 
         // Chain mode on the same stack — three bands.
         let mut mesh = LoopMesh::new();
         let selected = stacked_open(&mut mesh, 4);
-        let (e0, f0) = (mesh.totedge(), mesh.totface());
+        let (e0, f0) = (mesh.edge_count(), mesh.face_count());
         let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
         assert!(result.ok);
-        assert_eq!(mesh.totedge() - e0, 9);
-        assert_eq!(mesh.totface() - f0, 6);
+        assert_eq!(mesh.edge_count() - e0, 9);
+        assert_eq!(mesh.face_count() - f0, 6);
     }
 
     /// §8 — `use_merge` welds two equal-length open loops into one; element
@@ -1097,8 +1097,8 @@ mod tests {
                 Vec3::new(3.0, 0.0, 0.0),
             ],
         );
-        assert_eq!(mesh.totvert(), 8);
-        assert_eq!(mesh.totedge(), 6);
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.edge_count(), 6);
 
         let mut selected = ea.clone();
         selected.extend(eb.iter().copied());
@@ -1110,9 +1110,9 @@ mod tests {
         let result = mesh.bridge_loops(&selected, params);
 
         assert!(result.ok);
-        assert_eq!(mesh.totvert(), 4);
-        assert_eq!(mesh.totedge(), 3);
-        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.edge_count(), 3);
+        assert_eq!(mesh.face_count(), 0);
         assert!(result.faces_out.is_empty());
         assert!(result.edges_out.is_empty());
     }
@@ -1189,16 +1189,16 @@ mod tests {
                 Vec3::new(2.5, 0.0, 0.0),
             ],
         );
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let mut selected = ea.clone();
         selected.extend(eb.iter().copied());
         let result = mesh.bridge_loops(&selected, BridgeLoopsParams::default());
 
         assert!(result.ok);
-        assert_eq!(mesh.totvert() - v0, 0);
-        assert_eq!(mesh.totedge() - e0, 6);
-        assert_eq!(mesh.totface() - f0, 5);
+        assert_eq!(mesh.vertex_count() - v0, 0);
+        assert_eq!(mesh.edge_count() - e0, 6);
+        assert_eq!(mesh.face_count() - f0, 5);
         // Every refined band face is a triangle.
         for &f in &result.faces_out {
             assert_eq!(mesh.face_len(f), 3);
@@ -1217,11 +1217,11 @@ mod tests {
                 Vec3::new(2.0, 0.0, 0.0),
             ],
         );
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let result = mesh.bridge_loops(&ea, BridgeLoopsParams::default());
         assert!(!result.ok);
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
     }
@@ -1231,7 +1231,7 @@ mod tests {
     fn pairs_odd_count_cancels() {
         let mut mesh = LoopMesh::new();
         let selected = stacked_open(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let params = BridgeLoopsParams {
             use_pairs: true,
             ..Default::default()
@@ -1239,7 +1239,7 @@ mod tests {
         let result = mesh.bridge_loops(&selected, params);
         assert!(!result.ok);
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
     }
@@ -1265,7 +1265,7 @@ mod tests {
                 Vec3::new(2.0, 0.0, 0.0),
             ],
         );
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let mut selected = ea.clone();
         selected.extend(eb.iter().copied());
         let params = BridgeLoopsParams {
@@ -1275,7 +1275,7 @@ mod tests {
         let result = mesh.bridge_loops(&selected, params);
         assert!(!result.ok);
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
     }
@@ -1297,7 +1297,7 @@ mod tests {
             };
             let result = mesh.bridge_loops(&selected, params);
             assert!(result.ok);
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         };
         assert_eq!(build(0), build(1));
     }

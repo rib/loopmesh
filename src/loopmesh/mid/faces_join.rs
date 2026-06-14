@@ -576,9 +576,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, faces) = build_grid_3x3(&mut mesh);
 
-        let totvert_before = mesh.totvert();
-        let totedge_before = mesh.totedge();
-        let totface_before = mesh.totface();
+        let vertex_count_before = mesh.vertex_count();
+        let edge_count_before = mesh.edge_count();
+        let face_count_before = mesh.face_count();
         let centre = verts[5];
 
         let merged = mesh
@@ -589,13 +589,21 @@ mod tests {
             mesh.vertices.try_get(centre).is_none(),
             "interior-only centre vert must be killed per §4.1 step 4"
         );
-        assert_eq!(mesh.totvert(), totvert_before - 1, "1 vert killed");
         assert_eq!(
-            mesh.totedge(),
-            totedge_before - 4,
+            mesh.vertex_count(),
+            vertex_count_before - 1,
+            "1 vert killed"
+        );
+        assert_eq!(
+            mesh.edge_count(),
+            edge_count_before - 4,
             "4 interior edges killed"
         );
-        assert_eq!(mesh.totface(), totface_before - 3, "4 input faces → 1 face");
+        assert_eq!(
+            mesh.face_count(),
+            face_count_before - 3,
+            "4 input faces → 1 face"
+        );
 
         let perimeter = mesh.face_vert_keys(merged);
         assert_eq!(perimeter.len(), 8, "8-corner merged face");
@@ -614,14 +622,14 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (_verts, faces) = build_grid_3x3(&mut mesh);
 
-        let totvert_before = mesh.totvert();
+        let vertex_count_before = mesh.vertex_count();
 
         mesh.faces_join(&[faces[0], faces[1]])
             .expect("two-quad region joins successfully");
 
         assert_eq!(
-            mesh.totvert(),
-            totvert_before,
+            mesh.vertex_count(),
+            vertex_count_before,
             "no verts may be killed when every region vert retains a surviving edge"
         );
 
@@ -684,9 +692,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
 
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 7, "6 outer-rim + 1 interior v1-v2");
-        assert_eq!(mesh.totface(), 3);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 7, "6 outer-rim + 1 interior v1-v2");
+        assert_eq!(mesh.face_count(), 3);
 
         let survivor = mesh
             .faces_join(&[f_left, f_right])
@@ -698,17 +706,17 @@ mod tests {
         );
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             6,
             "every perimeter vert retains a shadow edge"
         );
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             6,
             "interior v1-v2 edge gone; outer rim survives"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "two source quads + new merged face killed; only the shadow remains"
         );
@@ -804,7 +812,7 @@ mod tests {
             }
         }
 
-        let totvert_before = mesh.totvert();
+        let vertex_count_before = mesh.vertex_count();
 
         let merged = mesh
             .faces_join(&[f_left, f_right])
@@ -817,13 +825,13 @@ mod tests {
         let got: std::collections::HashSet<VertexKey> = perimeter.iter().copied().collect();
         let expected: std::collections::HashSet<VertexKey> = v.iter().copied().collect();
         assert_eq!(got, expected, "perimeter is the union's outer rim");
-        assert_eq!(mesh.totvert(), totvert_before, "no verts killed");
+        assert_eq!(mesh.vertex_count(), vertex_count_before, "no verts killed");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             6,
             "shared interior edge killed; 6 rim edges remain"
         );
-        assert_eq!(mesh.totface(), 1, "two quads merged into one");
+        assert_eq!(mesh.face_count(), 1, "two quads merged into one");
         assert!(
             mesh.edge_keys().into_iter().all(|e| e != e_12),
             "shared edge gone"

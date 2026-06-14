@@ -332,7 +332,7 @@ mod tests {
                 .map(|&v| (mesh.vertex_position(v).x * 1e3).round() as i64)
                 .collect();
             xs.sort_unstable();
-            (mesh.totvert(), mesh.totface(), xs)
+            (mesh.vertex_count(), mesh.face_count(), xs)
         };
 
         let neg = run(SymmetrizeDirection::NegX);
@@ -359,7 +359,7 @@ mod tests {
             let geom = whole_mesh_geom(&mesh);
             mesh.symmetrize(&geom, SymmetrizeDirection::PosX, dist);
             mesh.validate_topology();
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         };
 
         let fires = run(0.2);

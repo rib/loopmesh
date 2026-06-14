@@ -579,12 +579,12 @@ mod tests {
     fn weld_verts_empty_map_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _face) = quad(&mut mesh, [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.weld_verts(&[], false);
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0)
         );
         mesh.validate_topology();
@@ -599,8 +599,8 @@ mod tests {
 
         mesh.weld_verts(&[(verts[0], verts[1])], false);
 
-        assert_eq!(mesh.totface(), 0, "the degenerate triangle is reaped");
-        assert_eq!(mesh.totvert(), 2, "source corner removed");
+        assert_eq!(mesh.face_count(), 0, "the degenerate triangle is reaped");
+        assert_eq!(mesh.vertex_count(), 2, "source corner removed");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&verts[0]), "source vert gone");
         assert!(
@@ -608,7 +608,7 @@ mod tests {
             "survivors stay"
         );
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             1,
             "one surviving edge between the survivors"
         );
@@ -629,7 +629,7 @@ mod tests {
 
         mesh.weld_verts(&[(verts[0], verts[2])], false);
 
-        assert_eq!(mesh.totface(), 0, "the quad disappears entirely");
+        assert_eq!(mesh.face_count(), 0, "the quad disappears entirely");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&verts[0]), "source corner gone");
         assert!(live.contains(&verts[2]), "target corner survives");
@@ -651,7 +651,7 @@ mod tests {
         mesh.weld_verts(&[(verts[0], verts[3])], false);
 
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "exactly one sub-face survives the pentagon weld"
         );
@@ -693,7 +693,7 @@ mod tests {
         mk(&mut mesh, [a0, b, c, a1]);
         mk(&mut mesh, [b, d0, d1, c]);
 
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         // Weld b onto c: the shared edge {b, c} collapses to nothing.
         mesh.weld_verts(&[(b, c)], false);
@@ -701,7 +701,7 @@ mod tests {
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&b), "welded vert gone");
         assert!(live.contains(&c), "target survives");
-        assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
+        assert_eq!(mesh.face_count(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
             assert_eq!(
                 mesh.face_len(face),
@@ -743,8 +743,12 @@ mod tests {
 
         mesh.weld_verts(&[(s0, t), (s1, t), (s2, t)], false);
 
-        assert_eq!(mesh.totvert(), 1, "all sources merge onto the one target");
-        assert_eq!(mesh.totface(), 0, "the fully-merged triangle drops");
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "all sources merge onto the one target"
+        );
+        assert_eq!(mesh.face_count(), 0, "the fully-merged triangle drops");
         let survivor = mesh.vert_keys()[0];
         assert_eq!(survivor, t, "the target is the survivor");
         assert_eq!(
@@ -777,7 +781,11 @@ mod tests {
 
         mesh.weld_verts(&[(s0, t), (s1, t), (s2, t)], true);
 
-        assert_eq!(mesh.totvert(), 1, "all sources merge onto the one target");
+        assert_eq!(
+            mesh.vertex_count(),
+            1,
+            "all sources merge onto the one target"
+        );
         let survivor = mesh.vert_keys()[0];
         let pos = mesh.vertex_position(survivor);
         assert!(
@@ -821,7 +829,7 @@ mod tests {
         assert!(live.contains(&b0), "target survives");
         // Both triangles survive: wing A becomes (hub, b0, a1), wing B is
         // untouched (hub, b0, b1). Neither degenerates.
-        assert_eq!(mesh.totface(), 2, "both wings survive");
+        assert_eq!(mesh.face_count(), 2, "both wings survive");
         mesh.validate_topology();
     }
 
@@ -846,11 +854,11 @@ mod tests {
         };
         mk(&mut mesh, [v0, v1, v2]);
         mk(&mut mesh, [v0, v1, v3]);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         mesh.weld_verts(&[(v2, v3)], false);
 
-        assert_eq!(mesh.totface(), 1, "the rebuilt duplicate is dropped");
+        assert_eq!(mesh.face_count(), 1, "the rebuilt duplicate is dropped");
         let survivor = mesh.face_keys()[0];
         let ring: std::collections::HashSet<VertexKey> =
             mesh.face_vert_keys(survivor).into_iter().collect();
@@ -875,8 +883,8 @@ mod tests {
 
         mesh.weld_verts(&[(v0, v1)], false);
 
-        assert_eq!(mesh.totvert(), 1, "the collapsed wire leaves one vert");
-        assert_eq!(mesh.totedge(), 0, "the collapsed wire edge is removed");
+        assert_eq!(mesh.vertex_count(), 1, "the collapsed wire leaves one vert");
+        assert_eq!(mesh.edge_count(), 0, "the collapsed wire edge is removed");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&v1), "the target survives");
         assert!(!live.contains(&v0), "the source is gone");
@@ -904,13 +912,13 @@ mod tests {
         mesh.weld_verts(&[(v0, v1), (v1, v2)], false);
 
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             0,
             "the rebuilt face leans on marked geometry and is reaped"
         );
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert_eq!(mesh.totvert(), 3, "verts 0 and 1 are both removed");
+        assert_eq!(mesh.vertex_count(), 3, "verts 0 and 1 are both removed");
         assert!(
             !live.contains(&v0) && !live.contains(&v1),
             "both chain sources gone"
@@ -921,7 +929,7 @@ mod tests {
         );
 
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             3,
             "three surviving edges incl. the chain-flatten"
         );
@@ -972,7 +980,7 @@ mod tests {
         mesh.weld_verts(&[(v0, v1)], false);
 
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "the single-entry weld keeps a closed-ring face"
         );
@@ -990,10 +998,10 @@ mod tests {
             "surviving ring is (1,2,3,4)"
         );
 
-        assert_eq!(mesh.totvert(), 4, "only vert 0 is removed");
+        assert_eq!(mesh.vertex_count(), 4, "only vert 0 is removed");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v0), "the sole source vert is gone");
-        assert_eq!(mesh.totedge(), 4, "the full ring of four edges survives");
+        assert_eq!(mesh.edge_count(), 4, "the full ring of four edges survives");
         mesh.validate_topology();
     }
 
@@ -1009,9 +1017,9 @@ mod tests {
 
         mesh.weld_verts(&[(source, target)], false);
 
-        assert_eq!(mesh.totvert(), 2, "source removed");
+        assert_eq!(mesh.vertex_count(), 2, "source removed");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             1,
             "the wire re-points onto the (a, target) edge"
         );

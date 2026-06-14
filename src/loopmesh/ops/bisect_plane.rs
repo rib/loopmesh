@@ -699,7 +699,7 @@ mod tests {
             let (mut mesh, _f, _v) = strip(-2.0, 4); // columns at x = -2..2
             let geom = whole_mesh_geom(&mesh);
             mesh.bisect_plane(&geom, params(0.0, false, inner, outer));
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         };
 
         // clear_outer keeps the negative half: two kept quads + the degenerate
@@ -771,7 +771,7 @@ mod tests {
             let (mut mesh, _f, _v) = strip(-2.0, 4);
             let geom = whole_mesh_geom(&mesh);
             mesh.bisect_plane(&geom, params(0.1, false, inner, outer));
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         };
 
         // clear_outer keeps the negative half sharing the single on-plane
@@ -793,7 +793,7 @@ mod tests {
         // quad straddles. The cut inserts two crossing verts and splits the
         // face; clear_outer keeps the negative side.
         let (mut mesh, _faces, _verts) = strip(0.0, 2); // columns x = 0..1, 1..2
-        let v_before = mesh.totvert();
+        let v_before = mesh.vertex_count();
         let geom = whole_mesh_geom(&mesh);
         let p = BisectParams {
             plane_co: Vec3::new(0.5, 0.0, 0.0),
@@ -806,7 +806,7 @@ mod tests {
         let result = mesh.bisect_plane(&geom, p);
 
         // Two crossing verts were created on the two straddling edges (§4).
-        assert!(mesh.totvert() < v_before, "positive side cleared");
+        assert!(mesh.vertex_count() < v_before, "positive side cleared");
         assert_eq!(result.seam_verts.len(), 2, "two crossing verts on x = 0.5");
         for &sv in &result.seam_verts {
             assert!(
@@ -948,11 +948,11 @@ mod tests {
     #[test]
     fn empty_geom_is_noop() {
         let (mut mesh, _f, _v) = strip(-1.0, 2);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let result = mesh.bisect_plane(&[], params(0.0, true, false, true));
         assert_eq!(
             (v0, e0, f0),
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         );
         // Nothing tagged → nothing classified on-plane → empty seam.
         assert!(result.seam_verts.is_empty());

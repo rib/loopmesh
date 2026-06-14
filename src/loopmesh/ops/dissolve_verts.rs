@@ -664,9 +664,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!(v0, 16);
         assert_eq!(e0, 24);
         assert_eq!(f0, 9);
@@ -681,9 +681,9 @@ mod tests {
         mesh.dissolve_verts(&[centre]);
 
         // §2 n-corner-fan delta for k = 4.
-        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (the centre)");
-        assert_eq!(mesh.totedge(), e0 - 4, "-4 E (the four spokes)");
-        assert_eq!(mesh.totface(), f0 - 3, "-3 F (four quads → one)");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "-1 V (the centre)");
+        assert_eq!(mesh.edge_count(), e0 - 4, "-4 E (the four spokes)");
+        assert_eq!(mesh.face_count(), f0 - 3, "-3 F (four quads → one)");
 
         // The merged face is the octagon whose perimeter is the ring of eight
         // verts around the dissolved centre.
@@ -720,9 +720,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_5x5(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         // Two interior verts two cells apart so their fans share no face.
         // verts[r*6+c]; pick (1,1) = 7 and (1,3) = 9? Those share row-1 faces.
@@ -734,9 +734,9 @@ mod tests {
 
         mesh.dissolve_verts(&[a, b]);
 
-        assert_eq!(mesh.totvert(), v0 - 2, "-2 V (both centres)");
-        assert_eq!(mesh.totedge(), e0 - 8, "-4 E per disjoint fan");
-        assert_eq!(mesh.totface(), f0 - 6, "-3 F per disjoint fan");
+        assert_eq!(mesh.vertex_count(), v0 - 2, "-2 V (both centres)");
+        assert_eq!(mesh.edge_count(), e0 - 8, "-4 E per disjoint fan");
+        assert_eq!(mesh.face_count(), f0 - 6, "-3 F per disjoint fan");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&a));
@@ -767,9 +767,9 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        assert_eq!(mesh.totvert(), 4);
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(
             mesh.vert_edge_keys(v[1]).len(),
             2,
@@ -778,9 +778,9 @@ mod tests {
 
         mesh.dissolve_verts(&[v[1]]);
 
-        assert_eq!(mesh.totvert(), 3, "-1 V (the collapsed corner)");
-        assert_eq!(mesh.totedge(), 3, "-1 E (two edges merge into one)");
-        assert_eq!(mesh.totface(), 1, "the face survives, now a triangle");
+        assert_eq!(mesh.vertex_count(), 3, "-1 V (the collapsed corner)");
+        assert_eq!(mesh.edge_count(), 3, "-1 E (two edges merge into one)");
+        assert_eq!(mesh.face_count(), 1, "the face survives, now a triangle");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v[1]), "the dissolved corner is gone");
@@ -815,9 +815,9 @@ mod tests {
         let e2 = mesh.create_edge([v[2], v[0]], EdgeCreateFlags::NO_DUPLICATE);
         mesh.face_create(&[v[0], v[1], v[2]], &[e0, e1, e2], FaceCreateFlags::NONE);
 
-        assert_eq!(mesh.totvert(), 3);
-        assert_eq!(mesh.totedge(), 3);
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.edge_count(), 3);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(
             mesh.vert_edge_keys(v[1]).len(),
             2,
@@ -826,9 +826,9 @@ mod tests {
 
         mesh.dissolve_verts(&[v[1]]);
 
-        assert_eq!(mesh.totvert(), 2, "-1 V (the collapsed corner)");
-        assert_eq!(mesh.totedge(), 1, "-2 E (spoke + spliced duplicate)");
-        assert_eq!(mesh.totface(), 0, "-1 F (the 2-gon is reaped)");
+        assert_eq!(mesh.vertex_count(), 2, "-1 V (the collapsed corner)");
+        assert_eq!(mesh.edge_count(), 1, "-2 E (spoke + spliced duplicate)");
+        assert_eq!(mesh.face_count(), 0, "-1 F (the 2-gon is reaped)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v[1]), "the dissolved corner is gone");
@@ -858,13 +858,13 @@ mod tests {
         let wire = mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE);
         assert!(mesh.edge_face_keys(wire).is_empty(), "edge is wire");
 
-        assert_eq!(mesh.totvert(), 3);
-        assert_eq!(mesh.totedge(), 1);
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.edge_count(), 1);
 
         mesh.dissolve_verts(&[a]);
 
-        assert_eq!(mesh.totvert(), 2, "-1 V (a)");
-        assert_eq!(mesh.totedge(), 0, "-1 E (the wire edge)");
+        assert_eq!(mesh.vertex_count(), 2, "-1 V (a)");
+        assert_eq!(mesh.edge_count(), 0, "-1 E (the wire edge)");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&a), "a is gone");
         assert!(live.contains(&b), "far endpoint b survives");
@@ -905,9 +905,9 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!(
             mesh.vert_edge_keys(hub).len(),
             4,
@@ -916,9 +916,9 @@ mod tests {
 
         mesh.dissolve_verts(&[hub]);
 
-        assert_eq!(mesh.totvert(), v0, "no-op: V unchanged");
-        assert_eq!(mesh.totedge(), e0, "no-op: E unchanged");
-        assert_eq!(mesh.totface(), f0, "no-op: F unchanged");
+        assert_eq!(mesh.vertex_count(), v0, "no-op: V unchanged");
+        assert_eq!(mesh.edge_count(), e0, "no-op: E unchanged");
+        assert_eq!(mesh.face_count(), f0, "no-op: F unchanged");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&hub), "the bowtie hub survives");
         mesh.validate_topology();
@@ -952,16 +952,16 @@ mod tests {
             );
         }
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!(mesh.edge_face_keys(e_spine).len(), 3, "spine is radial-3");
 
         mesh.dissolve_verts(&[v[0]]);
 
-        assert_eq!(mesh.totvert(), v0, "no-op: V unchanged");
-        assert_eq!(mesh.totedge(), e0, "no-op: E unchanged");
-        assert_eq!(mesh.totface(), f0, "no-op: F unchanged");
+        assert_eq!(mesh.vertex_count(), v0, "no-op: V unchanged");
+        assert_eq!(mesh.edge_count(), e0, "no-op: E unchanged");
+        assert_eq!(mesh.face_count(), f0, "no-op: F unchanged");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&v[0]), "the T-junction vert survives");
         mesh.validate_topology();
@@ -1009,9 +1009,9 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         // wire_far is the wire-only input vert (it has the single wire edge).
         mesh.dissolve_verts(&[centre, wire_far, hub]);
@@ -1020,12 +1020,12 @@ mod tests {
         // wire_far: -1 V, -1 E.
         // hub: no-op.
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0 - 2,
             "centre + wire_far removed; hub survives"
         );
-        assert_eq!(mesh.totedge(), e0 - 5, "-4 spokes + -1 wire edge");
-        assert_eq!(mesh.totface(), f0 - 3, "centre fan: 4 quads → 1");
+        assert_eq!(mesh.edge_count(), e0 - 5, "-4 spokes + -1 wire edge");
+        assert_eq!(mesh.face_count(), f0 - 3, "centre fan: 4 quads → 1");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&centre), "manifold fan centre gone");
@@ -1158,15 +1158,15 @@ mod tests {
     fn dissolve_verts_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let (_verts, _faces) = build_grid_3x3(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_verts(&[]);
 
-        assert_eq!(mesh.totvert(), v0);
-        assert_eq!(mesh.totedge(), e0);
-        assert_eq!(mesh.totface(), f0);
+        assert_eq!(mesh.vertex_count(), v0);
+        assert_eq!(mesh.edge_count(), e0);
+        assert_eq!(mesh.face_count(), f0);
         mesh.validate_topology();
     }
 
@@ -1208,9 +1208,9 @@ mod tests {
             FaceCreateFlags::NONE,
         );
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!(
             mesh.vert_edge_keys(v[0]).len(),
             2,
@@ -1222,9 +1222,9 @@ mod tests {
 
         mesh.dissolve_verts(&[v[0]]);
 
-        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (v0 collapsed)");
-        assert_eq!(mesh.totedge(), e0 - 1, "-1 E (two boundary edges → one)");
-        assert_eq!(mesh.totface(), f0, "both faces survive");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "-1 V (v0 collapsed)");
+        assert_eq!(mesh.edge_count(), e0 - 1, "-1 E (two boundary edges → one)");
+        assert_eq!(mesh.face_count(), f0, "both faces survive");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v[0]), "v0 is collapsed away");
@@ -1253,9 +1253,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!((v0, e0, f0), (16, 24, 9));
 
         let centre = verts[5];
@@ -1271,9 +1271,9 @@ mod tests {
 
         // Pre-pass: +4 E (diagonals) +4 F (triangle slices). Merge of the
         // resulting 4-triangle fan: −1 V, −4 E (spokes), −3 F (4 → 1).
-        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (the centre)");
-        assert_eq!(mesh.totedge(), e0, "+4 diagonals, −4 spokes → net 0 E");
-        assert_eq!(mesh.totface(), f0 + 1, "+4 slices, −3 from the merge");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "-1 V (the centre)");
+        assert_eq!(mesh.edge_count(), e0, "+4 diagonals, −4 spokes → net 0 E");
+        assert_eq!(mesh.face_count(), f0 + 1, "+4 slices, −3 from the merge");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&centre), "centre vert is gone");
@@ -1328,9 +1328,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.dissolve_verts_ex(
             &[verts[5]],
@@ -1341,9 +1341,9 @@ mod tests {
         );
 
         // No pre-pass: the four-quad fan merges directly into one octagon.
-        assert_eq!(mesh.totvert(), v0 - 1, "-1 V");
-        assert_eq!(mesh.totedge(), e0 - 4, "-4 spokes, no diagonals added");
-        assert_eq!(mesh.totface(), f0 - 3, "4 quads → 1");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "-1 V");
+        assert_eq!(mesh.edge_count(), e0 - 4, "-4 spokes, no diagonals added");
+        assert_eq!(mesh.face_count(), f0 - 3, "4 quads → 1");
 
         let mut octagon: Option<FaceKey> = None;
         let mut tri_count = 0usize;
@@ -1371,9 +1371,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_5x5(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let a = verts[1 * 6 + 1];
         let b = verts[3 * 6 + 3];
@@ -1388,14 +1388,14 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), v0 - 2, "-1 V per fan");
+        assert_eq!(mesh.vertex_count(), v0 - 2, "-1 V per fan");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             e0,
             "+4 diagonals −4 spokes per fan → net 0 E"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             f0 + 2,
             "+1 F per fan (4 → 1 merge + 4 slices)"
         );
@@ -1453,9 +1453,9 @@ mod tests {
             );
         }
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
         assert_eq!((v0, e0, f0), (5, 8, 4));
         assert_eq!(mesh.vert_edge_keys(c).len(), 4);
 
@@ -1470,9 +1470,9 @@ mod tests {
         // The pre-pass adds no diagonals (every face is already a triangle):
         // the four triangles merge straight into one quad rim. −1 V, −4 E
         // (spokes), −3 F (4 → 1).
-        assert_eq!(mesh.totvert(), v0 - 1, "-1 V (the centre)");
-        assert_eq!(mesh.totedge(), e0 - 4, "no diagonals added; −4 spokes");
-        assert_eq!(mesh.totface(), f0 - 3, "4 triangles → 1 quad");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "-1 V (the centre)");
+        assert_eq!(mesh.edge_count(), e0 - 4, "no diagonals added; −4 spokes");
+        assert_eq!(mesh.face_count(), f0 - 3, "4 triangles → 1 quad");
 
         let mut quad: Option<FaceKey> = None;
         let mut face_iter = MeshFaces::default();
@@ -1514,7 +1514,7 @@ mod tests {
         // Run the pre-pass directly (no dissolve) and confirm it does not
         // panic and that the faces straddling the a-b spoke are NOT sliced
         // (their adjacent corner is the other input vert).
-        let f0 = mesh.totface();
+        let f0 = mesh.face_count();
         mesh.dissolve_verts_ex(
             &[a, b],
             &DissolveVertsParams {
@@ -1529,7 +1529,7 @@ mod tests {
         assert!(!live.contains(&a), "a dissolved");
         assert!(!live.contains(&b), "b dissolved");
         assert!(
-            mesh.totface() >= 1,
+            mesh.face_count() >= 1,
             "{f0} faces before; mesh non-empty after"
         );
         mesh.validate_topology();
@@ -1594,7 +1594,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (h, _tabs) = build_hexagon_with_two_triangle_tabs(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 10, 3));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 10, 3)
+        );
         // Each corner has 3 incident edges (1 interior + 2 boundary).
         assert_eq!(
             mesh.vert_edge_keys(h[0]).len(),
@@ -1610,14 +1613,14 @@ mod tests {
         mesh.dissolve_verts(&[h[0], h[2]]);
 
         // §7 boundary-fan delta for k = 2 per corner (−1 V, −2 E, −1 F each).
-        assert_eq!(mesh.totvert(), 6, "−1 V per dissolved corner");
+        assert_eq!(mesh.vertex_count(), 6, "−1 V per dissolved corner");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             6,
             "−2 E per corner (interior spoke + boundary merge)"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             1,
             "both tabs fused, both corners collapsed → one face"
         );
@@ -1645,18 +1648,21 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (h, _tabs) = build_hexagon_with_two_triangle_tabs(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 10, 3));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 10, 3)
+        );
 
         mesh.dissolve_verts(&[h[0]]);
 
-        assert_eq!(mesh.totvert(), 7, "−1 V (corner h0)");
+        assert_eq!(mesh.vertex_count(), 7, "−1 V (corner h0)");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             8,
             "−2 E (interior spoke fused + boundary merge)"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             2,
             "−1 F (tab A fused into the body); tab B survives"
         );
@@ -1879,7 +1885,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
         let v1 = verts[1];
         assert_eq!(
             mesh.vert_edge_keys(v1).len(),
@@ -1895,10 +1904,10 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), 8, "−1 V (vert 1 torn out and GC'd)");
-        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.vertex_count(), 8, "−1 V (vert 1 torn out and GC'd)");
+        assert_eq!(mesh.edge_count(), 11, "−3 spokes + 2 split diagonals");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             4,
             "two bottom quads → triangles; counts unchanged"
         );
@@ -1971,7 +1980,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
         let v3 = verts[3];
         assert_eq!(
             mesh.vert_edge_keys(v3).len(),
@@ -1987,10 +1999,10 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), 8, "−1 V (vert 3 torn out and GC'd)");
-        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.vertex_count(), 8, "−1 V (vert 3 torn out and GC'd)");
+        assert_eq!(mesh.edge_count(), 11, "−3 spokes + 2 split diagonals");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             4,
             "two left quads → triangles; counts unchanged"
         );
@@ -2054,7 +2066,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
         let v7 = verts[7];
         assert_eq!(
             mesh.vert_edge_keys(v7).len(),
@@ -2070,10 +2085,10 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), 8, "−1 V (vert 7 torn out and GC'd)");
-        assert_eq!(mesh.totedge(), 11, "−3 spokes + 2 split diagonals");
+        assert_eq!(mesh.vertex_count(), 8, "−1 V (vert 7 torn out and GC'd)");
+        assert_eq!(mesh.edge_count(), 11, "−3 spokes + 2 split diagonals");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             4,
             "two top quads → triangles; counts unchanged"
         );
@@ -2115,7 +2130,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
         let v1 = verts[1];
         let v7 = verts[7];
 
@@ -2127,10 +2145,10 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), 7, "−1 V per torn vert");
-        assert_eq!(mesh.totedge(), 10, "−1 net E per torn vert");
+        assert_eq!(mesh.vertex_count(), 7, "−1 V per torn vert");
+        assert_eq!(mesh.edge_count(), 10, "−1 net E per torn vert");
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             4,
             "all four quads tear to triangles; count unchanged"
         );
@@ -2167,9 +2185,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let centre = verts[4];
         assert_eq!(
@@ -2188,9 +2206,13 @@ mod tests {
 
         // Identical to the default-parameter manifold-interior-fan outcome:
         // the tear flag never fires because the vert has no boundary edge.
-        assert_eq!(mesh.totvert(), v0 - 1, "−1 V (the centre)");
-        assert_eq!(mesh.totedge(), e0 - 4, "−4 spokes (no tear, no diagonals)");
-        assert_eq!(mesh.totface(), f0 - 3, "four quads merge into one face");
+        assert_eq!(mesh.vertex_count(), v0 - 1, "−1 V (the centre)");
+        assert_eq!(
+            mesh.edge_count(),
+            e0 - 4,
+            "−4 spokes (no tear, no diagonals)"
+        );
+        assert_eq!(mesh.face_count(), f0 - 3, "four quads merge into one face");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(
@@ -2222,9 +2244,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_quad_grid_2x2(&mut mesh);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let corner = verts[0];
         assert_eq!(
@@ -2241,13 +2263,21 @@ mod tests {
             },
         );
 
-        assert_eq!(mesh.totvert(), v0 - 1, "−1 V (corner collapsed, not torn)");
         assert_eq!(
-            mesh.totedge(),
+            mesh.vertex_count(),
+            v0 - 1,
+            "−1 V (corner collapsed, not torn)"
+        );
+        assert_eq!(
+            mesh.edge_count(),
             e0 - 1,
             "−1 E (two boundary edges merge into one)"
         );
-        assert_eq!(mesh.totface(), f0, "all four faces survive; no tear hole");
+        assert_eq!(
+            mesh.face_count(),
+            f0,
+            "all four faces survive; no tear hole"
+        );
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&corner), "the corner is collapsed away");

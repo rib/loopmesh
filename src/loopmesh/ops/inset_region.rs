@@ -1617,11 +1617,11 @@ mod tests {
         // Four seam edges → four wall quads.
         assert_eq!(result.wall_faces.len(), 4);
         // 16 original verts + 4 inset verts.
-        assert_eq!(mesh.totvert(), 20);
+        assert_eq!(mesh.vertex_count(), 20);
         // Original 24 edges + 4 seam-separated duplicates + 4 side edges.
-        assert_eq!(mesh.totedge(), 32);
+        assert_eq!(mesh.edge_count(), 32);
         // Original 9 faces + 4 walls.
-        assert_eq!(mesh.totface(), 13);
+        assert_eq!(mesh.face_count(), 13);
         mesh.validate_topology();
     }
 
@@ -1662,8 +1662,8 @@ mod tests {
         // input face 4's edges, so these seams were dropped (20 verts, 4
         // walls). With whole-mesh classification the totals match the BMesh
         // oracle: 23 verts, 6 walls.
-        assert_eq!(mesh.totvert(), 23);
-        assert_eq!(mesh.totface(), 15);
+        assert_eq!(mesh.vertex_count(), 23);
+        assert_eq!(mesh.face_count(), 15);
         assert_eq!(result.wall_faces.len(), 6);
     }
 
@@ -1679,9 +1679,9 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
         ];
         let face = create_face_from_verts(&mut mesh, &verts);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         let result = mesh.inset_region(
             &[face],
@@ -1693,9 +1693,9 @@ mod tests {
         );
 
         assert!(result.wall_faces.is_empty());
-        assert_eq!(mesh.totvert(), v0);
-        assert_eq!(mesh.totedge(), e0);
-        assert_eq!(mesh.totface(), f0);
+        assert_eq!(mesh.vertex_count(), v0);
+        assert_eq!(mesh.edge_count(), e0);
+        assert_eq!(mesh.face_count(), f0);
     }
 
     #[test]
@@ -1863,8 +1863,8 @@ mod tests {
         );
 
         rail.validate_topology();
-        assert_eq!(rail.totvert(), plain.totvert());
-        assert_eq!(rail.totface(), plain.totface());
+        assert_eq!(rail.vertex_count(), plain.vertex_count());
+        assert_eq!(rail.face_count(), plain.face_count());
         // The four inset-boundary verts should land at identical positions.
         let mut rail_pos: Vec<[f32; 3]> = rail
             .vertices

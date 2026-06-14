@@ -110,17 +110,17 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
         ];
         let face = create_face_from_verts(&mut mesh, &verts);
-        let pre_v = mesh.totvert();
-        let pre_e = mesh.totedge();
-        let pre_f = mesh.totface();
+        let pre_v = mesh.vertex_count();
+        let pre_e = mesh.edge_count();
+        let pre_f = mesh.face_count();
         let original_face_verts = mesh.face_vert_keys(face);
         let v0 = original_face_verts[0];
         let v1 = original_face_verts[1];
         let edge = mesh.query_edge_exists(v0, v1).unwrap();
 
         let (v_new, e_new) = mesh.euler_split_edge_make_vert(v1, edge);
-        assert_eq!(mesh.totvert(), pre_v + 1);
-        assert_eq!(mesh.totedge(), pre_e + 1);
+        assert_eq!(mesh.vertex_count(), pre_v + 1);
+        assert_eq!(mesh.edge_count(), pre_e + 1);
         assert_eq!(mesh.face_len(face), 5);
 
         // Collapse the new degree-2 vertex.
@@ -130,9 +130,9 @@ mod tests {
             "JEKV should succeed on a degree-2 vertex"
         );
 
-        assert_eq!(mesh.totvert(), pre_v);
-        assert_eq!(mesh.totedge(), pre_e);
-        assert_eq!(mesh.totface(), pre_f);
+        assert_eq!(mesh.vertex_count(), pre_v);
+        assert_eq!(mesh.edge_count(), pre_e);
+        assert_eq!(mesh.face_count(), pre_f);
         assert_eq!(mesh.face_len(face), 4);
 
         let after_verts: std::collections::HashSet<VertexKey> =

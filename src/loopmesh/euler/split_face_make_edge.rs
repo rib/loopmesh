@@ -170,15 +170,15 @@ mod tests {
             .find(|&&l| mesh.loop_vertex(l) == v2)
             .unwrap();
 
-        let pre_v = mesh.totvert();
-        let pre_e = mesh.totedge();
-        let pre_f = mesh.totface();
+        let pre_v = mesh.vertex_count();
+        let pre_e = mesh.edge_count();
+        let pre_f = mesh.face_count();
 
         let (face2, new_edge, _l_new) = mesh.euler_split_face_make_edge(face, l_v0, l_v2);
 
-        assert_eq!(mesh.totvert(), pre_v, "no vertex change");
-        assert_eq!(mesh.totedge(), pre_e + 1, "one edge added");
-        assert_eq!(mesh.totface(), pre_f + 1, "one face added");
+        assert_eq!(mesh.vertex_count(), pre_v, "no vertex change");
+        assert_eq!(mesh.edge_count(), pre_e + 1, "one edge added");
+        assert_eq!(mesh.face_count(), pre_f + 1, "one face added");
 
         // The new edge connects v0 <-> v2.
         let ne_verts = mesh.edge_vertices(new_edge);

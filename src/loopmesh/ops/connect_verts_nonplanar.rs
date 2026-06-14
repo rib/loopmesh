@@ -318,7 +318,7 @@ mod tests {
             let cut = mesh.connect_verts_nonplanar_out(&[face], ANGLE_TIGHT);
 
             assert!(cut.is_empty(), "flat {n}-gon yields no cut");
-            assert_eq!(mesh.totface(), 1, "flat {n}-gon untouched");
+            assert_eq!(mesh.face_count(), 1, "flat {n}-gon untouched");
             assert_eq!(mesh.face_len(face), n);
             mesh.validate_topology();
         }
@@ -329,14 +329,14 @@ mod tests {
         // §5.2 — a creased quad cut into two flat triangles: 4 V, 4→5 E, 1→2 F.
         let mut mesh = LoopMesh::new();
         let (face, _v) = folded_quad(&mut mesh, 0.8);
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
 
         let cut = mesh.connect_verts_nonplanar_out(&[face], ANGLE_TIGHT);
 
-        assert_eq!(mesh.totvert(), v0, "no verts created or destroyed");
+        assert_eq!(mesh.vertex_count(), v0, "no verts created or destroyed");
         assert_eq!(cut.len(), 1, "exactly one diagonal cut");
-        assert_eq!(mesh.totedge(), 5, "one new diagonal edge");
-        assert_eq!(mesh.totface(), 2, "quad becomes two triangles");
+        assert_eq!(mesh.edge_count(), 5, "one new diagonal edge");
+        assert_eq!(mesh.face_count(), 2, "quad becomes two triangles");
         for f in mesh.face_keys() {
             assert_eq!(mesh.face_len(f), 3, "both pieces are triangles");
         }
@@ -351,7 +351,7 @@ mod tests {
         let (face_fires, _) = folded_quad(&mut mesh_fires, 0.8);
         let cut_fires = mesh_fires.connect_verts_nonplanar_out(&[face_fires], ANGLE_TIGHT);
         assert_eq!(cut_fires.len(), 1, "tight tolerance cuts the crease");
-        assert_eq!(mesh_fires.totface(), 2);
+        assert_eq!(mesh_fires.face_count(), 2);
         mesh_fires.validate_topology();
 
         let mut mesh_blocks = LoopMesh::new();
@@ -361,7 +361,7 @@ mod tests {
             cut_blocks.is_empty(),
             "loose tolerance leaves the crease whole"
         );
-        assert_eq!(mesh_blocks.totface(), 1);
+        assert_eq!(mesh_blocks.face_count(), 1);
         assert_eq!(mesh_blocks.face_len(face_blocks), 4);
         mesh_blocks.validate_topology();
     }
@@ -373,22 +373,22 @@ mod tests {
         // structural invariants the guide makes deterministic.
         let mut mesh = LoopMesh::new();
         let (face, _) = nonplanar_pentagon(&mut mesh, 1.0);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
 
         let cut = mesh.connect_verts_nonplanar_out(&[face], ANGLE_TIGHT);
 
-        assert_eq!(mesh.totvert(), v0, "no verts created or destroyed");
+        assert_eq!(mesh.vertex_count(), v0, "no verts created or destroyed");
         assert!(!cut.is_empty(), "a ridged pentagon forces at least one cut");
         // §2 net delta: +(p-1) edges and +(p-1) faces for p leaf pieces.
-        let piece_count = mesh.totface();
+        let piece_count = mesh.face_count();
         assert!(
             piece_count >= 3,
             "the ridge drives the recursion past a single cut (≥3 pieces)"
         );
         assert_eq!(cut.len(), piece_count - 1, "p-1 diagonals for p pieces");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             e0 + (piece_count - 1),
             "+(p-1) interior edges"
         );
@@ -436,7 +436,7 @@ mod tests {
 
         let out = mesh.connect_verts_nonplanar_capture(&[face], ANGLE_TIGHT);
 
-        let piece_count = mesh.totface();
+        let piece_count = mesh.face_count();
         assert!(piece_count >= 3, "the ridge drives recursion past one cut");
         // Every leaf piece is present and the set is deduped: |faces.out| == p,
         // strictly greater than the (p-1) new-half count alone — proving the
@@ -472,7 +472,7 @@ mod tests {
         let cut = mesh.connect_verts_nonplanar_out(&[face], ANGLE_TIGHT);
 
         assert!(cut.is_empty());
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.face_len(face), 3);
         mesh.validate_topology();
     }
@@ -495,7 +495,7 @@ mod tests {
 
         assert_eq!(cut.len(), 1, "only the folded face is cut");
         assert_eq!(mesh.face_len(flat), 4, "flat face untouched");
-        assert_eq!(mesh.totface(), 3, "2 input faces become 3");
+        assert_eq!(mesh.face_count(), 3, "2 input faces become 3");
         mesh.validate_topology();
     }
 }

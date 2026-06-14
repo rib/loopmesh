@@ -610,16 +610,16 @@ mod tests {
     fn faces_context_kills_solely_owned_geometry() {
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 5);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let block = interior_2x2_block(&faces);
         mesh.delete(&block, DeleteContext::Faces);
 
         // DELETE.md §7: −4 F, −4 E (the four interior cross-edges), −1 V (the
         // single centre vert where the cross-edges met).
-        assert_eq!(f0 - mesh.totface(), 4, "faces");
-        assert_eq!(e0 - mesh.totedge(), 4, "edges");
-        assert_eq!(v0 - mesh.totvert(), 1, "verts");
+        assert_eq!(f0 - mesh.face_count(), 4, "faces");
+        assert_eq!(e0 - mesh.edge_count(), 4, "edges");
+        assert_eq!(v0 - mesh.vertex_count(), 1, "verts");
 
         // The deleted block faces are gone.
         for &f in &block {
@@ -680,16 +680,16 @@ mod tests {
     fn faces_only_context_keeps_whole_wireframe() {
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 5);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let block = interior_2x2_block(&faces);
         mesh.delete(&block, DeleteContext::FacesOnly);
 
         // DELETE.md §7 contrast pin: −4 F, 0 E, 0 V. The interior cross-edges
         // and centre vert that die under Faces all survive as wire here.
-        assert_eq!(f0 - mesh.totface(), 4, "faces");
-        assert_eq!(e0 - mesh.totedge(), 0, "edges");
-        assert_eq!(v0 - mesh.totvert(), 0, "verts");
+        assert_eq!(f0 - mesh.face_count(), 4, "faces");
+        assert_eq!(e0 - mesh.edge_count(), 0, "edges");
+        assert_eq!(v0 - mesh.vertex_count(), 0, "verts");
 
         for &f in &block {
             assert!(mesh.faces.try_get(f).is_none());
@@ -705,9 +705,9 @@ mod tests {
 
         mesh.delete(&faces, DeleteContext::Faces);
 
-        assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 0);
-        assert_eq!(mesh.totvert(), 0);
+        assert_eq!(mesh.face_count(), 0);
+        assert_eq!(mesh.edge_count(), 0);
+        assert_eq!(mesh.vertex_count(), 0);
     }
 
     #[test]
@@ -719,9 +719,9 @@ mod tests {
 
         mesh.delete(&faces, DeleteContext::FacesOnly);
 
-        assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totvert(), 4);
+        assert_eq!(mesh.face_count(), 0);
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.vertex_count(), 4);
     }
 
     /// Two quads sharing one edge: 6 verts, 7 edges (4 + 4 − 1 shared), 2
@@ -775,9 +775,13 @@ mod tests {
 
         mesh.delete(&block, DeleteContext::FacesKeepBoundary);
 
-        assert_eq!(mesh.totface(), 0, "both faces gone");
-        assert_eq!(mesh.totedge(), 6, "6 boundary edges kept as wire");
-        assert_eq!(mesh.totvert(), 6, "all verts rescued by kept wire edges");
+        assert_eq!(mesh.face_count(), 0, "both faces gone");
+        assert_eq!(mesh.edge_count(), 6, "6 boundary edges kept as wire");
+        assert_eq!(
+            mesh.vertex_count(),
+            6,
+            "all verts rescued by kept wire edges"
+        );
         assert!(
             mesh.edges.try_get(shared).is_none(),
             "radial-2 shared edge dies (only would-be boundary)"
@@ -793,13 +797,13 @@ mod tests {
 
         mesh.delete(&block, DeleteContext::Faces);
 
-        assert_eq!(mesh.totface(), 0);
+        assert_eq!(mesh.face_count(), 0);
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             0,
             "plain Faces drops the owned boundary too"
         );
-        assert_eq!(mesh.totvert(), 0);
+        assert_eq!(mesh.vertex_count(), 0);
     }
 
     #[test]
@@ -812,9 +816,9 @@ mod tests {
 
         mesh.delete(&faces, DeleteContext::FacesKeepBoundary);
 
-        assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totvert(), 4);
+        assert_eq!(mesh.face_count(), 0);
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.vertex_count(), 4);
     }
 
     #[test]
@@ -826,21 +830,25 @@ mod tests {
         // (radial-2 with a surviving grid face) and kept by the §4.2 keep-alive.
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 5);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let block = interior_2x2_block(&faces);
         mesh.delete(&block, DeleteContext::FacesKeepBoundary);
 
-        assert_eq!(f0 - mesh.totface(), 4, "faces");
-        assert_eq!(e0 - mesh.totedge(), 4, "edges (radial-2 cross-edges die)");
-        assert_eq!(v0 - mesh.totvert(), 1, "verts (centre)");
+        assert_eq!(f0 - mesh.face_count(), 4, "faces");
+        assert_eq!(
+            e0 - mesh.edge_count(),
+            4,
+            "edges (radial-2 cross-edges die)"
+        );
+        assert_eq!(v0 - mesh.vertex_count(), 1, "verts (centre)");
     }
 
     #[test]
     fn empty_seed_is_noop() {
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.delete(&[] as &[FaceKey], DeleteContext::Faces);
         mesh.delete(&[] as &[FaceKey], DeleteContext::FacesOnly);
@@ -848,7 +856,7 @@ mod tests {
 
         assert_eq!(
             (v0, e0, f0),
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         );
     }
 
@@ -861,16 +869,16 @@ mod tests {
         // seed) survive. Net: −1 V, −4 E, −4 F.
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 2);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         // In a 2×2 grid (3×3 verts), the single interior vert is the v11 corner
         // of face (0,0) — the corner diagonally opposite that face's origin.
         let centre = mesh.face_vert_keys(faces[0])[2];
         mesh.delete(&[centre], DeleteContext::Verts);
 
-        assert_eq!(f0 - mesh.totface(), 4, "all four faces die");
-        assert_eq!(e0 - mesh.totedge(), 4, "four spoke edges die");
-        assert_eq!(v0 - mesh.totvert(), 1, "only the seed vert dies");
+        assert_eq!(f0 - mesh.face_count(), 4, "all four faces die");
+        assert_eq!(e0 - mesh.edge_count(), 4, "four spoke edges die");
+        assert_eq!(v0 - mesh.vertex_count(), 1, "only the seed vert dies");
         assert!(mesh.vertices.try_get(centre).is_none(), "seed vert gone");
     }
 
@@ -887,9 +895,9 @@ mod tests {
 
         mesh.delete(&[corner], DeleteContext::Verts);
 
-        assert_eq!(mesh.totface(), 0, "the face dies through its corner");
-        assert_eq!(mesh.totvert(), 3, "three far corners survive");
-        assert_eq!(mesh.totedge(), 2, "two far edges survive as wire");
+        assert_eq!(mesh.face_count(), 0, "the face dies through its corner");
+        assert_eq!(mesh.vertex_count(), 3, "three far corners survive");
+        assert_eq!(mesh.edge_count(), 2, "two far edges survive as wire");
         assert!(mesh.vertices.try_get(corner).is_none());
     }
 
@@ -910,7 +918,7 @@ mod tests {
 
         mesh.delete(&[corner], DeleteContext::Verts);
 
-        assert_eq!(mesh.totface(), 0, "quad face dies");
+        assert_eq!(mesh.face_count(), 0, "quad face dies");
         assert!(mesh.vertices.try_get(corner).is_none(), "seed vert gone");
         assert!(
             mesh.vertices.try_get(far).is_some(),
@@ -918,8 +926,16 @@ mod tests {
         );
         // Survivors: the three far quad corners + the loose wire endpoint = 4 V;
         // the two far quad edges (wire) = 2 E; the wire edge itself is gone.
-        assert_eq!(mesh.totvert(), 4, "3 quad corners + 1 loose far endpoint");
-        assert_eq!(mesh.totedge(), 2, "two far quad edges survive, wire dies");
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "3 quad corners + 1 loose far endpoint"
+        );
+        assert_eq!(
+            mesh.edge_count(),
+            2,
+            "two far quad edges survive, wire dies"
+        );
     }
 
     /// Two triangles sharing exactly one vert (a bowtie): tris `(a,b,hub)` and
@@ -961,9 +977,17 @@ mod tests {
 
         mesh.delete(&[hub], DeleteContext::Verts);
 
-        assert_eq!(mesh.totface(), 0, "both triangles die");
-        assert_eq!(mesh.totedge(), 2, "the two hub-free opposite edges survive");
-        assert_eq!(mesh.totvert(), 4, "four non-shared corners survive loose");
+        assert_eq!(mesh.face_count(), 0, "both triangles die");
+        assert_eq!(
+            mesh.edge_count(),
+            2,
+            "the two hub-free opposite edges survive"
+        );
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "four non-shared corners survive loose"
+        );
         assert!(mesh.vertices.try_get(hub).is_none(), "hub gone");
         for c in corners {
             assert!(
@@ -1005,7 +1029,7 @@ mod tests {
         // −1 E, 0 V.
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         // A vertical interior edge between faces (1,1) and (1,1)'s right
         // neighbour: the shared edge of faces[4] (centre) and faces[5].
@@ -1027,9 +1051,9 @@ mod tests {
 
         mesh.delete(&[shared], DeleteContext::Edges);
 
-        assert_eq!(f0 - mesh.totface(), 2, "both radial faces die");
-        assert_eq!(e0 - mesh.totedge(), 1, "only the seed edge dies");
-        assert_eq!(v0 - mesh.totvert(), 0, "both endpoints kept (§7.2)");
+        assert_eq!(f0 - mesh.face_count(), 2, "both radial faces die");
+        assert_eq!(e0 - mesh.edge_count(), 1, "only the seed edge dies");
+        assert_eq!(v0 - mesh.vertex_count(), 0, "both endpoints kept (§7.2)");
         assert!(mesh.vertices.try_get(ea).is_some());
         assert!(mesh.vertices.try_get(eb).is_some());
     }
@@ -1046,8 +1070,8 @@ mod tests {
 
         mesh.delete(&[wire], DeleteContext::Edges);
 
-        assert_eq!(mesh.totedge(), 0, "wire edge gone");
-        assert_eq!(mesh.totvert(), 0, "both loose endpoints swept (§7.4)");
+        assert_eq!(mesh.edge_count(), 0, "wire edge gone");
+        assert_eq!(mesh.vertex_count(), 0, "both loose endpoints swept (§7.4)");
     }
 
     #[test]
@@ -1065,12 +1089,16 @@ mod tests {
         mesh.delete(&[spine], DeleteContext::Edges);
 
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             0,
             "all three pages die (exhaustive cascade)"
         );
-        assert_eq!(mesh.totedge(), 6, "six page edges survive as wire");
-        assert_eq!(mesh.totvert(), 5, "both spine ends + three apexes survive");
+        assert_eq!(mesh.edge_count(), 6, "six page edges survive as wire");
+        assert_eq!(
+            mesh.vertex_count(),
+            5,
+            "both spine ends + three apexes survive"
+        );
         assert!(mesh.vertices.try_get(s0).is_some(), "spine end kept (§7.2)");
         assert!(mesh.vertices.try_get(s1).is_some(), "spine end kept (§7.2)");
         assert!(mesh.edges.try_get(spine).is_none(), "spine edge gone");
@@ -1088,9 +1116,9 @@ mod tests {
 
         mesh.delete(&seed, DeleteContext::Edges);
 
-        assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 0);
-        assert_eq!(mesh.totvert(), 0, "all four loose corners swept");
+        assert_eq!(mesh.face_count(), 0);
+        assert_eq!(mesh.edge_count(), 0);
+        assert_eq!(mesh.vertex_count(), 0, "all four loose corners swept");
     }
 
     #[test]
@@ -1107,8 +1135,8 @@ mod tests {
 
         mesh.delete(&[wire], DeleteContext::EdgesFaces);
 
-        assert_eq!(mesh.totedge(), 0, "wire edge gone");
-        assert_eq!(mesh.totvert(), 2, "both endpoints kept loose (§7.5)");
+        assert_eq!(mesh.edge_count(), 0, "wire edge gone");
+        assert_eq!(mesh.vertex_count(), 2, "both endpoints kept loose (§7.5)");
         assert!(mesh.vertices.try_get(a).is_some());
         assert!(mesh.vertices.try_get(b).is_some());
     }
@@ -1117,7 +1145,7 @@ mod tests {
     fn edges_empty_seed_is_noop() {
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 3);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.delete(&[] as &[EdgeKey], DeleteContext::Edges);
         mesh.delete(&[] as &[EdgeKey], DeleteContext::EdgesFaces);
@@ -1125,7 +1153,7 @@ mod tests {
 
         assert_eq!(
             (v0, e0, f0),
-            (mesh.totvert(), mesh.totedge(), mesh.totface())
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
         );
     }
 
@@ -1140,9 +1168,9 @@ mod tests {
 
         mesh.delete(&corners, DeleteContext::Verts);
 
-        assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 0);
-        assert_eq!(mesh.totvert(), 0, "mesh fully erased");
+        assert_eq!(mesh.face_count(), 0);
+        assert_eq!(mesh.edge_count(), 0);
+        assert_eq!(mesh.vertex_count(), 0, "mesh fully erased");
     }
 
     #[test]
@@ -1182,9 +1210,13 @@ mod tests {
             DeleteContext::TaggedOnly,
         );
 
-        assert_eq!(mesh.totface(), 0, "all four tagged faces gone");
-        assert_eq!(mesh.totedge(), 8, "only the four tagged spokes removed");
-        assert_eq!(mesh.totvert(), 8, "only the tagged centre vert removed");
+        assert_eq!(mesh.face_count(), 0, "all four tagged faces gone");
+        assert_eq!(mesh.edge_count(), 8, "only the four tagged spokes removed");
+        assert_eq!(
+            mesh.vertex_count(),
+            8,
+            "only the tagged centre vert removed"
+        );
         assert!(mesh.vertices.try_get(centre).is_none(), "centre vert gone");
         for e in outer_ring_edges {
             assert!(
@@ -1212,9 +1244,13 @@ mod tests {
             DeleteContext::TaggedOnly,
         );
 
-        assert_eq!(mesh.totface(), 0, "tagged face gone");
-        assert_eq!(mesh.totedge(), 4, "untagged wire loop kept (§8.3 benign)");
-        assert_eq!(mesh.totvert(), 4, "untagged corners kept");
+        assert_eq!(mesh.face_count(), 0, "tagged face gone");
+        assert_eq!(
+            mesh.edge_count(),
+            4,
+            "untagged wire loop kept (§8.3 benign)"
+        );
+        assert_eq!(mesh.vertex_count(), 4, "untagged corners kept");
     }
 
     #[test]
@@ -1228,7 +1264,7 @@ mod tests {
         // outcome matches the closed set, −4 F, −4 E, −1 V.
         let mut mesh = LoopMesh::new();
         let faces = build_quad_grid(&mut mesh, 2);
-        let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let centre = mesh.face_vert_keys(faces[0])[2];
 
@@ -1241,10 +1277,14 @@ mod tests {
             DeleteContext::TaggedOnly,
         );
 
-        assert_eq!(f0 - mesh.totface(), 4, "all four faces gone via cascade");
-        assert_eq!(e0 - mesh.totedge(), 4, "all four spokes gone via cascade");
+        assert_eq!(f0 - mesh.face_count(), 4, "all four faces gone via cascade");
         assert_eq!(
-            v0 - mesh.totvert(),
+            e0 - mesh.edge_count(),
+            4,
+            "all four spokes gone via cascade"
+        );
+        assert_eq!(
+            v0 - mesh.vertex_count(),
             1,
             "only the tagged centre vert removed"
         );

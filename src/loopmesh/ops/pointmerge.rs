@@ -101,12 +101,12 @@ mod tests {
         mesh.pointmerge(&verts, [3.0, 0.0, 0.0]);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             1,
             "the whole input set fused to one survivor"
         );
         assert_eq!(
-            mesh.totface(),
+            mesh.face_count(),
             0,
             "the source face degenerated and was reaped"
         );
@@ -152,8 +152,8 @@ mod tests {
         let merge_co = [4.0, 4.0, 0.0];
         mesh.pointmerge(&[a, b], merge_co);
 
-        assert_eq!(mesh.totvert(), 1, "the pair fused to one survivor");
-        assert_eq!(mesh.totedge(), 0, "the collapsed edge is reaped");
+        assert_eq!(mesh.vertex_count(), 1, "the pair fused to one survivor");
+        assert_eq!(mesh.edge_count(), 0, "the collapsed edge is reaped");
         let survivor = mesh.vert_keys()[0];
         assert_eq!(survivor, a, "the first input vert survives");
         assert_eq!(
@@ -172,13 +172,13 @@ mod tests {
         let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
         let c = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let merge_co = [9.0, 9.0, 9.0];
         mesh.pointmerge(&[b], merge_co);
 
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             before,
             "pure move removes nothing"
         );
@@ -236,11 +236,14 @@ mod tests {
     fn pointmerge_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let a = mesh.create_vertex(Vec3::new(1.0, 2.0, 3.0));
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.pointmerge(&[], [0.0, 0.0, 0.0]);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         assert_eq!(
             mesh.vertex_position(a),
             Vec3::new(1.0, 2.0, 3.0),

@@ -138,16 +138,16 @@ mod tests {
         // Split at v1 (i.e. tail_vertex = v1, so new vertex sits between v0 and v1
         // along the original edge, leaving `edge` connecting v0 <-> v_new and
         // a new edge connecting v_new <-> v1).
-        let pre_totvert = mesh.totvert();
-        let pre_totedge = mesh.totedge();
-        let pre_totface = mesh.totface();
+        let pre_totvert = mesh.vertex_count();
+        let pre_totedge = mesh.edge_count();
+        let pre_totface = mesh.face_count();
 
         let (v_new, e_new) = mesh.euler_split_edge_make_vert(v1, edge);
 
         // Topology checks.
-        assert_eq!(mesh.totvert(), pre_totvert + 1, "one vertex added");
-        assert_eq!(mesh.totedge(), pre_totedge + 1, "one edge added");
-        assert_eq!(mesh.totface(), pre_totface, "no face change");
+        assert_eq!(mesh.vertex_count(), pre_totvert + 1, "one vertex added");
+        assert_eq!(mesh.edge_count(), pre_totedge + 1, "one edge added");
+        assert_eq!(mesh.face_count(), pre_totface, "no face change");
 
         // The face should now have 5 verts.
         let new_face_verts = mesh.face_vert_keys(face);
@@ -213,8 +213,8 @@ mod tests {
         // After first split, `edge` now goes v0 <-> v_mid1. Split that again.
         let (_v_mid2, _e2) = mesh.euler_split_edge_make_vert(v_mid1, edge);
 
-        assert_eq!(mesh.totvert(), 6);
-        assert_eq!(mesh.totedge(), 6);
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.edge_count(), 6);
         assert_eq!(mesh.face_len(face), 6);
     }
 }

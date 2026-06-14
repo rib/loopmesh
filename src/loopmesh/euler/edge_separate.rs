@@ -44,23 +44,23 @@ mod tests {
             .expect("cube has interior edges");
 
         // Snapshot the cube's totals.
-        let v0_before = mesh.totvert();
-        let e0_before = mesh.totedge();
-        let f0_before = mesh.totface();
+        let v0_before = mesh.vertex_count();
+        let e0_before = mesh.edge_count();
+        let f0_before = mesh.face_count();
 
         // Separate one loop off the edge.
         let l_sep = mesh.edge_radial_iter(interior_edge).next().unwrap();
         let e_new = mesh.euler_edge_separate(interior_edge, l_sep);
 
-        assert_eq!(mesh.totedge(), e0_before + 1);
+        assert_eq!(mesh.edge_count(), e0_before + 1);
         assert_eq!(mesh.edge_radial_iter(interior_edge).count(), 1);
         assert_eq!(mesh.edge_radial_iter(e_new).count(), 1);
 
         // Splice them back together. After: cube topology restored.
         assert!(mesh.edge_splice(interior_edge, e_new));
-        assert_eq!(mesh.totvert(), v0_before);
-        assert_eq!(mesh.totedge(), e0_before);
-        assert_eq!(mesh.totface(), f0_before);
+        assert_eq!(mesh.vertex_count(), v0_before);
+        assert_eq!(mesh.edge_count(), e0_before);
+        assert_eq!(mesh.face_count(), f0_before);
         assert_eq!(mesh.edge_radial_iter(interior_edge).count(), 2);
     }
 }

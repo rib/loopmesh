@@ -309,14 +309,14 @@ mod tests {
         let (face, wire, corner) = quad_with_wire_at_corner(&mut mesh);
 
         // Pre-state: 4 quad verts + 1 wire tip = 5 verts.
-        assert_eq!(mesh.totvert(), 5);
+        assert_eq!(mesh.vertex_count(), 5);
 
         let result = mesh.extrude_region_mixed(&[face], &[wire], &[]);
 
         // Verts duplicated: 4 quad verts + the wire tip v4. The shared corner
         // is counted once (it is one of the 4 quad verts). So 5 duplicates,
         // 10 verts total — NOT 6 duplicates / 11 verts.
-        assert_eq!(mesh.totvert(), 10, "shared corner duplicated once");
+        assert_eq!(mesh.vertex_count(), 10, "shared corner duplicated once");
         assert_eq!(
             result.vert_map.len(),
             5,
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(result.cap_faces.len(), 1);
 
         // Total faces: kept original + duplicate cap + 5 walls = 7.
-        assert_eq!(mesh.totface(), 7);
+        assert_eq!(mesh.face_count(), 7);
         mesh.validate_topology();
     }
 
@@ -462,10 +462,10 @@ mod tests {
         );
         assert_eq!(result_named.edge_map.len(), result_plain.edge_map.len());
         assert_eq!(result_named.edge_map.len(), 4);
-        assert_eq!(mesh_named.totface(), mesh_plain.totface());
+        assert_eq!(mesh_named.face_count(), mesh_plain.face_count());
         // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
         // walls = 6.
-        assert_eq!(mesh_named.totface(), 6);
+        assert_eq!(mesh_named.face_count(), 6);
         mesh_named.validate_topology();
     }
 
@@ -522,14 +522,18 @@ mod tests {
         let (face, wire, _loose) = face_loose_edge_and_vert(&mut mesh);
 
         // Pre-state: 4 quad verts + 2 wire verts + 1 loose vert = 7 verts.
-        assert_eq!(mesh.totvert(), 7);
+        assert_eq!(mesh.vertex_count(), 7);
 
         let result =
             mesh.extrude_region_mixed_ex_exclude(&[face], &[wire], &[], &[wire], false, false);
 
         // Only the 4 quad verts are duplicated; the wire's duplicate was killed
         // along with its two orphaned duplicate endpoints. 7 + 4 = 11 verts.
-        assert_eq!(mesh.totvert(), 11, "excluded-wire duplicate verts killed");
+        assert_eq!(
+            mesh.vertex_count(),
+            11,
+            "excluded-wire duplicate verts killed"
+        );
         assert_eq!(
             result.vert_map.len(),
             4,
@@ -539,7 +543,7 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 4, "4 face walls, no wire wall");
         // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
         // walls = 6 faces after the wire kill.
-        assert_eq!(mesh.totface(), 6, "6 faces after the wire kill");
+        assert_eq!(mesh.face_count(), 6, "6 faces after the wire kill");
 
         // The original wire edge is still present and faceless.
         let [w0, w1] = mesh.edge_vertices(wire);
@@ -558,13 +562,13 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (face, wire, _loose) = face_loose_edge_and_vert(&mut mesh);
 
-        assert_eq!(mesh.totvert(), 7);
+        assert_eq!(mesh.vertex_count(), 7);
 
         let result = mesh.extrude_region_mixed_ex_exclude(&[face], &[wire], &[], &[], false, false);
 
         // 4 quad verts + 2 wire-endpoint verts duplicated = 6 dups, 13 verts.
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             13,
             "wire endpoints duplicated when not excluded"
         );
@@ -573,7 +577,7 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 5, "wire contributes a wall");
         // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
         // face walls + 1 wire wall = 7 faces.
-        assert_eq!(mesh.totface(), 7);
+        assert_eq!(mesh.face_count(), 7);
         mesh.validate_topology();
     }
 
@@ -598,7 +602,7 @@ mod tests {
         assert_eq!(result.vert_map.len(), 4);
         // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 3
         // walls = 5 faces.
-        assert_eq!(mesh.totface(), 5);
+        assert_eq!(mesh.face_count(), 5);
         mesh.validate_topology();
     }
 
@@ -624,8 +628,8 @@ mod tests {
         assert_eq!(res_a.edge_map.len(), res_b.edge_map.len());
         assert_eq!(res_a.wall_faces.len(), res_b.wall_faces.len());
         assert_eq!(res_a.wire_edges.len(), res_b.wire_edges.len());
-        assert_eq!(mesh_a.totvert(), mesh_b.totvert());
-        assert_eq!(mesh_a.totface(), mesh_b.totface());
+        assert_eq!(mesh_a.vertex_count(), mesh_b.vertex_count());
+        assert_eq!(mesh_a.face_count(), mesh_b.face_count());
         mesh_b.validate_topology();
     }
 
@@ -633,7 +637,7 @@ mod tests {
     fn mixed_empty_input_is_noop() {
         let mut mesh = LoopMesh::new();
         let _ = unit_quad(&mut mesh);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let result = mesh.extrude_region_mixed(&[], &[], &[]);
 
@@ -641,7 +645,10 @@ mod tests {
         assert_eq!(result.edge_map.len(), 0);
         assert_eq!(result.wall_faces.len(), 0);
         assert_eq!(result.wire_edges.len(), 0);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 }

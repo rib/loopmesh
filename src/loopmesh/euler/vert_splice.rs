@@ -51,14 +51,14 @@ mod tests {
         let _ = mesh.face_create(&verts[2..], &[e23, e34, e24], FaceCreateFlags::NONE);
 
         let v_pinch = verts[2];
-        let v_before = mesh.totvert();
+        let v_before = mesh.vertex_count();
 
         let fans = mesh.euler_vert_separate(v_pinch);
         assert_eq!(fans.len(), 2, "bowtie pinch should split into 2 fans");
-        assert_eq!(mesh.totvert(), v_before + 1);
+        assert_eq!(mesh.vertex_count(), v_before + 1);
 
         mesh.euler_vert_splice(fans[0], fans[1]);
-        assert_eq!(mesh.totvert(), v_before);
+        assert_eq!(mesh.vertex_count(), v_before);
         mesh.validate_topology();
     }
 }

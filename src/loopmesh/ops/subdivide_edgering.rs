@@ -1395,7 +1395,7 @@ mod tests {
     use super::*;
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
-        (mesh.totvert(), mesh.totedge(), mesh.totface())
+        (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
 
     /// Build an open 1×k quad strip in the z = 0 plane. Bottom row verts at

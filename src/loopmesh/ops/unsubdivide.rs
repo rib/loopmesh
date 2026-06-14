@@ -621,19 +621,19 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = build_grid_n_faces(&mut mesh, 4);
 
-        assert_eq!(mesh.totvert(), 25);
-        assert_eq!(mesh.totedge(), 40);
-        assert_eq!(mesh.totface(), 16);
+        assert_eq!(mesh.vertex_count(), 25);
+        assert_eq!(mesh.edge_count(), 40);
+        assert_eq!(mesh.face_count(), 16);
 
         mesh.unsubdivide(&verts, 1);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             16,
             "16 V — one independent class of 9 removed"
         );
-        assert_eq!(mesh.totedge(), 28, "28 E");
-        assert_eq!(mesh.totface(), 13, "13 F");
+        assert_eq!(mesh.edge_count(), 28, "28 E");
+        assert_eq!(mesh.face_count(), 13, "13 F");
 
         let (triangles, quads) = face_corner_histogram(&mesh);
         assert_eq!(triangles, 8, "8 triangles in the irregular coarsening");
@@ -679,12 +679,12 @@ mod tests {
     fn unsubdivide_grid4_removes_one_independent_class() {
         let mut mesh = LoopMesh::new();
         let verts = build_grid_n_faces(&mut mesh, 4);
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
 
         mesh.unsubdivide(&verts, 1);
 
         assert_eq!(
-            v0 - mesh.totvert(),
+            v0 - mesh.vertex_count(),
             9,
             "exactly one bipartition class removed"
         );
@@ -703,15 +703,15 @@ mod tests {
         // verts[r*5+c]; (2,2) = 12 is a fully-interior 4-cross vert.
         let centre = verts[2 * 5 + 2];
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         mesh.unsubdivide(&[centre], 1);
 
-        assert_eq!(mesh.totvert(), v0, "no-op: V unchanged");
-        assert_eq!(mesh.totedge(), e0, "no-op: E unchanged");
-        assert_eq!(mesh.totface(), f0, "no-op: F unchanged");
+        assert_eq!(mesh.vertex_count(), v0, "no-op: V unchanged");
+        assert_eq!(mesh.edge_count(), e0, "no-op: E unchanged");
+        assert_eq!(mesh.face_count(), f0, "no-op: F unchanged");
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&centre), "the lone tagged vert survives");
         mesh.validate_topology();
@@ -728,9 +728,9 @@ mod tests {
 
         mesh.unsubdivide(&verts, 2);
 
-        assert_eq!(mesh.totvert(), 14, "14 V after the second step (§5.3)");
-        assert_eq!(mesh.totedge(), 25, "25 E after the second step (§5.3)");
-        assert_eq!(mesh.totface(), 12, "12 F after the second step (§5.3)");
+        assert_eq!(mesh.vertex_count(), 14, "14 V after the second step (§5.3)");
+        assert_eq!(mesh.edge_count(), 25, "25 E after the second step (§5.3)");
+        assert_eq!(mesh.face_count(), 12, "12 F after the second step (§5.3)");
 
         let (triangles, quads) = face_corner_histogram(&mesh);
         assert_eq!(triangles, 10, "10 triangles in the converged coarsening");
@@ -756,9 +756,21 @@ mod tests {
 
         mesh.unsubdivide(&verts, 4);
 
-        assert_eq!(mesh.totvert(), 14, "converged V unchanged by excess steps");
-        assert_eq!(mesh.totedge(), 25, "converged E unchanged by excess steps");
-        assert_eq!(mesh.totface(), 12, "converged F unchanged by excess steps");
+        assert_eq!(
+            mesh.vertex_count(),
+            14,
+            "converged V unchanged by excess steps"
+        );
+        assert_eq!(
+            mesh.edge_count(),
+            25,
+            "converged E unchanged by excess steps"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            12,
+            "converged F unchanged by excess steps"
+        );
 
         let (triangles, quads) = face_corner_histogram(&mesh);
         assert_eq!(triangles, 10);
@@ -782,18 +794,18 @@ mod tests {
         stepwise.unsubdivide(&stepwise_verts, 1);
         stepwise.unsubdivide(&stepwise_verts, 1);
 
-        assert_eq!(stepwise.totvert(), 14);
-        assert_eq!(stepwise.totedge(), 25);
-        assert_eq!(stepwise.totface(), 12);
+        assert_eq!(stepwise.vertex_count(), 14);
+        assert_eq!(stepwise.edge_count(), 25);
+        assert_eq!(stepwise.face_count(), 12);
         stepwise.validate_topology();
 
         let mut batched = LoopMesh::new();
         let batched_verts = build_grid_n_faces(&mut batched, 4);
         batched.unsubdivide(&batched_verts, 2);
 
-        assert_eq!(stepwise.totvert(), batched.totvert());
-        assert_eq!(stepwise.totedge(), batched.totedge());
-        assert_eq!(stepwise.totface(), batched.totface());
+        assert_eq!(stepwise.vertex_count(), batched.vertex_count());
+        assert_eq!(stepwise.edge_count(), batched.edge_count());
+        assert_eq!(stepwise.face_count(), batched.face_count());
     }
 
     /// §6 partial-selection scope: tagging only a sub-region coarsens that
@@ -813,9 +825,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = build_grid_n_faces(&mut mesh, 3);
 
-        assert_eq!(mesh.totvert(), 16);
-        assert_eq!(mesh.totedge(), 24);
-        assert_eq!(mesh.totface(), 9);
+        assert_eq!(mesh.vertex_count(), 16);
+        assert_eq!(mesh.edge_count(), 24);
+        assert_eq!(mesh.face_count(), 9);
 
         // stride = n + 1 = 4; verts[r * 4 + c] sits at Vec3(c, r, 0).
         // (1,1) = idx 5, (2,1) = idx 6 — two horizontally-adjacent interior
@@ -833,16 +845,20 @@ mod tests {
 
         mesh.unsubdivide(&partial, 1);
 
-        assert_eq!(mesh.totvert(), 15, "one of the two tagged verts removed");
         assert_eq!(
-            mesh.totedge(),
+            mesh.vertex_count(),
+            15,
+            "one of the two tagged verts removed"
+        );
+        assert_eq!(
+            mesh.edge_count(),
             24,
             "edges net-unchanged (spokes → diagonals)"
         );
-        assert_eq!(mesh.totface(), 10, "n-gon pre-pass nets +1 face");
+        assert_eq!(mesh.face_count(), 10, "n-gon pre-pass nets +1 face");
         // Euler-consistent planar surface with one boundary loop.
         assert_eq!(
-            mesh.totvert() as i64 - mesh.totedge() as i64 + mesh.totface() as i64,
+            mesh.vertex_count() as i64 - mesh.edge_count() as i64 + mesh.face_count() as i64,
             1,
         );
 
@@ -873,9 +889,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = build_grid_n_faces(&mut mesh, 3);
 
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
-        let f0 = mesh.totface();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
 
         // (1,1) = idx 5 and (2,2) = idx 10 are diagonal interior verts: both
         // eligible, but not joined by an edge, so the eligible subgraph is two
@@ -883,9 +899,9 @@ mod tests {
         let diagonal = [verts[1 * 4 + 1], verts[2 * 4 + 2]];
         mesh.unsubdivide(&diagonal, 1);
 
-        assert_eq!(mesh.totvert(), v0, "no-op: V unchanged");
-        assert_eq!(mesh.totedge(), e0, "no-op: E unchanged");
-        assert_eq!(mesh.totface(), f0, "no-op: F unchanged");
+        assert_eq!(mesh.vertex_count(), v0, "no-op: V unchanged");
+        assert_eq!(mesh.edge_count(), e0, "no-op: E unchanged");
+        assert_eq!(mesh.face_count(), f0, "no-op: F unchanged");
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&diagonal[0]) && live.contains(&diagonal[1]));
         mesh.validate_topology();
@@ -903,15 +919,19 @@ mod tests {
         let mut all = vec![center];
         all.extend_from_slice(&rim);
 
-        assert_eq!(mesh.totvert(), 7);
-        assert_eq!(mesh.totedge(), 12);
-        assert_eq!(mesh.totface(), 6);
+        assert_eq!(mesh.vertex_count(), 7);
+        assert_eq!(mesh.edge_count(), 12);
+        assert_eq!(mesh.face_count(), 6);
 
         mesh.unsubdivide(&all, 1);
 
-        assert_eq!(mesh.totvert(), 4, "4 V — center + 3 surviving rim verts");
-        assert_eq!(mesh.totedge(), 6, "6 E");
-        assert_eq!(mesh.totface(), 3, "3 F");
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "4 V — center + 3 surviving rim verts"
+        );
+        assert_eq!(mesh.edge_count(), 6, "6 E");
+        assert_eq!(mesh.face_count(), 3, "3 F");
         let (triangles, quads) = face_corner_histogram(&mesh);
         assert_eq!(
             triangles, 3,
@@ -951,19 +971,19 @@ mod tests {
         let mut all = vec![center];
         all.extend_from_slice(&rim);
 
-        assert_eq!(mesh.totvert(), 5);
-        assert_eq!(mesh.totedge(), 8);
-        assert_eq!(mesh.totface(), 4);
+        assert_eq!(mesh.vertex_count(), 5);
+        assert_eq!(mesh.edge_count(), 8);
+        assert_eq!(mesh.face_count(), 4);
 
         mesh.unsubdivide(&all, 1);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             3,
             "3 V — two adjacent rim verts removed (§4.4)"
         );
-        assert_eq!(mesh.totedge(), 3, "3 E — single triangle");
-        assert_eq!(mesh.totface(), 1, "1 F — collapsed to one triangle");
+        assert_eq!(mesh.edge_count(), 3, "3 E — single triangle");
+        assert_eq!(mesh.face_count(), 1, "1 F — collapsed to one triangle");
         let (triangles, quads) = face_corner_histogram(&mesh);
         assert_eq!(triangles, 1);
         assert_eq!(quads, 0);
@@ -989,15 +1009,19 @@ mod tests {
         let mut all = vec![center];
         all.extend_from_slice(&rim);
 
-        assert_eq!(mesh.totvert(), 4);
-        assert_eq!(mesh.totedge(), 6);
-        assert_eq!(mesh.totface(), 3);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.edge_count(), 6);
+        assert_eq!(mesh.face_count(), 3);
 
         mesh.unsubdivide(&all, 1);
 
-        assert_eq!(mesh.totvert(), 4, "no-op: rim verts blocked at eligibility");
-        assert_eq!(mesh.totedge(), 6, "no-op");
-        assert_eq!(mesh.totface(), 3, "no-op");
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "no-op: rim verts blocked at eligibility"
+        );
+        assert_eq!(mesh.edge_count(), 6, "no-op");
+        assert_eq!(mesh.face_count(), 3, "no-op");
         mesh.validate_topology();
     }
 
@@ -1013,15 +1037,15 @@ mod tests {
                 let mut mesh = LoopMesh::new();
                 let verts = build_triangulated_grid(&mut mesh, n);
 
-                assert_eq!(mesh.totvert(), exp_v, "n={n} input V");
-                assert_eq!(mesh.totedge(), exp_e, "n={n} input E");
-                assert_eq!(mesh.totface(), exp_f, "n={n} input F");
+                assert_eq!(mesh.vertex_count(), exp_v, "n={n} input V");
+                assert_eq!(mesh.edge_count(), exp_e, "n={n} input E");
+                assert_eq!(mesh.face_count(), exp_f, "n={n} input F");
 
                 mesh.unsubdivide(&verts, iterations);
 
-                assert_eq!(mesh.totvert(), exp_v, "n={n} it={iterations} no-op V");
-                assert_eq!(mesh.totedge(), exp_e, "n={n} it={iterations} no-op E");
-                assert_eq!(mesh.totface(), exp_f, "n={n} it={iterations} no-op F");
+                assert_eq!(mesh.vertex_count(), exp_v, "n={n} it={iterations} no-op V");
+                assert_eq!(mesh.edge_count(), exp_e, "n={n} it={iterations} no-op E");
+                assert_eq!(mesh.face_count(), exp_f, "n={n} it={iterations} no-op F");
                 mesh.validate_topology();
             }
         }
@@ -1039,9 +1063,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = build_mixed_ngon_patch(&mut mesh);
 
-        assert_eq!(mesh.totvert(), 9);
-        assert_eq!(mesh.totedge(), 13);
-        assert_eq!(mesh.totface(), 5);
+        assert_eq!(mesh.vertex_count(), 9);
+        assert_eq!(mesh.edge_count(), 13);
+        assert_eq!(mesh.face_count(), 5);
         assert_eq!(
             face_arity_histogram(&mesh),
             std::collections::BTreeMap::from([(3, 2), (4, 2), (5, 1)]),
@@ -1050,9 +1074,9 @@ mod tests {
 
         mesh.unsubdivide(&verts, 1);
 
-        assert_eq!(mesh.totvert(), 6, "6 V — three verts removed");
-        assert_eq!(mesh.totedge(), 10, "10 E");
-        assert_eq!(mesh.totface(), 5, "5 F — face count unchanged");
+        assert_eq!(mesh.vertex_count(), 6, "6 V — three verts removed");
+        assert_eq!(mesh.edge_count(), 10, "10 E");
+        assert_eq!(mesh.face_count(), 5, "5 F — face count unchanged");
         assert_eq!(
             face_arity_histogram(&mesh),
             std::collections::BTreeMap::from([(3, 5)]),
@@ -1078,9 +1102,9 @@ mod tests {
 
         mesh.unsubdivide(&verts, 2);
 
-        assert_eq!(mesh.totvert(), 4, "4 V — converged to a single quad");
-        assert_eq!(mesh.totedge(), 4, "4 E");
-        assert_eq!(mesh.totface(), 1, "1 F — single quad");
+        assert_eq!(mesh.vertex_count(), 4, "4 V — converged to a single quad");
+        assert_eq!(mesh.edge_count(), 4, "4 E");
+        assert_eq!(mesh.face_count(), 1, "1 F — single quad");
         assert_eq!(
             face_arity_histogram(&mesh),
             std::collections::BTreeMap::from([(4, 1)]),
@@ -1089,9 +1113,13 @@ mod tests {
         mesh.validate_topology();
 
         // A third step finds nothing to remove (§5.3 early-out).
-        let v_before = mesh.totvert();
+        let v_before = mesh.vertex_count();
         mesh.unsubdivide(&verts, 1);
-        assert_eq!(mesh.totvert(), v_before, "converged: third step is a no-op");
+        assert_eq!(
+            mesh.vertex_count(),
+            v_before,
+            "converged: third step is a no-op"
+        );
     }
 
     /// §1 — `iterations` is clamped to at least 1: a zero (or negative) count
@@ -1103,8 +1131,8 @@ mod tests {
 
         mesh.unsubdivide(&verts, 0);
 
-        assert_eq!(mesh.totvert(), 16, "iterations=0 clamps to one step");
-        assert_eq!(mesh.totface(), 13);
+        assert_eq!(mesh.vertex_count(), 16, "iterations=0 clamps to one step");
+        assert_eq!(mesh.face_count(), 13);
         mesh.validate_topology();
     }
 }

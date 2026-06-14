@@ -78,7 +78,7 @@ mod tests {
         mesh.remove_doubles(&verts, 0.5, false);
 
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             2,
             "the triple collapsed to one survivor plus the far vert"
         );
@@ -110,7 +110,7 @@ mod tests {
         verts.push(far);
         fired.remove_doubles(&verts, 0.5, false);
         assert_eq!(
-            fired.totvert(),
+            fired.vertex_count(),
             2,
             "dist above the spread merges the cluster"
         );
@@ -120,10 +120,18 @@ mod tests {
         let (cluster_b, far_b) = cluster_plus_far(&mut blocked, 3, 0.05);
         let mut verts_b = cluster_b.clone();
         verts_b.push(far_b);
-        let before = (blocked.totvert(), blocked.totedge(), blocked.totface());
+        let before = (
+            blocked.vertex_count(),
+            blocked.edge_count(),
+            blocked.face_count(),
+        );
         blocked.remove_doubles(&verts_b, 0.001, false);
         assert_eq!(
-            (blocked.totvert(), blocked.totedge(), blocked.totface()),
+            (
+                blocked.vertex_count(),
+                blocked.edge_count(),
+                blocked.face_count()
+            ),
             before,
             "dist below the spread leaves the mesh unchanged"
         );
@@ -145,7 +153,7 @@ mod tests {
         // at its own position, not the midpoint (0.05, 0, 0).
         mesh.remove_doubles(&verts, 0.5, false);
 
-        assert_eq!(mesh.totvert(), 1, "the pair merged to one vert");
+        assert_eq!(mesh.vertex_count(), 1, "the pair merged to one vert");
         let survivor = mesh.vert_keys()[0];
         assert_eq!(survivor, a, "the lower-index member is the survivor");
         assert_eq!(
@@ -178,7 +186,7 @@ mod tests {
         };
         mk(&mut mesh, [a0, b, c, a1]);
         mk(&mut mesh, [b, d0, d1, c]);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         // dist 0.1 covers the 0.02 gap between b and c; nothing else is close.
         mesh.remove_doubles(&[a0, b, c, a1, d0, d1], 0.1, false);
@@ -188,7 +196,7 @@ mod tests {
             !live.contains(&b) || !live.contains(&c),
             "one of the shared endpoints is gone"
         );
-        assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
+        assert_eq!(mesh.face_count(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
             assert_eq!(
                 mesh.face_len(face),
@@ -219,7 +227,7 @@ mod tests {
         let verts_s = build(&mut spatial);
         spatial.remove_doubles(&verts_s, 0.5, false);
         assert_eq!(
-            spatial.totvert(),
+            spatial.vertex_count(),
             3,
             "spatial merges the coincident disconnected pair"
         );
@@ -228,16 +236,16 @@ mod tests {
         let mut connected = LoopMesh::new();
         let verts_c = build(&mut connected);
         let before = (
-            connected.totvert(),
-            connected.totedge(),
-            connected.totface(),
+            connected.vertex_count(),
+            connected.edge_count(),
+            connected.face_count(),
         );
         connected.remove_doubles(&verts_c, 0.5, true);
         assert_eq!(
             (
-                connected.totvert(),
-                connected.totedge(),
-                connected.totface()
+                connected.vertex_count(),
+                connected.edge_count(),
+                connected.face_count()
             ),
             before,
             "connected leaves the disconnected pair apart: no-op"
@@ -253,15 +261,21 @@ mod tests {
         let verts: Vec<VertexKey> = (0..4)
             .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
             .collect();
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         // Well-separated input: empty map, no-op.
         mesh.remove_doubles(&verts, 0.5, false);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
 
         // Empty input slot: nothing considered, no-op.
         mesh.remove_doubles(&[], 0.5, false);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 
@@ -287,7 +301,7 @@ mod tests {
         };
         mk(&mut mesh, [hub, a0, a1]);
         mk(&mut mesh, [hub, b0, b1]);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
 
         // a0 and b0 are within 0.1 (gap 0.01); nothing else is close.
         mesh.remove_doubles(&[hub, a0, a1, b0, b1], 0.1, false);
@@ -299,8 +313,12 @@ mod tests {
             !live.contains(&a0) || !live.contains(&b0),
             "the near pair fused"
         );
-        assert_eq!(mesh.totvert(), 4, "a0/b0 fused: hub + survivor + a1 + b1");
-        assert_eq!(mesh.totface(), 2, "both wings survive as triangles");
+        assert_eq!(
+            mesh.vertex_count(),
+            4,
+            "a0/b0 fused: hub + survivor + a1 + b1"
+        );
+        assert_eq!(mesh.face_count(), 2, "both wings survive as triangles");
         mesh.validate_topology();
     }
 }

@@ -394,8 +394,8 @@ mod tests {
             },
         );
         assert_eq!(result.wall_faces.len(), 4);
-        assert_eq!(mesh.totvert(), 8);
-        assert_eq!(mesh.totface(), 5);
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.face_count(), 5);
         mesh.validate_topology();
     }
 

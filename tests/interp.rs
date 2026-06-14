@@ -540,10 +540,10 @@ fn loop_interp_is_skipped_when_no_loop_attribs() {
     let (verts, f, edges) = make_quad(&mut mesh);
 
     let (v_new, _e_new) = mesh.edge_split(edges[0], verts[0], 0.25);
-    assert_eq!(mesh.totvert(), 5);
+    assert_eq!(mesh.vertex_count(), 5);
     assert_eq!(mesh.vertex_position(v_new).x - 0.25 < 1e-5, true);
 
     // face_split still works.
     let (_new_face, _new_edge) = mesh.face_split(f, v_new, verts[2]).unwrap();
-    assert_eq!(mesh.totface(), 2);
+    assert_eq!(mesh.face_count(), 2);
 }

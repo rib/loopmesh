@@ -71,7 +71,7 @@ mod tests {
     use crate::loopmesh::test_support::create_face_from_verts;
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
-        (mesh.totvert(), mesh.totedge(), mesh.totface())
+        (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
 
     fn unit_quad(mesh: &mut LoopMesh) -> FaceKey {
@@ -291,7 +291,7 @@ mod tests {
         let geom = mesh.bisect_edges(&[spine], 1);
 
         assert_eq!(geom.verts.len(), 1, "spine midpoint created once");
-        assert_eq!(mesh.totface(), 3, "ΔF=0, no per-face dispatch");
+        assert_eq!(mesh.face_count(), 3, "ΔF=0, no per-face dispatch");
         let mid = geom.verts[0];
         for &f in &faces {
             assert_eq!(mesh.face_len(f), 4, "every radial face gains a flat corner");

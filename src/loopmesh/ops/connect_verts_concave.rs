@@ -315,19 +315,19 @@ mod tests {
     fn concave_quad_keeps_one_diagonal() {
         let mut mesh = LoopMesh::new();
         let (face, v) = concave_quad(&mut mesh);
-        let v0 = mesh.totvert();
-        let e0 = mesh.totedge();
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
 
         let created = mesh.connect_verts_concave_out(&[face]);
 
         // §5.1: 4 V (unchanged), 4 → 5 E (+1 surviving diagonal), 1 → 2 F.
         assert_eq!(
-            mesh.totvert(),
+            mesh.vertex_count(),
             v0,
             "operator never creates or destroys verts"
         );
-        assert_eq!(mesh.totedge(), e0 + 1, "one surviving interior diagonal");
-        assert_eq!(mesh.totface(), 2, "concave quad becomes two triangles");
+        assert_eq!(mesh.edge_count(), e0 + 1, "one surviving interior diagonal");
+        assert_eq!(mesh.face_count(), 2, "concave quad becomes two triangles");
         assert_eq!(created.len(), 1, "exactly one divider survives");
         // The kept diagonal is the 1-3 chord (the only legal one).
         let diag = mesh
@@ -354,9 +354,9 @@ mod tests {
         let created = mesh.connect_verts_concave_out(&[face]);
 
         assert!(created.is_empty(), "convex quad yields no dividers");
-        assert_eq!(mesh.totvert(), 4);
-        assert_eq!(mesh.totedge(), 4);
-        assert_eq!(mesh.totface(), 1, "convex quad untouched");
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.edge_count(), 4);
+        assert_eq!(mesh.face_count(), 1, "convex quad untouched");
         assert_eq!(mesh.face_len(face), 4);
         mesh.validate_topology();
     }
@@ -377,7 +377,7 @@ mod tests {
             let created = mesh.connect_verts_concave_out(&[face]);
 
             assert!(created.is_empty(), "convex {n}-gon yields no dividers");
-            assert_eq!(mesh.totface(), 1, "convex {n}-gon untouched");
+            assert_eq!(mesh.face_count(), 1, "convex {n}-gon untouched");
             assert_eq!(mesh.face_len(face), n);
             mesh.validate_topology();
         }
@@ -396,7 +396,7 @@ mod tests {
         let created = mesh.connect_verts_concave_out(&[face]);
 
         assert!(created.is_empty());
-        assert_eq!(mesh.totface(), 1);
+        assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.face_len(face), 3);
         mesh.validate_topology();
     }
@@ -417,21 +417,21 @@ mod tests {
             Vec3::new(0.0, 2.0, 0.0),
         ];
         let face = create_face_from_verts(&mut mesh, &coords);
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
 
         let created = mesh.connect_verts_concave_out(&[face]);
 
-        assert_eq!(mesh.totvert(), v0, "no verts created or destroyed");
+        assert_eq!(mesh.vertex_count(), v0, "no verts created or destroyed");
         assert!(
             !created.is_empty(),
             "the reflex corner forces ≥1 surviving cut"
         );
-        let face_count = mesh.totface();
+        let face_count = mesh.face_count();
         assert!(face_count >= 2, "decomposed into ≥2 convex pieces");
         // §4 net delta: +(c-1) edges and +(c-1) faces for c pieces.
         assert_eq!(created.len(), face_count - 1, "c-1 dividers for c pieces");
         assert_eq!(
-            mesh.totedge(),
+            mesh.edge_count(),
             5 + (face_count - 1),
             "+(c-1) interior edges"
         );
@@ -459,16 +459,16 @@ mod tests {
             Vec3::new(0.0, 3.0, 0.0),
         ];
         let face = create_face_from_verts(&mut mesh, &coords);
-        let v0 = mesh.totvert();
+        let v0 = mesh.vertex_count();
 
         let created = mesh.connect_verts_concave_out(&[face]);
 
-        assert_eq!(mesh.totvert(), v0, "no verts created");
+        assert_eq!(mesh.vertex_count(), v0, "no verts created");
         assert!(
             !created.is_empty(),
             "two reflex corners force surviving cuts"
         );
-        let face_count = mesh.totface();
+        let face_count = mesh.face_count();
         assert!(face_count >= 2);
         assert_eq!(created.len(), face_count - 1, "c-1 dividers for c pieces");
         assert!(
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(created.len(), 1, "only the concave face is cut");
         assert_eq!(mesh.face_len(convex), 4, "convex face untouched");
         // The concave face split into two triangles → 3 faces total.
-        assert_eq!(mesh.totface(), 3);
+        assert_eq!(mesh.face_count(), 3);
         mesh.validate_topology();
     }
 

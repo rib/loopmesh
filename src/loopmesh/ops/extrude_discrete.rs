@@ -271,9 +271,9 @@ mod tests {
         );
 
         // 4 original verts + 4 duplicates.
-        assert_eq!(mesh.totvert(), 8);
+        assert_eq!(mesh.vertex_count(), 8);
         // 4 walls + 1 cap; the original face header is gone.
-        assert_eq!(mesh.totface(), 5);
+        assert_eq!(mesh.face_count(), 5);
         assert!(
             !mesh.face_keys().contains(&face),
             "original face header is removed (DEL_ONLYFACES analog)"
@@ -368,7 +368,7 @@ mod tests {
         // Both originals removed; the two caps + 8 walls remain.
         let live_faces: HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert!(!live_faces.contains(&f0) && !live_faces.contains(&f1));
-        assert_eq!(mesh.totface(), 10, "2 caps + 8 walls");
+        assert_eq!(mesh.face_count(), 10, "2 caps + 8 walls");
         mesh.validate_topology();
     }
 
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(result.edge_map.len(), 3);
         assert_eq!(result.side_edges.len(), 3);
         assert_eq!(result.wall_faces.len(), 3);
-        assert_eq!(mesh.totface(), 4, "3 walls + 1 cap");
+        assert_eq!(mesh.face_count(), 4, "3 walls + 1 cap");
         for &wf in &result.wall_faces {
             assert_eq!(mesh.face_vert_keys(wf).len(), 4, "each wall is a quad");
         }

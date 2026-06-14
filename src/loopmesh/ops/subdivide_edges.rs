@@ -1701,7 +1701,7 @@ mod tests {
     }
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
-        (mesh.totvert(), mesh.totedge(), mesh.totface())
+        (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
 
     /// A dihedral fold of two quads hinged about the edge `{v1, v2}` (§9.1.5).

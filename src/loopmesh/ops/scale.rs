@@ -156,7 +156,10 @@ mod tests {
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner] * factor);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -176,7 +179,10 @@ mod tests {
             let expected = before[corner] * vec;
             assert_close(mesh.vertex_position(vert), expected);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -196,7 +202,10 @@ mod tests {
             assert_close(mesh.vertex_position(vert), expected);
         }
         // Reflection moves verts only; the loop cycles are exactly as they were.
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -221,7 +230,10 @@ mod tests {
         // Collapse onto a plane is in-place, not onto the origin (which a singular
         // `space` would produce) — the x/y spread survives.
         assert!(mesh.vertex_position(verts[6]).x.abs() > 1e-6);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -288,7 +300,10 @@ mod tests {
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -299,14 +314,17 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = unit_cube(&mut mesh);
         let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         mesh.scale(&[], params(Vec3::new(7.0, 7.0, 7.0)));
 
         for (corner, &vert) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(vert), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         mesh.validate_topology();
     }
 
@@ -329,7 +347,10 @@ mod tests {
         for corner in 4..8 {
             assert_close(mesh.vertex_position(verts[corner]), before[corner]);
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 
@@ -385,7 +406,10 @@ mod tests {
             let after = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
             assert_eq!(after, before, "loop UV survives the scale");
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (8, 12, 6));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 12, 6)
+        );
         mesh.validate_topology();
     }
 }

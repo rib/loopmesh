@@ -523,13 +523,13 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let [v0, v1, v2, v3] = two_tris_shared_diagonal(&mut mesh);
         let diag = edge_between(&mesh, v0, v2);
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[diag], true);
 
         assert_eq!(out.len(), 1, "one rotation, one reported edge");
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             counts,
             "rotation is 0 V / 0 E / 0 F"
         );
@@ -572,13 +572,13 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let [v0, v1, _v2, _v3] = two_tris_shared_diagonal(&mut mesh);
         let boundary = edge_between(&mesh, v0, v1); // radial 1
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[boundary], true);
 
         assert!(out.is_empty(), "ineligible edge → empty edges.out");
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             counts,
             "mesh unchanged"
         );
@@ -595,12 +595,15 @@ mod tests {
         let [v0, v1, v2, v3] = two_tris_shared_diagonal(&mut mesh);
         let b0 = edge_between(&mesh, v0, v1);
         let b1 = edge_between(&mesh, v2, v3);
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[b0, b1], true);
 
         assert!(out.is_empty());
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
     }
 
     /// Two well-separated triangulated quads, diagonals `{0,2}` and `{4,6}`.
@@ -625,12 +628,15 @@ mod tests {
         let v = two_disjoint_tri_quads(&mut mesh);
         let d0 = edge_between(&mesh, v[0], v[2]);
         let d1 = edge_between(&mesh, v[4], v[6]);
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[d0, d1], true);
 
         assert_eq!(out.len(), 2, "both disjoint edges rotate");
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         assert!(mesh.query_edge_exists(v[1], v[3]).is_some());
         assert!(mesh.query_edge_exists(v[5], v[7]).is_some());
     }
@@ -686,11 +692,14 @@ mod tests {
         let [v0, v1, _v2, v3, v4, v5] = tri_quads_shared_interior_edge(&mut mesh);
         let m = edge_between(&mesh, v1, v4); // shared vertical, length 1
         let r = edge_between(&mesh, v1, v5); // right diagonal, length √2
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[m, r], true);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
         assert!(!out.is_empty(), "at least the anchor edge rotated");
         // The shared vertical {1,4} and the right diagonal {1,5} cannot both
         // survive unrotated — the sweep made progress on a shared-face pair.
@@ -759,10 +768,10 @@ mod tests {
                 1 => [shared, right, left],
                 _ => [right, shared, left],
             };
-            let counts_before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let counts_before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
             mesh.rotate_edges(&sel, true);
             assert_eq!(
-                (mesh.totvert(), mesh.totedge(), mesh.totface()),
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
                 counts_before,
                 "all rotations are count-preserving"
             );
@@ -818,7 +827,11 @@ mod tests {
         let [a2, b2, c2, d2] = build(&mut region);
         let bd2 = edge_between(&region, b2, d2);
         let other = edge_between(&region, a2, b2); // boundary, just to size the selection
-        let counts = (region.totvert(), region.totedge(), region.totface());
+        let counts = (
+            region.vertex_count(),
+            region.edge_count(),
+            region.face_count(),
+        );
         let out_region = region.rotate_edges(&[bd2, other], true);
         assert!(
             region.query_edge_exists(b2, d2).is_some(),
@@ -826,7 +839,11 @@ mod tests {
         );
         assert!(region.query_edge_exists(a2, c2).is_none());
         assert_eq!(
-            (region.totvert(), region.totedge(), region.totface()),
+            (
+                region.vertex_count(),
+                region.edge_count(),
+                region.face_count()
+            ),
             counts,
             "degenerate-guarded multi-selection is a no-op here"
         );
@@ -886,10 +903,10 @@ mod tests {
             if reversed {
                 spokes.reverse();
             }
-            let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+            let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
             let out = mesh.rotate_edges(&spokes, true);
             assert_eq!(
-                (mesh.totvert(), mesh.totedge(), mesh.totface()),
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
                 counts,
                 "every rotation is count-preserving (§2)"
             );
@@ -1017,7 +1034,7 @@ mod tests {
         ];
         let (concave_diag, cverts) = quad_on_diag(&mut mesh, concave);
         let (convex_diag, [cw1, cw3]) = disjoint_convex_patch(&mut mesh);
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[concave_diag, convex_diag], true);
 
@@ -1042,7 +1059,7 @@ mod tests {
             "only the convex rotation contributes to edges.out"
         );
         assert_eq!(
-            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             counts,
             "rotations are count-preserving"
         );
@@ -1100,7 +1117,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (folded_diag, fverts) = quad_on_diag(&mut mesh, folded);
         let (convex_diag, [cw1, cw3]) = disjoint_convex_patch(&mut mesh);
-        let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let out = mesh.rotate_edges(&[folded_diag, convex_diag], true);
 
@@ -1121,7 +1138,10 @@ mod tests {
             1,
             "only the convex rotation contributes to edges.out"
         );
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts
+        );
     }
 
     /// §6 — `edges.out` carries one live new edge per successful rotation and

@@ -384,9 +384,9 @@ mod tests {
         let result = mesh.duplicate(&[face.into()], false);
 
         // Additive: original untouched, full coincident copy alongside.
-        assert_eq!(mesh.totvert(), 8, "4 originals + 4 clones");
-        assert_eq!(mesh.totedge(), 8);
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.vertex_count(), 8, "4 originals + 4 clones");
+        assert_eq!(mesh.edge_count(), 8);
+        assert_eq!(mesh.face_count(), 2);
         assert_eq!(clone_verts(&result).len(), 4);
         assert_eq!(clone_edges(&result).len(), 4);
         assert_eq!(clone_faces(&result).len(), 1);
@@ -437,7 +437,7 @@ mod tests {
 
         let result = mesh.duplicate(&[v.into()], false);
 
-        assert_eq!(mesh.totvert(), 2, "original + clone");
+        assert_eq!(mesh.vertex_count(), 2, "original + clone");
         assert_eq!(clone_verts(&result).len(), 1);
         assert_eq!(result.geom_out.len(), 1);
         assert_eq!(result.vert_map.len(), 2, "bidirectional");
@@ -463,8 +463,8 @@ mod tests {
 
         let result = mesh.duplicate(&[wire.into()], false);
 
-        assert_eq!(mesh.totvert(), 4, "2 originals + 2 closed endpoints");
-        assert_eq!(mesh.totedge(), 2);
+        assert_eq!(mesh.vertex_count(), 4, "2 originals + 2 closed endpoints");
+        assert_eq!(mesh.edge_count(), 2);
         assert_eq!(clone_verts(&result).len(), 2, "both endpoints closed");
         assert_eq!(clone_edges(&result).len(), 1);
         assert_eq!(result.geom_out.len(), 3);

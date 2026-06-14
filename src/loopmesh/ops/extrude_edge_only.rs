@@ -407,9 +407,9 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 1, "one wall per input edge");
 
         // 4 original verts + 2 duplicates.
-        assert_eq!(mesh.totvert(), 6);
+        assert_eq!(mesh.vertex_count(), 6);
         // original quad + 1 wall.
-        assert_eq!(mesh.totface(), 2);
+        assert_eq!(mesh.face_count(), 2);
         // The original face survives (no delete phase).
         assert!(mesh.face_keys().contains(&face), "original face is kept");
 

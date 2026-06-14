@@ -594,11 +594,14 @@ mod tests {
         let (cluster, far) = cluster_plus_far(&mut mesh, 3, 0.05);
         let mut verts = cluster.clone();
         verts.push(far);
-        let before = (mesh.totvert(), mesh.totedge(), mesh.totface());
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
 
         let _ = mesh.find_doubles(&verts, &[], 0.5, false);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
         mesh.validate_topology();
     }
 }

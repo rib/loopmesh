@@ -1720,7 +1720,7 @@ mod tests {
     use crate::loopmesh::test_support::mesh_add_cube;
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
-        (mesh.totvert(), mesh.totedge(), mesh.totface())
+        (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
 
     fn vert_at(mesh: &LoopMesh, position: Vec3) -> VertexKey {
