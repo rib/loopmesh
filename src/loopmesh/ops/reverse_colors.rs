@@ -74,12 +74,17 @@ impl LoopMesh {
     /// not resolve to a colour layer (none present, or out of range).
     pub(crate) fn active_color_layer(&self, color_index: usize) -> Option<ElementAttributeKey> {
         let attribs = self.loop_attribs();
-        // Convention: 4-component loop layers are colour layers, selected by
-        // position. (Render "semantic" tagging lives in the export bridge.)
+        // Among the 4-component loop layers this op handles, prefer those
+        // explicitly tagged with the Color role; if none is tagged, fall back
+        // to the layout convention (any Vec4 loop layer is treated as colour).
+        let is_vec4 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec4(_)));
+        let any_tagged = attribs
+            .iter_descriptors()
+            .any(|(key, d)| d.role == AttrRole::Color && is_vec4(key));
         attribs
             .iter_descriptors()
+            .filter(|(key, d)| is_vec4(*key) && (!any_tagged || d.role == AttrRole::Color))
             .map(|(key, _)| key)
-            .filter(|&key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec4(_))))
             .nth(color_index)
     }
 }
@@ -136,6 +141,62 @@ mod tests {
             .into_iter()
             .map(|l| mesh.loop_attribs().get_vec4(color, l.as_usize()).unwrap())
             .collect()
+    }
+
+    // Registration rejects a role/type pairing the role can't accept (set the
+    // `role` field directly to bypass the `with_role` debug-assert).
+    #[test]
+    fn registering_invalid_role_type_pairing_is_rejected() {
+        let mut mesh = LoopMesh::new();
+        let mut desc = ElementAttributeDesc::numeric(AttributeKey::custom("x"), AttrType::Bool);
+        desc.role = AttrRole::Color; // a bool colour is nonsense
+        assert!(mesh.register_loop_attribute(desc).is_err());
+
+        let mut desc = ElementAttributeDesc::numeric(AttributeKey::custom("y"), AttrType::F32);
+        desc.role = AttrRole::Uv; // a scalar UV is nonsense
+        assert!(mesh.register_loop_attribute(desc).is_err());
+    }
+
+    #[test]
+    #[should_panic]
+    fn with_role_debug_asserts_invalid_pairing() {
+        let _ = ElementAttributeDesc::numeric(AttributeKey::custom("x"), AttrType::F32)
+            .with_role(AttrRole::Uv);
+    }
+
+    // When a Color-tagged layer exists, lookup prefers it over an
+    // earlier-registered untagged Vec4 layer.
+    #[test]
+    fn color_lookup_prefers_role_tagged_layer() {
+        let mut mesh = LoopMesh::new();
+        let generic = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("generic4"),
+                AttrType::Vec4,
+            ))
+            .unwrap();
+        let tagged = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("col"),
+                AttrType::Vec4,
+            ))
+            .unwrap();
+        assert_eq!(mesh.active_color_layer(0), Some(tagged));
+        assert_ne!(mesh.active_color_layer(0), Some(generic));
+    }
+
+    // With no tagged layer, lookup falls back to the layout convention
+    // (first Vec4 loop layer).
+    #[test]
+    fn color_lookup_falls_back_to_layout_when_untagged() {
+        let mut mesh = LoopMesh::new();
+        let first = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("a"),
+                AttrType::Vec4,
+            ))
+            .unwrap();
+        assert_eq!(mesh.active_color_layer(0), Some(first));
     }
 
     /// §2 / §5.1 — even `n`: every corner moves; corner `i` gets corner

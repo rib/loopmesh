@@ -76,12 +76,18 @@ impl LoopMesh {
     /// carries no UV layer at all.
     fn active_uv_layer_for_rotate(&self) -> Option<ElementAttributeKey> {
         let attribs = self.loop_attribs();
-        // Convention: the first registered 2-component loop layer is the UV
-        // layer. (Render "semantic" tagging lives in the export bridge.)
+        // Among 2-component loop layers, prefer those tagged with the Uv role;
+        // fall back to the layout convention (first Vec2 loop layer) when none
+        // is tagged.
+        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
+        let any_tagged = attribs
+            .iter_descriptors()
+            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
         attribs
             .iter_descriptors()
+            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
             .map(|(key, _)| key)
-            .find(|&key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_))))
+            .next()
     }
 }
 

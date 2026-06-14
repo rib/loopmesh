@@ -35,6 +35,40 @@ pub enum AttrType {
     String,
 }
 
+/// The semantic role of an attribute layer — what an operator should treat it
+/// as, independent of its value type. Lets semantic-targeting operators (colour
+/// reverse/rotate, UV reverse/rotate) find the right layers without inferring
+/// meaning from the value type alone. `Generic` is data with no special role.
+///
+/// A role is only valid on certain value types ([`AttrRole::accepts`]); the
+/// registration path rejects mismatched pairings (a `Color` boolean, a `Uv`
+/// scalar, …), so the role and type can't drift into nonsense.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum AttrRole {
+    /// No special role; the value is generic data.
+    #[default]
+    Generic,
+    /// An RGB / RGBA colour.
+    Color,
+    /// Texture coordinates.
+    Uv,
+}
+
+impl AttrRole {
+    /// Whether this role may be attached to a layer of value type `ty`.
+    /// `Generic` accepts any type; `Color` needs a 3- or 4-component layout;
+    /// `Uv` needs a 2-component layout.
+    pub fn accepts(self, ty: AttrType) -> bool {
+        match self {
+            AttrRole::Generic => true,
+            AttrRole::Color => {
+                matches!(ty, AttrType::Vec3 | AttrType::Vec4 | AttrType::Vec4U8)
+            }
+            AttrRole::Uv => matches!(ty, AttrType::Vec2),
+        }
+    }
+}
+
 impl AttrType {
     /// True for the one non-numeric type.
     pub fn is_string(self) -> bool {

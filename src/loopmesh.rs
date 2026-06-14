@@ -9,7 +9,7 @@ use glam::*;
 use slab::Slab;
 use smallvec::SmallVec;
 
-pub use crate::attr::{AttrType, AttributeKey};
+pub use crate::attr::{AttrRole, AttrType, AttributeKey};
 
 bitflags! {
     struct LoopMeshFlags: u32 {
@@ -907,19 +907,24 @@ impl InterpPolicy {
 pub struct ElementAttributeDesc {
     pub key: AttributeKey,
     pub ty: AttrType,
+    /// Semantic role of the layer (colour / UV / generic). Must be compatible
+    /// with `ty` (see [`AttrRole::accepts`]); registration rejects a
+    /// mismatch. Defaults to [`AttrRole::Generic`].
+    pub role: AttrRole,
     pub interp: InterpPolicy,
     storage: AttributeStorage,
 }
 
 impl ElementAttributeDesc {
     /// Build a numeric attribute descriptor. `key` identifies the attribute;
-    /// `ty` is its [`AttrType`]. Interp policy defaults from the type.
-    /// (Despite the name, `ty` may be any non-string `AttrType` — use
-    /// [`string`](Self::string) for strings.)
+    /// `ty` is its [`AttrType`]. Interp policy defaults from the type, role
+    /// defaults to [`AttrRole::Generic`]. (Despite the name, `ty` may be any
+    /// non-string `AttrType` — use [`string`](Self::string) for strings.)
     pub fn numeric(key: impl Into<AttributeKey>, ty: AttrType) -> Self {
         Self {
             key: key.into(),
             ty,
+            role: AttrRole::Generic,
             interp: InterpPolicy::default_for(ty),
             // Placeholder — register_*_attribute resolves this when the
             // descriptor is inserted into a specific ElementAttributes.
@@ -933,6 +938,7 @@ impl ElementAttributeDesc {
         Self {
             key: key.into(),
             ty: AttrType::String,
+            role: AttrRole::Generic,
             interp: InterpPolicy::default_for(AttrType::String),
             storage: AttributeStorage::String(usize::MAX),
         }
@@ -942,6 +948,30 @@ impl ElementAttributeDesc {
     pub fn with_interp(mut self, interp: InterpPolicy) -> Self {
         self.interp = interp;
         self
+    }
+
+    /// Set the semantic [`AttrRole`]. Panics in debug builds if the role is
+    /// not valid for this descriptor's value type; registration also rejects
+    /// an invalid pairing (returning an error) regardless of build profile.
+    pub fn with_role(mut self, role: AttrRole) -> Self {
+        debug_assert!(
+            role.accepts(self.ty),
+            "role {role:?} is not valid for attribute type {:?}",
+            self.ty
+        );
+        self.role = role;
+        self
+    }
+
+    /// Convenience: a `Vec2` UV layer (role [`AttrRole::Uv`]).
+    pub fn uv(key: impl Into<AttributeKey>) -> Self {
+        Self::numeric(key, AttrType::Vec2).with_role(AttrRole::Uv)
+    }
+
+    /// Convenience: a colour layer of the given `ty` (role
+    /// [`AttrRole::Color`]). `ty` must be `Vec3` / `Vec4` / `Vec4U8`.
+    pub fn color(key: impl Into<AttributeKey>, ty: AttrType) -> Self {
+        Self::numeric(key, ty).with_role(AttrRole::Color)
     }
 }
 
@@ -1040,6 +1070,13 @@ impl ElementAttributes {
         mut desc: ElementAttributeDesc,
         key_watermark: usize,
     ) -> Result<ElementAttributeKey> {
+        if !desc.role.accepts(desc.ty) {
+            return Err(anyhow!(
+                "attribute role {:?} is not valid for value type {:?}",
+                desc.role,
+                desc.ty
+            ));
+        }
         let storage = match desc.ty {
             AttrType::Bool => {
                 let idx = self.attributes_bool.len();
