@@ -2537,7 +2537,7 @@ mod tests {
         let u = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("u"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             ))
             .unwrap();
         let face = unit_quad(&mut mesh);

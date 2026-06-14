@@ -1488,7 +1488,7 @@ mod tests {
         let color = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("face_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let first_color = [1.0_f32, 0.0, 0.0];
@@ -1995,7 +1995,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         // Assign UVs by vertex position so both faces agree at the seam verts

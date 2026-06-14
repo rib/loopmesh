@@ -953,7 +953,7 @@ mod tests {
         let color = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("face_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let first_color = [1.0_f32, 0.0, 0.0];
@@ -1415,7 +1415,7 @@ mod tests {
         let tint = mesh
             .register_edge_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("tint"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
 

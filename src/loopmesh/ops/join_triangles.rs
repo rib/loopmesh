@@ -223,7 +223,7 @@ impl LoopMesh {
             None => self
                 .register_edge_attribute(ElementAttributeDesc::numeric(
                     key,
-                    Format::new(ComponentType::I32, 1),
+                    AttrType::I32,
                 ))
                 .expect("I32x1 is a supported edge attribute format"),
         };
@@ -260,7 +260,7 @@ impl LoopMesh {
             None => self
                 .register_edge_attribute(ElementAttributeDesc::numeric(
                     key,
-                    Format::new(ComponentType::I32, 1),
+                    AttrType::I32,
                 ))
                 .expect("I32x1 is a supported edge attribute format"),
         };
@@ -295,7 +295,7 @@ impl LoopMesh {
             None => self
                 .register_face_attribute(ElementAttributeDesc::numeric(
                     key,
-                    Format::new(ComponentType::I32, 1),
+                    AttrType::I32,
                 ))
                 .expect("I32x1 is a supported face attribute format"),
         };
@@ -2107,7 +2107,7 @@ mod tests {
     fn register_uv_layer(mesh: &mut LoopMesh, name: &'static str) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom(name),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .expect("uv layer registers")
     }
@@ -2115,7 +2115,7 @@ mod tests {
     fn register_col_layer(mesh: &mut LoopMesh, name: &'static str) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom(name),
-            Format::new(ComponentType::F32, 4),
+            AttrType::Vec4,
         ))
         .expect("colour layer registers")
     }

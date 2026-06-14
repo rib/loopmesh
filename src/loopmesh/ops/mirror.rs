@@ -608,7 +608,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .expect("uv layer registers");
         let mut values: std::collections::HashMap<LoopKey, [f32; 2]> = std::collections::HashMap::new();
@@ -729,7 +729,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .expect("uv layer registers");
         for (j, &f) in faces.iter().enumerate() {

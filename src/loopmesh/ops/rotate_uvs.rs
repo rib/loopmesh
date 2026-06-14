@@ -76,13 +76,8 @@ impl LoopMesh {
     /// carries no UV layer at all.
     fn active_uv_layer_for_rotate(&self) -> Option<ElementAttributeKey> {
         let attribs = self.loop_attribs();
-
-        if let Some(key) = attribs.find(&AttributeKey::Semantic(AttributeSemantic::Uv0)) {
-            if matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_))) {
-                return Some(key);
-            }
-        }
-
+        // Convention: the first registered 2-component loop layer is the UV
+        // layer. (Render "semantic" tagging lives in the export bridge.)
         attribs
             .iter_descriptors()
             .map(|(key, _)| key)
@@ -100,7 +95,7 @@ mod tests {
     fn register_uv(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("uv"),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .expect("uv layer registers")
     }

@@ -1905,13 +1905,13 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let color = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         (uv, color)
@@ -2169,7 +2169,7 @@ mod tests {
         let tag = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("region"),
-                Format::new(ComponentType::I32, 1),
+                AttrType::I32,
             ))
             .unwrap();
         assert_eq!(
@@ -2420,7 +2420,7 @@ mod tests {
         let region = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("region"),
-                Format::new(ComponentType::I32, 1),
+                AttrType::I32,
             ))
             .unwrap();
         assert_eq!(
@@ -2483,7 +2483,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         assert_eq!(
@@ -3463,7 +3463,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
@@ -3558,7 +3558,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
@@ -3665,7 +3665,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
@@ -3738,7 +3738,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         // Continuous (gate-passing) but non-affine UV so each tagged triangle
@@ -3801,7 +3801,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         // Two loops on a throwaway triangle so we have valid slots to write.
@@ -3872,7 +3872,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
 
@@ -3985,7 +3985,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         // Non-affine continuous UV so the outer-pair gate passes (per-position)

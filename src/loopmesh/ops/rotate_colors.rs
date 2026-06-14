@@ -88,8 +88,8 @@ mod tests {
 
     fn register_color(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
-            AttributeKey::Semantic(AttributeSemantic::Color),
-            Format::new(ComponentType::F32, 4),
+            AttributeKey::custom("color"),
+            AttrType::Vec4,
         ))
         .expect("colour layer registers")
     }
@@ -314,7 +314,7 @@ mod tests {
         let other = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("color2"),
-                Format::new(ComponentType::F32, 4),
+                AttrType::Vec4,
             ))
             .expect("second colour layer registers");
         let face = ngon(&mut mesh, 4);

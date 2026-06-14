@@ -74,15 +74,8 @@ impl LoopMesh {
     /// not resolve to a colour layer (none present, or out of range).
     pub(crate) fn active_color_layer(&self, color_index: usize) -> Option<ElementAttributeKey> {
         let attribs = self.loop_attribs();
-
-        if color_index == 0 {
-            if let Some(key) = attribs.find(&AttributeKey::Semantic(AttributeSemantic::Color)) {
-                if matches!(attribs.storage_of(key), Some(AttributeStorage::Vec4(_))) {
-                    return Some(key);
-                }
-            }
-        }
-
+        // Convention: 4-component loop layers are colour layers, selected by
+        // position. (Render "semantic" tagging lives in the export bridge.)
         attribs
             .iter_descriptors()
             .map(|(key, _)| key)
@@ -100,8 +93,8 @@ mod tests {
 
     fn register_color(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
-            AttributeKey::Semantic(AttributeSemantic::Color),
-            Format::new(ComponentType::F32, 4),
+            AttributeKey::custom("color"),
+            AttrType::Vec4,
         ))
         .expect("colour layer registers")
     }
@@ -302,7 +295,7 @@ mod tests {
         let other = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("color2"),
-                Format::new(ComponentType::F32, 4),
+                AttrType::Vec4,
             ))
             .expect("second colour layer registers");
         let face = ngon(&mut mesh, 4);

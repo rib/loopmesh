@@ -1023,7 +1023,7 @@ mod tests {
         let mat = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("material_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
 
@@ -1658,7 +1658,7 @@ mod tests {
         let mat = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("material_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
 

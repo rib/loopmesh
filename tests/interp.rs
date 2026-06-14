@@ -17,8 +17,8 @@
 
 use glam::Vec3;
 use loopmesh::loopmesh::{
-    AttributeKey, ComponentType, EdgeCreateFlags, ElementAttributeDesc, ElementKey,
-    FaceCreateFlags, Format, InterpPolicy, LoopMesh, MeshIter,
+    AttributeKey, AttrType, EdgeCreateFlags, ElementAttributeDesc, ElementKey,
+    FaceCreateFlags, InterpPolicy, LoopMesh, MeshIter,
 };
 
 // ----- Small helpers -----
@@ -58,7 +58,7 @@ fn edge_split_interpolates_vertex_attrib_linearly() {
     let color_key = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     mesh.vertex_attribs_mut()
@@ -88,7 +88,7 @@ fn edge_split_at_midpoint_averages() {
     let color = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 4),
+            AttrType::Vec4,
         ))
         .unwrap();
     mesh.vertex_attribs_mut()
@@ -122,7 +122,7 @@ fn edge_split_copies_edge_attrib_to_new_edge() {
     let crease = mesh
         .register_edge_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("crease"),
-            Format::new(ComponentType::F32, 1),
+            AttrType::F32,
         ))
         .unwrap();
     mesh.edge_attribs_mut().set_f32(crease, e.as_usize(), 0.75);
@@ -152,7 +152,7 @@ fn face_split_copies_face_attrib_to_new_face() {
     let mat_color = mesh
         .register_face_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("material_color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     mesh.face_attribs_mut()
@@ -174,7 +174,7 @@ fn face_poke_centre_vertex_is_uniform_average() {
     let color = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     // Set the four corners to RGBA-like values; the centre should land on
@@ -212,7 +212,7 @@ fn face_poke_spawned_faces_inherit_source_attrib() {
     let mat_color = mesh
         .register_face_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("material_color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     mesh.face_attribs_mut()
@@ -258,7 +258,7 @@ fn vert_separate_copies_source_attrib_to_new_verts() {
     let color = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     mesh.vertex_attribs_mut()
@@ -286,7 +286,7 @@ fn edge_collapse_blends_survivor_vertex_50_50() {
     let color = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     mesh.vertex_attribs_mut()
@@ -319,7 +319,7 @@ fn no_interp_policy_leaves_destination_unchanged() {
         .register_vertex_attribute(
             ElementAttributeDesc::numeric(
                 AttributeKey::custom("opaque_id"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             )
             .with_interp(InterpPolicy::NoInterp),
         )
@@ -375,7 +375,7 @@ fn edge_split_interpolates_loop_uv_linearly() {
     let uv = mesh
         .register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("uv"),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .unwrap();
 
@@ -431,7 +431,7 @@ fn face_split_copies_loop_uv_from_corner_mates() {
     let uv = mesh
         .register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("uv"),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .unwrap();
     let mut corner_loops = std::collections::HashMap::new();
@@ -482,7 +482,7 @@ fn face_poke_centre_loops_average_corner_uvs() {
     let uv = mesh
         .register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("uv"),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .unwrap();
     let mut corner_uvs = std::collections::HashMap::new();

@@ -15,8 +15,22 @@
 use glam::Vec2;
 
 use crate::loopmesh::{FaceKey, LoopKey, LoopMesh, MeshIter};
-use crate::nub_mesh_convert::TriangulationPolicy;
 use crate::triangulate;
+
+/// How to break an n-gon face into triangles. Algorithm details for each
+/// variant are documented in
+/// `radial-mesh-guides/BMESH_POLYGON_TRIANGULATION.md`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TriangulationPolicy {
+    /// Fan from the first loop of each face. Cheap and correct for convex
+    /// faces; produces flipped or inverted triangles on concave quads and
+    /// arbitrary n-gons.
+    Fan,
+    /// Ear-clipping with quad-flip detection, matching the render-time path
+    /// described in `BMESH_POLYGON_TRIANGULATION.md` §5.1 (quad) and §7
+    /// (n-gon). Non-destructive, no beautify pass. Default.
+    EarClip,
+}
 
 /// Triangulate one face, appending `[LoopKey; 3]` triples to
 /// `out_tris`.

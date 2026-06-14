@@ -417,7 +417,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let mut expected: std::collections::HashMap<VertexKey, [f32; 2]> =
@@ -621,7 +621,7 @@ mod tests {
         let scalar = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("w"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             ))
             .unwrap();
         // Set w = x² on each original corner vertex.

@@ -455,7 +455,7 @@ mod tests {
         let color = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let palette = [
@@ -471,7 +471,7 @@ mod tests {
         let mat = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("material_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let face_color = [0.2_f32, 0.5, 0.9];

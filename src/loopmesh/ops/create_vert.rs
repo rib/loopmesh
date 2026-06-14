@@ -116,7 +116,7 @@ mod tests {
         let weight = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("weight"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             ))
             .expect("vert weight layer registers");
 

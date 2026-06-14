@@ -1064,7 +1064,7 @@ mod tests {
         let color = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let palette = [
@@ -1123,7 +1123,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
 
@@ -1233,7 +1233,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
 
@@ -1755,7 +1755,7 @@ mod tests {
         let mat = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("material_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let source_color = [0.4_f32, 0.6, 0.8];
@@ -2319,7 +2319,7 @@ mod tests {
         let mat = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("material_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let source_color = [0.2_f32, 0.5, 0.9];

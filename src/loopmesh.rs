@@ -9,8 +9,7 @@ use glam::*;
 use slab::Slab;
 use smallvec::SmallVec;
 
-pub use nub_mesh::attribute::{AttributeKey, AttributeSemantic};
-pub use nub_mesh::format::{ComponentType, Format};
+pub use crate::attr::{AttrType, AttributeKey};
 
 bitflags! {
     struct LoopMeshFlags: u32 {
@@ -848,70 +847,21 @@ where
     }
 }
 
-/// What kind of value an element attribute holds.
-///
-/// `Numeric` attributes carry a [`Format`] from nub-mesh — that gives loopmesh
-/// the same encoding vocabulary used by `nub-mesh::Mesh` on export
-/// (normalize / as_float / F16 / packed Unorm10_10_10_2 / …) and is the
-/// piece that round-trips through the GPU-side mesh representation.
-///
-/// `String` attributes mirror bmesh's `CD_PROP_STRING` — they live only on
-/// the loopmesh editing structure and do not round-trip through a
-/// `nub-mesh::Mesh` (no GPU representation).
-#[derive(Clone, Debug)]
-pub enum ElementAttributeKind {
-    Numeric(Format),
-    String,
-}
-
-/// Subset of [`Format`] variants that the in-memory storage currently
-/// understands. `register_*_attribute` returns an error for any other
-/// `Format`; expand this as new storage buckets are added.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NumericBucket {
-    U8,
-    I32,
-    U32,
-    F32,
-    Vec2,
-    Vec3,
-    Vec4,
-}
-
-impl NumericBucket {
-    fn for_format(format: Format) -> Option<Self> {
-        if format.normalize || format.as_float || format.packed.is_some() {
-            // The wire format is more compact than the in-memory storage;
-            // attributes get decoded to one of the canonical buckets above
-            // before being stored. Caller should pick a decoded Format.
-            return None;
-        }
-        let n = format.components;
-        match (format.ty, n) {
-            (ComponentType::U8, 1) => Some(NumericBucket::U8),
-            (ComponentType::I32, 1) => Some(NumericBucket::I32),
-            (ComponentType::U32, 1) => Some(NumericBucket::U32),
-            (ComponentType::F32, 1) => Some(NumericBucket::F32),
-            (ComponentType::F32, 2) => Some(NumericBucket::Vec2),
-            (ComponentType::F32, 3) => Some(NumericBucket::Vec3),
-            (ComponentType::F32, 4) => Some(NumericBucket::Vec4),
-            _ => None,
-        }
-    }
-}
-
 /// Where an attribute's per-element values live inside [`ElementAttributes`].
 /// Indexes into one of the typed buckets; the `Slab<ElementAttributeDesc>`
-/// remembers which.
+/// remembers which. One variant per [`AttrType`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttributeStorage {
+    Bool(usize),
     U8(usize),
     I32(usize),
     U32(usize),
     F32(usize),
+    F64(usize),
     Vec2(usize),
     Vec3(usize),
     Vec4(usize),
+    Vec4U8(usize),
     String(usize),
 }
 
@@ -939,14 +889,16 @@ pub enum InterpPolicy {
 }
 
 impl InterpPolicy {
-    /// Default policy for a given attribute kind.
-    pub fn default_for(kind: &ElementAttributeKind) -> Self {
-        match kind {
-            ElementAttributeKind::Numeric(format) => match format.ty {
-                ComponentType::F16 | ComponentType::F32 => InterpPolicy::Linear,
-                _ => InterpPolicy::Nearest,
-            },
-            ElementAttributeKind::String => InterpPolicy::CopyFirst,
+    /// Default policy for a given attribute type: weighted `Linear` for the
+    /// math types (float / vector / byte-color), `Nearest` for the integer /
+    /// bool types, `CopyFirst` for strings.
+    pub fn default_for(ty: AttrType) -> Self {
+        if ty.is_string() {
+            InterpPolicy::CopyFirst
+        } else if ty.is_math() {
+            InterpPolicy::Linear
+        } else {
+            InterpPolicy::Nearest
         }
     }
 }
@@ -954,22 +906,21 @@ impl InterpPolicy {
 #[derive(Clone, Debug)]
 pub struct ElementAttributeDesc {
     pub key: AttributeKey,
-    pub kind: ElementAttributeKind,
+    pub ty: AttrType,
     pub interp: InterpPolicy,
     storage: AttributeStorage,
 }
 
 impl ElementAttributeDesc {
     /// Build a numeric attribute descriptor. `key` identifies the attribute;
-    /// `format` describes the in-memory value layout. Interp policy defaults
-    /// from the format's component type.
-    pub fn numeric(key: impl Into<AttributeKey>, format: Format) -> Self {
-        let kind = ElementAttributeKind::Numeric(format);
-        let interp = InterpPolicy::default_for(&kind);
+    /// `ty` is its [`AttrType`]. Interp policy defaults from the type.
+    /// (Despite the name, `ty` may be any non-string `AttrType` — use
+    /// [`string`](Self::string) for strings.)
+    pub fn numeric(key: impl Into<AttributeKey>, ty: AttrType) -> Self {
         Self {
             key: key.into(),
-            kind,
-            interp,
+            ty,
+            interp: InterpPolicy::default_for(ty),
             // Placeholder — register_*_attribute resolves this when the
             // descriptor is inserted into a specific ElementAttributes.
             storage: AttributeStorage::U8(usize::MAX),
@@ -979,12 +930,10 @@ impl ElementAttributeDesc {
     /// Build a string attribute descriptor. Interp policy defaults to
     /// [`InterpPolicy::CopyFirst`].
     pub fn string(key: impl Into<AttributeKey>) -> Self {
-        let kind = ElementAttributeKind::String;
-        let interp = InterpPolicy::default_for(&kind);
         Self {
             key: key.into(),
-            kind,
-            interp,
+            ty: AttrType::String,
+            interp: InterpPolicy::default_for(AttrType::String),
             storage: AttributeStorage::String(usize::MAX),
         }
     }
@@ -1014,86 +963,135 @@ impl ElementAttributeKey {
 #[derive(Default)]
 pub struct ElementAttributes {
     attributes: Slab<ElementAttributeDesc>,
+    attributes_bool: Vec<Vec<bool>>,
     attributes_u8: Vec<Vec<u8>>,
     attributes_i32: Vec<Vec<i32>>,
     attributes_u32: Vec<Vec<u32>>,
     attributes_f32: Vec<Vec<f32>>,
+    attributes_f64: Vec<Vec<f64>>,
     attributes_vec2: Vec<Vec<[f32; 2]>>,
     attributes_vec3: Vec<Vec<[f32; 3]>>,
     attributes_vec4: Vec<Vec<[f32; 4]>>,
+    attributes_vec4u8: Vec<Vec<[u8; 4]>>,
     attributes_string: Vec<Vec<Option<String>>>,
 }
 
 impl ElementAttributes {
+    /// Resize every bucket to `key_watermark`, default-filling new slots, so
+    /// every registered layer keeps one slot per live element after the slab
+    /// grows. The single place that must enumerate every bucket type.
+    fn grow_all(&mut self, key_watermark: usize) {
+        for v in &mut self.attributes_bool {
+            v.resize(key_watermark, false);
+        }
+        for v in &mut self.attributes_u8 {
+            v.resize(key_watermark, 0);
+        }
+        for v in &mut self.attributes_i32 {
+            v.resize(key_watermark, 0);
+        }
+        for v in &mut self.attributes_u32 {
+            v.resize(key_watermark, 0);
+        }
+        for v in &mut self.attributes_f32 {
+            v.resize(key_watermark, 0.0);
+        }
+        for v in &mut self.attributes_f64 {
+            v.resize(key_watermark, 0.0);
+        }
+        for v in &mut self.attributes_vec2 {
+            v.resize(key_watermark, [0.0; 2]);
+        }
+        for v in &mut self.attributes_vec3 {
+            v.resize(key_watermark, [0.0; 3]);
+        }
+        for v in &mut self.attributes_vec4 {
+            v.resize(key_watermark, [0.0; 4]);
+        }
+        for v in &mut self.attributes_vec4u8 {
+            v.resize(key_watermark, [0; 4]);
+        }
+        for v in &mut self.attributes_string {
+            v.resize(key_watermark, None);
+        }
+    }
+
     fn clear(&mut self) {
         self.attributes.clear();
+        self.attributes_bool.clear();
         self.attributes_u8.clear();
         self.attributes_i32.clear();
         self.attributes_u32.clear();
         self.attributes_f32.clear();
+        self.attributes_f64.clear();
         self.attributes_vec2.clear();
         self.attributes_vec3.clear();
         self.attributes_vec4.clear();
+        self.attributes_vec4u8.clear();
         self.attributes_string.clear();
     }
 
     /// Reserve a new attribute slot in the matching typed bucket and
     /// return the resolved [`AttributeStorage`]. Used by every
-    /// `register_*_attribute`.
+    /// `register_*_attribute`. Total over [`AttrType`] — never fails on type
+    /// (the `Result` is kept for API stability).
     fn insert_with_storage(
         &mut self,
         mut desc: ElementAttributeDesc,
         key_watermark: usize,
     ) -> Result<ElementAttributeKey> {
-        let storage = match &desc.kind {
-            ElementAttributeKind::Numeric(format) => {
-                let bucket = NumericBucket::for_format(*format).ok_or_else(|| {
-                    anyhow!(
-                        "format {:?} has no in-memory bucket on LoopMesh; \
-                         supported: F32x{{1..=4}}, U8x1, I32x1, U32x1 (with \
-                         no normalize / as_float / packed)",
-                        format,
-                    )
-                })?;
-                match bucket {
-                    NumericBucket::U8 => {
-                        let idx = self.attributes_u8.len();
-                        self.attributes_u8.push(vec![0; key_watermark]);
-                        AttributeStorage::U8(idx)
-                    }
-                    NumericBucket::I32 => {
-                        let idx = self.attributes_i32.len();
-                        self.attributes_i32.push(vec![0; key_watermark]);
-                        AttributeStorage::I32(idx)
-                    }
-                    NumericBucket::U32 => {
-                        let idx = self.attributes_u32.len();
-                        self.attributes_u32.push(vec![0; key_watermark]);
-                        AttributeStorage::U32(idx)
-                    }
-                    NumericBucket::F32 => {
-                        let idx = self.attributes_f32.len();
-                        self.attributes_f32.push(vec![0.0; key_watermark]);
-                        AttributeStorage::F32(idx)
-                    }
-                    NumericBucket::Vec2 => {
-                        let idx = self.attributes_vec2.len();
-                        self.attributes_vec2.push(vec![[0.0; 2]; key_watermark]);
-                        AttributeStorage::Vec2(idx)
-                    }
-                    NumericBucket::Vec3 => {
-                        let idx = self.attributes_vec3.len();
-                        self.attributes_vec3.push(vec![[0.0; 3]; key_watermark]);
-                        AttributeStorage::Vec3(idx)
-                    }
-                    NumericBucket::Vec4 => {
-                        let idx = self.attributes_vec4.len();
-                        self.attributes_vec4.push(vec![[0.0; 4]; key_watermark]);
-                        AttributeStorage::Vec4(idx)
-                    }
-                }
+        let storage = match desc.ty {
+            AttrType::Bool => {
+                let idx = self.attributes_bool.len();
+                self.attributes_bool.push(vec![false; key_watermark]);
+                AttributeStorage::Bool(idx)
             }
-            ElementAttributeKind::String => {
+            AttrType::U8 => {
+                let idx = self.attributes_u8.len();
+                self.attributes_u8.push(vec![0; key_watermark]);
+                AttributeStorage::U8(idx)
+            }
+            AttrType::I32 => {
+                let idx = self.attributes_i32.len();
+                self.attributes_i32.push(vec![0; key_watermark]);
+                AttributeStorage::I32(idx)
+            }
+            AttrType::U32 => {
+                let idx = self.attributes_u32.len();
+                self.attributes_u32.push(vec![0; key_watermark]);
+                AttributeStorage::U32(idx)
+            }
+            AttrType::F32 => {
+                let idx = self.attributes_f32.len();
+                self.attributes_f32.push(vec![0.0; key_watermark]);
+                AttributeStorage::F32(idx)
+            }
+            AttrType::F64 => {
+                let idx = self.attributes_f64.len();
+                self.attributes_f64.push(vec![0.0; key_watermark]);
+                AttributeStorage::F64(idx)
+            }
+            AttrType::Vec2 => {
+                let idx = self.attributes_vec2.len();
+                self.attributes_vec2.push(vec![[0.0; 2]; key_watermark]);
+                AttributeStorage::Vec2(idx)
+            }
+            AttrType::Vec3 => {
+                let idx = self.attributes_vec3.len();
+                self.attributes_vec3.push(vec![[0.0; 3]; key_watermark]);
+                AttributeStorage::Vec3(idx)
+            }
+            AttrType::Vec4 => {
+                let idx = self.attributes_vec4.len();
+                self.attributes_vec4.push(vec![[0.0; 4]; key_watermark]);
+                AttributeStorage::Vec4(idx)
+            }
+            AttrType::Vec4U8 => {
+                let idx = self.attributes_vec4u8.len();
+                self.attributes_vec4u8.push(vec![[0; 4]; key_watermark]);
+                AttributeStorage::Vec4U8(idx)
+            }
+            AttrType::String => {
                 let idx = self.attributes_string.len();
                 self.attributes_string.push(vec![None; key_watermark]);
                 AttributeStorage::String(idx)
@@ -1126,7 +1124,7 @@ impl ElementAttributes {
 
     /// True if no attributes have been registered on this domain. Used by
     /// mid-level ops to skip the snapshot+interp work when no per-element
-    /// CD layers exist (the common case for the mesh-without-attribs
+    /// attribute layers exist (the common case for the mesh-without-attribs
     /// workflow).
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
@@ -1358,6 +1356,92 @@ impl ElementAttributes {
         self.attributes_string.get(bucket).map(|v| v.as_slice())
     }
 
+    pub(crate) fn bool_bucket(&self, bucket: usize) -> Option<&[bool]> {
+        self.attributes_bool.get(bucket).map(|v| v.as_slice())
+    }
+
+    pub(crate) fn f64_bucket(&self, bucket: usize) -> Option<&[f64]> {
+        self.attributes_f64.get(bucket).map(|v| v.as_slice())
+    }
+
+    pub(crate) fn vec4u8_bucket(&self, bucket: usize) -> Option<&[[u8; 4]]> {
+        self.attributes_vec4u8.get(bucket).map(|v| v.as_slice())
+    }
+
+    pub fn get_bool(&self, attr: ElementAttributeKey, slot: usize) -> Option<bool> {
+        match self.attributes.get(attr.as_usize())?.storage {
+            AttributeStorage::Bool(b) => self.attributes_bool.get(b).and_then(|v| v.get(slot).copied()),
+            _ => None,
+        }
+    }
+
+    pub fn set_bool(&mut self, attr: ElementAttributeKey, slot: usize, value: bool) -> bool {
+        let storage = match self.attributes.get(attr.as_usize()) {
+            Some(d) => d.storage,
+            None => return false,
+        };
+        match storage {
+            AttributeStorage::Bool(b) => match self.attributes_bool.get_mut(b) {
+                Some(v) if slot < v.len() => {
+                    v[slot] = value;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    pub fn get_f64(&self, attr: ElementAttributeKey, slot: usize) -> Option<f64> {
+        match self.attributes.get(attr.as_usize())?.storage {
+            AttributeStorage::F64(b) => self.attributes_f64.get(b).and_then(|v| v.get(slot).copied()),
+            _ => None,
+        }
+    }
+
+    pub fn set_f64(&mut self, attr: ElementAttributeKey, slot: usize, value: f64) -> bool {
+        let storage = match self.attributes.get(attr.as_usize()) {
+            Some(d) => d.storage,
+            None => return false,
+        };
+        match storage {
+            AttributeStorage::F64(b) => match self.attributes_f64.get_mut(b) {
+                Some(v) if slot < v.len() => {
+                    v[slot] = value;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    pub fn get_vec4u8(&self, attr: ElementAttributeKey, slot: usize) -> Option<[u8; 4]> {
+        match self.attributes.get(attr.as_usize())?.storage {
+            AttributeStorage::Vec4U8(b) => {
+                self.attributes_vec4u8.get(b).and_then(|v| v.get(slot).copied())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_vec4u8(&mut self, attr: ElementAttributeKey, slot: usize, value: [u8; 4]) -> bool {
+        let storage = match self.attributes.get(attr.as_usize()) {
+            Some(d) => d.storage,
+            None => return false,
+        };
+        match storage {
+            AttributeStorage::Vec4U8(b) => match self.attributes_vec4u8.get_mut(b) {
+                Some(v) if slot < v.len() => {
+                    v[slot] = value;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Serialise every attribute's value at `slot` into `out` as a stable
     /// byte sequence. Used to dedup "logically identical" per-corner
     /// attribute tuples during GPU export (seam-split). The exact bytes
@@ -1409,6 +1493,21 @@ impl ElementAttributes {
                         for lane in v {
                             out.extend_from_slice(&lane.to_le_bytes());
                         }
+                    }
+                }
+                AttributeStorage::Bool(b) => {
+                    if let Some(v) = self.bool_bucket(b).and_then(|s| s.get(slot)) {
+                        out.push(*v as u8);
+                    }
+                }
+                AttributeStorage::F64(b) => {
+                    if let Some(v) = self.f64_bucket(b).and_then(|s| s.get(slot)) {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                AttributeStorage::Vec4U8(b) => {
+                    if let Some(v) = self.vec4u8_bucket(b).and_then(|s| s.get(slot)) {
+                        out.extend_from_slice(v);
                     }
                 }
                 AttributeStorage::String(b) => {
@@ -1515,13 +1614,16 @@ impl ElementAttributes {
             }
         }
         match desc.storage {
+            AttributeStorage::Bool(bk) => pair_eq(self.bool_bucket(bk), a, b),
             AttributeStorage::U8(bk) => pair_eq(self.u8_bucket(bk), a, b),
             AttributeStorage::I32(bk) => pair_eq(self.i32_bucket(bk), a, b),
             AttributeStorage::U32(bk) => pair_eq(self.u32_bucket(bk), a, b),
             AttributeStorage::F32(bk) => pair_eq(self.f32_bucket(bk), a, b),
+            AttributeStorage::F64(bk) => pair_eq(self.f64_bucket(bk), a, b),
             AttributeStorage::Vec2(bk) => pair_eq(self.vec2_bucket(bk), a, b),
             AttributeStorage::Vec3(bk) => pair_eq(self.vec3_bucket(bk), a, b),
             AttributeStorage::Vec4(bk) => pair_eq(self.vec4_bucket(bk), a, b),
+            AttributeStorage::Vec4U8(bk) => pair_eq(self.vec4u8_bucket(bk), a, b),
             AttributeStorage::String(bk) => pair_eq(self.string_bucket(bk), a, b),
         }
     }
@@ -1591,6 +1693,15 @@ impl ElementAttributes {
                 }
                 AttributeStorage::Vec4(b) => {
                     SnapshotValues::Vec4(gather(&self.attributes_vec4[b], slots))
+                }
+                AttributeStorage::Bool(b) => {
+                    SnapshotValues::Bool(gather(&self.attributes_bool[b], slots))
+                }
+                AttributeStorage::F64(b) => {
+                    SnapshotValues::F64(gather(&self.attributes_f64[b], slots))
+                }
+                AttributeStorage::Vec4U8(b) => {
+                    SnapshotValues::Vec4U8(gather(&self.attributes_vec4u8[b], slots))
                 }
                 AttributeStorage::String(b) => SnapshotValues::String(
                     slots
@@ -1699,6 +1810,27 @@ impl ElementAttributes {
                         }
                     }
                 }
+                AttributeStorage::Bool(b) => {
+                    if let Some(v) = self.attributes_bool.get_mut(b) {
+                        if slot < v.len() {
+                            v[slot] = false;
+                        }
+                    }
+                }
+                AttributeStorage::F64(b) => {
+                    if let Some(v) = self.attributes_f64.get_mut(b) {
+                        if slot < v.len() {
+                            v[slot] = 0.0;
+                        }
+                    }
+                }
+                AttributeStorage::Vec4U8(b) => {
+                    if let Some(v) = self.attributes_vec4u8.get_mut(b) {
+                        if slot < v.len() {
+                            v[slot] = [0; 4];
+                        }
+                    }
+                }
                 AttributeStorage::String(b) => {
                     if let Some(v) = self.attributes_string.get_mut(b) {
                         if slot < v.len() {
@@ -1731,26 +1863,32 @@ impl SlotSnapshot {
 }
 
 enum SnapshotValues {
+    Bool(Vec<bool>),
     U8(Vec<u8>),
     I32(Vec<i32>),
     U32(Vec<u32>),
     F32(Vec<f32>),
+    F64(Vec<f64>),
     Vec2(Vec<[f32; 2]>),
     Vec3(Vec<[f32; 3]>),
     Vec4(Vec<[f32; 4]>),
+    Vec4U8(Vec<[u8; 4]>),
     String(Vec<Option<String>>),
 }
 
 impl SnapshotValues {
     fn len(&self) -> usize {
         match self {
+            SnapshotValues::Bool(v) => v.len(),
             SnapshotValues::U8(v) => v.len(),
             SnapshotValues::I32(v) => v.len(),
             SnapshotValues::U32(v) => v.len(),
             SnapshotValues::F32(v) => v.len(),
+            SnapshotValues::F64(v) => v.len(),
             SnapshotValues::Vec2(v) => v.len(),
             SnapshotValues::Vec3(v) => v.len(),
             SnapshotValues::Vec4(v) => v.len(),
+            SnapshotValues::Vec4U8(v) => v.len(),
             SnapshotValues::String(v) => v.len(),
         }
     }
@@ -1928,8 +2066,96 @@ fn apply_interp_from_snapshot(
                 }
             }
         }
+        (AttributeStorage::Bool(b), SnapshotValues::Bool(src)) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                pick_int!(v, src);
+            }
+        }
+        (AttributeStorage::F64(b), SnapshotValues::F64(src)) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                if let Some(out) = v.get_mut(dst) {
+                    match policy {
+                        InterpPolicy::Linear => {
+                            let mut sum = 0.0_f64;
+                            let mut wsum = 0.0_f64;
+                            for (i, &w) in weights.iter().enumerate() {
+                                if let Some(&val) = src.get(i) {
+                                    sum += w as f64 * val;
+                                    wsum += w as f64;
+                                }
+                            }
+                            if wsum != 0.0 {
+                                *out = sum / wsum;
+                            }
+                        }
+                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
+                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
+                                0
+                            } else {
+                                match nearest_snapshot_index(weights) {
+                                    Some(i) => i,
+                                    None => return,
+                                }
+                            };
+                            if let Some(&val) = src.get(idx) {
+                                *out = val;
+                            }
+                        }
+                        InterpPolicy::NoInterp => {}
+                    }
+                }
+            }
+        }
+        (AttributeStorage::Vec4U8(b), SnapshotValues::Vec4U8(src)) => {
+            if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
+                if let Some(out) = v.get_mut(dst) {
+                    match policy {
+                        InterpPolicy::Linear => {
+                            let mut sum = [0.0_f32; 4];
+                            let mut wsum = 0.0_f32;
+                            for (i, &w) in weights.iter().enumerate() {
+                                if let Some(val) = src.get(i) {
+                                    for lane in 0..4 {
+                                        sum[lane] += w * val[lane] as f32;
+                                    }
+                                    wsum += w;
+                                }
+                            }
+                            if wsum != 0.0 {
+                                *out = round_vec4u8(sum, wsum);
+                            }
+                        }
+                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
+                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
+                                0
+                            } else {
+                                match nearest_snapshot_index(weights) {
+                                    Some(i) => i,
+                                    None => return,
+                                }
+                            };
+                            if let Some(&val) = src.get(idx) {
+                                *out = val;
+                            }
+                        }
+                        InterpPolicy::NoInterp => {}
+                    }
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Round a weighted f32 accumulator (divided by `wsum`) back to `[u8; 4]`,
+/// clamping each lane into `0..=255`. Used for the explicit-`Linear` blend
+/// of a `Vec4U8` layer.
+fn round_vec4u8(sum: [f32; 4], wsum: f32) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for lane in 0..4 {
+        out[lane] = (sum[lane] / wsum).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// Per-attribute dispatch for [`ElementAttributes::interpolate_into`].
@@ -2083,6 +2309,98 @@ fn apply_interp(
                 }
             }
         }
+        AttributeStorage::F64(b) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                if dst >= v.len() {
+                    return;
+                }
+                match policy {
+                    InterpPolicy::Linear => {
+                        let mut sum = 0.0_f64;
+                        let mut wsum = 0.0_f64;
+                        for &(w, s) in sources {
+                            if let Some(&val) = v.get(s) {
+                                sum += w as f64 * val;
+                                wsum += w as f64;
+                            }
+                        }
+                        if wsum != 0.0 {
+                            v[dst] = sum / wsum;
+                        }
+                    }
+                    InterpPolicy::Nearest => {
+                        if let Some(s) = nearest_source(sources, v.len()) {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::CopyFirst => {
+                        let s = sources[0].1;
+                        if s < v.len() {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::NoInterp => {}
+                }
+            }
+        }
+        AttributeStorage::Vec4U8(b) => {
+            if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
+                if dst >= v.len() {
+                    return;
+                }
+                match policy {
+                    InterpPolicy::Linear => {
+                        let mut sum = [0.0_f32; 4];
+                        let mut wsum = 0.0_f32;
+                        for &(w, s) in sources {
+                            if let Some(&val) = v.get(s) {
+                                for lane in 0..4 {
+                                    sum[lane] += w * val[lane] as f32;
+                                }
+                                wsum += w;
+                            }
+                        }
+                        if wsum != 0.0 {
+                            v[dst] = round_vec4u8(sum, wsum);
+                        }
+                    }
+                    InterpPolicy::Nearest => {
+                        if let Some(s) = nearest_source(sources, v.len()) {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::CopyFirst => {
+                        let s = sources[0].1;
+                        if s < v.len() {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::NoInterp => {}
+                }
+            }
+        }
+        AttributeStorage::Bool(b) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                if dst >= v.len() {
+                    return;
+                }
+                match policy {
+                    // Bool has no fractional blend; Linear degenerates to Nearest.
+                    InterpPolicy::Nearest | InterpPolicy::Linear => {
+                        if let Some(s) = nearest_source(sources, v.len()) {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::CopyFirst => {
+                        let s = sources[0].1;
+                        if s < v.len() {
+                            v[dst] = v[s];
+                        }
+                    }
+                    InterpPolicy::NoInterp => {}
+                }
+            }
+        }
         AttributeStorage::U8(b) => {
             if let Some(v) = attrs.attributes_u8.get_mut(b) {
                 interp_integer(v, dst, sources, policy, |a, b| a.wrapping_add(b), 0);
@@ -2170,6 +2488,27 @@ fn apply_copy(attrs: &mut ElementAttributes, dst: usize, src: usize, storage: At
         }
         AttributeStorage::U32(b) => {
             if let Some(v) = attrs.attributes_u32.get_mut(b) {
+                if src < v.len() && dst < v.len() {
+                    v[dst] = v[src];
+                }
+            }
+        }
+        AttributeStorage::Bool(b) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                if src < v.len() && dst < v.len() {
+                    v[dst] = v[src];
+                }
+            }
+        }
+        AttributeStorage::F64(b) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                if src < v.len() && dst < v.len() {
+                    v[dst] = v[src];
+                }
+            }
+        }
+        AttributeStorage::Vec4U8(b) => {
+            if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
                 if src < v.len() && dst < v.len() {
                     v[dst] = v[src];
                 }
@@ -4098,30 +4437,7 @@ impl LoopMesh {
         });
 
         let key_watermark = self.vertices.key_watermark();
-        for attrib_vec in self.vertex_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.vertex_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.vertex_attribs.grow_all(key_watermark);
         self.op_flags.grow_vert_layers(key_watermark);
 
         vi
@@ -4198,30 +4514,7 @@ impl LoopMesh {
         });
 
         let key_watermark = self.edges.key_watermark();
-        for attrib_vec in self.edge_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.edge_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.edge_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.edge_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.edge_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.edge_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.edge_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.edge_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.edge_attribs.grow_all(key_watermark);
         self.op_flags.grow_edge_layers(key_watermark);
 
         self.vertex_disk_append_edge(vertices[0], edge);
@@ -4287,30 +4580,7 @@ impl LoopMesh {
         new_entry.insert(loop_data);
 
         let key_watermark = self.loops.key_watermark();
-        for attrib_vec in self.loop_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.loop_attribs.grow_all(key_watermark);
         self.op_flags.grow_loop_layers(key_watermark);
 
         loopi
@@ -4586,30 +4856,7 @@ impl LoopMesh {
         ));
 
         let key_watermark = self.loops.key_watermark();
-        for attrib_vec in self.loop_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.loop_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.loop_attribs.grow_all(key_watermark);
         self.op_flags.grow_loop_layers(key_watermark);
 
         new_face_entry.insert(Face {
@@ -4622,30 +4869,7 @@ impl LoopMesh {
         });
 
         let key_watermark = self.faces.key_watermark();
-        for attrib_vec in self.face_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.face_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.face_attribs.grow_all(key_watermark);
         self.op_flags.grow_face_layers(key_watermark);
 
         // Finish initializing the face edge loop
@@ -5030,30 +5254,7 @@ impl LoopMesh {
             normal: Vec3::ZERO,
         });
         let key_watermark = self.faces.key_watermark();
-        for attrib_vec in self.face_attribs.attributes_u8.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_i32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_u32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0);
-        }
-        for attrib_vec in self.face_attribs.attributes_f32.iter_mut() {
-            attrib_vec.resize(key_watermark, 0.0);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec2.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 2]);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec3.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 3]);
-        }
-        for attrib_vec in self.face_attribs.attributes_vec4.iter_mut() {
-            attrib_vec.resize(key_watermark, [0.0; 4]);
-        }
-        for attrib_vec in self.face_attribs.attributes_string.iter_mut() {
-            attrib_vec.resize(key_watermark, None);
-        }
+        self.face_attribs.grow_all(key_watermark);
         self.op_flags.grow_face_layers(key_watermark);
         key
     }
@@ -5798,7 +5999,7 @@ fn i32_vertex_attrib_round_trips() {
     let material = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("material"),
-            Format::new(ComponentType::I32, 1),
+            AttrType::I32,
         ))
         .unwrap();
 
@@ -5831,7 +6032,7 @@ fn i32_loop_attrib_round_trips() {
     let tag = mesh
         .register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("tag"),
-            Format::new(ComponentType::I32, 1),
+            AttrType::I32,
         ))
         .unwrap();
 
@@ -5856,7 +6057,7 @@ fn i32_setter_rejects_wrong_bucket_and_missing_key() {
     let color = mesh
         .register_vertex_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 3),
+            AttrType::Vec3,
         ))
         .unwrap();
     assert!(!mesh.vertex_attribs_mut().set_i32(color, v0.as_usize(), 1));

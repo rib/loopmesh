@@ -605,25 +605,25 @@ mod tests {
         let v_color = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("v_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let e_crease = mesh
             .register_edge_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("e_crease"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             ))
             .unwrap();
         let f_color = mesh
             .register_face_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("f_color"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
 

@@ -992,7 +992,7 @@ mod tests {
     fn register_uv(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("uv"),
-            Format::new(ComponentType::F32, 2),
+            AttrType::Vec2,
         ))
         .expect("uv layer registers")
     }
@@ -1056,7 +1056,7 @@ mod tests {
         let attr3 = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("vec3"),
-                Format::new(ComponentType::F32, 3),
+                AttrType::Vec3,
             ))
             .unwrap();
         let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
@@ -1208,7 +1208,7 @@ mod tests {
     fn register_color(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("color"),
-            Format::new(ComponentType::F32, 4),
+            AttrType::Vec4,
         ))
         .expect("color layer registers")
     }
@@ -1389,7 +1389,7 @@ mod tests {
         let uv1 = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv1"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let ([_, b, c, ..], shared) = two_quads_shared_edge(&mut mesh);
@@ -1754,7 +1754,7 @@ mod tests {
         let uv1 = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv1"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .unwrap();
         let (hub, _rim) = build_triangle_fan(&mut mesh, 4);
@@ -1944,7 +1944,7 @@ mod tests {
     fn register_loop_i32(mesh: &mut LoopMesh) -> ElementAttributeKey {
         mesh.register_loop_attribute(ElementAttributeDesc::numeric(
             AttributeKey::custom("int"),
-            Format::new(ComponentType::I32, 1),
+            AttrType::I32,
         ))
         .expect("int layer registers")
     }

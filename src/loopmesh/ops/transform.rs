@@ -280,7 +280,7 @@ mod tests {
         let weight = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("weight"),
-                Format::new(ComponentType::F32, 1),
+                AttrType::F32,
             ))
             .expect("vert weight layer registers");
         for (i, &v) in verts.iter().enumerate() {
@@ -291,7 +291,7 @@ mod tests {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
-                Format::new(ComponentType::F32, 2),
+                AttrType::Vec2,
             ))
             .expect("uv layer registers");
         let loop_uvs: Vec<(LoopKey, [f32; 2])> = mesh
