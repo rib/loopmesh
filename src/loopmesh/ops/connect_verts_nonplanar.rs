@@ -66,7 +66,8 @@ impl LoopMesh {
         faces: &[FaceKey],
         angle_limit: f32,
     ) -> Vec<EdgeKey> {
-        self.connect_verts_nonplanar_capture(faces, angle_limit).edges
+        self.connect_verts_nonplanar_capture(faces, angle_limit)
+            .edges
     }
 
     /// Capturing form returning both output buffers of
@@ -356,7 +357,10 @@ mod tests {
         let mut mesh_blocks = LoopMesh::new();
         let (face_blocks, _) = folded_quad(&mut mesh_blocks, 0.8);
         let cut_blocks = mesh_blocks.connect_verts_nonplanar_out(&[face_blocks], ANGLE_LOOSE);
-        assert!(cut_blocks.is_empty(), "loose tolerance leaves the crease whole");
+        assert!(
+            cut_blocks.is_empty(),
+            "loose tolerance leaves the crease whole"
+        );
         assert_eq!(mesh_blocks.totface(), 1);
         assert_eq!(mesh_blocks.face_len(face_blocks), 4);
         mesh_blocks.validate_topology();
@@ -383,7 +387,11 @@ mod tests {
             "the ridge drives the recursion past a single cut (≥3 pieces)"
         );
         assert_eq!(cut.len(), piece_count - 1, "p-1 diagonals for p pieces");
-        assert_eq!(mesh.totedge(), e0 + (piece_count - 1), "+(p-1) interior edges");
+        assert_eq!(
+            mesh.totedge(),
+            e0 + (piece_count - 1),
+            "+(p-1) interior edges"
+        );
         for f in mesh.face_keys() {
             assert!(mesh.face_len(f) >= 3);
         }
@@ -440,7 +448,11 @@ mod tests {
             "faces.out exceeds the leaf-only / edge count"
         );
         let unique: std::collections::HashSet<FaceKey> = out.faces.iter().copied().collect();
-        assert_eq!(unique.len(), out.faces.len(), "faces.out carries no duplicates");
+        assert_eq!(
+            unique.len(),
+            out.faces.len(),
+            "faces.out carries no duplicates"
+        );
         let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert_eq!(unique, live, "faces.out is exactly the live leaf set");
         mesh.validate_topology();

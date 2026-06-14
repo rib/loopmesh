@@ -146,13 +146,12 @@ impl LoopMesh {
         // §5 — realise the route as verts, splitting each crossed edge.
         let mut route_verts: Vec<VertexKey> = Vec::new();
         let mut route_vert_set: HashSet<VertexKey> = HashSet::new();
-        let mut push_route_vert = |v: VertexKey,
-                                   verts: &mut Vec<VertexKey>,
-                                   set: &mut HashSet<VertexKey>| {
-            if set.insert(v) {
-                verts.push(v);
-            }
-        };
+        let mut push_route_vert =
+            |v: VertexKey, verts: &mut Vec<VertexKey>, set: &mut HashSet<VertexKey>| {
+                if set.insert(v) {
+                    verts.push(v);
+                }
+            };
         for element in &route {
             match *element {
                 RouteElement::Vert(v) => {
@@ -209,7 +208,11 @@ impl LoopMesh {
 
         // Last resort: any axis orthogonal to the segment (§3.3).
         if normal.length_squared() < PLANE_EPS * PLANE_EPS {
-            let helper = if segment.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+            let helper = if segment.x.abs() < 0.9 {
+                Vec3::X
+            } else {
+                Vec3::Y
+            };
             normal = segment.cross(helper);
         }
 
@@ -262,12 +265,7 @@ impl LoopMesh {
     /// §5.3 — the crossing fraction `t` along edge `a`→`b` where the plane
     /// cuts it: `t = |dist(a)| / (|dist(a)| + |dist(b)|)`. A near-on-plane
     /// edge (both distances within tolerance) splits at the midpoint.
-    fn plane_crossing_fraction(
-        &self,
-        plane: &CuttingPlane,
-        a: VertexKey,
-        b: VertexKey,
-    ) -> f32 {
+    fn plane_crossing_fraction(&self, plane: &CuttingPlane, a: VertexKey, b: VertexKey) -> f32 {
         let da = plane.signed_distance(self.vertex_position(a)).abs();
         let db = plane.signed_distance(self.vertex_position(b)).abs();
         let total = da + db;

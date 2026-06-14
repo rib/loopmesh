@@ -83,8 +83,7 @@ impl LoopMesh {
         // over-cut, the *new* interior diagonals are exactly the edges joining
         // two original-face corners that are not in this set.
         let perimeter: HashSet<EdgeKey> = self.face_edge_keys(face).into_iter().collect();
-        let original_corners: HashSet<VertexKey> =
-            self.face_vert_keys(face).into_iter().collect();
+        let original_corners: HashSet<VertexKey> = self.face_vert_keys(face).into_iter().collect();
 
         // §4.1 — fully triangulate in place with the beautify triangulator.
         self.face_triangulate(face, QuadMethod::Beauty, NgonMethod::Beauty);
@@ -279,8 +278,7 @@ fn merged_quad_cycle(
         let nxt = tri_a[(i + 1) % 3];
         quad[out] = cur;
         out += 1;
-        let traverses_diagonal =
-            (cur == p && nxt == q) || (cur == q && nxt == p);
+        let traverses_diagonal = (cur == p && nxt == q) || (cur == q && nxt == p);
         if traverses_diagonal {
             quad[out] = far_b;
             out += 1;
@@ -323,12 +321,18 @@ mod tests {
         let created = mesh.connect_verts_concave_out(&[face]);
 
         // §5.1: 4 V (unchanged), 4 → 5 E (+1 surviving diagonal), 1 → 2 F.
-        assert_eq!(mesh.totvert(), v0, "operator never creates or destroys verts");
+        assert_eq!(
+            mesh.totvert(),
+            v0,
+            "operator never creates or destroys verts"
+        );
         assert_eq!(mesh.totedge(), e0 + 1, "one surviving interior diagonal");
         assert_eq!(mesh.totface(), 2, "concave quad becomes two triangles");
         assert_eq!(created.len(), 1, "exactly one divider survives");
         // The kept diagonal is the 1-3 chord (the only legal one).
-        let diag = mesh.query_edge_exists(v[1], v[3]).expect("1-3 diagonal survives");
+        let diag = mesh
+            .query_edge_exists(v[1], v[3])
+            .expect("1-3 diagonal survives");
         assert_eq!(created[0], diag);
         for f in mesh.face_keys() {
             assert_eq!(mesh.face_len(f), 3, "both survivors are triangles");
@@ -418,13 +422,23 @@ mod tests {
         let created = mesh.connect_verts_concave_out(&[face]);
 
         assert_eq!(mesh.totvert(), v0, "no verts created or destroyed");
-        assert!(!created.is_empty(), "the reflex corner forces ≥1 surviving cut");
+        assert!(
+            !created.is_empty(),
+            "the reflex corner forces ≥1 surviving cut"
+        );
         let face_count = mesh.totface();
         assert!(face_count >= 2, "decomposed into ≥2 convex pieces");
         // §4 net delta: +(c-1) edges and +(c-1) faces for c pieces.
         assert_eq!(created.len(), face_count - 1, "c-1 dividers for c pieces");
-        assert_eq!(mesh.totedge(), 5 + (face_count - 1), "+(c-1) interior edges");
-        assert!(every_face_is_convex(&mesh), "every surviving piece is convex");
+        assert_eq!(
+            mesh.totedge(),
+            5 + (face_count - 1),
+            "+(c-1) interior edges"
+        );
+        assert!(
+            every_face_is_convex(&mesh),
+            "every surviving piece is convex"
+        );
         mesh.validate_topology();
     }
 
@@ -450,11 +464,17 @@ mod tests {
         let created = mesh.connect_verts_concave_out(&[face]);
 
         assert_eq!(mesh.totvert(), v0, "no verts created");
-        assert!(!created.is_empty(), "two reflex corners force surviving cuts");
+        assert!(
+            !created.is_empty(),
+            "two reflex corners force surviving cuts"
+        );
         let face_count = mesh.totface();
         assert!(face_count >= 2);
         assert_eq!(created.len(), face_count - 1, "c-1 dividers for c pieces");
-        assert!(every_face_is_convex(&mesh), "every surviving piece is convex");
+        assert!(
+            every_face_is_convex(&mesh),
+            "every surviving piece is convex"
+        );
         mesh.validate_topology();
     }
 

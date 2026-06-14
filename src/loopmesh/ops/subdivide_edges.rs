@@ -437,7 +437,8 @@ impl LoopMesh {
         t: f32,
         params: &SubdivideParams,
     ) -> Vec3 {
-        self.smooth_endpoint_context(edge, near).placement(t, params)
+        self.smooth_endpoint_context(edge, near)
+            .placement(t, params)
     }
 
     /// §9.4.1 — when `use_sphere` is set, snap the inserted vert `v` radially
@@ -606,10 +607,17 @@ impl LoopMesh {
         debug_assert_eq!(mids.len(), 2, "two-cut tri has exactly two midpoints");
         // Start at the midpoint that has the other exactly two corners ahead,
         // so v1 (the shared corner) sits between them on the forward arc.
-        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+        let start = if (mids[1] - mids[0]) == 2 {
+            mids[0]
+        } else {
+            mids[1]
+        };
         let m01 = ring[start].0;
         let m12 = ring[(start + 2) % n].0;
-        debug_assert!(!ring[(start + 1) % n].1, "shared corner is original, not a midpoint");
+        debug_assert!(
+            !ring[(start + 1) % n].1,
+            "shared corner is original, not a midpoint"
+        );
 
         if let Some((new_face, _)) = self.face_split(face, m01, m12) {
             geom.faces.push(face);
@@ -649,7 +657,12 @@ impl LoopMesh {
     /// §5.1 — quad, one edge cut. Cycle is `v0, m, v1, v2, v3`; connect `m` into
     /// the interior to the two opposite corners `v3` and `v2`. 1 quad -> 3
     /// triangular fragments.
-    fn quad_one_cut(&mut self, face: FaceKey, ring: &[(VertexKey, bool)], geom: &mut SubdivideGeom) {
+    fn quad_one_cut(
+        &mut self,
+        face: FaceKey,
+        ring: &[(VertexKey, bool)],
+        geom: &mut SubdivideGeom,
+    ) {
         let (v, _) = Self::rotate_to_first_midpoint(ring);
         // v = [m, v1, v2, v3, v0]. The cut edge was {v0, v1}; the two interior
         // targets are v3 = v[3] and v2 = v[2].
@@ -734,11 +747,18 @@ impl LoopMesh {
         debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
         // Forward gap from mids[0] to mids[1]; the start is whichever midpoint
         // has the other exactly two corners ahead of it.
-        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+        let start = if (mids[1] - mids[0]) == 2 {
+            mids[0]
+        } else {
+            mids[1]
+        };
 
         let m01 = ring[start].0;
         let m12 = ring[(start + 2) % n].0;
-        debug_assert!(ring[(start + 1) % n].0 != m01, "shared corner between midpoints");
+        debug_assert!(
+            ring[(start + 1) % n].0 != m01,
+            "shared corner between midpoints"
+        );
 
         // m01 -> m12 carves the corner triangle off the hexagon.
         if let Some((new_face, _)) = self.face_split(face, m01, m12) {
@@ -764,9 +784,16 @@ impl LoopMesh {
         debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
         // Start at the midpoint that has the other exactly two corners ahead, so
         // the shared corner v1 sits between them on the forward arc.
-        let start = if (mids[1] - mids[0]) == 2 { mids[0] } else { mids[1] };
+        let start = if (mids[1] - mids[0]) == 2 {
+            mids[0]
+        } else {
+            mids[1]
+        };
         let at = |off: usize| ring[(start + off) % n].0;
-        debug_assert!(!ring[(start + 1) % n].1, "shared corner is original, not a midpoint");
+        debug_assert!(
+            !ring[(start + 1) % n].1,
+            "shared corner is original, not a midpoint"
+        );
         // ring order from m01: m01, v1, m12, v2, v3, v0.
         [at(0), at(1), at(2), at(3), at(4), at(5)]
     }
@@ -1229,7 +1256,8 @@ impl LoopMesh {
                     (u * v, v2.as_usize()),
                     ((1.0 - u) * v, v3.as_usize()),
                 ];
-                self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                self.vertex_attribs
+                    .interpolate_into(vk.as_usize(), &sources);
                 // §9.4.4 — snap each interior lattice node onto the sphere.
                 self.maybe_sphere_project(vk, params);
                 node[r][c] = vk;
@@ -1304,7 +1332,8 @@ impl LoopMesh {
                         (w1, v1.as_usize()),
                         (w2, v2.as_usize()),
                     ];
-                    self.vertex_attribs.interpolate_into(vk.as_usize(), &sources);
+                    self.vertex_attribs
+                        .interpolate_into(vk.as_usize(), &sources);
                     // §9.4.4 — snap each interior lattice node onto the sphere.
                     self.maybe_sphere_project(vk, params);
                     geom.verts.push(vk);
@@ -1319,7 +1348,7 @@ impl LoopMesh {
         self.face_kill(face);
         for s in 0..=n {
             let upper = n - s; // top index of the down-triangle run
-            // Up triangles.
+                               // Up triangles.
             for k in 0..=upper {
                 let cell = [rows[s][k], rows[s][k + 1], rows[s + 1][k]];
                 let f = self.create_lattice_cell(&cell, src_face);
@@ -1346,7 +1375,10 @@ impl LoopMesh {
         n: usize,
         geom: &mut SubdivideGeom,
     ) {
-        let cut = sides.iter().position(|s| !s.is_empty()).expect("one cut side");
+        let cut = sides
+            .iter()
+            .position(|s| !s.is_empty())
+            .expect("one cut side");
         // Rotate corners so the cut side is corners[0]->corners[1].
         let v0 = corners[cut];
         let v1 = corners[(cut + 1) % 4];
@@ -1386,7 +1418,10 @@ impl LoopMesh {
         sides: &[Vec<VertexKey>],
         geom: &mut SubdivideGeom,
     ) {
-        let cut = sides.iter().position(|s| !s.is_empty()).expect("one cut side");
+        let cut = sides
+            .iter()
+            .position(|s| !s.is_empty())
+            .expect("one cut side");
         let apex = corners[(cut + 2) % 3];
         let run = sides[cut].clone();
 
@@ -1507,7 +1542,14 @@ fn normal_coincides_with_reflection(normal: Vec3, reflected: Vec3) -> bool {
 /// *length* is the straight linear blend `lerp(radius_at_start, radius_at_end,
 /// t)`. Degeneracies (normals parallel to the chord, no finite centre, or
 /// diametrically opposite radii) fall back to the straight chord lerp.
-fn arc_point(start: Vec3, normal_at_start: Vec3, end: Vec3, normal_at_end: Vec3, chord_dir: Vec3, t: f32) -> Vec3 {
+fn arc_point(
+    start: Vec3,
+    normal_at_start: Vec3,
+    end: Vec3,
+    normal_at_end: Vec3,
+    chord_dir: Vec3,
+    t: f32,
+) -> Vec3 {
     // Arc plane: perpendicular to the chord and to the shared "up". The average
     // here is one endpoint's normal with that same normal's reflection (per the
     // dual-blend caller), so it is exactly the chord-perpendicular part of that
@@ -1586,8 +1628,7 @@ fn intersect_three_planes(
     if denom.abs() < SMOOTH_DIR_EPS {
         return None;
     }
-    let numerator =
-        da * nb.cross(nc) + db * nc.cross(na) + dc * na.cross(nb);
+    let numerator = da * nb.cross(nc) + db * nc.cross(na) + dc * na.cross(nb);
     Some(numerator / denom)
 }
 
@@ -1688,8 +1729,16 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
         (mesh, [v0, v1, v2, v3, v4, v5], e01)
     }
 
@@ -1721,9 +1770,7 @@ mod tests {
         let face = unit_quad(&mut mesh);
         let fv = mesh.face_vert_keys(face);
         let edges: Vec<_> = (0..4)
-            .map(|i| {
-                mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap()
-            })
+            .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
             .collect();
 
         let res = mesh.subdivide_edges(&edges, SubdivideParams::default());
@@ -1738,7 +1785,9 @@ mod tests {
         // The centre vert lands at the quad centroid (1, 1, 0).
         let centre = *geom.verts.last().unwrap();
         assert!(
-            mesh.vertex_position(centre).distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5,
+            mesh.vertex_position(centre)
+                .distance(Vec3::new(1.0, 1.0, 0.0))
+                < 1e-5,
             "centre vert at centroid"
         );
         // Every resulting face is a quad.
@@ -1807,8 +1856,16 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let (v, e, f) = counts(&mesh);
         assert_eq!((v, e, f), (6, 7, 2), "starting two-quad fixture");
@@ -1936,7 +1993,10 @@ mod tests {
             .find(|&f| mesh.face_len(f) == 3)
             .unwrap();
         let tri_verts = mesh.face_vert_keys(tri);
-        assert!(tri_verts.contains(&v1), "triangle holds the shared corner v1");
+        assert!(
+            tri_verts.contains(&v1),
+            "triangle holds the shared corner v1"
+        );
         assert!(tri_verts.contains(&m01) && tri_verts.contains(&m12));
 
         // The pentagon does *not* contain the shared corner v1.
@@ -1955,9 +2015,7 @@ mod tests {
     /// Cut the two adjacent edges `{v0,v1}` + `{v1,v2}` of a fresh unit quad
     /// under the given corner strategy. Returns the mesh, the geom, and the four
     /// original corner keys `[v0, v1, v2, v3]`.
-    fn adjacent_two_cut(
-        corner_type: QuadCornerType,
-    ) -> (LoopMesh, SubdivideGeom, [VertexKey; 4]) {
+    fn adjacent_two_cut(corner_type: QuadCornerType) -> (LoopMesh, SubdivideGeom, [VertexKey; 4]) {
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let fv = mesh.face_vert_keys(face);
@@ -2011,8 +2069,15 @@ mod tests {
         // quads plus the corner 4-gon around it (degree 3 in its disk: the
         // halved corner cut x2 + the c-v3 spoke).
         let v3 = find_vert_at(&mesh, Vec3::new(0.0, 2.0, 0.0));
-        assert!(mesh.query_edge_exists(c, v3).is_some(), "c spokes to far corner v3");
-        assert_eq!(mesh.vertex_disk_count_edges(c), 3, "c disk: two cut halves + spoke");
+        assert!(
+            mesh.query_edge_exists(c, v3).is_some(),
+            "c spokes to far corner v3"
+        );
+        assert_eq!(
+            mesh.vertex_disk_count_edges(c),
+            3,
+            "c disk: two cut halves + spoke"
+        );
     }
 
     #[test]
@@ -2027,8 +2092,14 @@ mod tests {
 
         let m01 = find_vert_at(&mesh, Vec3::new(1.0, 0.0, 0.0));
         let m12 = find_vert_at(&mesh, Vec3::new(2.0, 1.0, 0.0));
-        assert!(mesh.query_edge_exists(m01, m12).is_some(), "m01-m12 corner cut");
-        assert!(mesh.query_edge_exists(v0, v2).is_some(), "v0-v2 chained cut");
+        assert!(
+            mesh.query_edge_exists(m01, m12).is_some(),
+            "m01-m12 corner cut"
+        );
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_some(),
+            "v0-v2 chained cut"
+        );
 
         // Fragment shapes: two triangles + one quad.
         let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
@@ -2040,9 +2111,7 @@ mod tests {
             .faces
             .iter()
             .copied()
-            .find(|&fk| {
-                mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v1)
-            })
+            .find(|&fk| mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v1))
             .expect("corner triangle holds v1");
         let cv = mesh.face_vert_keys(corner_tri);
         assert!(cv.contains(&m01) && cv.contains(&m12));
@@ -2052,12 +2121,13 @@ mod tests {
             .faces
             .iter()
             .copied()
-            .find(|&fk| {
-                mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v3)
-            })
+            .find(|&fk| mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v3))
             .expect("far triangle holds v3");
         let fvv = mesh.face_vert_keys(far_tri);
-        assert!(fvv.contains(&v0) && fvv.contains(&v2), "far tri is {{v0,v2,v3}}");
+        assert!(
+            fvv.contains(&v0) && fvv.contains(&v2),
+            "far tri is {{v0,v2,v3}}"
+        );
     }
 
     #[test]
@@ -2112,7 +2182,11 @@ mod tests {
 
         // v3 is the fan hub: its disk gains both spokes on top of the two uncut
         // edges {v2,v3} and {v3,v0}.
-        assert_eq!(mesh.vertex_disk_count_edges(v3), 4, "v3 is a degree-4 fan hub");
+        assert_eq!(
+            mesh.vertex_disk_count_edges(v3),
+            4,
+            "v3 is a degree-4 fan hub"
+        );
         let _ = (v0, v2);
     }
 
@@ -2120,7 +2194,10 @@ mod tests {
     fn quad_corner_type_default_is_straight_cut() {
         // The setter default and SubdivideParams::default() must agree, leaving
         // the core STRAIGHT_CUT outcome unchanged (1 triangle + 1 pentagon).
-        assert_eq!(SubdivideParams::default().quad_corner_type, QuadCornerType::StraightCut);
+        assert_eq!(
+            SubdivideParams::default().quad_corner_type,
+            QuadCornerType::StraightCut
+        );
         let (mesh, geom, _) = adjacent_two_cut(QuadCornerType::StraightCut);
         let (v, e, f) = counts(&mesh);
         assert_eq!((v, e, f), (6, 7, 2), "STRAIGHT_CUT unchanged via setter");
@@ -2175,9 +2252,18 @@ mod tests {
 
         // The middle midpoint m12 fans to both end midpoints; m01-m23 is the
         // pentagon diagonal. Those three connecting edges exist.
-        assert!(mesh.query_edge_exists(m12, m01).is_some(), "m12-m01 corner cut");
-        assert!(mesh.query_edge_exists(m12, m23).is_some(), "m12-m23 corner cut");
-        assert!(mesh.query_edge_exists(m01, m23).is_some(), "m01-m23 pentagon diagonal");
+        assert!(
+            mesh.query_edge_exists(m12, m01).is_some(),
+            "m12-m01 corner cut"
+        );
+        assert!(
+            mesh.query_edge_exists(m12, m23).is_some(),
+            "m12-m23 corner cut"
+        );
+        assert!(
+            mesh.query_edge_exists(m01, m23).is_some(),
+            "m01-m23 pentagon diagonal"
+        );
 
         // The lone quad fragment is {v0, m01, m23, v3} and holds the two corners
         // of the uncut edge {v3,v0}.
@@ -2188,9 +2274,15 @@ mod tests {
             .find(|&f| mesh.face_len(f) == 4)
             .unwrap();
         let qv = mesh.face_vert_keys(quad);
-        assert!(qv.contains(&v0) && qv.contains(&v3), "quad spans the uncut edge");
+        assert!(
+            qv.contains(&v0) && qv.contains(&v3),
+            "quad spans the uncut edge"
+        );
         assert!(qv.contains(&m01) && qv.contains(&m23));
-        assert!(!qv.contains(&v1) && !qv.contains(&v2), "quad excludes the cut corners");
+        assert!(
+            !qv.contains(&v1) && !qv.contains(&v2),
+            "quad excludes the cut corners"
+        );
     }
 
     #[test]
@@ -2230,7 +2322,10 @@ mod tests {
             .into_iter()
             .find(|&vk| mesh.vertex_position(vk).distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5)
             .expect("m12");
-        assert!(mesh.query_edge_exists(m01, m12).is_some(), "m01-m12 corner cut");
+        assert!(
+            mesh.query_edge_exists(m01, m12).is_some(),
+            "m01-m12 corner cut"
+        );
 
         // The triangle is the cut-off shared corner {m01, v1, m12}; v1 is on it.
         let tri = geom
@@ -2304,8 +2399,7 @@ mod tests {
         let fv = mesh.face_vert_keys(face);
         let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
 
-        let res =
-            mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
         assert!(matches!(res, SubdivideResult::Ran(_)));
 
         let (v, e, f) = counts(&mesh);
@@ -2323,8 +2417,7 @@ mod tests {
         let fv = mesh.face_vert_keys(face);
         let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
 
-        let res =
-            mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().use_single_edge(false));
         assert!(matches!(res, SubdivideResult::Ran(_)));
 
         let (v, e, f) = counts(&mesh);
@@ -2345,8 +2438,7 @@ mod tests {
             .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
             .collect();
 
-        let res =
-            mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
         assert!(matches!(res, SubdivideResult::Ran(_)));
 
         let (v, e, f) = counts(&mesh);
@@ -2366,8 +2458,7 @@ mod tests {
             .map(|i| mesh.query_edge_exists(fv[i], fv[(i + 1) % 3]).unwrap())
             .collect();
 
-        let res =
-            mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().use_grid_fill(false));
         assert!(matches!(res, SubdivideResult::Ran(_)));
 
         let (v, e, f) = counts(&mesh);
@@ -2386,7 +2477,11 @@ mod tests {
         let fv = one_cut.face_vert_keys(f1);
         let e01 = one_cut.query_edge_exists(fv[0], fv[1]).unwrap();
         one_cut.subdivide_edges(&[e01], SubdivideParams::default());
-        assert_eq!(counts(&one_cut), (5, 7, 3), "default one-cut quad re-splits");
+        assert_eq!(
+            counts(&one_cut),
+            (5, 7, 3),
+            "default one-cut quad re-splits"
+        );
 
         let mut all_cut = LoopMesh::new();
         let f2 = unit_quad(&mut all_cut);
@@ -2395,7 +2490,11 @@ mod tests {
             .map(|i| all_cut.query_edge_exists(fv[i], fv[(i + 1) % 4]).unwrap())
             .collect();
         all_cut.subdivide_edges(&edges, SubdivideParams::default());
-        assert_eq!(counts(&all_cut), (9, 12, 4), "default four-cut quad plus-splits");
+        assert_eq!(
+            counts(&all_cut),
+            (9, 12, 4),
+            "default four-cut quad plus-splits"
+        );
     }
 
     /// Build a quad `{v0,v1,v2,v3}` and a triangle `{v1,v4,v2}` welded across the
@@ -2415,7 +2514,11 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e42 = mesh.create_edge([v4, v2], EdgeCreateFlags::NONE);
 
-        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         mesh.face_create(&[v1, v4, v2], &[e14, e42, e12], FaceCreateFlags::NONE);
         (mesh, e12)
     }
@@ -2429,14 +2532,15 @@ mod tests {
         let (mut mesh, shared) = quad_and_tri_shared_edge();
         assert_eq!(counts(&mesh), (5, 6, 2), "starting quad+tri fixture");
 
-        let res = mesh.subdivide_edges(
-            &[shared],
-            SubdivideParams::default().use_only_quads(true),
-        );
+        let res = mesh.subdivide_edges(&[shared], SubdivideParams::default().use_only_quads(true));
         assert!(matches!(res, SubdivideResult::Ran(_)));
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!((v, f), (6, 4), "gate ON: shared midpoint + quad->3, tri flat");
+        assert_eq!(
+            (v, f),
+            (6, 4),
+            "gate ON: shared midpoint + quad->3, tri flat"
+        );
 
         // The triangle that shared the edge is now a flat 4-gon (midpoint
         // inserted as a rim corner, no interior connection).
@@ -2450,12 +2554,14 @@ mod tests {
         let flat = mesh
             .vert_face_keys(mid)
             .into_iter()
-            .find(|&fk| mesh.face_len(fk) == 4 && {
-                // the flat 4-gon is the only midpoint-incident face that is NOT
-                // a quad-fragment: it holds the apex v4 (at x=2).
-                mesh.face_vert_keys(fk)
-                    .iter()
-                    .any(|&vk| mesh.vertex_position(vk).x > 1.5)
+            .find(|&fk| {
+                mesh.face_len(fk) == 4 && {
+                    // the flat 4-gon is the only midpoint-incident face that is NOT
+                    // a quad-fragment: it holds the apex v4 (at x=2).
+                    mesh.face_vert_keys(fk)
+                        .iter()
+                        .any(|&vk| mesh.vertex_position(vk).x > 1.5)
+                }
             })
             .expect("flat 4-gon on the triangle side");
         assert_eq!(mesh.face_len(flat), 4, "triangle left flat (4-gon)");
@@ -2510,7 +2616,11 @@ mod tests {
         let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
 
         mesh.subdivide_edges(&[e01], SubdivideParams::default().use_only_quads(true));
-        assert_eq!(counts(&mesh), (5, 7, 3), "gate ON, all-quad: quad still re-splits");
+        assert_eq!(
+            counts(&mesh),
+            (5, 7, 3),
+            "gate ON, all-quad: quad still re-splits"
+        );
     }
 
     #[test]
@@ -2556,7 +2666,10 @@ mod tests {
         let m = geom.verts[0];
         // Midpoint of {v0 (u=0), v1 (u=2)} should read u = 1.
         let got = mesh.vertex_attribs().get_f32(u, m.as_usize()).unwrap();
-        assert!((got - 1.0).abs() < 1e-5, "midpoint u expected 1.0, got {got}");
+        assert!(
+            (got - 1.0).abs() < 1e-5,
+            "midpoint u expected 1.0, got {got}"
+        );
     }
 
     // ---- Multi-cut (`cuts >= 2`, §3.3 / §9.5) ----------------------------
@@ -2645,7 +2758,11 @@ mod tests {
             .verts
             .iter()
             .copied()
-            .filter(|&vk| mesh.vertex_position(vk).distance(Vec3::new(2.0 / 3.0, 2.0 / 3.0, 0.0)) < 1e-5)
+            .filter(|&vk| {
+                mesh.vertex_position(vk)
+                    .distance(Vec3::new(2.0 / 3.0, 2.0 / 3.0, 0.0))
+                    < 1e-5
+            })
             .collect();
         assert_eq!(interior.len(), 1, "exactly one interior barycentric vert");
     }
@@ -2743,12 +2860,24 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
         assert_eq!(counts(&mesh), (6, 7, 2), "starting two-quad fixture");
 
         mesh.subdivide_edges(&[e12], SubdivideParams::default().cuts(2));
-        assert_eq!(counts(&mesh), (8, 13, 6), "shared-edge cuts=2 crack-free deltas");
+        assert_eq!(
+            counts(&mesh),
+            (8, 13, 6),
+            "shared-edge cuts=2 crack-free deltas"
+        );
 
         // Each shared midpoint sits on the shared edge and welds both quads:
         // its disk has the two halves of the (now thrice-split) shared edge
@@ -2846,7 +2975,9 @@ mod tests {
         let (mut lin_mesh, _v, e_lin) = folded_two_quads(FRAC_PI_3);
         let lin_geom = match lin_mesh.subdivide_edges(
             &[e_lin],
-            SubdivideParams::default().smooth(1.0).smooth_falloff(SmoothFalloff::Linear),
+            SubdivideParams::default()
+                .smooth(1.0)
+                .smooth_falloff(SmoothFalloff::Linear),
         ) {
             SubdivideResult::Ran(g) => g,
             _ => panic!("expected Ran"),
@@ -2856,7 +2987,9 @@ mod tests {
         let (mut sm_mesh, _v, e_sm) = folded_two_quads(FRAC_PI_3);
         let sm_geom = match sm_mesh.subdivide_edges(
             &[e_sm],
-            SubdivideParams::default().smooth(1.0).smooth_falloff(SmoothFalloff::Smooth),
+            SubdivideParams::default()
+                .smooth(1.0)
+                .smooth_falloff(SmoothFalloff::Smooth),
         ) {
             SubdivideResult::Ran(g) => g,
             _ => panic!("expected Ran"),
@@ -2922,8 +3055,10 @@ mod tests {
         );
         // The bow is purely off the surface (no chord-tangent drift): x and y
         // stay on the chord midplane, only z moves.
-        assert!((placed.x - 0.5).abs() < 1.0e-6 && placed.y.abs() < 1.0e-6,
-            "arc midpoint stays on the symmetric chord midplane (got {placed:?})");
+        assert!(
+            (placed.x - 0.5).abs() < 1.0e-6 && placed.y.abs() < 1.0e-6,
+            "arc midpoint stays on the symmetric chord midplane (got {placed:?})"
+        );
     }
 
     #[test]
@@ -2960,8 +3095,16 @@ mod tests {
             let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
             let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
             let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+            mesh.face_create(
+                &[v0, v1, v2, v3],
+                &[e01, e12, e23, e30],
+                FaceCreateFlags::NONE,
+            );
+            mesh.face_create(
+                &[v1, v4, v5, v2],
+                &[e14, e45, e52, e12],
+                FaceCreateFlags::NONE,
+            );
             let res = mesh.subdivide_edges(
                 &[e01],
                 SubdivideParams::default()
@@ -3073,7 +3216,11 @@ mod tests {
         // §9.4 topology-invariance: same fragment graph as the chord run (§5.1
         // one-edge quad re-split, 1 quad -> 3 faces).
         let (v, e, f) = counts(&mesh);
-        assert_eq!((v, e, f), (5, 7, 3), "use_sphere is topology-invariant (§9.4)");
+        assert_eq!(
+            (v, e, f),
+            (5, 7, 3),
+            "use_sphere is topology-invariant (§9.4)"
+        );
 
         // The midpoint is the single inserted vert. Its direction is the chord
         // midpoint (1,1,0) and its distance from the origin is now exactly √3.
@@ -3087,13 +3234,18 @@ mod tests {
         // Direction preserved: (1,1,0) normalised, scaled to √3 -> (1.2247..,
         // 1.2247.., 0).
         let expected = Vec3::new(1.0, 1.0, 0.0).normalize() * SPHERE_R;
-        assert!(pos.distance(expected) < 1e-5, "projected along the chord radial");
+        assert!(
+            pos.distance(expected) < 1e-5,
+            "projected along the chord radial"
+        );
 
         // §9.4.2 — pre-existing corners are never moved. The corner at (1,1,1)
         // is still exactly there (the rule never touches originals).
         let corner = find_vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
         assert!(
-            mesh.vertex_position(corner).distance(Vec3::new(1.0, 1.0, 1.0)) < 1e-9,
+            mesh.vertex_position(corner)
+                .distance(Vec3::new(1.0, 1.0, 1.0))
+                < 1e-9,
             "original corner unmoved"
         );
     }
@@ -3175,7 +3327,11 @@ mod tests {
         };
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!((v, e, f), (9, 12, 4), "use_sphere four-cut is the §5.4 plus-split");
+        assert_eq!(
+            (v, e, f),
+            (9, 12, 4),
+            "use_sphere four-cut is the §5.4 plus-split"
+        );
 
         // Every inserted vert (4 rim midpoints + 1 inner) lands on the sphere.
         assert_eq!(geom.verts.len(), 5, "4 rim midpoints + 1 inner vert");
@@ -3198,7 +3354,11 @@ mod tests {
 
         // The four corners are untouched (still at radius √3 where they began).
         let corner = find_vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
-        assert!(mesh.vertex_position(corner).distance(Vec3::new(1.0, 1.0, 1.0)) < 1e-9);
+        assert!(
+            mesh.vertex_position(corner)
+                .distance(Vec3::new(1.0, 1.0, 1.0))
+                < 1e-9
+        );
     }
 
     #[test]
@@ -3215,7 +3375,10 @@ mod tests {
 
         let res = mesh.subdivide_edges(
             &edges,
-            SubdivideParams::default().cuts(2).smooth(SPHERE_R).use_sphere(true),
+            SubdivideParams::default()
+                .cuts(2)
+                .smooth(SPHERE_R)
+                .use_sphere(true),
         );
         let geom = match res {
             SubdivideResult::Ran(g) => g,
@@ -3224,7 +3387,11 @@ mod tests {
 
         // §9.5.1 3x3 grid topology is unchanged by use_sphere: V 16 / E 24 / F 9.
         let (v, e, f) = counts(&mesh);
-        assert_eq!((v, e, f), (16, 24, 9), "cuts=2 grid topology unchanged (§9.5.1)");
+        assert_eq!(
+            (v, e, f),
+            (16, 24, 9),
+            "cuts=2 grid topology unchanged (§9.5.1)"
+        );
 
         // 8 rim midpoints + 4 interior lattice nodes, all on the sphere.
         assert_eq!(geom.verts.len(), 12, "8 rim midpoints + 4 interior nodes");

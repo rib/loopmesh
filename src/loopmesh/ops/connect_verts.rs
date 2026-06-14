@@ -520,7 +520,11 @@ mod tests {
         // (`created` also reports the pre-existing run edges 0-1, 1-2 — that
         // count is pinned separately by `edges_out_reports_pre_existing_tagged_pair`.)
         mesh.connect_verts_out(&[v[0], v[1], v[2]], &[], false);
-        assert_eq!(mesh.face_keys().len(), 2, "one endpoint chord cuts the run off");
+        assert_eq!(
+            mesh.face_keys().len(),
+            2,
+            "one endpoint chord cuts the run off"
+        );
         assert!(mesh.query_edge_exists(v[0], v[2]).is_some());
         // Interior run corner 1 gained no chord (still perimeter degree 2).
         assert_eq!(mesh.vert_edge_keys(v[1]).len(), 2);
@@ -696,7 +700,11 @@ mod tests {
         // edge reported, not a freshly-created duplicate.
         assert_eq!(mesh.vert_keys().len(), 4, "no verts created or removed");
         assert_eq!(mesh.edge_keys().len(), 5, "diagonal reused, no edge added");
-        assert_eq!(mesh.face_keys().len(), 2, "quad consumed, duplicates killed");
+        assert_eq!(
+            mesh.face_keys().len(),
+            2,
+            "quad consumed, duplicates killed"
+        );
         assert_eq!(
             mesh.query_edge_exists(vk[0], vk[2]),
             Some(diagonal),

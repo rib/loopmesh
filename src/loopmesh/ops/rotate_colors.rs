@@ -72,8 +72,11 @@ impl LoopMesh {
                 } else {
                     (i + n - 1) % n
                 };
-                self.loop_attribs_mut()
-                    .set_vec4(color_layer, loop_keys[i].as_usize(), saved[source]);
+                self.loop_attribs_mut().set_vec4(
+                    color_layer,
+                    loop_keys[i].as_usize(),
+                    saved[source],
+                );
             }
         }
     }
@@ -147,7 +150,11 @@ mod tests {
         let after = read_corner_colors(&mesh, face, color);
         let n = before.len();
         for i in 0..n {
-            assert_eq!(after[i], before[(i + n - 1) % n], "corner {i} takes predecessor");
+            assert_eq!(
+                after[i],
+                before[(i + n - 1) % n],
+                "corner {i} takes predecessor"
+            );
         }
     }
 
@@ -248,7 +255,10 @@ mod tests {
             let after = read_corner_colors(&mesh, face, color);
             let n = before.len();
             for i in 0..n {
-                assert_ne!(after[i], before[i], "tri corner {i} moved (no fixed corner)");
+                assert_ne!(
+                    after[i], before[i],
+                    "tri corner {i} moved (no fixed corner)"
+                );
                 assert_eq!(after[i], before[(i + n - 1) % n]);
             }
         }

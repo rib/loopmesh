@@ -77,8 +77,7 @@ impl LoopMesh {
                 continue;
             }
 
-            let component_edges =
-                self.collapse_flood_component(seed, &marked, &mut consumed_edges);
+            let component_edges = self.collapse_flood_component(seed, &marked, &mut consumed_edges);
 
             let mut centroid = Vec3::ZERO;
             let mut endpoint_count = 0;
@@ -319,11 +318,7 @@ impl LoopMesh {
     /// max are taken independently per component, so the result is the centre of
     /// the value's axis-aligned bounding box and is generally not any loop's
     /// original value and not the mean.
-    fn collapse_uvs_snap_island(
-        &mut self,
-        layer: ElementAttributeKey,
-        island: &[LoopKey],
-    ) {
+    fn collapse_uvs_snap_island(&mut self, layer: ElementAttributeKey, island: &[LoopKey]) {
         let first = match island.first() {
             Some(&first) => first,
             None => return,
@@ -334,15 +329,16 @@ impl LoopMesh {
         for &loop_key in &island[1..] {
             let value = self.loop_value(layer, loop_key);
             for component in 0..4 {
-                lo.components[component] = lo.components[component].min(value.components[component]);
-                hi.components[component] = hi.components[component].max(value.components[component]);
+                lo.components[component] =
+                    lo.components[component].min(value.components[component]);
+                hi.components[component] =
+                    hi.components[component].max(value.components[component]);
             }
         }
 
         let mut mid = lo;
         for component in 0..4 {
-            mid.components[component] =
-                (lo.components[component] + hi.components[component]) * 0.5;
+            mid.components[component] = (lo.components[component] + hi.components[component]) * 0.5;
         }
 
         for &loop_key in island {
@@ -357,14 +353,20 @@ impl LoopMesh {
         let slot = loop_key.as_usize();
         match self.loop_attribs().storage_of(layer) {
             Some(AttributeStorage::Vec2(_)) => {
-                let v = self.loop_attribs().get_vec2(layer, slot).unwrap_or([0.0; 2]);
+                let v = self
+                    .loop_attribs()
+                    .get_vec2(layer, slot)
+                    .unwrap_or([0.0; 2]);
                 LoopBlendValue {
                     components: [v[0], v[1], 0.0, 0.0],
                     used: 2,
                 }
             }
             Some(AttributeStorage::Vec4(_)) => {
-                let v = self.loop_attribs().get_vec4(layer, slot).unwrap_or([0.0; 4]);
+                let v = self
+                    .loop_attribs()
+                    .get_vec4(layer, slot)
+                    .unwrap_or([0.0; 4]);
                 LoopBlendValue {
                     components: v,
                     used: 4,
@@ -658,8 +660,14 @@ impl LoopMesh {
     /// edge mask or value-equality gate.
     fn corners_at_vertex(&self, vertex: VertexKey) -> SmallVec<[LoopKey; 16]> {
         let mut corners: SmallVec<[LoopKey; 16]> = SmallVec::new();
-        for edge in self.vertex_disk_iter(vertex).collect::<SmallVec<[EdgeKey; 16]>>() {
-            for loop_key in self.edge_radial_iter(edge).collect::<SmallVec<[LoopKey; 8]>>() {
+        for edge in self
+            .vertex_disk_iter(vertex)
+            .collect::<SmallVec<[EdgeKey; 16]>>()
+        {
+            for loop_key in self
+                .edge_radial_iter(edge)
+                .collect::<SmallVec<[LoopKey; 8]>>()
+            {
                 if self.loop_vertex(loop_key) != vertex {
                     continue;
                 }
@@ -726,7 +734,8 @@ fn loop_layer_participates_in_collapse_blend(
 fn loop_values_equal(a: LoopBlendValue, b: LoopBlendValue) -> bool {
     const TOLERANCE: f32 = 1e-6;
     let count = a.used.max(b.used);
-    (0..count).all(|component| (a.components[component] - b.components[component]).abs() <= TOLERANCE)
+    (0..count)
+        .all(|component| (a.components[component] - b.components[component]).abs() <= TOLERANCE)
 }
 
 #[cfg(test)]
@@ -740,9 +749,7 @@ mod tests {
     /// Two quads sharing the vertical edge `{b, c}`. Returns the six verts and
     /// the shared edge handle. Mirrors the `two_quads_shared_edge` fixture
     /// shape the matrix rows lean on.
-    fn two_quads_shared_edge(
-        mesh: &mut LoopMesh,
-    ) -> ([VertexKey; 6], EdgeKey) {
+    fn two_quads_shared_edge(mesh: &mut LoopMesh) -> ([VertexKey; 6], EdgeKey) {
         let a0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
         let c = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
@@ -789,7 +796,11 @@ mod tests {
         assert_eq!(mesh.totvert(), 5, "the shared pair fused to one survivor");
         assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
-            assert_eq!(mesh.face_len(face), 3, "each quad lost the collapsed corner");
+            assert_eq!(
+                mesh.face_len(face),
+                3,
+                "each quad lost the collapsed corner"
+            );
         }
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         let survivor = if live.contains(&b) { b } else { c };
@@ -998,7 +1009,12 @@ mod tests {
     }
 
     /// Set the UV on every loop whose corner sits at `vert`.
-    fn set_uv_at_vert(mesh: &mut LoopMesh, uv: ElementAttributeKey, vert: VertexKey, value: [f32; 2]) {
+    fn set_uv_at_vert(
+        mesh: &mut LoopMesh,
+        uv: ElementAttributeKey,
+        vert: VertexKey,
+        value: [f32; 2],
+    ) {
         let slots: Vec<usize> = mesh
             .loop_keys()
             .into_iter()
@@ -1032,13 +1048,17 @@ mod tests {
         assert_eq!(loops.len(), 3, "triangle has three loops");
         let values = [[0.0, 0.2], [0.4, 0.1], [0.1, 0.9]];
         for (loop_key, value) in loops.iter().zip(values) {
-            mesh.loop_attribs_mut().set_vec2(uv, loop_key.as_usize(), value);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, loop_key.as_usize(), value);
         }
 
         mesh.collapse_uvs_snap_island(uv, &loops);
 
         for &loop_key in &loops {
-            let snapped = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+            let snapped = mesh
+                .loop_attribs()
+                .get_vec2(uv, loop_key.as_usize())
+                .unwrap();
             assert!(
                 (snapped[0] - 0.20).abs() < 1e-6 && (snapped[1] - 0.50).abs() < 1e-6,
                 "island snaps to bounding-box midpoint (0.20, 0.50), got {snapped:?}"
@@ -1070,7 +1090,8 @@ mod tests {
         for l in mesh.loop_keys() {
             let v = mesh.loop_vertex(l);
             let tag = if v == b { 10.0 } else { 20.0 };
-            mesh.loop_attribs_mut().set_vec3(attr3, l.as_usize(), [tag, tag, tag]);
+            mesh.loop_attribs_mut()
+                .set_vec3(attr3, l.as_usize(), [tag, tag, tag]);
         }
         let vec3_before: Vec<[f32; 3]> = mesh
             .loop_keys()
@@ -1138,7 +1159,10 @@ mod tests {
                     .iter()
                     .any(|e| (uvv[0] - e[0]).abs() < 1e-6 && (uvv[1] - e[1]).abs() < 1e-6);
                 let is_midpoint = (uvv[0] - 0.5).abs() < 1e-6 && (uvv[1] - 0.5).abs() < 1e-6;
-                assert!(is_endpoint, "uvs=false copies endpoints through, got {uvv:?}");
+                assert!(
+                    is_endpoint,
+                    "uvs=false copies endpoints through, got {uvv:?}"
+                );
                 assert!(!is_midpoint, "uvs=false must not produce a midpoint");
             }
         }
@@ -1165,8 +1189,11 @@ mod tests {
                     5.0
                 };
                 let seam_offset = face_index as f32 * 100.0;
-                mesh.loop_attribs_mut()
-                    .set_vec2(uv, l.as_usize(), [base + seam_offset, base + seam_offset]);
+                mesh.loop_attribs_mut().set_vec2(
+                    uv,
+                    l.as_usize(),
+                    [base + seam_offset, base + seam_offset],
+                );
             }
         }
 
@@ -1198,7 +1225,11 @@ mod tests {
 
         mesh.collapse(&[shared], true);
 
-        assert_eq!(mesh.totvert(), 5, "topology collapses regardless of the flag");
+        assert_eq!(
+            mesh.totvert(),
+            5,
+            "topology collapses regardless of the flag"
+        );
         assert_eq!(mesh.totface(), 2);
         mesh.validate_topology();
     }
@@ -1217,7 +1248,12 @@ mod tests {
     fn uv_snapshot(mesh: &LoopMesh, uv: ElementAttributeKey) -> Vec<(usize, [f32; 2])> {
         mesh.loop_keys()
             .into_iter()
-            .map(|l| (l.as_usize(), mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap()))
+            .map(|l| {
+                (
+                    l.as_usize(),
+                    mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -1244,7 +1280,8 @@ mod tests {
             for l in mesh.face_loop_keys(face) {
                 let v = mesh.loop_vertex(l);
                 if v == island_verts[0] || v == island_verts[1] {
-                    mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value_at(v));
+                    mesh.loop_attribs_mut()
+                        .set_vec2(uv, l.as_usize(), value_at(v));
                 }
             }
         }
@@ -1301,7 +1338,11 @@ mod tests {
         mesh.collapse_uvs(&[]);
         mesh.validate_topology();
 
-        assert_eq!(uv_snapshot(&mesh, uv), before, "empty input leaves UVs untouched");
+        assert_eq!(
+            uv_snapshot(&mesh, uv),
+            before,
+            "empty input leaves UVs untouched"
+        );
     }
 
     /// §1.1 / §3 — the same like-valued island, but the shared edge is *not* in
@@ -1317,7 +1358,9 @@ mod tests {
         let before = uv_snapshot(&mesh, uv);
 
         // Mark a boundary edge of the first quad ({a0, a1}), not the shared one.
-        let unrelated = mesh.query_edge_exists(a1, a0).expect("boundary edge present");
+        let unrelated = mesh
+            .query_edge_exists(a1, a0)
+            .expect("boundary edge present");
         mesh.collapse_uvs(&[unrelated]);
         mesh.validate_topology();
 
@@ -1330,8 +1373,12 @@ mod tests {
             let v = mesh.loop_vertex(l);
             if v == b || v == c {
                 let uvv = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
-                let snapped = (uvv[0] - midpoint[0]).abs() < 1e-6 && (uvv[1] - midpoint[1]).abs() < 1e-6;
-                assert!(!snapped, "unmarked shared edge must not flood corner, got {uvv:?}");
+                let snapped =
+                    (uvv[0] - midpoint[0]).abs() < 1e-6 && (uvv[1] - midpoint[1]).abs() < 1e-6;
+                assert!(
+                    !snapped,
+                    "unmarked shared edge must not flood corner, got {uvv:?}"
+                );
             }
         }
         // a0/a1 corners are not part of any cross-face island either (no marked
@@ -1358,7 +1405,8 @@ mod tests {
                 if v == b || v == c {
                     let base = face_index as f32 * 100.0;
                     let bump = if v == b { 0.0 } else { 2.0 };
-                    mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [base + bump, base + bump]);
+                    mesh.loop_attribs_mut()
+                        .set_vec2(uv, l.as_usize(), [base + bump, base + bump]);
                 }
             }
         }
@@ -1374,7 +1422,10 @@ mod tests {
                 if v == b || v == c {
                     let uvv = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
                     let cross_seam = (uvv[0] - 51.0).abs() < 10.0;
-                    assert!(!cross_seam, "seam preserved, no cross-seam average, got {uvv:?}");
+                    assert!(
+                        !cross_seam,
+                        "seam preserved, no cross-seam average, got {uvv:?}"
+                    );
                 }
             }
         }
@@ -1439,7 +1490,8 @@ mod tests {
             for l in mesh.face_loop_keys(face) {
                 let v = mesh.loop_vertex(l);
                 if v == b || v == c {
-                    mesh.loop_attribs_mut().set_vec4(color, l.as_usize(), value_at(v));
+                    mesh.loop_attribs_mut()
+                        .set_vec4(color, l.as_usize(), value_at(v));
                 }
             }
         }
@@ -1581,7 +1633,10 @@ mod tests {
         mesh.validate_topology();
 
         for got in corner_uvs_at(&mesh, uv, hub) {
-            assert!(approx_uv(got, expected), "hub corner snapped to {expected:?}, got {got:?}");
+            assert!(
+                approx_uv(got, expected),
+                "hub corner snapped to {expected:?}, got {got:?}"
+            );
         }
     }
 
@@ -1614,7 +1669,10 @@ mod tests {
         mesh.validate_topology();
 
         for got in corner_uvs_at(&mesh, uv, hub) {
-            assert!(approx_uv(got, [0.5, 0.5]), "midpoint (0.5,0.5), not mean, got {got:?}");
+            assert!(
+                approx_uv(got, [0.5, 0.5]),
+                "midpoint (0.5,0.5), not mean, got {got:?}"
+            );
         }
     }
 
@@ -1662,8 +1720,14 @@ mod tests {
         mesh.average_vert_facedata(&[a, b]);
         mesh.validate_topology();
 
-        for got in corner_uvs_at(&mesh, uv, a).into_iter().chain(corner_uvs_at(&mesh, uv, b)) {
-            assert!(approx_uv(got, global_mid), "global pool midpoint {global_mid:?}, got {got:?}");
+        for got in corner_uvs_at(&mesh, uv, a)
+            .into_iter()
+            .chain(corner_uvs_at(&mesh, uv, b))
+        {
+            assert!(
+                approx_uv(got, global_mid),
+                "global pool midpoint {global_mid:?}, got {got:?}"
+            );
             assert!(!approx_uv(got, per_vert_a), "not vert a's own midpoint");
             assert!(!approx_uv(got, per_vert_b), "not vert b's own midpoint");
         }
@@ -1741,7 +1805,10 @@ mod tests {
         // Every hub corner now reads the same value (seam welded to one midpoint).
         let got = corner_uvs_at(&mesh, uv, hub);
         for v in &got {
-            assert!(approx_uv(*v, [0.4, 0.4]), "seam flattened to midpoint, got {v:?}");
+            assert!(
+                approx_uv(*v, [0.4, 0.4]),
+                "seam flattened to midpoint, got {v:?}"
+            );
         }
     }
 
@@ -1768,7 +1835,8 @@ mod tests {
         let v0 = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         for (l, v) in hub_corners.iter().zip(v0) {
             mesh.loop_attribs_mut().set_vec2(uv0, l.as_usize(), v);
-            mesh.loop_attribs_mut().set_vec2(uv1, l.as_usize(), [v[0] + 10.0, v[1] + 10.0]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv1, l.as_usize(), [v[0] + 10.0, v[1] + 10.0]);
         }
 
         mesh.average_vert_facedata(&[hub]);
@@ -1777,9 +1845,16 @@ mod tests {
         for got in corner_uvs_at(&mesh, uv0, hub) {
             assert!(approx_uv(got, [0.5, 0.5]), "uv0 snapped, got {got:?}");
         }
-        for l in mesh.loop_keys().into_iter().filter(|&l| mesh.loop_vertex(l) == hub) {
+        for l in mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+        {
             let got = mesh.loop_attribs().get_vec2(uv1, l.as_usize()).unwrap();
-            assert!(approx_uv(got, [10.5, 10.5]), "uv1 snapped independently, got {got:?}");
+            assert!(
+                approx_uv(got, [10.5, 10.5]),
+                "uv1 snapped independently, got {got:?}"
+            );
         }
     }
 
@@ -1811,7 +1886,11 @@ mod tests {
         mesh.average_vert_facedata(&[hub]);
         mesh.validate_topology();
 
-        for l in mesh.loop_keys().into_iter().filter(|&l| mesh.loop_vertex(l) == hub) {
+        for l in mesh
+            .loop_keys()
+            .into_iter()
+            .filter(|&l| mesh.loop_vertex(l) == hub)
+        {
             let rgba = mesh.loop_attribs().get_vec4(color, l.as_usize()).unwrap();
             for k in 0..4 {
                 assert!(
@@ -1836,7 +1915,10 @@ mod tests {
         for l in mesh.loop_keys() {
             let v = mesh.loop_vertex(l);
             let value = if v == hub {
-                [0.1 * (l.as_usize() % 7) as f32, 0.1 * (l.as_usize() % 5) as f32]
+                [
+                    0.1 * (l.as_usize() % 7) as f32,
+                    0.1 * (l.as_usize() % 5) as f32,
+                ]
             } else {
                 [100.0 + l.as_usize() as f32, 200.0 + l.as_usize() as f32]
             };
@@ -1850,7 +1932,10 @@ mod tests {
 
         let rim_after: Vec<Vec<[f32; 2]>> =
             rim.iter().map(|&v| corner_uvs_at(&mesh, uv, v)).collect();
-        assert_eq!(rim_before, rim_after, "rim corners at unselected verts untouched (§3)");
+        assert_eq!(
+            rim_before, rim_after,
+            "rim corners at unselected verts untouched (§3)"
+        );
     }
 
     /// §5.2 / §7 — no has-math loop layer is a whole-operator no-op: nothing
@@ -1881,8 +1966,11 @@ mod tests {
         let uv = register_uv(&mut mesh);
         let (hub, _rim) = build_triangle_fan(&mut mesh, 6);
         for l in mesh.loop_keys() {
-            mesh.loop_attribs_mut()
-                .set_vec2(uv, l.as_usize(), [0.1 * l.as_usize() as f32, 0.2 * l.as_usize() as f32]);
+            mesh.loop_attribs_mut().set_vec2(
+                uv,
+                l.as_usize(),
+                [0.1 * l.as_usize() as f32, 0.2 * l.as_usize() as f32],
+            );
         }
         // An isolated vert with no incident face.
         let loose = mesh.create_vertex(Vec3::new(9.0, 9.0, 9.0));
@@ -1928,15 +2016,22 @@ mod tests {
         let uv = register_uv(&mut mesh);
         let (_hub, _rim) = build_triangle_fan(&mut mesh, 6);
         for l in mesh.loop_keys() {
-            mesh.loop_attribs_mut()
-                .set_vec2(uv, l.as_usize(), [0.3 * l.as_usize() as f32, 0.4 * l.as_usize() as f32]);
+            mesh.loop_attribs_mut().set_vec2(
+                uv,
+                l.as_usize(),
+                [0.3 * l.as_usize() as f32, 0.4 * l.as_usize() as f32],
+            );
         }
         let before = uv_snapshot(&mesh, uv);
 
         mesh.average_vert_facedata(&[]);
         mesh.validate_topology();
 
-        assert_eq!(uv_snapshot(&mesh, uv), before, "empty input leaves UVs untouched");
+        assert_eq!(
+            uv_snapshot(&mesh, uv),
+            before,
+            "empty input leaves UVs untouched"
+        );
     }
 
     // ---- pointmerge_facedata (POINTMERGE_FACEDATA.md) ----
@@ -1985,12 +2080,19 @@ mod tests {
             }
 
             let first = mesh.fan_first_loop(hub).expect("non-empty closed fan");
-            let value = mesh.loop_attribs().get_i32(int_layer, first.as_usize()).unwrap();
+            let value = mesh
+                .loop_attribs()
+                .get_i32(int_layer, first.as_usize())
+                .unwrap();
             assert_eq!(
                 value, 101,
                 "closed disk_fan({n}) first loop is build-face 1's hub corner (n-independent)"
             );
-            assert_eq!(mesh.loop_vertex(first), hub, "first loop is anchored at the hub");
+            assert_eq!(
+                mesh.loop_vertex(first),
+                hub,
+                "first loop is anchored at the hub"
+            );
         }
     }
 
@@ -1998,7 +2100,10 @@ mod tests {
     /// edge. Page `i` is wound `[0, 1, 2+i]`, so all `n` pages share the spine
     /// `0–1` (its radial cycle has valence `n`). Returns the two spine verts
     /// `(v0, v1)` and the page-tip verts. Built closing-edge-first per §6.5.
-    fn build_nonmanifold_book(mesh: &mut LoopMesh, n: usize) -> (VertexKey, VertexKey, Vec<VertexKey>) {
+    fn build_nonmanifold_book(
+        mesh: &mut LoopMesh,
+        n: usize,
+    ) -> (VertexKey, VertexKey, Vec<VertexKey>) {
         let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
         let tips: Vec<VertexKey> = (0..n)
@@ -2035,7 +2140,8 @@ mod tests {
         // order, so the k-th corner at a spine vert belongs to build-face k.
         let tag = |mesh: &mut LoopMesh, spine: VertexKey, base: i32| {
             for (k, l) in hub_corner_keys(mesh, spine).into_iter().enumerate() {
-                mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), base + k as i32);
+                mesh.loop_attribs_mut()
+                    .set_i32(int_layer, l.as_usize(), base + k as i32);
             }
         };
         tag(&mut mesh, v0, 0);
@@ -2047,9 +2153,18 @@ mod tests {
         assert_eq!(mesh.loop_vertex(first0), v0, "v0 first loop anchored at v0");
         assert_eq!(mesh.loop_vertex(first1), v1, "v1 first loop anchored at v1");
 
-        let val0 = mesh.loop_attribs().get_i32(int_layer, first0.as_usize()).unwrap();
-        let val1 = mesh.loop_attribs().get_i32(int_layer, first1.as_usize()).unwrap();
-        assert_eq!(val0, 0, "book spine v0 → build-face 0 (private spoke anchor)");
+        let val0 = mesh
+            .loop_attribs()
+            .get_i32(int_layer, first0.as_usize())
+            .unwrap();
+        let val1 = mesh
+            .loop_attribs()
+            .get_i32(int_layer, first1.as_usize())
+            .unwrap();
+        assert_eq!(
+            val0, 0,
+            "book spine v0 → build-face 0 (private spoke anchor)"
+        );
         assert_eq!(
             val1,
             1000 + (n as i32 - 1),
@@ -2077,7 +2192,10 @@ mod tests {
     fn fan_first_loop_isolated_vertex_is_none() {
         let mut mesh = LoopMesh::new();
         let loose = mesh.create_vertex(Vec3::ZERO);
-        assert!(mesh.fan_first_loop(loose).is_none(), "isolated vert: empty fan");
+        assert!(
+            mesh.fan_first_loop(loose).is_none(),
+            "isolated vert: empty fan"
+        );
     }
 
     /// §2 / §3 / §4 headline — the snap vertex's corners are reduced to their
@@ -2114,7 +2232,10 @@ mod tests {
         mesh.validate_topology();
 
         for got in corner_uvs_at(&mesh, uv, hub) {
-            assert!(approx_uv(got, mean), "hub corner carries the mean {mean:?}, got {got:?}");
+            assert!(
+                approx_uv(got, mean),
+                "hub corner carries the mean {mean:?}, got {got:?}"
+            );
         }
     }
 
@@ -2142,8 +2263,14 @@ mod tests {
         mesh.validate_topology();
 
         for got in corner_uvs_at(&mesh, uv, hub) {
-            assert!(approx_uv(got, [mean, mean]), "mean ({mean}, {mean}), got {got:?}");
-            assert!(!approx_uv(got, [0.5, 0.5]), "must not land the bbox midpoint");
+            assert!(
+                approx_uv(got, [mean, mean]),
+                "mean ({mean}, {mean}), got {got:?}"
+            );
+            assert!(
+                !approx_uv(got, [0.5, 0.5]),
+                "must not land the bbox midpoint"
+            );
         }
     }
 
@@ -2163,8 +2290,11 @@ mod tests {
         let set_corners = |mesh: &mut LoopMesh, vert: VertexKey, base: [f32; 2]| {
             let corners = hub_corner_keys(mesh, vert);
             for (k, l) in corners.iter().enumerate() {
-                mesh.loop_attribs_mut()
-                    .set_vec2(uv, l.as_usize(), [base[0] + 0.1 * k as f32, base[1] + 0.2 * k as f32]);
+                mesh.loop_attribs_mut().set_vec2(
+                    uv,
+                    l.as_usize(),
+                    [base[0] + 0.1 * k as f32, base[1] + 0.2 * k as f32],
+                );
             }
         };
         set_corners(&mut mesh, snap, [0.0, 0.0]);
@@ -2179,8 +2309,14 @@ mod tests {
         mesh.validate_topology();
 
         for got in corner_uvs_at(&mesh, uv, target) {
-            assert!(approx_uv(got, snap_mean), "target carries the SNAP's mean, got {got:?}");
-            assert!(!approx_uv(got, target_own_mean), "must not average the target pool");
+            assert!(
+                approx_uv(got, snap_mean),
+                "target carries the SNAP's mean, got {got:?}"
+            );
+            assert!(
+                !approx_uv(got, target_own_mean),
+                "must not average the target pool"
+            );
         }
     }
 
@@ -2209,10 +2345,15 @@ mod tests {
         // its own corners, so the hub loop created during face `i`'s
         // `face_create` is the `i`-th hub loop in creation (slot) order.
         let hub_corners = hub_corner_keys(&mesh, hub);
-        assert_eq!(hub_corners.len(), n, "closed fan has one hub corner per face");
+        assert_eq!(
+            hub_corners.len(),
+            n,
+            "closed fan has one hub corner per face"
+        );
         for (face_index, l) in hub_corners.iter().enumerate() {
             let t = face_index as f32 / n as f32;
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.2 + 0.6 * t, 0.3]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.2 + 0.6 * t, 0.3]);
             mesh.loop_attribs_mut()
                 .set_i32(int_layer, l.as_usize(), 100 + face_index as i32);
         }
@@ -2220,7 +2361,8 @@ mod tests {
         // broadcast would leave them visibly distinct.
         for (i, l) in mesh.loop_keys().into_iter().enumerate() {
             if mesh.loop_vertex(l) != hub {
-                mesh.loop_attribs_mut().set_i32(int_layer, l.as_usize(), 200 + i as i32);
+                mesh.loop_attribs_mut()
+                    .set_i32(int_layer, l.as_usize(), 200 + i as i32);
             }
         }
 
@@ -2251,7 +2393,9 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                mesh.loop_attribs().get_i32(int_layer, l.as_usize()).unwrap(),
+                mesh.loop_attribs()
+                    .get_i32(int_layer, l.as_usize())
+                    .unwrap(),
                 first_int,
                 "the whole-block copy flattens the integer layer to the §6.5 \
                  fan-first corner's value"
@@ -2321,7 +2465,11 @@ mod tests {
         mesh.pointmerge_facedata(&cluster, loose);
         mesh.validate_topology();
 
-        assert_eq!(uv_snapshot(&mesh, uv), before, "loose snap vertex is a no-op");
+        assert_eq!(
+            uv_snapshot(&mesh, uv),
+            before,
+            "loose snap vertex is a no-op"
+        );
     }
 
     /// §7 single-corner snap (`tot == 1`) — phase one is a pass-through and the
@@ -2335,15 +2483,22 @@ mod tests {
         let c = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
         let verts = [a, b, c];
         let edges: Vec<EdgeKey> = (0..3)
-            .map(|k| mesh.create_edge([verts[k], verts[(k + 1) % 3]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|k| {
+                mesh.create_edge(
+                    [verts[k], verts[(k + 1) % 3]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect();
         mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
 
         let snap_corner = hub_corner_keys(&mesh, a)[0];
         let snap_uv = [0.1, 0.2];
-        mesh.loop_attribs_mut().set_vec2(uv, snap_corner.as_usize(), snap_uv);
+        mesh.loop_attribs_mut()
+            .set_vec2(uv, snap_corner.as_usize(), snap_uv);
         for l in hub_corner_keys(&mesh, b) {
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.7, 0.3]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.7, 0.3]);
         }
 
         mesh.pointmerge_facedata(&[b], a);
@@ -2351,11 +2506,16 @@ mod tests {
 
         // Pass-through: the snap corner keeps its value; the target receives it.
         assert!(approx_uv(
-            mesh.loop_attribs().get_vec2(uv, snap_corner.as_usize()).unwrap(),
+            mesh.loop_attribs()
+                .get_vec2(uv, snap_corner.as_usize())
+                .unwrap(),
             snap_uv
         ));
         for got in corner_uvs_at(&mesh, uv, b) {
-            assert!(approx_uv(got, snap_uv), "target receives the pass-through value, got {got:?}");
+            assert!(
+                approx_uv(got, snap_uv),
+                "target receives the pass-through value, got {got:?}"
+            );
         }
     }
 
@@ -2379,7 +2539,8 @@ mod tests {
             mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), v);
         }
         for l in hub_corner_keys(&mesh, target) {
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [5.0, 6.0]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [5.0, 6.0]);
         }
 
         let mean = [
@@ -2400,11 +2561,17 @@ mod tests {
             .map(|l| mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap())
             .collect();
         let mean_count = after.iter().filter(|got| approx_uv(**got, mean)).count();
-        assert_eq!(mean_count, 1, "exactly one snap corner holds the mean (the first)");
+        assert_eq!(
+            mean_count, 1,
+            "exactly one snap corner holds the mean (the first)"
+        );
         let transient_present = snap_values
             .iter()
             .any(|&v| after.iter().any(|got| approx_uv(*got, transient(v))));
-        assert!(transient_present, "the non-first snap corner keeps its value/tot fraction (§3.2)");
+        assert!(
+            transient_present,
+            "the non-first snap corner keeps its value/tot fraction (§3.2)"
+        );
         // The non-first corner must NOT have been restored to the mean — that is
         // the divergence from the overlap regime (§5).
         assert!(
@@ -2414,7 +2581,10 @@ mod tests {
 
         // The target received the mean.
         for got in corner_uvs_at(&mesh, uv, target) {
-            assert!(approx_uv(got, mean), "target receives the mean, got {got:?}");
+            assert!(
+                approx_uv(got, mean),
+                "target receives the mean, got {got:?}"
+            );
         }
     }
 
@@ -2437,7 +2607,10 @@ mod tests {
         mesh.pointmerge_facedata(&cluster, hub);
         let twice = uv_snapshot(&mesh, uv);
 
-        assert_eq!(once, twice, "second application reproduces the first (idempotent)");
+        assert_eq!(
+            once, twice,
+            "second application reproduces the first (idempotent)"
+        );
         mesh.validate_topology();
     }
 }

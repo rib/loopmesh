@@ -73,21 +73,17 @@ impl LoopMesh {
                 QuadMethod::Fixed => false,
                 QuadMethod::Alternate => true,
                 QuadMethod::ShortEdge => {
-                    let d_02_sq = (self.vertex_position(verts[2])
-                        - self.vertex_position(verts[0]))
-                    .length_squared();
-                    let d_13_sq = (self.vertex_position(verts[3])
-                        - self.vertex_position(verts[1]))
-                    .length_squared();
+                    let d_02_sq = (self.vertex_position(verts[2]) - self.vertex_position(verts[0]))
+                        .length_squared();
+                    let d_13_sq = (self.vertex_position(verts[3]) - self.vertex_position(verts[1]))
+                        .length_squared();
                     d_13_sq <= d_02_sq
                 }
                 QuadMethod::LongEdge => {
-                    let d_02_sq = (self.vertex_position(verts[2])
-                        - self.vertex_position(verts[0]))
-                    .length_squared();
-                    let d_13_sq = (self.vertex_position(verts[3])
-                        - self.vertex_position(verts[1]))
-                    .length_squared();
+                    let d_02_sq = (self.vertex_position(verts[2]) - self.vertex_position(verts[0]))
+                        .length_squared();
+                    let d_13_sq = (self.vertex_position(verts[3]) - self.vertex_position(verts[1]))
+                        .length_squared();
                     d_13_sq >= d_02_sq
                 }
                 QuadMethod::Beauty => {

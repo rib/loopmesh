@@ -77,13 +77,24 @@ mod tests {
 
         mesh.remove_doubles(&verts, 0.5, false);
 
-        assert_eq!(mesh.totvert(), 2, "the triple collapsed to one survivor plus the far vert");
+        assert_eq!(
+            mesh.totvert(),
+            2,
+            "the triple collapsed to one survivor plus the far vert"
+        );
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&far), "the far vert is untouched");
         // Exactly one cluster member survives.
-        let surviving_cluster: Vec<VertexKey> =
-            cluster.iter().copied().filter(|v| live.contains(v)).collect();
-        assert_eq!(surviving_cluster.len(), 1, "exactly one cluster member survives");
+        let surviving_cluster: Vec<VertexKey> = cluster
+            .iter()
+            .copied()
+            .filter(|v| live.contains(v))
+            .collect();
+        assert_eq!(
+            surviving_cluster.len(),
+            1,
+            "exactly one cluster member survives"
+        );
         mesh.validate_topology();
     }
 
@@ -98,7 +109,11 @@ mod tests {
         let mut verts = cluster.clone();
         verts.push(far);
         fired.remove_doubles(&verts, 0.5, false);
-        assert_eq!(fired.totvert(), 2, "dist above the spread merges the cluster");
+        assert_eq!(
+            fired.totvert(),
+            2,
+            "dist above the spread merges the cluster"
+        );
 
         // Blocks.
         let mut blocked = LoopMesh::new();
@@ -169,10 +184,17 @@ mod tests {
         mesh.remove_doubles(&[a0, b, c, a1, d0, d1], 0.1, false);
 
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&b) || !live.contains(&c), "one of the shared endpoints is gone");
+        assert!(
+            !live.contains(&b) || !live.contains(&c),
+            "one of the shared endpoints is gone"
+        );
         assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
-            assert_eq!(mesh.face_len(face), 3, "each quad lost the collapsed corner");
+            assert_eq!(
+                mesh.face_len(face),
+                3,
+                "each quad lost the collapsed corner"
+            );
         }
         mesh.validate_topology();
     }
@@ -196,15 +218,27 @@ mod tests {
         let mut spatial = LoopMesh::new();
         let verts_s = build(&mut spatial);
         spatial.remove_doubles(&verts_s, 0.5, false);
-        assert_eq!(spatial.totvert(), 3, "spatial merges the coincident disconnected pair");
+        assert_eq!(
+            spatial.totvert(),
+            3,
+            "spatial merges the coincident disconnected pair"
+        );
         spatial.validate_topology();
 
         let mut connected = LoopMesh::new();
         let verts_c = build(&mut connected);
-        let before = (connected.totvert(), connected.totedge(), connected.totface());
+        let before = (
+            connected.totvert(),
+            connected.totedge(),
+            connected.totface(),
+        );
         connected.remove_doubles(&verts_c, 0.5, true);
         assert_eq!(
-            (connected.totvert(), connected.totedge(), connected.totface()),
+            (
+                connected.totvert(),
+                connected.totedge(),
+                connected.totface()
+            ),
             before,
             "connected leaves the disconnected pair apart: no-op"
         );
@@ -261,7 +295,10 @@ mod tests {
         // No special rejection: the cleanup runs. a0 and b0 fuse to one vert;
         // each wing triangle keeps its three distinct corners.
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&a0) || !live.contains(&b0), "the near pair fused");
+        assert!(
+            !live.contains(&a0) || !live.contains(&b0),
+            "the near pair fused"
+        );
         assert_eq!(mesh.totvert(), 4, "a0/b0 fused: hub + survivor + a1 + b1");
         assert_eq!(mesh.totface(), 2, "both wings survive as triangles");
         mesh.validate_topology();

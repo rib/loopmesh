@@ -117,7 +117,11 @@ impl LoopMesh {
             // §3.2 — fold the source's selection onto the target; the hidden
             // bit is intentionally not force-merged so welding a visible vert
             // onto a hidden one does not reveal the result.
-            if self.vertices.get(source).eflags.contains(ElementFlags::SELECTED)
+            if self
+                .vertices
+                .get(source)
+                .eflags
+                .contains(ElementFlags::SELECTED)
                 && self.vertices.try_get(target).is_some()
             {
                 self.vertices.get_mut(target).eflags |= ElementFlags::SELECTED;
@@ -238,7 +242,8 @@ impl LoopMesh {
         // appended so the same walk re-visits them (§5.1.1). A cursor advances
         // through the list rather than `pop`ping so the order matches a single
         // forward walk over the growing edge set.
-        let mut pending: SmallVec<[EdgeKey; 32]> = collect_iter::<_, 32>(self, MeshEdges::default());
+        let mut pending: SmallVec<[EdgeKey; 32]> =
+            collect_iter::<_, 32>(self, MeshEdges::default());
         let mut cursor = 0;
         while cursor < pending.len() {
             let edge = pending[cursor];
@@ -270,7 +275,8 @@ impl LoopMesh {
                 Some(existing) => existing,
                 None => {
                     let created = self.create_edge([v1_sub, v2_sub], EdgeCreateFlags::NONE);
-                    self.edge_attribs.copy_into(created.as_usize(), edge.as_usize());
+                    self.edge_attribs
+                        .copy_into(created.as_usize(), edge.as_usize());
                     // §5.1.1 — re-visit the created edge: if either substituted
                     // endpoint is itself a source, the rule fires again and
                     // chain-flattens the surviving edge forward.
@@ -341,7 +347,8 @@ impl LoopMesh {
             // §5.3 / §5.4 — create the replacement, seeding per-face and
             // per-loop customdata from the original face.
             let new_face = self.face_create(&ring.verts, &ring.edges, FaceCreateFlags::NONE);
-            self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+            self.face_attribs
+                .copy_into(new_face.as_usize(), face.as_usize());
             if !self.loop_attribs.is_empty() {
                 self.weld_copy_surviving_loop_cd(new_face, &ring.source_loops);
             }
@@ -576,7 +583,10 @@ mod tests {
 
         mesh.weld_verts(&[], false);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         mesh.validate_topology();
     }
 
@@ -593,10 +603,19 @@ mod tests {
         assert_eq!(mesh.totvert(), 2, "source corner removed");
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&verts[0]), "source vert gone");
-        assert!(live.contains(&verts[1]) && live.contains(&verts[2]), "survivors stay");
-        assert_eq!(mesh.totedge(), 1, "one surviving edge between the survivors");
-        let endpoints: std::collections::HashSet<VertexKey> =
-            mesh.edge_vert_keys(mesh.edge_keys()[0]).into_iter().collect();
+        assert!(
+            live.contains(&verts[1]) && live.contains(&verts[2]),
+            "survivors stay"
+        );
+        assert_eq!(
+            mesh.totedge(),
+            1,
+            "one surviving edge between the survivors"
+        );
+        let endpoints: std::collections::HashSet<VertexKey> = mesh
+            .edge_vert_keys(mesh.edge_keys()[0])
+            .into_iter()
+            .collect();
         assert_eq!(endpoints, [verts[1], verts[2]].into_iter().collect());
         mesh.validate_topology();
     }
@@ -631,7 +650,11 @@ mod tests {
         // Corners 0 and 3 are non-adjacent on the pentagon.
         mesh.weld_verts(&[(verts[0], verts[3])], false);
 
-        assert_eq!(mesh.totface(), 1, "exactly one sub-face survives the pentagon weld");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "exactly one sub-face survives the pentagon weld"
+        );
         let surviving = mesh.face_keys()[0];
         assert_eq!(mesh.face_len(surviving), 3, "the survivor is a triangle");
         let ring: std::collections::HashSet<VertexKey> =
@@ -680,13 +703,20 @@ mod tests {
         assert!(live.contains(&c), "target survives");
         assert_eq!(mesh.totface(), 2, "both quads survive as triangles");
         for face in mesh.face_keys() {
-            assert_eq!(mesh.face_len(face), 3, "each quad lost the collapsed corner");
+            assert_eq!(
+                mesh.face_len(face),
+                3,
+                "each quad lost the collapsed corner"
+            );
         }
         // The collapsed shared edge is gone: no surviving edge touches the dead
         // vert `b`, and no edge is a self-loop at `c`.
         for edge in mesh.edge_keys() {
             let [e0, e1] = mesh.edge_vert_keys(edge);
-            assert!(e0 != b && e1 != b, "no surviving edge touches the welded vert");
+            assert!(
+                e0 != b && e1 != b,
+                "no surviving edge touches the welded vert"
+            );
             assert!(e0 != e1, "no surviving edge is a collapsed self-loop");
         }
         mesh.validate_topology();
@@ -824,7 +854,11 @@ mod tests {
         let survivor = mesh.face_keys()[0];
         let ring: std::collections::HashSet<VertexKey> =
             mesh.face_vert_keys(survivor).into_iter().collect();
-        assert_eq!(ring, [v0, v1, v3].into_iter().collect(), "the surviving face is (0,1,3)");
+        assert_eq!(
+            ring,
+            [v0, v1, v3].into_iter().collect(),
+            "the surviving face is (0,1,3)"
+        );
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v2), "welded vert gone");
         mesh.validate_topology();
@@ -869,19 +903,34 @@ mod tests {
         // Chained map: 1 is both the value of 0's entry and the key of its own.
         mesh.weld_verts(&[(v0, v1), (v1, v2)], false);
 
-        assert_eq!(mesh.totface(), 0, "the rebuilt face leans on marked geometry and is reaped");
+        assert_eq!(
+            mesh.totface(),
+            0,
+            "the rebuilt face leans on marked geometry and is reaped"
+        );
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert_eq!(mesh.totvert(), 3, "verts 0 and 1 are both removed");
-        assert!(!live.contains(&v0) && !live.contains(&v1), "both chain sources gone");
+        assert!(
+            !live.contains(&v0) && !live.contains(&v1),
+            "both chain sources gone"
+        );
         assert!(
             live.contains(&v2) && live.contains(&v3) && live.contains(&v4),
             "the non-source verts survive"
         );
 
-        assert_eq!(mesh.totedge(), 3, "three surviving edges incl. the chain-flatten");
+        assert_eq!(
+            mesh.totedge(),
+            3,
+            "three surviving edges incl. the chain-flatten"
+        );
         let norm = |a: VertexKey, b: VertexKey| {
-            if a.as_usize() <= b.as_usize() { [a, b] } else { [b, a] }
+            if a.as_usize() <= b.as_usize() {
+                [a, b]
+            } else {
+                [b, a]
+            }
         };
         let surviving: std::collections::HashSet<[VertexKey; 2]> = mesh
             .edge_keys()
@@ -891,8 +940,14 @@ mod tests {
                 norm(a, b)
             })
             .collect();
-        assert!(surviving.contains(&norm(v2, v3)), "ring edge {{2,3}} survives");
-        assert!(surviving.contains(&norm(v3, v4)), "ring edge {{3,4}} survives");
+        assert!(
+            surviving.contains(&norm(v2, v3)),
+            "ring edge {{2,3}} survives"
+        );
+        assert!(
+            surviving.contains(&norm(v3, v4)),
+            "ring edge {{3,4}} survives"
+        );
         assert!(
             surviving.contains(&norm(v4, v2)),
             "the chain-flattened edge {{4,2}} survives — {{4,0}} re-pointed 0->1 then 1->2"
@@ -916,9 +971,17 @@ mod tests {
 
         mesh.weld_verts(&[(v0, v1)], false);
 
-        assert_eq!(mesh.totface(), 1, "the single-entry weld keeps a closed-ring face");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "the single-entry weld keeps a closed-ring face"
+        );
         let survivor = mesh.face_keys()[0];
-        assert_eq!(mesh.face_len(survivor), 4, "the survivor is the (1,2,3,4) quad");
+        assert_eq!(
+            mesh.face_len(survivor),
+            4,
+            "the survivor is the (1,2,3,4) quad"
+        );
         let ring: std::collections::HashSet<VertexKey> =
             mesh.face_vert_keys(survivor).into_iter().collect();
         assert_eq!(
@@ -947,7 +1010,11 @@ mod tests {
         mesh.weld_verts(&[(source, target)], false);
 
         assert_eq!(mesh.totvert(), 2, "source removed");
-        assert_eq!(mesh.totedge(), 1, "the wire re-points onto the (a, target) edge");
+        assert_eq!(
+            mesh.totedge(),
+            1,
+            "the wire re-points onto the (a, target) edge"
+        );
         assert!(
             mesh.query_edge_exists(a, target).is_some(),
             "the re-pointed edge {{a, target}} exists"

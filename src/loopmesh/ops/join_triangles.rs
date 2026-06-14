@@ -221,10 +221,7 @@ impl LoopMesh {
         let layer = match self.edge_attribs().find(&key) {
             Some(layer) => layer,
             None => self
-                .register_edge_attribute(ElementAttributeDesc::numeric(
-                    key,
-                    AttrType::I32,
-                ))
+                .register_edge_attribute(ElementAttributeDesc::numeric(key, AttrType::I32))
                 .expect("I32x1 is a supported edge attribute format"),
         };
         self.edge_attribs_mut()
@@ -258,10 +255,7 @@ impl LoopMesh {
         let layer = match self.edge_attribs().find(&key) {
             Some(layer) => layer,
             None => self
-                .register_edge_attribute(ElementAttributeDesc::numeric(
-                    key,
-                    AttrType::I32,
-                ))
+                .register_edge_attribute(ElementAttributeDesc::numeric(key, AttrType::I32))
                 .expect("I32x1 is a supported edge attribute format"),
         };
         self.edge_attribs_mut()
@@ -293,13 +287,11 @@ impl LoopMesh {
         let layer = match self.face_attribs().find(&key) {
             Some(layer) => layer,
             None => self
-                .register_face_attribute(ElementAttributeDesc::numeric(
-                    key,
-                    AttrType::I32,
-                ))
+                .register_face_attribute(ElementAttributeDesc::numeric(key, AttrType::I32))
                 .expect("I32x1 is a supported face attribute format"),
         };
-        self.face_attribs_mut().set_i32(layer, face.as_usize(), index);
+        self.face_attribs_mut()
+            .set_i32(layer, face.as_usize(), index);
     }
 
     /// Merge adjacent input triangles back into quads.
@@ -423,8 +415,7 @@ impl LoopMesh {
             if influence_active {
                 match current_error.get(&candidate.edge) {
                     Some(&(error, order))
-                        if error == candidate.error
-                            && order == candidate.insertion_order => {}
+                        if error == candidate.error && order == candidate.insertion_order => {}
                     _ => continue,
                 }
             }
@@ -436,9 +427,8 @@ impl LoopMesh {
                     // a clean merge propagates the grid front. Unlike the §6.1
                     // seed pass, the post-merge re-score uses the quad's *raw*
                     // §5.1 error (no over-prioritisation scaling).
-                    let quad_error = join_triangles_quad_error(
-                        &self.join_triangles_quad_corners_of_face(quad),
-                    );
+                    let quad_error =
+                        join_triangles_quad_error(&self.join_triangles_quad_corners_of_face(quad));
                     self.join_triangles_reprioritise_quad(
                         quad,
                         quad_error,
@@ -526,13 +516,15 @@ impl LoopMesh {
         };
 
         let seam_layer = if params.cmp_seam {
-            self.edge_attribs().find(&AttributeKey::custom(SEAM_ATTRIBUTE))
+            self.edge_attribs()
+                .find(&AttributeKey::custom(SEAM_ATTRIBUTE))
         } else {
             None
         };
 
         let sharp_layer = if params.cmp_sharp {
-            self.edge_attribs().find(&AttributeKey::custom(SHARP_ATTRIBUTE))
+            self.edge_attribs()
+                .find(&AttributeKey::custom(SHARP_ATTRIBUTE))
         } else {
             None
         };
@@ -585,7 +577,11 @@ impl LoopMesh {
     /// read off the radial-edge structure without performing the merge. The
     /// quad winds: `edge.start → opposite-tri apex → edge.end → own-tri apex`.
     fn join_triangles_quad_corners(&self, edge: EdgeKey) -> [Vec3; 4] {
-        let loop_a = self.edges.get(edge).radial_link.expect("manifold edge has a loop");
+        let loop_a = self
+            .edges
+            .get(edge)
+            .radial_link
+            .expect("manifold edge has a loop");
         let loop_op = self.loop_radial_next(loop_a);
 
         let start = self.loops.get(loop_a).vertex;
@@ -614,7 +610,8 @@ impl LoopMesh {
         if delimit.cmp_seam && self.join_triangles_edge_is_seam_cached(delimit.seam_layer, edge) {
             return true;
         }
-        if delimit.cmp_sharp && self.join_triangles_edge_is_sharp_cached(delimit.sharp_layer, edge) {
+        if delimit.cmp_sharp && self.join_triangles_edge_is_sharp_cached(delimit.sharp_layer, edge)
+        {
             return true;
         }
         if delimit.cmp_materials
@@ -625,7 +622,8 @@ impl LoopMesh {
         }
 
         // §4.2 — customdata-island gates.
-        if delimit.cmp_uvs && !self.join_triangles_edge_loop_cd_contiguous(edge, &delimit.uv_layers) {
+        if delimit.cmp_uvs && !self.join_triangles_edge_loop_cd_contiguous(edge, &delimit.uv_layers)
+        {
             return true;
         }
         if delimit.cmp_vcols
@@ -763,7 +761,12 @@ impl LoopMesh {
         edge: EdgeKey,
     ) -> bool {
         match seam_layer {
-            Some(layer) => self.edge_attribs().get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            Some(layer) => {
+                self.edge_attribs()
+                    .get_i32(layer, edge.as_usize())
+                    .unwrap_or(0)
+                    != 0
+            }
             None => false,
         }
     }
@@ -782,7 +785,12 @@ impl LoopMesh {
         edge: EdgeKey,
     ) -> bool {
         match sharp_layer {
-            Some(layer) => self.edge_attribs().get_i32(layer, edge.as_usize()).unwrap_or(0) != 0,
+            Some(layer) => {
+                self.edge_attribs()
+                    .get_i32(layer, edge.as_usize())
+                    .unwrap_or(0)
+                    != 0
+            }
             None => false,
         }
     }
@@ -800,7 +808,10 @@ impl LoopMesh {
         face: FaceKey,
     ) -> i32 {
         match material_layer {
-            Some(layer) => self.face_attribs().get_i32(layer, face.as_usize()).unwrap_or(0),
+            Some(layer) => self
+                .face_attribs()
+                .get_i32(layer, face.as_usize())
+                .unwrap_or(0),
             None => 0,
         }
     }
@@ -1268,7 +1279,10 @@ mod tests {
             },
         );
 
-        assert!(result.joined.is_empty(), "the material boundary blocks the merge");
+        assert!(
+            result.joined.is_empty(),
+            "the material boundary blocks the merge"
+        );
         assert_eq!(mesh.totface(), 2, "both triangles survive");
         assert_eq!(mesh.face_len(lower), 3);
         assert_eq!(mesh.face_len(upper), 3);
@@ -1300,7 +1314,11 @@ mod tests {
             "explicit 5 vs default 0 is a material boundary"
         );
         assert_eq!(mesh.totface(), 2, "both triangles survive");
-        assert_eq!(mesh.face_material_index(upper), 0, "unset face reads default 0");
+        assert_eq!(
+            mesh.face_material_index(upper),
+            0,
+            "unset face reads default 0"
+        );
         mesh.validate_topology();
     }
 
@@ -1324,7 +1342,11 @@ mod tests {
                 },
             );
 
-            assert_eq!(result.joined.len(), 1, "equal materials merge (assigned={assign_equal})");
+            assert_eq!(
+                result.joined.len(),
+                1,
+                "equal materials merge (assigned={assign_equal})"
+            );
             assert_eq!(mesh.totface(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
@@ -1342,7 +1364,11 @@ mod tests {
 
         let result = mesh.join_triangles(&[lower, upper], JoinTrianglesParams::default());
 
-        assert_eq!(result.joined.len(), 1, "material difference ignored when gate is off");
+        assert_eq!(
+            result.joined.len(),
+            1,
+            "material difference ignored when gate is off"
+        );
         assert_eq!(mesh.totface(), 1);
         assert_eq!(mesh.face_len(result.joined[0]), 4);
         mesh.validate_topology();
@@ -1373,7 +1399,10 @@ mod tests {
         mesh.set_edge_seam(perimeter, false);
 
         assert!(mesh.edge_seam(diagonal));
-        assert!(!mesh.edge_seam(perimeter), "explicit false reads as no seam");
+        assert!(
+            !mesh.edge_seam(perimeter),
+            "explicit false reads as no seam"
+        );
 
         // Clearing a previously-set seam round-trips back to false.
         mesh.set_edge_seam(diagonal, false);
@@ -1424,7 +1453,11 @@ mod tests {
                 },
             );
 
-            assert_eq!(result.joined.len(), 1, "no seam merges (assigned={assign_false})");
+            assert_eq!(
+                result.joined.len(),
+                1,
+                "no seam merges (assigned={assign_false})"
+            );
             assert_eq!(mesh.totface(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
@@ -1467,7 +1500,10 @@ mod tests {
         mesh.set_edge_sharp(perimeter, false);
 
         assert!(mesh.edge_sharp(diagonal));
-        assert!(!mesh.edge_sharp(perimeter), "explicit false reads as smooth");
+        assert!(
+            !mesh.edge_sharp(perimeter),
+            "explicit false reads as smooth"
+        );
 
         // Clearing a previously-set sharp edge round-trips back to smooth.
         mesh.set_edge_sharp(diagonal, false);
@@ -1520,7 +1556,11 @@ mod tests {
                 },
             );
 
-            assert_eq!(result.joined.len(), 1, "smooth merges (assigned={assign_smooth})");
+            assert_eq!(
+                result.joined.len(),
+                1,
+                "smooth merges (assigned={assign_smooth})"
+            );
             assert_eq!(mesh.totface(), 1);
             assert_eq!(mesh.face_len(result.joined[0]), 4);
             mesh.validate_topology();
@@ -1589,7 +1629,11 @@ mod tests {
         );
 
         assert_eq!(result.joined.len(), 1, "the tri-pair merges");
-        assert_eq!(result.unmerged, vec![lone], "the lone triangle survives un-merged");
+        assert_eq!(
+            result.unmerged,
+            vec![lone],
+            "the lone triangle survives un-merged"
+        );
         assert_eq!(mesh.totface(), 2, "merged quad + surviving triangle");
         assert_eq!(mesh.face_len(lone), 3);
         mesh.validate_topology();
@@ -1695,13 +1739,20 @@ mod tests {
         let eq1 = mesh.create_edge([q1, q2], EdgeCreateFlags::NO_DUPLICATE);
         let eq2 = mesh.create_edge([q2, q3], EdgeCreateFlags::NO_DUPLICATE);
         let eq3 = mesh.create_edge([q3, q0], EdgeCreateFlags::NO_DUPLICATE);
-        let quad = mesh.face_create(&[q0, q1, q2, q3], &[eq0, eq1, eq2, eq3], FaceCreateFlags::NONE);
+        let quad = mesh.face_create(
+            &[q0, q1, q2, q3],
+            &[eq0, eq1, eq2, eq3],
+            FaceCreateFlags::NONE,
+        );
 
         let result = mesh.join_triangles(&[lower, upper, quad], JoinTrianglesParams::default());
 
         assert_eq!(result.joined.len(), 1, "only the tri-pair merges");
         assert_eq!(mesh.totface(), 2, "merged quad + the untouched input quad");
-        assert!(mesh.faces.try_get(quad).is_some(), "the input quad survives");
+        assert!(
+            mesh.faces.try_get(quad).is_some(),
+            "the input quad survives"
+        );
         assert_eq!(mesh.face_len(quad), 4);
         mesh.validate_topology();
     }
@@ -1732,7 +1783,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(blocked_result.joined.is_empty(), "tight fold gate blocks merge");
+        assert!(
+            blocked_result.joined.is_empty(),
+            "tight fold gate blocks merge"
+        );
         assert_eq!(blocked.totface(), 2, "both triangles survive");
         blocked.validate_topology();
 
@@ -1769,14 +1823,21 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(blocked_result.joined.is_empty(), "tight shape gate rejects sliver");
+        assert!(
+            blocked_result.joined.is_empty(),
+            "tight shape gate rejects sliver"
+        );
         assert_eq!(blocked.totface(), 2);
         blocked.validate_topology();
 
         let mut allowed = LoopMesh::new();
         let (l, u) = build(&mut allowed);
         let allowed_result = allowed.join_triangles(&[l, u], JoinTrianglesParams::default());
-        assert_eq!(allowed_result.joined.len(), 1, "disabled shape gate merges sliver");
+        assert_eq!(
+            allowed_result.joined.len(),
+            1,
+            "disabled shape gate merges sliver"
+        );
         allowed.validate_topology();
     }
 
@@ -1803,7 +1864,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(blocked_result.joined.is_empty(), "cmp_uvs gates the UV seam");
+        assert!(
+            blocked_result.joined.is_empty(),
+            "cmp_uvs gates the UV seam"
+        );
         assert_eq!(blocked.totface(), 2);
         blocked.validate_topology();
 
@@ -1812,7 +1876,11 @@ mod tests {
         let (l, u) = build(&mut allowed);
         set_loop_uvs_island_split(&mut allowed, l, u, uv);
         let allowed_result = allowed.join_triangles(&[l, u], JoinTrianglesParams::default());
-        assert_eq!(allowed_result.joined.len(), 1, "cmp_uvs off merges across the seam");
+        assert_eq!(
+            allowed_result.joined.len(),
+            1,
+            "cmp_uvs off merges across the seam"
+        );
         allowed.validate_topology();
     }
 
@@ -1835,7 +1903,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(blocked_result.joined.is_empty(), "cmp_vcols gates the colour seam");
+        assert!(
+            blocked_result.joined.is_empty(),
+            "cmp_vcols gates the colour seam"
+        );
         assert_eq!(blocked.totface(), 2);
         blocked.validate_topology();
 
@@ -1844,7 +1915,11 @@ mod tests {
         let (l, u) = build(&mut allowed);
         set_loop_cols_island_split(&mut allowed, l, u, col);
         let allowed_result = allowed.join_triangles(&[l, u], JoinTrianglesParams::default());
-        assert_eq!(allowed_result.joined.len(), 1, "cmp_vcols off merges across the seam");
+        assert_eq!(
+            allowed_result.joined.len(),
+            1,
+            "cmp_vcols off merges across the seam"
+        );
         allowed.validate_topology();
     }
 
@@ -1920,7 +1995,11 @@ mod tests {
         let zero_result = zero.join_triangles(&faces, JoinTrianglesParams::default());
 
         assert_eq!((zero.totvert(), zero.totedge(), zero.totface()), (7, 9, 3));
-        assert_eq!(zero_result.joined.len(), 1, "one tri-pair merges at influence 0");
+        assert_eq!(
+            zero_result.joined.len(),
+            1,
+            "one tri-pair merges at influence 0"
+        );
         assert_eq!(zero_result.unmerged, vec![tc], "Tc survives at influence 0");
         assert!(zero.faces.try_get(tc).is_some());
         assert_eq!(zero.face_len(tc), 3);
@@ -1939,10 +2018,18 @@ mod tests {
         );
 
         assert_eq!((two.totvert(), two.totedge(), two.totface()), (7, 9, 3));
-        assert_eq!(two_result.joined.len(), 1, "one tri-pair merges at influence 2");
+        assert_eq!(
+            two_result.joined.len(),
+            1,
+            "one tri-pair merges at influence 2"
+        );
         assert_eq!(two_result.unmerged, vec![tb2], "Tb survives at influence 2");
         assert!(two.faces.try_get(tb2).is_some());
-        assert_eq!(two.face_len(tb2), 3, "Tb is still a triangle at influence 2");
+        assert_eq!(
+            two.face_len(tb2),
+            3,
+            "Tb is still a triangle at influence 2"
+        );
         let _ = tc2;
         two.validate_topology();
     }
@@ -2024,8 +2111,15 @@ mod tests {
             },
         );
 
-        assert_eq!((folded.totvert(), folded.totedge(), folded.totface()), (7, 9, 3));
-        assert_eq!(result.joined.len(), 1, "one tri-pair merges across the fold");
+        assert_eq!(
+            (folded.totvert(), folded.totedge(), folded.totface()),
+            (7, 9, 3)
+        );
+        assert_eq!(
+            result.joined.len(),
+            1,
+            "one tri-pair merges across the fold"
+        );
         assert_eq!(
             result.unmerged,
             vec![tb],

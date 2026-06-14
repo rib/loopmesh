@@ -104,13 +104,19 @@ impl LoopMesh {
         // `merge_dist` of the WORLD `axis = 0` plane welds its clone onto it.
         // `matrix` is deliberately NOT passed: it owns the §3 reflection frame
         // only, never the seam test (§4).
-        let weld_pairs = self.build_seam_weld_map(geom, &dup.vert_map, params.axis, params.merge_dist);
+        let weld_pairs =
+            self.build_seam_weld_map(geom, &dup.vert_map, params.axis, params.merge_dist);
 
         // Step 4 (§5) — flip the cloned faces' UVs, after the verbatim CD copy
         // (done by the clone in step 1) and before the weld. The flip touches
         // the clone half only; the originals keep their UVs untouched.
         if params.mirror_u || params.mirror_v {
-            self.mirror_clone_uvs(&dup.geom_out, params.mirror_u, params.mirror_v, params.mirror_udim);
+            self.mirror_clone_uvs(
+                &dup.geom_out,
+                params.mirror_u,
+                params.mirror_v,
+                params.mirror_udim,
+            );
         }
 
         // Step 5 (§6.5) — weld the seam: each seam clone collapses onto its
@@ -173,8 +179,11 @@ impl LoopMesh {
             .loop_attribs()
             .iter_descriptors()
             .filter_map(|(key, _)| {
-                matches!(self.loop_attribs().storage_of(key), Some(AttributeStorage::Vec2(_)))
-                    .then_some(key)
+                matches!(
+                    self.loop_attribs().storage_of(key),
+                    Some(AttributeStorage::Vec2(_))
+                )
+                .then_some(key)
             })
             .collect();
         if uv_layers.is_empty() {
@@ -373,9 +382,16 @@ mod tests {
         assert_eq!(mesh.totface(), 4, "original 2 quads + 2 reflected quads");
 
         // The two on-plane originals survive; the reflected half lands on -x.
-        let xs: Vec<f32> = mesh.vert_keys().iter().map(|&v| mesh.vertex_position(v).x).collect();
+        let xs: Vec<f32> = mesh
+            .vert_keys()
+            .iter()
+            .map(|&v| mesh.vertex_position(v).x)
+            .collect();
         assert!(xs.iter().any(|&x| x < -1.5), "a clone reflected to x = -2");
-        assert!(xs.iter().any(|&x| (x - 2.0).abs() < 1e-6), "an original stays at x = 2");
+        assert!(
+            xs.iter().any(|&x| (x - 2.0).abs() < 1e-6),
+            "an original stays at x = 2"
+        );
         assert_eq!(
             xs.iter().filter(|&&x| x.abs() < 1e-6).count(),
             2,
@@ -408,9 +424,16 @@ mod tests {
         assert_eq!(mesh.totface(), 4, "original 2 quads + 2 reflected quads");
 
         // The reflected half lands on −y; the two on-plane originals stay at y=0.
-        let ys: Vec<f32> = mesh.vert_keys().iter().map(|&v| mesh.vertex_position(v).y).collect();
+        let ys: Vec<f32> = mesh
+            .vert_keys()
+            .iter()
+            .map(|&v| mesh.vertex_position(v).y)
+            .collect();
         assert!(ys.iter().any(|&y| y < -1.5), "a clone reflected to y = -2");
-        assert!(ys.iter().any(|&y| (y - 2.0).abs() < 1e-6), "an original stays at y = 2");
+        assert!(
+            ys.iter().any(|&y| (y - 2.0).abs() < 1e-6),
+            "an original stays at y = 2"
+        );
         assert_eq!(
             ys.iter().filter(|&&y| y.abs() < 1e-6).count(),
             2,
@@ -428,7 +451,9 @@ mod tests {
 
         // The seam edge {v0, v3} (on y = 0) is shared by an original and a
         // reflected face — radial count 2 proves the two halves fused.
-        let seam = mesh.query_edge_exists(verts[0], verts[3]).expect("seam edge survives");
+        let seam = mesh
+            .query_edge_exists(verts[0], verts[3])
+            .expect("seam edge survives");
         assert_eq!(
             mesh.iter_radial_loops(seam).count(),
             2,
@@ -458,7 +483,9 @@ mod tests {
 
         // Connectivity: a single shared seam edge {v0, v3} carries faces from
         // both halves (radial count 2).
-        let seam = mesh.query_edge_exists(verts[0], verts[3]).expect("seam edge survives");
+        let seam = mesh
+            .query_edge_exists(verts[0], verts[3])
+            .expect("seam edge survives");
         assert_eq!(
             mesh.iter_radial_loops(seam).count(),
             2,
@@ -483,7 +510,11 @@ mod tests {
         assert_eq!(mesh.totedge(), 14);
         assert_eq!(mesh.totface(), 4);
         assert_eq!(
-            result.geom_out.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count(),
+            result
+                .geom_out
+                .iter()
+                .filter(|g| matches!(g, GeomKey::Vert(_)))
+                .count(),
             6,
             "every clone vert survives — no seam weld"
         );
@@ -548,7 +579,11 @@ mod tests {
         let reflected = mesh
             .face_keys()
             .into_iter()
-            .find(|&f| mesh.face_vert_keys(f).iter().any(|&v| mesh.vertex_position(v).x < 0.0))
+            .find(|&f| {
+                mesh.face_vert_keys(f)
+                    .iter()
+                    .any(|&v| mesh.vertex_position(v).x < 0.0)
+            })
             .expect("a reflected face exists");
         let reflected_area = signed_area(&mesh, reflected);
 
@@ -604,14 +639,18 @@ mod tests {
     fn decorate_loops_with_uv(
         mesh: &mut LoopMesh,
         faces: &[FaceKey],
-    ) -> (ElementAttributeKey, std::collections::HashMap<LoopKey, [f32; 2]>) {
+    ) -> (
+        ElementAttributeKey,
+        std::collections::HashMap<LoopKey, [f32; 2]>,
+    ) {
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("uv"),
                 AttrType::Vec2,
             ))
             .expect("uv layer registers");
-        let mut values: std::collections::HashMap<LoopKey, [f32; 2]> = std::collections::HashMap::new();
+        let mut values: std::collections::HashMap<LoopKey, [f32; 2]> =
+            std::collections::HashMap::new();
         for (j, &f) in faces.iter().enumerate() {
             for (i, l) in mesh.face_loop_keys(f).into_iter().enumerate() {
                 let value = [0.1 + 0.05 * i as f32, 0.2 + 0.05 * j as f32];
@@ -667,9 +706,9 @@ mod tests {
                 // carried: u ∈ {0.10,0.15,0.20,0.25} ↦ {0.90,0.85,0.80,0.75}.
                 let source_u = 1.0 - u;
                 let source_v = 1.0 - v;
-                let matches_source = original_uvs.values().any(|&[su, sv]| {
-                    (su - source_u).abs() < 1e-5 && (sv - source_v).abs() < 1e-5
-                });
+                let matches_source = original_uvs
+                    .values()
+                    .any(|&[su, sv]| (su - source_u).abs() < 1e-5 && (sv - source_v).abs() < 1e-5);
                 assert!(
                     matches_source,
                     "clone UV [{u},{v}] is the 1−x flip of a source UV"
@@ -777,7 +816,10 @@ mod tests {
                 assert!((0.0..1.0).contains(&v), "v stayed in UDIM tile (0,1): {v}");
                 // The exact reflection: u ∈ {1.10,1.15,1.20,1.25} ↦ {1.90,..,1.75}.
                 let source_u = 1.0 + 1.0 - (u - 1.0); // invert: floor=1, frac flip
-                assert!((1.10..=1.25).contains(&source_u), "u is an in-tile flip: {u}");
+                assert!(
+                    (1.10..=1.25).contains(&source_u),
+                    "u is an in-tile flip: {u}"
+                );
             }
         }
         mesh.validate_topology();
@@ -819,7 +861,10 @@ mod tests {
         );
         // Unit-square sends tile-(1,2) UVs to negative tile (−1, 0).
         for [ub, _vb] in &unit_square {
-            assert!(f32::from_bits(*ub) < 0.0, "unit-square flip jumps u below 0");
+            assert!(
+                f32::from_bits(*ub) < 0.0,
+                "unit-square flip jumps u below 0"
+            );
         }
     }
 
@@ -876,7 +921,11 @@ mod tests {
         assert_eq!(mesh.totedge(), 14);
         assert_eq!(mesh.totface(), 4);
         assert_eq!(
-            result.geom_out.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count(),
+            result
+                .geom_out
+                .iter()
+                .filter(|g| matches!(g, GeomKey::Vert(_)))
+                .count(),
             6,
             "every clone vert survives — the world `x = 0` seam test welds nothing"
         );
@@ -902,7 +951,10 @@ mod tests {
             })
             .collect();
         for c in &clone_keys {
-            assert!(!originals.contains(c), "clone keys are disjoint from originals");
+            assert!(
+                !originals.contains(c),
+                "clone keys are disjoint from originals"
+            );
         }
         mesh.validate_topology();
     }

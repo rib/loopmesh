@@ -84,9 +84,16 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        let left = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let right =
-            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let left = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let right = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
         (left, right, e12)
     }
 
@@ -243,7 +250,8 @@ mod tests {
             std::collections::HashMap::new();
         for (i, &loop_key) in loops.iter().enumerate() {
             let value = pair_value(i);
-            mesh.loop_attribs_mut().set_vec2(uv, loop_key.as_usize(), value);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, loop_key.as_usize(), value);
             expected.insert(mesh.loop_vertex(loop_key), value);
         }
 
@@ -253,10 +261,12 @@ mod tests {
         // no interpolation, no mirroring.
         for loop_key in mesh.face_loop_keys(face) {
             let corner = mesh.loop_vertex(loop_key);
-            let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, loop_key.as_usize())
+                .unwrap();
             assert_eq!(
-                got,
-                expected[&corner],
+                got, expected[&corner],
                 "loop at corner {corner:?} keeps its own UV"
             );
         }
@@ -271,7 +281,11 @@ mod tests {
         let n = after_values.len();
         assert_eq!(after_values[0], pair_value(0));
         for i in 1..n {
-            assert_eq!(after_values[i], pair_value(n - i), "UV order reversed at {i}");
+            assert_eq!(
+                after_values[i],
+                pair_value(n - i),
+                "UV order reversed at {i}"
+            );
         }
     }
 

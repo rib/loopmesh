@@ -1108,7 +1108,11 @@ mod tests {
             let e_r = mesh.create_edge([b1, t1], EdgeCreateFlags::NO_DUPLICATE);
             let e_t = mesh.create_edge([t1, t0], EdgeCreateFlags::NO_DUPLICATE);
             let e_l = mesh.create_edge([t0, b0], EdgeCreateFlags::NO_DUPLICATE);
-            mesh.face_create(&[b0, b1, t1, t0], &[e_b, e_r, e_t, e_l], FaceCreateFlags::NONE);
+            mesh.face_create(
+                &[b0, b1, t1, t0],
+                &[e_b, e_r, e_t, e_l],
+                FaceCreateFlags::NONE,
+            );
         }
 
         let mut verts: Vec<VertexKey> = bottom.clone();
@@ -1175,7 +1179,10 @@ mod tests {
             }
             DissolveLimitResult::Unsupported => panic!("delimit 0 must run"),
         }
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         mesh.validate_topology();
     }
 
@@ -1228,7 +1235,11 @@ mod tests {
             mesh.query_edge_exists(b[2], t[2]).is_some(),
             "the 90° ridge seam survives the angle gate"
         );
-        assert_eq!(mesh.totface(), 2, "two flat quads merge; the folded one stays");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "two flat quads merge; the folded one stays"
+        );
         mesh.validate_topology();
     }
 
@@ -1252,11 +1263,19 @@ mod tests {
             let e12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
             let e23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
             let e30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-            mesh.face_create(&[v[0], v[1], v[2], v[3]], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+            mesh.face_create(
+                &[v[0], v[1], v[2], v[3]],
+                &[e01, e12, e23, e30],
+                FaceCreateFlags::NONE,
+            );
             let e14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
             let e45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
             let e52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
-            mesh.face_create(&[v[1], v[4], v[5], v[2]], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+            mesh.face_create(
+                &[v[1], v[4], v[5], v[2]],
+                &[e14, e45, e52, e12],
+                FaceCreateFlags::NONE,
+            );
 
             let seam = mesh.query_edge_exists(v[1], v[2]).unwrap();
             let params = DissolveLimitParams {
@@ -1292,11 +1311,19 @@ mod tests {
         let e12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
         let e23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
         let e30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[0], v[1], v[2], v[3]], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         let e14 = mesh.create_edge([v[1], v[4]], EdgeCreateFlags::NO_DUPLICATE);
         let e45 = mesh.create_edge([v[4], v[5]], EdgeCreateFlags::NO_DUPLICATE);
         let e52 = mesh.create_edge([v[5], v[2]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[1], v[4], v[5], v[2]], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[1], v[4], v[5], v[2]],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let seam = mesh.query_edge_exists(v[1], v[2]).unwrap();
         let params = DissolveLimitParams {
@@ -1365,7 +1392,11 @@ mod tests {
         let e1 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
         let e2 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
         let e3 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[0], v[1], v[2], v[3]], &[e0, e1, e2, e3], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e0, e1, e2, e3],
+            FaceCreateFlags::NONE,
+        );
 
         // false branch at a tight angle_limit: the 90° corners are rejected.
         {
@@ -1385,7 +1416,11 @@ mod tests {
             let pe1 = probe.create_edge([p[1], p[2]], EdgeCreateFlags::NO_DUPLICATE);
             let pe2 = probe.create_edge([p[2], p[3]], EdgeCreateFlags::NO_DUPLICATE);
             let pe3 = probe.create_edge([p[3], p[0]], EdgeCreateFlags::NO_DUPLICATE);
-            probe.face_create(&[p[0], p[1], p[2], p[3]], &[pe0, pe1, pe2, pe3], FaceCreateFlags::NONE);
+            probe.face_create(
+                &[p[0], p[1], p[2], p[3]],
+                &[pe0, pe1, pe2, pe3],
+                FaceCreateFlags::NONE,
+            );
             let params = DissolveLimitParams {
                 angle_limit: std::f32::consts::FRAC_PI_4,
                 use_dissolve_boundaries: false,
@@ -1449,7 +1484,11 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[seam1, seam2], &[], &params);
-        assert_eq!(mesh.totface(), 1, "both shallow seams dissolve after re-score");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "both shallow seams dissolve after re-score"
+        );
         mesh.validate_topology();
     }
 
@@ -1541,7 +1580,10 @@ mod tests {
         };
         let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
         assert_eq!(result, DissolveLimitResult::Unsupported);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         mesh.validate_topology();
     }
 
@@ -1574,7 +1616,11 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "without MATERIAL the boundary edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "without MATERIAL the boundary edge dissolves"
+        );
         mesh.validate_topology();
 
         // DELIMIT_MATERIAL with mismatched indices: the boundary edge survives.
@@ -1590,7 +1636,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "DELIMIT_MATERIAL preserves the material boundary");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "DELIMIT_MATERIAL preserves the material boundary"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
 
@@ -1604,7 +1654,11 @@ mod tests {
             delimit: DELIMIT_MATERIAL,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "matching materials are not a boundary; edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "matching materials are not a boundary; edge dissolves"
+        );
         mesh.validate_topology();
     }
 
@@ -1623,7 +1677,11 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "without SEAM the flag is inert; edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "without SEAM the flag is inert; edge dissolves"
+        );
         mesh.validate_topology();
 
         // DELIMIT_SEAM with the flag set: the edge survives.
@@ -1638,7 +1696,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "DELIMIT_SEAM preserves the seam-flagged edge");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "DELIMIT_SEAM preserves the seam-flagged edge"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
 
@@ -1650,7 +1712,11 @@ mod tests {
             delimit: DELIMIT_SEAM,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "an un-flagged edge is not a seam; it dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "an un-flagged edge is not a seam; it dissolves"
+        );
         mesh.validate_topology();
     }
 
@@ -1669,7 +1735,11 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "without SHARP the flag is inert; edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "without SHARP the flag is inert; edge dissolves"
+        );
         mesh.validate_topology();
 
         // DELIMIT_SHARP with the flag set (non-smooth): the edge survives.
@@ -1684,7 +1754,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "DELIMIT_SHARP preserves the sharp (non-smooth) edge");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "DELIMIT_SHARP preserves the sharp (non-smooth) edge"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
 
@@ -1697,7 +1771,11 @@ mod tests {
             delimit: DELIMIT_SHARP,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "a smooth edge is not sharp; it dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "a smooth edge is not sharp; it dissolves"
+        );
         mesh.validate_topology();
     }
 
@@ -1720,7 +1798,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "SEAM | MATERIAL preserves the doubly-delimited edge");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "SEAM | MATERIAL preserves the doubly-delimited edge"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
 
@@ -1735,7 +1817,11 @@ mod tests {
             delimit: DELIMIT_SEAM | DELIMIT_MATERIAL,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 2, "the OR blocks on the material boundary alone");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "the OR blocks on the material boundary alone"
+        );
         mesh.validate_topology();
 
         // And neither condition holding ⇒ the edge dissolves under the same
@@ -1747,7 +1833,11 @@ mod tests {
             delimit: DELIMIT_SEAM | DELIMIT_MATERIAL,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "no seam and matching materials ⇒ edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "no seam and matching materials ⇒ edge dissolves"
+        );
         mesh.validate_topology();
     }
 
@@ -1858,7 +1948,11 @@ mod tests {
             mesh.vertices.try_get(v).is_none(),
             "without a delimiter the modulated cost dissolves the seam vert"
         );
-        assert_eq!(mesh.totvert(), v0 - 1, "exactly the one seam vert collapses");
+        assert_eq!(
+            mesh.totvert(),
+            v0 - 1,
+            "exactly the one seam vert collapses"
+        );
         mesh.validate_topology();
 
         // DELIMIT_SHARP with a sharp-flagged seam edge: v is a §3.3 delimiter
@@ -1877,7 +1971,11 @@ mod tests {
             mesh.vertices.try_get(v).is_some(),
             "the §3.3 delimiter vert forgoes the dihedral discount and survives"
         );
-        assert_eq!(mesh.totvert(), v0, "no collapse: the delimiter vert is preserved");
+        assert_eq!(
+            mesh.totvert(),
+            v0,
+            "no collapse: the delimiter vert is preserved"
+        );
         mesh.validate_topology();
     }
 
@@ -1900,13 +1998,21 @@ mod tests {
         let e12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
         let e23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
         let e30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[0], v[1], v[2], v[3]], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[0], v[1], v[2], v[3]],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         // Face B: [v1,v2,v5,v4] — also traverses the shared edge v1->v2, so the
         // edge is non-contiguous and B winds opposite to A (flipped normal).
         let e25 = mesh.create_edge([v[2], v[5]], EdgeCreateFlags::NO_DUPLICATE);
         let e54 = mesh.create_edge([v[5], v[4]], EdgeCreateFlags::NO_DUPLICATE);
         let e41 = mesh.create_edge([v[4], v[1]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[1], v[2], v[5], v[4]], &[e12, e25, e54, e41], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[1], v[2], v[5], v[4]],
+            &[e12, e25, e54, e41],
+            FaceCreateFlags::NONE,
+        );
 
         let shared = mesh.query_edge_exists(v[1], v[2]).unwrap();
         (mesh, shared)
@@ -1955,7 +2061,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "DELIMIT_NORMAL preserves the non-contiguous edge");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "DELIMIT_NORMAL preserves the non-contiguous edge"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
     }
@@ -2004,14 +2114,16 @@ mod tests {
         let seam_offset = if split_uv { 10.0 } else { 0.0 };
         for l in mesh.face_loop_keys(face_a) {
             let p = mesh.vertex_position(mesh.loops.get(l).vertex);
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x, p.y]);
         }
         for l in mesh.face_loop_keys(face_b) {
             let vert = mesh.loops.get(l).vertex;
             let p = mesh.vertex_position(vert);
             let on_seam = vert == v[1] || vert == v[2];
             let off = if on_seam { seam_offset } else { 0.0 };
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x + off, p.y]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x + off, p.y]);
         }
 
         let shared = mesh.query_edge_exists(v[1], v[2]).unwrap();
@@ -2033,7 +2145,11 @@ mod tests {
             delimit: 0,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "UV split edge dissolves when delimit = 0");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "UV split edge dissolves when delimit = 0"
+        );
         mesh.validate_topology();
 
         // DELIMIT_UV with mismatched seam UVs: the island boundary survives.
@@ -2047,7 +2163,11 @@ mod tests {
             mesh.dissolve_limit(&[shared], &[], &params),
             DissolveLimitResult::Ran { region_out } if region_out.is_empty()
         ));
-        assert_eq!(mesh.totface(), 2, "DELIMIT_UV preserves the UV-island boundary");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "DELIMIT_UV preserves the UV-island boundary"
+        );
         assert!(mesh.edges.try_get(shared).is_some());
         mesh.validate_topology();
 
@@ -2060,7 +2180,11 @@ mod tests {
             delimit: DELIMIT_UV,
         };
         mesh.dissolve_limit(&[shared], &[], &params);
-        assert_eq!(mesh.totface(), 1, "matching seam UVs are contiguous; the edge dissolves");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "matching seam UVs are contiguous; the edge dissolves"
+        );
         mesh.validate_topology();
     }
 
@@ -2078,8 +2202,15 @@ mod tests {
             delimit: DELIMIT_UV,
         };
         let result = mesh.dissolve_limit(&edges, &interior_verts, &params);
-        assert!(matches!(result, DissolveLimitResult::Ran { .. }), "UV bit auto-clears, runs");
-        assert_eq!(mesh.totface(), 1, "no UV layers ⇒ UV bit inert ⇒ full collapse");
+        assert!(
+            matches!(result, DissolveLimitResult::Ran { .. }),
+            "UV bit auto-clears, runs"
+        );
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "no UV layers ⇒ UV bit inert ⇒ full collapse"
+        );
         assert_eq!(mesh.totvert(), 4);
         mesh.validate_topology();
     }
@@ -2128,7 +2259,11 @@ mod tests {
         };
         mesh.dissolve_limit(&[], &[r], &params);
 
-        assert_eq!(mesh.totvert(), 4, "the reflex empty-ear vert collapses away");
+        assert_eq!(
+            mesh.totvert(),
+            4,
+            "the reflex empty-ear vert collapses away"
+        );
         assert_eq!(mesh.totface(), 1, "the face survives as a quad");
         assert!(
             mesh.query_edge_exists(verts[0], verts[2]).is_some(),
@@ -2214,6 +2349,3 @@ mod tests {
         mesh.validate_topology();
     }
 }
-
-
-

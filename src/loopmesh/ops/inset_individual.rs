@@ -186,8 +186,10 @@ impl LoopMesh {
             && (!self.loop_attribs.is_empty() || !self.vertex_attribs.is_empty())
         {
             let projection = PlaneProjection::from_normal(face_normal);
-            let proj_corners: Vec<Vec2> =
-                old_positions.iter().map(|&p| projection.project(p)).collect();
+            let proj_corners: Vec<Vec2> = old_positions
+                .iter()
+                .map(|&p| projection.project(p))
+                .collect();
             let loop_slots: Vec<usize> = loops.iter().map(|l| l.as_usize()).collect();
             // The new verts carry verbatim copies of the old verts' customdata,
             // so snapshotting the old verts captures the same baseline the new
@@ -632,7 +634,8 @@ mod tests {
         }
         for &v in &corner_verts {
             let x = mesh.vertex_position(v).x;
-            mesh.vertex_attribs_mut().set_f32(scalar, v.as_usize(), x * x);
+            mesh.vertex_attribs_mut()
+                .set_f32(scalar, v.as_usize(), x * x);
         }
 
         // Snapshot the source corners in loop-cycle order *before* the inset.
@@ -752,7 +755,10 @@ mod tests {
                 let matches_source = expected
                     .values()
                     .any(|&s| (s[0] - got[0]).abs() < 1.0e-6 && (s[1] - got[1]).abs() < 1.0e-6);
-                assert!(matches_source, "wall UV {got:?} not a source-face corner value");
+                assert!(
+                    matches_source,
+                    "wall UV {got:?} not a source-face corner value"
+                );
                 filled += 1;
             }
         }
@@ -918,8 +924,7 @@ mod tests {
             for (corner, near_uv) in &near {
                 let want = near_expected[corner];
                 assert!(
-                    (near_uv[0] - want[0]).abs() < 1.0e-5
-                        && (near_uv[1] - want[1]).abs() < 1.0e-5,
+                    (near_uv[0] - want[0]).abs() < 1.0e-5 && (near_uv[1] - want[1]).abs() < 1.0e-5,
                     "near corner {corner}: got {near_uv:?} want rebaked inset value {want:?}"
                 );
                 // Did this wall carry a gradient (far != near at a corner)?

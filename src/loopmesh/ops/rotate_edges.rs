@@ -582,7 +582,10 @@ mod tests {
             counts,
             "mesh unchanged"
         );
-        assert!(mesh.query_edge_exists(v0, v1).is_some(), "boundary edge survives");
+        assert!(
+            mesh.query_edge_exists(v0, v1).is_some(),
+            "boundary edge survives"
+        );
     }
 
     /// An entirely ineligible selection is a complete no-op (§7).
@@ -797,8 +800,15 @@ mod tests {
         let [a, b, c, d] = build(&mut lone);
         let bd = edge_between(&lone, b, d);
         let out_lone = lone.rotate_edges(&[bd], true);
-        assert_eq!(out_lone.len(), 1, "lone edge rotates despite degenerate result");
-        assert!(lone.query_edge_exists(a, c).is_some(), "new {{a,c}} diagonal laid");
+        assert_eq!(
+            out_lone.len(),
+            1,
+            "lone edge rotates despite degenerate result"
+        );
+        assert!(
+            lone.query_edge_exists(a, c).is_some(),
+            "new {{a,c}} diagonal laid"
+        );
 
         // Multi-edge selection containing the same edge plus another (so the
         // guard set becomes {exists, degenerate}) — the degenerate rotation is
@@ -868,7 +878,9 @@ mod tests {
             // boundary pass seeds nothing and the all-edges pass owns the work.
             let set: std::collections::HashSet<EdgeKey> = spokes.iter().copied().collect();
             assert!(
-                spokes.iter().all(|&e| !mesh.is_region_boundary_edge(e, &set)),
+                spokes
+                    .iter()
+                    .all(|&e| !mesh.is_region_boundary_edge(e, &set)),
                 "every spoke is region-interior (§4.3) — pure all-edges-pass case"
             );
             if reversed {
@@ -886,7 +898,11 @@ mod tests {
 
         let forward = landed(false);
         // Order-independence: the all-pass result is a function of the edge set.
-        assert_eq!(forward, landed(true), "all-interior sweep is order-independent (§5)");
+        assert_eq!(
+            forward,
+            landed(true),
+            "all-interior sweep is order-independent (§5)"
+        );
 
         let (rotated, edges) = forward;
         // Pin the specific landed topology produced by the raw-cost all-edges
@@ -917,16 +933,16 @@ mod tests {
             ends.sort_unstable();
         }
         expected.sort_unstable();
-        assert_eq!(edges, expected, "pinned landed diagonals (raw-cost all-pass order)");
+        assert_eq!(
+            edges, expected,
+            "pinned landed diagonals (raw-cost all-pass order)"
+        );
     }
 
     /// Build two tris sharing diagonal {p1,p3} of an explicit quad
     /// p0,p1,p2,p3 (cyclic). Tris (p0,p1,p3) and (p1,p2,p3) share {p1,p3}.
     /// Returns the shared edge and the 4 verts in cyclic order.
-    fn quad_on_diag(
-        mesh: &mut LoopMesh,
-        p: [Vec3; 4],
-    ) -> (EdgeKey, [VertexKey; 4]) {
+    fn quad_on_diag(mesh: &mut LoopMesh, p: [Vec3; 4]) -> (EdgeKey, [VertexKey; 4]) {
         let v: Vec<VertexKey> = p.iter().map(|&pp| mesh.create_vertex(pp)).collect();
         tri(mesh, [v[0], v[1], v[3]]);
         tri(mesh, [v[1], v[2], v[3]]);
@@ -1016,8 +1032,15 @@ mod tests {
             "concave new diagonal was not laid"
         );
         // Convex rotated.
-        assert!(mesh.query_edge_exists(cw1, cw3).is_some(), "convex diagonal rotated");
-        assert_eq!(out.len(), 1, "only the convex rotation contributes to edges.out");
+        assert!(
+            mesh.query_edge_exists(cw1, cw3).is_some(),
+            "convex diagonal rotated"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "only the convex rotation contributes to edges.out"
+        );
         assert_eq!(
             (mesh.totvert(), mesh.totedge(), mesh.totface()),
             counts,
@@ -1089,8 +1112,15 @@ mod tests {
             mesh.query_edge_exists(fverts[0], fverts[2]).is_none(),
             "folded new diagonal was not laid"
         );
-        assert!(mesh.query_edge_exists(cw1, cw3).is_some(), "convex diagonal rotated");
-        assert_eq!(out.len(), 1, "only the convex rotation contributes to edges.out");
+        assert!(
+            mesh.query_edge_exists(cw1, cw3).is_some(),
+            "convex diagonal rotated"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "only the convex rotation contributes to edges.out"
+        );
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), counts);
     }
 
@@ -1105,7 +1135,11 @@ mod tests {
 
         let out = mesh.rotate_edges(&[diag, boundary], true);
 
-        assert_eq!(out.len(), 1, "only the eligible edge contributes to edges.out");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the eligible edge contributes to edges.out"
+        );
         let live: std::collections::HashSet<EdgeKey> = mesh.edge_keys().into_iter().collect();
         for &e in &out {
             assert!(live.contains(&e), "every out-edge is a live post-op edge");

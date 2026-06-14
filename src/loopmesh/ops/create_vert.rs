@@ -61,8 +61,10 @@ mod tests {
             Vec3::new(1.0, 1.0, 0.0),
             Vec3::new(0.0, 1.0, 0.0),
         ];
-        let quad_verts: Vec<VertexKey> =
-            quad_corners.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let quad_verts: Vec<VertexKey> = quad_corners
+            .iter()
+            .map(|&p| mesh.create_vertex(p))
+            .collect();
         let quad_edges: Vec<EdgeKey> = (0..4)
             .map(|i| {
                 mesh.create_edge(
@@ -129,7 +131,10 @@ mod tests {
         let v = mesh.create_vert(Vec3::new(2.0, 0.0, 0.0));
 
         let stored = mesh.vertex_attribs().get_f32(weight, v.as_usize()).unwrap();
-        assert_eq!(stored, 0.0, "new vertex reads the layer default, not a copy");
+        assert_eq!(
+            stored, 0.0,
+            "new vertex reads the layer default, not a copy"
+        );
         mesh.validate_topology();
     }
 }

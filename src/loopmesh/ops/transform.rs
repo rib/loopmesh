@@ -155,7 +155,12 @@ mod tests {
         let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
         let verts = [v0, v1, v2, v3];
         let edges: Vec<EdgeKey> = (0..4)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % 4]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect();
         let face = mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
         (verts, face)
@@ -261,7 +266,10 @@ mod tests {
         let before: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
         let counts = (mesh.totvert(), mesh.totedge(), mesh.totface());
 
-        mesh.transform(&[], params(Mat4::from_translation(Vec3::new(9.0, 9.0, 9.0))));
+        mesh.transform(
+            &[],
+            params(Mat4::from_translation(Vec3::new(9.0, 9.0, 9.0))),
+        );
 
         for (i, &v) in verts.iter().enumerate() {
             assert_close(mesh.vertex_position(v), before[i]);
@@ -314,7 +322,10 @@ mod tests {
 
         for (i, &v) in verts.iter().enumerate() {
             let w = mesh.vertex_attribs().get_f32(weight, v.as_usize()).unwrap();
-            assert!((w - 0.1 * (i as f32 + 1.0)).abs() < 1e-6, "vert weight survives");
+            assert!(
+                (w - 0.1 * (i as f32 + 1.0)).abs() < 1e-6,
+                "vert weight survives"
+            );
         }
         for (l, before) in loop_uvs {
             let after = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
@@ -367,8 +378,16 @@ mod tests {
 
         // diag(1,1,0): non-zero entries (not the sentinel) but determinant 0.
         let singular_space = Mat4::from_scale(Vec3::new(1.0, 1.0, 0.0));
-        assert_ne!(singular_space, Mat4::ZERO, "fixture must not be the sentinel");
-        assert_eq!(singular_space.determinant(), 0.0, "fixture must be singular");
+        assert_ne!(
+            singular_space,
+            Mat4::ZERO,
+            "fixture must not be the sentinel"
+        );
+        assert_eq!(
+            singular_space.determinant(),
+            0.0,
+            "fixture must be singular"
+        );
 
         // A non-trivial matrix: the convention must collapse to the origin
         // regardless of `matrix` (and regardless of each vert's input position).

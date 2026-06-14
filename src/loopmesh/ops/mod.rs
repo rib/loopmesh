@@ -30,9 +30,9 @@ mod extrude_edge_only;
 mod extrude_mixed;
 mod extrude_region;
 mod extrude_vert_indiv;
-mod find_doubles;
 mod face_poke;
 mod face_triangulate;
+mod find_doubles;
 mod inset_individual;
 mod inset_region;
 mod join_triangles;
@@ -53,8 +53,8 @@ mod smooth_vert;
 mod spin;
 mod split;
 mod split_edges;
-mod subdivide_edges;
 mod subdivide_edgering;
+mod subdivide_edges;
 mod symmetrize;
 mod transform;
 mod translate;
@@ -64,8 +64,8 @@ mod weld_verts;
 pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult};
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
-pub use connect_verts_nonplanar::ConnectVertsNonplanarOut;
 pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};
+pub use connect_verts_nonplanar::ConnectVertsNonplanarOut;
 pub use delete::{DeleteContext, DeleteSeed, MixedSeed};
 pub use dissolve_edges::{DissolveEdgesParams, DissolveEdgesResult};
 pub use dissolve_faces::{DissolveFacesOptions, DissolveFacesResult};
@@ -88,11 +88,11 @@ pub use rotate_edges::RotateEdgesResult;
 pub use scale::ScaleParams;
 pub use smooth_vert::SmoothVertParams;
 pub use split::SplitResult;
-pub use subdivide_edges::{
-    QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
-};
 pub use subdivide_edgering::{
     ProfileShape, RingInterp, SubdivideEdgeRingParams, SubdivideEdgeRingResult,
+};
+pub use subdivide_edges::{
+    QuadCornerType, SmoothFalloff, SubdivideGeom, SubdivideParams, SubdivideResult,
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;

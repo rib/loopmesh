@@ -81,7 +81,11 @@ impl LoopMesh {
     ///
     /// See `radial-mesh-guides/operators/DUPLICATE.md` for the full algorithm
     /// and parity contract.
-    pub fn duplicate(&mut self, geom: &[GeomKey], use_edge_flip_from_face: bool) -> DuplicateResult {
+    pub fn duplicate(
+        &mut self,
+        geom: &[GeomKey],
+        use_edge_flip_from_face: bool,
+    ) -> DuplicateResult {
         debug_assert!(
             !use_edge_flip_from_face,
             "duplicate: use_edge_flip_from_face=true is a by-design deferral (DUPLICATE.md §7)"
@@ -132,7 +136,13 @@ impl LoopMesh {
             if edge_ledger.contains_key(&source) {
                 continue;
             }
-            self.clone_edge(source, &mut vert_ledger, &mut edge_ledger, &face_selected, &mut result);
+            self.clone_edge(
+                source,
+                &mut vert_ledger,
+                &mut edge_ledger,
+                &face_selected,
+                &mut result,
+            );
         }
 
         // ---- Pass C — selected faces: corners, perimeter, then assemble
@@ -144,7 +154,13 @@ impl LoopMesh {
             if result.face_map.contains_key(&source) {
                 continue;
             }
-            self.clone_face(source, &mut vert_ledger, &mut edge_ledger, &face_selected, &mut result);
+            self.clone_face(
+                source,
+                &mut vert_ledger,
+                &mut edge_ledger,
+                &face_selected,
+                &mut result,
+            );
         }
 
         result
@@ -154,7 +170,8 @@ impl LoopMesh {
     /// clone for `geom_out`. The shared copy routine for all three passes.
     fn clone_vertex(&mut self, source: VertexKey, result: &mut DuplicateResult) -> VertexKey {
         let clone = self.create_vertex(self.vertex_position(source));
-        self.vertex_attribs.copy_into(clone.as_usize(), source.as_usize());
+        self.vertex_attribs
+            .copy_into(clone.as_usize(), source.as_usize());
         result.vert_map.insert(source, clone);
         result.vert_map.insert(clone, source);
         result.geom_out.push(GeomKey::Vert(clone));
@@ -178,7 +195,8 @@ impl LoopMesh {
         let c1 = self.closure_vertex(v1, vert_ledger, result);
 
         let clone = self.create_edge([c0, c1], EdgeCreateFlags::NONE);
-        self.edge_attribs.copy_into(clone.as_usize(), source.as_usize());
+        self.edge_attribs
+            .copy_into(clone.as_usize(), source.as_usize());
         result.edge_map.insert(source, clone);
         result.edge_map.insert(clone, source);
         result.geom_out.push(GeomKey::Edge(clone));
@@ -207,8 +225,7 @@ impl LoopMesh {
         let source_loops: Vec<LoopKey> = self.face_loop_keys(source);
         let source_verts: Vec<VertexKey> =
             source_loops.iter().map(|&l| self.loop_vertex(l)).collect();
-        let source_edges: Vec<EdgeKey> =
-            source_loops.iter().map(|&l| self.loop_edge(l)).collect();
+        let source_edges: Vec<EdgeKey> = source_loops.iter().map(|&l| self.loop_edge(l)).collect();
 
         // §3.3 step 1: clone corner verts via the ledger.
         let clone_verts: Vec<VertexKey> = source_verts
@@ -232,7 +249,8 @@ impl LoopMesh {
         // source loop-cycle order, so the clone face's loops align with the
         // source's one-to-one.
         let clone = self.face_create(&clone_verts, &clone_edges, FaceCreateFlags::NONE);
-        self.face_attribs.copy_into(clone.as_usize(), source.as_usize());
+        self.face_attribs
+            .copy_into(clone.as_usize(), source.as_usize());
 
         if !self.loop_attribs.is_empty() {
             let clone_loops: Vec<LoopKey> = self.face_loop_keys(clone);
@@ -454,7 +472,10 @@ mod tests {
         assert_eq!(result.vert_map.len(), 4);
         assert_eq!(result.edge_map.len(), 2);
         assert_eq!(result.boundary_map.len(), 1, "wire edge count 0 < 2");
-        assert!(result.isovert_map.is_empty(), "endpoints held by the wire clone");
+        assert!(
+            result.isovert_map.is_empty(),
+            "endpoints held by the wire clone"
+        );
 
         let clone_edge = clone_edges(&result)[0];
         let [ca, cb] = mesh.edge_vertices(clone_edge);
@@ -542,7 +563,11 @@ mod tests {
         let fa_edges: HashSet<EdgeKey> = mesh.face_edge_keys(clone_fa).into_iter().collect();
         let fb_edges: HashSet<EdgeKey> = mesh.face_edge_keys(clone_fb).into_iter().collect();
         let shared: Vec<EdgeKey> = fa_edges.intersection(&fb_edges).copied().collect();
-        assert_eq!(shared.len(), 1, "clone region welded across one shared edge");
+        assert_eq!(
+            shared.len(),
+            1,
+            "clone region welded across one shared edge"
+        );
 
         // boundary_map = 6 outer perimeter edges; the shared edge (count 2) is
         // absent.
@@ -584,7 +609,11 @@ mod tests {
         assert_eq!(clone_verts(&result).len(), 8, "no shared verts");
         assert_eq!(clone_edges(&result).len(), 8, "no shared edges");
         assert_eq!(clone_faces(&result).len(), 2);
-        assert_eq!(result.boundary_map.len(), 8, "all perimeter edges are frontier");
+        assert_eq!(
+            result.boundary_map.len(),
+            8,
+            "all perimeter edges are frontier"
+        );
         assert!(result.isovert_map.is_empty());
 
         // The two clone faces share nothing.
@@ -652,22 +681,38 @@ mod tests {
         for (&src, &clone) in result.vert_map.iter() {
             // vert_map is bidirectional; only assert the source->clone half.
             if mesh.vertex_position(src) == mesh.vertex_position(clone) {
-                let a = mesh.vertex_attribs().get_vec3(v_color, src.as_usize()).unwrap();
-                let b = mesh.vertex_attribs().get_vec3(v_color, clone.as_usize()).unwrap();
+                let a = mesh
+                    .vertex_attribs()
+                    .get_vec3(v_color, src.as_usize())
+                    .unwrap();
+                let b = mesh
+                    .vertex_attribs()
+                    .get_vec3(v_color, clone.as_usize())
+                    .unwrap();
                 assert_eq!(a, b, "vert CD copied verbatim");
             }
         }
         // Edge CD.
         for (&src, &clone) in result.edge_map.iter() {
-            let a = mesh.edge_attribs().get_f32(e_crease, src.as_usize()).unwrap();
-            let b = mesh.edge_attribs().get_f32(e_crease, clone.as_usize()).unwrap();
+            let a = mesh
+                .edge_attribs()
+                .get_f32(e_crease, src.as_usize())
+                .unwrap();
+            let b = mesh
+                .edge_attribs()
+                .get_f32(e_crease, clone.as_usize())
+                .unwrap();
             assert_eq!(a, b, "edge CD copied verbatim");
         }
         // Face CD.
         let clone_face = clone_faces(&result)[0];
         assert_eq!(
-            mesh.face_attribs().get_vec3(f_color, face.as_usize()).unwrap(),
-            mesh.face_attribs().get_vec3(f_color, clone_face.as_usize()).unwrap(),
+            mesh.face_attribs()
+                .get_vec3(f_color, face.as_usize())
+                .unwrap(),
+            mesh.face_attribs()
+                .get_vec3(f_color, clone_face.as_usize())
+                .unwrap(),
             "face CD copied verbatim"
         );
         // Loop CD: clone loops carry identical UVs in loop order.

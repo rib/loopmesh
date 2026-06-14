@@ -720,9 +720,7 @@ impl LoopMesh {
             // deletion: no surviving incident edge). A boundary vert keeps its
             // boundary edge and is skipped.
             for v in interior_endpoints {
-                if self.vertices.try_get(v).is_some()
-                    && self.vertex_disk_iter(v).next().is_none()
-                {
+                if self.vertices.try_get(v).is_some() && self.vertex_disk_iter(v).next().is_none() {
                     self.vertex_kill(v);
                     vert_deleted[v.as_usize()] = true;
                 }
@@ -981,7 +979,11 @@ mod tests {
         let result = mesh.extrude_region(&[top, neighbour]);
 
         // Surround-touching → originals re-anchored, not kept.
-        assert_eq!(result.cap_faces.len(), 0, "delete pass runs: no separate caps");
+        assert_eq!(
+            result.cap_faces.len(),
+            0,
+            "delete pass runs: no separate caps"
+        );
         // The interior shared edge's original is gone from the mesh.
         assert!(
             mesh.edges.try_get(shared_edge).is_none(),
@@ -1117,8 +1119,16 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-        let face0 = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let face1 = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let face0 = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let face1 = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
@@ -1133,7 +1143,8 @@ mod tests {
             for l in mesh.iter_face_loops(f).collect::<Vec<_>>() {
                 let v = mesh.loop_vertex(l);
                 let p = mesh.vertex_position(v);
-                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [p.x, p.y]);
             }
         }
 
@@ -1225,10 +1236,16 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-        let face0 =
-            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let face1 =
-            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let face0 = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let face1 = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let uv = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
@@ -1242,7 +1259,8 @@ mod tests {
             for l in mesh.iter_face_loops(f).collect::<Vec<_>>() {
                 let v = mesh.loop_vertex(l);
                 let p = mesh.vertex_position(v);
-                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [p.x, p.y]);
             }
         }
         // Capture face 0's own loop UV at each of its corners, keyed by vert.
@@ -1426,10 +1444,12 @@ mod tests {
                     .collect();
                 // Same winding: identical as a rotation (not reversed).
                 let n = a_pos.len();
-                let same_rotation = (0..n).any(|shift| {
-                    (0..n).all(|i| a_pos[i] == b_pos[(i + shift) % n])
-                });
-                assert!(same_rotation, "extrude_region must equal _ex(false) winding");
+                let same_rotation =
+                    (0..n).any(|shift| (0..n).all(|i| a_pos[i] == b_pos[(i + shift) % n]));
+                assert!(
+                    same_rotation,
+                    "extrude_region must equal _ex(false) winding"
+                );
                 matched = true;
                 break;
             }
@@ -1453,11 +1473,17 @@ mod tests {
         let source_verts = mesh.face_vert_keys(face);
         let v0 = source_verts[0];
         let v1 = source_verts[1];
-        let excluded_edge = mesh.query_edge_exists(v0, v1).expect("perimeter edge v0-v1");
+        let excluded_edge = mesh
+            .query_edge_exists(v0, v1)
+            .expect("perimeter edge v0-v1");
 
         let result = mesh.extrude_region_exclude(&[face], &[excluded_edge], false, false);
 
-        assert_eq!(result.vert_map.len(), 4, "all 4 boundary verts still duplicated");
+        assert_eq!(
+            result.vert_map.len(),
+            4,
+            "all 4 boundary verts still duplicated"
+        );
         assert_eq!(
             result.edge_map.len(),
             4,
@@ -1531,7 +1557,10 @@ mod tests {
                 let n = plain_pos.len();
                 let same_rotation =
                     (0..n).any(|shift| (0..n).all(|i| plain_pos[i] == excl_pos[(i + shift) % n]));
-                assert!(same_rotation, "empty-exclude wall must match plain wall winding");
+                assert!(
+                    same_rotation,
+                    "empty-exclude wall must match plain wall winding"
+                );
                 matched = true;
                 break;
             }
@@ -1572,9 +1601,7 @@ mod tests {
 
     // Build two quads sharing edge v1–v2: face0 = {v0,v1,v2,v3}, face1 the
     // neighbour on the far side of v1–v2. Returns (mesh, face0, face1, v1, v2).
-    fn two_quads_shared_edge(
-        mesh: &mut LoopMesh,
-    ) -> (FaceKey, FaceKey, VertexKey, VertexKey) {
+    fn two_quads_shared_edge(mesh: &mut LoopMesh) -> (FaceKey, FaceKey, VertexKey, VertexKey) {
         let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
         let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
@@ -1588,10 +1615,16 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-        let face0 =
-            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let face1 =
-            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let face0 = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let face1 = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
         (face0, face1, v1, v2)
     }
 
@@ -1631,8 +1664,7 @@ mod tests {
 
         let mut mesh_adj = LoopMesh::new();
         let (f0_adj, _f1_adj, _v1, _v2) = two_quads_shared_edge(&mut mesh_adj);
-        let res_adj =
-            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let res_adj = mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
         let wall_adj = find_wall_on(&mesh_adj, &res_adj.wall_faces, v1, v2);
         let adj_pos = wall_cycle_pos(&mesh_adj, wall_adj);
 
@@ -1664,8 +1696,7 @@ mod tests {
 
         let mut mesh_adj = LoopMesh::new();
         let (f0_adj, _f1b, _v1b, _v2b) = two_quads_shared_edge(&mut mesh_adj);
-        let res_adj =
-            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let res_adj = mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
         let wall_adj = find_wall_on(&mesh_adj, &res_adj.wall_faces, v0, v1);
         let adj_pos = wall_cycle_pos(&mesh_adj, wall_adj);
 
@@ -1694,14 +1725,15 @@ mod tests {
 
         let mut mesh_off = LoopMesh::new();
         let (f0_off, _f1b, _v1, _v2) = two_quads_shared_edge(&mut mesh_off);
-        let res_off =
-            mesh_off.extrude_region_ex_normal_from_adjacent(&[f0_off], false, false);
+        let res_off = mesh_off.extrude_region_ex_normal_from_adjacent(&[f0_off], false, false);
 
         assert_eq!(res_ex.wall_faces.len(), res_off.wall_faces.len());
         for &(a, b) in &[(v0, v1), (v1, v2)] {
             let pos_ex = wall_cycle_pos(&mesh_ex, find_wall_on(&mesh_ex, &res_ex.wall_faces, a, b));
-            let pos_off =
-                wall_cycle_pos(&mesh_off, find_wall_on(&mesh_off, &res_off.wall_faces, a, b));
+            let pos_off = wall_cycle_pos(
+                &mesh_off,
+                find_wall_on(&mesh_off, &res_off.wall_faces, a, b),
+            );
             let n = pos_ex.len();
             let same_rotation =
                 (0..n).any(|shift| (0..n).all(|i| pos_ex[i] == pos_off[(i + shift) % n]));
@@ -1721,17 +1753,19 @@ mod tests {
         // relative to the un-flipped adjacent result.
         let mut mesh_adj = LoopMesh::new();
         let (f0_adj, _f1, v1, v2) = two_quads_shared_edge(&mut mesh_adj);
-        let res_adj =
-            mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
-        let adj_pos =
-            wall_cycle_pos(&mesh_adj, find_wall_on(&mesh_adj, &res_adj.wall_faces, v1, v2));
+        let res_adj = mesh_adj.extrude_region_ex_normal_from_adjacent(&[f0_adj], false, true);
+        let adj_pos = wall_cycle_pos(
+            &mesh_adj,
+            find_wall_on(&mesh_adj, &res_adj.wall_faces, v1, v2),
+        );
 
         let mut mesh_flip = LoopMesh::new();
         let (f0_flip, _f1b, _v1, _v2) = two_quads_shared_edge(&mut mesh_flip);
-        let res_flip =
-            mesh_flip.extrude_region_ex_normal_from_adjacent(&[f0_flip], true, true);
-        let flip_pos =
-            wall_cycle_pos(&mesh_flip, find_wall_on(&mesh_flip, &res_flip.wall_faces, v1, v2));
+        let res_flip = mesh_flip.extrude_region_ex_normal_from_adjacent(&[f0_flip], true, true);
+        let flip_pos = wall_cycle_pos(
+            &mesh_flip,
+            find_wall_on(&mesh_flip, &res_flip.wall_faces, v1, v2),
+        );
 
         assert!(
             cycles_are_reversed(&adj_pos, &flip_pos),
@@ -1803,14 +1837,19 @@ mod tests {
         // verts; the cap references only duplicates.
         let cap = result.cap_faces[0];
         let cap_verts = mesh.face_vert_keys(cap);
-        let dup_verts: HashSet<VertexKey> =
-            result.vert_map.iter().map(|&(_s, d)| d).collect();
+        let dup_verts: HashSet<VertexKey> = result.vert_map.iter().map(|&(_s, d)| d).collect();
         for v in &cap_verts {
-            assert!(dup_verts.contains(v), "cap must reference only duplicate verts");
+            assert!(
+                dup_verts.contains(v),
+                "cap must reference only duplicate verts"
+            );
         }
         let orig_verts = mesh.face_vert_keys(face);
         for v in &orig_verts {
-            assert!(!dup_verts.contains(v), "kept original keeps its source verts");
+            assert!(
+                !dup_verts.contains(v),
+                "kept original keeps its source verts"
+            );
         }
         mesh.validate_topology();
     }
@@ -1896,7 +1935,9 @@ mod tests {
         let source_verts = mesh.face_vert_keys(face);
         let v0 = source_verts[0];
         let v1 = source_verts[1];
-        let excluded = mesh.query_edge_exists(v0, v1).expect("perimeter edge v0-v1");
+        let excluded = mesh
+            .query_edge_exists(v0, v1)
+            .expect("perimeter edge v0-v1");
 
         let result = mesh.extrude_region_exclude(&[face], &[excluded], true, false);
 
@@ -1978,12 +2019,15 @@ mod tests {
         let (centre, _left, _right) = folded_strip(&mut mesh);
 
         let faces_before = mesh.totface();
-        let result =
-            mesh.extrude_region_ex_dissolve_ortho(&[centre], false, true);
+        let result = mesh.extrude_region_ex_dissolve_ortho(&[centre], false, true);
 
         // The centre face still has four boundary edges, so four walls were
         // built; two of them sat on perpendicular surrounds and were dissolved.
-        assert_eq!(result.wall_faces.len(), 4, "four walls built before dissolve");
+        assert_eq!(
+            result.wall_faces.len(),
+            4,
+            "four walls built before dissolve"
+        );
 
         // Dissolve absorbs the two side walls into the two neighbour faces and
         // collapses the stranded boundary verts: strictly fewer faces than the
@@ -2012,8 +2056,7 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (centre, _left, _right) = folded_strip(&mut mesh);
 
-        let result =
-            mesh.extrude_region_ex_dissolve_ortho(&[centre], false, false);
+        let result = mesh.extrude_region_ex_dissolve_ortho(&[centre], false, false);
 
         assert_eq!(result.wall_faces.len(), 4, "four walls built");
         // 3 input faces, centre re-anchored to cap (net 0), + 4 walls = 7.
@@ -2053,13 +2096,18 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-        let face0 =
-            mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let _face1 =
-            mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let face0 = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let _face1 = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
-        let result_dissolve_on =
-            mesh.extrude_region_ex_dissolve_ortho(&[face0], false, true);
+        let result_dissolve_on = mesh.extrude_region_ex_dissolve_ortho(&[face0], false, true);
 
         // Coplanar surround (normal +Z, parallel to cap +Z) is NOT perpendicular,
         // so nothing dissolves: all 4 walls survive, just like plain extrude.
@@ -2149,12 +2197,17 @@ mod tests {
 
             // Four vertical side walls, each sharing one floor edge and standing
             // perpendicular to the floor (normal in the XY plane).
-            let mut wall = |a: VertexKey, b: VertexKey, ta: VertexKey, tb: VertexKey, shared: EdgeKey| {
-                let e_a_ta = mesh.create_edge([a, ta], EdgeCreateFlags::NO_DUPLICATE);
-                let e_ta_tb = mesh.create_edge([ta, tb], EdgeCreateFlags::NO_DUPLICATE);
-                let e_tb_b = mesh.create_edge([tb, b], EdgeCreateFlags::NO_DUPLICATE);
-                mesh.face_create(&[a, ta, tb, b], &[e_a_ta, e_ta_tb, e_tb_b, shared], FaceCreateFlags::NONE);
-            };
+            let mut wall =
+                |a: VertexKey, b: VertexKey, ta: VertexKey, tb: VertexKey, shared: EdgeKey| {
+                    let e_a_ta = mesh.create_edge([a, ta], EdgeCreateFlags::NO_DUPLICATE);
+                    let e_ta_tb = mesh.create_edge([ta, tb], EdgeCreateFlags::NO_DUPLICATE);
+                    let e_tb_b = mesh.create_edge([tb, b], EdgeCreateFlags::NO_DUPLICATE);
+                    mesh.face_create(
+                        &[a, ta, tb, b],
+                        &[e_a_ta, e_ta_tb, e_tb_b, shared],
+                        FaceCreateFlags::NONE,
+                    );
+                };
             wall(f0, f1, t0, t1, e_f01);
             wall(f1, f2, t1, t2, e_f12);
             wall(f2, f3, t2, t3, e_f23);

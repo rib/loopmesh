@@ -402,8 +402,7 @@ impl LoopMesh {
                 let mut current = v_endpoint;
                 let mut came_from = edge;
                 loop {
-                    let Some(next_edge) =
-                        self.vertex_disk_iter(current).find(|&e| e != came_from)
+                    let Some(next_edge) = self.vertex_disk_iter(current).find(|&e| e != came_from)
                     else {
                         break;
                     };
@@ -510,9 +509,7 @@ impl LoopMesh {
         loop {
             // The next chain edge is the one in `current`'s 2-edge disk that
             // we did not arrive on.
-            let next_edge = self
-                .vertex_disk_iter(current)
-                .find(|&e| e != came_from)?;
+            let next_edge = self.vertex_disk_iter(current).find(|&e| e != came_from)?;
             if next_edge != arrived_via && self.edge_op_flag_test(chain, next_edge, 0) {
                 // Ran into a different selected chain edge mid-walk: abandon.
                 return None;
@@ -855,7 +852,11 @@ mod tests {
         let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
         let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
         let e_20 = mesh.create_edge([v[2], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-        let f = mesh.face_create(&[v[0], v[1], v[2]], &[e_01, e_12, e_20], FaceCreateFlags::NONE);
+        let f = mesh.face_create(
+            &[v[0], v[1], v[2]],
+            &[e_01, e_12, e_20],
+            FaceCreateFlags::NONE,
+        );
         (v, vec![e_01, e_12, e_20], f)
     }
 
@@ -1005,7 +1006,10 @@ mod tests {
 
         mesh.dissolve_edges(&[wire], &Default::default());
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         assert!(
             mesh.query_edge_exists(w0, w1).is_some(),
             "wire edge survives (BMesh does not kill wire edges directly)"
@@ -1026,7 +1030,10 @@ mod tests {
 
         mesh.dissolve_edges(&[edges[0]], &Default::default());
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         assert!(
             mesh.query_edge_exists(verts[0], verts[1]).is_some(),
             "boundary edge survives"
@@ -1048,8 +1055,12 @@ mod tests {
 
         // Edge {1,5} sits between faces[0]/faces[1] (bottom row).
         // Edge {10,14} sits between faces[6]/faces[7] (top row) — disjoint.
-        let edge_a = mesh.query_edge_exists(verts[1], verts[5]).expect("edge {1,5}");
-        let edge_b = mesh.query_edge_exists(verts[10], verts[14]).expect("edge {10,14}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[5])
+            .expect("edge {1,5}");
+        let edge_b = mesh
+            .query_edge_exists(verts[10], verts[14])
+            .expect("edge {10,14}");
 
         mesh.dissolve_edges(&[edge_a, edge_b], &Default::default());
 
@@ -1069,8 +1080,12 @@ mod tests {
         let e0 = mesh.totedge();
         let f0 = mesh.totface();
 
-        let edge_a = mesh.query_edge_exists(verts[1], verts[5]).expect("edge {1,5}");
-        let edge_b = mesh.query_edge_exists(verts[10], verts[14]).expect("edge {10,14}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[5])
+            .expect("edge {1,5}");
+        let edge_b = mesh
+            .query_edge_exists(verts[10], verts[14])
+            .expect("edge {10,14}");
 
         mesh.dissolve_edges(&[edge_b, edge_a], &Default::default());
 
@@ -1095,8 +1110,12 @@ mod tests {
 
         // Centre vert is verts[5]. Two interior edges meeting at it:
         // {1,5} (between faces[0]/faces[1]) and {5,6} (between faces[1]/faces[2]).
-        let edge_a = mesh.query_edge_exists(verts[1], verts[5]).expect("edge {1,5}");
-        let edge_b = mesh.query_edge_exists(verts[5], verts[6]).expect("edge {5,6}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[5])
+            .expect("edge {1,5}");
+        let edge_b = mesh
+            .query_edge_exists(verts[5], verts[6])
+            .expect("edge {5,6}");
 
         mesh.dissolve_edges(&[edge_a, edge_b], &Default::default());
 
@@ -1126,7 +1145,10 @@ mod tests {
 
         mesh.dissolve_edges(&[spine], &Default::default());
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         assert!(
             mesh.query_edge_exists(s0, s1).is_some(),
             "non-manifold spine edge survives"
@@ -1148,7 +1170,10 @@ mod tests {
 
         mesh.dissolve_edges(&edges, &Default::default());
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         mesh.validate_topology();
     }
 
@@ -1162,7 +1187,10 @@ mod tests {
 
         mesh.dissolve_edges(&[], &Default::default());
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         mesh.validate_topology();
     }
 
@@ -1221,7 +1249,9 @@ mod tests {
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
 
-        let edge = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
 
         let result = mesh.dissolve_edges(&[edge], &use_verts(std::f32::consts::PI));
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1231,7 +1261,10 @@ mod tests {
         assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&verts[1]), "vert 1 (became edge-pair) collapsed");
+        assert!(
+            !live.contains(&verts[1]),
+            "vert 1 (became edge-pair) collapsed"
+        );
         assert!(live.contains(&verts[4]), "vert 4 (still 3-valent) survives");
         // The merged-then-collapsed face is the pentagon 0,2,5,4,3.
         assert!(
@@ -1250,7 +1283,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
 
-        let edge = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
 
         let result = mesh.dissolve_edges(&[edge], &use_verts(0.0));
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1261,7 +1296,11 @@ mod tests {
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&verts[1]), "vert 1 survives — no collapse");
-        assert_eq!(mesh.vert_edge_keys(verts[1]).len(), 2, "vert 1 is now edge-pair but uncollapsed");
+        assert_eq!(
+            mesh.vert_edge_keys(verts[1]).len(),
+            2,
+            "vert 1 is now edge-pair but uncollapsed"
+        );
         mesh.validate_topology();
     }
 
@@ -1284,8 +1323,16 @@ mod tests {
         let e_20 = mesh.create_edge([v[2], v[0]], EdgeCreateFlags::NO_DUPLICATE);
         let e_23 = mesh.create_edge([v[2], v[3]], EdgeCreateFlags::NO_DUPLICATE);
         let e_30 = mesh.create_edge([v[3], v[0]], EdgeCreateFlags::NO_DUPLICATE);
-        mesh.face_create(&[v[0], v[1], v[2]], &[e_01, e_12, e_20], FaceCreateFlags::NONE);
-        mesh.face_create(&[v[0], v[2], v[3]], &[e_20, e_23, e_30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[0], v[1], v[2]],
+            &[e_01, e_12, e_20],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[v[0], v[2], v[3]],
+            &[e_20, e_23, e_30],
+            FaceCreateFlags::NONE,
+        );
 
         let diagonal = mesh.query_edge_exists(v[0], v[2]).expect("diagonal {0,2}");
 
@@ -1294,11 +1341,19 @@ mod tests {
 
         // The guard fires at both endpoints: neither collapses. The two tris
         // become one quad; verts unchanged. Same as use_verts = false.
-        assert_eq!(mesh.totvert(), 4, "0 V removed — guard preserved both endpoints");
+        assert_eq!(
+            mesh.totvert(),
+            4,
+            "0 V removed — guard preserved both endpoints"
+        );
         assert_eq!(mesh.totedge(), 4, "-1 E (the diagonal)");
         assert_eq!(mesh.totface(), 1, "-1 F (two tris → one quad)");
         let faces = mesh.face_keys();
-        assert_eq!(mesh.face_len(faces[0]), 4, "the merged face is an intact quad");
+        assert_eq!(
+            mesh.face_len(faces[0]),
+            4,
+            "the merged face is an intact quad"
+        );
         mesh.validate_topology();
     }
 
@@ -1314,8 +1369,12 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
 
-        let edge_a = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
-        let edge_b = mesh.query_edge_exists(verts[4], verts[5]).expect("edge {4,5}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
+        let edge_b = mesh
+            .query_edge_exists(verts[4], verts[5])
+            .expect("edge {4,5}");
 
         let result = mesh.dissolve_edges(&[edge_a, edge_b], &use_verts(std::f32::consts::PI));
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1325,8 +1384,14 @@ mod tests {
             live.contains(&verts[4]),
             "vert 4 touches unselected faces with >1 tagged edge — filter preserves it"
         );
-        assert!(!live.contains(&verts[1]), "vert 1 (one tagged edge) collapses");
-        assert!(!live.contains(&verts[5]), "vert 5 (one tagged edge) collapses");
+        assert!(
+            !live.contains(&verts[1]),
+            "vert 1 (one tagged edge) collapses"
+        );
+        assert!(
+            !live.contains(&verts[5]),
+            "vert 5 (one tagged edge) collapses"
+        );
         mesh.validate_topology();
     }
 
@@ -1381,12 +1446,30 @@ mod tests {
     fn dissolve_edges_use_verts_chain_walk_through_subdivided_chord() {
         let mut mesh = LoopMesh::new();
         let v = build_chain_through_edge_pair_verts(&mut mesh);
-        assert_eq!(mesh.vert_edge_keys(v[4]).len(), 2, "vert 4 is pre-merge edge-pair");
-        assert_eq!(mesh.vert_edge_keys(v[5]).len(), 2, "vert 5 is pre-merge edge-pair");
-        assert_eq!(mesh.vert_edge_keys(v[1]).len(), 3, "vert 1 is a 3-valent terminus");
-        assert_eq!(mesh.vert_edge_keys(v[3]).len(), 3, "vert 3 is a 3-valent terminus");
+        assert_eq!(
+            mesh.vert_edge_keys(v[4]).len(),
+            2,
+            "vert 4 is pre-merge edge-pair"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(v[5]).len(),
+            2,
+            "vert 5 is pre-merge edge-pair"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(v[1]).len(),
+            3,
+            "vert 1 is a 3-valent terminus"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(v[3]).len(),
+            3,
+            "vert 3 is a 3-valent terminus"
+        );
 
-        let edge = mesh.query_edge_exists(v[4], v[5]).expect("middle chord segment {4,5}");
+        let edge = mesh
+            .query_edge_exists(v[4], v[5])
+            .expect("middle chord segment {4,5}");
 
         let result = mesh.dissolve_edges(&[edge], &use_verts(std::f32::consts::PI));
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1396,8 +1479,14 @@ mod tests {
         // consumed by the merge of {4,5} (their shared segment dies). The
         // termini collapse, removing them from the live set.
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&v[1]), "terminus vert 1 collapsed (chain-walk target)");
-        assert!(!live.contains(&v[3]), "terminus vert 3 collapsed (chain-walk target)");
+        assert!(
+            !live.contains(&v[1]),
+            "terminus vert 1 collapsed (chain-walk target)"
+        );
+        assert!(
+            !live.contains(&v[3]),
+            "terminus vert 3 collapsed (chain-walk target)"
+        );
         mesh.validate_topology();
     }
 
@@ -1425,12 +1514,20 @@ mod tests {
         // CD). Tag both with the same value so the survivor must carry the
         // propagated (non-default) value regardless of which side is kept.
         let cd_value = [0.25_f32, 0.5, 0.75];
-        let e_01 = mesh.query_edge_exists(verts[0], verts[1]).expect("edge {0,1}");
-        let e_12 = mesh.query_edge_exists(verts[1], verts[2]).expect("edge {1,2}");
-        mesh.edge_attribs_mut().set_vec3(tint, e_01.as_usize(), cd_value);
-        mesh.edge_attribs_mut().set_vec3(tint, e_12.as_usize(), cd_value);
+        let e_01 = mesh
+            .query_edge_exists(verts[0], verts[1])
+            .expect("edge {0,1}");
+        let e_12 = mesh
+            .query_edge_exists(verts[1], verts[2])
+            .expect("edge {1,2}");
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, e_01.as_usize(), cd_value);
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, e_12.as_usize(), cd_value);
 
-        let edge = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
         let result = mesh.dissolve_edges(&[edge], &use_verts(std::f32::consts::PI));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
@@ -1471,10 +1568,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0) + displacement,
             Vec3::new(1.0, 1.0, 0.0) + displacement,
         ];
-        let v: Vec<VertexKey> = positions
-            .iter()
-            .map(|&p| mesh.create_vertex(p))
-            .collect();
+        let v: Vec<VertexKey> = positions.iter().map(|&p| mesh.create_vertex(p)).collect();
 
         let e_01 = mesh.create_edge([v[0], v[1]], EdgeCreateFlags::NO_DUPLICATE);
         let e_12 = mesh.create_edge([v[1], v[2]], EdgeCreateFlags::NO_DUPLICATE);
@@ -1515,21 +1609,35 @@ mod tests {
         let v = build_folded_two_quads(&mut mesh, Vec3::new(0.0, 0.0, 1.0));
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (6, 7, 2));
 
-        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge {1,2}");
+        let shared = mesh
+            .query_edge_exists(v[1], v[2])
+            .expect("shared edge {1,2}");
 
         let result = mesh.dissolve_edges(&[shared], &use_verts(0.5));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
-        assert_eq!(mesh.totvert(), 6, "0 V removed — both candidates rejected by the gate");
+        assert_eq!(
+            mesh.totvert(),
+            6,
+            "0 V removed — both candidates rejected by the gate"
+        );
         assert_eq!(mesh.totedge(), 6, "-1 E (only the merge)");
-        assert_eq!(mesh.totface(), 1, "-1 F (the two quads merge into one hexagon)");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "-1 F (the two quads merge into one hexagon)"
+        );
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&v[1]), "vert 1 survives — α_raw = π/2 ≥ 0.5");
         assert!(live.contains(&v[2]), "vert 2 survives — α_raw = π/2 ≥ 0.5");
         let face = mesh.face_keys();
         assert_eq!(face.len(), 1);
-        assert_eq!(mesh.face_len(face[0]), 6, "merged hexagon perimeter 0-1-4-5-2-3");
+        assert_eq!(
+            mesh.face_len(face[0]),
+            6,
+            "merged hexagon perimeter 0-1-4-5-2-3"
+        );
         mesh.validate_topology();
     }
 
@@ -1543,14 +1651,22 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let v = build_folded_two_quads(&mut mesh, Vec3::new(0.0, 0.0, 1.0));
 
-        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge {1,2}");
+        let shared = mesh
+            .query_edge_exists(v[1], v[2])
+            .expect("shared edge {1,2}");
 
         let result = mesh.dissolve_edges(&[shared], &use_verts(2.0));
         assert_eq!(result, DissolveEdgesResult::Ran);
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&v[1]), "vert 1 collapses — α_raw = π/2 < 2.0");
-        assert!(!live.contains(&v[2]), "vert 2 collapses — α_raw = π/2 < 2.0");
+        assert!(
+            !live.contains(&v[1]),
+            "vert 1 collapses — α_raw = π/2 < 2.0"
+        );
+        assert!(
+            !live.contains(&v[2]),
+            "vert 2 collapses — α_raw = π/2 < 2.0"
+        );
         assert_eq!(mesh.totvert(), 4, "-2 V (both endpoints collapsed)");
         assert_eq!(mesh.totface(), 1, "-1 F (the merge)");
         mesh.validate_topology();
@@ -1569,7 +1685,9 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
 
-        let edge = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
+        let edge = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
 
         let result = mesh.dissolve_edges(&[edge], &use_verts(0.5));
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1579,7 +1697,10 @@ mod tests {
         assert_eq!(mesh.totface(), 3, "-1 F (faces 0+1 merged)");
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(!live.contains(&verts[1]), "vert 1 (straight chain) collapsed by the gate");
+        assert!(
+            !live.contains(&verts[1]),
+            "vert 1 (straight chain) collapsed by the gate"
+        );
         assert!(live.contains(&verts[4]), "vert 4 (still 3-valent) survives");
         mesh.validate_topology();
     }
@@ -1625,10 +1746,18 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (9, 12, 4));
-        assert_eq!(mesh.vert_edge_keys(verts[4]).len(), 4, "vert 4 is the 4-valence centre");
+        assert_eq!(
+            mesh.vert_edge_keys(verts[4]).len(),
+            4,
+            "vert 4 is the 4-valence centre"
+        );
 
-        let edge_a = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
-        let edge_b = mesh.query_edge_exists(verts[3], verts[4]).expect("edge {3,4}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
+        let edge_b = mesh
+            .query_edge_exists(verts[3], verts[4])
+            .expect("edge {3,4}");
 
         let result = mesh.dissolve_edges(&[edge_a, edge_b], &use_face_split());
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1662,8 +1791,12 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_face_grid_2x2(&mut mesh);
 
-        let edge_a = mesh.query_edge_exists(verts[1], verts[4]).expect("edge {1,4}");
-        let edge_b = mesh.query_edge_exists(verts[3], verts[4]).expect("edge {3,4}");
+        let edge_a = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("edge {1,4}");
+        let edge_b = mesh
+            .query_edge_exists(verts[3], verts[4])
+            .expect("edge {3,4}");
 
         let result = mesh.dissolve_edges(&[edge_a, edge_b], &Default::default());
         assert_eq!(result, DissolveEdgesResult::Ran);
@@ -1677,7 +1810,11 @@ mod tests {
             mesh.query_edge_exists(verts[5], verts[7]).is_none(),
             "without the pre-pass no {{5,7}} diagonal exists"
         );
-        assert_eq!(count_triangles(&mesh), 0, "no triangles without the pre-pass");
+        assert_eq!(
+            count_triangles(&mesh),
+            0,
+            "no triangles without the pre-pass"
+        );
         mesh.validate_topology();
     }
 
@@ -1717,7 +1854,10 @@ mod tests {
     fn dissolve_edges_use_face_split_noop_when_candidates_are_edge_pairs() {
         let mut mesh = LoopMesh::new();
         let (verts, _faces) = build_grid_3x3(&mut mesh);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (16, 24, 9));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (16, 24, 9)
+        );
 
         // verts[5] and verts[6] are deep-interior 4-valence verts sharing an
         // interior edge between faces[1] and faces[4].
@@ -1767,7 +1907,10 @@ mod tests {
         let result = mesh.dissolve_edges(&[], &use_face_split());
         assert_eq!(result, DissolveEdgesResult::Ran);
 
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
         assert_eq!(count_triangles(&mesh), 0, "no slices on empty input");
         mesh.validate_topology();
     }

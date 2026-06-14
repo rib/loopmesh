@@ -17,8 +17,8 @@
 
 use glam::Vec3;
 use loopmesh::loopmesh::{
-    AttributeKey, AttrType, EdgeCreateFlags, ElementAttributeDesc, ElementKey,
-    FaceCreateFlags, InterpPolicy, LoopMesh, MeshIter,
+    AttrType, AttributeKey, EdgeCreateFlags, ElementAttributeDesc, ElementKey, FaceCreateFlags,
+    InterpPolicy, LoopMesh, MeshIter,
 };
 
 // ----- Small helpers -----
@@ -317,11 +317,8 @@ fn no_interp_policy_leaves_destination_unchanged() {
 
     let opaque = mesh
         .register_vertex_attribute(
-            ElementAttributeDesc::numeric(
-                AttributeKey::custom("opaque_id"),
-                AttrType::F32,
-            )
-            .with_interp(InterpPolicy::NoInterp),
+            ElementAttributeDesc::numeric(AttributeKey::custom("opaque_id"), AttrType::F32)
+                .with_interp(InterpPolicy::NoInterp),
         )
         .unwrap();
     mesh.vertex_attribs_mut()

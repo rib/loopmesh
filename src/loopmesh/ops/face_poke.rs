@@ -641,9 +641,17 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        let face_a = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let face_a = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         // Quad B walks v1->v4->v5->v2->v1, sharing edge e12 (v1<->v2) with A.
-        let face_b = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let face_b = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         (face_a, face_b, vec![v0, v1, v2, v3], vec![v1, v4, v5, v2])
     }

@@ -327,38 +327,34 @@ impl LoopMesh {
         // §7.3: strip vert = endpoint + offset · (in-face perpendicular to E),
         // the perpendicular chosen to point into the face interior (toward its
         // centroid). The face normal disambiguates the in-plane perpendicular.
-        let strip_a_left =
-            self.create_vertex(strip_vert_position(
-                self.vertex_position(a),
-                direction,
-                left_normal,
-                left_center,
-                offset,
-            ));
-        let strip_a_right =
-            self.create_vertex(strip_vert_position(
-                self.vertex_position(a),
-                direction,
-                right_normal,
-                right_center,
-                offset,
-            ));
-        let strip_b_left =
-            self.create_vertex(strip_vert_position(
-                self.vertex_position(b),
-                direction,
-                left_normal,
-                left_center,
-                offset,
-            ));
-        let strip_b_right =
-            self.create_vertex(strip_vert_position(
-                self.vertex_position(b),
-                direction,
-                right_normal,
-                right_center,
-                offset,
-            ));
+        let strip_a_left = self.create_vertex(strip_vert_position(
+            self.vertex_position(a),
+            direction,
+            left_normal,
+            left_center,
+            offset,
+        ));
+        let strip_a_right = self.create_vertex(strip_vert_position(
+            self.vertex_position(a),
+            direction,
+            right_normal,
+            right_center,
+            offset,
+        ));
+        let strip_b_left = self.create_vertex(strip_vert_position(
+            self.vertex_position(b),
+            direction,
+            left_normal,
+            left_center,
+            offset,
+        ));
+        let strip_b_right = self.create_vertex(strip_vert_position(
+            self.vertex_position(b),
+            direction,
+            right_normal,
+            right_center,
+            offset,
+        ));
         result
             .verts
             .extend([strip_a_left, strip_a_right, strip_b_left, strip_b_right]);
@@ -405,12 +401,7 @@ impl LoopMesh {
         // §7.1 item 2 / §5.1 winding: build the strip quad over the four strip
         // verts, wound opposite to how fL traverses its new `aL–bL` long edge so
         // the quad and fL share that edge with consistent (radial-2) traversal.
-        let strip = self.build_strip_quad(
-            strip_a_left,
-            strip_b_left,
-            strip_b_right,
-            strip_a_right,
-        );
+        let strip = self.build_strip_quad(strip_a_left, strip_b_left, strip_b_right, strip_a_right);
         result.faces.push(strip.face);
         result.edges.extend(strip.edges);
 
@@ -575,8 +566,7 @@ impl LoopMesh {
         let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors.len());
 
         for sector in &sectors {
-            let boundvert_position =
-                self.solve_meet_point(vertex, vertex_position, sector, offset);
+            let boundvert_position = self.solve_meet_point(vertex, vertex_position, sector, offset);
             let boundvert = self.create_vertex(boundvert_position);
             result.verts.push(boundvert);
             boundverts.push(boundvert);
@@ -690,8 +680,14 @@ impl LoopMesh {
             if face == face_left || face == face_right {
                 continue;
             }
-            let ordered =
-                self.order_third_face_strip(face, vertex, left_other, right_other, strip_left, strip_right);
+            let ordered = self.order_third_face_strip(
+                face,
+                vertex,
+                left_other,
+                right_other,
+                strip_left,
+                strip_right,
+            );
             set_face_substitution(substitutions, vertex, face, ordered);
         }
     }
@@ -882,7 +878,8 @@ impl LoopMesh {
 
         self.face_kill(face);
         let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-        self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+        self.face_attribs
+            .copy_into(new_face.as_usize(), face.as_usize());
     }
 
     /// Build one beveled edge's strip quad over its four near/far corner verts
@@ -1043,9 +1040,17 @@ impl LoopMesh {
             }
 
             if face == sub.face_left {
-                new_cycle.push(if w == sub.a { sub.strip_a_left } else { sub.strip_b_left });
+                new_cycle.push(if w == sub.a {
+                    sub.strip_a_left
+                } else {
+                    sub.strip_b_left
+                });
             } else if face == sub.face_right {
-                new_cycle.push(if w == sub.a { sub.strip_a_right } else { sub.strip_b_right });
+                new_cycle.push(if w == sub.a {
+                    sub.strip_a_right
+                } else {
+                    sub.strip_b_right
+                });
             } else {
                 // Third face: replace the corner with both strip verts, ordered so
                 // the one sharing the incoming edge sits next to `prev`.
@@ -1054,9 +1059,19 @@ impl LoopMesh {
                     .query_edge_exists(prev_vertex, w)
                     .expect("third face's incoming corner edge exists");
                 let (left_other, right_other, strip_left, strip_right) = if w == sub.a {
-                    (sub.left_other_a, sub.right_other_a, sub.strip_a_left, sub.strip_a_right)
+                    (
+                        sub.left_other_a,
+                        sub.right_other_a,
+                        sub.strip_a_left,
+                        sub.strip_a_right,
+                    )
                 } else {
-                    (sub.left_other_b, sub.right_other_b, sub.strip_b_left, sub.strip_b_right)
+                    (
+                        sub.left_other_b,
+                        sub.right_other_b,
+                        sub.strip_b_left,
+                        sub.strip_b_right,
+                    )
                 };
                 if incoming_edge == left_other {
                     new_cycle.push(strip_left);
@@ -1076,7 +1091,8 @@ impl LoopMesh {
 
         self.face_kill(face);
         let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-        self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+        self.face_attribs
+            .copy_into(new_face.as_usize(), face.as_usize());
     }
 
     /// Build the strip quad over the four strip verts in the cyclic order
@@ -1114,7 +1130,8 @@ impl LoopMesh {
             .map(|i| {
                 let p = ring[i];
                 let q = ring[(i + 1) % ring.len()];
-                self.query_edge_exists(p, q).expect("strip quad edge exists")
+                self.query_edge_exists(p, q)
+                    .expect("strip quad edge exists")
             })
             .collect();
         edges.sort_by_key(|e| e.as_usize());
@@ -1126,12 +1143,7 @@ impl LoopMesh {
     /// The edge of `face` incident to `vertex` that is **not** `exclude` (BEVEL.md
     /// §7.4): a face corner sits on exactly two of its edges, so excluding the
     /// beveled edge leaves the single other one.
-    fn face_other_edge_at(
-        &self,
-        face: FaceKey,
-        vertex: VertexKey,
-        exclude: EdgeKey,
-    ) -> EdgeKey {
+    fn face_other_edge_at(&self, face: FaceKey, vertex: VertexKey, exclude: EdgeKey) -> EdgeKey {
         let mut found = None;
         for loop_key in self.face_loop_keys(face) {
             let loop_edge = self.loop_edge(loop_key);
@@ -1201,7 +1213,11 @@ impl LoopMesh {
                 .iter()
                 .map(|&edge| {
                     let [a, b] = self.edge_vert_keys(edge);
-                    if a == vertex { b } else { a }
+                    if a == vertex {
+                        b
+                    } else {
+                        a
+                    }
                 })
                 .collect();
             let far_positions: Vec<Vec3> =
@@ -1254,11 +1270,9 @@ impl LoopMesh {
     ) -> Vec<BeveledCorner> {
         let mut corners = Vec::with_capacity(frames.len());
         for frame in frames {
-            let incident_edges: Vec<EdgeKey> =
-                frame.placements.iter().map(|p| p.edge).collect();
+            let incident_edges: Vec<EdgeKey> = frame.placements.iter().map(|p| p.edge).collect();
             let incident_faces = self.vert_face_keys(frame.vertex);
-            let interior_fan =
-                self.is_interior_fan(frame.vertex, &incident_edges, &incident_faces);
+            let interior_fan = self.is_interior_fan(frame.vertex, &incident_edges, &incident_faces);
 
             let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
                 Vec::with_capacity(frame.placements.len());
@@ -1312,8 +1326,7 @@ impl LoopMesh {
                         .iter()
                         .find(|c| c.vertex == w)
                         .expect("a beveled corner vertex has a ring");
-                    let prev_vertex =
-                        cycle_verts[(index + cycle_length - 1) % cycle_length];
+                    let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
                     let next_vertex = cycle_verts[(index + 1) % cycle_length];
 
                     let incoming_edge = self
@@ -1323,10 +1336,8 @@ impl LoopMesh {
                         .query_edge_exists(w, next_vertex)
                         .expect("incident face's outgoing corner edge exists");
 
-                    new_cycle
-                        .push(self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge));
-                    new_cycle
-                        .push(self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge));
+                    new_cycle.push(self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge));
+                    new_cycle.push(self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge));
                 } else {
                     new_cycle.push(w);
                 }
@@ -1334,7 +1345,8 @@ impl LoopMesh {
 
             self.face_kill(face);
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-            self.face_attribs.copy_into(new_face.as_usize(), face.as_usize());
+            self.face_attribs
+                .copy_into(new_face.as_usize(), face.as_usize());
         }
     }
 
@@ -1369,10 +1381,7 @@ impl LoopMesh {
 
     /// Walk the disk's chamfer edges into an ordered ring and build the cap face
     /// over them, wound opposite the incident faces (BEVEL.md §5.1).
-    fn build_cap_face(
-        &mut self,
-        ring_vert_for_edge: &[(EdgeKey, VertexKey)],
-    ) -> Option<CapFace> {
+    fn build_cap_face(&mut self, ring_vert_for_edge: &[(EdgeKey, VertexKey)]) -> Option<CapFace> {
         let ring_verts: Vec<VertexKey> = ring_vert_for_edge.iter().map(|&(_, r)| r).collect();
 
         // The chamfer edges minted by the re-stitch connect ring verts pairwise.
@@ -1507,7 +1516,11 @@ fn set_face_substitution(
         .find(|s| s.vertex == vertex && s.face == face)
     {
         Some(existing) => existing.verts = verts,
-        None => substitutions.push(FaceSubstitution { vertex, face, verts }),
+        None => substitutions.push(FaceSubstitution {
+            vertex,
+            face,
+            verts,
+        }),
     }
 }
 
@@ -1665,7 +1678,8 @@ fn solve_3x3(m: &[[f32; 3]; 3], rhs: &[f32; 3]) -> Option<[f32; 3]> {
         for row in 0..3 {
             replaced[row][column] = rhs[row];
         }
-        let det_c = replaced[0][0] * (replaced[1][1] * replaced[2][2] - replaced[1][2] * replaced[2][1])
+        let det_c = replaced[0][0]
+            * (replaced[1][1] * replaced[2][2] - replaced[1][2] * replaced[2][1])
             - replaced[0][1] * (replaced[1][0] * replaced[2][2] - replaced[1][2] * replaced[2][0])
             + replaced[0][2] * (replaced[1][0] * replaced[2][1] - replaced[1][1] * replaced[2][0]);
         solution[column] = det_c / det;
@@ -1753,7 +1767,9 @@ mod tests {
         // 1.0, the §4.4.3 collision offset, on every beveled edge.
         for &ring in &result.verts {
             let ring_position = mesh.vertex_position(ring);
-            let slide = (ring_position - pos_a).length().min((ring_position - pos_b).length());
+            let slide = (ring_position - pos_a)
+                .length()
+                .min((ring_position - pos_b).length());
             assert!(
                 (slide - 1.0).abs() < 1.0e-5,
                 "clamped slide {slide} should be 1.0 (effective offset), not 1.5",
@@ -1833,7 +1849,10 @@ mod tests {
             2,
             "two distinct ring verts coincide at the midpoint, no merge",
         );
-        assert_ne!(coincident[0], coincident[1], "the pair is two distinct verts");
+        assert_ne!(
+            coincident[0], coincident[1],
+            "the pair is two distinct verts"
+        );
 
         // They are joined by a real (zero-length) inner-segment edge.
         let segment = mesh.query_edge_exists(coincident[0], coincident[1]);
@@ -1933,10 +1952,7 @@ mod tests {
 
         // The original corner is gone.
         assert!(
-            !mesh
-                .vert_keys()
-                .into_iter()
-                .any(|v| v == corner),
+            !mesh.vert_keys().into_iter().any(|v| v == corner),
             "beveled vertex removed",
         );
 
@@ -1974,7 +1990,10 @@ mod tests {
         let small = make(0.25);
         let large = make(0.5);
         for distance in &small {
-            assert!((distance - 0.25).abs() < 1.0e-5, "small slide is the offset");
+            assert!(
+                (distance - 0.25).abs() < 1.0e-5,
+                "small slide is the offset"
+            );
         }
         for distance in &large {
             assert!((distance - 0.5).abs() < 1.0e-5, "large slide is the offset");
@@ -2096,7 +2115,11 @@ mod tests {
             },
         );
 
-        assert_eq!(counts(&mesh), (10, 15, 7), "isolated edge +2 V / +3 E / +1 F");
+        assert_eq!(
+            counts(&mesh),
+            (10, 15, 7),
+            "isolated edge +2 V / +3 E / +1 F"
+        );
         assert_eq!(result.verts.len(), 4, "four strip verts");
         assert_eq!(result.faces.len(), 1, "the strip quad is the only new face");
 
@@ -2121,7 +2144,11 @@ mod tests {
     fn edge_bevel_strip_verts_perpendicular_offset() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let edge = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
 
         let offset = 0.25_f32;
         let result = mesh.bevel(
@@ -2158,7 +2185,11 @@ mod tests {
     fn edge_bevel_face_sizes_and_strip_manifold() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let edge = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
 
         let result = mesh.bevel(
             &[edge.into()],
@@ -2232,7 +2263,11 @@ mod tests {
         mesh_add_cube(&mut mesh);
         assert_eq!(counts(&mesh), (8, 12, 6));
 
-        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
         let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
 
         let result = mesh.bevel(
@@ -2260,12 +2295,22 @@ mod tests {
             .iter()
             .filter(|&&v| (mesh.vertex_position(v) - front_meet).length() < 1.0e-5)
             .count();
-        assert_eq!(near, 1, "the planar Front sector boundvert is the exact meet");
+        assert_eq!(
+            near, 1,
+            "the planar Front sector boundvert is the exact meet"
+        );
 
         // Vertex 0 and the two far endpoints are consumed.
-        for removed in [Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)] {
+        for removed in [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+        ] {
             assert!(
-                !mesh.vert_keys().into_iter().any(|v| mesh.vertex_position(v) == removed),
+                !mesh
+                    .vert_keys()
+                    .into_iter()
+                    .any(|v| mesh.vertex_position(v) == removed),
                 "original endpoint {removed:?} removed",
             );
         }
@@ -2284,7 +2329,11 @@ mod tests {
         mesh_add_cube(&mut mesh);
         assert_eq!(counts(&mesh), (8, 12, 6));
 
-        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
         let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
         let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
 
@@ -2332,7 +2381,10 @@ mod tests {
             Vec3::new(1.0, -1.0, 1.0),
         ] {
             assert!(
-                !mesh.vert_keys().into_iter().any(|v| mesh.vertex_position(v) == removed),
+                !mesh
+                    .vert_keys()
+                    .into_iter()
+                    .any(|v| mesh.vertex_position(v) == removed),
                 "original endpoint {removed:?} removed",
             );
         }
@@ -2346,7 +2398,11 @@ mod tests {
     fn edge_bevel_three_edge_junction_patch_manifold() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let e01 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
         let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
         let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
 
@@ -2382,7 +2438,11 @@ mod tests {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let before = counts(&mesh);
-        let edge = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0));
+        let edge = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
 
         let result = mesh.bevel(
             &[edge.into()],
@@ -2749,17 +2809,15 @@ fn order_ring_cycle(
     let mut ordered = vec![start];
     // First step: pick either chamfer neighbour of `start`.
     let mut previous = start;
-    let mut current = neighbours
-        .iter()
-        .find_map(|&(a, b)| {
-            if a == start {
-                Some(b)
-            } else if b == start {
-                Some(a)
-            } else {
-                None
-            }
-        })?;
+    let mut current = neighbours.iter().find_map(|&(a, b)| {
+        if a == start {
+            Some(b)
+        } else if b == start {
+            Some(a)
+        } else {
+            None
+        }
+    })?;
 
     while current != start {
         ordered.push(current);

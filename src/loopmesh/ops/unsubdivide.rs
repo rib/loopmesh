@@ -124,9 +124,8 @@ impl LoopMesh {
             while !frontier.is_empty() {
                 next_frontier.clear();
                 for &front_vert in &frontier {
-                    let neighbours = self.unsubdivide_eligible_neighbours(
-                        front_vert, tagged, tagged_bit,
-                    );
+                    let neighbours =
+                        self.unsubdivide_eligible_neighbours(front_vert, tagged, tagged_bit);
                     for neighbour in neighbours {
                         if self.vert_op_flag_test(colour, neighbour, VISITED_BIT) {
                             continue;
@@ -591,15 +590,27 @@ mod tests {
         let e57 = edge(mesh, 5, 7); // interior
 
         // qA = [0, 1, 4, 3] (quad).
-        mesh.face_create(&[v[0], v[1], v[4], v[3]], &[e01, e14, e34, e30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[0], v[1], v[4], v[3]],
+            &[e01, e14, e34, e30],
+            FaceCreateFlags::NONE,
+        );
         // qB = [1, 2, 5, 4] (quad).
-        mesh.face_create(&[v[1], v[2], v[5], v[4]], &[e12, e52, e45, e14], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[1], v[2], v[5], v[4]],
+            &[e12, e52, e45, e14],
+            FaceCreateFlags::NONE,
+        );
         // triR = [2, 8, 5] (triangle, zero-area sliver).
         mesh.face_create(&[v[2], v[8], v[5]], &[e28, e58, e52], FaceCreateFlags::NONE);
         // triT = [5, 8, 7] (triangle).
         mesh.face_create(&[v[5], v[8], v[7]], &[e58, e87, e57], FaceCreateFlags::NONE);
         // pent = [3, 4, 5, 7, 6] (pentagon).
-        mesh.face_create(&[v[3], v[4], v[5], v[7], v[6]], &[e34, e45, e57, e76, e63], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v[3], v[4], v[5], v[7], v[6]],
+            &[e34, e45, e57, e76, e63],
+            FaceCreateFlags::NONE,
+        );
         v
     }
 
@@ -616,7 +627,11 @@ mod tests {
 
         mesh.unsubdivide(&verts, 1);
 
-        assert_eq!(mesh.totvert(), 16, "16 V — one independent class of 9 removed");
+        assert_eq!(
+            mesh.totvert(),
+            16,
+            "16 V — one independent class of 9 removed"
+        );
         assert_eq!(mesh.totedge(), 28, "28 E");
         assert_eq!(mesh.totface(), 13, "13 F");
 
@@ -634,8 +649,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let verts = build_grid_n_faces(&mut mesh, 4);
 
-        let original: Vec<(VertexKey, Vec3)> =
-            verts.iter().map(|&v| (v, mesh.vertex_position(v))).collect();
+        let original: Vec<(VertexKey, Vec3)> = verts
+            .iter()
+            .map(|&v| (v, mesh.vertex_position(v)))
+            .collect();
 
         mesh.unsubdivide(&verts, 1);
 
@@ -666,7 +683,11 @@ mod tests {
 
         mesh.unsubdivide(&verts, 1);
 
-        assert_eq!(v0 - mesh.totvert(), 9, "exactly one bipartition class removed");
+        assert_eq!(
+            v0 - mesh.totvert(),
+            9,
+            "exactly one bipartition class removed"
+        );
         mesh.validate_topology();
     }
 
@@ -813,7 +834,11 @@ mod tests {
         mesh.unsubdivide(&partial, 1);
 
         assert_eq!(mesh.totvert(), 15, "one of the two tagged verts removed");
-        assert_eq!(mesh.totedge(), 24, "edges net-unchanged (spokes → diagonals)");
+        assert_eq!(
+            mesh.totedge(),
+            24,
+            "edges net-unchanged (spokes → diagonals)"
+        );
         assert_eq!(mesh.totface(), 10, "n-gon pre-pass nets +1 face");
         // Euler-consistent planar surface with one boundary loop.
         assert_eq!(
@@ -888,11 +913,17 @@ mod tests {
         assert_eq!(mesh.totedge(), 6, "6 E");
         assert_eq!(mesh.totface(), 3, "3 F");
         let (triangles, quads) = face_corner_histogram(&mesh);
-        assert_eq!(triangles, 3, "all-triangle output (no quad pre-pass on a tri fan)");
+        assert_eq!(
+            triangles, 3,
+            "all-triangle output (no quad pre-pass on a tri fan)"
+        );
         assert_eq!(quads, 0);
 
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(live.contains(&center), "center survives as the coarser fan hub");
+        assert!(
+            live.contains(&center),
+            "center survives as the coarser fan hub"
+        );
         mesh.validate_topology();
     }
 
@@ -926,7 +957,11 @@ mod tests {
 
         mesh.unsubdivide(&all, 1);
 
-        assert_eq!(mesh.totvert(), 3, "3 V — two adjacent rim verts removed (§4.4)");
+        assert_eq!(
+            mesh.totvert(),
+            3,
+            "3 V — two adjacent rim verts removed (§4.4)"
+        );
         assert_eq!(mesh.totedge(), 3, "3 E — single triangle");
         assert_eq!(mesh.totface(), 1, "1 F — collapsed to one triangle");
         let (triangles, quads) = face_corner_histogram(&mesh);
@@ -934,7 +969,10 @@ mod tests {
         assert_eq!(quads, 0);
 
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
-        assert!(live.contains(&center), "center survives (held kept as the seed)");
+        assert!(
+            live.contains(&center),
+            "center survives (held kept as the seed)"
+        );
         mesh.validate_topology();
     }
 

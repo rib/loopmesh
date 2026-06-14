@@ -114,9 +114,7 @@ mod tests {
         // Midpoint lands on the chord at t = 0.5.
         let mid = geom.verts[0];
         assert!(
-            mesh.vertex_position(mid)
-                .distance(Vec3::new(1.0, 0.0, 0.0))
-                < 1e-6,
+            mesh.vertex_position(mid).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-6,
             "midpoint at edge centre"
         );
     }
@@ -232,7 +230,11 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e42 = mesh.create_edge([v4, v2], EdgeCreateFlags::NONE);
 
-        let quad = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let quad = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         let tri = mesh.face_create(&[v1, v4, v2], &[e14, e42, e12], FaceCreateFlags::NONE);
         (mesh, e12, quad, tri)
     }
@@ -254,7 +256,10 @@ mod tests {
         // The single midpoint is seen by both faces' loop cycles (crack-free).
         let mid = geom.verts[0];
         let incident = mesh.vert_face_keys(mid);
-        assert!(incident.contains(&quad) && incident.contains(&tri), "shared by both faces");
+        assert!(
+            incident.contains(&quad) && incident.contains(&tri),
+            "shared by both faces"
+        );
     }
 
     #[test]
@@ -290,7 +295,10 @@ mod tests {
         let mid = geom.verts[0];
         for &f in &faces {
             assert_eq!(mesh.face_len(f), 4, "every radial face gains a flat corner");
-            assert!(mesh.vert_face_keys(mid).contains(&f), "midpoint shared by face");
+            assert!(
+                mesh.vert_face_keys(mid).contains(&f),
+                "midpoint shared by face"
+            );
         }
     }
 
@@ -309,12 +317,13 @@ mod tests {
         assert_eq!(geom.verts.len(), 1, "one midpoint");
         let mid = geom.verts[0];
         assert!(
-            mesh.vertex_position(mid)
-                .distance(Vec3::new(1.0, 0.0, 0.0))
-                < 1e-6,
+            mesh.vertex_position(mid).distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-6,
             "midpoint at wire centre"
         );
-        assert!(mesh.vert_face_keys(mid).is_empty(), "no face touches the midpoint");
+        assert!(
+            mesh.vert_face_keys(mid).is_empty(),
+            "no face touches the midpoint"
+        );
     }
 
     #[test]

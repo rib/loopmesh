@@ -49,9 +49,8 @@ impl LeadingRing {
     /// first, then edges, then verts, mirroring the duplicate/extrude result
     /// ordering used elsewhere in the crate.
     fn into_geom_out(self) -> Vec<GeomKey> {
-        let mut out: Vec<GeomKey> = Vec::with_capacity(
-            self.faces.len() + self.edges.len() + self.verts.len(),
-        );
+        let mut out: Vec<GeomKey> =
+            Vec::with_capacity(self.faces.len() + self.edges.len() + self.verts.len());
         out.extend(self.faces.into_iter().map(GeomKey::from));
         out.extend(self.edges.into_iter().map(GeomKey::from));
         out.extend(self.verts.into_iter().map(GeomKey::from));
@@ -327,7 +326,9 @@ impl LoopMesh {
     fn profile_closure_verts(&self, geom: &[GeomKey]) -> Vec<VertexKey> {
         let mut seen: std::collections::HashSet<VertexKey> = std::collections::HashSet::new();
         let mut out: Vec<VertexKey> = Vec::new();
-        let push = |v: VertexKey, seen: &mut std::collections::HashSet<VertexKey>, out: &mut Vec<VertexKey>| {
+        let push = |v: VertexKey,
+                    seen: &mut std::collections::HashSet<VertexKey>,
+                    out: &mut Vec<VertexKey>| {
             if seen.insert(v) {
                 out.push(v);
             }
@@ -439,11 +440,7 @@ impl LoopMesh {
     /// originals survive. This mutates the swept mesh (closing the seam) but does
     /// not produce the returned slot: per §5.5 the returned `geom_last.out` is the
     /// penultimate ring, which this weld never touches.
-    fn weld_final_ring(
-        &mut self,
-        ring: &LeadingRing,
-        origin_of: &HashMap<VertexKey, VertexKey>,
-    ) {
+    fn weld_final_ring(&mut self, ring: &LeadingRing, origin_of: &HashMap<VertexKey, VertexKey>) {
         // §5.4 stage 1 — pair each final vert with its identified original and
         // weld onto it (the original survives). A vert whose identity resolves to
         // itself (no distinct original) is not a weld target.
@@ -539,7 +536,11 @@ mod tests {
         // E+Bv = 1+2 = 3 edges, F+B = 0+1 = 1 wall face. Over 4 steps:
         // verts 2 + 4*2 = 10; edges 1 + 4*3 = 13; faces 4.
         assert_eq!(mesh.totvert(), 10, "2 profile + 4 rings * 2");
-        assert_eq!(mesh.totedge(), 13, "1 profile + 4 steps * (1 dup + 2 vertical)");
+        assert_eq!(
+            mesh.totedge(),
+            13,
+            "1 profile + 4 steps * (1 dup + 2 vertical)"
+        );
         assert_eq!(mesh.totface(), 4, "4 wall quads");
 
         // geom_last.out is the final ring: one edge.
@@ -675,7 +676,10 @@ mod tests {
         // 8 (spoke) + 8*2/... edges; assert the seam is closed by checking the
         // vert count is exactly one ring fewer than the merge-off doubled count.
         let merged_counts = (merged.totvert(), merged.totedge(), merged.totface());
-        assert_eq!(merged_counts.0, 16, "8 distinct spokes * 2 verts, seam fused");
+        assert_eq!(
+            merged_counts.0, 16,
+            "8 distinct spokes * 2 verts, seam fused"
+        );
         assert_eq!(merged_counts.2, 8, "8 wall quads around the tube");
         merged.validate_topology();
 
@@ -744,7 +748,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(out.len(), 3, "penultimate ring: 2 verts + 1 edge = 3 elements");
+        assert_eq!(
+            out.len(),
+            3,
+            "penultimate ring: 2 verts + 1 edge = 3 elements"
+        );
         assert_eq!(verts.len(), 2, "penultimate ring has 2 verts");
         assert_eq!(edges.len(), 1, "penultimate ring has 1 edge");
 
@@ -795,9 +803,11 @@ mod tests {
         for g in &out_off {
             if let GeomKey::Vert(v) = g {
                 let a = angle_of(&unmerged, *v).rem_euclid(std::f32::consts::TAU);
-                let at_seam = a.abs() < 1e-4
-                    || (a - std::f32::consts::TAU).abs() < 1e-4;
-                assert!(at_seam, "merge-off final ring sits at the seam angle, got {a}");
+                let at_seam = a.abs() < 1e-4 || (a - std::f32::consts::TAU).abs() < 1e-4;
+                assert!(
+                    at_seam,
+                    "merge-off final ring sits at the seam angle, got {a}"
+                );
             }
         }
     }
@@ -1168,9 +1178,21 @@ mod tests {
             None,
         );
         // Merge fuses one ring of 2 verts / 1 edge onto the originals by identity.
-        assert_eq!(off.totvert() - mesh.totvert(), 2, "merge fuses one ring of 2 verts");
-        assert_eq!(off.totedge() - mesh.totedge(), 1, "merge fuses one ring edge");
-        assert_eq!(mesh.totface(), steps as usize, "closed tube: `steps` wall bands");
+        assert_eq!(
+            off.totvert() - mesh.totvert(),
+            2,
+            "merge fuses one ring of 2 verts"
+        );
+        assert_eq!(
+            off.totedge() - mesh.totedge(),
+            1,
+            "merge fuses one ring edge"
+        );
+        assert_eq!(
+            mesh.totface(),
+            steps as usize,
+            "closed tube: `steps` wall bands"
+        );
     }
 
     /// §2 / §6 face profile arity: a quad face swept a quarter turn becomes a
@@ -1253,12 +1275,20 @@ mod tests {
 
         // The wire polyline: steps+1 verts, steps wire edges, no faces.
         assert_eq!(mesh.totvert(), 5, "steps+1 = 5 polyline verts");
-        assert_eq!(mesh.totedge(), 4, "steps = 4 wire edges joining the polyline");
+        assert_eq!(
+            mesh.totedge(),
+            4,
+            "steps = 4 wire edges joining the polyline"
+        );
         assert_eq!(mesh.totface(), 0, "vert profile grows no walls");
 
         // §6.4 — the leading edge is the single last extruded vert: 1 element,
         // a vert, with no edge or face in the returned slot.
-        assert_eq!(out.len(), 1, "geom_last.out is one profile-shaped ring: 1 vert");
+        assert_eq!(
+            out.len(),
+            1,
+            "geom_last.out is one profile-shaped ring: 1 vert"
+        );
         assert!(
             matches!(out[0], GeomKey::Vert(_)),
             "the leading slot names the single last extruded vert"
@@ -1279,9 +1309,16 @@ mod tests {
         let expected: Vec<f32> = (0..=4)
             .map(|k| std::f32::consts::FRAC_PI_2 * k as f32 / 4.0)
             .collect();
-        assert_eq!(angles.len(), expected.len(), "five evenly spaced polyline verts");
+        assert_eq!(
+            angles.len(),
+            expected.len(),
+            "five evenly spaced polyline verts"
+        );
         for (got, want) in angles.iter().zip(expected.iter()) {
-            assert!((got - want).abs() < 1e-4, "polyline vert angle {got} != {want}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "polyline vert angle {got} != {want}"
+            );
         }
 
         // The leading vert sits at the total sweep angle π/2.
@@ -1329,11 +1366,22 @@ mod tests {
 
         // The returned slot is the seeded input `geom` passed straight back: the
         // one input edge (count 1, NOT the swept-ring count and NOT 0).
-        assert_eq!(out.len(), 1, "geom_last.out is the input geom buffer (count 1)");
-        assert_eq!(out[0], e.into(), "the returned element is the verbatim input edge");
+        assert_eq!(
+            out.len(),
+            1,
+            "geom_last.out is the input geom buffer (count 1)"
+        );
+        assert_eq!(
+            out[0],
+            e.into(),
+            "the returned element is the verbatim input edge"
+        );
 
         // The input edge and its endpoints are unchanged and still live.
-        assert!(mesh.edges.try_get(e).is_some(), "input edge survives untouched");
+        assert!(
+            mesh.edges.try_get(e).is_some(),
+            "input edge survives untouched"
+        );
         assert_eq!(mesh.vertex_position(v0), Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(mesh.vertex_position(v1), Vec3::new(1.0, 0.0, 1.0));
         mesh.validate_topology();
@@ -1384,7 +1432,11 @@ mod tests {
 
         // §7 leading-edge count: the last (coincident) ring is one profile-shaped
         // ring — 2 verts + 1 edge = 3, not collapsed by the coincidence.
-        assert_eq!(out.len(), 3, "last ring V+E = 2+1 = 3 (coincidence does not shrink it)");
+        assert_eq!(
+            out.len(),
+            3,
+            "last ring V+E = 2+1 = 3 (coincidence does not shrink it)"
+        );
         assert_eq!(
             out.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count(),
             2,
@@ -1426,8 +1478,15 @@ mod tests {
                 None,
             );
             // Same leading-edge contract as the positive sweep: one ring, 1 edge.
-            assert_eq!(out.len(), 3, "negative-angle leading edge is one ring (V+E=3)");
-            assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (10, 13, 4));
+            assert_eq!(
+                out.len(),
+                3,
+                "negative-angle leading edge is one ring (V+E=3)"
+            );
+            assert_eq!(
+                (mesh.totvert(), mesh.totedge(), mesh.totface()),
+                (10, 13, 4)
+            );
             mesh.validate_topology();
             let quant = |p: Vec3| {
                 [
@@ -1503,7 +1562,10 @@ mod tests {
             None,
         );
 
-        assert!(out.is_empty(), "empty geom returns the seeded-empty slot (count 0)");
+        assert!(
+            out.is_empty(),
+            "empty geom returns the seeded-empty slot (count 0)"
+        );
         assert_eq!(
             (mesh.totvert(), mesh.totedge(), mesh.totface()),
             before,
@@ -1584,15 +1646,12 @@ mod tests {
             .vert_keys()
             .into_iter()
             .map(|v| mesh.vertex_position(v))
-            .filter(|p| {
-                p.distance(p_bottom) > 1e-4 && p.distance(p_top) > 1e-4
-            })
+            .filter(|p| p.distance(p_bottom) > 1e-4 && p.distance(p_top) > 1e-4)
             .collect();
         assert_eq!(ring_positions.len(), 2, "two swept ring verts");
 
-        let matches_expected = |target: Vec3| {
-            ring_positions.iter().any(|p| p.distance(target) < 1e-4)
-        };
+        let matches_expected =
+            |target: Vec3| ring_positions.iter().any(|p| p.distance(target) < 1e-4);
         assert!(
             matches_expected(want_bottom),
             "swept bottom vert at the conjugated position {want_bottom:?}; got {ring_positions:?}"
@@ -1668,18 +1727,17 @@ mod tests {
                 .into_iter()
                 .map(|v| mesh.vertex_position(v))
                 .collect();
-            ps.sort_by(|a, b| {
-                (a.x, a.y, a.z)
-                    .partial_cmp(&(b.x, b.y, b.z))
-                    .unwrap()
-            });
+            ps.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap());
             (ps, (mesh.totvert(), mesh.totedge(), mesh.totface()))
         };
 
         let (none_ps, none_counts) = run(None);
         let (ident_ps, ident_counts) = run(Some(Mat4::IDENTITY.to_cols_array()));
 
-        assert_eq!(none_counts, ident_counts, "identity space matches None counts");
+        assert_eq!(
+            none_counts, ident_counts,
+            "identity space matches None counts"
+        );
         assert_eq!(none_ps.len(), ident_ps.len());
         for (a, b) in none_ps.iter().zip(ident_ps.iter()) {
             assert!(

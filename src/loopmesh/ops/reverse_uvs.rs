@@ -49,8 +49,10 @@ impl LoopMesh {
                     .get_vec2(uv_layer, back)
                     .expect("active UV layer is a vec2 loop attribute");
 
-                self.loop_attribs_mut().set_vec2(uv_layer, front, back_value);
-                self.loop_attribs_mut().set_vec2(uv_layer, back, front_value);
+                self.loop_attribs_mut()
+                    .set_vec2(uv_layer, front, back_value);
+                self.loop_attribs_mut()
+                    .set_vec2(uv_layer, back, front_value);
             }
         }
     }
@@ -103,12 +105,17 @@ mod tests {
     }
 
     /// Seed distinct UVs corner-by-corner in loop-cycle order; return them.
-    fn seed_corner_uvs(mesh: &mut LoopMesh, face: FaceKey, uv: ElementAttributeKey) -> Vec<[f32; 2]> {
+    fn seed_corner_uvs(
+        mesh: &mut LoopMesh,
+        face: FaceKey,
+        uv: ElementAttributeKey,
+    ) -> Vec<[f32; 2]> {
         let loops = mesh.face_loop_keys(face);
         let mut values = Vec::with_capacity(loops.len());
         for (i, &loop_key) in loops.iter().enumerate() {
             let value = [i as f32, 10.0 + i as f32];
-            mesh.loop_attribs_mut().set_vec2(uv, loop_key.as_usize(), value);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, loop_key.as_usize(), value);
             values.push(value);
         }
         values
@@ -135,7 +142,11 @@ mod tests {
         let after = read_corner_uvs(&mesh, face, uv);
         let n = before.len();
         for i in 0..n {
-            assert_eq!(after[i], before[n - 1 - i], "corner {i} takes mirror corner");
+            assert_eq!(
+                after[i],
+                before[n - 1 - i],
+                "corner {i} takes mirror corner"
+            );
         }
     }
 

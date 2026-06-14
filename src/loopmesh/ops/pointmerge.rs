@@ -100,8 +100,16 @@ mod tests {
 
         mesh.pointmerge(&verts, [3.0, 0.0, 0.0]);
 
-        assert_eq!(mesh.totvert(), 1, "the whole input set fused to one survivor");
-        assert_eq!(mesh.totface(), 0, "the source face degenerated and was reaped");
+        assert_eq!(
+            mesh.totvert(),
+            1,
+            "the whole input set fused to one survivor"
+        );
+        assert_eq!(
+            mesh.totface(),
+            0,
+            "the source face degenerated and was reaped"
+        );
         let survivor = mesh.vert_keys()[0];
         assert_eq!(survivor, sources[0], "the first input vert is the survivor");
         mesh.validate_topology();
@@ -204,7 +212,10 @@ mod tests {
 
         let live: HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(live.contains(&a0), "the first input vert survives");
-        assert!(!live.contains(&b0), "the second island vert fused onto the survivor");
+        assert!(
+            !live.contains(&b0),
+            "the second island vert fused onto the survivor"
+        );
         assert_eq!(
             mesh.vertex_position(a0),
             Vec3::from(merge_co),
@@ -212,7 +223,10 @@ mod tests {
         );
         // Both islands' remaining wire anchors stay; the survivor now bridges
         // their incident edges.
-        assert!(live.contains(&a1) && live.contains(&b1), "the wire anchors stay");
+        assert!(
+            live.contains(&a1) && live.contains(&b1),
+            "the wire anchors stay"
+        );
         mesh.validate_topology();
     }
 
@@ -227,7 +241,11 @@ mod tests {
         mesh.pointmerge(&[], [0.0, 0.0, 0.0]);
 
         assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), before);
-        assert_eq!(mesh.vertex_position(a), Vec3::new(1.0, 2.0, 3.0), "no position written");
+        assert_eq!(
+            mesh.vertex_position(a),
+            Vec3::new(1.0, 2.0, 3.0),
+            "no position written"
+        );
         mesh.validate_topology();
     }
 }

@@ -357,7 +357,12 @@ impl LoopMesh {
     /// The live face still incident to both `a` and `b`. After a face_split the
     /// next chord's endpoints land on exactly one of the two sub-faces; this
     /// finds it. Falls back to the original handle when no split has happened.
-    fn live_face_with_pair(&self, original: FaceKey, a: VertexKey, b: VertexKey) -> Option<FaceKey> {
+    fn live_face_with_pair(
+        &self,
+        original: FaceKey,
+        a: VertexKey,
+        b: VertexKey,
+    ) -> Option<FaceKey> {
         for f in self.vert_face_keys(a) {
             if self.face_vert_keys(f).contains(&b) {
                 return Some(f);
@@ -739,10 +744,16 @@ mod tests {
         let (inner_min, inner_max) = survivor_xs(true, false);
         // clear_outer keeps x <= 0: the negative extent reaches -2, none above 0.
         assert!(outer_min < -1.0, "clear_outer keeps the negative extent");
-        assert!(outer_max <= 1e-5, "clear_outer keeps nothing strictly positive");
+        assert!(
+            outer_max <= 1e-5,
+            "clear_outer keeps nothing strictly positive"
+        );
         // clear_inner keeps x >= 0: the positive extent reaches +2, none below 0.
         assert!(inner_max > 1.0, "clear_inner keeps the positive extent");
-        assert!(inner_min >= -1e-5, "clear_inner keeps nothing strictly negative");
+        assert!(
+            inner_min >= -1e-5,
+            "clear_inner keeps nothing strictly negative"
+        );
         // The two survivor x-extents differ — the clears select opposite sides.
         assert_ne!(
             (outer_min, outer_max),
@@ -798,13 +809,20 @@ mod tests {
         assert!(mesh.totvert() < v_before, "positive side cleared");
         assert_eq!(result.seam_verts.len(), 2, "two crossing verts on x = 0.5");
         for &sv in &result.seam_verts {
-            assert!((mesh.vertex_position(sv).x - 0.5).abs() < 1e-5, "seam at x = 0.5");
+            assert!(
+                (mesh.vertex_position(sv).x - 0.5).abs() < 1e-5,
+                "seam at x = 0.5"
+            );
         }
         // The kept sub-face is a quad between x = 0 and x = 0.5.
         for v in mesh.vert_keys() {
             assert!(mesh.vertex_position(v).x <= 0.5 + 1e-5);
         }
-        assert_eq!(result.seam_edges.len(), 1, "one seam edge across the cut face");
+        assert_eq!(
+            result.seam_edges.len(),
+            1,
+            "one seam edge across the cut face"
+        );
     }
 
     #[test]
@@ -882,7 +900,10 @@ mod tests {
             r_wide.seam_verts.contains(&near),
             "near-plane column is a seam vert under dist = 0.2"
         );
-        assert!(wide.vertices.try_get(near).is_some(), "kept under clear_inner");
+        assert!(
+            wide.vertices.try_get(near).is_some(),
+            "kept under clear_inner"
+        );
 
         // dist = 0: the near-plane column is strictly positive; under
         // clear_inner it is kept, but it is NOT a seam vert.
@@ -901,7 +922,7 @@ mod tests {
         // a freshly split sub-face; each sub-face must keep the parent's CCW
         // winding (normal +z). The face-split preserves orientation.
         let (mut mesh, faces, _verts) = strip(0.0, 3); // x = 0..3
-        // Parent faces are wound CCW in the z = 0 plane → +z normal.
+                                                       // Parent faces are wound CCW in the z = 0 plane → +z normal.
         for &f in &faces {
             assert!(mesh.face_compute_normal(f).z > 0.0, "parent +z");
         }
@@ -929,7 +950,10 @@ mod tests {
         let (mut mesh, _f, _v) = strip(-1.0, 2);
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
         let result = mesh.bisect_plane(&[], params(0.0, true, false, true));
-        assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
+        assert_eq!(
+            (v0, e0, f0),
+            (mesh.totvert(), mesh.totedge(), mesh.totface())
+        );
         // Nothing tagged → nothing classified on-plane → empty seam.
         assert!(result.seam_verts.is_empty());
         assert!(result.seam_edges.is_empty());

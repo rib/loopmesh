@@ -281,7 +281,9 @@ mod tests {
             .iter()
             .map(|&v| quant(mesh.vertex_position(v)))
             .collect();
-        present.iter().all(|&(x, y, z)| present.contains(&(-x, y, z)))
+        present
+            .iter()
+            .all(|&(x, y, z)| present.contains(&(-x, y, z)))
     }
 
     #[test]
@@ -293,7 +295,10 @@ mod tests {
         let geom = whole_mesh_geom(&mesh);
         mesh.symmetrize(&geom, SymmetrizeDirection::NegX, 0.0);
 
-        assert!(is_x_symmetric(&mesh), "result is mirror-symmetric about x = 0");
+        assert!(
+            is_x_symmetric(&mesh),
+            "result is mirror-symmetric about x = 0"
+        );
         // The kept half was x < 0; nothing of the discarded x > 0 *original*
         // survives un-reflected — every survivor is the kept half or its mirror.
         for v in mesh.vert_keys() {
@@ -465,7 +470,9 @@ mod tests {
             .map(|&v| quant(mesh.vertex_position(v)))
             .collect();
         assert!(
-            present.iter().all(|&(x, y, z)| present.contains(&(x, -y, z))),
+            present
+                .iter()
+                .all(|&(x, y, z)| present.contains(&(x, -y, z))),
             "result is mirror-symmetric about y = 0"
         );
         // Kept negative half reaches y = -2; nothing beyond |y| = 2.

@@ -237,9 +237,7 @@ impl LoopMesh {
                 if source.source_loop_at.is_empty() {
                     self.edge_kill(e_new);
                     edge_dup_killed[slot] = true;
-                    for (endpoint_old, endpoint_dup) in
-                        [(v0_old, v0_new), (v1_old, v1_new)]
-                    {
+                    for (endpoint_old, endpoint_dup) in [(v0_old, v0_new), (v1_old, v1_new)] {
                         if self.vertex_disk_iter(endpoint_dup).next().is_none() {
                             self.vertex_kill(endpoint_dup);
                             vert_dup_killed[endpoint_old.as_usize()] = true;
@@ -510,7 +508,11 @@ mod tests {
         // loop existed to source from.
         for l in mesh.iter_face_loops(wall).collect::<Vec<_>>() {
             let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
-            assert_eq!(got, [0.0, 0.0], "faceless wall loop CD is default-initialised");
+            assert_eq!(
+                got,
+                [0.0, 0.0],
+                "faceless wall loop CD is default-initialised"
+            );
         }
         mesh.validate_topology();
     }
@@ -598,6 +600,9 @@ mod tests {
             .collect();
         let n = a_pos.len();
         let same_rotation = (0..n).any(|shift| (0..n).all(|i| a_pos[i] == b_pos[(i + shift) % n]));
-        assert!(same_rotation, "extrude_edge_only must equal _ex(false) winding");
+        assert!(
+            same_rotation,
+            "extrude_edge_only must equal _ex(false) winding"
+        );
     }
 }

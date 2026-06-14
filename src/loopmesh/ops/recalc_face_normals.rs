@@ -411,10 +411,17 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
 
-        let left = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        let left = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         // Wound the *wrong* way: traverses the shared edge 1->2 same as left.
-        let right =
-            mesh.face_create(&[v1, v2, v5, v4], &[e12, e52, e45, e14], FaceCreateFlags::NONE);
+        let right = mesh.face_create(
+            &[v1, v2, v5, v4],
+            &[e12, e52, e45, e14],
+            FaceCreateFlags::NONE,
+        );
         (left, right, e12)
     }
 
@@ -428,13 +435,22 @@ mod tests {
 
         // Invert one face so it disagrees with its neighbours.
         mesh.reverse_faces(&[oct.faces[0]], false);
-        assert!(!all_consistent(&mesh, &oct.faces), "fixture must start inconsistent");
+        assert!(
+            !all_consistent(&mesh, &oct.faces),
+            "fixture must start inconsistent"
+        );
 
         mesh.recalc_face_normals(&oct.faces, false);
         mesh.mesh_normals_update();
 
-        assert!(all_consistent(&mesh, &oct.faces), "all faces consistently wound");
-        assert!(all_point_outward(&mesh, &oct.faces), "whole solid points outward");
+        assert!(
+            all_consistent(&mesh, &oct.faces),
+            "all faces consistently wound"
+        );
+        assert!(
+            all_point_outward(&mesh, &oct.faces),
+            "whole solid points outward"
+        );
     }
 
     /// Already-consistent, already-outward solid: recalc-outside is a winding
@@ -445,7 +461,10 @@ mod tests {
         let oct = build_octahedron(&mut mesh);
         mesh.calc_face_normals();
         assert!(all_consistent(&mesh, &oct.faces));
-        assert!(all_point_outward(&mesh, &oct.faces), "fixture starts outward");
+        assert!(
+            all_point_outward(&mesh, &oct.faces),
+            "fixture starts outward"
+        );
 
         let before: Vec<Vec<VertexKey>> =
             oct.faces.iter().map(|&f| mesh.face_vert_keys(f)).collect();
@@ -454,7 +473,11 @@ mod tests {
         mesh.mesh_normals_update();
 
         for (i, &face) in oct.faces.iter().enumerate() {
-            assert_eq!(mesh.face_vert_keys(face), before[i], "face {i} winding unchanged");
+            assert_eq!(
+                mesh.face_vert_keys(face),
+                before[i],
+                "face {i} winding unchanged"
+            );
         }
         assert!(all_point_outward(&mesh, &oct.faces));
     }
@@ -469,14 +492,20 @@ mod tests {
         mesh.calc_face_normals();
         // Reverse every face -> consistent but pointing inward.
         mesh.reverse_faces(&oct.faces, false);
-        assert!(all_consistent(&mesh, &oct.faces), "still consistent after global flip");
+        assert!(
+            all_consistent(&mesh, &oct.faces),
+            "still consistent after global flip"
+        );
         assert!(!all_point_outward(&mesh, &oct.faces), "now points inward");
 
         mesh.recalc_face_normals(&oct.faces, false);
         mesh.mesh_normals_update();
 
         assert!(all_consistent(&mesh, &oct.faces));
-        assert!(all_point_outward(&mesh, &oct.faces), "seed test re-orients outward");
+        assert!(
+            all_point_outward(&mesh, &oct.faces),
+            "seed test re-orients outward"
+        );
     }
 
     /// Open inconsistent pair: two quads sharing an edge, the second wound the
@@ -487,12 +516,18 @@ mod tests {
         let (left, right, _) = build_two_quads_inconsistent(&mut mesh);
         mesh.calc_face_normals();
         let faces = [left, right];
-        assert!(!all_consistent(&mesh, &faces), "fixture starts inconsistent");
+        assert!(
+            !all_consistent(&mesh, &faces),
+            "fixture starts inconsistent"
+        );
 
         mesh.recalc_face_normals(&faces, false);
         mesh.mesh_normals_update();
 
-        assert!(all_consistent(&mesh, &faces), "pair now agrees across shared edge");
+        assert!(
+            all_consistent(&mesh, &faces),
+            "pair now agrees across shared edge"
+        );
         // The two coplanar quads end up with normals pointing the same way.
         assert!(
             (mesh.face_normal(left) - mesh.face_normal(right)).length() < 1e-5,
@@ -563,7 +598,10 @@ mod tests {
                 centre += mesh.vertex_position(v);
             }
             centre /= verts.len() as f32;
-            assert!(mesh.face_normal(face).dot(centre) < 0.0, "face points inward");
+            assert!(
+                mesh.face_normal(face).dot(centre) < 0.0,
+                "face points inward"
+            );
         }
     }
 

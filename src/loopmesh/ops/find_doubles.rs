@@ -106,7 +106,11 @@ impl LoopMesh {
                 if other == seed || (target[other] != -1 && target[other] != other as isize) {
                     continue;
                 }
-                if self.vertex_position(verts[other]).distance_squared(seed_pos) <= dist_sq {
+                if self
+                    .vertex_position(verts[other])
+                    .distance_squared(seed_pos)
+                    <= dist_sq
+                {
                     members.push(other);
                 }
             }
@@ -142,11 +146,7 @@ impl LoopMesh {
     ) -> usize {
         // §5 — a protected member is already a survivor and wins; the lowest
         // such index is the deterministic choice if two keep-verts coincide.
-        if let Some(&kept) = members
-            .iter()
-            .filter(|&&m| target[m] == m as isize)
-            .min()
-        {
+        if let Some(&kept) = members.iter().filter(|&&m| target[m] == m as isize).min() {
             return kept;
         }
 
@@ -227,20 +227,21 @@ impl LoopMesh {
         target: &mut [isize],
         stack: &mut SmallVec<[usize; 32]>,
     ) {
-        let try_claim = |candidate: VertexKey, target: &mut [isize], stack: &mut SmallVec<[usize; 32]>| {
-            let Some(&ci) = index_of.get(&candidate) else {
-                return;
+        let try_claim =
+            |candidate: VertexKey, target: &mut [isize], stack: &mut SmallVec<[usize; 32]>| {
+                let Some(&ci) = index_of.get(&candidate) else {
+                    return;
+                };
+                // Already claimed (incl. a pre-seeded keep) — first-claim-wins.
+                if target[ci] != -1 {
+                    return;
+                }
+                // §4.1 / §4.2 — strict distance to the seed origin.
+                if self.vertex_position(candidate).distance_squared(origin) < dist_sq {
+                    target[ci] = seed as isize;
+                    stack.push(ci);
+                }
             };
-            // Already claimed (incl. a pre-seeded keep) — first-claim-wins.
-            if target[ci] != -1 {
-                return;
-            }
-            // §4.1 / §4.2 — strict distance to the seed origin.
-            if self.vertex_position(candidate).distance_squared(origin) < dist_sq {
-                target[ci] = seed as isize;
-                stack.push(ci);
-            }
-        };
 
         // Edge step (§4.1) — every vert across an incident edge (the disk).
         for edge in self.vert_edge_keys(stepping_vert) {
@@ -263,10 +264,7 @@ impl LoopMesh {
             };
             for offset in 0..count {
                 // Skip self and the two edge-adjacent neighbours.
-                if offset == here
-                    || (here + 1) % count == offset
-                    || (offset + 1) % count == here
-                {
+                if offset == here || (here + 1) % count == offset || (offset + 1) % count == here {
                     continue;
                 }
                 try_claim(ring[offset], target, stack);
@@ -315,7 +313,10 @@ mod tests {
         assert_eq!(map.len(), 2, "three sources yield two arrows");
         for &(s, t) in &map {
             assert_ne!(s, t, "no self-mapping");
-            assert!(cluster.contains(&s) && cluster.contains(&t), "arrows stay in the cluster");
+            assert!(
+                cluster.contains(&s) && cluster.contains(&t),
+                "arrows stay in the cluster"
+            );
             assert_ne!(s, far);
             assert_ne!(t, far);
         }
@@ -339,7 +340,10 @@ mod tests {
         // Cluster spread (ring diameter at r=0.05 is ~0.0866); a dist well below
         // that separates every member.
         let blocked = mesh.find_doubles(&verts, &[], 0.001, false);
-        assert!(blocked.is_empty(), "dist below the spread leaves the map empty");
+        assert!(
+            blocked.is_empty(),
+            "dist below the spread leaves the map empty"
+        );
     }
 
     /// §3.1 vs §4.1 — a vert at exactly `dist` merges in spatial mode
@@ -356,7 +360,10 @@ mod tests {
         assert_eq!(spatial.len(), 1, "spatial merges at exactly dist");
 
         let connected = mesh.find_doubles(&verts, &[], 1.0, true);
-        assert!(connected.is_empty(), "connected does not merge at exactly dist");
+        assert!(
+            connected.is_empty(),
+            "connected does not merge at exactly dist"
+        );
     }
 
     /// §5 — protecting the higher-index member forces it to be the survivor;
@@ -392,8 +399,11 @@ mod tests {
 
         let map = mesh.find_doubles(&verts, &[k], 0.5, false);
 
-        assert_eq!(as_set(&map), [(a, k), (b, k)].into_iter().collect(),
-            "both ordinary members map onto the keep-vert (a -> k, b -> k)");
+        assert_eq!(
+            as_set(&map),
+            [(a, k), (b, k)].into_iter().collect(),
+            "both ordinary members map onto the keep-vert (a -> k, b -> k)"
+        );
     }
 
     /// §5.1 — two protected verts in one cluster both survive; an ordinary near
@@ -416,7 +426,10 @@ mod tests {
         // The ordinary vert c is the only source, mapping onto a keep-vert.
         assert_eq!(map.len(), 1, "only the ordinary vert maps away");
         assert_eq!(map[0].0, c);
-        assert!(map[0].1 == a || map[0].1 == b, "c maps onto a protected survivor");
+        assert!(
+            map[0].1 == a || map[0].1 == b,
+            "c maps onto a protected survivor"
+        );
     }
 
     /// §4.4 — on a cluster of three positioned so the centroid-closest member
@@ -435,7 +448,11 @@ mod tests {
 
         assert_eq!(map.len(), 2);
         let values: HashSet<VertexKey> = map.iter().map(|&(_, t)| t).collect();
-        assert_eq!(values, [v2].into_iter().collect(), "centroid-closest v2 survives");
+        assert_eq!(
+            values,
+            [v2].into_iter().collect(),
+            "centroid-closest v2 survives"
+        );
     }
 
     /// §4.3 — two verts close in space but sharing no incidence path merge in
@@ -459,8 +476,15 @@ mod tests {
         let connected = mesh.find_doubles(&verts, &[], 0.5, true);
 
         assert_eq!(spatial.len(), 1, "spatial merges the coincident pair");
-        assert!(connected.is_empty(), "connected leaves the disconnected pair apart");
-        assert_ne!(as_set(&spatial), as_set(&connected), "the two modes diverge");
+        assert!(
+            connected.is_empty(),
+            "connected leaves the disconnected pair apart"
+        );
+        assert_ne!(
+            as_set(&spatial),
+            as_set(&connected),
+            "the two modes diverge"
+        );
     }
 
     /// §4.2 — within connected mode, a chain longer than `dist` end-to-end
@@ -499,14 +523,23 @@ mod tests {
         let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
         let verts = [v0, v1, v2, v3];
         let edges: Vec<EdgeKey> = (0..4)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % 4]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect();
         mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
 
         // dist 0.1 reaches across the 0.02 diagonal but not the unit edges.
         let map = mesh.find_doubles(&verts, &[], 0.1, true);
 
-        assert_eq!(map.len(), 1, "the far diagonal corner merges via the face-corner step");
+        assert_eq!(
+            map.len(),
+            1,
+            "the far diagonal corner merges via the face-corner step"
+        );
         // Seeded at v0, v2 is reached as the non-edge-adjacent far corner.
         assert_eq!(map[0], (v2, v0));
     }

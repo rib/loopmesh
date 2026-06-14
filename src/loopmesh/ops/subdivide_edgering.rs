@@ -433,10 +433,7 @@ fn centre_aligned_fallback_normal(ring: &[Vec3], axis: Vec3) -> Vec3 {
 /// Cubic Bézier point at `t` from four control points.
 fn bezier(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
     let u = 1.0 - t;
-    p0 * (u * u * u)
-        + p1 * (3.0 * u * u * t)
-        + p2 * (3.0 * u * t * t)
-        + p3 * (t * t * t)
+    p0 * (u * u * u) + p1 * (3.0 * u * u * t) + p2 * (3.0 * u * t * t) + p3 * (t * t * t)
 }
 
 /// The local path tangent at an interior sample, the angle bisector of the two
@@ -798,10 +795,8 @@ impl LoopMesh {
                 RingPlacementMode::Path(setup)
             }
             RingInterp::Surface => {
-                let band_faces: HashSet<FaceKey> =
-                    strip_quads.iter().map(|s| s.face).collect();
-                let tangents =
-                    self.rim_surface_tangents(&rungs, &rail_a_verts, &band_faces);
+                let band_faces: HashSet<FaceKey> = strip_quads.iter().map(|s| s.face).collect();
+                let tangents = self.rim_surface_tangents(&rungs, &rail_a_verts, &band_faces);
                 // §6.3.3: SURFACE's profile reference is the centre *spline*
                 // (same rim centres + reconciled normals PATH samples), built
                 // only when the profile is active.
@@ -842,8 +837,7 @@ impl LoopMesh {
         // makes their raw Newell normals comparably oriented, which is what lets
         // the reconciliation step settle their relative sign even when a normal
         // lands near-perpendicular to the centre-to-centre axis (§6.2.1).
-        let mate: HashMap<VertexKey, VertexKey> =
-            rungs.values().map(|&(a, b)| (a, b)).collect();
+        let mate: HashMap<VertexKey, VertexKey> = rungs.values().map(|&(a, b)| (a, b)).collect();
         let ordered_a = self.ordered_rail(rail_a_verts);
         let ring_a: Vec<Vec3> = ordered_a.iter().map(|&v| self.vertex_position(v)).collect();
         let ring_b: Vec<Vec3> = ordered_a
@@ -955,8 +949,8 @@ impl LoopMesh {
             // Chord fallback direction: from each rim vert across the strip
             // toward the other rail. Used only when the bucketed accumulation
             // degenerates (e.g. stale/zero stored face normals, §6.2.3 trap).
-            let chord_a = (self.vertex_position(v_b) - self.vertex_position(v_a))
-                .normalize_or_zero();
+            let chord_a =
+                (self.vertex_position(v_b) - self.vertex_position(v_a)).normalize_or_zero();
             let chord_b = -chord_a;
             tangents.insert(
                 v_a,
@@ -1142,8 +1136,12 @@ impl LoopMesh {
         // parameters. At smooth = 0 the handles collapse onto the centres → the
         // straight chord of centres, but PATH still diverges from LINEAR via the
         // frames and the triangle transport below.
-        let handle_len =
-            handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
+        let handle_len = handle_length(
+            setup.center_a,
+            setup.center_b,
+            setup.normal_a,
+            setup.normal_b,
+        );
         let handle_a = setup.center_a + smooth * handle_len * setup.normal_a;
         let handle_b = setup.center_b + smooth * handle_len * setup.normal_b;
         let path: Vec<Vec3> = (0..resolu)
@@ -1227,7 +1225,12 @@ impl LoopMesh {
         // handles collapse and it degenerates to the straight centre axis. Built
         // only when the profile is active (`centre` is `Some`).
         let ref_co: Option<Vec<Vec3>> = centre.map(|setup| {
-            let h = handle_length(setup.center_a, setup.center_b, setup.normal_a, setup.normal_b);
+            let h = handle_length(
+                setup.center_a,
+                setup.center_b,
+                setup.normal_a,
+                setup.normal_b,
+            );
             let h_a = setup.center_a + smooth * h * setup.normal_a;
             let h_b = setup.center_b + smooth * h * setup.normal_b;
             (0..resolu)
@@ -1501,7 +1504,11 @@ mod tests {
             assert!(p.z.abs() < 1e-6, "stays in the strip plane");
         }
         // The four midpoints span the four rung columns x = 0..=3.
-        let mut xs: Vec<f32> = result.verts.iter().map(|&m| mesh.vertex_position(m).x).collect();
+        let mut xs: Vec<f32> = result
+            .verts
+            .iter()
+            .map(|&m| mesh.vertex_position(m).x)
+            .collect();
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         for (i, x) in xs.iter().enumerate() {
             assert!((x - i as f32).abs() < 1e-6, "midpoint column {i}");
@@ -1544,7 +1551,11 @@ mod tests {
             }
         }
         // Each connecting edge is counted from both endpoints.
-        assert_eq!(connect_edges / 2, 4, "closed new ring has k connecting edges");
+        assert_eq!(
+            connect_edges / 2,
+            4,
+            "closed new ring has k connecting edges"
+        );
     }
 
     #[test]
@@ -1754,11 +1765,7 @@ mod tests {
     /// fixture can be compared cut-for-cut.
     fn cut_positions(mesh: &LoopMesh, verts: &[VertexKey]) -> Vec<Vec3> {
         let mut ps: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        ps.sort_by(|a, b| {
-            (a.x, a.y, a.z)
-                .partial_cmp(&(b.x, b.y, b.z))
-                .unwrap()
-        });
+        ps.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap());
         ps
     }
 
@@ -1903,9 +1910,7 @@ mod tests {
         let frames = [frame0, frame1, frame2];
 
         // Unit reference triangles (legs along local +X then +Y).
-        let tri = |f: Quat, p: Vec3| -> [Vec3; 3] {
-            [p, f * Vec3::X + p, f * Vec3::Y + p]
-        };
+        let tri = |f: Quat, p: Vec3| -> [Vec3; 3] { [p, f * Vec3::X + p, f * Vec3::Y + p] };
         let tris = [
             tri(frames[0], path[0]),
             tri(frames[1], path[1]),
@@ -1986,8 +1991,7 @@ mod tests {
         // (the chord midpoint), even on a twisted strip.
         let step = 0.5;
         let (mut surf_mesh, surf_rungs) = twisted_strip(4, step);
-        let surf =
-            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 1, 0.0));
+        let surf = surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 1, 0.0));
 
         let (mut lin_mesh, lin_rungs) = twisted_strip(4, step);
         let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 1, 0.0));
@@ -2012,8 +2016,7 @@ mod tests {
         // Use the flat strip (rungs run y = 0 → y = 1) so the chord line is the
         // y axis and "on the chord line" is just "z = 0, x = column".
         let (mut surf_mesh, surf_rungs) = open_strip(3);
-        let surf =
-            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
+        let surf = surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
 
         let b13 = {
             let t = 1.0_f32 / 3.0;
@@ -2053,8 +2056,7 @@ mod tests {
         // to LINEAR: the smoothstep re-spacing moves the interior verts along the
         // chord. Pin the non-vacuity directly.
         let (mut surf_mesh, surf_rungs) = open_strip(3);
-        let surf =
-            surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
+        let surf = surf_mesh.subdivide_edgering(&surf_rungs, params(RingInterp::Surface, 2, 0.0));
 
         let (mut lin_mesh, lin_rungs) = open_strip(3);
         let lin = lin_mesh.subdivide_edgering(&lin_rungs, params(RingInterp::Linear, 2, 0.0));
@@ -2111,10 +2113,7 @@ mod tests {
         for z in 0..radii.len() {
             let level: Vec<EdgeKey> = (0..k)
                 .map(|i| {
-                    mesh.create_edge(
-                        [rings[z][i], rings[z][(i + 1) % k]],
-                        EdgeCreateFlags::NONE,
-                    )
+                    mesh.create_edge([rings[z][i], rings[z][(i + 1) % k]], EdgeCreateFlags::NONE)
                 })
                 .collect();
             ring_edges.push(level);
@@ -2246,7 +2245,8 @@ mod tests {
             let (mut b, rungs_b) = closed_band(6);
             // SMOOTH curve, factor 0 — the profile gate is off, so this must
             // reproduce `params(...)` exactly (bit-for-bit, not just close).
-            let res_b = b.subdivide_edgering(&rungs_b, profile(interp, 2, ProfileShape::Smooth, 0.0));
+            let res_b =
+                b.subdivide_edgering(&rungs_b, profile(interp, 2, ProfileShape::Smooth, 0.0));
 
             let mut pos_a: Vec<[u32; 3]> = res_a
                 .verts
@@ -2271,8 +2271,10 @@ mod tests {
         // radius 1.0 (even-spacing chord) out to radius 1.3704, purely radially
         // (the y/axis coordinate is untouched: rung chord ∥ centre axis).
         let (mut mesh, rungs) = closed_band(6);
-        let result =
-            mesh.subdivide_edgering(&rungs, profile(RingInterp::Linear, 2, ProfileShape::Smooth, 0.5));
+        let result = mesh.subdivide_edgering(
+            &rungs,
+            profile(RingInterp::Linear, 2, ProfileShape::Smooth, 0.5),
+        );
 
         // Contrast: the same fixture/params at factor 0 stays at radius 1.0.
         let (mut flat, flat_rungs) = closed_band(6);
@@ -2325,8 +2327,10 @@ mod tests {
         // SHARP and SPHERE give different f(2/3) (§6.3.4: 0.4444 vs 0.9428) →
         // different interior shape_size (1.2222 vs 1.4714) → different radii.
         let (mut sharp_mesh, sharp_rungs) = closed_band(6);
-        let sharp = sharp_mesh
-            .subdivide_edgering(&sharp_rungs, profile(RingInterp::Linear, 2, ProfileShape::Sharp, 0.5));
+        let sharp = sharp_mesh.subdivide_edgering(
+            &sharp_rungs,
+            profile(RingInterp::Linear, 2, ProfileShape::Sharp, 0.5),
+        );
 
         let (mut sphere_mesh, sphere_rungs) = closed_band(6);
         let sphere = sphere_mesh.subdivide_edgering(

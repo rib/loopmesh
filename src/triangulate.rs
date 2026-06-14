@@ -113,13 +113,7 @@ pub fn is_quad_flip(v0: Vec3, v1: Vec3, v2: Vec3, v3: Vec3) -> u32 {
 /// score: positive when keeping the existing diagonal is better,
 /// negative when swapping to the candidate improves the triangulation.
 /// Degenerate configurations per §8.3 return `±f32::MAX`.
-pub fn beautify_quad_cost_2d(
-    v1: Vec2,
-    v2: Vec2,
-    v3: Vec2,
-    v4: Vec2,
-    lock_degenerate: bool,
-) -> f32 {
+pub fn beautify_quad_cost_2d(v1: Vec2, v2: Vec2, v3: Vec2, v4: Vec2, lock_degenerate: bool) -> f32 {
     beautify_quad_cost_2d_ex(v1, v2, v3, v4, lock_degenerate).0
 }
 
@@ -219,13 +213,7 @@ fn diagonal_area_over_perimeter(
 /// Follows the §8.6 inlined-3D recipe: build the projection normal from
 /// the two existing-diagonal corner triangles (not the face's cached
 /// normal) so the score is independent of normal-cache state.
-pub fn beautify_quad_cost(
-    v0: Vec3,
-    v1: Vec3,
-    v2: Vec3,
-    v3: Vec3,
-    lock_degenerate: bool,
-) -> f32 {
+pub fn beautify_quad_cost(v0: Vec3, v1: Vec3, v2: Vec3, v3: Vec3, lock_degenerate: bool) -> f32 {
     // §8.6: derive a projection normal from the two existing-diagonal
     // corner triangles' cross products. Their unnormalised sum's length
     // doubles as a scale factor for the signum tolerance below.
@@ -615,13 +603,16 @@ fn third_corner_in_triangle(half_edges: &[BeautifyHalfEdge], here: usize) -> usi
 }
 
 fn sorted_endpoints(a: u32, b: u32) -> (u32, u32) {
-    if a < b { (a, b) } else { (b, a) }
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 fn is_perimeter_edge_pair(endpoints: (u32, u32), last_coord_index: u32) -> bool {
     debug_assert!(endpoints.0 < endpoints.1);
-    endpoints.0 + 1 == endpoints.1
-        || (endpoints.0 == 0 && endpoints.1 == last_coord_index)
+    endpoints.0 + 1 == endpoints.1 || (endpoints.0 == 0 && endpoints.1 == last_coord_index)
 }
 
 // ============================== Ear-clipping ==============================
@@ -704,7 +695,11 @@ impl EarClipState {
                 let b = coords[(i + 1) % vertex_count as usize];
                 shoelace_sum += (b.x - a.x) * (b.y + a.y);
             }
-            if shoelace_sum <= 0.0 { 1 } else { -1 }
+            if shoelace_sum <= 0.0 {
+                1
+            } else {
+                -1
+            }
         } else {
             coords_sign
         };

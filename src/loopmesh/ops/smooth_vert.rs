@@ -70,7 +70,8 @@ impl LoopMesh {
         // §4 pass 1 — compute every target against the input snapshot. Nothing is
         // written to the live mesh yet, so each neighbour read sees its pre-pass
         // position. The scratch buffer is indexed in lockstep with `verts`.
-        let mut targets: smallvec::SmallVec<[Vec3; 32]> = smallvec::SmallVec::with_capacity(verts.len());
+        let mut targets: smallvec::SmallVec<[Vec3; 32]> =
+            smallvec::SmallVec::with_capacity(verts.len());
         for &vert in verts {
             let original = self.vertex_position(vert);
 

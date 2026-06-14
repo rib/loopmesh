@@ -399,13 +399,12 @@ impl LoopMesh {
         // Degenerate fallback (§5.1): a loop whose end-to-end direction is
         // parallel to the between-loops axis projects to nothing, so compare
         // the unprojected directions instead.
-        let (cmp_a, cmp_b) = if proj_a.length_squared() < 1.0e-12
-            || proj_b.length_squared() < 1.0e-12
-        {
-            (dir_a, dir_b)
-        } else {
-            (proj_a, proj_b)
-        };
+        let (cmp_a, cmp_b) =
+            if proj_a.length_squared() < 1.0e-12 || proj_b.length_squared() < 1.0e-12 {
+                (dir_a, dir_b)
+            } else {
+                (proj_a, proj_b)
+            };
 
         if cmp_a.dot(cmp_b) < 0.0 {
             loop_b.verts.reverse();
@@ -492,7 +491,8 @@ impl LoopMesh {
             return reference;
         }
         let normal = normal.normalize();
-        if !edge_loop.closed && reference.length_squared() > 1.0e-20 && normal.dot(reference) < 0.0 {
+        if !edge_loop.closed && reference.length_squared() > 1.0e-20 && normal.dot(reference) < 0.0
+        {
             -normal
         } else {
             normal
@@ -784,8 +784,12 @@ impl LoopMesh {
             self.set_vertex_position(v_b, pos_a.lerp(pos_b, merge_factor));
 
             if !self.vertex_attribs.is_empty() {
-                let sources = [(1.0 - merge_factor, v_a.as_usize()), (merge_factor, v_b.as_usize())];
-                self.vertex_attribs.interpolate_into(v_b.as_usize(), &sources);
+                let sources = [
+                    (1.0 - merge_factor, v_a.as_usize()),
+                    (merge_factor, v_b.as_usize()),
+                ];
+                self.vertex_attribs
+                    .interpolate_into(v_b.as_usize(), &sources);
             }
 
             pairs.push((v_a, v_b));
@@ -1216,7 +1220,10 @@ mod tests {
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
         let result = mesh.bridge_loops(&ea, BridgeLoopsParams::default());
         assert!(!result.ok);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
     }
 
     /// §3.1 — an odd loop count under `use_pairs` cancels, mesh unchanged.
@@ -1231,7 +1238,10 @@ mod tests {
         };
         let result = mesh.bridge_loops(&selected, params);
         assert!(!result.ok);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
     }
 
     /// §3.1 — unequal loop lengths under `use_merge` cancel, mesh unchanged.
@@ -1264,7 +1274,10 @@ mod tests {
         };
         let result = mesh.bridge_loops(&selected, params);
         assert!(!result.ok);
-        assert_eq!((mesh.totvert(), mesh.totedge(), mesh.totface()), (v0, e0, f0));
+        assert_eq!(
+            (mesh.totvert(), mesh.totedge(), mesh.totface()),
+            (v0, e0, f0)
+        );
     }
 
     /// §5.6 — `twist_offset` on a closed pair re-shifts the rung connectivity
@@ -1373,7 +1386,10 @@ mod tests {
             let corners = [a[i], a[i + 1], above[i + 1], above[i]];
             let edges: Vec<EdgeKey> = (0..4)
                 .map(|k| {
-                    mesh.create_edge([corners[k], corners[(k + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
+                    mesh.create_edge(
+                        [corners[k], corners[(k + 1) % 4]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
                 })
                 .collect();
             let face = mesh.face_create(&corners, &edges, FaceCreateFlags::NONE);

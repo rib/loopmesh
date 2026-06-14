@@ -362,7 +362,10 @@ mod tests {
 
         let e_kill = mesh.vert_edge_keys(v1)[0];
         let surviving = mesh.vert_collapse_edge(e_kill, v1);
-        assert!(surviving.is_some(), "collapse succeeds on a triangle corner");
+        assert!(
+            surviving.is_some(),
+            "collapse succeeds on a triangle corner"
+        );
 
         assert_eq!(mesh.totvert(), 2, "-1 V (collapsed corner)");
         assert_eq!(mesh.totedge(), 1, "-2 E (spoke + spliced duplicate)");
@@ -370,7 +373,10 @@ mod tests {
 
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
         assert!(!live.contains(&v1), "the collapsed corner is gone");
-        assert!(live.contains(&v0) && live.contains(&v2), "neighbours survive");
+        assert!(
+            live.contains(&v0) && live.contains(&v2),
+            "neighbours survive"
+        );
 
         // The single surviving edge spans the two surviving neighbours.
         let edges = mesh.edge_keys();
@@ -442,7 +448,11 @@ mod tests {
 
         assert_eq!(mesh.totvert(), 2, "-1 V");
         assert_eq!(mesh.totedge(), 2, "-1 E (spoke only; duplicate left)");
-        assert_eq!(mesh.totface(), 1, "the 2-gon is left alive when reaping is off");
+        assert_eq!(
+            mesh.totface(),
+            1,
+            "the 2-gon is left alive when reaping is off"
+        );
     }
 
     /// The reaping is a property of the primitive, so the single-vert

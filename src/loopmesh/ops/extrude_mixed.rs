@@ -207,12 +207,8 @@ impl LoopMesh {
         let mut ledger = ExtrudeVertDupLedger::new(vert_watermark);
 
         if !faces.is_empty() {
-            let region = self.extrude_region_exclude(
-                faces,
-                &face_excluded,
-                use_keep_orig,
-                use_normal_flip,
-            );
+            let region =
+                self.extrude_region_exclude(faces, &face_excluded, use_keep_orig, use_normal_flip);
             // Seed the ledger from the region result: each duplicated source
             // vert, plus the vertical edge the region lifted at it (if any —
             // an interior region vert has no wall and thus no vertical edge,
@@ -282,9 +278,7 @@ mod tests {
 
     // The compat fixture shape: a quad face (verts 0..3), a disjoint wire edge
     // {4,5}, and a single loose vert 6.
-    fn face_loose_edge_and_vert(
-        mesh: &mut LoopMesh,
-    ) -> (FaceKey, EdgeKey, VertexKey) {
+    fn face_loose_edge_and_vert(mesh: &mut LoopMesh) -> (FaceKey, EdgeKey, VertexKey) {
         let face = unit_quad(mesh);
         let v4 = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
         let v5 = mesh.create_vertex(Vec3::new(4.0, 0.0, 0.0));
@@ -297,9 +291,7 @@ mod tests {
     // whose v1 endpoint is the quad's corner vert 1. The wire edge is named
     // directly; the quad is named as a face. The corner vert is reachable
     // through both kinds.
-    fn quad_with_wire_at_corner(
-        mesh: &mut LoopMesh,
-    ) -> (FaceKey, EdgeKey, VertexKey) {
+    fn quad_with_wire_at_corner(mesh: &mut LoopMesh) -> (FaceKey, EdgeKey, VertexKey) {
         let face = unit_quad(mesh);
         let corner = mesh.face_vert_keys(face)[1];
         let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
@@ -331,8 +323,11 @@ mod tests {
             "5 unique source verts duplicated (corner not double-counted)"
         );
         // The corner appears in the merged vert_map exactly once.
-        let corner_entries =
-            result.vert_map.iter().filter(|&&(s, _)| s == corner).count();
+        let corner_entries = result
+            .vert_map
+            .iter()
+            .filter(|&&(s, _)| s == corner)
+            .count();
         assert_eq!(corner_entries, 1, "corner has a single duplicate entry");
         mesh.validate_topology();
     }
@@ -452,8 +447,7 @@ mod tests {
         let boundary_edge = mesh_named
             .query_edge_exists(fv[0], fv[1])
             .expect("perimeter edge v0-v1");
-        let result_named =
-            mesh_named.extrude_region_mixed(&[face_named], &[boundary_edge], &[]);
+        let result_named = mesh_named.extrude_region_mixed(&[face_named], &[boundary_edge], &[]);
 
         let mut mesh_plain = LoopMesh::new();
         let face_plain = unit_quad(&mut mesh_plain);
@@ -461,7 +455,11 @@ mod tests {
 
         // Naming the boundary edge changed nothing: same wall / edge counts.
         assert_eq!(result_named.wall_faces.len(), result_plain.wall_faces.len());
-        assert_eq!(result_named.wall_faces.len(), 4, "exactly 4 walls, no extra");
+        assert_eq!(
+            result_named.wall_faces.len(),
+            4,
+            "exactly 4 walls, no extra"
+        );
         assert_eq!(result_named.edge_map.len(), result_plain.edge_map.len());
         assert_eq!(result_named.edge_map.len(), 4);
         assert_eq!(mesh_named.totface(), mesh_plain.totface());
@@ -483,7 +481,11 @@ mod tests {
         let result = mesh.extrude_region_mixed(&[face], &[], &[corner]);
 
         // No isolated wire edge: the corner is covered by the face.
-        assert_eq!(result.wire_edges.len(), 0, "face-owned vert is not isolated");
+        assert_eq!(
+            result.wire_edges.len(),
+            0,
+            "face-owned vert is not isolated"
+        );
         assert_eq!(result.vert_map.len(), 4, "only the 4 face verts duplicated");
         assert_eq!(result.wall_faces.len(), 4);
         mesh.validate_topology();
@@ -502,7 +504,11 @@ mod tests {
 
         assert_eq!(result.wall_faces.len(), 1, "one wall from the wire edge");
         assert_eq!(result.wire_edges.len(), 0, "edge endpoint is not isolated");
-        assert_eq!(result.vert_map.len(), 2, "both edge endpoints duplicated once");
+        assert_eq!(
+            result.vert_map.len(),
+            2,
+            "both edge endpoints duplicated once"
+        );
         mesh.validate_topology();
     }
 
@@ -518,19 +524,17 @@ mod tests {
         // Pre-state: 4 quad verts + 2 wire verts + 1 loose vert = 7 verts.
         assert_eq!(mesh.totvert(), 7);
 
-        let result = mesh.extrude_region_mixed_ex_exclude(
-            &[face],
-            &[wire],
-            &[],
-            &[wire],
-            false,
-            false,
-        );
+        let result =
+            mesh.extrude_region_mixed_ex_exclude(&[face], &[wire], &[], &[wire], false, false);
 
         // Only the 4 quad verts are duplicated; the wire's duplicate was killed
         // along with its two orphaned duplicate endpoints. 7 + 4 = 11 verts.
         assert_eq!(mesh.totvert(), 11, "excluded-wire duplicate verts killed");
-        assert_eq!(result.vert_map.len(), 4, "only the 4 face verts survive in the map");
+        assert_eq!(
+            result.vert_map.len(),
+            4,
+            "only the 4 face verts survive in the map"
+        );
         // No wire wall, no contribution from the excluded wire edge.
         assert_eq!(result.wall_faces.len(), 4, "4 face walls, no wire wall");
         // Surround-free face → §3.2.1 keeps the original: 1 kept + 1 cap + 4
@@ -539,7 +543,10 @@ mod tests {
 
         // The original wire edge is still present and faceless.
         let [w0, w1] = mesh.edge_vertices(wire);
-        assert!(mesh.query_edge_exists(w0, w1).is_some(), "original wire kept");
+        assert!(
+            mesh.query_edge_exists(w0, w1).is_some(),
+            "original wire kept"
+        );
         mesh.validate_topology();
     }
 
@@ -553,17 +560,14 @@ mod tests {
 
         assert_eq!(mesh.totvert(), 7);
 
-        let result = mesh.extrude_region_mixed_ex_exclude(
-            &[face],
-            &[wire],
-            &[],
-            &[],
-            false,
-            false,
-        );
+        let result = mesh.extrude_region_mixed_ex_exclude(&[face], &[wire], &[], &[], false, false);
 
         // 4 quad verts + 2 wire-endpoint verts duplicated = 6 dups, 13 verts.
-        assert_eq!(mesh.totvert(), 13, "wire endpoints duplicated when not excluded");
+        assert_eq!(
+            mesh.totvert(),
+            13,
+            "wire endpoints duplicated when not excluded"
+        );
         assert_eq!(result.vert_map.len(), 6);
         // 4 face walls + 1 wire wall.
         assert_eq!(result.wall_faces.len(), 5, "wire contributes a wall");
@@ -585,14 +589,8 @@ mod tests {
             .query_edge_exists(fv[0], fv[1])
             .expect("perimeter edge v0-v1");
 
-        let result = mesh.extrude_region_mixed_ex_exclude(
-            &[face],
-            &[],
-            &[],
-            &[boundary],
-            false,
-            false,
-        );
+        let result =
+            mesh.extrude_region_mixed_ex_exclude(&[face], &[], &[], &[boundary], false, false);
 
         // 3 walls instead of 4: the excluded boundary edge builds no wall.
         assert_eq!(result.wall_faces.len(), 3, "one wall suppressed");
@@ -609,8 +607,7 @@ mod tests {
         // An empty edges_exclude reproduces extrude_region_mixed exactly.
         let mut mesh_a = LoopMesh::new();
         let (face_a, wire_a, loose_a) = face_loose_edge_and_vert(&mut mesh_a);
-        let res_a =
-            mesh_a.extrude_region_mixed(&[face_a], &[wire_a], &[loose_a]);
+        let res_a = mesh_a.extrude_region_mixed(&[face_a], &[wire_a], &[loose_a]);
 
         let mut mesh_b = LoopMesh::new();
         let (face_b, wire_b, loose_b) = face_loose_edge_and_vert(&mut mesh_b);

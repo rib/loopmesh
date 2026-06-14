@@ -60,8 +60,10 @@ impl LoopMesh {
                     .get_vec4(color_layer, back)
                     .expect("selected colour layer is a vec4 loop attribute");
 
-                self.loop_attribs_mut().set_vec4(color_layer, front, back_value);
-                self.loop_attribs_mut().set_vec4(color_layer, back, front_value);
+                self.loop_attribs_mut()
+                    .set_vec4(color_layer, front, back_value);
+                self.loop_attribs_mut()
+                    .set_vec4(color_layer, back, front_value);
             }
         }
     }
@@ -213,7 +215,11 @@ mod tests {
         let after = read_corner_colors(&mesh, face, color);
         let n = before.len();
         for i in 0..n {
-            assert_eq!(after[i], before[n - 1 - i], "corner {i} takes mirror corner");
+            assert_eq!(
+                after[i],
+                before[n - 1 - i],
+                "corner {i} takes mirror corner"
+            );
         }
     }
 

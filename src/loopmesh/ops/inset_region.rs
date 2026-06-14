@@ -217,18 +217,18 @@ impl LoopMesh {
                 }
             }
 
-            let (is_seam, is_mesh_boundary, seam_loop) =
-                if tagged_count == 1 && untagged_count >= 1 {
-                    (true, false, first_tagged.unwrap())
-                } else if tagged_count == 1
-                    && untagged_count == 0
-                    && params.use_boundary
-                    && !params.use_outset
-                {
-                    (true, true, first_tagged.unwrap())
-                } else {
-                    (false, false, LoopKey(0))
-                };
+            let (is_seam, is_mesh_boundary, seam_loop) = if tagged_count == 1 && untagged_count >= 1
+            {
+                (true, false, first_tagged.unwrap())
+            } else if tagged_count == 1
+                && untagged_count == 0
+                && params.use_boundary
+                && !params.use_outset
+            {
+                (true, true, first_tagged.unwrap())
+            } else {
+                (false, false, LoopKey(0))
+            };
             if !is_seam {
                 continue;
             }
@@ -707,9 +707,7 @@ impl LoopMesh {
                         if let Some(far_src) = far_src {
                             self.loop_attribs
                                 .copy_into(wl.as_usize(), far_src.as_usize());
-                            if let Some(&(snap_idx, corner_idx)) =
-                                premove_corner.get(&far_src)
-                            {
+                            if let Some(&(snap_idx, corner_idx)) = premove_corner.get(&far_src) {
                                 self.write_premove_corner(
                                     wl,
                                     snap_idx,
@@ -807,8 +805,7 @@ impl LoopMesh {
         // live corner verts are the tagged-region vertex set.
         let mut tagged_verts: std::collections::HashSet<VertexKey> =
             std::collections::HashSet::new();
-        let mut tagged_edges: std::collections::HashSet<EdgeKey> =
-            std::collections::HashSet::new();
+        let mut tagged_edges: std::collections::HashSet<EdgeKey> = std::collections::HashSet::new();
         for f in self.face_keys() {
             if !self.face_op_flag_test(face_tag, f, 0) {
                 continue;
@@ -1310,11 +1307,8 @@ impl LoopMesh {
             };
 
             // Step 1 — outer pair at the RIM vertex (the gate loops).
-            let outer_a = self.loop_on_face_at_vertex_on_edge(
-                side.wall,
-                side.connect_edge,
-                side.rim_vertex,
-            );
+            let outer_a =
+                self.loop_on_face_at_vertex_on_edge(side.wall, side.connect_edge, side.rim_vertex);
             let outer_b =
                 self.loop_on_face_at_vertex_on_edge(face_b, side.connect_edge, side.rim_vertex);
             // Step 2 — inner pair at the moved corner `v` on `e_connect`.
@@ -1323,23 +1317,17 @@ impl LoopMesh {
                 side.connect_edge,
                 side.moved_corner,
             );
-            let inner_b = self.loop_on_face_at_vertex_on_edge(
-                face_b,
-                side.connect_edge,
-                side.moved_corner,
-            );
-            let (outer_a, outer_b, inner_a, inner_b) =
-                match (outer_a, outer_b, inner_a, inner_b) {
-                    (Some(oa), Some(ob), Some(ia), Some(ib)) => (oa, ob, ia, ib),
-                    _ => continue,
-                };
+            let inner_b =
+                self.loop_on_face_at_vertex_on_edge(face_b, side.connect_edge, side.moved_corner);
+            let (outer_a, outer_b, inner_a, inner_b) = match (outer_a, outer_b, inner_a, inner_b) {
+                (Some(oa), Some(ob), Some(ia), Some(ib)) => (oa, ob, ia, ib),
+                _ => continue,
+            };
 
             // Step 3 — behind pair: cross each face's OTHER edge at `v` (the
             // edge at `v` that is not `e_connect`), one radial step inward.
-            let behind_a =
-                self.inset_behind_loop(inner_a, side.connect_edge, side.moved_corner);
-            let behind_b =
-                self.inset_behind_loop(inner_b, side.connect_edge, side.moved_corner);
+            let behind_a = self.inset_behind_loop(inner_a, side.connect_edge, side.moved_corner);
+            let behind_b = self.inset_behind_loop(inner_b, side.connect_edge, side.moved_corner);
             let (behind_a, behind_b) = match (behind_a, behind_b) {
                 (Some(la), Some(lb)) => (la, lb),
                 _ => continue,
@@ -1355,10 +1343,11 @@ impl LoopMesh {
             // Step 5 — gate on the outer (rim) pair agreeing, using the
             // *tolerant* per-layer comparator (§6.3 step-5 note): a math UV
             // layer compares by squared distance, never byte-for-byte.
-            if !self
-                .loop_attribs
-                .slots_tolerant_equal(outer_a.as_usize(), outer_b.as_usize(), CORNER_MERGE_EPS_SQ)
-            {
+            if !self.loop_attribs.slots_tolerant_equal(
+                outer_a.as_usize(),
+                outer_b.as_usize(),
+                CORNER_MERGE_EPS_SQ,
+            ) {
                 continue;
             }
 
@@ -1515,7 +1504,12 @@ impl LoopMesh {
 
     /// INSET.md §6.3.1 test (b) — whether two distinct faces are edge-adjacent
     /// through `corner`: they share one of `corner`'s incident edges.
-    fn faces_share_edge_through(&self, face_a: FaceKey, face_b: FaceKey, corner: VertexKey) -> bool {
+    fn faces_share_edge_through(
+        &self,
+        face_a: FaceKey,
+        face_b: FaceKey,
+        corner: VertexKey,
+    ) -> bool {
         for edge in self.vertex_disk_iter(corner).collect::<Vec<_>>() {
             let mut on_a = false;
             let mut on_b = false;
@@ -1919,11 +1913,7 @@ mod tests {
 
     /// Expected mean-value blend of `corner_vals` at the post-displacement
     /// projected position of a corner, using the documented §10.1 routine.
-    fn expected_blend2(
-        proj_corners: &[Vec2],
-        corner_vals: &[[f32; 2]],
-        q: Vec2,
-    ) -> [f32; 2] {
+    fn expected_blend2(proj_corners: &[Vec2], corner_vals: &[[f32; 2]], q: Vec2) -> [f32; 2] {
         let w = mean_value_weights(proj_corners, q);
         let mut out = [0.0_f32; 2];
         for i in 0..w.len() {
@@ -1958,10 +1948,7 @@ mod tests {
         }
         let projection = PlaneProjection::from_normal(Vec3::Z);
         let proj_corners: Vec<Vec2> = orig_pos.iter().map(|&p| projection.project(p)).collect();
-        let corner_uvs: Vec<[f32; 2]> = orig_pos
-            .iter()
-            .map(|&p| [p.x * p.y, p.x * p.x])
-            .collect();
+        let corner_uvs: Vec<[f32; 2]> = orig_pos.iter().map(|&p| [p.x * p.y, p.x * p.x]).collect();
 
         mesh.inset_region(
             &[centre],
@@ -1987,7 +1974,10 @@ mod tests {
             );
             // The corner genuinely moved, so this is the smooth-interior path,
             // not the identity short-circuit.
-            assert!((new_p - orig_pos[i]).length() > 1e-3, "corner {i} did not move");
+            assert!(
+                (new_p - orig_pos[i]).length() > 1e-3,
+                "corner {i} did not move"
+            );
             checked += 1;
         }
         assert_eq!(checked, 4);
@@ -2150,7 +2140,10 @@ mod tests {
                 }
             }
         }
-        assert!(merged_corners >= 4, "expected merged corners, got {merged_corners}");
+        assert!(
+            merged_corners >= 4,
+            "expected merged corners, got {merged_corners}"
+        );
     }
 
     #[test]
@@ -2193,7 +2186,8 @@ mod tests {
                 acc
             };
             for l in loops {
-                mesh.loop_attribs_mut().set_i32(tag, l.as_usize(), fi as i32);
+                mesh.loop_attribs_mut()
+                    .set_i32(tag, l.as_usize(), fi as i32);
             }
         }
 
@@ -2255,7 +2249,8 @@ mod tests {
         let loops: Vec<LoopKey> = mesh.loops.iter().collect();
         for l in loops {
             let p = mesh.vertex_position(mesh.loop_vertex(l));
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x, p.y]);
         }
 
         // The centre face's four original corner UVs (= the only legitimate
@@ -2280,9 +2275,8 @@ mod tests {
         assert_eq!(result.wall_faces.len(), 4);
         mesh.validate_topology();
 
-        let approx = |a: [f32; 2], b: [f32; 2]| {
-            (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
-        };
+        let approx =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
 
         for &wall in &result.wall_faces {
             let mut wall_pos_uv: Vec<([f32; 3], [f32; 2])> = Vec::new();
@@ -2344,7 +2338,8 @@ mod tests {
         let loops: Vec<LoopKey> = mesh.loops.iter().collect();
         for l in loops {
             let p = mesh.vertex_position(mesh.loop_vertex(l));
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x, p.y]);
         }
 
         // Original corner UVs of the three tagged faces (the only legit sources).
@@ -2367,9 +2362,8 @@ mod tests {
         mesh.validate_topology();
         assert!(!result.wall_faces.is_empty());
 
-        let approx = |a: [f32; 2], b: [f32; 2]| {
-            (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
-        };
+        let approx =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
 
         for &wall in &result.wall_faces {
             let mut wall_pos_uv: Vec<([f32; 3], [f32; 2])> = Vec::new();
@@ -2495,7 +2489,8 @@ mod tests {
         let loops: Vec<LoopKey> = mesh.loops.iter().collect();
         for l in loops {
             let p = mesh.vertex_position(mesh.loop_vertex(l));
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [p.x, p.y]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x, p.y]);
         }
 
         let result = mesh.inset_region(
@@ -2531,7 +2526,10 @@ mod tests {
                 }
             }
         }
-        assert!(merged_corners >= 4, "math layer should still merge corners, got {merged_corners}");
+        assert!(
+            merged_corners >= 4,
+            "math layer should still merge corners, got {merged_corners}"
+        );
     }
 
     #[test]
@@ -2674,9 +2672,15 @@ mod tests {
         );
         // Perpendicular to the seam: zero Y, magnitude `thickness`, pointing
         // into f0 (toward -X).
-        assert!(d1.y.abs() < 1.0e-5, "bare tangent should have no Y; d1={d1:?}");
+        assert!(
+            d1.y.abs() < 1.0e-5,
+            "bare tangent should have no Y; d1={d1:?}"
+        );
         assert!(d1.z.abs() < 1.0e-5, "planar mesh stays in z=0; d1={d1:?}");
-        assert!(d1.x < 0.0, "tangent should point into the tagged face (-X); d1={d1:?}");
+        assert!(
+            d1.x < 0.0,
+            "tangent should point into the tagged face (-X); d1={d1:?}"
+        );
         assert!(
             (d1.length() - 0.25).abs() < 1.0e-5,
             "displacement magnitude should equal thickness; |d1|={}",
@@ -2716,8 +2720,14 @@ mod tests {
         // Each genuinely slides along its boundary edge → non-zero Y, with
         // opposite signs (v1's boundary edge v0–v1 tilts down, v2's edge
         // v2–v3 tilts up).
-        assert!(d1.y.abs() > 1.0e-4, "even-on v1 should slide off-axis; d1={d1:?}");
-        assert!(d2.y.abs() > 1.0e-4, "even-on v2 should slide off-axis; d2={d2:?}");
+        assert!(
+            d1.y.abs() > 1.0e-4,
+            "even-on v1 should slide off-axis; d1={d1:?}"
+        );
+        assert!(
+            d2.y.abs() > 1.0e-4,
+            "even-on v2 should slide off-axis; d2={d2:?}"
+        );
         assert!(
             d1.y.signum() != d2.y.signum(),
             "the two corners slide toward opposite Y; d1={d1:?} d2={d2:?}"
@@ -2934,7 +2944,9 @@ mod tests {
     /// along its *incoming* normal (§8.1.1) — which we seed to a known
     /// non-degenerate unit vector so the displacement is exactly
     /// `depth * relaxed_length` along it.
-    fn graded_5x5_inner_block(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey, [f32; 5], [f32; 5]) {
+    fn graded_5x5_inner_block(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<FaceKey>, VertexKey, [f32; 5], [f32; 5]) {
         // Deliberately irregular spacing on both axes.
         let xs = [0.0_f32, 0.7, 1.5, 2.6, 4.0];
         let ys = [0.0_f32, 0.5, 1.4, 2.0, 3.1];
@@ -3202,8 +3214,7 @@ mod tests {
         // operator computes in phase two and never recomputes. They are the
         // values §6.1 says each wall must inherit.
         mesh.calc_face_normals();
-        let tagged_normals: Vec<Vec3> =
-            tagged_faces.iter().map(|&f| mesh.face_normal(f)).collect();
+        let tagged_normals: Vec<Vec3> = tagged_faces.iter().map(|&f| mesh.face_normal(f)).collect();
         for normal in &tagged_normals {
             assert!(
                 normal.length() > 0.5 && normal.z > 0.0,
@@ -3817,7 +3828,8 @@ mod tests {
         let (a, b) = (face_loops[0], face_loops[1]);
 
         // Within epsilon: separation 1e-3 → squared distance 1e-6 < 1e-5.
-        mesh.loop_attribs_mut().set_vec2(uv, a.as_usize(), [0.5, 0.5]);
+        mesh.loop_attribs_mut()
+            .set_vec2(uv, a.as_usize(), [0.5, 0.5]);
         mesh.loop_attribs_mut()
             .set_vec2(uv, b.as_usize(), [0.5 + 1.0e-3, 0.5]);
         assert!(

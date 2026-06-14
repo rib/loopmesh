@@ -326,8 +326,7 @@ impl LoopMesh {
                 } else {
                     l_fb
                 };
-                self.loop_attribs
-                    .copy_into(dst.as_usize(), src.as_usize());
+                self.loop_attribs.copy_into(dst.as_usize(), src.as_usize());
             }
 
             for &l in &fb_chain {
@@ -591,7 +590,11 @@ mod tests {
             "interior-only centre vert must be killed per §4.1 step 4"
         );
         assert_eq!(mesh.totvert(), totvert_before - 1, "1 vert killed");
-        assert_eq!(mesh.totedge(), totedge_before - 4, "4 interior edges killed");
+        assert_eq!(
+            mesh.totedge(),
+            totedge_before - 4,
+            "4 interior edges killed"
+        );
         assert_eq!(mesh.totface(), totface_before - 3, "4 input faces → 1 face");
 
         let perimeter = mesh.face_vert_keys(merged);
@@ -631,9 +634,7 @@ mod tests {
     /// perimeter coincides with the outer boundary of the two-quad
     /// region (`[v0, v1, v4, v5, v2, v3]`). Returns
     /// `(verts, [left_quad, right_quad, shadow])`.
-    fn build_shadow_over_two_quads(
-        mesh: &mut LoopMesh,
-    ) -> (Vec<VertexKey>, [FaceKey; 3]) {
+    fn build_shadow_over_two_quads(mesh: &mut LoopMesh) -> (Vec<VertexKey>, [FaceKey; 3]) {
         let v: Vec<VertexKey> = [
             (0.0, 0.0),
             (1.0, 0.0),
@@ -696,8 +697,16 @@ mod tests {
             "§4.2 step 3: the pre-existing shadow face becomes the reported survivor"
         );
 
-        assert_eq!(mesh.totvert(), 6, "every perimeter vert retains a shadow edge");
-        assert_eq!(mesh.totedge(), 6, "interior v1-v2 edge gone; outer rim survives");
+        assert_eq!(
+            mesh.totvert(),
+            6,
+            "every perimeter vert retains a shadow edge"
+        );
+        assert_eq!(
+            mesh.totedge(),
+            6,
+            "interior v1-v2 edge gone; outer rim survives"
+        );
         assert_eq!(
             mesh.totface(),
             1,
@@ -790,7 +799,8 @@ mod tests {
         for (face_id, face) in [(1.0_f32, f_left), (2.0_f32, f_right)] {
             for l in mesh.face_loop_keys(face) {
                 let vi = vert_index(mesh.loop_vertex(l));
-                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [face_id, vi]);
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [face_id, vi]);
             }
         }
 
@@ -808,9 +818,16 @@ mod tests {
         let expected: std::collections::HashSet<VertexKey> = v.iter().copied().collect();
         assert_eq!(got, expected, "perimeter is the union's outer rim");
         assert_eq!(mesh.totvert(), totvert_before, "no verts killed");
-        assert_eq!(mesh.totedge(), 6, "shared interior edge killed; 6 rim edges remain");
+        assert_eq!(
+            mesh.totedge(),
+            6,
+            "shared interior edge killed; 6 rim edges remain"
+        );
         assert_eq!(mesh.totface(), 1, "two quads merged into one");
-        assert!(mesh.edge_keys().into_iter().all(|e| e != e_12), "shared edge gone");
+        assert!(
+            mesh.edge_keys().into_iter().all(|e| e != e_12),
+            "shared edge gone"
+        );
 
         // Per-corner attribute routing (§4.1.5): every surviving boundary
         // loop kept its own source-face UV and is anchored at the vertex
@@ -941,10 +958,12 @@ mod tests {
         // The survivor must be a brand-new face (the JFKE chain keeps
         // face[0]'s slot alive as the survivor; either way it is NOT some
         // *other* pre-existing face).
-        let live_faces: std::collections::HashSet<FaceKey> =
-            mesh.face_keys().into_iter().collect();
+        let live_faces: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert!(live_faces.contains(&survivor));
-        assert_eq!(survivor, faces[0], "JFKE preserves the first input's face slot");
+        assert_eq!(
+            survivor, faces[0],
+            "JFKE preserves the first input's face slot"
+        );
 
         mesh.validate_topology();
     }

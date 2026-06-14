@@ -133,10 +133,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(2.0, 0.0, 0.0),
         ];
-        let verts: Vec<VertexKey> = positions
-            .iter()
-            .map(|&p| mesh.create_vertex(p))
-            .collect();
+        let verts: Vec<VertexKey> = positions.iter().map(|&p| mesh.create_vertex(p)).collect();
 
         let result = mesh.extrude_vert_indiv(&verts);
 
@@ -232,9 +229,17 @@ mod tests {
         let (_s_b, dup_b) = *result.vert_map.iter().find(|&&(s, _)| s == b).unwrap();
 
         // a is the first stored endpoint (v1) of the wire -> swap -> [dup_a, a].
-        assert_eq!(new_edge_for(a), [dup_a, a], "first wire endpoint swaps winding");
+        assert_eq!(
+            new_edge_for(a),
+            [dup_a, a],
+            "first wire endpoint swaps winding"
+        );
         // b is the second stored endpoint -> no swap -> default [b, dup_b].
-        assert_eq!(new_edge_for(b), [b, dup_b], "second endpoint keeps default winding");
+        assert_eq!(
+            new_edge_for(b),
+            [b, dup_b],
+            "second endpoint keeps default winding"
+        );
 
         mesh.validate_topology();
     }

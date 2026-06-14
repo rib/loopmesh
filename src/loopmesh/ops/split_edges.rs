@@ -135,8 +135,7 @@ impl LoopMesh {
             // Peel one face at a time until the edge is radial-1 (or a boundary
             // /wire edge, which supports no separation: the loop never runs).
             loop {
-                let loops: SmallVec<[LoopKey; 4]> =
-                    self.edge_radial_iter(edge).collect();
+                let loops: SmallVec<[LoopKey; 4]> = self.edge_radial_iter(edge).collect();
                 if loops.len() < 2 {
                     break;
                 }
@@ -328,7 +327,11 @@ mod tests {
         let (verts, _faces, shared) = build_two_quads(&mut mesh);
         let (v0, e0, f0) = (mesh.totvert(), mesh.totedge(), mesh.totface());
         assert_eq!((v0, e0, f0), (6, 7, 2));
-        assert_eq!(mesh.edge_face_keys(shared).len(), 2, "shared edge is radial-2");
+        assert_eq!(
+            mesh.edge_face_keys(shared).len(),
+            2,
+            "shared edge is radial-2"
+        );
 
         mesh.split_edges(&[shared], &[], false);
 
@@ -364,8 +367,15 @@ mod tests {
         let unique: HashSet<EdgeKey> = out.iter().copied().collect();
         assert_eq!(unique.len(), 2, "the two seam edges are distinct");
         for &e in &out {
-            assert!(mesh.edges.try_get(e).is_some(), "every reported edge is live");
-            assert_eq!(mesh.edge_face_keys(e).len(), 1, "each seam edge carries one face");
+            assert!(
+                mesh.edges.try_get(e).is_some(),
+                "every reported edge is live"
+            );
+            assert_eq!(
+                mesh.edge_face_keys(e).len(),
+                1,
+                "each seam edge carries one face"
+            );
         }
         mesh.validate_topology();
     }
@@ -405,7 +415,10 @@ mod tests {
                 .iter()
                 .filter(|&&f| mesh.face_vert_keys(f).contains(&verts[2]))
                 .count();
-            assert_eq!(touching_v2, 2, "vert 2 stays welded — both faces still hinge on it");
+            assert_eq!(
+                touching_v2, 2,
+                "vert 2 stays welded — both faces still hinge on it"
+            );
             mesh.validate_topology();
         }
     }
@@ -430,8 +443,15 @@ mod tests {
         let mut pairs: HashSet<(VertexKey, VertexKey)> = HashSet::new();
         for e in mesh.edge_keys() {
             let [a, b] = mesh.edge_vert_keys(e);
-            let key = if a.as_usize() <= b.as_usize() { (a, b) } else { (b, a) };
-            assert!(pairs.insert(key), "no coincident double edge survives the guard");
+            let key = if a.as_usize() <= b.as_usize() {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            assert!(
+                pairs.insert(key),
+                "no coincident double edge survives the guard"
+            );
         }
         mesh.validate_topology();
     }
@@ -450,8 +470,16 @@ mod tests {
 
         let out = mesh.split_edges_out(&[spine], &[], false);
 
-        assert_eq!(mesh.totvert(), v0 + 4, "+4 V (each endpoint fans into three)");
-        assert_eq!(mesh.totedge(), e0 + 2, "+2 E (spine -> three coincident edges)");
+        assert_eq!(
+            mesh.totvert(),
+            v0 + 4,
+            "+4 V (each endpoint fans into three)"
+        );
+        assert_eq!(
+            mesh.totedge(),
+            e0 + 2,
+            "+2 E (spine -> three coincident edges)"
+        );
         assert_eq!(mesh.totface(), f0, "+0 F (three pages survive)");
         assert_eq!(out.len(), 3, "edges.out = three coincident spine edges");
 
@@ -497,7 +525,11 @@ mod tests {
         // Three interior edges duplicated -> +3 E. The four interior verts on
         // the seam (1, 5, 9, 13) each split into two fans (left/right) -> +4 V.
         assert_eq!(mesh.totedge(), e0 + 3, "+3 E (three duplicated seam edges)");
-        assert_eq!(mesh.totvert(), v0 + 4, "+4 V (each seam vert fans into two)");
+        assert_eq!(
+            mesh.totvert(),
+            v0 + 4,
+            "+4 V (each seam vert fans into two)"
+        );
         assert_eq!(mesh.totface(), f0, "+0 F");
         mesh.validate_topology();
     }

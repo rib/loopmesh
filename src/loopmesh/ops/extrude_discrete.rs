@@ -76,7 +76,8 @@ impl LoopMesh {
             let mut dup_verts: SmallVec<[VertexKey; 8]> = SmallVec::new();
             for &(_l, v_org, _e) in &org_loops {
                 let dup = self.create_vertex(self.vertex_position(v_org));
-                self.vertex_attribs.copy_into(dup.as_usize(), v_org.as_usize());
+                self.vertex_attribs
+                    .copy_into(dup.as_usize(), v_org.as_usize());
                 vert_map_out.push((v_org, dup));
                 dup_verts.push(dup);
             }
@@ -88,7 +89,8 @@ impl LoopMesh {
                 let next = (i + 1) % perimeter;
                 let e_org = org_loops[i].2;
                 let dup = self.create_edge([dup_verts[i], dup_verts[next]], EdgeCreateFlags::NONE);
-                self.edge_attribs.copy_into(dup.as_usize(), e_org.as_usize());
+                self.edge_attribs
+                    .copy_into(dup.as_usize(), e_org.as_usize());
                 edge_map_out.push((e_org, dup));
                 dup_edges.push(dup);
             }
@@ -169,7 +171,8 @@ impl LoopMesh {
                     &[e_org, side_b, e_dup, side_a],
                     FaceCreateFlags::NONE,
                 );
-                self.face_attribs.copy_into(wall.as_usize(), face.as_usize());
+                self.face_attribs
+                    .copy_into(wall.as_usize(), face.as_usize());
 
                 // Wall loop customdata (§4.3): the source face is the original
                 // face itself. Its two loops on e_org are `l_org` (at `va_org`)
@@ -261,7 +264,11 @@ mod tests {
         assert_eq!(result.vert_map.len(), 4, "4 verts duplicated");
         assert_eq!(result.edge_map.len(), 4, "4 edges duplicated");
         assert_eq!(result.side_edges.len(), 4, "4 vertical edges");
-        assert_eq!(result.wall_faces.len(), 4, "4 walls, one per perimeter edge");
+        assert_eq!(
+            result.wall_faces.len(),
+            4,
+            "4 walls, one per perimeter edge"
+        );
 
         // 4 original verts + 4 duplicates.
         assert_eq!(mesh.totvert(), 8);
@@ -309,8 +316,16 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
-        let f0 = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let f1 = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let f0 = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let f1 = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let result = mesh.extrude_discrete_faces(&[f0, f1]);
 
@@ -318,11 +333,23 @@ mod tests {
         // its own copy of the shared edge v1–v2 and the shared verts v1, v2. So
         // the dup count is 8 verts (4 per face, with v1/v2 duplicated twice) and
         // 8 edges (4 per face, with e12 duplicated twice).
-        assert_eq!(result.vert_map.len(), 8, "each face dups all 4 of its verts");
-        assert_eq!(result.edge_map.len(), 8, "each face dups all 4 of its edges");
+        assert_eq!(
+            result.vert_map.len(),
+            8,
+            "each face dups all 4 of its verts"
+        );
+        assert_eq!(
+            result.edge_map.len(),
+            8,
+            "each face dups all 4 of its edges"
+        );
         // 4 walls per face = 8 walls; the shared edge is walled twice (once by
         // each face's own duplicate), which is the isolation signature.
-        assert_eq!(result.wall_faces.len(), 8, "each face rings itself with 4 walls");
+        assert_eq!(
+            result.wall_faces.len(),
+            8,
+            "each face rings itself with 4 walls"
+        );
 
         // Exactly two walls sit on the original shared edge v1–v2 — proof the
         // faces split apart rather than merging into one patch.
@@ -465,7 +492,8 @@ mod tests {
             [1.0, 1.0, 0.0],
         ];
         for (i, &v) in source_verts.iter().enumerate() {
-            mesh.vertex_attribs_mut().set_vec3(color, v.as_usize(), palette[i]);
+            mesh.vertex_attribs_mut()
+                .set_vec3(color, v.as_usize(), palette[i]);
         }
 
         let mat = mesh
@@ -475,20 +503,30 @@ mod tests {
             ))
             .unwrap();
         let face_color = [0.2_f32, 0.5, 0.9];
-        mesh.face_attribs_mut().set_vec3(mat, face.as_usize(), face_color);
+        mesh.face_attribs_mut()
+            .set_vec3(mat, face.as_usize(), face_color);
 
         let result = mesh.extrude_discrete_faces(&[face]);
 
         for &(src, dup) in &result.vert_map {
-            let src_val = mesh.vertex_attribs().get_vec3(color, src.as_usize()).unwrap();
-            let dup_val = mesh.vertex_attribs().get_vec3(color, dup.as_usize()).unwrap();
+            let src_val = mesh
+                .vertex_attribs()
+                .get_vec3(color, src.as_usize())
+                .unwrap();
+            let dup_val = mesh
+                .vertex_attribs()
+                .get_vec3(color, dup.as_usize())
+                .unwrap();
             assert_eq!(src_val, dup_val, "duplicate vert carries source color");
         }
         // Every wall face inherits the original face's material color.
         for &wf in &result.wall_faces {
             let got = mesh.face_attribs().get_vec3(mat, wf.as_usize()).unwrap();
             for i in 0..3 {
-                assert!((got[i] - face_color[i]).abs() < 1e-6, "wall inherits face color");
+                assert!(
+                    (got[i] - face_color[i]).abs() < 1e-6,
+                    "wall inherits face color"
+                );
             }
         }
     }

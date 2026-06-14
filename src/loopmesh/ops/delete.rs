@@ -767,7 +767,11 @@ mod tests {
             mesh.face_vert_keys(block[0])[2],
         );
         let shared = shared.expect("shared edge exists");
-        assert_eq!(mesh.edge_radial_iter(shared).count(), 2, "shared is interior");
+        assert_eq!(
+            mesh.edge_radial_iter(shared).count(),
+            2,
+            "shared is interior"
+        );
 
         mesh.delete(&block, DeleteContext::FacesKeepBoundary);
 
@@ -790,7 +794,11 @@ mod tests {
         mesh.delete(&block, DeleteContext::Faces);
 
         assert_eq!(mesh.totface(), 0);
-        assert_eq!(mesh.totedge(), 0, "plain Faces drops the owned boundary too");
+        assert_eq!(
+            mesh.totedge(),
+            0,
+            "plain Faces drops the owned boundary too"
+        );
         assert_eq!(mesh.totvert(), 0);
     }
 
@@ -838,7 +846,10 @@ mod tests {
         mesh.delete(&[] as &[FaceKey], DeleteContext::FacesOnly);
         mesh.delete(&[] as &[VertexKey], DeleteContext::Verts);
 
-        assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
+        assert_eq!(
+            (v0, e0, f0),
+            (mesh.totvert(), mesh.totedge(), mesh.totface())
+        );
     }
 
     #[test]
@@ -1053,7 +1064,11 @@ mod tests {
 
         mesh.delete(&[spine], DeleteContext::Edges);
 
-        assert_eq!(mesh.totface(), 0, "all three pages die (exhaustive cascade)");
+        assert_eq!(
+            mesh.totface(),
+            0,
+            "all three pages die (exhaustive cascade)"
+        );
         assert_eq!(mesh.totedge(), 6, "six page edges survive as wire");
         assert_eq!(mesh.totvert(), 5, "both spine ends + three apexes survive");
         assert!(mesh.vertices.try_get(s0).is_some(), "spine end kept (§7.2)");
@@ -1108,7 +1123,10 @@ mod tests {
         mesh.delete(&[] as &[EdgeKey], DeleteContext::EdgesFaces);
         let _ = faces;
 
-        assert_eq!((v0, e0, f0), (mesh.totvert(), mesh.totedge(), mesh.totface()));
+        assert_eq!(
+            (v0, e0, f0),
+            (mesh.totvert(), mesh.totedge(), mesh.totface())
+        );
     }
 
     #[test]
@@ -1225,7 +1243,11 @@ mod tests {
 
         assert_eq!(f0 - mesh.totface(), 4, "all four faces gone via cascade");
         assert_eq!(e0 - mesh.totedge(), 4, "all four spokes gone via cascade");
-        assert_eq!(v0 - mesh.totvert(), 1, "only the tagged centre vert removed");
+        assert_eq!(
+            v0 - mesh.totvert(),
+            1,
+            "only the tagged centre vert removed"
+        );
         assert!(mesh.vertices.try_get(centre).is_none(), "centre vert gone");
     }
 }

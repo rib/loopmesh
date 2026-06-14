@@ -358,7 +358,10 @@ mod tests {
             })
             .collect();
         assert_eq!(clone_faces.len(), 1);
-        assert!(mesh.faces.try_get(clone_faces[0]).is_some(), "clone survives");
+        assert!(
+            mesh.faces.try_get(clone_faces[0]).is_some(),
+            "clone survives"
+        );
 
         // Every frontier edge was solely owned and deleted -> all self-maps.
         assert_eq!(result.boundary_map.len(), 4);
@@ -383,13 +386,23 @@ mod tests {
 
         assert_eq!(mesh.totvert() - v0, 4, "+4 verts (clone corners)");
         assert_eq!(mesh.totedge() - e0, 4, "+4 edges (clone boundary)");
-        assert_eq!(mesh.totface(), f0, "face count unchanged (clone offsets original)");
-        assert!(mesh.faces.try_get(centre).is_none(), "original centre torn out");
+        assert_eq!(
+            mesh.totface(),
+            f0,
+            "face count unchanged (clone offsets original)"
+        );
+        assert!(
+            mesh.faces.try_get(centre).is_none(),
+            "original centre torn out"
+        );
 
         assert_eq!(result.boundary_map.len(), 4);
         for (&k, &v) in result.boundary_map.iter() {
             assert_ne!(k, v, "shared frontier survives -> source->clone (§5)");
-            assert!(mesh.edges.try_get(k).is_some(), "surviving source key is live");
+            assert!(
+                mesh.edges.try_get(k).is_some(),
+                "surviving source key is live"
+            );
             assert!(mesh.edges.try_get(v).is_some(), "clone value is live");
         }
         mesh.validate_topology();
@@ -407,10 +420,17 @@ mod tests {
 
         let result = mesh.split(&[corner.into()], false);
 
-        assert_eq!(result.boundary_map.len(), 4, "all four perimeter edges frontier");
+        assert_eq!(
+            result.boundary_map.len(),
+            4,
+            "all four perimeter edges frontier"
+        );
         let self_maps = result.boundary_map.iter().filter(|(k, v)| k == v).count();
         let cross_maps = result.boundary_map.iter().filter(|(k, v)| k != v).count();
-        assert_eq!(self_maps, 2, "two solely-owned boundary edges self-map (§5)");
+        assert_eq!(
+            self_maps, 2,
+            "two solely-owned boundary edges self-map (§5)"
+        );
         assert_eq!(cross_maps, 2, "two shared edges keep source->clone (§5)");
         mesh.validate_topology();
     }
@@ -428,16 +448,25 @@ mod tests {
         let (face, wire, loose) = face_with_loose_edge_and_vert(&mut mesh);
         let [wa, wb] = mesh.edge_vertices(wire);
 
-        mesh.split(
-            &[face.into(), wire.into(), loose.into()],
-            true,
-        );
+        mesh.split(&[face.into(), wire.into(), loose.into()], true);
 
         // All loose originals torn out.
-        assert!(mesh.edges.try_get(wire).is_none(), "wire original swept (§4)");
-        assert!(mesh.vertices.try_get(wa).is_none(), "wire endpoint swept (§4)");
-        assert!(mesh.vertices.try_get(wb).is_none(), "wire endpoint swept (§4)");
-        assert!(mesh.vertices.try_get(loose).is_none(), "loose vert swept (§4)");
+        assert!(
+            mesh.edges.try_get(wire).is_none(),
+            "wire original swept (§4)"
+        );
+        assert!(
+            mesh.vertices.try_get(wa).is_none(),
+            "wire endpoint swept (§4)"
+        );
+        assert!(
+            mesh.vertices.try_get(wb).is_none(),
+            "wire endpoint swept (§4)"
+        );
+        assert!(
+            mesh.vertices.try_get(loose).is_none(),
+            "loose vert swept (§4)"
+        );
         assert!(mesh.faces.try_get(face).is_none(), "original face torn out");
 
         // The whole-mesh widening also sweeps the clone wire (2V/1E) and clone
@@ -460,16 +489,25 @@ mod tests {
         let (face, wire, loose) = face_with_loose_edge_and_vert(&mut mesh);
         let [wa, wb] = mesh.edge_vertices(wire);
 
-        mesh.split(
-            &[face.into(), wire.into(), loose.into()],
-            false,
-        );
+        mesh.split(&[face.into(), wire.into(), loose.into()], false);
 
         // Named loose originals torn out, but the wire's endpoints survive loose.
-        assert!(mesh.edges.try_get(wire).is_none(), "named wire original torn (§3.3)");
-        assert!(mesh.vertices.try_get(wa).is_some(), "wire endpoint spared loose (§3.3)");
-        assert!(mesh.vertices.try_get(wb).is_some(), "wire endpoint spared loose (§3.3)");
-        assert!(mesh.vertices.try_get(loose).is_none(), "named loose vert torn (§3.3)");
+        assert!(
+            mesh.edges.try_get(wire).is_none(),
+            "named wire original torn (§3.3)"
+        );
+        assert!(
+            mesh.vertices.try_get(wa).is_some(),
+            "wire endpoint spared loose (§3.3)"
+        );
+        assert!(
+            mesh.vertices.try_get(wb).is_some(),
+            "wire endpoint spared loose (§3.3)"
+        );
+        assert!(
+            mesh.vertices.try_get(loose).is_none(),
+            "named loose vert torn (§3.3)"
+        );
         assert!(mesh.faces.try_get(face).is_none(), "original face torn out");
 
         // Quad clone (4V/4E/1F) + wire clone (2V/1E) + clone loose vert (1V) +
@@ -498,9 +536,19 @@ mod tests {
         let (&src, &clone) = result.isovert_map.iter().next().unwrap();
         assert_eq!(src, v, "key is the verbatim source (no §5 fix-up)");
         assert_ne!(src, clone, "isovert couple is never a self-map");
-        assert!(mesh.vertices.try_get(v).is_none(), "original swept under use_only_faces");
-        assert!(mesh.vertices.try_get(clone).is_none(), "clone loose vert swept too (§4 whole-mesh)");
-        assert_eq!(mesh.totvert(), 0, "both original and clone loose verts swept");
+        assert!(
+            mesh.vertices.try_get(v).is_none(),
+            "original swept under use_only_faces"
+        );
+        assert!(
+            mesh.vertices.try_get(clone).is_none(),
+            "clone loose vert swept too (§4 whole-mesh)"
+        );
+        assert_eq!(
+            mesh.totvert(),
+            0,
+            "both original and clone loose verts swept"
+        );
         mesh.validate_topology();
     }
 }

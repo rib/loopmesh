@@ -241,8 +241,7 @@ impl LoopMesh {
                 // around the face), pinching the triangle closed in §7.
                 let opposite = self.loop_edge(self.loop_next(loop_key));
                 self.edge_op_flag_set(pending, opposite, COLLAPSE_PENDING_BIT);
-            } else if let Some((_new_face, diagonal)) =
-                self.face_split(face, prev_vert, next_vert)
+            } else if let Some((_new_face, diagonal)) = self.face_split(face, prev_vert, next_vert)
             {
                 self.edge_op_flag_set(pending, diagonal, COLLAPSE_PENDING_BIT);
             }
@@ -253,9 +252,7 @@ impl LoopMesh {
             self.edge_split(outgoing, corner_vert, len_prev / len_next);
             // The split inserts the new corner vertex as the loop's next.
             let new_next_vert = self.loop_vertex(self.loop_next(loop_key));
-            if let Some((_new_face, diagonal)) =
-                self.face_split(face, prev_vert, new_next_vert)
-            {
+            if let Some((_new_face, diagonal)) = self.face_split(face, prev_vert, new_next_vert) {
                 self.edge_op_flag_set(pending, diagonal, COLLAPSE_PENDING_BIT);
             }
         } else {
@@ -265,9 +262,7 @@ impl LoopMesh {
             self.edge_split(incoming, corner_vert, len_next / len_prev);
             // The split inserts the new corner vertex as the loop's prev.
             let new_prev_vert = self.loop_vertex(self.loop_prev(loop_key));
-            if let Some((_new_face, diagonal)) =
-                self.face_split(face, new_prev_vert, next_vert)
-            {
+            if let Some((_new_face, diagonal)) = self.face_split(face, new_prev_vert, next_vert) {
                 self.edge_op_flag_set(pending, diagonal, COLLAPSE_PENDING_BIT);
             }
         }

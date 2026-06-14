@@ -117,12 +117,17 @@ mod tests {
     }
 
     /// Seed distinct UVs corner-by-corner in loop-cycle order; return them.
-    fn seed_corner_uvs(mesh: &mut LoopMesh, face: FaceKey, uv: ElementAttributeKey) -> Vec<[f32; 2]> {
+    fn seed_corner_uvs(
+        mesh: &mut LoopMesh,
+        face: FaceKey,
+        uv: ElementAttributeKey,
+    ) -> Vec<[f32; 2]> {
         let loops = mesh.face_loop_keys(face);
         let mut values = Vec::with_capacity(loops.len());
         for (i, &loop_key) in loops.iter().enumerate() {
             let value = [i as f32, 10.0 + i as f32];
-            mesh.loop_attribs_mut().set_vec2(uv, loop_key.as_usize(), value);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, loop_key.as_usize(), value);
             values.push(value);
         }
         values
@@ -149,7 +154,11 @@ mod tests {
         let after = read_corner_uvs(&mesh, face, uv);
         let n = before.len();
         for i in 0..n {
-            assert_eq!(after[i], before[(i + n - 1) % n], "corner {i} takes predecessor");
+            assert_eq!(
+                after[i],
+                before[(i + n - 1) % n],
+                "corner {i} takes predecessor"
+            );
         }
     }
 
@@ -211,11 +220,17 @@ mod tests {
 
         let quad_after = read_corner_uvs(&mesh, quad, uv);
         for i in 0..quad_before.len() {
-            assert_eq!(quad_after[i], quad_before[(i + quad_before.len() - 1) % quad_before.len()]);
+            assert_eq!(
+                quad_after[i],
+                quad_before[(i + quad_before.len() - 1) % quad_before.len()]
+            );
         }
         let tri_after = read_corner_uvs(&mesh, tri, uv);
         for i in 0..tri_before.len() {
-            assert_eq!(tri_after[i], tri_before[(i + tri_before.len() - 1) % tri_before.len()]);
+            assert_eq!(
+                tri_after[i],
+                tri_before[(i + tri_before.len() - 1) % tri_before.len()]
+            );
         }
 
         assert_eq!(mesh.face_vert_keys(quad), quad_verts, "topology unchanged");
@@ -240,7 +255,10 @@ mod tests {
         let tri_after = read_corner_uvs(&mesh, tri, uv);
         for i in 0..tri_before.len() {
             assert_ne!(tri_after[i], tri_before[i], "tri corner {i} moved");
-            assert_eq!(tri_after[i], tri_before[(i + tri_before.len() - 1) % tri_before.len()]);
+            assert_eq!(
+                tri_after[i],
+                tri_before[(i + tri_before.len() - 1) % tri_before.len()]
+            );
         }
         let quad_after = read_corner_uvs(&mesh, quad, uv);
         for i in 0..quad_before.len() {

@@ -336,7 +336,10 @@ mod tests {
 
         let result = mesh.dissolve_faces(&[faces[0]], Default::default());
 
-        assert!(result.region.is_empty(), "singleton region contributes nothing to region.out");
+        assert!(
+            result.region.is_empty(),
+            "singleton region contributes nothing to region.out"
+        );
         assert_eq!(mesh.totvert(), v0);
         assert_eq!(mesh.totedge(), e0);
         assert_eq!(mesh.totface(), f0);
@@ -354,15 +357,15 @@ mod tests {
 
         // Faces[0] perimeter = v0,v1,v5,v4. Faces[1] perimeter = v1,v2,v6,v5.
         // Shared edge sits between v1 and v5. Merged perimeter = {v0,v1,v2,v6,v5,v4}.
-        let expected: std::collections::HashSet<VertexKey> = [
-            verts[0], verts[1], verts[2], verts[6], verts[5], verts[4],
-        ]
-        .into_iter()
-        .collect();
+        let expected: std::collections::HashSet<VertexKey> =
+            [verts[0], verts[1], verts[2], verts[6], verts[5], verts[4]]
+                .into_iter()
+                .collect();
 
         let result = mesh.dissolve_faces(&[faces[0], faces[1]], Default::default());
         let merged = result.region[0];
-        let got: std::collections::HashSet<VertexKey> = mesh.face_vert_keys(merged).into_iter().collect();
+        let got: std::collections::HashSet<VertexKey> =
+            mesh.face_vert_keys(merged).into_iter().collect();
         assert_eq!(got, expected);
     }
 
@@ -418,22 +421,44 @@ mod tests {
         let v2 = verts[2];
         let v1_pre_count = mesh.vert_edge_keys(v1).len();
         let v2_pre_count = mesh.vert_edge_keys(v2).len();
-        assert_eq!(v1_pre_count, 3, "v1 has 3 edges pre-merge → eligible for use_verts mark");
-        assert_eq!(v2_pre_count, 3, "v2 has 3 edges pre-merge → eligible for use_verts mark");
+        assert_eq!(
+            v1_pre_count, 3,
+            "v1 has 3 edges pre-merge → eligible for use_verts mark"
+        );
+        assert_eq!(
+            v2_pre_count, 3,
+            "v2 has 3 edges pre-merge → eligible for use_verts mark"
+        );
 
         let result = mesh.dissolve_faces(
             &[faces[0], faces[1], faces[2]],
             DissolveFacesOptions { use_verts: true },
         );
 
-        assert_eq!(result.region.len(), 1, "one connected region merges into one face");
+        assert_eq!(
+            result.region.len(),
+            1,
+            "one connected region merges into one face"
+        );
 
         // §6 post-pass collapses verts 1 and 2, each contributing -1 V and -1 E.
         // The region merge itself is -2 F, -2 E (two interior edges between
         // the three faces), 0 V. Net: -2 F, -4 E, -2 V.
-        assert_eq!(mesh.totface(), f0_count - 2, "-2 faces (3 input → 1 merged)");
-        assert_eq!(mesh.totedge(), e0_count - 4, "-2 from merge, -2 from use_verts collapses");
-        assert_eq!(mesh.totvert(), v0_count - 2, "-2 verts: v1 and v2 collapsed by post-pass");
+        assert_eq!(
+            mesh.totface(),
+            f0_count - 2,
+            "-2 faces (3 input → 1 merged)"
+        );
+        assert_eq!(
+            mesh.totedge(),
+            e0_count - 4,
+            "-2 from merge, -2 from use_verts collapses"
+        );
+        assert_eq!(
+            mesh.totvert(),
+            v0_count - 2,
+            "-2 verts: v1 and v2 collapsed by post-pass"
+        );
         mesh.validate_topology();
     }
 
@@ -452,17 +477,27 @@ mod tests {
 
         let v_bottom_left = verts[0];
         let v_bottom_right = verts[3];
-        assert_eq!(mesh.vert_edge_keys(v_bottom_left).len(), 2, "v0 is edge-pair pre-merge");
-        assert_eq!(mesh.vert_edge_keys(v_bottom_right).len(), 2, "v3 is edge-pair pre-merge");
+        assert_eq!(
+            mesh.vert_edge_keys(v_bottom_left).len(),
+            2,
+            "v0 is edge-pair pre-merge"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(v_bottom_right).len(),
+            2,
+            "v3 is edge-pair pre-merge"
+        );
 
         // The edges that hold these corners on the perimeter — to vert 4 above
         // and to vert 7 above respectively — must survive both the merge and
         // the post-pass.
         let v_above_left = verts[4];
         let v_above_right = verts[7];
-        let e_left_up = mesh.query_edge_exists(v_bottom_left, v_above_left)
+        let e_left_up = mesh
+            .query_edge_exists(v_bottom_left, v_above_left)
             .expect("edge {v0,v4} exists pre-merge");
-        let e_right_up = mesh.query_edge_exists(v_bottom_right, v_above_right)
+        let e_right_up = mesh
+            .query_edge_exists(v_bottom_right, v_above_right)
             .expect("edge {v3,v7} exists pre-merge");
         let _ = (e_left_up, e_right_up);
 
@@ -473,11 +508,13 @@ mod tests {
 
         // Corners survive — the post-pass left them alone.
         assert!(
-            mesh.query_edge_exists(v_bottom_left, v_above_left).is_some(),
+            mesh.query_edge_exists(v_bottom_left, v_above_left)
+                .is_some(),
             "v0's pre-existing edge to v4 survives the use_verts post-pass"
         );
         assert!(
-            mesh.query_edge_exists(v_bottom_right, v_above_right).is_some(),
+            mesh.query_edge_exists(v_bottom_right, v_above_right)
+                .is_some(),
             "v3's pre-existing edge to v7 survives the use_verts post-pass"
         );
         // The corner verts themselves survive too, still edge-pair.
@@ -534,7 +571,11 @@ mod tests {
         // post-pass marks but does not collapse them.
         assert_eq!(mesh.totface(), f0_count - 3);
         assert_eq!(mesh.totedge(), e0_count - 4);
-        assert_eq!(mesh.totvert(), v0_count - 1, "centre vert killed by merge, no use_verts collapse");
+        assert_eq!(
+            mesh.totvert(),
+            v0_count - 1,
+            "centre vert killed by merge, no use_verts collapse"
+        );
 
         // The centre vert is gone — it does not appear in the live vert key list.
         let live: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
@@ -574,8 +615,16 @@ mod tests {
         assert_eq!(mesh.totedge(), e0_count - 2);
         assert_eq!(mesh.totvert(), v0_count);
 
-        assert_eq!(mesh.vert_edge_keys(v1).len(), 2, "v1 sits on the merged perimeter as a 2-edge node");
-        assert_eq!(mesh.vert_edge_keys(v2).len(), 2, "v2 sits on the merged perimeter as a 2-edge node");
+        assert_eq!(
+            mesh.vert_edge_keys(v1).len(),
+            2,
+            "v1 sits on the merged perimeter as a 2-edge node"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(v2).len(),
+            2,
+            "v2 sits on the merged perimeter as a 2-edge node"
+        );
         mesh.validate_topology();
     }
 
@@ -661,10 +710,10 @@ mod tests {
     /// Counts: 5 V, 7 E (1 spine + 2 per page), 3 F.
     fn build_nonmanifold_book_3(mesh: &mut LoopMesh) -> (Vec<VertexKey>, Vec<FaceKey>) {
         let v: Vec<VertexKey> = [
-            (0.0, 0.0, 0.0), // 0: spine start
-            (1.0, 0.0, 0.0), // 1: spine end
-            (0.5, 1.0, 0.0), // 2: apex of face 0
-            (0.5, -0.5, 0.866), // 3: apex of face 1
+            (0.0, 0.0, 0.0),     // 0: spine start
+            (1.0, 0.0, 0.0),     // 1: spine end
+            (0.5, 1.0, 0.0),     // 2: apex of face 0
+            (0.5, -0.5, 0.866),  // 3: apex of face 1
             (0.5, -0.5, -0.866), // 4: apex of face 2
         ]
         .into_iter()
@@ -721,14 +770,26 @@ mod tests {
         let f2 = faces[2];
         let result = mesh.dissolve_faces(&[faces[0], faces[1]], DissolveFacesOptions::default());
 
-        assert_eq!(result.region.len(), 1, "the two-of-three input forms one region");
+        assert_eq!(
+            result.region.len(),
+            1,
+            "the two-of-three input forms one region"
+        );
         let kite = result.region[0];
 
         // §7 row 2 for the kite region: -1 F (2 source → 1 merged); no
         // edge killed (the spine survives with f2's loop on it); no
         // verts killed (every region vert retains at least one edge).
-        assert_eq!(mesh.totface(), 2, "f0 + f1 merged into the kite; f2 untouched");
-        assert_eq!(mesh.totedge(), 7, "spine survives — its radial dropped to 1, not 0");
+        assert_eq!(
+            mesh.totface(),
+            2,
+            "f0 + f1 merged into the kite; f2 untouched"
+        );
+        assert_eq!(
+            mesh.totedge(),
+            7,
+            "spine survives — its radial dropped to 1, not 0"
+        );
         assert_eq!(mesh.totvert(), 5);
 
         // The spine edge is still alive and its radial cycle is now the
@@ -738,11 +799,17 @@ mod tests {
             .expect("spine {v0,v1} survives the merge");
         let spine_radial = mesh.edge_face_keys(spine_post);
         assert_eq!(spine_radial.len(), 1, "radial cycle dropped from 3 to 1");
-        assert_eq!(spine_radial[0], f2, "the surviving radial loop belongs to f2");
+        assert_eq!(
+            spine_radial[0], f2,
+            "the surviving radial loop belongs to f2"
+        );
 
         // f2 is still alive, still has v0 and v1 in its corner cycle.
         let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
-        assert!(live.contains(&f2), "f2 (the page left out of the input set) survives");
+        assert!(
+            live.contains(&f2),
+            "f2 (the page left out of the input set) survives"
+        );
         let f2_verts: std::collections::HashSet<VertexKey> =
             mesh.face_vert_keys(f2).into_iter().collect();
         assert!(f2_verts.contains(&v0));
@@ -771,7 +838,10 @@ mod tests {
         //       the hallmark of a non-degenerate, consistently-wound face.
         let mut seen: std::collections::HashSet<VertexKey> = std::collections::HashSet::new();
         for &corner in &kite_verts {
-            assert!(seen.insert(corner), "kite corner {corner:?} visited twice — winding self-intersects");
+            assert!(
+                seen.insert(corner),
+                "kite corner {corner:?} visited twice — winding self-intersects"
+            );
         }
         for window_start in 0..kite_verts.len() {
             let a = kite_verts[window_start];
@@ -809,13 +879,13 @@ mod tests {
         mesh: &mut LoopMesh,
     ) -> (Vec<VertexKey>, Vec<FaceKey>) {
         let v: Vec<VertexKey> = [
-            (0.0, 0.0, 0.0),    // 0: spine start
-            (1.0, 0.0, 0.0),    // 1: spine end
-            (0.5, 1.0, 0.0),    // 2: apex of page 0
-            (0.5, -0.5, 0.866), // 3: apex of page 1
-            (0.5, -0.5, -0.866),// 4: apex of page 2
-            (-0.5, 0.5, 0.3),   // 5: fin A apex
-            (-0.5, 0.5, -0.3),  // 6: fin B apex
+            (0.0, 0.0, 0.0),     // 0: spine start
+            (1.0, 0.0, 0.0),     // 1: spine end
+            (0.5, 1.0, 0.0),     // 2: apex of page 0
+            (0.5, -0.5, 0.866),  // 3: apex of page 1
+            (0.5, -0.5, -0.866), // 4: apex of page 2
+            (-0.5, 0.5, 0.3),    // 5: fin A apex
+            (-0.5, 0.5, -0.3),   // 6: fin B apex
         ]
         .into_iter()
         .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
@@ -873,7 +943,11 @@ mod tests {
             .expect("page 1's second non-manifold edge exists pre-merge");
         let pre_radial: std::collections::HashSet<FaceKey> =
             mesh.edge_face_keys(other_edge).into_iter().collect();
-        assert_eq!(pre_radial.len(), 3, "{{v0, apex_1}} is non-manifold pre-merge");
+        assert_eq!(
+            pre_radial.len(),
+            3,
+            "{{v0, apex_1}} is non-manifold pre-merge"
+        );
         assert!(pre_radial.contains(&faces[1]), "page 1 is on the radial");
         assert!(pre_radial.contains(&fin_a));
         assert!(pre_radial.contains(&fin_b));
@@ -911,8 +985,16 @@ mod tests {
         let fin_a_live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert!(fin_a_live.contains(&fin_a));
         assert!(fin_a_live.contains(&fin_b));
-        assert_eq!(mesh.face_vert_keys(fin_a).len(), 3, "fin A is still a triangle");
-        assert_eq!(mesh.face_vert_keys(fin_b).len(), 3, "fin B is still a triangle");
+        assert_eq!(
+            mesh.face_vert_keys(fin_a).len(),
+            3,
+            "fin A is still a triangle"
+        );
+        assert_eq!(
+            mesh.face_vert_keys(fin_b).len(),
+            3,
+            "fin B is still a triangle"
+        );
 
         mesh.validate_topology();
     }
