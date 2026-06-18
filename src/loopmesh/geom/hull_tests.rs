@@ -227,3 +227,210 @@ fn fewer_than_four_points_has_no_hull() {
     ];
     assert!(convex_hull(&points).is_none());
 }
+
+#[test]
+fn coincident_points_are_deduplicated() {
+    // A tetrahedron whose apex is duplicated three times. The duplicates are
+    // coincident with a true hull vertex, so a correct hull lists that corner
+    // exactly once. The first cut already culls strict duplicates here (they sit
+    // on every incident face plane), so this dedup invariant holds today — it is
+    // a real, currently-passing test, not a row-5 target. (Full dedup across all
+    // degenerate inputs — e.g. coincident points that are not all extreme — is
+    // still row-5 work; this fixture's extreme-corner case is covered now.)
+    let points = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(0.0, 1.0, 0.0),
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(0.0, 0.0, 1.0), // dup of index 3
+        DVec3::new(0.0, 0.0, 1.0), // dup of index 3
+    ];
+    let topo = convex_hull(&points).expect("tetra-with-duplicates has a hull");
+
+    assert!(
+        hull_positions_are_distinct(&points, &topo),
+        "coincident points were not deduplicated on the hull"
+    );
+    // Exactly one of the three coincident apex indices represents the corner;
+    // a deduped hull has four distinct hull vertices, not six.
+    assert_eq!(
+        topo.vertices.len(),
+        4,
+        "deduped tetra hull must have four distinct vertices, got {}",
+        topo.vertices.len()
+    );
+    assert_hull_invariants(&points, &topo);
+}
+
+// ---------------------------------------------------------------------------
+// Degenerate-input fixtures (decomposition row 4).
+//
+// These encode the *target* post-merge / post-dedup invariants the convex_hull
+// contract requires (prerequisites/convex_hull.md row 5: coplanar-face merge +
+// degenerate combinatorics). The first cut is general-position only, so each of
+// these fails today — `#[ignore]` keeps them out of routine runs while making
+// the gap a runnable record. They run under
+// `cargo test -p loopmesh --lib -- --ignored`.
+// ---------------------------------------------------------------------------
+
+/// True when no two on-hull vertices share a position (the dedup invariant): a
+/// correct hull never lists two coincident input points as distinct hull verts.
+fn hull_positions_are_distinct(points: &[DVec3], topo: &HullTopology) -> bool {
+    for (i, &vi) in topo.vertices.iter().enumerate() {
+        for &vj in &topo.vertices[i + 1..] {
+            if points[vi] == points[vj] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[test]
+#[ignore = "coplanar merge not yet implemented; see prerequisites/convex_hull.md row 5"]
+fn cube_merges_coplanar_faces() {
+    // Eight corners of the unit cube. Every cube face is four coplanar points,
+    // so the operator contract is six merged quad faces — NOT a 12-triangle fan.
+    // The general-position first cut triangulates each square into two triangles
+    // (12 faces), so the face-count assertion fails until coplanar merge lands.
+    let points = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, 1.0, 0.0),
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
+    ];
+    let topo = convex_hull(&points).expect("cube has a hull");
+
+    // Every corner is extreme → all eight inputs must be on the hull.
+    assert_eq!(topo.vertices, (0..8).collect::<Vec<_>>(), "every cube corner is on-hull");
+
+    // Target contract: six coplanar-merged faces, not a triangle fan.
+    assert_eq!(
+        topo.faces.len(),
+        6,
+        "cube must merge to six coplanar faces, got {} (triangle fan?)",
+        topo.faces.len()
+    );
+
+    assert_hull_invariants(&points, &topo);
+}
+
+#[test]
+#[ignore = "coplanar (lower-dimensional) hull not yet implemented; see prerequisites/convex_hull.md row 5"]
+fn coplanar_slab_yields_flat_hull() {
+    // A single-plane point cloud (z == 0): a 3x3 grid plus interior jitter. No
+    // positive-volume seed simplex exists, so the first cut returns None. The
+    // target contract is a degenerate (flat) hull: a single planar polygon over
+    // the cloud's 2D convex boundary (the four grid corners), interior points
+    // culled. We assert that target; it fails today on the None.
+    let points = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(2.0, 0.0, 0.0),
+        DVec3::new(2.0, 2.0, 0.0),
+        DVec3::new(0.0, 2.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(1.0, 2.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0), // interior → culled
+    ];
+    let topo = convex_hull(&points).expect("coplanar slab must produce a flat hull");
+
+    // The four corners bound the planar region; the interior centre is culled.
+    assert!(
+        topo.vertices.binary_search(&6).is_err(),
+        "interior coplanar point leaked onto the flat hull"
+    );
+    for corner in [0usize, 1, 2, 3] {
+        assert!(
+            topo.vertices.binary_search(&corner).is_ok(),
+            "boundary corner {corner} missing from the flat hull"
+        );
+    }
+    assert!(hull_positions_are_distinct(&points, &topo));
+}
+
+#[test]
+#[ignore = "collinear (degenerate) input handling not yet implemented; see prerequisites/convex_hull.md row 5"]
+fn collinear_cloud_yields_degenerate_hull() {
+    // All points on a single line: no area, no volume. The first cut returns
+    // None (no seed simplex). The target contract reduces this to the two
+    // extreme endpoints of the segment — a 1D degenerate hull whose on-hull set
+    // is exactly those two extremes, interior collinear points culled.
+    let points = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(2.0, 2.0, 2.0),
+        DVec3::new(3.0, 3.0, 3.0),
+        DVec3::new(0.5, 0.5, 0.5), // interior on the segment → culled
+    ];
+    let topo = convex_hull(&points).expect("collinear cloud must produce a degenerate hull");
+
+    // Only the two endpoints are extreme.
+    assert_eq!(
+        topo.vertices,
+        vec![0, 3],
+        "collinear hull must reduce to the two segment endpoints"
+    );
+    assert!(hull_positions_are_distinct(&points, &topo));
+}
+
+#[test]
+#[ignore = "coplanar-subset face merge not yet implemented; see prerequisites/convex_hull.md row 5"]
+fn cospherical_with_coplanar_subsets_merges_faces() {
+    // A cospherical octagonal pyramid: eight base points around a circle in the
+    // exact plane z = z0, plus an apex at the north pole. Every point is extreme
+    // (all radius 1 → on the unit sphere), so all nine are on the hull.
+    //
+    // The merge target here is genuine, not incidental: the eight base points lie
+    // in the supporting plane z = z0 (the apex is the *only* point above it), so
+    // `{0,1,..,7}` is a true hull facet — an octagon. A correct merged hull emits
+    // that octagon as ONE face plus the eight triangular side faces to the apex:
+    // nine faces total. The general-position first cut instead fans the octagon
+    // into six triangles (eight base + apex = 14 triangles overall), so the
+    // merged-vs-triangulated face count is the load-bearing assertion. The
+    // triangulated count (14) equals the Euler bound 2V-4 exactly, and the merged
+    // count (9) sits a comfortable five faces below it — no incidental-quad
+    // margin.
+    let z0 = -0.5;
+    let rho = (1.0_f64 - z0 * z0).sqrt(); // base circle radius so every point is on the unit sphere
+    let mut points: Vec<DVec3> = (0..8)
+        .map(|k| {
+            let angle = std::f64::consts::TAU * (k as f64) / 8.0;
+            DVec3::new(rho * angle.cos(), rho * angle.sin(), z0)
+        })
+        .collect();
+    points.push(DVec3::new(0.0, 0.0, 1.0)); // apex at the north pole
+
+    let topo = convex_hull(&points).expect("cospherical cloud has a hull");
+
+    // Every point lies on the sphere → every input must be on the hull.
+    assert_eq!(
+        topo.vertices.len(),
+        points.len(),
+        "every cospherical point must be on the hull"
+    );
+
+    // The eight base points (indices 0..=7) lie in the supporting plane z = z0
+    // and must merge into a single octagonal face, not a six-triangle fan. A
+    // correctly merged hull therefore emits strictly fewer faces than the
+    // all-triangle count (9 merged vs 14 triangulated = 2V-4). The first cut
+    // triangulates the octagon, hitting the bound, so this fails until the merge
+    // lands.
+    //
+    // NOTE for row 5: a triangular `HullFace` cannot represent the merged octagon
+    // at all — the merge step must extend the output type to n-gon faces (and
+    // `assert_hull_invariants` will need an n-gon-aware planarity/winding check at
+    // that point). This bound-based check stands in until that type lands.
+    let triangulated_upper_bound = 2 * topo.vertices.len() - 4; // Euler bound for a triangulated hull
+    assert!(
+        topo.faces.len() < triangulated_upper_bound,
+        "coplanar octagon must merge: got {} faces, a merged hull is strictly \
+         below the triangulated bound {triangulated_upper_bound}",
+        topo.faces.len()
+    );
+
+    assert_hull_invariants(&points, &topo);
+}
