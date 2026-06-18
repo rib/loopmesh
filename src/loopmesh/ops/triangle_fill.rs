@@ -5,6 +5,158 @@ use glam::{Vec2, Vec3};
 use crate::loopmesh::*;
 use crate::triangulate::{axis_dominant_basis_negated, ear_clip};
 
+/// Axis-aligned 2D bounding box of a component's projected vertices,
+/// used by the §1.2.3 hole-coalesce pass.
+#[derive(Copy, Clone, Debug)]
+struct BoundingBox2D {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl BoundingBox2D {
+    fn empty() -> Self {
+        Self {
+            min: Vec2::splat(f32::INFINITY),
+            max: Vec2::splat(f32::NEG_INFINITY),
+        }
+    }
+
+    fn expand(&mut self, p: Vec2) {
+        self.min = self.min.min(p);
+        self.max = self.max.max(p);
+    }
+
+    fn union(&mut self, other: &BoundingBox2D) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+    }
+
+    fn overlaps(&self, other: &BoundingBox2D) -> bool {
+        self.min.x <= other.max.x
+            && other.min.x <= self.max.x
+            && self.min.y <= other.max.y
+            && other.min.y <= self.max.y
+    }
+
+    fn area(&self) -> f32 {
+        let extent = (self.max - self.min).max(Vec2::ZERO);
+        extent.x * extent.y
+    }
+}
+
+/// Triangulate a bridged keyhole polygon (§1.2.4) — a simple polygon whose
+/// vertex sequence may repeat the two bridge endpoints — by ear-clipping with a
+/// **full** interior-vertex rejection test. Unlike the single-loop ear-clip,
+/// every candidate ear is checked against *all* remaining vertices (not only
+/// reflex ones), which is what keeps any ear from escaping across the hole: a
+/// hole-loop vertex inside a candidate triangle always rejects it. Emits index
+/// triples into `coords`.
+///
+/// Auto-detects the polygon winding from its signed area so the orientation
+/// convention matches the caller's projection. Produces *a* valid triangulation
+/// of the region-with-holes (§1.1 "any valid triangulation"), leaving the hole
+/// empty.
+fn triangle_fill_ear_clip_with_holes(coords: &[Vec2], out_tris: &mut Vec<[u32; 3]>) {
+    let n = coords.len();
+    if n < 3 {
+        return;
+    }
+
+    // Signed area: positive ⇒ CCW. The interior of a convex corner is on the
+    // left for a CCW polygon, on the right for CW; `interior_sign` carries that
+    // so the ear/inclusion tests work for either winding.
+    let mut twice_area = 0.0f32;
+    for i in 0..n {
+        let a = coords[i];
+        let b = coords[(i + 1) % n];
+        twice_area += a.x * b.y - b.x * a.y;
+    }
+    let interior_sign = if twice_area >= 0.0 { 1.0 } else { -1.0 };
+
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    // Strict point-in-triangle (apex `b`, neighbours `a`,`c`) for the polygon's
+    // winding. A point shared with a triangle corner is treated as outside so a
+    // repeated bridge vertex never rejects its own ear.
+    let point_in_tri = |p: Vec2, a: Vec2, b: Vec2, c: Vec2| {
+        let d1 = interior_sign * cross(a, b, p);
+        let d2 = interior_sign * cross(b, c, p);
+        let d3 = interior_sign * cross(c, a, p);
+        d1 > 1e-9 && d2 > 1e-9 && d3 > 1e-9
+    };
+
+    let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+    let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
+    let mut remaining = n;
+    let mut cursor = 0usize;
+    let mut guard = 0usize;
+    let guard_limit = n * n + n;
+
+    while remaining > 3 {
+        guard += 1;
+        if guard > guard_limit {
+            break;
+        }
+        let i_prev = prev[cursor];
+        let i_next = next[cursor];
+        let a = coords[i_prev];
+        let b = coords[cursor];
+        let c = coords[i_next];
+
+        // Convex (an ear must turn toward the interior) and non-degenerate.
+        let turn = interior_sign * cross(a, b, c);
+        let is_convex = turn > 1e-12;
+
+        let mut is_ear = is_convex;
+        if is_ear {
+            // Full inclusion test: reject if any *other* remaining vertex lies
+            // strictly inside the candidate triangle (§1.2.4 hole guard).
+            let mut probe = next[i_next];
+            while probe != i_prev {
+                if probe != cursor
+                    && coords[probe] != a
+                    && coords[probe] != b
+                    && coords[probe] != c
+                    && point_in_tri(coords[probe], a, b, c)
+                {
+                    is_ear = false;
+                    break;
+                }
+                probe = next[probe];
+            }
+        }
+
+        if is_ear {
+            out_tris.push([i_prev as u32, cursor as u32, i_next as u32]);
+            next[i_prev] = i_next;
+            prev[i_next] = i_prev;
+            remaining -= 1;
+            cursor = i_prev;
+            guard = 0;
+        } else {
+            cursor = i_next;
+        }
+    }
+
+    if remaining == 3 {
+        let i_prev = prev[cursor];
+        let i_next = next[cursor];
+        out_tris.push([i_prev as u32, cursor as u32, i_next as u32]);
+    }
+}
+
+/// Projected bounding box of a single loop, for the §1.2.3 outer-loop ordering.
+fn loop_box(
+    mesh: &LoopMesh,
+    loop_verts: &[VertexKey],
+    project: &impl Fn(&LoopMesh, VertexKey) -> Vec2,
+) -> BoundingBox2D {
+    let mut bbox = BoundingBox2D::empty();
+    for &v in loop_verts {
+        bbox.expand(project(mesh, v));
+    }
+    bbox
+}
+
 /// Squared-length floor below which a normal (derived corner normal, accumulated
 /// fill normal, or supplied `normal`) is treated as zero. Guards the projection
 /// basis and the supplied-vs-derived choice against a degenerate-length vector.
@@ -72,12 +224,15 @@ impl LoopMesh {
     /// A supplied non-zero `params.normal` is used directly as the projection
     /// plane and skips the §4 winding vote; the fill orients to that normal.
     ///
-    /// **Scope (current):** the in-scope case is a single closed loop of
-    /// input edges (the editor's "fill a selected edge loop" path). An edge
-    /// set that does not resolve to exactly one simple closed loop — multiple
-    /// disjoint loops, an annulus/hole, an open chain, or loose edges (§8) —
-    /// fills nothing and returns an empty result. The multi-region sweep is
-    /// not yet implemented.
+    /// **Scope:** a single simple closed loop rides the fast path
+    /// ([`Self::triangle_fill_order_single_loop`] → ear-clip). An edge set
+    /// that is *not* one simple closed loop — multiple disjoint loops, an
+    /// annulus/hole, an open chain, or loose edges (§8) — is handled by the
+    /// region-discovery path (§1.2): connected-component labelling (§1.2.1),
+    /// loose-edge / dangling-chain trim (§1.2.2), bounding-box coalescing of
+    /// components into fill regions (§1.2.3), and a with-holes fill that leaves
+    /// an enclosed inner loop empty (§1.2.4). Multiple disjoint regions fill
+    /// independently in the one call; loose edges create nothing.
     ///
     /// **`use_beauty`:** the beautify post-pass (§6) is not yet applied — the
     /// flag is accepted but ignored, producing the un-beautified (still valid)
@@ -94,95 +249,456 @@ impl LoopMesh {
             return result;
         }
 
-        let Some(loop_verts) = self.triangle_fill_order_single_loop(edges) else {
-            // Not a single simple closed loop — the multi-region / hole /
-            // open-chain sweep (§1.1/§8) is out of scope. Fill nothing.
-            return result;
-        };
-        let vertex_count = loop_verts.len();
-        if vertex_count < 3 {
-            return result;
-        }
-
-        // §3 — projection-plane normal: supplied (authoritative) or derived.
-        let (fill_normal, normal_was_derived) = match params.normal {
-            Some(n) if n.length_squared() > MIN_NORMAL_LEN_SQ => (n.normalize(), false),
-            _ => (self.triangle_fill_derive_normal(&loop_verts), true),
-        };
-
-        // Project onto the plane and triangulate. ear_clip produces *a* valid
-        // triangulation of the simple polygon, which satisfies the §1.1
-        // "any valid triangulation" contract; with use_dissolve the choice is
-        // erased anyway (§7/§9 strategy 1).
-        let (axis_u, axis_w) = axis_dominant_basis_negated(fill_normal);
-        let projected: Vec<Vec2> = loop_verts
-            .iter()
-            .map(|&v| {
-                let p = self.vertex_position(v);
-                Vec2::new(axis_u.dot(p), axis_w.dot(p))
-            })
-            .collect();
-
-        let mut tris: Vec<[u32; 3]> = Vec::with_capacity(vertex_count - 2);
-        ear_clip(&projected, 0, &mut tris);
-        if tris.is_empty() {
-            // Collinear / degenerate projection (§8): nothing to fill.
-            return result;
-        }
-
-        // §4 — winding vote: only when the normal was derived and some input
-        // edge already carries a face (rim-of-a-hole). The sweep is already
-        // consistently wound, so the decision is global.
-        let flip = normal_was_derived
-            && self.triangle_fill_winding_vote(&loop_verts, &tris);
-
-        // §5 — materialise each triangle with no-double edge creation, marking
-        // the new interior diagonals for geom.out and the dissolve pass.
         let mut interior_edges: Vec<EdgeKey> = Vec::new();
-        let mut interior_seen: std::collections::HashSet<EdgeKey> = std::collections::HashSet::new();
-        for tri in &tris {
-            let (a, b, c) = if flip {
-                (tri[0], tri[2], tri[1])
-            } else {
-                (tri[0], tri[1], tri[2])
-            };
-            let va = loop_verts[a as usize];
-            let vb = loop_verts[b as usize];
-            let vc = loop_verts[c as usize];
+        let mut created_faces: Vec<FaceKey> = Vec::new();
 
-            // Track which of the three edges already existed before this
-            // triangle (boundary edges always do; an interior diagonal might
-            // already have been minted by a previous fill triangle). Only the
-            // genuinely-fresh, non-boundary diagonals are interior fill edges.
-            let face = self.face_create_verts(&[va, vb, vc], FaceCreateFlags::NO_DUPLICATE);
-            result.faces.push(face);
-
-            for edge in self.face_edge_keys(face) {
-                if interior_seen.contains(&edge) {
-                    continue;
-                }
-                // A diagonal is interior iff it is not one of the input
-                // boundary edges. Input edges pre-existed and must survive
-                // the dissolve pass (§5/§7).
-                if !edges.contains(&edge) {
-                    interior_seen.insert(edge);
-                    interior_edges.push(edge);
-                }
+        if let Some(loop_verts) = self.triangle_fill_order_single_loop(edges) {
+            // Fast path: the whole edge set is one simple closed loop.
+            self.triangle_fill_region(
+                &[loop_verts],
+                edges,
+                params,
+                &mut interior_edges,
+                &mut created_faces,
+            );
+        } else {
+            // §1.2 region-discovery path: multiple loops, an annulus/hole, an
+            // open chain, or loose edges. Decompose the net into regions, trim
+            // dangling edges, and fill each region (holes left empty).
+            for region_loops in self.triangle_fill_discover_regions(edges) {
+                self.triangle_fill_region(
+                    &region_loops,
+                    edges,
+                    params,
+                    &mut interior_edges,
+                    &mut created_faces,
+                );
             }
+        }
+
+        if created_faces.is_empty() {
+            return result;
         }
 
         if params.use_dissolve {
             // Seed the survivor set with *every* fill face just created, so a
             // face whose edges are never visited as a manifold interior edge
             // (e.g. the lone triangle of a 3-edge loop) is still reported in
-            // geom.out (§1/§7). `result.faces` currently holds exactly those.
-            let created_faces = std::mem::take(&mut result.faces);
+            // geom.out (§1/§7).
             self.triangle_fill_dissolve(&interior_edges, created_faces, &mut result);
         } else {
+            result.faces = created_faces;
             result.edges = interior_edges;
         }
 
         result
+    }
+
+    /// Fill one region — an outer loop plus zero or more enclosed hole loops
+    /// (§1.2.4) — appending its new interior diagonals and fill faces to the
+    /// caller's accumulators. The fill is a planar triangulation of the
+    /// outer-with-holes region; a hole is bridged into the outer boundary so
+    /// the band between them is tiled while the hole stays empty.
+    ///
+    /// `region_loops[0]` is the outer loop; `region_loops[1..]` are holes. A
+    /// single-loop region (no holes) is the §1.1 simple-polygon case.
+    fn triangle_fill_region(
+        &mut self,
+        region_loops: &[Vec<VertexKey>],
+        boundary_edges: &[EdgeKey],
+        params: &TriangleFillParams,
+        interior_edges: &mut Vec<EdgeKey>,
+        created_faces: &mut Vec<FaceKey>,
+    ) {
+        let outer = &region_loops[0];
+        if outer.len() < 3 {
+            return;
+        }
+
+        // §3 — projection-plane normal: supplied (authoritative) or derived
+        // from the outer loop's corner turns.
+        let (fill_normal, normal_was_derived) = match params.normal {
+            Some(n) if n.length_squared() > MIN_NORMAL_LEN_SQ => (n.normalize(), false),
+            _ => (self.triangle_fill_derive_normal(outer), true),
+        };
+        let (axis_u, axis_w) = axis_dominant_basis_negated(fill_normal);
+        let project = |mesh: &LoopMesh, v: VertexKey| {
+            let p = mesh.vertex_position(v);
+            Vec2::new(axis_u.dot(p), axis_w.dot(p))
+        };
+
+        // §1.2.4 — bridge each hole loop into the outer boundary, yielding a
+        // single simple-polygon vertex sequence whose triangulation leaves the
+        // hole empty. With no holes this is just the outer loop verbatim.
+        let has_holes = region_loops.len() > 1;
+        let sweep_verts = self.triangle_fill_bridge_holes(region_loops, &project);
+        let projected: Vec<Vec2> = sweep_verts.iter().map(|&v| project(self, v)).collect();
+
+        let mut tris: Vec<[u32; 3]> = Vec::with_capacity(sweep_verts.len());
+        if has_holes {
+            // A bridged keyhole is a simple polygon, but its repeated bridge
+            // vertices and zero-width slit defeat the single-loop ear-clip's
+            // convex-skip fast path (§1.2.4 needs the interior-vertex test to
+            // run against *every* candidate, not only reflex ones). Use the
+            // full-inclusion triangulator so no ear escapes across the hole.
+            triangle_fill_ear_clip_with_holes(&projected, &mut tris);
+        } else {
+            ear_clip(&projected, 0, &mut tris);
+        }
+        if tris.is_empty() {
+            return;
+        }
+
+        // §4 — winding vote: only when the normal was derived and some input
+        // edge already carries a face (rim-of-a-hole). The fill is already
+        // consistently wound, so the decision is global.
+        let flip = normal_was_derived && self.triangle_fill_winding_vote(&sweep_verts, &tris);
+
+        // §5 — materialise each triangle with no-double edge creation. A
+        // bridge introduces the same vertex twice in `sweep_verts`; a triangle
+        // that would collapse onto a repeated vertex is degenerate (zero area
+        // in the band) and is skipped rather than creating a self-edge.
+        let mut interior_seen: std::collections::HashSet<EdgeKey> =
+            interior_edges.iter().copied().collect();
+        for tri in &tris {
+            let (a, b, c) = if flip {
+                (tri[0], tri[2], tri[1])
+            } else {
+                (tri[0], tri[1], tri[2])
+            };
+            let va = sweep_verts[a as usize];
+            let vb = sweep_verts[b as usize];
+            let vc = sweep_verts[c as usize];
+            if va == vb || vb == vc || vc == va {
+                continue;
+            }
+
+            let face = self.face_create_verts(&[va, vb, vc], FaceCreateFlags::NO_DUPLICATE);
+            created_faces.push(face);
+
+            for edge in self.face_edge_keys(face) {
+                if interior_seen.contains(&edge) {
+                    continue;
+                }
+                // A diagonal is interior iff it is not one of the input
+                // boundary edges. Input edges pre-existed and must survive the
+                // dissolve pass (§5/§7).
+                if !boundary_edges.contains(&edge) {
+                    interior_seen.insert(edge);
+                    interior_edges.push(edge);
+                }
+            }
+        }
+    }
+
+    /// §1.2.4 — splice every hole loop of a region into its outer loop with a
+    /// bridge diagonal, producing a single simple-polygon vertex sequence. The
+    /// bridge re-enters the outer chain so the band between outer and hole is
+    /// fillable while the hole interior is left empty. Each hole is wound
+    /// opposite to the outer loop (in projection) so the bridged polygon stays
+    /// simple.
+    fn triangle_fill_bridge_holes(
+        &self,
+        region_loops: &[Vec<VertexKey>],
+        project: &impl Fn(&LoopMesh, VertexKey) -> Vec2,
+    ) -> Vec<VertexKey> {
+        let mut chain: Vec<VertexKey> = region_loops[0].clone();
+        if region_loops.len() == 1 {
+            return chain;
+        }
+
+        let outer_ccw = self.triangle_fill_loop_is_ccw(&chain, project);
+        for hole in &region_loops[1..] {
+            if hole.len() < 3 {
+                continue;
+            }
+            // Wind the hole opposite to the outer loop so the bridged polygon
+            // is simple (the band stays on one side of the bridge).
+            let mut hole_seq = hole.clone();
+            if self.triangle_fill_loop_is_ccw(&hole_seq, project) == outer_ccw {
+                hole_seq.reverse();
+            }
+
+            // Bridge at the closest outer/hole vertex pair (a short bridge is
+            // the least likely to cross the band geometry).
+            let (outer_index, hole_index) =
+                self.triangle_fill_closest_pair(&chain, &hole_seq, project);
+
+            // Splice: ... outer[outer_index], hole[hole_index..], hole[hole_index],
+            // outer[outer_index] ... — the repeated outer and hole vertices are
+            // the two bridge endpoints, traversed out along the bridge, around
+            // the hole, and back.
+            let mut spliced: Vec<VertexKey> = Vec::with_capacity(chain.len() + hole_seq.len() + 2);
+            spliced.extend_from_slice(&chain[..=outer_index]);
+            for offset in 0..hole_seq.len() {
+                spliced.push(hole_seq[(hole_index + offset) % hole_seq.len()]);
+            }
+            spliced.push(hole_seq[hole_index]);
+            spliced.extend_from_slice(&chain[outer_index..]);
+            chain = spliced;
+        }
+        chain
+    }
+
+    /// Signed-area (shoelace) test on a loop's projected coordinates: true when
+    /// the loop is wound counter-clockwise in the projection plane.
+    fn triangle_fill_loop_is_ccw(
+        &self,
+        loop_verts: &[VertexKey],
+        project: &impl Fn(&LoopMesh, VertexKey) -> Vec2,
+    ) -> bool {
+        let n = loop_verts.len();
+        let mut twice_area = 0.0f32;
+        for i in 0..n {
+            let a = project(self, loop_verts[i]);
+            let b = project(self, loop_verts[(i + 1) % n]);
+            twice_area += a.x * b.y - b.x * a.y;
+        }
+        twice_area > 0.0
+    }
+
+    /// Index pair `(outer_index, hole_index)` minimising the projected
+    /// distance between an outer-loop vertex and a hole-loop vertex — the
+    /// bridge endpoints for [`Self::triangle_fill_bridge_holes`].
+    fn triangle_fill_closest_pair(
+        &self,
+        outer: &[VertexKey],
+        hole: &[VertexKey],
+        project: &impl Fn(&LoopMesh, VertexKey) -> Vec2,
+    ) -> (usize, usize) {
+        let mut best = (0usize, 0usize);
+        let mut best_dist = f32::INFINITY;
+        for (oi, &ov) in outer.iter().enumerate() {
+            let op = project(self, ov);
+            for (hi, &hv) in hole.iter().enumerate() {
+                let dist = op.distance_squared(project(self, hv));
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = (oi, hi);
+                }
+            }
+        }
+        best
+    }
+
+    /// §1.2.1–§1.2.3 — decompose the input edge net into fill regions. Each
+    /// returned region is a list of closed loops: index 0 the outer loop, the
+    /// rest enclosed holes. Loose edges and dangling chains (§1.2.2) are
+    /// trimmed and contribute no region.
+    fn triangle_fill_discover_regions(&self, edges: &[EdgeKey]) -> Vec<Vec<Vec<VertexKey>>> {
+        // §1.2.2 — iterative leaf-trim: repeatedly drop every edge incident to
+        // a valence-1 vertex until only edges that lie on a cycle survive.
+        let mut surviving: Vec<EdgeKey> = Vec::new();
+        let mut degree: HashMap<VertexKey, u32> = HashMap::new();
+        for &edge in edges {
+            let [v0, v1] = self.edge_vert_keys(edge);
+            if v0 == v1 {
+                continue;
+            }
+            surviving.push(edge);
+            *degree.entry(v0).or_default() += 1;
+            *degree.entry(v1).or_default() += 1;
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut kept: Vec<EdgeKey> = Vec::with_capacity(surviving.len());
+            for &edge in &surviving {
+                let [v0, v1] = self.edge_vert_keys(edge);
+                if degree[&v0] == 1 || degree[&v1] == 1 {
+                    *degree.get_mut(&v0).unwrap() -= 1;
+                    *degree.get_mut(&v1).unwrap() -= 1;
+                    changed = true;
+                } else {
+                    kept.push(edge);
+                }
+            }
+            surviving = kept;
+        }
+        if surviving.is_empty() {
+            return Vec::new();
+        }
+
+        // §1.2.1 — connected-component labelling over the surviving cycle
+        // edges, then order each component into its closed loops.
+        let mut component_of: HashMap<VertexKey, usize> = HashMap::new();
+        let mut adjacency: HashMap<VertexKey, smallvec::SmallVec<[VertexKey; 4]>> = HashMap::new();
+        for &edge in &surviving {
+            let [v0, v1] = self.edge_vert_keys(edge);
+            adjacency.entry(v0).or_default().push(v1);
+            adjacency.entry(v1).or_default().push(v0);
+        }
+        let mut component_loops: Vec<Vec<Vec<VertexKey>>> = Vec::new();
+        let mut stack: Vec<VertexKey> = Vec::new();
+        for &edge in &surviving {
+            let [seed, _] = self.edge_vert_keys(edge);
+            if component_of.contains_key(&seed) {
+                continue;
+            }
+            let component_index = component_loops.len();
+            let mut component_verts: Vec<VertexKey> = Vec::new();
+            stack.push(seed);
+            component_of.insert(seed, component_index);
+            while let Some(v) = stack.pop() {
+                component_verts.push(v);
+                for &neighbour in &adjacency[&v] {
+                    if !component_of.contains_key(&neighbour) {
+                        component_of.insert(neighbour, component_index);
+                        stack.push(neighbour);
+                    }
+                }
+            }
+            let loops = self.triangle_fill_extract_loops(&component_verts, &adjacency);
+            component_loops.push(loops);
+        }
+
+        // §1.2.3 — coalesce components whose 2D bounding boxes overlap into one
+        // region (no point-in-polygon / nesting test). The projection plane is
+        // derived per-region later; for the box test, project on whichever
+        // plane the region's first loop derives — close enough for the overlap
+        // decision, which only chooses which loops share a sweep.
+        self.triangle_fill_coalesce_regions(component_loops)
+    }
+
+    /// Order one component's vertices into its constituent closed loops. A
+    /// component is usually one loop; a figure-eight or multi-cycle component
+    /// yields several. Each loop walks degree-2 chains; higher-degree junctions
+    /// pick an unused incident edge.
+    fn triangle_fill_extract_loops(
+        &self,
+        component_verts: &[VertexKey],
+        adjacency: &HashMap<VertexKey, smallvec::SmallVec<[VertexKey; 4]>>,
+    ) -> Vec<Vec<VertexKey>> {
+        // Track unused undirected edges as a multiset of neighbour slots.
+        let mut remaining: HashMap<VertexKey, Vec<VertexKey>> = HashMap::new();
+        for &v in component_verts {
+            remaining.insert(v, adjacency[&v].to_vec());
+        }
+        let take_edge = |remaining: &mut HashMap<VertexKey, Vec<VertexKey>>,
+                         from: VertexKey,
+                         to: VertexKey| {
+            if let Some(slots) = remaining.get_mut(&from) {
+                if let Some(pos) = slots.iter().position(|&n| n == to) {
+                    slots.swap_remove(pos);
+                }
+            }
+            if let Some(slots) = remaining.get_mut(&to) {
+                if let Some(pos) = slots.iter().position(|&n| n == from) {
+                    slots.swap_remove(pos);
+                }
+            }
+        };
+
+        let mut loops: Vec<Vec<VertexKey>> = Vec::new();
+        for &start in component_verts {
+            while !remaining[&start].is_empty() {
+                let mut loop_verts: Vec<VertexKey> = vec![start];
+                let first_step = remaining[&start][0];
+                take_edge(&mut remaining, start, first_step);
+                let mut next = first_step;
+                while next != start {
+                    loop_verts.push(next);
+                    let following = remaining
+                        .get(&next)
+                        .and_then(|slots| slots.first().copied());
+                    let Some(following) = following else {
+                        break;
+                    };
+                    take_edge(&mut remaining, next, following);
+                    next = following;
+                }
+                if loop_verts.len() >= 3 && next == start {
+                    loops.push(loop_verts);
+                }
+            }
+        }
+        loops
+    }
+
+    /// §1.2.3 — group components into regions by transitive 2D bounding-box
+    /// overlap. The region's loops are concatenated with the largest-box loop
+    /// first (the outer loop); the rest are treated as holes by the fill.
+    fn triangle_fill_coalesce_regions(
+        &self,
+        component_loops: Vec<Vec<Vec<VertexKey>>>,
+    ) -> Vec<Vec<Vec<VertexKey>>> {
+        let component_count = component_loops.len();
+
+        // Derive one shared projection basis from the first non-empty loop so
+        // the box test is computed in a consistent plane. The overlap decision
+        // only chooses which loops share a sweep, so the exact plane is not
+        // load-bearing (§1.2.3).
+        let mut basis_normal = Vec3::Z;
+        for loops in &component_loops {
+            if let Some(first) = loops.first() {
+                if first.len() >= 3 {
+                    basis_normal = self.triangle_fill_derive_normal(first);
+                    break;
+                }
+            }
+        }
+        let (axis_u, axis_w) = axis_dominant_basis_negated(basis_normal);
+        let project = |mesh: &LoopMesh, v: VertexKey| {
+            let p = mesh.vertex_position(v);
+            Vec2::new(axis_u.dot(p), axis_w.dot(p))
+        };
+
+        let mut boxes: Vec<BoundingBox2D> = vec![BoundingBox2D::empty(); component_count];
+        for (i, loops) in component_loops.iter().enumerate() {
+            for loop_verts in loops {
+                for &v in loop_verts {
+                    boxes[i].expand(project(self, v));
+                }
+            }
+        }
+
+        // Union-find by transitive box overlap.
+        let mut target: Vec<usize> = (0..component_count).collect();
+        fn find(target: &mut [usize], mut i: usize) -> usize {
+            while target[i] != i {
+                target[i] = target[target[i]];
+                i = target[i];
+            }
+            i
+        }
+        for a in 0..component_count {
+            for b in (a + 1)..component_count {
+                if boxes[a].overlaps(&boxes[b]) {
+                    let ra = find(&mut target, a);
+                    let rb = find(&mut target, b);
+                    if ra != rb {
+                        target[rb] = ra;
+                        let merged = boxes[rb];
+                        boxes[ra].union(&merged);
+                    }
+                }
+            }
+        }
+
+        // Gather each region's loops; order so the largest-box loop is first
+        // (the outer boundary, with the rest as holes).
+        let mut regions: HashMap<usize, Vec<Vec<VertexKey>>> = HashMap::new();
+        for (i, loops) in component_loops.into_iter().enumerate() {
+            let root = find(&mut target, i);
+            regions.entry(root).or_default().extend(loops);
+        }
+        let mut out: Vec<Vec<Vec<VertexKey>>> = Vec::new();
+        for (_, mut loops) in regions {
+            loops.retain(|l| l.len() >= 3);
+            if loops.is_empty() {
+                continue;
+            }
+            loops.sort_by(|a, b| {
+                let box_a = loop_box(self, a, &project);
+                let box_b = loop_box(self, b, &project);
+                box_b
+                    .area()
+                    .partial_cmp(&box_a.area())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            out.push(loops);
+        }
+        out
     }
 
     /// Order an undirected edge set into a single simple closed loop's vertex
@@ -587,6 +1103,127 @@ mod tests {
         );
         assert!(result.is_empty());
         assert_eq!(mesh.face_count(), 0);
+    }
+
+    /// Build a free wire ring of `n` verts on a circle of the given `radius`,
+    /// centred at `center` in the z=0 plane, returning the ring edges.
+    fn wire_ring_at(
+        mesh: &mut LoopMesh,
+        n: usize,
+        center: Vec3,
+        radius: f32,
+    ) -> Vec<EdgeKey> {
+        let verts: Vec<VertexKey> = (0..n)
+            .map(|i| {
+                let theta = (i as f32) * TAU / (n as f32);
+                mesh.create_vertex(center + Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0))
+            })
+            .collect();
+        (0..n)
+            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .collect()
+    }
+
+    #[test]
+    fn two_disjoint_loops_both_fill_independently() {
+        // §1.2.1 / §8: two disjoint closed loops in one edge set — each is a
+        // connected component (boxes do not overlap) and fills independently.
+        let mut mesh = LoopMesh::new();
+        let mut edges = wire_ring_at(&mut mesh, 4, Vec3::new(-5.0, 0.0, 0.0), 1.0);
+        edges.extend(wire_ring_at(&mut mesh, 5, Vec3::new(5.0, 0.0, 0.0), 1.0));
+
+        let result = mesh.triangle_fill(&edges, &TriangleFillParams::default());
+
+        // quad → 2 tris, pentagon → 3 tris.
+        assert_eq!(mesh.face_count(), 2 + 3, "both regions filled");
+        assert_eq!(mesh.vertex_count(), 9, "no vertex created");
+        assert_eq!(result.faces().len(), 5);
+        for face in mesh.face_keys() {
+            assert_eq!(mesh.face_len(face), 3, "every fill face is a triangle");
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn annulus_fills_band_and_leaves_hole_empty() {
+        // §1.2.3 / §1.2.4 / §8: an outer loop enclosing an inner loop. The two
+        // loops coalesce (inner box ⊂ outer box) into one region; the band is
+        // tiled and the inner loop is left empty (no face covers the hole).
+        let mut mesh = LoopMesh::new();
+        let outer = wire_ring_at(&mut mesh, 4, Vec3::ZERO, 4.0);
+        let inner = wire_ring_at(&mut mesh, 4, Vec3::ZERO, 1.0);
+        let mut edges = outer.clone();
+        edges.extend(inner.iter().copied());
+
+        let result = mesh.triangle_fill(&edges, &TriangleFillParams::default());
+
+        assert_eq!(mesh.vertex_count(), 8, "no vertex created");
+        assert!(!result.faces().is_empty(), "band must be filled");
+        for face in mesh.face_keys() {
+            assert_eq!(mesh.face_len(face), 3, "every band face is a triangle");
+        }
+        // The four inner edges still bound the empty hole: each carries exactly
+        // one fill face (the band side), never two (which would mean the hole
+        // got covered).
+        for &inner_edge in &inner {
+            let face_count = mesh.edge_loop_keys(inner_edge).len();
+            assert_eq!(
+                face_count, 1,
+                "inner edge {inner_edge:?} must have the band on one side only (hole empty)"
+            );
+        }
+        // No fill triangle may have all three corners on the inner loop — that
+        // would be a triangle inside the hole.
+        let inner_verts: std::collections::HashSet<VertexKey> = inner
+            .iter()
+            .flat_map(|&e| mesh.edge_vert_keys(e))
+            .collect();
+        for face in mesh.face_keys() {
+            let all_inner = mesh
+                .face_vert_keys(face)
+                .iter()
+                .all(|v| inner_verts.contains(v));
+            assert!(!all_inner, "no triangle may fill the hole interior");
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn loose_dangling_edges_create_nothing() {
+        // §1.2.2: a closed triangle with a dangling tail. The tail is trimmed
+        // by the leaf-trim pass; only the triangle fills. A *purely* dangling
+        // chain (no cycle) fills nothing.
+        let mut mesh = LoopMesh::new();
+
+        // Pure dangling chain: a 3-edge open path off to one side.
+        let p0 = mesh.create_vertex(Vec3::new(10.0, 0.0, 0.0));
+        let p1 = mesh.create_vertex(Vec3::new(11.0, 0.0, 0.0));
+        let p2 = mesh.create_vertex(Vec3::new(12.0, 0.0, 0.0));
+        let p3 = mesh.create_vertex(Vec3::new(13.0, 0.5, 0.0));
+        let d0 = mesh.create_edge([p0, p1], EdgeCreateFlags::NO_DUPLICATE);
+        let d1 = mesh.create_edge([p1, p2], EdgeCreateFlags::NO_DUPLICATE);
+        let d2 = mesh.create_edge([p2, p3], EdgeCreateFlags::NO_DUPLICATE);
+
+        let result = mesh.triangle_fill(&[d0, d1, d2], &TriangleFillParams::default());
+        assert!(result.is_empty(), "a pure dangling chain bounds no region");
+        assert_eq!(mesh.face_count(), 0);
+
+        // A closed loop plus a dangling spur off one of its vertices: the spur
+        // is trimmed, the loop fills.
+        let mut mesh2 = LoopMesh::new();
+        let ring = wire_ring_at(&mut mesh2, 4, Vec3::ZERO, 1.0);
+        let spur_tip = mesh2.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let ring_v = mesh2.edge_vert_keys(ring[0])[0];
+        let spur = mesh2.create_edge([ring_v, spur_tip], EdgeCreateFlags::NO_DUPLICATE);
+        let mut edges = ring.clone();
+        edges.push(spur);
+
+        let result2 = mesh2.triangle_fill(&edges, &TriangleFillParams::default());
+        assert_eq!(mesh2.face_count(), 2, "the quad fills (spur trimmed)");
+        assert_eq!(result2.faces().len(), 2);
+        // The spur edge survives untouched (the op never deletes input edges).
+        assert!(mesh2.edges.try_get(spur).is_some(), "spur edge untouched");
+        mesh2.validate_topology();
     }
 
     #[test]
