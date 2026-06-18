@@ -1,16 +1,15 @@
-//! Tier-2 property tests for the in-tree quickhull (general-position clouds).
+//! Tier-2 property tests for the in-tree quickhull.
 //!
 //! No oracle: a hull is self-checking. We assert the invariants the
 //! prerequisite file lists —
 //!   1. every input point is on or inside the hull;
 //!   2. the hull is globally convex (every input below or on every face plane);
-//!   3. every face is outward-wound (and, being a triangle, trivially planar
-//!      and convex).
+//!   3. every face is outward-wound, planar, and convex (faces are now n-gons,
+//!      so planarity and convexity are explicit checks, not free triangle
+//!      properties);
+//!   4. coplanar input points merge into a single face.
 //! Exact orientation in the assertions uses the same `robust::orient3d`
 //! predicate the implementation does, so "on or inside" is decided exactly.
-//!
-//! Degenerate clouds (coplanar / collinear / coincident / cospherical) are out
-//! of scope for this first cut and are not exercised here.
 
 use glam::DVec3;
 use robust::{orient3d, Coord3D};
@@ -33,7 +32,12 @@ fn orient(a: DVec3, b: DVec3, c: DVec3, d: DVec3) -> f64 {
     orient3d(coord(a), coord(b), coord(c), coord(d))
 }
 
-/// Assert the three hull invariants on `topo` over `points`.
+/// Assert the hull invariants on a full-dimensional `topo` over `points`.
+///
+/// Faces are n-gons, so planarity and convexity are explicit. Each face's plane
+/// is taken from its first three vertices; planarity asserts every further face
+/// vertex lies exactly in that plane, and global convexity asserts every input
+/// point is on or inside every face plane.
 fn assert_hull_invariants(points: &[DVec3], topo: &HullTopology) {
     assert!(!topo.faces.is_empty(), "hull produced no faces");
     assert!(topo.vertices.len() >= 4, "hull needs at least a tetrahedron");
@@ -45,25 +49,61 @@ fn assert_hull_invariants(points: &[DVec3], topo: &HullTopology) {
         "hull vertices not strictly ascending / unique"
     );
     for face in &topo.faces {
-        for index in [face.a, face.b, face.c] {
+        assert!(face.vertices.len() >= 3, "face has fewer than three vertices");
+        for &index in &face.vertices {
             assert!(index < points.len(), "face references out-of-range index");
             assert!(
                 topo.vertices.binary_search(&index).is_ok(),
                 "face index {index} missing from hull vertex set"
             );
         }
+        // No repeated vertex within a single face.
+        let mut sorted = face.vertices.clone();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        sorted.dedup();
+        assert_eq!(len, sorted.len(), "face has a repeated vertex");
     }
 
     for (face_number, face) in topo.faces.iter().enumerate() {
-        let a = points[face.a];
-        let b = points[face.b];
-        let c = points[face.c];
+        let a = points[face.vertices[0]];
+        let b = points[face.vertices[1]];
+        let c = points[face.vertices[2]];
 
-        // Invariant 3: outward-wound — every OTHER input point is on or inside
-        // (>= 0) relative to this face plane. A negative value would mean a
-        // point outside the face (hull not closed / wound inward).
+        // Non-degenerate seed triangle (the first three face vertices are not
+        // collinear).
+        let normal = (b - a).cross(c - a);
+        assert!(
+            normal.length_squared() > EPS,
+            "face {face_number} has a collinear seed triangle"
+        );
+
+        // Planarity: every further vertex of the face lies exactly in the plane.
+        for &index in &face.vertices[3..] {
+            let side = orient(a, b, c, points[index]);
+            assert_eq!(
+                side, 0.0,
+                "face {face_number} is non-planar at vertex {index}"
+            );
+        }
+
+        // Convexity: walking the boundary, every turn bends the same way. The
+        // cross product of consecutive edges must stay parallel (not anti-
+        // parallel) to the face normal at every corner.
+        let count = face.vertices.len();
+        for corner in 0..count {
+            let prev = points[face.vertices[(corner + count - 1) % count]];
+            let here = points[face.vertices[corner]];
+            let nextp = points[face.vertices[(corner + 1) % count]];
+            let turn = (here - prev).cross(nextp - here);
+            assert!(
+                turn.dot(normal) >= -EPS,
+                "face {face_number} is non-convex / mis-wound at corner {corner}"
+            );
+        }
+
         for (index, &point) in points.iter().enumerate() {
-            if index == face.a || index == face.b || index == face.c {
+            if face.vertices.contains(&index) {
                 continue;
             }
             let side = orient(a, b, c, point);
@@ -72,21 +112,16 @@ fn assert_hull_invariants(points: &[DVec3], topo: &HullTopology) {
                 "point {index} lies outside face {face_number}: orient={side}"
             );
         }
-
-        // Sanity: the face is non-degenerate (the three points are not
-        // collinear). A general-position hull never emits a sliver.
-        let normal = (b - a).cross(c - a);
-        assert!(
-            normal.length_squared() > EPS,
-            "face {face_number} is degenerate (collinear vertices)"
-        );
     }
 
     // Invariant 1 & 2 combined: every input point is on or inside the hull,
     // which for a convex polytope is exactly "on or below every face plane".
     for (index, &point) in points.iter().enumerate() {
         for (face_number, face) in topo.faces.iter().enumerate() {
-            let side = orient(points[face.a], points[face.b], points[face.c], point);
+            let a = points[face.vertices[0]];
+            let b = points[face.vertices[1]];
+            let c = points[face.vertices[2]];
+            let side = orient(a, b, c, point);
             assert!(
                 side >= -EPS,
                 "input point {index} is outside face {face_number}: orient={side}"
@@ -219,13 +254,24 @@ fn random_clouds_on_a_sphere() {
 }
 
 #[test]
-fn fewer_than_four_points_has_no_hull() {
-    let points = vec![
+fn lower_dimensional_clouds_resolve_to_degenerate_hulls() {
+    // Three non-collinear coplanar points are a genuine (flat) hull: one
+    // triangular face over the three boundary points. The pre-merge first cut
+    // returned `None` here; the degenerate handling now resolves it.
+    let triangle = vec![
         DVec3::new(0.0, 0.0, 0.0),
         DVec3::new(1.0, 0.0, 0.0),
         DVec3::new(0.0, 1.0, 0.0),
     ];
-    assert!(convex_hull(&points).is_none());
+    let topo = convex_hull(&triangle).expect("coplanar triangle is a flat hull");
+    assert_eq!(topo.vertices, vec![0, 1, 2]);
+    assert_eq!(topo.faces.len(), 1, "flat triangle hull is one face");
+    assert_eq!(topo.faces[0].vertices.len(), 3);
+
+    // A hull only fails to exist when fewer than two distinct points remain.
+    let single = vec![DVec3::new(1.0, 1.0, 1.0), DVec3::new(1.0, 1.0, 1.0)];
+    assert!(convex_hull(&single).is_none(), "one distinct point has no hull");
+    assert!(convex_hull(&[]).is_none(), "empty cloud has no hull");
 }
 
 #[test]
@@ -287,7 +333,6 @@ fn hull_positions_are_distinct(points: &[DVec3], topo: &HullTopology) -> bool {
 }
 
 #[test]
-#[ignore = "coplanar merge not yet implemented; see prerequisites/convex_hull.md row 5"]
 fn cube_merges_coplanar_faces() {
     // Eight corners of the unit cube. Every cube face is four coplanar points,
     // so the operator contract is six merged quad faces — NOT a 12-triangle fan.
@@ -320,7 +365,6 @@ fn cube_merges_coplanar_faces() {
 }
 
 #[test]
-#[ignore = "coplanar (lower-dimensional) hull not yet implemented; see prerequisites/convex_hull.md row 5"]
 fn coplanar_slab_yields_flat_hull() {
     // A single-plane point cloud (z == 0): a 3x3 grid plus interior jitter. No
     // positive-volume seed simplex exists, so the first cut returns None. The
@@ -353,7 +397,6 @@ fn coplanar_slab_yields_flat_hull() {
 }
 
 #[test]
-#[ignore = "collinear (degenerate) input handling not yet implemented; see prerequisites/convex_hull.md row 5"]
 fn collinear_cloud_yields_degenerate_hull() {
     // All points on a single line: no area, no volume. The first cut returns
     // None (no seed simplex). The target contract reduces this to the two
@@ -378,7 +421,6 @@ fn collinear_cloud_yields_degenerate_hull() {
 }
 
 #[test]
-#[ignore = "coplanar-subset face merge not yet implemented; see prerequisites/convex_hull.md row 5"]
 fn cospherical_with_coplanar_subsets_merges_faces() {
     // A cospherical octagonal pyramid: eight base points around a circle in the
     // exact plane z = z0, plus an apex at the north pole. Every point is extreme
@@ -420,10 +462,6 @@ fn cospherical_with_coplanar_subsets_merges_faces() {
     // triangulates the octagon, hitting the bound, so this fails until the merge
     // lands.
     //
-    // NOTE for row 5: a triangular `HullFace` cannot represent the merged octagon
-    // at all — the merge step must extend the output type to n-gon faces (and
-    // `assert_hull_invariants` will need an n-gon-aware planarity/winding check at
-    // that point). This bound-based check stands in until that type lands.
     let triangulated_upper_bound = 2 * topo.vertices.len() - 4; // Euler bound for a triangulated hull
     assert!(
         topo.faces.len() < triangulated_upper_bound,
@@ -431,6 +469,16 @@ fn cospherical_with_coplanar_subsets_merges_faces() {
          below the triangulated bound {triangulated_upper_bound}",
         topo.faces.len()
     );
+
+    // Concretely: the base merges to exactly one octagonal face, plus eight
+    // triangular side faces to the apex (nine faces total).
+    assert_eq!(topo.faces.len(), 9, "expected one octagon + eight side triangles");
+    let octagons = topo
+        .faces
+        .iter()
+        .filter(|face| face.vertices.len() == 8)
+        .count();
+    assert_eq!(octagons, 1, "the eight coplanar base points must form one octagon");
 
     assert_hull_invariants(&points, &topo);
 }

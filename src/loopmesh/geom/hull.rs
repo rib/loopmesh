@@ -8,29 +8,34 @@
 //! `orient3d` predicate (Shewchuk's algorithm). We never hand-roll the
 //! predicate: only the combinatorial quickhull skeleton lives here.
 //!
-//! This first cut is **general-position correct**. Degenerate combinatorics
-//! (coincident / collinear / coplanar / cospherical inputs) are deferred; see
-//! `bmesh-parity/prerequisites/convex_hull.md`.
+//! The hull is full-dimensional in the general case, but mesh-vertex inputs are
+//! disproportionately degenerate (cubes, grids, coplanar rings, collinear
+//! runs). So the output is n-gon faces with coplanar input merged into a single
+//! face, and lower-dimensional clouds (coplanar / collinear) resolve to their
+//! genuine degenerate hulls rather than `None`.
 
 use glam::DVec3;
 use robust::{orient3d, Coord3D};
 
-/// A hull face as a triangle of indices into the provider's input point slice.
+/// A hull face as a CCW-wound loop of indices into the provider's input point
+/// slice.
 ///
 /// Indices are **into the input cloud** (not a remapped hull-vertex set): the
 /// output is neutral and index-based so any consumer can map them back to its
 /// own vertex keys without positional drift. The winding is counter-clockwise
 /// as seen from outside the hull (outward-facing normal by the right-hand
 /// rule).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A face has at least three vertices. Coplanar input points that share a
+/// supporting plane are emitted as a single n-gon face, not a triangle fan, so
+/// a cube hull is six quads and an octagonal-base pyramid's base is one octagon.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HullFace {
-    pub a: usize,
-    pub b: usize,
-    pub c: usize,
+    pub vertices: Vec<usize>,
 }
 
-/// The topology of a convex hull: a set of outward-wound triangular faces over
-/// the input point indices, plus the set of input indices that lie on the hull.
+/// The topology of a convex hull: a set of outward-wound faces over the input
+/// point indices, plus the set of input indices that lie on the hull.
 ///
 /// `vertices` is the on-hull subset of the input indices, in ascending order.
 /// `faces` reference the original input indices (so they index the caller's
@@ -51,9 +56,9 @@ pub struct HullTopology {
 pub trait ConvexHullProvider {
     /// Compute the convex hull of `points`.
     ///
-    /// Returns `None` when no full-dimensional hull exists for this provider
-    /// (e.g. fewer than four points, or — for this first cut — a degenerate
-    /// lower-dimensional input the provider cannot resolve).
+    /// Returns `None` only when no hull of any dimension exists (fewer than two
+    /// distinct points). Coplanar and collinear clouds resolve to their genuine
+    /// degenerate hulls.
     fn convex_hull(&self, points: &[DVec3]) -> Option<HullTopology>;
 }
 
@@ -107,17 +112,109 @@ impl WorkFace {
     }
 }
 
-/// Compute the 3D convex hull of `points` (general-position inputs).
+/// Compute the 3D convex hull of `points`.
 ///
-/// Returns `None` when the cloud has fewer than four points or is degenerate
-/// (all points coplanar / collinear / coincident, so no positive-volume seed
-/// simplex exists). Handling those degeneracies as real hulls is deferred.
+/// Returns `None` only when fewer than two distinct points exist (no hull of
+/// any dimension). Collinear clouds reduce to their two extreme endpoints;
+/// coplanar clouds reduce to a single flat polygon over their 2D boundary;
+/// full-dimensional clouds yield a closed polytope with coplanar faces merged.
 pub fn convex_hull(points: &[DVec3]) -> Option<HullTopology> {
-    if points.len() < 4 {
+    let basis = dimension_basis(points)?;
+    match basis {
+        DimensionBasis::Volume(seed) => Some(full_hull(points, seed)),
+        DimensionBasis::Plane { origin, edge, area } => {
+            Some(planar_hull(points, origin, edge, area))
+        }
+        DimensionBasis::Line { origin, direction } => {
+            Some(collinear_hull(points, origin, direction))
+        }
+    }
+}
+
+/// The dimensionality of a point cloud and a basis for its affine hull.
+enum DimensionBasis {
+    /// Full-dimensional: a positive-volume seed tetrahedron.
+    Volume([usize; 4]),
+    /// Coplanar (rank 2): a point on the plane and two in-plane vectors. `edge`
+    /// and `area` span the plane; their cross product is the plane normal.
+    Plane {
+        origin: usize,
+        edge: usize,
+        area: usize,
+    },
+    /// Collinear (rank 1): a point and a direction vector index.
+    Line { origin: usize, direction: usize },
+}
+
+/// Classify `points` by affine dimension and return a non-degenerate basis.
+///
+/// Returns `None` only when fewer than two distinct points exist. Distinctness
+/// is decided by exact equality of positions, so coincident duplicates collapse
+/// before any predicate runs.
+fn dimension_basis(points: &[DVec3]) -> Option<DimensionBasis> {
+    let n = points.len();
+    if n == 0 {
         return None;
     }
 
-    let seed = seed_simplex(points)?;
+    // First two distinct points span the line.
+    let origin = 0;
+    let direction = (1..n).find(|&i| points[i] != points[origin])?;
+
+    // Third point off the line: maximize the cross-product magnitude (orient3d
+    // still decides the simplex below; this is only for numerical comfort).
+    let line = points[direction] - points[origin];
+    let mut area = None;
+    let mut best_area = 0.0f64;
+    for i in 0..n {
+        if i == origin || i == direction {
+            continue;
+        }
+        let span = line.cross(points[i] - points[origin]).length_squared();
+        if span > best_area {
+            best_area = span;
+            area = Some(i);
+        }
+    }
+    let area = match area {
+        Some(index) if best_area > 0.0 => index,
+        _ => {
+            return Some(DimensionBasis::Line { origin, direction });
+        }
+    };
+
+    // Fourth point off the plane, chosen by largest exact orientation magnitude.
+    let mut apex = None;
+    let mut best_vol = 0.0f64;
+    for i in 0..n {
+        if i == origin || i == direction || i == area {
+            continue;
+        }
+        let vol = orient(points[origin], points[direction], points[area], points[i]).abs();
+        if vol > best_vol {
+            best_vol = vol;
+            apex = Some(i);
+        }
+    }
+    match apex {
+        Some(index) if best_vol > 0.0 => {
+            Some(DimensionBasis::Volume([origin, direction, area, index]))
+        }
+        _ => Some(DimensionBasis::Plane {
+            origin,
+            edge: direction,
+            area,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full-dimensional hull
+// ---------------------------------------------------------------------------
+
+/// Build the closed polytope from a positive-volume seed simplex, then merge
+/// coplanar faces.
+fn full_hull(points: &[DVec3], seed: [usize; 4]) -> HullTopology {
     let mut faces = seed_faces(points, seed);
 
     // Assign every remaining point to the first face it sits outside of. A
@@ -143,7 +240,8 @@ pub fn convex_hull(points: &[DVec3]) -> Option<HullTopology> {
 
         // Find every face visible from the apex (flood from the seed face
         // across shared edges) and collect their orphaned outside points.
-        let visible = visible_faces(points, &faces, face_index, apex);
+        let adjacency = build_adjacency(&faces);
+        let visible = visible_faces(points, &faces, &adjacency, face_index, apex);
         let horizon = horizon_edges(&faces, &visible);
 
         let mut orphans: Vec<usize> = Vec::new();
@@ -153,81 +251,37 @@ pub fn convex_hull(points: &[DVec3]) -> Option<HullTopology> {
         }
 
         // Stitch a new face from each horizon edge to the apex; redistribute
-        // the orphaned points onto the new faces.
+        // the orphaned points onto the first new face each can see (mirroring
+        // the single-owner assignment of `assign_to_face`).
+        let new_face_start = faces.len();
         for (edge_start, edge_end) in horizon {
-            let new_index = faces.len();
             faces.push(WorkFace {
                 points: [edge_start, edge_end, apex],
                 alive: true,
             });
             outside.push(Vec::new());
+        }
+        let new_faces = new_face_start..faces.len();
 
-            for &orphan in &orphans {
-                if orphan == apex {
-                    continue;
-                }
+        for &orphan in &orphans {
+            if orphan == apex {
+                continue;
+            }
+            for new_index in new_faces.clone() {
                 if point_outside(points, &faces[new_index], orphan) {
                     outside[new_index].push(orphan);
+                    break;
                 }
             }
+        }
+        for new_index in new_faces {
             if !outside[new_index].is_empty() {
                 face_queue.push(new_index);
             }
         }
     }
 
-    Some(finalize(&faces))
-}
-
-/// Pick four input points that form a positive-volume (non-degenerate) seed
-/// tetrahedron. Returns `None` if the cloud is degenerate (coplanar etc.).
-fn seed_simplex(points: &[DVec3]) -> Option<[usize; 4]> {
-    let n = points.len();
-
-    // First two distinct points span an edge.
-    let p0 = 0;
-    let p1 = (1..n).find(|&i| points[i] != points[p0])?;
-
-    // Third point not collinear with the edge: maximize the cross-product
-    // magnitude for numerical comfort (orient3d still decides the simplex).
-    let line = points[p1] - points[p0];
-    let mut p2 = None;
-    let mut best_area = 0.0f64;
-    for i in 0..n {
-        if i == p0 || i == p1 {
-            continue;
-        }
-        let area = line.cross(points[i] - points[p0]).length_squared();
-        if area > best_area {
-            best_area = area;
-            p2 = Some(i);
-        }
-    }
-    let p2 = p2?;
-    if best_area == 0.0 {
-        return None;
-    }
-
-    // Fourth point off the plane of the first three, chosen by the largest
-    // exact orientation magnitude.
-    let mut p3 = None;
-    let mut best_vol = 0.0f64;
-    for i in 0..n {
-        if i == p0 || i == p1 || i == p2 {
-            continue;
-        }
-        let vol = orient(points[p0], points[p1], points[p2], points[i]).abs();
-        if vol > best_vol {
-            best_vol = vol;
-            p3 = Some(i);
-        }
-    }
-    let p3 = p3?;
-    if best_vol == 0.0 {
-        return None;
-    }
-
-    Some([p0, p1, p2, p3])
+    merge_coplanar(points, &faces)
 }
 
 /// Build the four outward-wound faces of the seed tetrahedron.
@@ -305,11 +359,32 @@ fn furthest_outside_point(points: &[DVec3], face: &WorkFace, candidates: &[usize
     best
 }
 
+/// A map from each directed edge `(start, end)` to the alive face that owns it.
+/// On a closed orientable hull each directed edge belongs to exactly one face,
+/// so this gives O(1) neighbour lookup (cross an edge by reversing it).
+type Adjacency = std::collections::HashMap<(usize, usize), usize>;
+
+fn build_adjacency(faces: &[WorkFace]) -> Adjacency {
+    let mut adjacency =
+        std::collections::HashMap::with_capacity(faces.iter().filter(|f| f.alive).count() * 3);
+    for (face_index, face) in faces.iter().enumerate() {
+        if !face.alive {
+            continue;
+        }
+        for edge in face.edges() {
+            adjacency.insert(edge, face_index);
+        }
+    }
+    adjacency
+}
+
 /// All alive faces visible from `apex`, found by flooding from `start` across
-/// shared edges (the visible set is edge-connected on a convex hull).
+/// shared edges (the visible set is edge-connected on a convex hull). Neighbour
+/// lookup is O(1) via the directed-edge adjacency map.
 fn visible_faces(
     points: &[DVec3],
     faces: &[WorkFace],
+    adjacency: &Adjacency,
     start: usize,
     apex: usize,
 ) -> Vec<usize> {
@@ -322,13 +397,9 @@ fn visible_faces(
             continue;
         }
         visible.push(face_index);
-        // Cross every edge to neighbouring faces.
         for (edge_start, edge_end) in faces[face_index].edges() {
-            for neighbour in 0..faces.len() {
-                if seen[neighbour] || !faces[neighbour].alive {
-                    continue;
-                }
-                if shares_edge(&faces[neighbour], edge_end, edge_start) {
+            if let Some(&neighbour) = adjacency.get(&(edge_end, edge_start)) {
+                if !seen[neighbour] && faces[neighbour].alive {
                     seen[neighbour] = true;
                     stack.push(neighbour);
                 }
@@ -338,23 +409,18 @@ fn visible_faces(
     visible
 }
 
-/// True when `face` contains the directed edge `(u, v)` in its winding.
-#[inline]
-fn shares_edge(face: &WorkFace, u: usize, v: usize) -> bool {
-    face.edges().iter().any(|&(s, e)| s == u && e == v)
-}
-
 /// The horizon: directed boundary edges of the visible region — edges of a
 /// visible face whose opposite (reverse) edge does not belong to any other
 /// visible face. Each horizon edge becomes the base of one new face.
 fn horizon_edges(faces: &[WorkFace], visible: &[usize]) -> Vec<(usize, usize)> {
+    let visible_set: std::collections::HashSet<(usize, usize)> = visible
+        .iter()
+        .flat_map(|&face_index| faces[face_index].edges())
+        .collect();
     let mut horizon = Vec::new();
     for &face_index in visible {
         for (edge_start, edge_end) in faces[face_index].edges() {
-            let shared = visible.iter().any(|&other| {
-                other != face_index && shares_edge(&faces[other], edge_end, edge_start)
-            });
-            if !shared {
+            if !visible_set.contains(&(edge_end, edge_start)) {
                 horizon.push((edge_start, edge_end));
             }
         }
@@ -362,30 +428,304 @@ fn horizon_edges(faces: &[WorkFace], visible: &[usize]) -> Vec<(usize, usize)> {
     horizon
 }
 
-fn finalize(faces: &[WorkFace]) -> HullTopology {
+// ---------------------------------------------------------------------------
+// Coplanar-face merge
+// ---------------------------------------------------------------------------
+
+/// Merge maximally-coplanar adjacent triangles of the finished polytope into
+/// single n-gon faces, then collect the on-hull vertex set.
+///
+/// Two edge-adjacent triangles belong to the same face iff they are exactly
+/// coplanar (the neighbour's off-edge vertex lies in the triangle's plane).
+/// Each merged component's boundary is the chain of directed edges whose
+/// reverse is not internal to the component; that chain is the n-gon's CCW
+/// winding.
+fn merge_coplanar(points: &[DVec3], faces: &[WorkFace]) -> HullTopology {
+    let alive: Vec<usize> = faces
+        .iter()
+        .enumerate()
+        .filter(|(_, face)| face.alive)
+        .map(|(index, _)| index)
+        .collect();
+
+    // Position in `alive` for each global face index, so union-find works over
+    // a compact range.
+    let mut slot = vec![usize::MAX; faces.len()];
+    for (compact, &face_index) in alive.iter().enumerate() {
+        slot[face_index] = compact;
+    }
+
+    let edge_owner = build_adjacency(faces);
+    let mut groups = UnionFind::new(alive.len());
+
+    for (compact, &face_index) in alive.iter().enumerate() {
+        let [a, b, c] = faces[face_index].points;
+        for (edge_start, edge_end) in faces[face_index].edges() {
+            if let Some(&neighbour) = edge_owner.get(&(edge_end, edge_start)) {
+                if !faces[neighbour].alive {
+                    continue;
+                }
+                let off_edge = off_edge_vertex(&faces[neighbour], edge_end, edge_start);
+                if orient(points[a], points[b], points[c], points[off_edge]) == 0.0 {
+                    groups.union(compact, slot[neighbour]);
+                }
+            }
+        }
+    }
+
+    // Gather each component's triangles, then extract its boundary polygon.
+    let mut component_faces: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (compact, &face_index) in alive.iter().enumerate() {
+        component_faces
+            .entry(groups.find(compact))
+            .or_default()
+            .push(face_index);
+    }
+
     let mut topo = HullTopology::default();
-    let mut on_hull = vec![false; 0];
-    let mut max_index = 0usize;
-    for face in faces {
-        if face.alive {
-            max_index = max_index.max(face.points[0].max(face.points[1]).max(face.points[2]));
+    let mut on_hull = vec![false; points.len()];
+
+    for triangles in component_faces.values() {
+        let face = extract_boundary_polygon(faces, triangles);
+        for &index in &face.vertices {
+            on_hull[index] = true;
         }
+        topo.faces.push(face);
     }
-    on_hull.resize(max_index + 1, false);
-    for face in faces {
-        if !face.alive {
-            continue;
-        }
-        let [a, b, c] = face.points;
-        topo.faces.push(HullFace { a, b, c });
-        on_hull[a] = true;
-        on_hull[b] = true;
-        on_hull[c] = true;
-    }
+
     for (index, &present) in on_hull.iter().enumerate() {
         if present {
             topo.vertices.push(index);
         }
     }
     topo
+}
+
+/// The vertex of `triangle` that is not on the directed edge `(u, v)` (nor its
+/// reverse).
+#[inline]
+fn off_edge_vertex(triangle: &WorkFace, u: usize, v: usize) -> usize {
+    triangle.points[triangle
+        .points
+        .iter()
+        .position(|&p| p != u && p != v)
+        .expect("triangle has a vertex off any of its edges")]
+}
+
+/// Chain the boundary directed edges of a coplanar triangle component into a
+/// single CCW n-gon. Internal edges (those whose reverse is also in the
+/// component) cancel; the surviving boundary edges form one closed loop because
+/// each component is a disc of a convex polytope facet.
+fn extract_boundary_polygon(faces: &[WorkFace], triangles: &[usize]) -> HullFace {
+    let internal: std::collections::HashSet<(usize, usize)> = triangles
+        .iter()
+        .flat_map(|&face_index| faces[face_index].edges())
+        .collect();
+
+    // next[start] = end for each surviving boundary edge. A correct convex-hull
+    // facet boundary is a simple disc, so each vertex has exactly one outgoing
+    // boundary edge; a collision would mean the component pinched at a vertex,
+    // which is unreachable for valid hull input.
+    let mut next: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &face_index in triangles {
+        for (edge_start, edge_end) in faces[face_index].edges() {
+            if !internal.contains(&(edge_end, edge_start)) {
+                let previous = next.insert(edge_start, edge_end);
+                assert!(
+                    previous.is_none(),
+                    "coplanar component is not a simple disc: vertex has two boundary edges"
+                );
+            }
+        }
+    }
+
+    let start = *next
+        .keys()
+        .next()
+        .expect("coplanar component has a boundary");
+    let mut vertices = Vec::with_capacity(next.len());
+    let mut current = start;
+    loop {
+        vertices.push(current);
+        current = next[&current];
+        if current == start {
+            break;
+        }
+        debug_assert!(
+            vertices.len() <= next.len(),
+            "boundary walk did not close into a single loop"
+        );
+    }
+    // The walk closed; a simple disc consumes every boundary edge exactly once,
+    // so an under-length loop means the boundary was not a single cycle.
+    assert!(
+        vertices.len() == next.len(),
+        "boundary walk closed before consuming every boundary edge"
+    );
+    HullFace { vertices }
+}
+
+/// Minimal union-find over a compact index range, for grouping coplanar faces.
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(count: usize) -> Self {
+        UnionFind {
+            parent: (0..count).collect(),
+        }
+    }
+
+    fn find(&mut self, mut node: usize) -> usize {
+        while self.parent[node] != node {
+            self.parent[node] = self.parent[self.parent[node]];
+            node = self.parent[node];
+        }
+        node
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[ra] = rb;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Degenerate (lower-dimensional) hulls
+// ---------------------------------------------------------------------------
+
+/// A coplanar cloud reduces to a single flat polygon over its 2D convex
+/// boundary, with interior points culled.
+///
+/// We work in the plane spanned by `(points[edge] - points[origin])` and the
+/// in-plane normal `n x edge` (so the 2D coordinates stay exact in spirit and
+/// the gift-wrap below uses exact `orient3d` for every turn test). The polygon
+/// is wound CCW about the plane normal `edge x area`.
+fn planar_hull(points: &[DVec3], origin: usize, edge: usize, area: usize) -> HullTopology {
+    let normal = (points[edge] - points[origin]).cross(points[area] - points[origin]);
+
+    // A reference point strictly off the plane on the positive side, so the
+    // 3D `orient` predicate decides 2D left/right turns exactly.
+    let apex = points[origin] + normal;
+
+    let boundary = gift_wrap_2d(points, apex);
+    let mut topo = HullTopology::default();
+    if boundary.len() >= 3 {
+        topo.vertices = sorted_unique(&boundary);
+        topo.faces.push(HullFace { vertices: boundary });
+    } else {
+        // Fewer than three distinct boundary points means the cloud collapsed
+        // to a segment after dedup; fall back to the collinear hull.
+        return collinear_hull(points, origin, edge);
+    }
+    topo
+}
+
+/// Gift-wrap the 2D convex boundary of a coplanar cloud. `apex` is a fixed
+/// reference off the plane used to turn 2D turn-tests into exact 3D
+/// orientations.
+///
+/// Each hull edge `(current, next)` is the one for which every other point lies
+/// to the left (`orient(current, next, apex, other) >= 0` with no point strictly
+/// to the right). Starts from the lexicographically smallest position so the
+/// result is deterministic.
+fn gift_wrap_2d(points: &[DVec3], apex: DVec3) -> Vec<usize> {
+    let n = points.len();
+
+    // Deduplicate coincident positions: keep the lowest index per position.
+    let mut representative: Vec<usize> = Vec::new();
+    'outer: for i in 0..n {
+        for &kept in &representative {
+            if points[i] == points[kept] {
+                continue 'outer;
+            }
+        }
+        representative.push(i);
+    }
+    if representative.len() < 3 {
+        return representative;
+    }
+
+    // Start at the extreme along the plane's `edge` direction (lowest lexicographic
+    // position) — guaranteed on the boundary.
+    let start = *representative
+        .iter()
+        .min_by(|&&a, &&b| {
+            let pa = points[a];
+            let pb = points[b];
+            (pa.x, pa.y, pa.z)
+                .partial_cmp(&(pb.x, pb.y, pb.z))
+                .unwrap()
+        })
+        .unwrap();
+
+    let mut boundary = Vec::new();
+    let mut current = start;
+    loop {
+        boundary.push(current);
+        // Tentative next: any point other than `current`.
+        let mut next = *representative.iter().find(|&&p| p != current).unwrap();
+        for &candidate in &representative {
+            if candidate == current || candidate == next {
+                continue;
+            }
+            // `orient(current, next, apex, candidate)`: with `apex` off-plane on
+            // the positive side, this is negative when `candidate` is to the
+            // right of the directed edge (current -> next). A right-turn means
+            // `candidate` is a more clockwise next vertex; keep sweeping until
+            // every point lies left of (current -> next).
+            let side = orient(points[current], points[next], apex, points[candidate]);
+            if side < 0.0 {
+                next = candidate;
+            }
+        }
+        if next == start {
+            break;
+        }
+        current = next;
+        if boundary.len() > representative.len() {
+            break;
+        }
+    }
+    boundary
+}
+
+/// A collinear cloud reduces to its two extreme endpoints along the line.
+fn collinear_hull(points: &[DVec3], origin: usize, direction: usize) -> HullTopology {
+    let axis = points[direction] - points[origin];
+
+    let mut min_index = origin;
+    let mut max_index = origin;
+    let mut min_t = axis.dot(points[origin] - points[origin]);
+    let mut max_t = min_t;
+    for i in 0..points.len() {
+        let t = axis.dot(points[i] - points[origin]);
+        if t < min_t {
+            min_t = t;
+            min_index = i;
+        }
+        if t > max_t {
+            max_t = t;
+            max_index = i;
+        }
+    }
+
+    let mut topo = HullTopology::default();
+    topo.vertices = sorted_unique(&[min_index, max_index]);
+    // A 1D hull has no area face; the two endpoints carry the result. The
+    // `faces` list stays empty for a genuinely 1D hull.
+    topo
+}
+
+/// Sort and deduplicate a small index set in ascending order.
+fn sorted_unique(indices: &[usize]) -> Vec<usize> {
+    let mut out = indices.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
