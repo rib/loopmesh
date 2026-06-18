@@ -63,6 +63,7 @@ pub use crate::keys::{EdgeKey, ElementKey, ElementKeyFromUsize, FaceKey, LoopKey
 // one contributes an `impl LoopMesh` block.
 mod attributes;
 mod euler;
+mod geom;
 mod index;
 mod iter;
 mod mid;
@@ -72,6 +73,7 @@ mod queries;
 mod radial;
 
 pub use attributes::*;
+pub use geom::{convex_hull, ConvexHullProvider, HullFace, HullTopology, Quickhull};
 pub use iter::*;
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
