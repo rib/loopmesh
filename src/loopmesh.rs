@@ -87,7 +87,8 @@ pub use ops::{
     RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothVertParams,
     SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
     SubdivideResult, SymmetrizeDirection, SymmetrizeResult, TransformParams, TranslateParams,
-    DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
+    TriangleFillParams, TriangleFillResult, DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM,
+    DELIMIT_SHARP, DELIMIT_UV,
 };
 
 // Shared fixtures for the per-operator unit tests that live in the `euler`,

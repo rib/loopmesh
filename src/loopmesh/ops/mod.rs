@@ -58,6 +58,7 @@ mod subdivide_edges;
 mod symmetrize;
 mod transform;
 mod translate;
+mod triangle_fill;
 mod unsubdivide;
 mod weld_verts;
 
@@ -96,4 +97,5 @@ pub use subdivide_edges::{
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;
+pub use triangle_fill::{TriangleFillParams, TriangleFillResult};
 pub use translate::TranslateParams;
