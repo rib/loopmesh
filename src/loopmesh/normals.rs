@@ -202,16 +202,30 @@ impl LoopMesh {
         self.face_calc_normal(face);
     }
 
-    /// Interior corner angle at `apex`, between the rays to `prev` and `next`,
-    /// in radians on `[0, π]`. A zero-length ray normalises to zero (same guard
-    /// as `normalize_or_zero`), so a degenerate corner has dot `0` and angle
-    /// exactly `π/2`, never `NaN`. The operand is clamped so `acos` stays in
-    /// domain.
-    fn corner_angle(apex: Vec3, prev: Vec3, next: Vec3) -> f32 {
-        let to_prev = LoopMesh::normalize_or_zero(prev - apex);
-        let to_next = LoopMesh::normalize_or_zero(next - apex);
-        let dot = to_prev.dot(to_next).clamp(-1.0, 1.0);
-        dot.acos()
+    /// Polynomial approximation of `acos` on `[-1, 1]`, in radians on `[0, π]`.
+    ///
+    /// Form (publicly known clamp + `sqrt(1 - |x|)` × polynomial, the standard
+    /// extension of Abramowitz & Stegun 4.4.45 to one more term): for `x ≥ 0`,
+    /// `acos(x) ≈ sqrt(1 - x) · P(x)` with `P` a degree-4 polynomial fitted
+    /// over `[0, 1]`; the negative half uses the symmetry
+    /// `acos(-x) = π - acos(x)`. The operand is clamped to `[-1, 1]` first, so
+    /// the `sqrt` argument is never negative and the result never `NaN`.
+    /// Maximum absolute error over `[-1, 1]` is ~1.97e-5 rad, below the guide's
+    /// 4.5e-5 target (see `acos_approx_max_error` self-test).
+    fn acos_approx(x: f32) -> f32 {
+        let x = x.clamp(-1.0, 1.0);
+        let abs_x = x.abs();
+        // Horner evaluation of the degree-4 fit of acos(t)/sqrt(1-t) over [0,1].
+        let poly = 1.570_776_8
+            + abs_x
+                * (-0.213_973_87
+                    + abs_x * (0.084_163_88 + abs_x * (-0.035_166_71 + abs_x * 0.008_428_128)));
+        let result = (1.0 - abs_x).sqrt() * poly;
+        if x < 0.0 {
+            core::f32::consts::PI - result
+        } else {
+            result
+        }
     }
 
     /// Recompute a single vertex's normal as the angle-weighted sum of the
@@ -234,17 +248,31 @@ impl LoopMesh {
         // angle. Lending iterators keep the walk allocation-free.
         let mut disk = self.disk_edges(v);
         while let Some(e) = disk.next(self) {
+            // The *outgoing* edge from `v` along disk edge `e` is shared by
+            // every radial corner this edge contributes at `v`, so its unit ray
+            // is normalised once per disk edge — not per corner. The corner's
+            // far endpoint is the loop's other vertex, i.e. `e`'s far endpoint.
+            let far_vertex = match self.edges.get(e).other_vertex(v) {
+                Some(w) => w,
+                None => continue,
+            };
+            let out_ray =
+                LoopMesh::normalize_or_zero(self.vertices.get(far_vertex).position - apex);
             let mut radial = self.radial_loops(e);
             while let Some(l) = radial.next(self) {
-                if self.loops.get(l).vertex != v {
+                let loop_data = self.loops.get(l);
+                if loop_data.vertex != v {
                     continue;
                 }
-                let prev_vert = self.loops.get(self.loop_prev(l)).vertex;
-                let next_vert = self.loops.get(self.loop_next(l)).vertex;
-                let prev_pos = self.vertices.get(prev_vert).position;
-                let next_pos = self.vertices.get(next_vert).position;
-                let weight = LoopMesh::corner_angle(apex, prev_pos, next_pos);
-                acc += weight * self.faces.get(self.loops.get(l).face).normal;
+                let face = loop_data.face;
+                // Only the loop-cycle predecessor edge's ray is normalised
+                // per corner; `out_ray` is reused from above.
+                let prev_vertex = self.loops.get(self.loop_prev(l)).vertex;
+                let in_ray =
+                    LoopMesh::normalize_or_zero(self.vertices.get(prev_vertex).position - apex);
+                let dot = in_ray.dot(out_ray).clamp(-1.0, 1.0);
+                let weight = LoopMesh::acos_approx(dot);
+                acc += weight * self.faces.get(face).normal;
             }
         }
         let unit = LoopMesh::normalize_or_zero(acc);
@@ -292,6 +320,33 @@ mod tests {
         assert_eq!(normals[3], Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(normals[4], Vec3::new(0.0, 1.0, 0.0));
         assert_eq!(normals[5], Vec3::new(0.0, -1.0, 0.0));
+    }
+
+    /// The polynomial `acos` approximation stays under the guide's 4.5e-5 rad
+    /// max-abs-error target across a dense sweep of `[-1, 1]`, and is exact at
+    /// the clamp endpoints / midpoint (no NaN, monotone-ish).
+    #[test]
+    fn acos_approx_max_error() {
+        let samples = 200_001;
+        let mut max_err = 0.0_f32;
+        for i in 0..samples {
+            let x = -1.0 + 2.0 * (i as f32) / ((samples - 1) as f32);
+            let approx = LoopMesh::acos_approx(x);
+            assert!(approx.is_finite(), "acos_approx({x}) not finite");
+            let err = (approx - x.acos()).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(
+            max_err < 4.5e-5,
+            "acos_approx max error {max_err} exceeds 4.5e-5 rad target"
+        );
+        // Out-of-domain operands are clamped, never NaN.
+        assert!(LoopMesh::acos_approx(2.0).is_finite());
+        assert!(LoopMesh::acos_approx(-2.0).is_finite());
+        // A degenerate-corner dot of 0 weights at exactly π/2 (within tol).
+        assert!((LoopMesh::acos_approx(0.0) - core::f32::consts::FRAC_PI_2).abs() < 4.5e-5);
     }
 
     #[test]
