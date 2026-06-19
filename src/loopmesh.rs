@@ -86,8 +86,9 @@ pub use ops::{
     MirrorResult, MixedSeed, NgonMethod, ProfileShape, QuadCornerType, QuadMethod, RingInterp,
     RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothVertParams,
     SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
-    SubdivideResult, SymmetrizeDirection, SymmetrizeResult, TransformParams, TranslateParams,
-    TriangleFillParams, TriangleFillResult, DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM,
+    SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult, TransformParams,
+    TranslateParams, TriangleFillParams, TriangleFillResult, DELIMIT_MATERIAL, DELIMIT_NORMAL,
+    DELIMIT_SEAM,
     DELIMIT_SHARP, DELIMIT_UV,
 };
 
