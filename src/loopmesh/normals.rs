@@ -202,43 +202,58 @@ impl LoopMesh {
         self.face_calc_normal(face);
     }
 
-    /// Recompute a single vertex's normal as the area-weighted average of
-    /// incident face normals, normalised. Falls back to `Vec3::Z` for
-    /// isolated / wire-only vertices.
+    /// Interior corner angle at `apex`, between the rays to `prev` and `next`,
+    /// in radians on `[0, π]`. A zero-length ray normalises to zero (same guard
+    /// as `normalize_or_zero`), so a degenerate corner has dot `0` and angle
+    /// exactly `π/2`, never `NaN`. The operand is clamped so `acos` stays in
+    /// domain.
+    fn corner_angle(apex: Vec3, prev: Vec3, next: Vec3) -> f32 {
+        let to_prev = LoopMesh::normalize_or_zero(prev - apex);
+        let to_next = LoopMesh::normalize_or_zero(next - apex);
+        let dot = to_prev.dot(to_next).clamp(-1.0, 1.0);
+        dot.acos()
+    }
+
+    /// Recompute a single vertex's normal as the angle-weighted sum of the
+    /// incident faces' *stored* normals (Thürmer–Wüthrich weighting), one
+    /// contribution per corner. There is no per-face dedup: a vertex visited by
+    /// several corners of the same face contributes once per corner. When the
+    /// accumulator normalises to zero — a wire/isolated vertex, fully cancelled
+    /// contributions, or only degenerate incident faces — the stored normal is
+    /// the vertex's own position treated as a direction from the origin
+    /// (`normalize(position)`, and `(0,0,0)` at the origin).
     ///
-    /// Note: callers should ensure face normals are current first (e.g.
-    /// via [`Self::mesh_normals_update`]); the area weight is read from
-    /// each face's stored `normal` field.
+    /// Note: callers should ensure face normals are current first (e.g. via
+    /// [`Self::mesh_normals_update`]); each weight scales that face's stored
+    /// `normal` field.
     pub fn vert_normal_update(&mut self, v: VertexKey) {
-        // Walk v's incident faces (with dedup) using lending iterators —
-        // SmallVec keeps the dedup set off the heap for typical valences.
-        let mut seen: smallvec::SmallVec<[FaceKey; 8]> = smallvec::SmallVec::new();
+        let apex = self.vertices.get(v).position;
+        let mut acc = Vec3::ZERO;
+        // Per-corner gather: walk v's disk, and for every radial corner that
+        // sits *at* v, weight that face's stored normal by the interior corner
+        // angle. Lending iterators keep the walk allocation-free.
         let mut disk = self.disk_edges(v);
         while let Some(e) = disk.next(self) {
             let mut radial = self.radial_loops(e);
             while let Some(l) = radial.next(self) {
-                let f = self.loops.get(l).face;
-                if !seen.contains(&f) {
-                    seen.push(f);
+                if self.loops.get(l).vertex != v {
+                    continue;
                 }
+                let prev_vert = self.loops.get(self.loop_prev(l)).vertex;
+                let next_vert = self.loops.get(self.loop_next(l)).vertex;
+                let prev_pos = self.vertices.get(prev_vert).position;
+                let next_pos = self.vertices.get(next_vert).position;
+                let weight = LoopMesh::corner_angle(apex, prev_pos, next_pos);
+                acc += weight * self.faces.get(self.loops.get(l).face).normal;
             }
         }
-        if seen.is_empty() {
-            self.set_vertex_normal(v, Vec3::Z);
-            return;
-        }
-        let mut acc = Vec3::ZERO;
-        for &f in &seen {
-            let area = self.face_calc_area(f);
-            let n_f = self.faces.get(f).normal;
-            acc += area * n_f;
-        }
-        let n = if acc.length_squared() > 0.0 {
-            acc.normalize()
+        let unit = LoopMesh::normalize_or_zero(acc);
+        let normal = if unit != Vec3::ZERO {
+            unit
         } else {
-            Vec3::Z
+            LoopMesh::normalize_or_zero(apex)
         };
-        self.set_vertex_normal(v, n);
+        self.set_vertex_normal(v, normal);
     }
 
     /// Recompute every face normal, then every vertex normal. This is the
@@ -491,6 +506,177 @@ mod tests {
         mesh.face_calc_normal(face);
         let normal = mesh.faces.get(face).normal;
         assert_eq!(normal, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    /// Two triangles share a single apex vertex. Both corners at the apex have
+    /// the same interior angle (45°) but vastly different areas (10000:1). The
+    /// vertex normal must bisect the two face normals — angle weighting cancels
+    /// the area difference. Area weighting would collapse the result onto the
+    /// large face's normal, so this guards the angle-weighting fix.
+    #[test]
+    fn vert_normal_is_angle_weighted_not_area_weighted() {
+        let mut mesh = LoopMesh::new();
+
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+
+        // Small face in plane z = 0, corner angle 45° at apex, normal +Z.
+        let s = 0.1_f32;
+        let b = mesh.create_vertex(Vec3::new(s, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(s, s, 0.0));
+        let eab = mesh.create_edge([apex, b], EdgeCreateFlags::NONE);
+        let ebc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let eca = mesh.create_edge([c, apex], EdgeCreateFlags::NONE);
+        mesh.face_create(&[apex, b, c], &[eab, ebc, eca], FaceCreateFlags::NONE);
+
+        // Large face in plane x = 0, corner angle 45° at apex, normal +X.
+        let large = 10.0_f32;
+        let d = mesh.create_vertex(Vec3::new(0.0, large, 0.0));
+        let e = mesh.create_vertex(Vec3::new(0.0, large, large));
+        let ead = mesh.create_edge([apex, d], EdgeCreateFlags::NONE);
+        let ede = mesh.create_edge([d, e], EdgeCreateFlags::NONE);
+        let eea = mesh.create_edge([e, apex], EdgeCreateFlags::NONE);
+        mesh.face_create(&[apex, d, e], &[ead, ede, eea], FaceCreateFlags::NONE);
+
+        mesh.mesh_normals_update();
+
+        let n = mesh.vertex_normal(apex);
+        let expected = Vec3::new(1.0, 0.0, 1.0).normalize();
+        assert!(
+            (n - expected).length() < 1.0e-4,
+            "apex normal {n:?} should bisect the two face normals (got != {expected:?})"
+        );
+    }
+
+    /// A vertex whose incident faces' normals cancel falls back to the vertex's
+    /// own position normalised, not +Z or zero. Two coplanar triangles with
+    /// opposite winding give equal-and-opposite normals at the shared apex.
+    #[test]
+    fn vert_normal_fallback_is_normalized_position() {
+        let mut mesh = LoopMesh::new();
+
+        let apex = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+
+        // Face 1: CCW in z = 0, normal +Z, 90° corner at apex.
+        let b = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let e1 = mesh.create_edge([apex, b], EdgeCreateFlags::NONE);
+        let e2 = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e3 = mesh.create_edge([c, apex], EdgeCreateFlags::NONE);
+        mesh.face_create(&[apex, b, c], &[e1, e2, e3], FaceCreateFlags::NONE);
+
+        // Face 2: CW in z = 0, normal -Z, same 90° corner at apex.
+        let d = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let f = mesh.create_vertex(Vec3::new(2.0, -1.0, 0.0));
+        let e4 = mesh.create_edge([apex, f], EdgeCreateFlags::NONE);
+        let e5 = mesh.create_edge([f, d], EdgeCreateFlags::NONE);
+        let e6 = mesh.create_edge([d, apex], EdgeCreateFlags::NONE);
+        mesh.face_create(&[apex, f, d], &[e4, e5, e6], FaceCreateFlags::NONE);
+
+        mesh.mesh_normals_update();
+
+        // Normals cancel -> fallback = normalize(position) = +X.
+        let n = mesh.vertex_normal(apex);
+        assert!(
+            (n - Vec3::new(1.0, 0.0, 0.0)).length() < 1.0e-5,
+            "cancelled accumulator should fall back to normalize(position); got {n:?}"
+        );
+    }
+
+    /// Near-cancellation (not exact-zero): the angle-weighted accumulator is a
+    /// tiny-but-nonzero residual whose squared length sits below the
+    /// `normalize_or_zero` guard. The old `length_squared() > 0.0` gate would
+    /// have passed this residual into a raw `normalize()`, producing a
+    /// wildly-scaled / non-finite normal; the guarded gate must instead take the
+    /// `normalize(position)` fallback. Drive the vertex pass with two
+    /// stored-normal contributions that nearly cancel.
+    #[test]
+    fn vert_normal_near_cancellation_uses_position_fallback() {
+        let mut mesh = LoopMesh::new();
+
+        let apex = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+
+        // Two coplanar triangles sharing the apex, 90° corner each, so both
+        // gather weights are exactly π/2 and the accumulator is π/2 * (n1 + n2)
+        // for whatever stored face normals we plant below.
+        let b = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        let e1 = mesh.create_edge([apex, b], EdgeCreateFlags::NONE);
+        let e2 = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e3 = mesh.create_edge([c, apex], EdgeCreateFlags::NONE);
+        let f1 = mesh.face_create(&[apex, b, c], &[e1, e2, e3], FaceCreateFlags::NONE);
+
+        let d = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let g = mesh.create_vertex(Vec3::new(2.0, -1.0, 0.0));
+        let e4 = mesh.create_edge([apex, g], EdgeCreateFlags::NONE);
+        let e5 = mesh.create_edge([g, d], EdgeCreateFlags::NONE);
+        let e6 = mesh.create_edge([d, apex], EdgeCreateFlags::NONE);
+        let f2 = mesh.face_create(&[apex, g, d], &[e4, e5, e6], FaceCreateFlags::NONE);
+
+        // Plant stored face normals that nearly cancel. f1 = (tiny, 0, +1),
+        // f2 = (0, 0, -1); their sum is the residual (tiny, 0, 0). With both
+        // gather weights π/2 the accumulator is (π/2 * tiny, 0, 0), whose
+        // squared length ~6.2e-36 is strictly > 0 (passes the old `> 0.0`
+        // gate) yet < the 1e-35 `normalize_or_zero` guard — so the guarded
+        // path must reject it and take the position fallback. (Raw normalize()
+        // of this residual would yield a non-finite / unit-X vector instead.)
+        let tiny = 1.0e-18_f32;
+        assert!(tiny > 0.0);
+        mesh.faces.get_mut(f1).normal = Vec3::new(tiny, 0.0, 1.0);
+        mesh.faces.get_mut(f2).normal = Vec3::new(0.0, 0.0, -1.0);
+
+        mesh.vert_normal_update(apex);
+
+        let n = mesh.vertex_normal(apex);
+        // Residual after cancellation is below the guard -> position fallback.
+        assert!(
+            n.is_finite(),
+            "near-cancelled accumulator must not produce a non-finite normal; got {n:?}"
+        );
+        assert!(
+            (n.length() - 1.0).abs() < 1.0e-5,
+            "fallback must be a unit vector; got length {} ({n:?})",
+            n.length()
+        );
+        assert!(
+            (n - Vec3::new(1.0, 0.0, 0.0)).length() < 1.0e-5,
+            "near-cancelled accumulator should fall back to normalize(position) = +X; got {n:?}"
+        );
+    }
+
+    /// A wire/isolated vertex (no faces) falls back to normalize(position)
+    /// under the whole-mesh sweep, and a vertex at the origin yields (0,0,0).
+    #[test]
+    fn vert_normal_wire_vertex_uses_position_fallback() {
+        let mut mesh = LoopMesh::new();
+        let off_origin = mesh.create_vertex(Vec3::new(0.0, 0.0, 5.0));
+        let at_origin = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+
+        mesh.mesh_normals_update();
+
+        assert_eq!(mesh.vertex_normal(off_origin), Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(mesh.vertex_normal(at_origin), Vec3::ZERO);
+    }
+
+    /// On a unit cube every vertex normal is the symmetric diagonal of its
+    /// three incident faces — independent of weighting since all three corner
+    /// angles are 90° and all three faces have equal area. Sanity check that the
+    /// rebuilt gather still produces the expected closed-manifold result.
+    #[test]
+    fn vert_normal_cube_diagonals() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        mesh.mesh_normals_update();
+
+        let mut it = mesh.mesh_verts();
+        while let Some(v) = it.next(&mesh) {
+            let pos = mesh.vertices.get(v).position;
+            let expected = pos.normalize(); // cube is centred at origin
+            let n = mesh.vertex_normal(v);
+            assert!(
+                (n - expected).length() < 1.0e-5,
+                "cube vertex {v:?} at {pos:?}: normal {n:?} != {expected:?}"
+            );
+        }
     }
 
     #[test]
