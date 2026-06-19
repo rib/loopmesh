@@ -1336,6 +1336,24 @@ impl LoopMesh {
         // the edge lookups it depends on (which ring vert each beveled corner's
         // incoming / outgoing edge carries) are read while the original incident
         // edges still connect their original endpoints.
+        // Each freshly-minted chamfer edge and the original incident edge whose
+        // per-edge CD it inherits (BEVEL.md §6.5.1). §6.5.1's "leading endpoint"
+        // is the chamfer edge's first endpoint in the walk of the face that *owns*
+        // the edge for inheritance — and that is the **cap** (§5.1), not the
+        // incident surface face. The cap is wound *opposite* its incident faces
+        // (§5.1), so the chamfer edge `(r_i, r_(i+1))` — which in incident face
+        // `f_i`'s rebuilt boundary runs `r_i → r_(i+1)` (leading `r_i`, owned by
+        // the incoming edge `e_i`) — is traversed `r_(i+1) → r_i` by the cap.
+        // Its cap-leading endpoint is therefore the *trailing* ring vert `r_(i+1)`
+        // of the incident-face walk, whose owning edge is the **outgoing** edge
+        // `e_(i+1)`. Recording the outgoing edge makes the inheritance the
+        // canonical form reads land on §6.5.1's leading endpoint for *every*
+        // corner uniformly, regardless of the corner's disk handedness. The owning
+        // EdgeKey is recorded against the original mesh and survives the in-place
+        // re-point below (same key / same CD slot), so it is still readable after
+        // the rebuild mints the chamfer edge.
+        let mut chamfer_cd: Vec<(VertexKey, VertexKey, EdgeKey)> = Vec::new();
+
         let mut rebuilds: Vec<(FaceKey, Vec<VertexKey>)> = Vec::with_capacity(faces.len());
         for &face in &faces {
             let cycle_verts = self.face_vert_keys(face);
@@ -1358,8 +1376,18 @@ impl LoopMesh {
                         .query_edge_exists(w, next_vertex)
                         .expect("incident face's outgoing corner edge exists");
 
-                    new_cycle.push(self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge));
-                    new_cycle.push(self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge));
+                    let leading_ring = self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge);
+                    let trailing_ring =
+                        self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge);
+
+                    // §6.5.1 (cap-frame leading): the chamfer edge
+                    // (leading_ring, trailing_ring) inherits the per-edge CD of the
+                    // **outgoing** original edge — the owning edge of the cap's
+                    // leading endpoint (`trailing_ring` in this incident-face walk).
+                    chamfer_cd.push((leading_ring, trailing_ring, outgoing_edge));
+
+                    new_cycle.push(leading_ring);
+                    new_cycle.push(trailing_ring);
                 } else {
                     new_cycle.push(w);
                 }
@@ -1381,6 +1409,19 @@ impl LoopMesh {
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
             self.face_attribs
                 .copy_into(new_face.as_usize(), face.as_usize());
+        }
+
+        // §6.5.1: copy each owning (outgoing) edge's per-edge CD onto the chamfer
+        // edge it owns. Run after every face is rebuilt so the chamfer edge exists
+        // (the cap later *adopts* this same edge, §5.1, so no separate cap step is
+        // needed). The chamfer edge joins two ring verts of one corner — never a
+        // re-pointed surviving edge — so copying here cannot clobber a re-pointed
+        // edge's own preserved CD.
+        for (leading_ring, trailing_ring, owning_edge) in chamfer_cd {
+            if let Some(chamfer_edge) = self.query_edge_exists(leading_ring, trailing_ring) {
+                self.edge_attribs
+                    .copy_into(chamfer_edge.as_usize(), owning_edge.as_usize());
+            }
         }
     }
 
@@ -2978,6 +3019,239 @@ mod tests {
             assert_eq!(
                 carried, value,
                 "incident edge {edge:?} keeps its per-edge CD across the bevel",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.5.1: each freshly-minted corner-fill chamfer edge inherits the
+    /// per-edge CD of the original incident edge that owns its *leading* ring-vert
+    /// endpoint in the re-stitched face's boundary order. The discriminating pin:
+    /// the chamfer edge whose leading ring vert is the ring vert of the shared
+    /// edge {0,1} picks up {0,1}'s tint, on *both* corners (§6.5.2 — {0,1}
+    /// contributes a ring vert to each beveled corner). A chamfer edge leads with
+    /// the {0,1} ring vert in every re-stitched face where {0,1} is the incoming
+    /// corner edge, so the {0,1} ring vert may lead more than one chamfer edge
+    /// within a corner; the load-bearing fact is that the inheritance fires (an
+    /// edge next to {0,1}'s entry carries {0,1}'s tint), not a fresh default.
+    #[test]
+    fn corner_fill_chamfer_edge_inherits_leading_owning_edge_cd() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let p1 = Vec3::new(-1.0, -1.0, -1.0);
+        let shared_value = [0.42, 0.0, 0.0];
+
+        // Tag the shared edge {0,1} distinctly; the rest stay at the default so
+        // only the {0,1}-leading chamfer edge can carry the marker.
+        let shared_edge = cube_edge(&mesh, p0, p1);
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, shared_edge.as_usize(), shared_value);
+
+        let v0 = vert_at(&mesh, p0);
+        let v1 = vert_at(&mesh, p1);
+        let result = mesh.bevel(
+            &[v0.into(), v1.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        // The {0,1} ring vert of corner 0 slides 0.5 from (1,-1,-1) toward
+        // (-1,-1,-1) -> (0.5,-1,-1); of corner 1, from (-1,-1,-1) toward
+        // (1,-1,-1) -> (-0.5,-1,-1). Each corner's fill must produce exactly one
+        // chamfer edge that leads with its {0,1} ring vert and so inherits
+        // {0,1}'s tint.
+        for ring_pos in [Vec3::new(0.5, -1.0, -1.0), Vec3::new(-0.5, -1.0, -1.0)] {
+            let ring = vert_at(&mesh, ring_pos);
+            let inheriting: Vec<EdgeKey> = mesh
+                .edge_keys()
+                .into_iter()
+                .filter(|&edge| {
+                    let [a, b] = mesh.edge_vert_keys(edge);
+                    (a == ring || b == ring)
+                        && mesh.edge_attribs().get_vec3(tint, edge.as_usize())
+                            == Some(shared_value)
+                })
+                .collect();
+            assert!(
+                !inheriting.is_empty(),
+                "a chamfer edge at the {{0,1}} ring vert {ring_pos:?} inherits \
+                 {{0,1}}'s per-edge CD rather than default-filling (§6.5.1)",
+            );
+            // Each inheriting edge must be a genuine chamfer edge (both endpoints
+            // ring verts), not a re-pointed survivor that happens to share the tint.
+            for &edge in &inheriting {
+                let [a, b] = mesh.edge_vert_keys(edge);
+                let other = if a == ring { b } else { a };
+                assert!(
+                    result_has_vert_near(&mesh, &result, mesh.vertex_position(other)) > 0
+                        || other == ring,
+                    "the inheriting edge {edge:?} is a chamfer edge between two ring verts",
+                );
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.5.1: no corner-fill chamfer edge is left default-filled — every
+    /// freshly-minted chamfer edge inherits a tagged original edge's per-edge CD.
+    /// This is the broad closure of the 6/18 corner-fill divergence: with every
+    /// incident edge of both corners tagged distinctly, each chamfer edge carries
+    /// the value of the original edge whose ring vert leads it (never the [0,0,0]
+    /// default a fresh-mint would leave).
+    #[test]
+    fn corner_fill_chamfer_edges_are_never_default_filled() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let p1 = Vec3::new(-1.0, -1.0, -1.0);
+
+        // Tag every incident edge of both corners distinctly (shared + four
+        // corner-adjacent), each component non-zero so an inherited value is
+        // always distinguishable from the [0,0,0] default.
+        let incident = [
+            (p0, p1, [0.42, 0.5, 0.5]),
+            (p0, Vec3::new(1.0, 1.0, -1.0), [0.1, 0.5, 0.5]),
+            (p0, Vec3::new(1.0, -1.0, 1.0), [0.2, 0.5, 0.5]),
+            (p1, Vec3::new(-1.0, 1.0, -1.0), [0.3, 0.5, 0.5]),
+            (p1, Vec3::new(-1.0, -1.0, 1.0), [0.4, 0.5, 0.5]),
+        ];
+        let mut tagged_values: Vec<[f32; 3]> = Vec::new();
+        for &(near, far, value) in &incident {
+            let edge = cube_edge(&mesh, near, far);
+            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+            tagged_values.push(value);
+        }
+
+        let v0 = vert_at(&mesh, p0);
+        let v1 = vert_at(&mesh, p1);
+        let result = mesh.bevel(
+            &[v0.into(), v1.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        // The new edges between two ring verts of the same corner are the
+        // chamfer / fill edges; each must carry a tagged value, never the default.
+        let ring_verts: Vec<VertexKey> = result.verts.clone();
+        let mut chamfer_count = 0;
+        for &edge in &result.edges {
+            let [a, b] = mesh.edge_vert_keys(edge);
+            let is_chamfer = ring_verts.contains(&a) && ring_verts.contains(&b);
+            if !is_chamfer {
+                continue;
+            }
+            chamfer_count += 1;
+            let carried = mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap();
+            assert_ne!(
+                carried, [0.0, 0.0, 0.0],
+                "chamfer edge {edge:?} must inherit an owning edge's CD, not default",
+            );
+            assert!(
+                tagged_values.contains(&carried),
+                "chamfer edge {edge:?} inherits one of the tagged owning-edge values, got {carried:?}",
+            );
+        }
+        assert!(
+            chamfer_count >= 2,
+            "both interior corners contribute fill chamfer edges",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.5.1 (cap-frame leading): pin the *specific* chamfer-edge -> CD
+    /// mapping, not just the multiset. The cap is wound opposite its incident
+    /// faces (§5.1), so the chamfer edge `(r_i, r_(i+1))` inherits the **outgoing**
+    /// edge `e_(i+1)`'s CD (the owning edge of the cap's leading endpoint), uniformly
+    /// for every corner. This catches the cyclic-shift permutation a per-edge-set
+    /// check passes spuriously through: tagging each owning edge distinctly forces
+    /// the test to fail under the wrong (incoming) assignment.
+    #[test]
+    fn corner_fill_chamfer_edge_mapping_follows_outgoing_owning_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+
+        // Corner v0 = (1,-1,-1) with its three incident edges distinctly tagged.
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let p1 = Vec3::new(-1.0, -1.0, -1.0); // e0 = {v0,v1}
+        let p3 = Vec3::new(1.0, 1.0, -1.0); // e3 = {v3,v0}
+        let p4 = Vec3::new(1.0, -1.0, 1.0); // e8 = {v0,v4}
+        let e0_value = [0.10, 0.5, 0.5];
+        let e3_value = [0.20, 0.5, 0.5];
+        let e8_value = [0.30, 0.5, 0.5];
+        for &(near, far, value) in &[
+            (p0, p1, e0_value),
+            (p0, p3, e3_value),
+            (p0, p4, e8_value),
+        ] {
+            let edge = cube_edge(&mesh, near, far);
+            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+        }
+
+        let v0 = vert_at(&mesh, p0);
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        // Ring-vert positions: r_e0 slides v0->v1, r_e3 v0->v3, r_e8 v0->v4.
+        let r_e0 = Vec3::new(0.5, -1.0, -1.0);
+        let r_e3 = Vec3::new(1.0, -0.5, -1.0);
+        let r_e8 = Vec3::new(1.0, -1.0, -0.5);
+
+        // The chamfer triangle of v0 is r_e3 -> r_e0 -> r_e8 (-> r_e3). Per the
+        // cap-frame rule each chamfer edge carries its *outgoing* owning edge's
+        // tint, which lands on the edge's r_(i+1) (trailing-in-face) endpoint:
+        //   (r_e3, r_e0)  outgoing e0  -> e0_value   (Front)
+        //   (r_e0, r_e8)  outgoing e8  -> e8_value   (Bottom)
+        //   (r_e8, r_e3)  outgoing e3  -> e3_value   (Left)
+        // The wrong (incoming) assignment would put e3/e0/e8 on these instead,
+        // so each row distinguishes the two readings.
+        for &(near_a, near_b, expected) in &[
+            (r_e3, r_e0, e0_value),
+            (r_e0, r_e8, e8_value),
+            (r_e8, r_e3, e3_value),
+        ] {
+            let a = vert_at(&mesh, near_a);
+            let b = vert_at(&mesh, near_b);
+            let edge = mesh
+                .query_edge_exists(a, b)
+                .expect("the chamfer edge between these two ring verts exists");
+            let carried = mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap();
+            assert_eq!(
+                carried, expected,
+                "chamfer edge {near_a:?}-{near_b:?} must inherit its outgoing owning \
+                 edge's CD {expected:?} (cap-frame leading, §6.5.1), got {carried:?}",
             );
         }
         mesh.validate_topology();
