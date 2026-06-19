@@ -563,6 +563,14 @@ impl LoopMesh {
         let midpoint_layer = self.push_vert_op_flag_layer();
         const MIDPOINT: u8 = 1;
 
+        // §9.2.3 deferred write — the fractal jitter does not mutate `v.co` in
+        // place; it stages displaced positions (computed from each vert's
+        // pristine position) here, copied back only after every cut edge has been
+        // processed. This is what makes a shared corner a last-writer overwrite,
+        // not an accumulation (§9.2.3.3). Empty/unused when fractal is off.
+        let mut fractal_scratch: std::collections::HashMap<VertexKey, Vec3> =
+            std::collections::HashMap::new();
+
         // ---- Phase one: per-edge midpoint insertion (§3) ----
         // Each input edge is split once at t = 0.5. The edge_split wrapper does
         // the position lerp and the per-vert / per-edge / per-loop linear
@@ -588,10 +596,11 @@ impl LoopMesh {
             // §9.4.1 — radial snap onto the origin-centred sphere of radius
             // `smooth`, taken from the inserted midpoint's chord position.
             self.maybe_sphere_project(m, &params);
-            // §9.2.3 / §9.2.6 — fractal is the last placement step, displacing
-            // the vert off its (chord / smooth / sphere) base position.
+            // §9.2.3 / §9.2.6 — fractal is the last placement step. It stages the
+            // displaced midpoint *and* the cut edge's two endpoints (§9.2.3.3)
+            // into the deferred scratch store rather than writing in place.
             if let (Some(offset), Some(ctx)) = (fractal_offset, &fractal_ctx) {
-                self.apply_fractal(m, offset, ctx, &params);
+                self.stage_fractal(m, offset, ctx, &params, &mut fractal_scratch);
             }
             self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
             // §1 — the midpoint and the two edge-halves (`edge` survives as the
@@ -602,6 +611,12 @@ impl LoopMesh {
                     touched_faces.push(f);
                 }
             }
+        }
+
+        // §9.2.3 — copy the staged displacements back into the mesh now that
+        // every cut edge has been processed (the deferred write).
+        for (v, co) in &fractal_scratch {
+            self.set_vertex_position(*v, *co);
         }
 
         // ---- Phase two: per-face pattern dispatch (§4) ----
@@ -735,23 +750,35 @@ impl LoopMesh {
             edge_len: (co_a - co_b).length(),
             no_a: self.angle_weighted_vertex_normal(near),
             no_b: self.angle_weighted_vertex_normal(far),
+            va: near,
+            co_a,
+            vb: far,
+            co_b,
         }
     }
 
-    /// §9.2.3 — displace one inserted vert `v` off its current (chord / smooth /
-    /// sphere) position by the fractal jitter. The displacement is a pure
-    /// function of `v`'s position, the per-operator `offset`, the cut edge `ctx`,
-    /// and the knobs (§9.2.5), so it is reproducible for a fixed seed.
-    fn apply_fractal(
-        &mut self,
-        v: VertexKey,
+    /// §9.2.3 / §9.2.3.3 — compute the fractal displacement for every vert of one
+    /// cut edge (the inserted midpoint `m` plus the two pre-existing endpoints)
+    /// and stage the results into the deferred scratch store. Each vert's noise
+    /// sample reads its **pristine** position — for `m` the freshly-placed
+    /// (chord / smooth / sphere) position, for an endpoint its captured input
+    /// position — so a corner shared by several cut edges is recomputed from its
+    /// unchanged input and **overwritten** by each incident edge (last-writer
+    /// wins, §9.2.3.3); the scratch is copied back to the mesh only after every
+    /// cut edge is processed.
+    fn stage_fractal(
+        &self,
+        m: VertexKey,
         offset: Vec3,
         ctx: &FractalEdgeContext,
         params: &SubdivideParams,
+        scratch: &mut std::collections::HashMap<VertexKey, Vec3>,
     ) {
-        let co = self.vertex_position(v);
-        let displaced = fractal_displace(co, offset, ctx, params);
-        self.set_vertex_position(v, displaced);
+        // The inserted midpoint reads its own freshly-placed position; the two
+        // endpoints read their pristine input positions captured in `ctx`.
+        scratch.insert(m, fractal_displace(self.vertex_position(m), offset, ctx, params));
+        scratch.insert(ctx.va, fractal_displace(ctx.co_a, offset, ctx, params));
+        scratch.insert(ctx.vb, fractal_displace(ctx.co_b, offset, ctx, params));
     }
 
     /// Dispatch and apply the §5 / §6 re-split pattern for one touched face.
@@ -1372,6 +1399,11 @@ impl LoopMesh {
         let midpoint_layer = self.push_vert_op_flag_layer();
         const MIDPOINT: u8 = 1;
 
+        // §9.2.3 deferred write — staged fractal displacements, copied back only
+        // after every cut edge is processed (§9.2.3.3 last-writer overwrite).
+        let mut fractal_scratch: std::collections::HashMap<VertexKey, Vec3> =
+            std::collections::HashMap::new();
+
         // Phase one: per-edge N-evenly-spaced split (§3.3). Each input edge is
         // split into N+1 segments by inserting N midpoints at t = i/(N+1). A
         // shared interior edge is cut once, so both incident faces see the same
@@ -1401,9 +1433,11 @@ impl LoopMesh {
             for &m in &mids {
                 // §9.4.1 — radial snap each rim midpoint from its chord position.
                 self.maybe_sphere_project(m, &params);
-                // §9.2.3 / §9.2.6 — fractal is the last placement step.
+                // §9.2.3 / §9.2.6 — fractal is the last placement step. Stages
+                // each rim midpoint and the cut edge's two endpoints (§9.2.3.3)
+                // into the deferred scratch store.
                 if let (Some(offset), Some(ctx)) = (fractal_offset, &fractal_ctx) {
-                    self.apply_fractal(m, offset, ctx, &params);
+                    self.stage_fractal(m, offset, ctx, &params, &mut fractal_scratch);
                 }
                 self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
                 // §1 — every rim midpoint is both a split vert and an inner vert.
@@ -1430,6 +1464,12 @@ impl LoopMesh {
                     }
                 }
             }
+        }
+
+        // §9.2.3 — copy the staged displacements back now that every cut edge
+        // has been processed (the deferred write).
+        for (v, co) in &fractal_scratch {
+            self.set_vertex_position(*v, *co);
         }
 
         // Phase two: per-face §9.5 lattice fill.
@@ -1904,14 +1944,22 @@ fn sphere_project(co_chord: Vec3, radius: f32) -> Vec3 {
 }
 
 /// The §9.2.3 fractal basis for one cut edge `{v_a, v_b}`: the edge length (the
-/// displacement scales with it) and the two endpoint vertex normals (the
-/// displacement frame is built from their plain, *un-renormalised* average).
-/// Captured before the split since the split rewrites the far endpoint.
+/// displacement scales with it), the two endpoint vertex normals (the
+/// displacement frame is built from their plain, *un-renormalised* average), and
+/// the two pre-existing endpoint verts (which are jittered alongside the
+/// inserted midpoint, §9.2.3.3). Captured before the split since the split
+/// rewrites the far endpoint.
 #[derive(Clone, Copy, Debug)]
 struct FractalEdgeContext {
     edge_len: f32,
     no_a: Vec3,
     no_b: Vec3,
+    /// The cut edge's first endpoint `v_a` and its pristine input position.
+    va: VertexKey,
+    co_a: Vec3,
+    /// The cut edge's second endpoint `v_b` and its pristine input position.
+    vb: VertexKey,
+    co_b: Vec3,
 }
 
 /// §9.2.3 — the per-vert fractal displacement. `co` is the vert's current
@@ -1939,37 +1987,43 @@ fn fractal_displace(
     let tvec = Vec3::new(fac * t0, fac * t1, fac * t2);
 
     // 4. Apply along the frame derived from the plain (un-renormalised) average
-    //    endpoint normal plus two unit tangents (§9.2.3 step 4). `along_normal`
-    //    attenuates *only* the two tangential components (§9.2.4).
+    //    endpoint normal plus the §9.2.3.4 closed-form tangents (§9.2.3 step 4).
+    //    `along_normal` attenuates *only* the two tangential components (§9.2.4).
     let normal = 0.5 * (ctx.no_a + ctx.no_b);
-    let (base1, base2) = fractal_tangent_basis(normal);
+    let (base1, base2) = tangent_frame(normal);
     let tangential = 1.0 - params.along_normal;
 
     co + normal * tvec.x + base1 * (tvec.y * tangential) + base2 * (tvec.z * tangential)
 }
 
-/// §9.2.3 step 4 — two **unit** vectors perpendicular to `normal` (and to each
-/// other), independent of `normal`'s length. The normal-direction component
-/// carries `normal`'s length itself (§9.2.3's un-renormalised subtlety); only
-/// these two tangents are unit. Falls back to a stable axis-aligned pair when
-/// `normal` is degenerate.
-fn fractal_tangent_basis(normal: Vec3) -> (Vec3, Vec3) {
-    let unit = normal.normalize_or_zero();
-    if unit.length_squared() < 0.5 {
-        return (Vec3::X, Vec3::Y);
-    }
-    // Pick the world axis least aligned with `unit` so the cross product is well
-    // conditioned, then complete a right-handed orthonormal pair.
-    let reference = if unit.x.abs() <= unit.y.abs() && unit.x.abs() <= unit.z.abs() {
-        Vec3::X
-    } else if unit.y.abs() <= unit.z.abs() {
-        Vec3::Y
+/// §9.2.3.4 — the closed-form tangent frame of the (un-renormalised) averaged
+/// endpoint `normal = (nx, ny, nz)`. Returns `(base1, base2)` where `base1` is
+/// the **unit** in-plane perpendicular to `normal`'s xy-projection and `base2`
+/// is `normal × base1`, whose length equals `|normal|` (it is **not**
+/// re-normalised — that length attenuates the third displacement component on a
+/// non-flat edge exactly as the normal component is attenuated).
+///
+/// Anchored on the squared length of the xy-projection `f = nx² + ny²`. When the
+/// projection vanishes (`normal` along ±z, `f ≤ f32::EPSILON`) the frame falls
+/// back to the axis-aligned pair `base1 = (±1, 0, 0)` (x-sign from `nz`),
+/// `base2 = (0, 1, 0)`.
+fn tangent_frame(normal: Vec3) -> (Vec3, Vec3) {
+    let (nx, ny, nz) = (normal.x, normal.y, normal.z);
+    let xy_proj_sq = nx * nx + ny * ny;
+
+    if xy_proj_sq > f32::EPSILON {
+        let inv_xy_len = 1.0 / xy_proj_sq.sqrt();
+        // Unit in-plane perpendicular to the xy-projection (`z = 0`).
+        let base1 = Vec3::new(ny * inv_xy_len, -nx * inv_xy_len, 0.0);
+        // The substituted closed form of `normal × base1`; length is |normal|.
+        let base2 = Vec3::new(nx * nz * inv_xy_len, ny * nz * inv_xy_len, -xy_proj_sq.sqrt());
+        (base1, base2)
     } else {
-        Vec3::Z
-    };
-    let base1 = unit.cross(reference).normalize_or_zero();
-    let base2 = unit.cross(base1).normalize_or_zero();
-    (base1, base2)
+        // Projection vanishes: `normal` points (nearly) along ±z.
+        let base1 = Vec3::new(if nz < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0);
+        let base2 = Vec3::new(0.0, 1.0, 0.0);
+        (base1, base2)
+    }
 }
 
 /// Reflect `n` across the plane whose normal is `dir` (a unit chord direction):
@@ -4121,6 +4175,12 @@ mod tests {
             edge_len: 2.0,
             no_a: Vec3::Z,
             no_b: Vec3::Z,
+            // The endpoint fields are inert for this `fractal_displace` self-check
+            // (it reads only edge_len / no_a / no_b); placeholder keys/positions.
+            va: VertexKey(0),
+            co_a: Vec3::new(0.0, 0.0, 0.0),
+            vb: VertexKey(1),
+            co_b: Vec3::new(2.0, 0.0, 0.0),
         };
         let expected = fractal_displace(Vec3::new(1.0, 0.0, 0.0), offset, &ctx, &params);
         assert!(
@@ -4231,11 +4291,198 @@ mod tests {
                 .length(),
             no_a: reference.angle_weighted_vertex_normal(ref_fv[0]),
             no_b: reference.angle_weighted_vertex_normal(ref_fv[1]),
+            // Inert for this midpoint self-check (only edge_len / normals read).
+            va: ref_fv[0],
+            co_a: reference.vertex_position(ref_fv[0]),
+            vb: ref_fv[1],
+            co_b: reference.vertex_position(ref_fv[1]),
         };
         let expected = fractal_displace(sphere_point, offset, &ctx, &params);
         assert!(
             pos.distance(expected) < 1e-5,
             "sphere+fractal matches §9.2 arithmetic: got {pos:?}, want {expected:?}"
         );
+    }
+
+    #[test]
+    fn fractal_displaces_cut_edge_endpoints() {
+        // §9.2.3.3 — the displacement runs on the cut edge's two pre-existing
+        // ENDPOINT verts, not only the inserted midpoint. Cut edge {0,1} runs
+        // from (0,0,0) to (2,0,0); after a non-zero fractal both corners must
+        // have moved off their input positions. The far corners (2,3) of the
+        // quad are NOT on the cut edge, so they stay put.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let (v0, v1, v2, v3) = (fv[0], fv[1], fv[2], fv[3]);
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let params = SubdivideParams::default().fractal(1.0).seed(1);
+        match mesh.subdivide_edges(&[e01], params) {
+            SubdivideResult::Ran(_) => {}
+            _ => panic!("expected Ran"),
+        }
+
+        // The two cut-edge endpoints are jittered off their input positions.
+        assert!(
+            mesh.vertex_position(v0).distance(Vec3::new(0.0, 0.0, 0.0)) > 1e-4,
+            "cut-edge endpoint v0 displaced, got {:?}",
+            mesh.vertex_position(v0)
+        );
+        assert!(
+            mesh.vertex_position(v1).distance(Vec3::new(2.0, 0.0, 0.0)) > 1e-4,
+            "cut-edge endpoint v1 displaced, got {:?}",
+            mesh.vertex_position(v1)
+        );
+        // Corners off the cut edge are untouched.
+        assert!(
+            mesh.vertex_position(v2).distance(Vec3::new(2.0, 2.0, 0.0)) < 1e-9,
+            "non-cut corner v2 stays put"
+        );
+        assert!(
+            mesh.vertex_position(v3).distance(Vec3::new(0.0, 2.0, 0.0)) < 1e-9,
+            "non-cut corner v3 stays put"
+        );
+
+        // The endpoints read their OWN pristine input position (§9.2.3.3): the
+        // displacement reproduces fractal_displace evaluated at (0,0,0) / (2,0,0)
+        // with the cut edge's frame (flat +z, edge_len 2, factor inert).
+        let offset = {
+            let mut rng = fractal_noise::SeededRng::new_hashed(1);
+            Vec3::new(
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+            )
+        };
+        let ctx = FractalEdgeContext {
+            edge_len: 2.0,
+            no_a: Vec3::Z,
+            no_b: Vec3::Z,
+            va: v0,
+            co_a: Vec3::new(0.0, 0.0, 0.0),
+            vb: v1,
+            co_b: Vec3::new(2.0, 0.0, 0.0),
+        };
+        let want_v0 = fractal_displace(Vec3::new(0.0, 0.0, 0.0), offset, &ctx, &params);
+        let want_v1 = fractal_displace(Vec3::new(2.0, 0.0, 0.0), offset, &ctx, &params);
+        assert!(
+            mesh.vertex_position(v0).distance(want_v0) < 1e-6,
+            "v0 matches the §9.2.3.3 endpoint arithmetic"
+        );
+        assert!(
+            mesh.vertex_position(v1).distance(want_v1) < 1e-6,
+            "v1 matches the §9.2.3.3 endpoint arithmetic"
+        );
+    }
+
+    #[test]
+    fn fractal_zero_leaves_endpoints_unmoved() {
+        // §9.2.3.3 contrast — with fractal = 0 the deferred displacement never
+        // runs, so the cut edge's endpoints stay exactly on their input
+        // positions and the core stays bit-identical (no endpoint move).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let (v0, v1) = (fv[0], fv[1]);
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        match mesh.subdivide_edges(&[e01], SubdivideParams::default()) {
+            SubdivideResult::Ran(_) => {}
+            _ => panic!("expected Ran"),
+        }
+        assert!(
+            mesh.vertex_position(v0).distance(Vec3::new(0.0, 0.0, 0.0)) < 1e-9,
+            "fractal = 0 leaves endpoint v0 on its input position"
+        );
+        assert!(
+            mesh.vertex_position(v1).distance(Vec3::new(2.0, 0.0, 0.0)) < 1e-9,
+            "fractal = 0 leaves endpoint v1 on its input position"
+        );
+    }
+
+    #[test]
+    fn fractal_shared_endpoint_last_writer_wins() {
+        // §9.2.3.3 overwrite-not-accumulate — on the flat equal-length quad a
+        // corner shared by two cut edges of identical length and identical +z
+        // averaged normal collapses to a single application (the last-writer
+        // ambiguity vanishes). Cut two edges sharing corner v1; v1's displaced
+        // position must equal a single fractal_displace from its pristine input,
+        // NOT twice the offset (which an accumulating port would produce).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let (v0, v1, v2) = (fv[0], fv[1], fv[2]);
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e12 = mesh.query_edge_exists(v1, v2).unwrap();
+        let params = SubdivideParams::default().fractal(1.0).seed(3);
+        match mesh.subdivide_edges(&[e01, e12], params) {
+            SubdivideResult::Ran(_) => {}
+            _ => panic!("expected Ran"),
+        }
+
+        let offset = {
+            let mut rng = fractal_noise::SeededRng::new_hashed(3);
+            Vec3::new(
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+            )
+        };
+        // Both incident edges have length 2, +z normal: the frame is identical,
+        // so the single-application result is the same regardless of writer.
+        let ctx = FractalEdgeContext {
+            edge_len: 2.0,
+            no_a: Vec3::Z,
+            no_b: Vec3::Z,
+            va: v1,
+            co_a: Vec3::new(2.0, 0.0, 0.0),
+            vb: v2,
+            co_b: Vec3::new(2.0, 2.0, 0.0),
+        };
+        let single = fractal_displace(Vec3::new(2.0, 0.0, 0.0), offset, &ctx, &params);
+        assert!(
+            mesh.vertex_position(v1).distance(single) < 1e-6,
+            "shared corner v1 is a single (last-writer) application, not accumulated: \
+             got {:?}, want {single:?}",
+            mesh.vertex_position(v1)
+        );
+    }
+
+    #[test]
+    fn tangent_frame_closed_form_and_degenerate_branch() {
+        // §9.2.3.4 — the exact closed-form tangent basis.
+
+        // Non-degenerate: a tilted normal with a non-trivial xy-projection.
+        let normal = Vec3::new(0.6, 0.8, 0.5);
+        let (base1, base2) = tangent_frame(normal);
+        let f = normal.x * normal.x + normal.y * normal.y; // 0.36 + 0.64 = 1.0
+        let d = 1.0 / f.sqrt();
+        let want_base1 = Vec3::new(normal.y * d, -normal.x * d, 0.0);
+        let want_base2 = Vec3::new(
+            normal.x * normal.z * d,
+            normal.y * normal.z * d,
+            -f.sqrt(),
+        );
+        assert!(base1.distance(want_base1) < 1e-6, "base1 closed form");
+        assert!(base2.distance(want_base2) < 1e-6, "base2 closed form");
+        // base1 is UNIT; base2 has length |normal| (NOT renormalised).
+        assert!((base1.length() - 1.0).abs() < 1e-6, "base1 is unit");
+        assert!(
+            (base2.length() - normal.length()).abs() < 1e-5,
+            "base2 length == |normal|, got {} vs {}",
+            base2.length(),
+            normal.length()
+        );
+        // base1 lies in the xy-plane (z = 0).
+        assert!(base1.z.abs() < 1e-7, "base1 is in the xy-plane");
+
+        // Degenerate +z: f <= EPSILON => base1 = (1,0,0), base2 = (0,1,0).
+        let (b1, b2) = tangent_frame(Vec3::Z);
+        assert!(b1.distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-9, "+z base1 = +x");
+        assert!(b2.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9, "+z base2 = +y");
+
+        // Degenerate -z: the x-sign of base1 flips with nz < 0.
+        let (b1n, b2n) = tangent_frame(Vec3::new(0.0, 0.0, -1.0));
+        assert!(b1n.distance(Vec3::new(-1.0, 0.0, 0.0)) < 1e-9, "-z base1 = -x");
+        assert!(b2n.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9, "-z base2 = +y");
     }
 }
