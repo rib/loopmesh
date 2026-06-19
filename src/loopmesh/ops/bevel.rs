@@ -1299,10 +1299,26 @@ impl LoopMesh {
     /// beveled vertex, swapping *all* of that face's beveled corners at once.
     /// Each beveled corner `v` becomes the pair (ring vert of `v`'s incoming
     /// edge, ring vert of `v`'s outgoing edge), keeping the face winding; the
-    /// chamfer edge between the pair is minted by the rebuild. A loop edge
-    /// between two beveled corners (a shared edge `E`, §6.4.3) is re-pointed from
-    /// `{a, b}` to `{r_a, r_b}` — the surviving inner segment — by virtue of both
-    /// its endpoints being swapped in the same rebuild.
+    /// only freshly minted edge is the chamfer edge between the pair.
+    ///
+    /// **Every incident edge of a beveled corner survives in place.** §6.1 says a
+    /// re-stitched face's two corner edges become `prev — r_i` (the original
+    /// incoming edge `e_i`) and `r_(i+1) — next` (the original outgoing edge
+    /// `e_(i+1)`) — *the same edges re-pointed*, not new ones — and §6.4.3 states
+    /// the general preservation principle: a surviving edge "keeps the original
+    /// edge's identity (and any per-edge attributes), simply re-pointed". So each
+    /// of a corner `v`'s incident edges `e` has its `v`-endpoint re-pointed to
+    /// `e`'s ring vert for `v`. An edge with **one** beveled endpoint is swapped
+    /// once (`v → r_v`); a **shared** edge with both endpoints beveled is swapped
+    /// once from each corner (`a → r_a`, then `b → r_b`), so the both-beveled case
+    /// is just the general re-point applied twice. That up-front pass
+    /// (`repoint_incident_edges`) uses the in-place re-point primitive (no
+    /// kill/recreate, so each edge keeps the **same `EdgeKey` and `edge_attribs`
+    /// slot**). The subsequent face rebuild then *adopts* every re-pointed edge
+    /// (the face builder reuses an existing edge rather than minting a duplicate,
+    /// BEVEL.md §6.1 / §6.4.3) and mints only the chamfer edges fresh. An interior
+    /// shared edge ends with radial count 2 — both straddling faces rebuilt onto
+    /// the same surviving edge.
     fn restitch_incident_faces(&mut self, beveled: &[VertexKey], corners: &[BeveledCorner]) {
         // Collect each distinct incident face once, regardless of how many
         // beveled corners it has, so a shared-edge face is rebuilt a single time.
@@ -1315,7 +1331,13 @@ impl LoopMesh {
             }
         }
 
-        for face in faces {
+        // Compute every face's rebuilt vertex cycle against the *current* mesh,
+        // before any re-point or kill mutates the disks. Each face's cycle and
+        // the edge lookups it depends on (which ring vert each beveled corner's
+        // incoming / outgoing edge carries) are read while the original incident
+        // edges still connect their original endpoints.
+        let mut rebuilds: Vec<(FaceKey, Vec<VertexKey>)> = Vec::with_capacity(faces.len());
+        for &face in &faces {
             let cycle_verts = self.face_vert_keys(face);
             let cycle_length = cycle_verts.len();
 
@@ -1342,11 +1364,62 @@ impl LoopMesh {
                     new_cycle.push(w);
                 }
             }
+            rebuilds.push((face, new_cycle));
+        }
 
+        // §6.1 / §6.4.3: re-point every incident edge of every beveled corner in
+        // place *after* the cycles are captured but *before* any face is killed,
+        // preserving each edge's identity / per-edge CD. After this every
+        // corner-adjacent edge connects its ring vert(s); the face rebuild below
+        // reuses each one (the face builder's NO_DUPLICATE reuse) rather than
+        // minting it fresh, leaving only the chamfer edges newly minted.
+        let _ = beveled;
+        self.repoint_incident_edges(corners);
+
+        for (face, new_cycle) in rebuilds {
             self.face_kill(face);
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
             self.face_attribs
                 .copy_into(new_face.as_usize(), face.as_usize());
+        }
+    }
+
+    /// Re-point every incident edge of every beveled corner in place
+    /// (BEVEL.md §6.1 / §6.4.3).
+    ///
+    /// For a beveled corner `v` and one of its incident edges `e` carrying ring
+    /// vert `r`, this swaps `e`'s `v`-endpoint to `r` with the in-place edge
+    /// re-point primitive — the same `EdgeKey`, the same `edge_attribs` slot,
+    /// just a new endpoint — so the re-pointed edge *is* the original edge with
+    /// its identity and per-edge CD preserved. The re-point also patches `e`'s
+    /// radial loops; those loops belong to faces about to be killed and rebuilt,
+    /// so the transient face-cycle inconsistency it leaves is immediately
+    /// discarded.
+    ///
+    /// An edge with a **single** beveled endpoint is re-pointed exactly once
+    /// (`v → r`). A **shared** edge `E = {a, b}` whose *both* endpoints are
+    /// beveled is reached once from `a`'s ring and once from `b`'s ring, so the
+    /// loop below swaps it `a → r_a` when processing `a` and `b → r_b` when
+    /// processing `b`, leaving `E` as the surviving inner segment `{r_a, r_b}`
+    /// (§6.4.3) — the both-beveled case is the general re-point applied twice. The
+    /// `(edge, endpoint)` guard ensures each endpoint of each edge is swapped at
+    /// most once even if a corner's ring lists the same edge twice (a degenerate
+    /// self-edge cannot arise here, but the guard keeps the pass idempotent).
+    fn repoint_incident_edges(&mut self, corners: &[BeveledCorner]) {
+        let mut done: Vec<(EdgeKey, VertexKey)> = Vec::new();
+        for corner in corners {
+            let v = corner.vertex;
+            for &(edge, ring) in &corner.ring_vert_for_edge {
+                if done.contains(&(edge, v)) {
+                    continue;
+                }
+                // Precondition of the re-point primitive: the new vert (the ring
+                // vert) must not already be on the edge. Ring verts are freshly
+                // minted, so this holds for both the single- and both-beveled
+                // cases.
+                self.edge_replace_vertex_raw(edge, v, ring);
+                done.push((edge, v));
+            }
         }
     }
 
@@ -2597,6 +2670,317 @@ mod tests {
         for (a, o) in absolute.iter().zip(&offset_slides) {
             assert!((a - o).abs() < 1.0e-6, "ABSOLUTE coincides with OFFSET");
         }
+    }
+
+    /// Register a per-edge Float3 `tint` layer and tag the edge between `pa` and
+    /// `pb` with `value`, returning the layer key and that edge's key.
+    fn tag_edge_tint(
+        mesh: &mut LoopMesh,
+        pa: Vec3,
+        pb: Vec3,
+        value: [f32; 3],
+    ) -> (ElementAttributeKey, EdgeKey) {
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let edge = cube_edge(mesh, pa, pb);
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, edge.as_usize(), value);
+        (tint, edge)
+    }
+
+    /// BEVEL.md §6.4.3: beveling the two endpoints of an interior (manifold)
+    /// shared edge keeps that edge in place — **same `EdgeKey`**, radial count 2,
+    /// and its per-edge custom-data carried over — rather than minting a fresh
+    /// inner segment that would default-initialise the attribute.
+    #[test]
+    fn shared_edge_manifold_keeps_identity_and_per_edge_cd() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let pa = Vec3::new(1.0, -1.0, -1.0);
+        let pb = Vec3::new(-1.0, -1.0, -1.0);
+        let (tint, shared_edge) = tag_edge_tint(&mut mesh, pa, pb, [0.42, 0.0, 0.0]);
+
+        let a = vert_at(&mesh, pa);
+        let b = vert_at(&mesh, pb);
+        mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        // The same edge object survives — its key is still alive — re-pointed onto
+        // the two ring verts r_a = (0.5,-1,-1), r_b = (-0.5,-1,-1).
+        assert!(
+            mesh.edge_keys().contains(&shared_edge),
+            "the surviving inner segment is the *same* edge (identity preserved)",
+        );
+        let r_a = vert_at(&mesh, Vec3::new(0.5, -1.0, -1.0));
+        let r_b = vert_at(&mesh, Vec3::new(-0.5, -1.0, -1.0));
+        assert_eq!(
+            mesh.query_edge_exists(r_a, r_b),
+            Some(shared_edge),
+            "the original edge, re-pointed to {{r_a, r_b}}, is the inner segment",
+        );
+        assert_eq!(
+            mesh.edge_radial_iter(shared_edge).count(),
+            2,
+            "an interior shared edge keeps radial count 2",
+        );
+
+        let carried = mesh
+            .edge_attribs()
+            .get_vec3(tint, shared_edge.as_usize())
+            .unwrap();
+        assert_eq!(
+            carried, [0.42, 0.0, 0.0],
+            "the surviving edge keeps its original per-edge CD",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.4.3 (boundary sub-case): when the shared edge straddled by a
+    /// *single* face is beveled at both endpoints, the same edge still survives
+    /// in place and keeps its per-edge CD — with radial count 1, the one
+    /// re-stitched face.
+    #[test]
+    fn shared_edge_single_face_keeps_identity_and_per_edge_cd() {
+        // A flat quad; bevel two adjacent corners so the shared edge between them
+        // is a boundary edge (one incident face).
+        let mut mesh = LoopMesh::new();
+        let positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 2.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        ];
+        let verts: Vec<VertexKey> = positions.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let edges: Vec<EdgeKey> = (0..4)
+            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % 4]], EdgeCreateFlags::NONE))
+            .collect();
+        mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        // The shared edge is verts[0]-verts[1], a boundary edge of the single quad.
+        let shared_edge = edges[0];
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, shared_edge.as_usize(), [0.0, 0.7, 0.0]);
+        assert_eq!(
+            mesh.edge_radial_iter(shared_edge).count(),
+            1,
+            "shared edge has a single incident face before the bevel",
+        );
+
+        mesh.bevel(
+            &[verts[0].into(), verts[1].into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            mesh.edge_keys().contains(&shared_edge),
+            "the single-face shared edge survives as the same edge",
+        );
+        // r_a slid 0.5 from (0,0,0) toward (2,0,0) -> (0.5,0,0);
+        // r_b slid 0.5 from (2,0,0) toward (0,0,0) -> (1.5,0,0).
+        let r_a = vert_at(&mesh, Vec3::new(0.5, 0.0, 0.0));
+        let r_b = vert_at(&mesh, Vec3::new(1.5, 0.0, 0.0));
+        assert_eq!(
+            mesh.query_edge_exists(r_a, r_b),
+            Some(shared_edge),
+            "the re-pointed edge spans the two ring verts",
+        );
+        assert_eq!(
+            mesh.edge_radial_iter(shared_edge).count(),
+            1,
+            "still a single incident face after the bevel",
+        );
+        let carried = mesh
+            .edge_attribs()
+            .get_vec3(tint, shared_edge.as_usize())
+            .unwrap();
+        assert_eq!(
+            carried, [0.0, 0.7, 0.0],
+            "the surviving boundary edge keeps its per-edge CD",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.4.2 (clamped-collapse degenerate): even when the surviving
+    /// inner segment has *zero length* (the two ring verts coincident), it is
+    /// still a real edge — the same one — and keeps its per-edge CD.
+    #[test]
+    fn shared_edge_clamped_collapse_keeps_per_edge_cd() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let pa = Vec3::new(1.0, -1.0, -1.0);
+        let pb = Vec3::new(-1.0, -1.0, -1.0);
+        let (tint, shared_edge) = tag_edge_tint(&mut mesh, pa, pb, [0.1, 0.2, 0.3]);
+
+        let a = vert_at(&mesh, pa);
+        let b = vert_at(&mesh, pb);
+        mesh.bevel(
+            &[a.into(), b.into()],
+            BevelOptions {
+                offset: 1.5,
+                clamp_overlap: true,
+                ..Default::default()
+            },
+        );
+
+        // The clamp collapses r_a, r_b onto the midpoint (0,-1,-1): a zero-length
+        // edge, but still the *same* surviving edge with its CD intact.
+        assert!(
+            mesh.edge_keys().contains(&shared_edge),
+            "the zero-length surviving segment is still the same edge",
+        );
+        let [p, q] = mesh.edge_vert_keys(shared_edge);
+        let length = (mesh.vertex_position(p) - mesh.vertex_position(q)).length();
+        assert!(length < 1.0e-5, "the surviving segment is zero-length");
+        let carried = mesh
+            .edge_attribs()
+            .get_vec3(tint, shared_edge.as_usize())
+            .unwrap();
+        assert_eq!(
+            carried, [0.1, 0.2, 0.3],
+            "even the collapsed edge keeps its per-edge CD",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.1 / §6.4.3: a **single-beveled-endpoint** corner-adjacent edge
+    /// (one beveled endpoint, one not) is re-pointed in place exactly like the
+    /// shared edge — same `EdgeKey`, same per-edge CD — it is *not* re-minted by
+    /// the incident-face rebuild. Bevels only vertex 0 and checks edge {0,3}
+    /// (vertex 3 not beveled) survives re-pointed onto 0's ring vert.
+    #[test]
+    fn corner_adjacent_edge_single_beveled_endpoint_keeps_identity_and_per_edge_cd() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        // Edge {0,3}: (1,-1,-1)-(1,1,-1). Only vertex 0 will be beveled.
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let p3 = Vec3::new(1.0, 1.0, -1.0);
+        let (tint, adjacent_edge) = tag_edge_tint(&mut mesh, p0, p3, [0.0, 0.0, 0.9]);
+
+        let v0 = vert_at(&mesh, p0);
+        let v3 = vert_at(&mesh, p3);
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            mesh.edge_keys().contains(&adjacent_edge),
+            "the corner-adjacent edge survives as the *same* edge (identity preserved)",
+        );
+        // Vertex 0's ring vert on {0,3} slides 0.5 from (1,-1,-1) toward
+        // (1,1,-1) -> (1,-0.5,-1). Vertex 3 is untouched.
+        let ring = vert_at(&mesh, Vec3::new(1.0, -0.5, -1.0));
+        assert!(
+            mesh.vert_keys().contains(&v3),
+            "the non-beveled far endpoint is untouched",
+        );
+        assert_eq!(
+            mesh.query_edge_exists(ring, v3),
+            Some(adjacent_edge),
+            "the original edge, re-pointed {{0 -> r_0}}, spans the ring vert and vertex 3",
+        );
+        assert_eq!(
+            mesh.edge_radial_iter(adjacent_edge).count(),
+            2,
+            "the re-pointed interior edge keeps radial count 2",
+        );
+        let carried = mesh
+            .edge_attribs()
+            .get_vec3(tint, adjacent_edge.as_usize())
+            .unwrap();
+        assert_eq!(
+            carried, [0.0, 0.0, 0.9],
+            "the single-beveled-endpoint edge keeps its per-edge CD",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.1 / §6.4.3: over the full shared-edge pair, *every* incident
+    /// edge of both beveled corners is preserved in place — the shared edge {0,1}
+    /// (both endpoints beveled) and each corner-adjacent edge (one beveled
+    /// endpoint). Only the chamfer edges between a corner's ring verts are minted
+    /// fresh. This pins the broad per-edge-CD survival the narrow shared-edge fix
+    /// did not cover.
+    #[test]
+    fn shared_edge_pair_preserves_all_incident_edges_cd() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+
+        // Tag every incident edge of the two beveled corners 0 and 1 with a
+        // distinct value, and record (EdgeKey, ring-vert-position-after-bevel,
+        // far-endpoint-position, expected-tint) for each.
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let p1 = Vec3::new(-1.0, -1.0, -1.0);
+
+        // (near beveled vertex position, far endpoint position, tint)
+        let incident = [
+            // shared edge {0,1}: both endpoints beveled.
+            (p0, p1, [0.42, 0.0, 0.0]),
+            // vertex 0's other edges {0,3}, {0,4}: one beveled endpoint.
+            (p0, Vec3::new(1.0, 1.0, -1.0), [0.1, 0.0, 0.0]),
+            (p0, Vec3::new(1.0, -1.0, 1.0), [0.2, 0.0, 0.0]),
+            // vertex 1's other edges {1,2}, {1,5}: one beveled endpoint.
+            (p1, Vec3::new(-1.0, 1.0, -1.0), [0.3, 0.0, 0.0]),
+            (p1, Vec3::new(-1.0, -1.0, 1.0), [0.4, 0.0, 0.0]),
+        ];
+
+        let mut tagged: Vec<(EdgeKey, [f32; 3])> = Vec::new();
+        for &(near, far, value) in &incident {
+            let edge = cube_edge(&mesh, near, far);
+            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+            tagged.push((edge, value));
+        }
+
+        let v0 = vert_at(&mesh, p0);
+        let v1 = vert_at(&mesh, p1);
+        mesh.bevel(
+            &[v0.into(), v1.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        for &(edge, value) in &tagged {
+            assert!(
+                mesh.edge_keys().contains(&edge),
+                "every incident edge survives with the same EdgeKey",
+            );
+            let carried = mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap();
+            assert_eq!(
+                carried, value,
+                "incident edge {edge:?} keeps its per-edge CD across the bevel",
+            );
+        }
+        mesh.validate_topology();
     }
 }
 
