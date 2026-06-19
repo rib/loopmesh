@@ -39,12 +39,18 @@ impl LoopMesh {
     }
 
     /// [`extrude_discrete_faces`](Self::extrude_discrete_faces) with the
-    /// `use_normal_flip` parameter exposed: when set, each wall's winding is
-    /// reversed (EXTRUDE.md §4.2 / §5).
+    /// `use_normal_flip` parameter exposed for API compatibility.
+    ///
+    /// Unlike region (§5) and edge-only (§10) extrude, the discrete variant
+    /// accepts `use_normal_flip` but **never acts on it** (EXTRUDE.md §9.1):
+    /// the flag makes no winding decision, so flag-on output is byte-for-byte
+    /// identical to flag-off — same cap winding, same wall winding, same
+    /// loop-data placement. The parameter is retained only so callers can pass
+    /// it without a separate code path.
     pub fn extrude_discrete_faces_ex(
         &mut self,
         faces: &[FaceKey],
-        use_normal_flip: bool,
+        _use_normal_flip: bool,
     ) -> ExtrudeResult {
         let do_loop_cd = !self.loop_attribs.is_empty();
 
@@ -123,10 +129,12 @@ impl LoopMesh {
                 let vb_dup = dup_verts[next];
                 let e_dup = dup_edges[i];
 
-                // Winding (EXTRUDE.md §5): orient as a loop of the duplicate edge
-                // so the wall's loop on e_dup runs opposite the cap's loop. With
-                // no surround, `use_normal_from_adjacent` is irrelevant; the cue
-                // is always the duplicate face's loop direction.
+                // Winding (EXTRUDE.md §9.1): the discrete wall uses one fixed
+                // vertex order, oriented so the wall's loop on e_dup runs
+                // opposite the cap's loop. Unlike region (§5) and edge-only (§10)
+                // extrude, the discrete path makes no winding decision from
+                // `use_normal_flip` — the flag is accepted but never acts on the
+                // winding, so flag-on output is identical to flag-off.
                 let [e_dup_v0, _e_dup_v1] = self.edge_vertices(e_dup);
                 let dup_first_loop = self.edges.get(e_dup).radial_link;
                 let edge_normal_flip = match dup_first_loop {
@@ -138,10 +146,10 @@ impl LoopMesh {
                     }
                 };
 
-                // §5 vert order. The "v1" of each edge is its first endpoint;
-                // map the duplicate-edge ordering back onto original verts via
-                // the loop ring (loop `i` is anchored at `va_org`/`va_dup`).
-                let (wa_org, wb_org, wa_dup, wb_dup) = if edge_normal_flip == use_normal_flip {
+                // Fixed vert order, mapping the duplicate-edge ordering back onto
+                // original verts via the loop ring (loop `i` is anchored at
+                // `va_org`/`va_dup`). No XOR against `use_normal_flip` (§9.1).
+                let (wa_org, wb_org, wa_dup, wb_dup) = if !edge_normal_flip {
                     (va_org, vb_org, va_dup, vb_dup)
                 } else {
                     (vb_org, va_org, vb_dup, va_dup)
@@ -398,11 +406,136 @@ mod tests {
     }
 
     #[test]
-    fn discrete_normal_flip_reverses_wall_winding() {
-        // The use_normal_flip variant must reverse each wall's vertex order
-        // relative to the default. We extrude the same quad twice (default and
-        // flipped) and assert each wall's perimeter is the reverse cycle of its
-        // default counterpart.
+    fn discrete_flag_is_noop_on_cube_face() {
+        // EXTRUDE.md §9.1: the discrete operator accepts `use_normal_flip` but
+        // never acts on it — flag-on output is identical to flag-off, with the
+        // same wall winding. We extrude one face of a cube — chosen because its
+        // loop ring walks two of its four edges *against* their stored canonical
+        // orientation, the configuration where a path that XOR-ed the flag into
+        // the winding (the old region-mirroring bug) would silently reverse
+        // walls. The flag-on and flag-off discrete walls must match edge-for-edge
+        // AND winding-for-winding. (§9.1 caveat: the discrete fixed order is its
+        // own thing, NOT region's — so this test does not compare against the
+        // region path.)
+        use crate::loopmesh::test_support::mesh_add_cube;
+
+        // Label each wall corner by (position, is_duplicate). Original and
+        // duplicate verts share a position (extrude is pure topology), so the
+        // duplicate marker is what makes the winding comparison meaningful — a
+        // bare position cycle would collapse and hide any reversal.
+        let labelled = |mesh: &LoopMesh, res: &ExtrudeResult| -> Vec<Vec<([u32; 3], bool)>> {
+            let dups: std::collections::HashSet<usize> =
+                res.vert_map.iter().map(|(_, d)| d.as_usize()).collect();
+            res.wall_faces
+                .iter()
+                .map(|&wf| {
+                    mesh.face_vert_keys(wf)
+                        .iter()
+                        .map(|&v| (pos_key(mesh.vertex_position(v)), dups.contains(&v.as_usize())))
+                        .collect()
+                })
+                .collect()
+        };
+        let edge_key = |cyc: &[([u32; 3], bool)]| -> Vec<[u32; 3]> {
+            let mut p: Vec<[u32; 3]> = cyc.iter().map(|(p, _)| *p).collect();
+            p.sort();
+            p.dedup();
+            p
+        };
+        let same_winding = |a: &[([u32; 3], bool)], b: &[([u32; 3], bool)]| -> bool {
+            let n = a.len();
+            (0..n).any(|shift| (0..n).all(|i| a[i] == b[(i + shift) % n]))
+        };
+
+        let mut mesh_off = LoopMesh::new();
+        mesh_add_cube(&mut mesh_off);
+        let face_off = mesh_off.face_keys()[1];
+        let res_off = mesh_off.extrude_discrete_faces_ex(&[face_off], false);
+        let walls_off = labelled(&mesh_off, &res_off);
+
+        let mut mesh_on = LoopMesh::new();
+        mesh_add_cube(&mut mesh_on);
+        let face_on = mesh_on.face_keys()[1];
+        let res_on = mesh_on.extrude_discrete_faces_ex(&[face_on], true);
+        let walls_on = labelled(&mesh_on, &res_on);
+
+        assert_eq!(walls_off.len(), walls_on.len());
+        for off_wall in &walls_off {
+            let okey = edge_key(off_wall);
+            let on_wall = walls_on
+                .iter()
+                .find(|w| edge_key(w) == okey)
+                .expect("flag-on must produce a wall over the same edge");
+            assert!(
+                same_winding(off_wall, on_wall),
+                "flag is a no-op: flag-off wall {off_wall:?} must match flag-on wall {on_wall:?} winding-for-winding"
+            );
+        }
+    }
+
+    #[test]
+    fn discrete_wall_winding_identical_across_flag() {
+        // Pin the absolute cyclic order (original vs duplicate corners) of an
+        // isolated quad's bottom-edge wall and assert flag-on is the SAME cycle
+        // as flag-off (EXTRUDE.md §9.1: the flag is a no-op, so flag-on output is
+        // identical to flag-off — not reversed). Corners are labelled
+        // original/duplicate via the vert map so the assertion is
+        // winding-sensitive even though the duplicate sits on top of its original.
+        let labelled = |mesh: &LoopMesh, wf: FaceKey, dups: &std::collections::HashSet<usize>| -> Vec<([u32; 3], bool)> {
+            mesh.face_vert_keys(wf)
+                .iter()
+                .map(|&v| (pos_key(mesh.vertex_position(v)), dups.contains(&v.as_usize())))
+                .collect()
+        };
+        let find_bottom_wall = |mesh: &LoopMesh, res: &ExtrudeResult| -> Vec<([u32; 3], bool)> {
+            let dups: std::collections::HashSet<usize> =
+                res.vert_map.iter().map(|(_, d)| d.as_usize()).collect();
+            let p00 = pos_key(Vec3::new(0.0, 0.0, 0.0));
+            let p10 = pos_key(Vec3::new(1.0, 0.0, 0.0));
+            for &wf in &res.wall_faces {
+                let lab = labelled(mesh, wf, &dups);
+                let keys: std::collections::HashSet<[u32; 3]> =
+                    lab.iter().map(|(p, _)| *p).collect();
+                if keys.len() == 2 && keys.contains(&p00) && keys.contains(&p10) {
+                    return lab;
+                }
+            }
+            panic!("no wall over the bottom edge");
+        };
+
+        let mut mesh_f = LoopMesh::new();
+        let face_f = unit_quad(&mut mesh_f);
+        let res_f = mesh_f.extrude_discrete_faces_ex(&[face_f], true);
+        let flip_wall = find_bottom_wall(&mesh_f, &res_f);
+
+        let mut mesh_nf = LoopMesh::new();
+        let face_nf = unit_quad(&mut mesh_nf);
+        let res_nf = mesh_nf.extrude_discrete_faces(&[face_nf]);
+        let noflip_wall = find_bottom_wall(&mesh_nf, &res_nf);
+
+        // §9.1: the wall is always [orig_a, orig_b, dup_b, dup_a] — two originals
+        // then two duplicates — regardless of the flag.
+        let is_two_orig_two_dup = |w: &[([u32; 3], bool)]| -> bool {
+            !w[0].1 && !w[1].1 && w[2].1 && w[3].1
+        };
+        assert!(is_two_orig_two_dup(&flip_wall), "flag-on wall shape {flip_wall:?}");
+        assert!(is_two_orig_two_dup(&noflip_wall), "flag-off wall shape {noflip_wall:?}");
+
+        // §9.1: flag-on must be the SAME cycle as flag-off (the flag is a no-op).
+        let n = flip_wall.len();
+        let identical = (0..n).any(|shift| (0..n).all(|i| flip_wall[i] == noflip_wall[(i + shift) % n]));
+        assert!(
+            identical,
+            "flag-on wall {flip_wall:?} must be identical to flag-off wall {noflip_wall:?}"
+        );
+    }
+
+    #[test]
+    fn discrete_normal_flip_preserves_wall_winding() {
+        // EXTRUDE.md §9.1: the flag is a no-op, so the flagged variant must
+        // produce the SAME wall winding as the default (not reversed). We extrude
+        // the same quad twice (default and flagged) and assert each wall's
+        // perimeter is the identical cycle of its default counterpart.
         let mut mesh_default = LoopMesh::new();
         let face_default = unit_quad(&mut mesh_default);
         let res_default = mesh_default.extrude_discrete_faces(&[face_default]);
@@ -411,12 +544,12 @@ mod tests {
         let face_flip = unit_quad(&mut mesh_flip);
         let res_flip = mesh_flip.extrude_discrete_faces_ex(&[face_flip], true);
 
-        // Topology counts are identical; only the winding differs.
+        // Topology counts are identical and so is the winding.
         assert_eq!(res_default.wall_faces.len(), res_flip.wall_faces.len());
 
-        // For each default wall, find the flipped wall over the same original
+        // For each default wall, find the flagged wall over the same original
         // edge (same original-vertex pair) and check the vertex cycle is
-        // reversed.
+        // identical.
         let key_pair = |mesh: &LoopMesh, wf: FaceKey| -> (VertexKey, VertexKey) {
             // The two original (lower) verts of the wall are the ones whose
             // positions match the z=0 plane.
@@ -453,24 +586,79 @@ mod tests {
                 if flip_lower_pos != def_lower_pos {
                     continue;
                 }
-                // Same edge. The flipped wall's position cycle must be the
-                // reverse of the default's.
+                // Same edge. The flagged wall's position cycle must be the
+                // identical cycle of the default's (flag is a no-op).
                 let flip_pos: Vec<Vec3> = mesh_flip
                     .face_vert_keys(wf_flip)
                     .iter()
                     .map(|&v| mesh_flip.vertex_position(v))
                     .collect();
                 assert!(
-                    cycles_are_reversed(&def_pos, &flip_pos),
-                    "flip wall must be reverse cycle of default wall"
+                    cycles_are_identical(&def_pos, &flip_pos),
+                    "flagged wall must be identical cycle of default wall"
                 );
                 matched = true;
                 break;
             }
-            assert!(matched, "every default wall has a flipped counterpart");
+            assert!(matched, "every default wall has a flagged counterpart");
         }
 
         mesh_flip.validate_topology();
+    }
+
+    #[test]
+    fn discrete_walls_wind_outward() {
+        // EXTRUDE.md §9.1: the discrete fixed wall order is the unflipped /
+        // outward one — the same outward convention loopmesh's region extrude
+        // produces. This pins that convention WITHOUT comparing against BMesh:
+        // extrude a quad discretely, lift the duplicate cap off the surface so
+        // the walls have area, refresh wall normals, and assert each wall normal
+        // points AWAY from the shell centroid (outward). A wrong fixed branch
+        // (the inward winding) reverses every wall and fails this — confirmed by
+        // flipping the `if !edge_normal_flip` condition in the impl, which turns
+        // every dot below negative.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+
+        let result = mesh.extrude_discrete_faces(&[face]);
+
+        // Lift the cap (the duplicate verts) along +Z so the walls are real
+        // quads with a well-defined normal.
+        let lift = Vec3::new(0.0, 0.0, 1.0);
+        for &(_src, dup) in &result.vert_map {
+            let p = mesh.vertex_position(dup);
+            mesh.set_vertex_position(dup, p + lift);
+        }
+
+        for &wf in &result.wall_faces {
+            mesh.face_normal_update(wf);
+        }
+
+        // Shell centroid: the box runs x,y in [0,1], z in [0,1] after the lift,
+        // so the central vertical axis passes through (0.5, 0.5, *). For each
+        // wall, take the horizontal (in-plane) offset of its centroid from that
+        // axis and require the wall normal to have a positive component along it.
+        let axis_xy = Vec3::new(0.5, 0.5, 0.0);
+        for &wf in &result.wall_faces {
+            let verts = mesh.face_vert_keys(wf);
+            let mut centroid = Vec3::ZERO;
+            for &v in &verts {
+                centroid += mesh.vertex_position(v);
+            }
+            centroid /= verts.len() as f32;
+            let mut outward = centroid - axis_xy;
+            outward.z = 0.0;
+            let outward = outward.normalize();
+
+            let normal = mesh.face_normal(wf);
+            let dot = normal.dot(outward);
+            assert!(
+                dot > 0.5,
+                "wall {wf:?} must wind outward: normal {normal:?} vs outward dir {outward:?} (dot {dot})"
+            );
+        }
+
+        mesh.validate_topology();
     }
 
     #[test]
@@ -535,16 +723,15 @@ mod tests {
         [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
     }
 
-    // Two 4-cycles describe the same quad with opposite winding iff one is the
-    // reverse rotation of the other.
-    fn cycles_are_reversed(a: &[Vec3], b: &[Vec3]) -> bool {
+    // Two 4-cycles describe the same quad with the same winding iff one is a
+    // rotation of the other.
+    fn cycles_are_identical(a: &[Vec3], b: &[Vec3]) -> bool {
         let n = a.len();
         if b.len() != n {
             return false;
         }
-        let rev: Vec<Vec3> = b.iter().rev().copied().collect();
         for shift in 0..n {
-            if (0..n).all(|i| a[i] == rev[(i + shift) % n]) {
+            if (0..n).all(|i| a[i] == b[(i + shift) % n]) {
                 return true;
             }
         }
