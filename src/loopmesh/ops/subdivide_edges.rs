@@ -282,29 +282,38 @@ pub enum SubdivideResult {
 ///
 /// - [`Self::geom_split`] (`geom_split.out`) — the new midpoint verts and the
 ///   edge-halves produced by splitting the input edges.
-/// - [`Self::geom_inner`] (`geom_inner.out`) — the geometry created *inside* a
-///   re-split face: the inner edges the pattern added, plus (for the four-cut
-///   quad §5.4, the §5.2.2 INNERVERT corner, and the multi-cut lattices §9.5)
-///   the inner vert(s).
-/// - [`Self::geom`] (`geom.out`) — the headline union: every vert, edge, and
-///   face the operator created or replaced. The original re-split faces keep
-///   their handle and also appear here.
+/// - [`Self::geom_inner`] (`geom_inner.out`) — the inner population (§1): **every
+///   inserted midpoint vert** (all rim midpoints are inner), plus the interior
+///   geometry of the *grid-style* fills only — the §5.4 quad plus-split, the
+///   §6.3 tri 1-to-4, the §9.5 lattices, and the §5.2.2 INNERVERT corner vert
+///   `c` — marking their interior verts, interior edges, and fragment faces
+///   inner. The corner-cut / fan / path patterns (§5.1, §5.2 straight/path/fan,
+///   §5.3, §6.1, §6.2) contribute **only** their rim midpoints, never their
+///   connecting edges or fragment faces.
+/// - [`Self::geom`] (`geom.out`) — the union of the split, inner, and per-face
+///   re-split marks (§1). A re-split face appears here as the **single**
+///   re-split-marked original face, *not* as all its fragments; a grid fill's
+///   fragments enter only through the inner mark. So `geom.out`'s face count is
+///   the inner fragment count plus one re-split mark per re-split face — far
+///   fewer than the raw fragment total for the non-grid patterns.
 ///
 /// The [`Self::verts`] / [`Self::faces`] fields are the `geom.out` vert and
-/// face sets (their long-standing meaning); [`Self::edges`] completes that
-/// union with the `geom.out` edge set.
+/// face sets; [`Self::edges`] completes that union with the `geom.out` edge set.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SubdivideGeom {
-    /// `geom.out` verts: every midpoint vert inserted on a cut edge (§3), plus
-    /// any inner vert a per-face pattern added (the §5.4 quad centre, the
-    /// §5.2.2 INNERVERT corner, the §9.5 lattice interior).
+    /// `geom.out` verts (§1): split ∪ inner — every midpoint vert inserted on a
+    /// cut edge (§3) plus any interior vert a grid fill added (the §5.4 quad
+    /// centre, the §5.2.2 INNERVERT corner, the §9.5 lattice interior).
     pub verts: Vec<VertexKey>,
-    /// `geom.out` edges: every edge the operator created — the edge-halves of
-    /// the split input edges (§3) and the inner edges laid by the re-split
-    /// patterns (§5 / §6 / §9.5).
+    /// `geom.out` edges (§1): split ∪ inner — the edge-halves of the split input
+    /// edges (§3) and the interior edges laid by the *grid* fills (§5.4 / §6.3 /
+    /// §9.5) and the two-edge fallback. The connecting edges of the non-grid
+    /// patterns are in *no* mark-set and never appear here.
     pub edges: Vec<EdgeKey>,
-    /// `geom.out` faces: every face produced by a re-split (§5 / §6 / §9.5). The
-    /// original faces that were re-split keep their handle and also appear here.
+    /// `geom.out` faces (§1): one re-split mark per re-split input face plus the
+    /// inner fragment faces of the grid fills. **Not** every fragment — a
+    /// non-grid re-split face contributes a single face (the re-split-marked
+    /// original), not all its fragments.
     pub faces: Vec<FaceKey>,
     /// `geom_split.out` verts: the new midpoint verts produced by splitting the
     /// input edges (§3). A subset of [`Self::verts`].
@@ -312,13 +321,20 @@ pub struct SubdivideGeom {
     /// `geom_split.out` edges: the edge-halves produced by splitting the input
     /// edges (§3). A subset of [`Self::edges`].
     pub split_edges: Vec<EdgeKey>,
-    /// `geom_inner.out` verts: the inner vert(s) a per-face pattern added (§5.4
+    /// `geom_inner.out` verts (§1): **every** inserted midpoint vert (all rim
+    /// midpoints are inner) plus the interior vert(s) a grid fill added (§5.4
     /// quad centre, §5.2.2 INNERVERT corner, §9.5 lattice interior). A subset of
     /// [`Self::verts`].
     pub inner_verts: Vec<VertexKey>,
-    /// `geom_inner.out` edges: the inner edges a per-face re-split pattern added
-    /// inside a face (§5 / §6 / §9.5). A subset of [`Self::edges`].
+    /// `geom_inner.out` edges (§1): the interior edges a *grid* fill (§5.4 / §6.3
+    /// / §9.5) or the two-edge fallback laid down inside a face. The non-grid
+    /// patterns' connecting edges are *not* inner. A subset of [`Self::edges`].
     pub inner_edges: Vec<EdgeKey>,
+    /// `geom_inner.out` faces (§1): the new fragment faces of a *grid* fill
+    /// (§5.4 / §6.3 / §9.5), minus the one fragment that keeps the original
+    /// face's identity (the re-split mark). The non-grid patterns mark no
+    /// fragment inner. A subset of [`Self::faces`].
+    pub inner_faces: Vec<FaceKey>,
 }
 
 /// A read-only view over one of [`SubdivideGeom`]'s three output slots (§1).
@@ -342,13 +358,14 @@ impl SubdivideGeom {
         }
     }
 
-    /// `geom_inner.out` (§1): the inner edges (and inner vert, where a pattern
-    /// adds one) created *inside* a re-split face. No faces.
+    /// `geom_inner.out` (§1): every inserted midpoint vert plus the interior
+    /// verts/edges/faces of the grid-style fills (and the §5.2.2 INNERVERT
+    /// corner vert).
     pub fn geom_inner(&self) -> SubdivideSlot<'_> {
         SubdivideSlot {
             verts: &self.inner_verts,
             edges: &self.inner_edges,
-            faces: &[],
+            faces: &self.inner_faces,
         }
     }
 
@@ -363,9 +380,10 @@ impl SubdivideGeom {
     }
 
     /// Record a midpoint vert and the two edge-halves of the just-split input
-    /// edge into both `geom.out` and `geom_split.out` (§3). `original_half` is
-    /// the input-edge handle that survives the split (the near-side half),
-    /// `new_half` the freshly-created far-side half.
+    /// edge into `geom.out`, `geom_split.out`, and `geom_inner.out` (§3).
+    /// `original_half` is the input-edge handle that survives the split (the
+    /// near-side half), `new_half` the freshly-created far-side half. Every rim
+    /// midpoint is inner (§1), so the vert lands in `geom_inner.out` too.
     fn record_split(
         &mut self,
         midpoint: VertexKey,
@@ -374,8 +392,18 @@ impl SubdivideGeom {
     ) {
         self.verts.push(midpoint);
         self.split_verts.push(midpoint);
+        self.inner_verts.push(midpoint);
         self.push_split_edge(original_half);
         self.push_split_edge(new_half);
+    }
+
+    /// Record a rim midpoint vert into `geom.out`, `geom_split.out`, and
+    /// `geom_inner.out` (§3). The multi-cut split path records its segment edges
+    /// separately; this captures only the vert (which is split *and* inner, §1).
+    fn record_split_vert(&mut self, midpoint: VertexKey) {
+        self.verts.push(midpoint);
+        self.split_verts.push(midpoint);
+        self.inner_verts.push(midpoint);
     }
 
     fn push_split_edge(&mut self, edge: EdgeKey) {
@@ -403,6 +431,30 @@ impl SubdivideGeom {
     fn record_inner_vert(&mut self, vert: VertexKey) {
         self.verts.push(vert);
         self.inner_verts.push(vert);
+    }
+
+    /// Record the single re-split mark for one re-split input face into
+    /// `geom.out` (§1). A re-split face contributes exactly one face to
+    /// `geom.out` — the original handle the dispatcher flagged — regardless of
+    /// how many fragments the surgery produced. Non-grid patterns call this for
+    /// their original face and record no fragment faces at all.
+    fn record_resplit_face(&mut self, face: FaceKey) {
+        if !self.faces.contains(&face) {
+            self.faces.push(face);
+        }
+    }
+
+    /// Record a grid-fill fragment face into both `geom.out` and
+    /// `geom_inner.out` (§5.4 / §6.3 / §9.5). Only the grid-style fills mark
+    /// their fragments inner; one fragment per fill keeps the original face's
+    /// identity and is recorded via [`Self::record_resplit_face`] instead.
+    fn record_inner_face(&mut self, face: FaceKey) {
+        if !self.inner_faces.contains(&face) {
+            self.inner_faces.push(face);
+        }
+        if !self.faces.contains(&face) {
+            self.faces.push(face);
+        }
     }
 }
 
@@ -705,10 +757,11 @@ impl LoopMesh {
         // After rotation: v[0] = m, v[1] = v1, v[2] = v2, v[3] = v0. The apex
         // opposite the cut edge {v0,v1} is v[2].
         let (m, apex) = (v[0], v[2]);
-        if let Some((new_face, inner)) = self.face_split(face, m, apex) {
-            geom.faces.push(face);
-            geom.faces.push(new_face);
-            geom.record_inner_edge(inner);
+        // §1 / §6.1 Output-slot note: the apex-connect edge and the fragment
+        // faces are *not* inner; only the rim midpoint (recorded in §3) is.
+        // geom.out gets the single re-split mark for the original face.
+        if self.face_split(face, m, apex).is_some() {
+            geom.record_resplit_face(face);
         }
     }
 
@@ -743,10 +796,10 @@ impl LoopMesh {
             "shared corner is original, not a midpoint"
         );
 
-        if let Some((new_face, inner)) = self.face_split(face, m01, m12) {
-            geom.faces.push(face);
-            geom.faces.push(new_face);
-            geom.record_inner_edge(inner);
+        // §1 / §6.2 Output-slot note: the corner cut and the two fragments are
+        // *not* inner; only the two rim midpoints (recorded in §3) are.
+        if self.face_split(face, m01, m12).is_some() {
+            geom.record_resplit_face(face);
         }
     }
 
@@ -773,10 +826,14 @@ impl LoopMesh {
         let f3 = self.face_with_both(m20, m01);
         let (corner_c, inner_c) = self.face_split(f3, m20, m01).expect("m20-m01 split");
 
-        geom.faces.push(face);
-        geom.faces.push(corner_a);
-        geom.faces.push(corner_b);
-        geom.faces.push(corner_c);
+        // §1 / §6.3 Output-slot note: this is a grid-style fill — its three
+        // connecting edges and its new fragment faces are inner. The original
+        // `face` keeps its identity (the re-split mark), so it goes to geom.out
+        // only; the three peeled corner fragments are inner faces.
+        geom.record_resplit_face(face);
+        geom.record_inner_face(corner_a);
+        geom.record_inner_face(corner_b);
+        geom.record_inner_face(corner_c);
         geom.record_inner_edge(inner_a);
         geom.record_inner_edge(inner_b);
         geom.record_inner_edge(inner_c);
@@ -796,16 +853,15 @@ impl LoopMesh {
         // targets are v3 = v[3] and v2 = v[2].
         let (m, v2, v3) = (v[0], v[2], v[3]);
         // m -> v3 peels {v0, m, v3}.
-        let (frag_a, inner_a) = self.face_split(face, m, v3).expect("m-v3 split");
+        self.face_split(face, m, v3).expect("m-v3 split");
         // m -> v2 splits the remaining quad {m, v1, v2, v3}.
         let f2 = self.face_with_both(m, v2);
-        let (frag_b, inner_b) = self.face_split(f2, m, v2).expect("m-v2 split");
+        self.face_split(f2, m, v2).expect("m-v2 split");
 
-        geom.faces.push(face);
-        geom.faces.push(frag_a);
-        geom.faces.push(frag_b);
-        geom.record_inner_edge(inner_a);
-        geom.record_inner_edge(inner_b);
+        // §1 / §5.1 Output-slot note: the two connecting edges (m→v3, m→v2) and
+        // the three fragments are *not* inner; only the rim midpoint (recorded
+        // in §3) is. geom.out gets the single re-split mark for `face`.
+        geom.record_resplit_face(face);
     }
 
     /// §5.2 — discriminate the two-cut quad's sub-case. After the §3 midpoint
@@ -842,10 +898,11 @@ impl LoopMesh {
         // v = [m01, v1, v2, m23, v3, v0]; the two opposite midpoints are v[0]
         // and v[3] (diametrically opposite in the six-corner ring).
         let (m01, m23) = (v[0], v[3]);
-        if let Some((new_face, inner)) = self.face_split(face, m01, m23) {
-            geom.faces.push(face);
-            geom.faces.push(new_face);
-            geom.record_inner_edge(inner);
+        // §1 / §5.2 Output-slot note: the loop-cut connecting edge and the two
+        // fragments are *not* inner; only the two rim midpoints (recorded in §3)
+        // are. geom.out gets the single re-split mark for `face`.
+        if self.face_split(face, m01, m23).is_some() {
+            geom.record_resplit_face(face);
         }
     }
 
@@ -891,11 +948,11 @@ impl LoopMesh {
             "shared corner between midpoints"
         );
 
-        // m01 -> m12 carves the corner triangle off the hexagon.
-        if let Some((new_face, inner)) = self.face_split(face, m01, m12) {
-            geom.faces.push(face);
-            geom.faces.push(new_face);
-            geom.record_inner_edge(inner);
+        // m01 -> m12 carves the corner triangle off the hexagon. §1 / §5.2
+        // Output-slot note: the corner cut and the two fragments are *not*
+        // inner; only the two rim midpoints (recorded in §3) are.
+        if self.face_split(face, m01, m12).is_some() {
+            geom.record_resplit_face(face);
         }
     }
 
@@ -947,31 +1004,28 @@ impl LoopMesh {
         let [m01, _v1, m12, _v2, v3, _v0] = Self::adjacent_two_cut_corners(ring);
 
         // 1. Corner cut m01 -> m12, carving the corner triangle off and leaving
-        //    the pentagon (the STRAIGHT_CUT intermediate). The corner cut is an
-        //    inner edge (§1 geom_inner).
-        let (new_face, corner_cut_edge) = self.face_split(face, m01, m12).expect("m01-m12 split");
-        geom.faces.push(face);
-        geom.faces.push(new_face);
+        //    the pentagon (the STRAIGHT_CUT intermediate). §1 / §5.2 Output-slot
+        //    note: INNERVERT is non-grid for edges/faces — its connecting edges
+        //    and fragments are *not* inner; only its three verts (the two rim
+        //    midpoints + `c`) are. So geom.out gets the single re-split mark.
+        let (_new_face, corner_cut_edge) = self.face_split(face, m01, m12).expect("m01-m12 split");
+        geom.record_resplit_face(face);
 
         // 2. Inner vert c at the midpoint of the m01-m12 cut. The edge_split
         //    wrapper places c at t = 0.5 and applies the §7.2 two-source blend
         //    of the cut's endpoints (m01, m12) — exactly the documented inner-
-        //    vert rule, *not* the §5.4 face-wide centroid. The split leaves
-        //    `corner_cut_edge` as the m01-c half and yields `c_half` (c-m12);
-        //    both are inner edges, as is c itself an inner vert.
-        let (c, c_half) = self.edge_split(corner_cut_edge, m01, 0.5);
+        //    vert rule, *not* the §5.4 face-wide centroid. `c` is the lone
+        //    non-grid interior vert that is inner (§1); its two interior
+        //    half-edges are *not* inner.
+        let (c, _c_half) = self.edge_split(corner_cut_edge, m01, 0.5);
         // §9.4.2 — the operator-created inner vert is snapped onto the sphere
         // under `use_sphere`, outward from its chord (corner-cut midpoint).
         self.maybe_sphere_project(c, params);
         geom.record_inner_vert(c);
-        geom.record_inner_edge(corner_cut_edge);
-        geom.record_inner_edge(c_half);
 
         // 3. Spoke c -> v3, splitting the pentagon into the two filling quads.
         let pent = self.face_with_both(c, v3);
-        let (quad_b, spoke) = self.face_split(pent, c, v3).expect("c-v3 spoke");
-        geom.faces.push(quad_b);
-        geom.record_inner_edge(spoke);
+        self.face_split(pent, c, v3).expect("c-v3 spoke");
     }
 
     /// §5.2.3 — quad, two **adjacent** edges cut, `PATH`. Lay the `m01`→`m12`
@@ -987,19 +1041,18 @@ impl LoopMesh {
     ) {
         let [m01, _v1, m12, v2, _v3, v0] = Self::adjacent_two_cut_corners(ring);
 
-        // 1. Corner cut m01 -> m12.
-        let (new_face, corner_cut) = self.face_split(face, m01, m12).expect("m01-m12 split");
-        geom.faces.push(face);
-        geom.faces.push(new_face);
-        geom.record_inner_edge(corner_cut);
+        // 1. Corner cut m01 -> m12. §1 / §5.2 Output-slot note: PATH is
+        //    non-grid — its two cuts and three fragments are *not* inner; only
+        //    the two rim midpoints (recorded in §3) are.
+        self.face_split(face, m01, m12).expect("m01-m12 split");
 
         // 2. Chained v0 -> v2 cut across the pentagon {v0, m01, m12, v2, v3},
         //    splitting it into the central quad {v0, m01, m12, v2} and the far-
         //    corner triangle {v0, v2, v3}.
         let pent = self.face_with_both(v0, v2);
-        let (tri_far, chain_cut) = self.face_split(pent, v0, v2).expect("v0-v2 chained cut");
-        geom.faces.push(tri_far);
-        geom.record_inner_edge(chain_cut);
+        self.face_split(pent, v0, v2).expect("v0-v2 chained cut");
+
+        geom.record_resplit_face(face);
     }
 
     /// §5.2.4 — quad, two **adjacent** edges cut, `FAN`. Spoke both rim
@@ -1018,17 +1071,16 @@ impl LoopMesh {
 
         // 1. First spoke m01 -> v3, carving the triangle {v3, v0, m01}.
         let f1 = self.face_with_both(m01, v3);
-        let (tri_a, spoke_a) = self.face_split(f1, m01, v3).expect("m01-v3 spoke");
+        self.face_split(f1, m01, v3).expect("m01-v3 spoke");
         // 2. Second spoke m12 -> v3, carving the triangle {v3, m12, v2}, leaving
         //    the central quad {v3, m01, v1, m12} between the two spokes.
         let f2 = self.face_with_both(m12, v3);
-        let (tri_b, spoke_b) = self.face_split(f2, m12, v3).expect("m12-v3 spoke");
+        self.face_split(f2, m12, v3).expect("m12-v3 spoke");
 
-        geom.faces.push(face);
-        geom.faces.push(tri_a);
-        geom.faces.push(tri_b);
-        geom.record_inner_edge(spoke_a);
-        geom.record_inner_edge(spoke_b);
+        // §1 / §5.2 Output-slot note: FAN is non-grid — the two spokes and the
+        // three fragments are *not* inner; only the two rim midpoints (recorded
+        // in §3) are.
+        geom.record_resplit_face(face);
     }
 
     /// §5.3 — quad, three edges cut. Three of the four edges carry a midpoint
@@ -1072,22 +1124,19 @@ impl LoopMesh {
 
         // m12 -> m01 peels the corner triangle {m01, v1, m12}.
         let f1 = self.face_with_both(m12, m01);
-        let (corner_a, inner_a) = self.face_split(f1, m12, m01).expect("m12-m01 split");
+        self.face_split(f1, m12, m01).expect("m12-m01 split");
         // m12 -> m23 peels the corner triangle {m12, v2, m23}.
         let f2 = self.face_with_both(m12, m23);
-        let (corner_b, inner_b) = self.face_split(f2, m12, m23).expect("m12-m23 split");
+        self.face_split(f2, m12, m23).expect("m12-m23 split");
         // m01 -> m23 splits the remaining pentagon {v0, m01, m12, m23, v3} into
         // the centre triangle {m01, m12, m23} and the quad {v0, m01, m23, v3}.
         let f3 = self.face_with_both(m01, m23);
-        let (centre, inner_c) = self.face_split(f3, m01, m23).expect("m01-m23 split");
+        self.face_split(f3, m01, m23).expect("m01-m23 split");
 
-        geom.faces.push(face);
-        geom.faces.push(corner_a);
-        geom.faces.push(corner_b);
-        geom.faces.push(centre);
-        geom.record_inner_edge(inner_a);
-        geom.record_inner_edge(inner_b);
-        geom.record_inner_edge(inner_c);
+        // §1 — the three-edge quad is *not* a grid fill (§1 lists §5.3 among the
+        // non-grid patterns): its three connecting edges and four fragments are
+        // not inner; only the three rim midpoints (recorded in §3) are.
+        geom.record_resplit_face(face);
     }
 
     /// §5.4 — quad, all four edges cut. Cycle is
@@ -1142,20 +1191,20 @@ impl LoopMesh {
         // Connect the remaining two rim midpoints to c, finishing the four
         // spokes (m01-c and m23-c already exist as the halved diagonal).
         let f_m12 = self.face_with_both(c, m12);
-        let (q_a, _) = self.face_split(f_m12, c, m12).expect("c-m12 split");
+        self.face_split(f_m12, c, m12).expect("c-m12 split");
         let f_m30 = self.face_with_both(c, m30);
-        let (q_b, _) = self.face_split(f_m30, c, m30).expect("c-m30 split");
+        self.face_split(f_m30, c, m30).expect("c-m30 split");
 
+        // §1 / §5.4 Output-slot note: this grid fill marks its interior
+        // geometry inner — `c`, the four "plus" spokes, and the new fragment
+        // faces. One fragment keeps `face`'s identity (the re-split mark) and is
+        // recorded to geom.out only; the rest are inner. The four cells are
+        // exactly c's incident faces.
         geom.record_inner_vert(c);
-        geom.faces.push(face);
-        geom.faces.push(q_a);
-        geom.faces.push(q_b);
-        // The fourth quad is whichever half the last two splits left as `face`'s
-        // sibling; it is already in the mesh and reachable, but to report the
-        // full fragment set we collect every face now incident to c.
+        geom.record_resplit_face(face);
         for f in self.vert_face_keys(c) {
-            if !geom.faces.contains(&f) {
-                geom.faces.push(f);
+            if f != face {
+                geom.record_inner_face(f);
             }
         }
         // The four "plus" spokes are exactly c's incident edges (the halved
@@ -1220,8 +1269,8 @@ impl LoopMesh {
                 // §9.4.1 — radial snap each rim midpoint from its chord position.
                 self.maybe_sphere_project(m, &params);
                 self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
-                geom.verts.push(m);
-                geom.split_verts.push(m);
+                // §1 — every rim midpoint is both a split vert and an inner vert.
+                geom.record_split_vert(m);
             }
             // §1 — the N+1 edge-halves are the segments of the now-subdivided
             // input edge: the consecutive pairs of [near, mids.., far].
@@ -1449,6 +1498,11 @@ impl LoopMesh {
 
         let src_face = face.as_usize();
         self.face_kill(face);
+        // §1 / §5.4 Output-slot note: the lattice fill is grid-style — its
+        // interior verts/edges and its fragment faces are inner. The original
+        // face was killed and rebuilt, so one cell stands in for the re-split
+        // mark (geom.out only); the rest are inner faces.
+        let mut first = true;
         for r in 0..=n {
             for c in 0..=n {
                 let cell = [
@@ -1458,7 +1512,12 @@ impl LoopMesh {
                     node[r + 1][c],
                 ];
                 let f = self.create_lattice_cell(&cell, src_face, geom);
-                geom.faces.push(f);
+                if first {
+                    geom.record_resplit_face(f);
+                    first = false;
+                } else {
+                    geom.record_inner_face(f);
+                }
             }
         }
     }
@@ -1528,19 +1587,30 @@ impl LoopMesh {
 
         let src_face = face.as_usize();
         self.face_kill(face);
+        // §1 / §6.3 Output-slot note: grid-style fill — interior geometry and
+        // fragments are inner; one cell stands in for the re-split mark
+        // (geom.out only) since the original face was killed and rebuilt.
+        let mut first = true;
+        let mut record = |this: &mut Self, cell: &[VertexKey], geom: &mut SubdivideGeom| {
+            let f = this.create_lattice_cell(cell, src_face, geom);
+            if first {
+                geom.record_resplit_face(f);
+                first = false;
+            } else {
+                geom.record_inner_face(f);
+            }
+        };
         for s in 0..=n {
             let upper = n - s; // top index of the down-triangle run
                                // Up triangles.
             for k in 0..=upper {
                 let cell = [rows[s][k], rows[s][k + 1], rows[s + 1][k]];
-                let f = self.create_lattice_cell(&cell, src_face, geom);
-                geom.faces.push(f);
+                record(self, &cell, geom);
             }
             // Down triangles.
             for k in 0..upper {
                 let cell = [rows[s][k + 1], rows[s + 1][k + 1], rows[s + 1][k]];
-                let f = self.create_lattice_cell(&cell, src_face, geom);
-                geom.faces.push(f);
+                record(self, &cell, geom);
             }
         }
     }
@@ -1569,26 +1639,19 @@ impl LoopMesh {
         let run = &sides[cut];
         let _ = (v0, v1);
 
-        geom.faces.push(face);
         // Lower half (parameter < 0.5) fans to v3; upper half to v2.
         let split = (n + 1) / 2;
         for i in 0..n {
             let m = run[i];
             let target = if i < split { v3 } else { v2 };
             let sub = self.face_with_both(m, target);
-            if let Some((new_face, inner)) = self.face_split(sub, m, target) {
-                geom.faces.push(new_face);
-                geom.record_inner_edge(inner);
-            }
+            self.face_split(sub, m, target);
         }
-        // Collect any final residual fragment(s) reachable from the midpoints.
-        for &m in run {
-            for f in self.vert_face_keys(m) {
-                if !geom.faces.contains(&f) {
-                    geom.faces.push(f);
-                }
-            }
-        }
+        // §1 / §5.1 Output-slot note: the one-edge fan is non-grid — its
+        // connecting edges and fragments are *not* inner; only the rim midpoints
+        // (recorded in §3) are. geom.out gets the single re-split mark for
+        // `face`, which survives as one fan fragment.
+        geom.record_resplit_face(face);
     }
 
     /// §9.5.3 — one-edge triangle fan. The single cut edge `corners[0]->
@@ -1608,14 +1671,14 @@ impl LoopMesh {
         let apex = corners[(cut + 2) % 3];
         let run = sides[cut].clone();
 
-        geom.faces.push(face);
         for m in run {
             let sub = self.face_with_both(m, apex);
-            if let Some((new_face, inner)) = self.face_split(sub, m, apex) {
-                geom.faces.push(new_face);
-                geom.record_inner_edge(inner);
-            }
+            self.face_split(sub, m, apex);
         }
+        // §1 / §6.1 Output-slot note: the one-edge tri fan is non-grid — its
+        // apex-connect edges and fragments are *not* inner; only the rim
+        // midpoints (recorded in §3) are. geom.out gets the single re-split mark.
+        geom.record_resplit_face(face);
     }
 }
 
@@ -1888,6 +1951,15 @@ mod tests {
         (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
 
+    /// The actual re-split *fragment* faces in the mesh. §1's `geom.out.faces`
+    /// reports only the one re-split-marked original per re-split face (not the
+    /// fragments), so a test that checks fragment shapes must walk the topology.
+    /// These fixtures start from a single isolated face, so after the op every
+    /// face in the mesh is one of that face's fragments.
+    fn resplit_fragments(mesh: &LoopMesh, _geom: &SubdivideGeom) -> Vec<FaceKey> {
+        mesh.face_keys()
+    }
+
     /// A dihedral fold of two quads hinged about the edge `{v1, v2}` (§9.1.5).
     /// Quad A lies flat in `z = 0`; quad B folds up by `angle` about the hinge.
     /// The hinge verts `v1`/`v2` get bisector normals (divergent from the flat
@@ -2097,9 +2169,13 @@ mod tests {
         assert_eq!((v, e, f), (6, 7, 2), "quad opposite two-cut deltas");
 
         // Both resulting faces are quads (a straight loop cut, no triangles).
-        for f in &geom.faces {
+        let frags = resplit_fragments(&mesh, &geom);
+        assert_eq!(frags.len(), 2, "loop cut yields two fragments");
+        for f in &frags {
             assert_eq!(mesh.face_len(*f), 4, "loop cut yields quads");
         }
+        // geom.out reports a single re-split mark, not both fragments (§1).
+        assert_eq!(geom.faces.len(), 1, "geom.out: one re-split mark");
 
         // The two rim midpoints land at the edge midpoints, and a connecting
         // edge joins them straight across.
@@ -2165,13 +2241,13 @@ mod tests {
         );
 
         // Exactly one triangle and one pentagon fragment.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 5], "1 triangle + 1 pentagon");
 
         // The triangle is the shared-corner cut-off {m01, v1, m12}; v1 is on it.
-        let tri = geom
-            .faces
+        let tri = frags
             .iter()
             .copied()
             .find(|&f| mesh.face_len(f) == 3)
@@ -2184,8 +2260,7 @@ mod tests {
         assert!(tri_verts.contains(&m01) && tri_verts.contains(&m12));
 
         // The pentagon does *not* contain the shared corner v1.
-        let pent = geom
-            .faces
+        let pent = frags
             .iter()
             .copied()
             .find(|&f| mesh.face_len(f) == 5)
@@ -2245,7 +2320,8 @@ mod tests {
 
         // Fragment shapes: one 4-gon (the shared-corner ring {m01,v1,m12,c})
         // plus two quads {v0,m01,c,v3} and {v3,c,m12,v2}.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![4, 4, 4], "4-gon + 2 quads");
 
@@ -2286,13 +2362,13 @@ mod tests {
         );
 
         // Fragment shapes: two triangles + one quad.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 3, 4], "corner tri + central quad + far tri");
 
         // The corner triangle {m01, v1, m12} holds the shared corner v1.
-        let corner_tri = geom
-            .faces
+        let corner_tri = frags
             .iter()
             .copied()
             .find(|&fk| mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v1))
@@ -2301,8 +2377,7 @@ mod tests {
         assert!(cv.contains(&m01) && cv.contains(&m12));
 
         // The far-corner triangle {v0, v2, v3} holds v3 and both uncut corners.
-        let far_tri = geom
-            .faces
+        let far_tri = frags
             .iter()
             .copied()
             .find(|&fk| mesh.face_len(fk) == 3 && mesh.face_vert_keys(fk).contains(&v3))
@@ -2336,14 +2411,14 @@ mod tests {
         );
 
         // Fragment shapes: two triangles + one central quad.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 3, 4], "tri + central quad + tri");
 
         // The central quad {v3, m01, v1, m12} is the only fragment holding the
         // shared corner v1.
-        let central = geom
-            .faces
+        let central = frags
             .iter()
             .copied()
             .find(|&fk| mesh.face_len(fk) == 4)
@@ -2357,8 +2432,7 @@ mod tests {
 
         // v1 appears on exactly one fragment (the central quad); the two flank
         // triangles hold the uncut corners v0 / v2.
-        let holds_v1 = geom
-            .faces
+        let holds_v1 = frags
             .iter()
             .filter(|&&fk| mesh.face_vert_keys(fk).contains(&v1))
             .count();
@@ -2385,7 +2459,8 @@ mod tests {
         let (mesh, geom, _) = adjacent_two_cut(QuadCornerType::StraightCut);
         let (v, e, f) = counts(&mesh);
         assert_eq!((v, e, f), (6, 7, 2), "STRAIGHT_CUT unchanged via setter");
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 5], "1 triangle + 1 pentagon");
     }
@@ -2413,7 +2488,8 @@ mod tests {
         assert_eq!((v, e, f), (7, 10, 4), "quad three-cut deltas");
 
         // Fragment shapes: three triangles + one quad.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 3, 3, 4], "3 triangles + 1 quad");
 
@@ -2451,8 +2527,7 @@ mod tests {
 
         // The lone quad fragment is {v0, m01, m23, v3} and holds the two corners
         // of the uncut edge {v3,v0}.
-        let quad = geom
-            .faces
+        let quad = frags
             .iter()
             .copied()
             .find(|&f| mesh.face_len(f) == 4)
@@ -2492,7 +2567,8 @@ mod tests {
         assert_eq!((v, e, f), (5, 6, 2), "tri two-cut deltas");
 
         // Fragment shapes: one triangle + one quad.
-        let mut lens: Vec<usize> = geom.faces.iter().map(|&f| mesh.face_len(f)).collect();
+        let frags = resplit_fragments(&mesh, &geom);
+        let mut lens: Vec<usize> = frags.iter().map(|&f| mesh.face_len(f)).collect();
         lens.sort_unstable();
         assert_eq!(lens, vec![3, 4], "1 triangle + 1 quad");
 
@@ -2512,8 +2588,7 @@ mod tests {
         );
 
         // The triangle is the cut-off shared corner {m01, v1, m12}; v1 is on it.
-        let tri = geom
-            .faces
+        let tri = frags
             .iter()
             .copied()
             .find(|&f| mesh.face_len(f) == 3)
@@ -2523,8 +2598,7 @@ mod tests {
         assert!(tv.contains(&m01) && tv.contains(&m12));
 
         // The quad {v0, m01, m12, v2} excludes the shared corner v1.
-        let quad = geom
-            .faces
+        let quad = frags
             .iter()
             .copied()
             .find(|&f| mesh.face_len(f) == 4)
@@ -3602,9 +3676,11 @@ mod tests {
 
     #[test]
     fn slots_quad_single_edge() {
-        // §5.1 / §1 — one cut edge of a quad. geom_split: 1 midpoint + the 2
-        // edge-halves of the split input edge. geom_inner: the 2 interior
-        // connecting edges (m→v3, m→v2), no inner vert. geom: the union.
+        // §5.1 / §1.1 — one cut edge of a quad. The §5.1 corner-cut pattern is
+        // non-grid, so it marks *none* of its connecting edges or fragment faces
+        // inner; its only inner contribution is the rim midpoint. The pinned
+        // cardinalities (§1.1): split {1V, 2E, 0F}, inner {1V, 0E, 0F},
+        // geom {1V, 2E, 1F} — the geom face count is 1, not 3.
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let fv = mesh.face_vert_keys(face);
@@ -3615,7 +3691,7 @@ mod tests {
             _ => panic!("expected Ran"),
         };
 
-        // geom_split.
+        // geom_split: the one midpoint + its two edge-halves (§3).
         let split = geom.geom_split();
         assert_eq!(split.verts.len(), 1, "one midpoint in geom_split");
         assert_eq!(split.edges.len(), 2, "two edge-halves in geom_split");
@@ -3631,36 +3707,40 @@ mod tests {
             "each edge-half is incident to the midpoint"
         );
 
-        // geom_inner.
+        // geom_inner: only the rim midpoint is inner; the §5.1 connecting edges
+        // and fragments are *not* (§1.1 inner = {1V, 0E, 0F}).
         let inner = geom.geom_inner();
-        assert!(inner.verts.is_empty(), "no inner vert for the one-cut quad");
-        assert_eq!(inner.edges.len(), 2, "two interior connecting edges");
-        no_dup(inner.edges, "geom_inner.edges");
+        assert_eq!(inner.verts.len(), 1, "the rim midpoint is inner");
+        assert_eq!(inner.verts[0], m, "the inner vert is the rim midpoint");
+        assert!(inner.edges.is_empty(), "§5.1 marks no connecting edge inner");
+        assert!(inner.faces.is_empty(), "§5.1 marks no fragment face inner");
 
-        // geom (union). 1 vert created, 3 edges created (2 halves + ... the two
-        // inner connects are extra, the surviving half overlaps); E went 4→7 so
-        // 3 new + 1 surviving half = the 4 created-or-replaced edges that the
-        // operator touched (2 split + 2 inner).
+        // geom (union): split ∪ inner ∪ {one re-split-marked original face}.
+        // The two connecting edges (m→v3, m→v2) are in *no* mark-set, so the
+        // union edge count is just the 2 split-halves (§1.1 geom = {1V, 2E, 1F}).
         let g = geom.geom();
         assert_eq!(g.verts.len(), 1, "geom union: one created vert");
-        assert_eq!(g.faces.len(), 3, "geom union: 3 fragment faces");
-        // Union edges = the 2 split-halves + 2 inner edges (disjoint sets here).
-        assert_eq!(g.edges.len(), 4, "geom union: 2 split + 2 inner edges");
+        assert_eq!(
+            g.faces.len(),
+            1,
+            "geom union: 1 re-split mark, NOT 3 fragments"
+        );
+        assert_eq!(g.faces[0], face, "the re-split mark is the original face");
+        assert_eq!(g.edges.len(), 2, "geom union: just the 2 split-halves");
         no_dup(g.edges, "geom.edges");
-        // geom_split and geom_inner partition geom's edge set for this pattern.
+        // geom_split alone covers geom's edge set for this non-grid pattern.
         for &e in split.edges {
             assert!(g.edges.contains(&e), "split edge is in the union");
-        }
-        for &e in inner.edges {
-            assert!(g.edges.contains(&e), "inner edge is in the union");
         }
     }
 
     #[test]
     fn slots_quad_four_edges_plus_split() {
-        // §5.4 / §1 — the headline four-cut quad. geom_split: 4 midpoints + 8
-        // edge-halves (each of the 4 input edges → 2). geom_inner: the centre
-        // inner vert + the 4 "plus" spokes. geom: the union (V 5 / E 12 / F 4).
+        // §5.4 / §1 — the headline four-cut quad. This is a grid-style fill, so
+        // it marks its interior geometry inner. geom_split: 4 midpoints + 8
+        // edge-halves. geom_inner: 4 rim midpoints + the centre inner vert (5V),
+        // the 4 "plus" spokes (4E), and the fragment faces minus the one
+        // re-split-marked original (3F). geom: split ∪ inner ∪ the re-split mark.
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let edges = quad_all_edges(&mut mesh, face);
@@ -3677,15 +3757,26 @@ mod tests {
         no_dup(split.edges, "geom_split.edges");
 
         let inner = geom.geom_inner();
-        assert_eq!(inner.verts.len(), 1, "the centre inner vert");
+        // §1 — all 4 rim midpoints are inner, plus the centre vert (5 total).
+        assert_eq!(inner.verts.len(), 5, "4 rim midpoints + 1 centre vert");
+        no_dup(inner.verts, "geom_inner.verts");
         assert_eq!(inner.edges.len(), 4, "the 4 plus-split spokes");
         no_dup(inner.edges, "geom_inner.edges");
-        // The inner vert is the centroid (1, 1, 0); each inner edge meets it.
-        let c = inner.verts[0];
+        // The grid fill marks all but one of its 4 fragments inner (the one that
+        // keeps the original face's identity carries the re-split mark instead).
+        assert_eq!(inner.faces.len(), 3, "4 fragments minus 1 re-split original");
+        no_dup(inner.faces, "geom_inner.faces");
         assert!(
-            mesh.vertex_position(c).distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5,
-            "inner vert at the centroid"
+            !inner.faces.contains(&face),
+            "the original re-split face is not an inner face"
         );
+        // The centre vert is the centroid (1, 1, 0); each inner edge meets it.
+        let c = inner
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| mesh.vertex_position(v).distance(Vec3::new(1.0, 1.0, 0.0)) < 1e-5)
+            .expect("centre vert at the centroid");
         for &e in inner.edges {
             let [a, b] = mesh.edge_vert_keys(e);
             assert!(a == c || b == c, "each spoke meets the inner vert");
@@ -3694,18 +3785,15 @@ mod tests {
         let g = geom.geom();
         assert_eq!(g.verts.len(), 5, "geom union: 4 mid + 1 inner");
         assert_eq!(g.edges.len(), 12, "geom union: 8 split + 4 inner");
-        assert_eq!(g.faces.len(), 4, "geom union: the 2x2 grid faces");
+        assert_eq!(g.faces.len(), 4, "geom union: 3 inner + 1 re-split mark");
         no_dup(g.edges, "geom.edges");
         no_dup(g.verts, "geom.verts");
-        // The union vert/edge sets equal the final mesh totals minus the
-        // pre-existing 4 corners / 0 reused-whole edges.
+        no_dup(g.faces, "geom.faces");
+        assert!(g.faces.contains(&face), "the re-split mark is in the union");
         assert_eq!(counts(&mesh), (9, 12, 4), "four-cut quad deltas");
-        // geom_split ∪ geom_inner = geom for verts and edges (disjoint here).
-        assert_eq!(
-            split.verts.len() + inner.verts.len(),
-            g.verts.len(),
-            "split+inner verts partition the union"
-        );
+        // The midpoints are shared between geom_split and geom_inner, so the
+        // union vert count is split (4) + just the centre (1) = 5, and edges
+        // partition cleanly (split halves vs. inner spokes are disjoint).
         assert_eq!(
             split.edges.len() + inner.edges.len(),
             g.edges.len(),
@@ -3715,10 +3803,10 @@ mod tests {
 
     #[test]
     fn slots_multicut_quad_grid_cuts2() {
-        // §9.5.1 / §1 — fully-cut quad at cuts = 2 (3x3 grid). geom_split: 8
-        // rim midpoints + 16 edge-halves (each of the 4 input edges → 3
-        // segments). geom_inner: the 4 interior lattice verts + the inner
-        // lattice edges; geom: the union (V 16 / E 24 / F 9).
+        // §9.5.1 / §1.1 — fully-cut quad at cuts = 2 (3x3 grid). The pinned
+        // §1.1 cardinalities: split {8V, 12E}, inner {12V, 12E, 8F}, geom
+        // {12V, 24E, 9F}. inner verts = 8 rim midpoints (all inner) + 4 interior
+        // lattice nodes; inner faces = the 9 cells minus the one re-split mark.
         let mut mesh = LoopMesh::new();
         let face = unit_quad(&mut mesh);
         let edges = quad_all_edges(&mut mesh, face);
@@ -3735,9 +3823,13 @@ mod tests {
         no_dup(split.edges, "geom_split.edges");
 
         let inner = geom.geom_inner();
-        assert_eq!(inner.verts.len(), 4, "the 4 interior lattice nodes");
+        // §1 — 8 rim midpoints are inner, plus the 4 interior lattice nodes.
+        assert_eq!(inner.verts.len(), 12, "8 rim midpoints + 4 interior nodes");
         no_dup(inner.verts, "geom_inner.verts");
+        assert_eq!(inner.edges.len(), 12, "the 12 interior lattice edges");
         no_dup(inner.edges, "geom_inner.edges");
+        assert_eq!(inner.faces.len(), 8, "9 cells minus 1 re-split original");
+        no_dup(inner.faces, "geom_inner.faces");
         // No inner edge is one of the rim edge-halves (disjoint slots).
         for &e in inner.edges {
             assert!(
@@ -3751,6 +3843,7 @@ mod tests {
         assert_eq!(g.faces.len(), 9, "geom union: the 3x3 cells");
         no_dup(g.verts, "geom.verts");
         no_dup(g.edges, "geom.edges");
+        no_dup(g.faces, "geom.faces");
         // Union edges = the 12 rim halves + every interior lattice edge; the
         // total matches the final mesh edge count (no edge survives uncut).
         assert_eq!(g.edges.len(), 24, "geom union covers all 24 mesh edges");
