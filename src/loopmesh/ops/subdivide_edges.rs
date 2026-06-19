@@ -1,6 +1,7 @@
 use glam::Vec3;
 use smallvec::SmallVec;
 
+use super::fractal_noise;
 use crate::loopmesh::*;
 
 /// Strategy for the quad-with-two-adjacent-cut-edges re-split
@@ -134,6 +135,28 @@ pub struct SubdivideParams {
     /// the §9.1 machinery is skipped and `smooth` is overloaded as the sphere
     /// radius (§9.4.3). `smooth_falloff` / `use_smooth_even` become inert.
     pub use_sphere: bool,
+    /// Random displacement magnitude (§9.2). The master gain on the per-vert
+    /// fractal jitter: `0.0` (default) is the no-op core (every inserted vert
+    /// stays exactly where §9.1 / §9.4 / the chord placed it). A non-zero value
+    /// roughens the subdivision — each inserted vert is pushed by a
+    /// deterministic turbulence-noise displacement scaled by `fractal` and the
+    /// cut edge's length (§9.2.3). Applied **last**, after the §9.4 sphere /
+    /// §9.1 smooth / chord branch (§9.2.6), so `use_sphere` + `fractal`
+    /// composes into a roughened dome.
+    pub fractal: f32,
+    /// Fraction of the fractal displacement constrained to the surface normal
+    /// (§9.2.4), in `[0, 1]`. Scales **only** the two tangential displacement
+    /// components by `(1 - along_normal)`; the normal-direction component is
+    /// untouched. `0.0` (default) is a free 3-D jitter; `1.0` moves each vert
+    /// only along the averaged endpoint normal (displacement-mapping style). No
+    /// effect when `fractal == 0`.
+    pub along_normal: f32,
+    /// RNG seed for the fractal displacement (§9.2.1). Consumed exactly once,
+    /// up front, to derive the fixed per-operator offset that shifts the noise
+    /// sample domain — so two runs with the same `seed` produce bit-identical
+    /// displacements regardless of vert count or visit order. No effect when
+    /// `fractal == 0`.
+    pub seed: i32,
 }
 
 impl Default for SubdivideParams {
@@ -148,6 +171,9 @@ impl Default for SubdivideParams {
             smooth_falloff: SmoothFalloff::Smooth,
             use_smooth_even: false,
             use_sphere: false,
+            fractal: 0.0,
+            along_normal: 0.0,
+            seed: 0,
         }
     }
 }
@@ -255,6 +281,37 @@ impl SubdivideParams {
     #[must_use]
     pub fn use_sphere(mut self, enabled: bool) -> Self {
         self.use_sphere = enabled;
+        self
+    }
+
+    /// Set the fractal displacement magnitude (§9.2). Defaults to `0.0` (the
+    /// no-op core: every inserted vert keeps its §9.1 / §9.4 / chord position).
+    /// A non-zero value pushes each inserted vert by a deterministic
+    /// turbulence-noise displacement scaled by this value and the cut edge's
+    /// length (§9.2.3), applied last (§9.2.6). The jitter is reproducible for a
+    /// fixed [`Self::seed`].
+    #[must_use]
+    pub fn fractal(mut self, fractal: f32) -> Self {
+        self.fractal = fractal;
+        self
+    }
+
+    /// Bias the fractal jitter onto the surface normal (§9.2.4). Defaults to
+    /// `0.0` (free 3-D displacement). Scales **only** the two tangential
+    /// components by `(1 - along_normal)`; at `1.0` the vert moves only along
+    /// the averaged endpoint normal. No effect when `fractal == 0`.
+    #[must_use]
+    pub fn along_normal(mut self, along_normal: f32) -> Self {
+        self.along_normal = along_normal;
+        self
+    }
+
+    /// Set the fractal RNG seed (§9.2.1). Defaults to `0`. Consumed exactly
+    /// once to derive the fixed per-operator offset, so the jitter is fully
+    /// reproducible for a fixed seed. No effect when `fractal == 0`.
+    #[must_use]
+    pub fn seed(mut self, seed: i32) -> Self {
+        self.seed = seed;
         self
     }
 }
@@ -486,13 +543,19 @@ impl LoopMesh {
 
         let mut geom = SubdivideGeom::default();
 
-        // §9.1.1 — the off-chord offset reads the cut edge's endpoint vertex
-        // normals, which must be current before placement. Freshen all cached
-        // normals once up front; the chord-only core (`smooth == 0`) skips this
-        // and stays bit-identical to the no-displacement path.
-        if params.smooth != 0.0 {
+        // §9.1.1 / §9.2.3 — both the off-chord offset and the fractal basis read
+        // the cut edge's endpoint vertex normals, which must be current before
+        // placement. Freshen all cached normals once up front; the chord-only
+        // core (`smooth == 0 && fractal == 0`) skips this and stays bit-identical
+        // to the no-displacement path.
+        if params.smooth != 0.0 || params.fractal != 0.0 {
             self.mesh_normals_update();
         }
+
+        // §9.2.1 — the seed is consumed exactly once, up front, into a fixed
+        // per-operator offset shared by every inserted vert. `None` when fractal
+        // is off, leaving the core untouched.
+        let fractal_offset = self.fractal_offset(&params);
 
         // A vert op-flag layer tags the freshly-inserted midpoints so phase two
         // can tell original corners from inserted midpoints when it walks a
@@ -513,6 +576,10 @@ impl LoopMesh {
             // §9.1 offset is skipped under `use_sphere` (§9.4.3, sphere wins).
             let placement = (!params.use_sphere && params.smooth != 0.0)
                 .then(|| self.smooth_placement(edge, near, 0.5, &params));
+            // §9.2.3 — snapshot the cut edge's fractal basis (endpoint positions,
+            // length, and angle-weighted endpoint normals) before the split
+            // rewrites the far endpoint.
+            let fractal_ctx = fractal_offset.map(|_| self.fractal_edge_context(edge, near));
             let (m, e_new) = self.edge_split(edge, near, 0.5);
             if let Some(co_final) = placement {
                 self.set_vertex_position(m, co_final);
@@ -521,6 +588,11 @@ impl LoopMesh {
             // §9.4.1 — radial snap onto the origin-centred sphere of radius
             // `smooth`, taken from the inserted midpoint's chord position.
             self.maybe_sphere_project(m, &params);
+            // §9.2.3 / §9.2.6 — fractal is the last placement step, displacing
+            // the vert off its (chord / smooth / sphere) base position.
+            if let (Some(offset), Some(ctx)) = (fractal_offset, &fractal_ctx) {
+                self.apply_fractal(m, offset, ctx, &params);
+            }
             self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
             // §1 — the midpoint and the two edge-halves (`edge` survives as the
             // near-side half, `e_new` is the far-side half) populate geom_split.
@@ -627,6 +699,59 @@ impl LoopMesh {
             let co_sphere = sphere_project(self.vertex_position(v), params.smooth);
             self.set_vertex_position(v, co_sphere);
         }
+    }
+
+    /// §9.2.1 — derive the fixed per-operator fractal offset from the seed, by
+    /// drawing three floats from the hashed RNG and scaling each by `200.0`. The
+    /// RNG is consumed *exactly* here and nowhere else, so the whole pass shares
+    /// one offset and a fixed seed is reproducible. `None` when `fractal == 0`,
+    /// so the core never advances the RNG.
+    fn fractal_offset(&self, params: &SubdivideParams) -> Option<Vec3> {
+        if params.fractal == 0.0 {
+            return None;
+        }
+        let mut rng = fractal_noise::SeededRng::new_hashed(params.seed as u32);
+        Some(Vec3::new(
+            rng.next_float() * 200.0,
+            rng.next_float() * 200.0,
+            rng.next_float() * 200.0,
+        ))
+    }
+
+    /// §9.2.3 — snapshot the cut edge's fractal basis before the split: the
+    /// endpoint positions, the edge length (the displacement scales with it),
+    /// and the **angle-weighted** endpoint vertex normals (the §9.1.5 convention,
+    /// shared with the smooth path; assumes face normals are current). `near` is
+    /// the edge's first endpoint `v_a`.
+    fn fractal_edge_context(&self, edge: EdgeKey, near: VertexKey) -> FractalEdgeContext {
+        let far = self
+            .edges
+            .get(edge)
+            .other_vertex(near)
+            .expect("near_vertex must belong to edge");
+        let co_a = self.vertex_position(near);
+        let co_b = self.vertex_position(far);
+        FractalEdgeContext {
+            edge_len: (co_a - co_b).length(),
+            no_a: self.angle_weighted_vertex_normal(near),
+            no_b: self.angle_weighted_vertex_normal(far),
+        }
+    }
+
+    /// §9.2.3 — displace one inserted vert `v` off its current (chord / smooth /
+    /// sphere) position by the fractal jitter. The displacement is a pure
+    /// function of `v`'s position, the per-operator `offset`, the cut edge `ctx`,
+    /// and the knobs (§9.2.5), so it is reproducible for a fixed seed.
+    fn apply_fractal(
+        &mut self,
+        v: VertexKey,
+        offset: Vec3,
+        ctx: &FractalEdgeContext,
+        params: &SubdivideParams,
+    ) {
+        let co = self.vertex_position(v);
+        let displaced = fractal_displace(co, offset, ctx, params);
+        self.set_vertex_position(v, displaced);
     }
 
     /// Dispatch and apply the §5 / §6 re-split pattern for one touched face.
@@ -1233,11 +1358,16 @@ impl LoopMesh {
         let cuts = params.cuts;
         let mut geom = SubdivideGeom::default();
 
-        // §9.1.1 — endpoint vertex normals must be current before any off-chord
-        // placement. Freshen once; `smooth == 0` keeps the chord-only path.
-        if params.smooth != 0.0 {
+        // §9.1.1 / §9.2.3 — endpoint vertex normals must be current before any
+        // off-chord or fractal placement. Freshen once; the chord-only path
+        // (`smooth == 0 && fractal == 0`) keeps the core untouched.
+        if params.smooth != 0.0 || params.fractal != 0.0 {
             self.mesh_normals_update();
         }
+
+        // §9.2.1 — the seed is consumed exactly once, shared by every inserted
+        // vert. `None` when fractal is off.
+        let fractal_offset = self.fractal_offset(&params);
 
         let midpoint_layer = self.push_vert_op_flag_layer();
         const MIDPOINT: u8 = 1;
@@ -1255,6 +1385,9 @@ impl LoopMesh {
             // §9.4.3 — the §9.1 offset is skipped under `use_sphere` (sphere wins).
             let smooth_ctx = (!params.use_sphere && params.smooth != 0.0)
                 .then(|| self.smooth_endpoint_context(edge, near));
+            // §9.2.3 — snapshot the fractal basis before the split (it reads the
+            // same pre-split endpoint positions / normals).
+            let fractal_ctx = fractal_offset.map(|_| self.fractal_edge_context(edge, near));
             let mids = self.edge_split_n(edge, near, cuts);
             if let Some(ctx) = &smooth_ctx {
                 let denom = cuts as f32 + 1.0;
@@ -1268,6 +1401,10 @@ impl LoopMesh {
             for &m in &mids {
                 // §9.4.1 — radial snap each rim midpoint from its chord position.
                 self.maybe_sphere_project(m, &params);
+                // §9.2.3 / §9.2.6 — fractal is the last placement step.
+                if let (Some(offset), Some(ctx)) = (fractal_offset, &fractal_ctx) {
+                    self.apply_fractal(m, offset, ctx, &params);
+                }
                 self.vert_op_flag_set(midpoint_layer, m, MIDPOINT);
                 // §1 — every rim midpoint is both a split vert and an inner vert.
                 geom.record_split_vert(m);
@@ -1764,6 +1901,75 @@ impl SmoothEndpointContext {
 /// cut chord and lattice node.
 fn sphere_project(co_chord: Vec3, radius: f32) -> Vec3 {
     co_chord.normalize_or_zero() * radius
+}
+
+/// The §9.2.3 fractal basis for one cut edge `{v_a, v_b}`: the edge length (the
+/// displacement scales with it) and the two endpoint vertex normals (the
+/// displacement frame is built from their plain, *un-renormalised* average).
+/// Captured before the split since the split rewrites the far endpoint.
+#[derive(Clone, Copy, Debug)]
+struct FractalEdgeContext {
+    edge_len: f32,
+    no_a: Vec3,
+    no_b: Vec3,
+}
+
+/// §9.2.3 — the per-vert fractal displacement. `co` is the vert's current
+/// (chord / smooth / sphere) position; `offset` is the §9.2.1 per-operator
+/// constant. Returns the displaced position. A pure function — no mesh access.
+fn fractal_displace(
+    co: Vec3,
+    offset: Vec3,
+    ctx: &FractalEdgeContext,
+    params: &SubdivideParams,
+) -> Vec3 {
+    // 1. Magnitude scales with the cut edge's length (§9.2.3 step 1).
+    let fac = params.fractal * ctx.edge_len;
+
+    // 2. Sample point: shift by the per-operator offset, scale by the fixed
+    //    frequency constant 10.0 (§9.2.3 step 2).
+    let sample = (co + offset) * 10.0;
+
+    // 3. Three decorrelated turbulence components, each recentred to ±0.5 and
+    //    scaled by `fac`. The three coordinate orderings are load-bearing
+    //    (§9.2.3 step 3): (x,y,z), (y,x,z), (y,z,x).
+    let t0 = fractal_noise::turbulence(sample.x, sample.y, sample.z) - 0.5;
+    let t1 = fractal_noise::turbulence(sample.y, sample.x, sample.z) - 0.5;
+    let t2 = fractal_noise::turbulence(sample.y, sample.z, sample.x) - 0.5;
+    let tvec = Vec3::new(fac * t0, fac * t1, fac * t2);
+
+    // 4. Apply along the frame derived from the plain (un-renormalised) average
+    //    endpoint normal plus two unit tangents (§9.2.3 step 4). `along_normal`
+    //    attenuates *only* the two tangential components (§9.2.4).
+    let normal = 0.5 * (ctx.no_a + ctx.no_b);
+    let (base1, base2) = fractal_tangent_basis(normal);
+    let tangential = 1.0 - params.along_normal;
+
+    co + normal * tvec.x + base1 * (tvec.y * tangential) + base2 * (tvec.z * tangential)
+}
+
+/// §9.2.3 step 4 — two **unit** vectors perpendicular to `normal` (and to each
+/// other), independent of `normal`'s length. The normal-direction component
+/// carries `normal`'s length itself (§9.2.3's un-renormalised subtlety); only
+/// these two tangents are unit. Falls back to a stable axis-aligned pair when
+/// `normal` is degenerate.
+fn fractal_tangent_basis(normal: Vec3) -> (Vec3, Vec3) {
+    let unit = normal.normalize_or_zero();
+    if unit.length_squared() < 0.5 {
+        return (Vec3::X, Vec3::Y);
+    }
+    // Pick the world axis least aligned with `unit` so the cross product is well
+    // conditioned, then complete a right-handed orthonormal pair.
+    let reference = if unit.x.abs() <= unit.y.abs() && unit.x.abs() <= unit.z.abs() {
+        Vec3::X
+    } else if unit.y.abs() <= unit.z.abs() {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    let base1 = unit.cross(reference).normalize_or_zero();
+    let base2 = unit.cross(base1).normalize_or_zero();
+    (base1, base2)
 }
 
 /// Reflect `n` across the plane whose normal is `dir` (a unit chord direction):
@@ -3849,5 +4055,187 @@ mod tests {
         assert_eq!(g.edges.len(), 24, "geom union covers all 24 mesh edges");
         assert_eq!(split.edges.len() + inner.edges.len(), g.edges.len());
         assert_eq!(counts(&mesh), (16, 24, 9), "cuts=2 grid deltas");
+    }
+
+    // ---- §9.2 fractal / along_normal / seed ----
+
+    /// Cut edge `{0,1}` of the flat `unit_quad` with the given fractal params and
+    /// return `(mesh, geom, midpoint_position)`. The cut edge runs from
+    /// `(0,0,0)` to `(2,0,0)`; its chord midpoint is `(1,0,0)`.
+    fn fractal_cut(params: SubdivideParams) -> (LoopMesh, SubdivideGeom, Vec3) {
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let geom = match mesh.subdivide_edges(&[e01], params) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let pos = mesh.vertex_position(geom.verts[0]);
+        (mesh, geom, pos)
+    }
+
+    #[test]
+    fn fractal_zero_keeps_chord_midpoint() {
+        // §9.2 / §9.2.6 — fractal = 0 is the no-op core: the midpoint stays on
+        // the chord at (1,0,0) and the §5.1 one-edge re-split is unchanged.
+        let (mesh, _geom, pos) = fractal_cut(SubdivideParams::default());
+        assert!(
+            pos.distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-6,
+            "fractal = 0 keeps the chord midpoint, got {pos:?}"
+        );
+        assert_eq!(counts(&mesh), (5, 7, 3), "core single-edge quad re-split");
+    }
+
+    #[test]
+    fn fractal_displaces_midpoint_deterministically() {
+        // §9.2.3 — a non-zero fractal pushes the midpoint off the chord. The
+        // displacement is a deterministic function of seed + position (§9.2.5):
+        // it matches the §9.2 arithmetic computed independently, and is
+        // topology-invariant (counts unchanged vs the fractal = 0 core).
+        let params = SubdivideParams::default().fractal(1.0).seed(1);
+        let (mesh, _geom, pos) = fractal_cut(params);
+
+        assert!(
+            pos.distance(Vec3::new(1.0, 0.0, 0.0)) > 1e-4,
+            "fractal displaces the midpoint off the chord, got {pos:?}"
+        );
+        assert_eq!(
+            counts(&mesh),
+            (5, 7, 3),
+            "fractal is topology-invariant (§9.2)"
+        );
+
+        // Self-check the exact §9.2 placement. On the flat quad both endpoints'
+        // angle-weighted normals are +Z, so the basis matches a known offset and
+        // the in-crate noise port pins the position to the bit.
+        let offset = {
+            let mut rng = fractal_noise::SeededRng::new_hashed(1);
+            Vec3::new(
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+            )
+        };
+        let ctx = FractalEdgeContext {
+            edge_len: 2.0,
+            no_a: Vec3::Z,
+            no_b: Vec3::Z,
+        };
+        let expected = fractal_displace(Vec3::new(1.0, 0.0, 0.0), offset, &ctx, &params);
+        assert!(
+            pos.distance(expected) < 1e-6,
+            "midpoint matches the §9.2 arithmetic exactly: got {pos:?}, want {expected:?}"
+        );
+    }
+
+    #[test]
+    fn fractal_same_seed_reproducible_different_seed_differs() {
+        // §9.2.1 — the RNG is consumed once up front, so a fixed seed is fully
+        // reproducible while a different seed samples a different noise region.
+        let (_m1, _g1, a) = fractal_cut(SubdivideParams::default().fractal(1.0).seed(1));
+        let (_m2, _g2, b) = fractal_cut(SubdivideParams::default().fractal(1.0).seed(1));
+        let (_m3, _g3, c) = fractal_cut(SubdivideParams::default().fractal(1.0).seed(2));
+
+        assert!(a.distance(b) < 1e-9, "same seed -> identical position");
+        assert!(a.distance(c) > 1e-5, "different seed -> different position");
+    }
+
+    #[test]
+    fn fractal_along_normal_constrains_to_normal_axis() {
+        // §9.2.4 — along_normal = 1.0 zeroes the two tangential components, so
+        // the midpoint moves only along the averaged endpoint normal (here +Z,
+        // off the flat z = 0 quad). along_normal = 0.0 is the free 3-D jitter,
+        // which also moves in the in-plane (x, y) directions.
+        let (_mn, _gn, normal_only) =
+            fractal_cut(SubdivideParams::default().fractal(1.0).along_normal(1.0).seed(1));
+        let (_mf, _gf, free_3d) =
+            fractal_cut(SubdivideParams::default().fractal(1.0).along_normal(0.0).seed(1));
+
+        // normal-only: the chord midpoint (1,0,0) moves purely in z.
+        assert!(
+            (normal_only.x - 1.0).abs() < 1e-6 && normal_only.y.abs() < 1e-6,
+            "along_normal = 1 keeps x,y on the chord, got {normal_only:?}"
+        );
+        assert!(
+            normal_only.z.abs() > 1e-5,
+            "along_normal = 1 still displaces along the normal (z), got {normal_only:?}"
+        );
+
+        // free-3D moves off the chord in the tangent plane too, so it differs
+        // from the normal-only run.
+        assert!(
+            free_3d.distance(normal_only) > 1e-5,
+            "along_normal = 0 free-3D differs from normal-only"
+        );
+        // The z (normal) component is shared — along_normal only attenuates the
+        // tangential push, never the normal one (§9.2.4).
+        assert!(
+            (free_3d.z - normal_only.z).abs() < 1e-6,
+            "the normal-direction component is untouched by along_normal"
+        );
+    }
+
+    #[test]
+    fn use_sphere_then_fractal_composes() {
+        // §9.2.6 — fractal is applied *after* the §9.4 sphere snap, so the two
+        // compose into a roughened dome (they are not mutually exclusive). The
+        // displaced vert is off both the chord and the clean sphere point.
+        let mut mesh = LoopMesh::new();
+        let face = sphere_cage_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let params = SubdivideParams::default()
+            .smooth(SPHERE_R)
+            .use_sphere(true)
+            .fractal(1.0)
+            .seed(1);
+        let geom = match mesh.subdivide_edges(&[e01], params) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        let pos = mesh.vertex_position(geom.verts[0]);
+
+        // The clean sphere point (no fractal) is (1,1,0) normalised to radius √3.
+        let sphere_point = Vec3::new(1.0, 1.0, 0.0).normalize() * SPHERE_R;
+        assert!(
+            pos.distance(sphere_point) > 1e-4,
+            "fractal displaces off the sphere point, got {pos:?}"
+        );
+        assert_eq!(
+            counts(&mesh),
+            (5, 7, 3),
+            "sphere + fractal is topology-invariant"
+        );
+
+        // Self-check: the placement is exactly the §9.2 displacement applied to
+        // the sphere point (the base position fractal reads, §9.2.3 step 2 /
+        // §9.2.6). The cut edge's basis (length, angle-weighted endpoint normals)
+        // is read from a clean reference mesh *before* the re-split moves things,
+        // matching what the operator captures pre-split.
+        let offset = {
+            let mut rng = fractal_noise::SeededRng::new_hashed(1);
+            Vec3::new(
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+                rng.next_float() * 200.0,
+            )
+        };
+        let mut reference = LoopMesh::new();
+        let ref_face = sphere_cage_quad(&mut reference);
+        let ref_fv = reference.face_vert_keys(ref_face);
+        reference.mesh_normals_update();
+        let ctx = FractalEdgeContext {
+            edge_len: (reference.vertex_position(ref_fv[0]) - reference.vertex_position(ref_fv[1]))
+                .length(),
+            no_a: reference.angle_weighted_vertex_normal(ref_fv[0]),
+            no_b: reference.angle_weighted_vertex_normal(ref_fv[1]),
+        };
+        let expected = fractal_displace(sphere_point, offset, &ctx, &params);
+        assert!(
+            pos.distance(expected) < 1e-5,
+            "sphere+fractal matches §9.2 arithmetic: got {pos:?}, want {expected:?}"
+        );
     }
 }

@@ -33,6 +33,7 @@ mod extrude_vert_indiv;
 mod face_poke;
 mod face_triangulate;
 mod find_doubles;
+mod fractal_noise;
 mod inset_individual;
 mod inset_region;
 mod join_triangles;
