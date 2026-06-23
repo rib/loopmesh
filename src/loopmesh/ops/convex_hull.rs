@@ -186,7 +186,8 @@ impl LoopMesh {
     /// classification (CONVEX_HULL.md §4, §4.1, §7): every input vert not on the
     /// hull is interior, and an interior vert is unused when all its incident
     /// elements are themselves input (verts-only ⇒ a buried vert is loose ⇒
-    /// unused). The customdata example-face seed (§6.1) is not yet implemented.
+    /// unused). A fresh hull face bordering a pre-existing non-input neighbour
+    /// inherits its customdata verbatim (the example-face seed, §6.1).
     /// For mixed input (input edges/faces routed into the classification) see
     /// [`Self::convex_hull_with_input`]; for the `use_existing_faces` reuse path
     /// (§5) and the `geom_holes.out` slot see [`Self::convex_hull_with_faces`].
@@ -230,8 +231,9 @@ impl LoopMesh {
     /// `input_faces` are routed into `geom_interior.out` / `geom_unused.out`
     /// (§4.2, §7) exactly as [`Self::convex_hull_with_input`] with an empty
     /// input-edge set — every input face is interior unless reused as a hole,
-    /// and an interior face is always unused. The customdata example-face seed
-    /// (§6.1) is not yet implemented.
+    /// and an interior face is always unused. A fresh hull face bordering a
+    /// pre-existing non-input neighbour inherits its customdata verbatim (the
+    /// example-face seed, §6.1).
     pub fn convex_hull_with_faces(
         &mut self,
         verts: &[VertexKey],
@@ -262,8 +264,9 @@ impl LoopMesh {
     /// geometry.
     ///
     /// `use_existing_faces` (§5) behaves exactly as
-    /// [`Self::convex_hull_with_faces`]. The customdata example-face seed (§6.1)
-    /// is not yet implemented.
+    /// [`Self::convex_hull_with_faces`]. A fresh hull face bordering a
+    /// pre-existing non-input neighbour inherits its customdata verbatim (the
+    /// example-face seed, §6.1).
     pub fn convex_hull_with_input(
         &mut self,
         verts: &[VertexKey],
@@ -351,12 +354,40 @@ impl LoopMesh {
             // face's stored normal points outward. `face_create_verts` with
             // NO_DUPLICATE performs both the no-double edge creation (§6 step 1)
             // and the face find-or-create (§6 step 2) in one call.
+            //
+            // §6.1 — find the per-face example *before* the build, while the
+            // three boundary edges may still carry only their pre-existing
+            // neighbour: a freshly-minted hull edge has no other face, so the
+            // example is always found across a *reused* edge that already
+            // bordered existing geometry (an input face is eligible — §6.1).
+            let example = self.find_example_face(a, b, c, &seen_faces, &hole_faces);
+
+            // §6 step 2 — find-or-create. A NO_DUPLICATE build that *reuses* an
+            // existing face (its footprint already spanned by a face) keeps that
+            // face's own customdata live and is not re-seeded (§6 step 2); only a
+            // genuinely fresh face takes the example-face seed (§6 step 3). The
+            // face-count delta distinguishes the two.
+            let faces_before = self.face_count();
             let face = self.face_create_verts(&[a, b, c], FaceCreateFlags::NO_DUPLICATE);
+            let freshly_built = self.face_count() != faces_before;
 
             // §4.3 / §6 step 4 — flag the face, its edges, and its verts
             // on-hull as they are materialised.
             if seen_faces.insert(face) {
                 result.faces.push(face);
+                // §6 step 3 — seed the fresh face's customdata by **two distinct
+                // verbatim copies on two domains** (never an interpolation): the
+                // per-face layers from the single example neighbour (§6.1), and
+                // the per-loop layers by the separate `BM_face_copy_shared`-equiv
+                // vertex-matched write-once pass over the shared-edge neighbours
+                // (§6 step 3). Only a genuinely fresh face takes the seed (a
+                // reused face's customdata is already live, §6 step 2).
+                if freshly_built {
+                    if let Some(example) = example {
+                        self.copy_example_face_data(face, example);
+                    }
+                    self.copy_shared_corner_data(face);
+                }
             }
             for vert in [a, b, c] {
                 on_hull_verts.insert(vert);
@@ -552,6 +583,135 @@ impl LoopMesh {
             }
         }
         None
+    }
+
+    /// CONVEX_HULL.md §6.1 — find the **per-face** example face for a fresh hull
+    /// triangle. This governs **only** the per-face copy of §6 step 3; the
+    /// per-loop data is sourced separately and per-edge (see
+    /// [`Self::copy_shared_corner_data`]).
+    ///
+    /// The criterion is broadened from "external neighbour" to **any face that is
+    /// an input face OR a face not (yet) flagged as a hull-output face** — i.e.
+    /// an already-present neighbour that is not one of the new hull faces this
+    /// operator is building (nor a reused-as-hole facet). Input faces are
+    /// **eligible**; the only exclusions are the operator's own built / reused
+    /// hull-output faces. The scan walks the triangle's three edges in order
+    /// `(a,b), (b,c), (c,a)`, and within each edge in radial-cycle order,
+    /// returning the *first* eligible neighbour — the choice is position-dependent
+    /// and affects customdata values, not incidence. A freshly-minted hull edge
+    /// has no other face, so the match is always across a reused edge that
+    /// already bordered existing geometry; `None` when no such neighbour exists
+    /// (e.g. a hull over a pure loose-vert cloud), in which case the per-face
+    /// data falls back to defaults.
+    fn find_example_face(
+        &self,
+        a: VertexKey,
+        b: VertexKey,
+        c: VertexKey,
+        built_faces: &HashSet<FaceKey>,
+        hole_faces: &HashSet<FaceKey>,
+    ) -> Option<FaceKey> {
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            let Some(edge) = self.query_edge_exists(u, v) else {
+                continue;
+            };
+            for loop_key in self.iter_radial_loops(edge) {
+                let face = self.loop_face(loop_key);
+                if built_faces.contains(&face) || hole_faces.contains(&face) {
+                    continue;
+                }
+                return Some(face);
+            }
+        }
+        None
+    }
+
+    /// CONVEX_HULL.md §6 step 3, per-face half — copy `example`'s per-face
+    /// customdata onto `face` *verbatim* (the `BM_elem_attrs_copy` semantics of
+    /// BMESH_API.md §11, a copy and not an interpolation). This carries **only**
+    /// the per-face layers; the new face's three corners still hold default loop
+    /// data afterwards — the per-loop layers are filled separately by
+    /// [`Self::copy_shared_corner_data`].
+    fn copy_example_face_data(&mut self, face: FaceKey, example: FaceKey) {
+        if !self.face_attribs.is_empty() {
+            self.face_attribs
+                .copy_into(face.as_usize(), example.as_usize());
+        }
+    }
+
+    /// CONVEX_HULL.md §6 step 3, per-loop half — the `BM_face_copy_shared`
+    /// equivalent (BMESH_API.md §11). For each of `face`'s edges that has a
+    /// radially-adjacent neighbour face, copy that neighbour's two corner blocks
+    /// onto `face`'s two corners at the shared edge's endpoints, **matched by
+    /// vertex** (the destination corner at vertex `v` receives the neighbour's
+    /// corner at the same vertex `v`), verbatim. The per-loop source is **each
+    /// edge's own radial neighbour** (up to three different neighbours), *not* the
+    /// per-face example. A corner whose touching edges have no other face keeps
+    /// its default loop data.
+    ///
+    /// **Write-once per corner — first shared edge in loop-iteration order
+    /// wins.** Each corner sits on two of `face`'s edges, both of which may carry
+    /// a (distinct) neighbour; the walk visits the loops in loop order and a
+    /// destination corner is written **at most once**, by the *first* shared edge
+    /// reached that touches it. A corner already filled by an earlier edge is
+    /// left untouched when a later edge's neighbour would otherwise write it.
+    fn copy_shared_corner_data(&mut self, face: FaceKey) {
+        if self.loop_attribs.is_empty() {
+            return;
+        }
+
+        // Write-once per destination corner: a corner already supplied by an
+        // earlier shared edge is not overwritten by a later edge's neighbour.
+        let mut filled: HashSet<LoopKey> = HashSet::new();
+
+        // Walk `face`'s loops in loop order (no allocation — a manual loop-link
+        // walk, as the wall/cap copies in `extrude_region` do). Each loop sits on
+        // one of `face`'s edges; `start` is `loop_edge(loop)`'s start corner and
+        // `loop_next(start)` is its end corner.
+        let first = self.face_first_loop(face);
+        let mut start = first;
+        loop {
+            let end = self.loop_next(start);
+            let edge = self.loop_edge(start);
+
+            // The neighbour across this shared edge: the first loop in the edge's
+            // radial cycle that belongs to a *different* face. A freshly-minted
+            // hull edge has only `face`'s loop, so there is no neighbour.
+            let mut neighbour: Option<LoopKey> = None;
+            for radial in self.iter_radial_loops(edge) {
+                if self.loop_face(radial) != face {
+                    neighbour = Some(radial);
+                    break;
+                }
+            }
+
+            if let Some(neighbour_loop) = neighbour {
+                // The neighbour's two corners on this edge: `neighbour_loop` at
+                // its own vertex, `loop_next(neighbour_loop)` at the edge's other
+                // endpoint. Match each destination corner to the neighbour corner
+                // at the *same* vertex (winding-independent).
+                let neighbour_next = self.loop_next(neighbour_loop);
+                for &source in &[neighbour_loop, neighbour_next] {
+                    let source_vertex = self.loop_vertex(source);
+                    let target = if self.loop_vertex(start) == source_vertex {
+                        start
+                    } else if self.loop_vertex(end) == source_vertex {
+                        end
+                    } else {
+                        continue;
+                    };
+                    if filled.insert(target) {
+                        self.loop_attribs
+                            .copy_into(target.as_usize(), source.as_usize());
+                    }
+                }
+            }
+
+            start = end;
+            if start == first {
+                break;
+            }
+        }
     }
 
     /// CONVEX_HULL.md §5 hole-cleanup pass. Mutates `hole_faces` in place
@@ -1574,6 +1734,365 @@ mod tests {
                 normal.dot(face_point - center) > 0.0,
                 "built hull face {face:?} must be wound outward"
             );
+        }
+        mesh.validate_topology();
+    }
+
+    /// Register a per-face and a per-loop i32 layer, returning their attribute
+    /// handles. The convex_hull glob (`use crate::loopmesh::*`) re-exports the
+    /// attribute vocabulary.
+    fn register_cd_layers(mesh: &mut LoopMesh) -> (ElementAttributeKey, ElementAttributeKey) {
+        let face_layer = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("face_tag"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        let loop_layer = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("loop_tag"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        (face_layer, loop_layer)
+    }
+
+    #[test]
+    fn fresh_hull_face_inherits_neighbour_customdata_verbatim() {
+        // §6.1 / §6 step 3 — a fresh hull triangle that borders a pre-existing
+        // neighbour face across a *reused* edge inherits that neighbour's
+        // per-face customdata (the §6.1 example) AND its per-loop customdata via
+        // the vertex-matched `BM_face_copy_shared` pass (a copy, not an
+        // interpolation). Only the two corners on the shared edge are filled; the
+        // third (unshared) corner stays at default.
+        let mut mesh = LoopMesh::new();
+        let (face_layer, loop_layer) = register_cd_layers(&mut mesh);
+
+        let input = cloud(&mut mesh, &tetra_positions());
+        // A non-input vertex outside the hull, sharing the hull edge
+        // (input[0], input[1]) via a neighbour face. That edge bounds a tetra
+        // facet, so the hull's surgery reuses it and the neighbour is found
+        // across it.
+        let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
+        let neighbour =
+            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+
+        // Distinctive customdata on the neighbour: a face-layer value and a
+        // single loop-layer value on every corner (so the per-loop copy is
+        // unambiguous whichever corner is the verbatim source).
+        const FACE_VALUE: i32 = 4242;
+        const LOOP_VALUE: i32 = 777;
+        assert!(mesh
+            .face_attribs_mut()
+            .set_i32(face_layer, neighbour.as_usize(), FACE_VALUE));
+        for loop_key in mesh.face_loop_keys(neighbour) {
+            assert!(mesh
+                .loop_attribs_mut()
+                .set_i32(loop_layer, loop_key.as_usize(), LOOP_VALUE));
+        }
+
+        let result = mesh.convex_hull_with_input(&input, &[], &[], false);
+
+        // Find the built hull face spanning {input[0], input[1], input[2]} —
+        // the facet that shares the reused (input[0], input[1]) edge with the
+        // neighbour.
+        let seeded = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| {
+                let vs = mesh.face_vert_keys(f);
+                vs.contains(&input[0]) && vs.contains(&input[1])
+            })
+            .expect("a hull facet must use the reused (input[0], input[1]) edge");
+
+        // Per-face customdata copied verbatim from the example face.
+        assert_eq!(
+            mesh.face_attribs().get_i32(face_layer, seeded.as_usize()),
+            Some(FACE_VALUE),
+            "the fresh hull face inherits the neighbour's per-face customdata verbatim"
+        );
+
+        // Per-loop customdata: the two corners on the shared (input[0], input[1])
+        // edge inherit the neighbour's value; the unshared corner stays default.
+        for loop_key in mesh.face_loop_keys(seeded) {
+            let v = mesh.loop_vertex(loop_key);
+            let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
+            if v == input[0] || v == input[1] {
+                assert_eq!(got, Some(LOOP_VALUE), "shared-edge corner inherits per-loop CD");
+            } else {
+                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn shared_corner_data_is_vertex_matched_not_broadcast() {
+        // §6 step 3 (the per-loop `BM_face_copy_shared` pass) — a neighbour with
+        // **different** values on its different corners. A vertex-matched copy and
+        // a broadcast-from-first-corner give different results; assert the
+        // triangle's corners receive the **vertex-matched** values.
+        //
+        // The neighbour spans (input[0], input[1], outsider) and carries a
+        // distinct per-corner value at each of input[0] / input[1]. The hull
+        // facet sharing the (input[0], input[1]) edge must receive the
+        // neighbour's value *at the matching vertex* on each of those two
+        // corners.
+        let mut mesh = LoopMesh::new();
+        let (_face_layer, loop_layer) = register_cd_layers(&mut mesh);
+
+        let input = cloud(&mut mesh, &tetra_positions());
+        let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
+        let neighbour =
+            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+
+        // Distinct value per neighbour corner, keyed by which vertex the corner
+        // sits at.
+        const VALUE_AT_0: i32 = 11;
+        const VALUE_AT_1: i32 = 22;
+        const VALUE_AT_OUTSIDER: i32 = 33;
+        for loop_key in mesh.face_loop_keys(neighbour) {
+            let v = mesh.loop_vertex(loop_key);
+            let value = if v == input[0] {
+                VALUE_AT_0
+            } else if v == input[1] {
+                VALUE_AT_1
+            } else {
+                VALUE_AT_OUTSIDER
+            };
+            assert!(mesh
+                .loop_attribs_mut()
+                .set_i32(loop_layer, loop_key.as_usize(), value));
+        }
+
+        let result = mesh.convex_hull_with_input(&input, &[], &[], false);
+
+        let seeded = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| {
+                let vs = mesh.face_vert_keys(f);
+                vs.contains(&input[0]) && vs.contains(&input[1])
+            })
+            .expect("a hull facet must use the reused (input[0], input[1]) edge");
+
+        // The corner at input[0] gets VALUE_AT_0, the corner at input[1] gets
+        // VALUE_AT_1 — a broadcast-from-first-corner would put the *same* value on
+        // both. The third (unshared) corner stays default.
+        for loop_key in mesh.face_loop_keys(seeded) {
+            let v = mesh.loop_vertex(loop_key);
+            let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
+            if v == input[0] {
+                assert_eq!(got, Some(VALUE_AT_0), "corner at input[0] gets the matching value");
+            } else if v == input[1] {
+                assert_eq!(got, Some(VALUE_AT_1), "corner at input[1] gets the matching value");
+            } else {
+                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn shared_corner_write_once_first_edge_in_loop_order_wins() {
+        // §6 step 3 write-once tie-break — a triangle corner shared by **two**
+        // edges whose neighbours carry **different** loop CD. The earlier-visited
+        // edge in loop-iteration order supplies that corner; the later edge's
+        // write to the same corner is dropped (its other endpoint still lands).
+        //
+        // Fixture: a flat hull over four coplanar square corners. The square
+        // facet fans into two triangles. We surround the patch with two neighbour
+        // faces across two adjacent boundary edges that meet at one shared corner,
+        // each carrying a distinct per-loop value — so exactly one hull-facet
+        // corner is contested by two differently-attributed neighbours.
+        let mut mesh = LoopMesh::new();
+        let (_face_layer, loop_layer) = register_cd_layers(&mut mesh);
+
+        // A square in the z = 0 plane.
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(-1.0, -1.0, 0.0), // 0
+                Vec3::new(1.0, -1.0, 0.0),  // 1
+                Vec3::new(1.0, 1.0, 0.0),   // 2
+                Vec3::new(-1.0, 1.0, 0.0),  // 3
+            ],
+        );
+
+        // Two neighbour faces across two square edges that meet at corner
+        // input[1]: one across (input[0], input[1]), one across (input[1],
+        // input[2]). Both carry a distinct per-corner value at input[1].
+        let out_a = mesh.create_vertex(Vec3::new(0.0, -3.0, 0.0));
+        let out_b = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let neighbour_a =
+            mesh.face_create_verts(&[input[0], input[1], out_a], FaceCreateFlags::NO_DUPLICATE);
+        let neighbour_b =
+            mesh.face_create_verts(&[input[1], input[2], out_b], FaceCreateFlags::NO_DUPLICATE);
+
+        const VALUE_A_AT_1: i32 = 100;
+        const VALUE_B_AT_1: i32 = 200;
+        for loop_key in mesh.face_loop_keys(neighbour_a) {
+            if mesh.loop_vertex(loop_key) == input[1] {
+                assert!(mesh
+                    .loop_attribs_mut()
+                    .set_i32(loop_layer, loop_key.as_usize(), VALUE_A_AT_1));
+            }
+        }
+        for loop_key in mesh.face_loop_keys(neighbour_b) {
+            if mesh.loop_vertex(loop_key) == input[1] {
+                assert!(mesh
+                    .loop_attribs_mut()
+                    .set_i32(loop_layer, loop_key.as_usize(), VALUE_B_AT_1));
+            }
+        }
+
+        let result = mesh.convex_hull(&input);
+
+        // The hull facet that owns the contested corner input[1] sits on both the
+        // (input[0], input[1]) and (input[1], input[2]) edges (a fan apex/spoke).
+        let facet = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| {
+                let vs = mesh.face_vert_keys(f);
+                vs.contains(&input[0]) && vs.contains(&input[1]) && vs.contains(&input[2])
+            })
+            .expect("a fan triangle must span input[0], input[1], input[2]");
+
+        // Read the contested corner's value.
+        let mut contested: Option<i32> = None;
+        for loop_key in mesh.face_loop_keys(facet) {
+            if mesh.loop_vertex(loop_key) == input[1] {
+                contested = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
+            }
+        }
+        let contested = contested.expect("corner at input[1] is present");
+        assert!(
+            contested == VALUE_A_AT_1 || contested == VALUE_B_AT_1,
+            "the contested corner takes exactly one neighbour's value, not a blend or default"
+        );
+
+        // Decide independently which shared edge is visited **first** in the
+        // facet's loop order — the write-once precedence claim. A corner is
+        // written when its containing shared edge is reached; the loop walk visits
+        // edges in `face_loop_keys` order, so the first of the two contested edges
+        // to appear supplies the contested corner.
+        let mut expected: Option<i32> = None;
+        for loop_key in mesh.face_loop_keys(facet) {
+            let u = mesh.loop_vertex(loop_key);
+            let w = mesh.loop_vertex(mesh.loop_next(loop_key));
+            let edge = std::collections::HashSet::from([u, w]);
+            if edge == std::collections::HashSet::from([input[0], input[1]]) {
+                expected = Some(VALUE_A_AT_1);
+                break;
+            }
+            if edge == std::collections::HashSet::from([input[1], input[2]]) {
+                expected = Some(VALUE_B_AT_1);
+                break;
+            }
+        }
+        let expected = expected.expect("the facet visits one of the two contested edges first");
+        assert_eq!(
+            contested, expected,
+            "the first shared edge in loop order wins the contested corner — \
+             the later edge's write is dropped (not last-writer-wins, not a blend)"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn fresh_hull_face_with_no_neighbour_gets_default_customdata() {
+        // §6.1 — a hull over a pure loose-vert cloud has no non-input neighbour
+        // across any edge, so every fresh face keeps DEFAULT customdata (not some
+        // distinctive value). Pinned by registering a layer (default 0) and
+        // asserting the hull faces stay at the default.
+        let mut mesh = LoopMesh::new();
+        let (face_layer, loop_layer) = register_cd_layers(&mut mesh);
+
+        let input = cloud(&mut mesh, &tetra_positions());
+        let result = mesh.convex_hull(&input);
+
+        assert_eq!(result.faces().len(), 4, "the loose tetra cloud builds four faces");
+        for &face in result.faces() {
+            assert_eq!(
+                mesh.face_attribs().get_i32(face_layer, face.as_usize()),
+                Some(0),
+                "a face with no neighbour keeps default per-face customdata"
+            );
+            for loop_key in mesh.face_loop_keys(face) {
+                assert_eq!(
+                    mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize()),
+                    Some(0),
+                    "a face with no neighbour keeps default per-loop customdata"
+                );
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn input_neighbour_face_is_eligible_as_example() {
+        // §6.1 (corrected) — an **input** face IS eligible as the per-face
+        // example (the criterion accepts any face that is an input face OR not
+        // yet flagged a hull-output face). Here the only neighbour across the
+        // reused hull edge (input[0], input[1]) is an input face, so the fresh
+        // hull facet inherits its per-face customdata (and, since the same face
+        // is the shared-edge neighbour, its per-loop customdata via
+        // `BM_face_copy_shared`).
+        let mut mesh = LoopMesh::new();
+        let (face_layer, loop_layer) = register_cd_layers(&mut mesh);
+
+        let input = cloud(&mut mesh, &tetra_positions());
+        let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
+        // A neighbour across the hull edge (input[0], input[1]) — and it IS an
+        // input face this time. The corrected criterion accepts it.
+        let input_neighbour =
+            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+
+        const FACE_VALUE: i32 = 4242;
+        const LOOP_VALUE: i32 = 777;
+        assert!(mesh
+            .face_attribs_mut()
+            .set_i32(face_layer, input_neighbour.as_usize(), FACE_VALUE));
+        for loop_key in mesh.face_loop_keys(input_neighbour) {
+            assert!(mesh
+                .loop_attribs_mut()
+                .set_i32(loop_layer, loop_key.as_usize(), LOOP_VALUE));
+        }
+
+        // Pass the neighbour as an input face — it must still be eligible as the
+        // example (input faces are NOT rejected, per the corrected §6.1).
+        let result = mesh.convex_hull_with_input(&input, &[], &[input_neighbour], false);
+
+        let candidate = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| {
+                let vs = mesh.face_vert_keys(f);
+                vs.contains(&input[0]) && vs.contains(&input[1])
+            })
+            .expect("a hull facet must use the (input[0], input[1]) edge");
+
+        // Per-face customdata inherited from the input example face.
+        assert_eq!(
+            mesh.face_attribs().get_i32(face_layer, candidate.as_usize()),
+            Some(FACE_VALUE),
+            "an input neighbour IS chosen as the example face — per-face CD inherited"
+        );
+        // Per-loop: the two corners on the shared (input[0], input[1]) edge get
+        // the neighbour's loop values; the third (unshared) corner stays default.
+        for loop_key in mesh.face_loop_keys(candidate) {
+            let v = mesh.loop_vertex(loop_key);
+            let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
+            if v == input[0] || v == input[1] {
+                assert_eq!(got, Some(LOOP_VALUE), "shared-edge corner inherits per-loop CD");
+            } else {
+                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+            }
         }
         mesh.validate_topology();
     }
