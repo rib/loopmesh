@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use glam::{Vec2, Vec3};
 
 use crate::loopmesh::*;
-use crate::triangulate::{axis_dominant_basis_negated, ear_clip};
+use crate::triangulate::{axis_dominant_basis, axis_dominant_basis_negated, ear_clip};
 
 /// Axis-aligned 2D bounding box of a component's projected vertices,
 /// used by the §1.2.3 hole-coalesce pass.
@@ -321,7 +321,18 @@ impl LoopMesh {
             Some(n) if n.length_squared() > MIN_NORMAL_LEN_SQ => (n.normalize(), false),
             _ => (self.triangle_fill_derive_normal(outer), true),
         };
-        let (axis_u, axis_w) = axis_dominant_basis_negated(fill_normal);
+        // §3 — a supplied normal sets the projection plane *and* the default
+        // orientation: the fill must face `+normal` (wound CCW seen from
+        // `+normal`). The `+n` frame's third axis is `+n`, so a CCW projected
+        // loop materialises facing `+n`. The derived-normal path uses the `-n`
+        // frame (its CW projection is what the §4 winding vote and the
+        // ear-clip kernel expect) — a free loop has no inherent front and the
+        // vote corrects orientation against any boundary faces.
+        let (axis_u, axis_w) = if normal_was_derived {
+            axis_dominant_basis_negated(fill_normal)
+        } else {
+            axis_dominant_basis(fill_normal)
+        };
         let project = |mesh: &LoopMesh, v: VertexKey| {
             let p = mesh.vertex_position(v);
             Vec2::new(axis_u.dot(p), axis_w.dot(p))
@@ -998,13 +1009,13 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// Fill a fresh pentagon ring with the supplied projection normal and
-    /// return the (consistent) sign of each fill face's normal along the
-    /// supplied axis. The ring is rebuilt each call so vertex/edge ordering is
-    /// identical across calls — only the supplied normal differs.
-    fn pentagon_fill_face_signs(supplied: Vec3) -> Vec<f32> {
+    /// Fill a fresh n-gon ring with the supplied projection normal and return
+    /// each fill face's normal projected onto the supplied axis. The ring is
+    /// rebuilt each call so vertex/edge ordering is identical across calls —
+    /// only the supplied normal differs.
+    fn ring_fill_face_dots(n: usize, supplied: Vec3) -> Vec<f32> {
         let mut mesh = LoopMesh::new();
-        let edges = convex_wire_ring(&mut mesh, 5);
+        let edges = convex_wire_ring(&mut mesh, n);
         let result = mesh.triangle_fill(
             &edges,
             &TriangleFillParams {
@@ -1013,7 +1024,7 @@ mod tests {
                 normal: Some(supplied),
             },
         );
-        assert_eq!(result.faces().len(), 3, "pentagon → n-2 = 3 triangles");
+        assert_eq!(result.faces().len(), n - 2, "n-gon → n-2 triangles");
         mesh.validate_topology();
         result
             .faces()
@@ -1028,17 +1039,70 @@ mod tests {
     #[test]
     fn explicit_normal_supplied_projects_and_winds_consistently() {
         // A supplied non-zero normal is authoritative (§3/§4): it is used
-        // directly as the projection plane and the §4 winding vote is skipped.
-        // The guide guarantees the fill is *consistently* wound (the sweep
-        // emits a consistently-wound triangle set); it does not tie the face
-        // normals' sign to the supplied normal's sign, so assert consistency,
-        // not a particular hemisphere.
-        let signs = pentagon_fill_face_signs(Vec3::new(0.0, 0.3, 1.0));
-        let first = signs[0].signum();
+        // directly as the projection plane, the §4 winding vote is skipped, and
+        // §3 fixes the default orientation so the fill *faces the supplied
+        // normal* (wound CCW seen from +normal). Every fill face's normal must
+        // therefore agree with the supplied normal (positive dot), and the fill
+        // must be consistently wound.
+        let dots = ring_fill_face_dots(5, Vec3::new(0.0, 0.3, 1.0));
         assert!(
-            signs.iter().all(|s| s.signum() == first && s.abs() > 0.0),
-            "fill must be consistently wound for a supplied normal: {signs:?}"
+            dots.iter().all(|d| *d > 0.0),
+            "fill must face the supplied normal (positive dot): {dots:?}"
         );
+    }
+
+    #[test]
+    fn explicit_normal_sign_flips_fill_orientation() {
+        // §3: the supplied normal's sign drives the fill orientation. A +Z
+        // normal yields fill faces pointing +Z; a −Z normal yields faces
+        // pointing −Z. Flipping the supplied normal flips the fill.
+        for &n in &[5usize, 6] {
+            let plus = ring_fill_face_dots(n, Vec3::Z);
+            assert!(
+                plus.iter().all(|d| *d > 0.0),
+                "+Z supplied normal must make fill faces point +Z: {plus:?}"
+            );
+
+            let minus = ring_fill_face_dots(n, -Vec3::Z);
+            assert!(
+                minus.iter().all(|d| *d > 0.0),
+                "−Z supplied normal must make fill faces point −Z: {minus:?}"
+            );
+
+            // Cross-check the raw (un-projected) Z component flips sign with the
+            // supplied normal: +Z fill faces have positive Z, −Z negative Z.
+            let mut mesh_plus = LoopMesh::new();
+            let edges_plus = convex_wire_ring(&mut mesh_plus, n);
+            let res_plus = mesh_plus.triangle_fill(
+                &edges_plus,
+                &TriangleFillParams {
+                    use_beauty: false,
+                    use_dissolve: false,
+                    normal: Some(Vec3::Z),
+                },
+            );
+            let mut mesh_minus = LoopMesh::new();
+            let edges_minus = convex_wire_ring(&mut mesh_minus, n);
+            let res_minus = mesh_minus.triangle_fill(
+                &edges_minus,
+                &TriangleFillParams {
+                    use_beauty: false,
+                    use_dissolve: false,
+                    normal: Some(-Vec3::Z),
+                },
+            );
+            for &face in res_plus.faces() {
+                mesh_plus.face_normal_update(face);
+                assert!(mesh_plus.face_normal(face).z > 0.0, "+Z fill face faces +Z");
+            }
+            for &face in res_minus.faces() {
+                mesh_minus.face_normal_update(face);
+                assert!(
+                    mesh_minus.face_normal(face).z < 0.0,
+                    "−Z fill face faces −Z"
+                );
+            }
+        }
     }
 
     #[test]
