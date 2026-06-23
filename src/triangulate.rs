@@ -293,11 +293,39 @@ pub struct BeautifySwap {
 /// surrounding edges with an area-scaled epsilon threshold to suppress
 /// endless near-zero swaps.
 pub fn beautify_polygon(coords: &[Vec2], tris: &mut [[u32; 3]]) -> Vec<BeautifySwap> {
+    // Simple-polygon perimeter rule (§8.1): an edge is fixed when its two
+    // endpoints are consecutive in the polygon cycle (indices `i`,`i+1`, or the
+    // `0`/`last` wrap). Every other shared edge is an interior diagonal and may
+    // rotate. This is exact only when `coords` *is* the cycle in order.
+    let last_coord_index = (coords.len() - 1) as u32;
+    beautify_polygon_protected(coords, tris, |a, b| {
+        is_perimeter_edge_pair(sorted_endpoints(a, b), last_coord_index)
+    })
+}
+
+/// Like [`beautify_polygon`] but with a caller-supplied **boundary predicate**
+/// instead of the index-adjacency perimeter rule, for triangulations whose
+/// vertex sequence is *not* a single simple cycle in index order — notably the
+/// bridged-keyhole fill (`TRIANGLE_FILL.md` §1.2.4), whose sequence repeats the
+/// two bridge endpoints and carries a zero-width slit.
+///
+/// `is_boundary(a, b)` returns `true` for an undirected coord-index pair that
+/// must **never** rotate: the region's outer-loop edges, every hole-rim edge,
+/// and the bridge/slit edges. Beautify then only ever rotates a *genuine
+/// interior diagonal* between two adjacent fill triangles, and additionally
+/// refuses any rotation whose replacement diagonal would (a) collapse onto a
+/// repeated vertex (a zero-width slit edge — both endpoints share a position) or
+/// (b) coincide with a protected boundary edge. Together these keep a diagonal
+/// from ever being rotated into the slit or across the hole (§6).
+pub fn beautify_polygon_protected(
+    coords: &[Vec2],
+    tris: &mut [[u32; 3]],
+    is_boundary: impl Fn(u32, u32) -> bool,
+) -> Vec<BeautifySwap> {
     let tri_count = tris.len();
     if tri_count < 2 {
         return Vec::new();
     }
-    let last_coord_index = (coords.len() - 1) as u32;
     let half_edge_count = tri_count * 3;
 
     let mut half_edges: Vec<BeautifyHalfEdge> =
@@ -330,7 +358,7 @@ pub fn beautify_polygon(coords: &[Vec2], tris: &mut [[u32; 3]]) -> Vec<BeautifyS
             let to = half_edges[half_edges[here].next as usize].origin;
             sorted_endpoints(from, to)
         };
-        if is_perimeter_edge_pair(endpoints, last_coord_index) {
+        if is_boundary(endpoints.0, endpoints.1) {
             continue;
         }
         match pending_edges.remove(&endpoints) {
@@ -366,7 +394,8 @@ pub fn beautify_polygon(coords: &[Vec2], tris: &mut [[u32; 3]]) -> Vec<BeautifyS
         if twin == BeautifyHalfEdge::NONE || (twin as usize) >= here {
             continue;
         }
-        let (cost, _) = score_internal_edge_for_swap(coords, &half_edges, twin as usize);
+        let (cost, _) =
+            score_internal_edge_for_swap(coords, &half_edges, twin as usize, &is_boundary);
         if cost < 0.0 {
             let edge_id = half_edges[here].internal_edge_id as usize;
             latest_generation[edge_id] = 1;
@@ -422,6 +451,7 @@ pub fn beautify_polygon(coords: &[Vec2], tris: &mut [[u32; 3]]) -> Vec<BeautifyS
                 &mut latest_generation,
                 &mut still_pending,
                 &mut swap_queue,
+                &is_boundary,
             );
         }
     }
@@ -520,14 +550,29 @@ fn score_internal_edge_for_swap(
     coords: &[Vec2],
     half_edges: &[BeautifyHalfEdge],
     diagonal_in_first_tri: usize,
+    is_boundary: &impl Fn(u32, u32) -> bool,
 ) -> (f32, f32) {
     let diagonal_in_second_tri = half_edges[diagonal_in_first_tri].twin as usize;
     let opposite_in_first_tri = third_corner_in_triangle(half_edges, diagonal_in_first_tri);
     let opposite_in_second_tri = third_corner_in_triangle(half_edges, diagonal_in_second_tri);
 
-    let v1 = coords[half_edges[opposite_in_first_tri].origin as usize];
+    // Candidate (post-rotation) diagonal connects the two opposite corners.
+    // Refuse the swap outright when that diagonal would land on a protected
+    // boundary edge or collapse onto a repeated vertex (a zero-width slit edge
+    // of the bridged keyhole, §1.2.4) — either would rotate a diagonal into the
+    // slit / across the hole. A refused swap reports a non-negative cost so it
+    // never enters the heap.
+    let candidate_a = half_edges[opposite_in_first_tri].origin;
+    let candidate_b = half_edges[opposite_in_second_tri].origin;
+    if is_boundary(candidate_a, candidate_b)
+        || coords[candidate_a as usize] == coords[candidate_b as usize]
+    {
+        return (f32::MAX, 0.0);
+    }
+
+    let v1 = coords[candidate_a as usize];
     let v2 = coords[half_edges[diagonal_in_first_tri].origin as usize];
-    let v3 = coords[half_edges[opposite_in_second_tri].origin as usize];
+    let v3 = coords[candidate_b as usize];
     let v4 = coords[half_edges[diagonal_in_second_tri].origin as usize];
 
     beautify_quad_cost_2d_ex(v1, v2, v3, v4, false)
@@ -574,12 +619,14 @@ fn rescore_after_swap(
     latest_generation: &mut [u32],
     still_pending: &mut [bool],
     swap_queue: &mut BinaryHeap<SwapCandidate>,
+    is_boundary: &impl Fn(u32, u32) -> bool,
 ) {
     if half_edges[half_edge_idx].twin == BeautifyHalfEdge::NONE {
         return;
     }
     let edge_id = half_edges[half_edge_idx].internal_edge_id as usize;
-    let (cost, quad_area) = score_internal_edge_for_swap(coords, half_edges, half_edge_idx);
+    let (cost, quad_area) =
+        score_internal_edge_for_swap(coords, half_edges, half_edge_idx, is_boundary);
     // §8.4 area-scaled epsilon: suppresses endless near-zero swaps on
     // large quads where the cost would otherwise oscillate around 0.
     let acceptance_threshold = -1e-6_f32 * quad_area.max(1.0);

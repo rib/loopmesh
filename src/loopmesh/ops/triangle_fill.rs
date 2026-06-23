@@ -3,7 +3,17 @@ use std::collections::HashMap;
 use glam::{Vec2, Vec3};
 
 use crate::loopmesh::*;
-use crate::triangulate::{axis_dominant_basis, axis_dominant_basis_negated, beautify_polygon, ear_clip};
+use crate::triangulate::{self, axis_dominant_basis, axis_dominant_basis_negated, beautify_polygon, ear_clip};
+
+/// Order a vertex-key pair so the two orientations of an undirected edge hash to
+/// the same key — used to build the §6 beautify boundary-protection set.
+fn unordered_pair(a: VertexKey, b: VertexKey) -> (VertexKey, VertexKey) {
+    if a.as_usize() <= b.as_usize() {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
 
 /// Axis-aligned 2D bounding box of a component's projected vertices,
 /// used by the §1.2.3 hole-coalesce pass.
@@ -172,9 +182,12 @@ const MIN_NORMAL_LEN_SQ: f32 = 1e-12;
 pub struct TriangleFillParams {
     /// When set, run the beautify edge-rotation pass after the raw fill (§6):
     /// rotate the fill's interior diagonals toward a Delaunay-like
-    /// triangulation. Applied to the single-loop (no-holes) fill before the §7
-    /// dissolve, so beautify runs before dissolve when both flags are set. The
-    /// with-holes/keyhole fill (§1.2.4) is not yet beautified.
+    /// triangulation, before the §7 dissolve (so beautify runs before dissolve
+    /// when both flags are set). Applied to the whole fill region — the
+    /// single-loop (no-holes) fill and the bridged with-holes/keyhole fill
+    /// (§1.2.4) alike; on the keyhole, the region's loop edges, hole rims, and
+    /// the zero-width bridge slit are protected so only genuine interior
+    /// diagonals rotate and no diagonal escapes into the hole.
     pub use_beauty: bool,
     /// When set, dissolve the fill's new interior edges into larger n-gons
     /// after the fill (§7).
@@ -237,8 +250,10 @@ impl LoopMesh {
     ///
     /// **`use_beauty`:** when set, the beautify post-pass (§6) rotates the
     /// fill's interior diagonals toward a Delaunay-like triangulation before the
-    /// §7 dissolve. Applied to the single-loop (no-holes) fill; the
-    /// with-holes/keyhole fill (§1.2.4) is not yet beautified.
+    /// §7 dissolve. Applied to the whole fill region — both the single-loop
+    /// (no-holes) fill and the bridged with-holes/keyhole fill (§1.2.4); on the
+    /// keyhole, loop edges, hole rims, and the bridge slit are protected so only
+    /// interior diagonals rotate.
     pub fn triangle_fill(
         &mut self,
         edges: &[EdgeKey],
@@ -367,12 +382,30 @@ impl LoopMesh {
         // which interior diagonals exist changes; the boundary edges and the
         // vertex set are untouched. Mutating `tris` here (before face creation,
         // hence before the §7 dissolve in `triangle_fill`) is what satisfies
-        // §6's "beautify before dissolve" ordering. Scoped to the no-holes path:
-        // the bridged keyhole's repeated bridge vertices and zero-width slit
-        // (§1.2.4) are not a simple polygon in the sense the rotation kernel
-        // assumes, so beautify is not yet run for the with-holes case.
-        if params.use_beauty && !has_holes {
-            beautify_polygon(&projected, &mut tris);
+        // §6's "beautify before dissolve" ordering.
+        if params.use_beauty {
+            if has_holes {
+                // The bridged keyhole is one polygon, but its sequence repeats
+                // the two bridge endpoints and carries a zero-width slit, so the
+                // simple-polygon index-adjacency perimeter rule is unsafe (it
+                // could rotate a diagonal into the slit or across the hole).
+                // Drive beautify with an explicit boundary predicate over the
+                // region's *actual* loop edges (outer loop + every hole rim),
+                // keyed on VertexKey so a vertex repeated at several sweep
+                // indices is protected at all of them. Beautify then only
+                // rotates genuine interior diagonals (§6).
+                let boundary_pairs = self.triangle_fill_boundary_pairs(region_loops);
+                let is_boundary = |a: u32, b: u32| {
+                    let va = sweep_verts[a as usize];
+                    let vb = sweep_verts[b as usize];
+                    // A repeated bridge vertex at two distinct sweep indices is
+                    // a zero-width slit edge — always fixed.
+                    va == vb || boundary_pairs.contains(&unordered_pair(va, vb))
+                };
+                triangulate::beautify_polygon_protected(&projected, &mut tris, is_boundary);
+            } else {
+                beautify_polygon(&projected, &mut tris);
+            }
         }
 
         // §4 — winding vote: only when the normal was derived and some input
@@ -464,6 +497,30 @@ impl LoopMesh {
             chain = spliced;
         }
         chain
+    }
+
+    /// Collect every region-boundary edge as an undirected VertexKey pair: the
+    /// outer loop's edges and every hole rim's edges (§1.2.4). The §6 beautify
+    /// pass treats these as fixed — it may rotate only genuine interior
+    /// diagonals, never a loop edge — which is what keeps a rotation from
+    /// escaping the region or covering a hole.
+    fn triangle_fill_boundary_pairs(
+        &self,
+        region_loops: &[Vec<VertexKey>],
+    ) -> std::collections::HashSet<(VertexKey, VertexKey)> {
+        let mut pairs = std::collections::HashSet::new();
+        for loop_verts in region_loops {
+            let n = loop_verts.len();
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let a = loop_verts[i];
+                let b = loop_verts[(i + 1) % n];
+                pairs.insert(unordered_pair(a, b));
+            }
+        }
+        pairs
     }
 
     /// Signed-area (shoelace) test on a loop's projected coordinates: true when
@@ -935,7 +992,7 @@ impl LoopMesh {
 mod tests {
     use std::f32::consts::TAU;
 
-    use glam::Vec3;
+    use glam::{Vec2, Vec3};
 
     use super::TriangleFillParams;
     use crate::loopmesh::*;
@@ -1351,6 +1408,228 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// Build an axis-aligned rectangular annulus: an outer rectangle ring and a
+    /// concentric inner rectangle ring (the hole), returning `(outer, inner)`
+    /// edge sets. The four corners of each ring are placed explicitly so the
+    /// band quads can be made elongated (driving the beautify contrast).
+    fn rect_annulus(
+        mesh: &mut LoopMesh,
+        outer_half: Vec2,
+        inner_half: Vec2,
+    ) -> (Vec<EdgeKey>, Vec<EdgeKey>) {
+        let ring = |mesh: &mut LoopMesh, h: Vec2| {
+            let corners = [
+                Vec3::new(-h.x, -h.y, 0.0),
+                Vec3::new(h.x, -h.y, 0.0),
+                Vec3::new(h.x, h.y, 0.0),
+                Vec3::new(-h.x, h.y, 0.0),
+            ];
+            let verts: Vec<VertexKey> = corners.iter().map(|&c| mesh.create_vertex(c)).collect();
+            (0..4)
+                .map(|i| {
+                    mesh.create_edge(
+                        [verts[i], verts[(i + 1) % 4]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let outer = ring(mesh, outer_half);
+        let inner = ring(mesh, inner_half);
+        (outer, inner)
+    }
+
+    /// Like [`rect_annulus`] but the two rectangles are given by explicit
+    /// lo/hi corners, so the hole can be placed off-centre — which skews the
+    /// band quads and makes the raw bridged ear-clip pick a non-Delaunay
+    /// diagonal that beautify then rotates.
+    fn rect_annulus_box(
+        mesh: &mut LoopMesh,
+        outer_lo: Vec2,
+        outer_hi: Vec2,
+        inner_lo: Vec2,
+        inner_hi: Vec2,
+    ) -> (Vec<EdgeKey>, Vec<EdgeKey>) {
+        let ring = |mesh: &mut LoopMesh, lo: Vec2, hi: Vec2| {
+            let corners = [
+                Vec3::new(lo.x, lo.y, 0.0),
+                Vec3::new(hi.x, lo.y, 0.0),
+                Vec3::new(hi.x, hi.y, 0.0),
+                Vec3::new(lo.x, hi.y, 0.0),
+            ];
+            let verts: Vec<VertexKey> = corners.iter().map(|&c| mesh.create_vertex(c)).collect();
+            (0..4)
+                .map(|i| {
+                    mesh.create_edge(
+                        [verts[i], verts[(i + 1) % 4]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let outer = ring(mesh, outer_lo, outer_hi);
+        let inner = ring(mesh, inner_lo, inner_hi);
+        (outer, inner)
+    }
+
+    /// The set of interior-diagonal endpoint pairs of a fill, keyed by rounded
+    /// position so it is comparable across separate meshes. A diagonal is an
+    /// edge of the live mesh that is *not* one of the supplied boundary edges.
+    fn interior_diagonal_positions(
+        mesh: &LoopMesh,
+        boundary: &[EdgeKey],
+    ) -> std::collections::HashSet<((i32, i32), (i32, i32))> {
+        let boundary_set: std::collections::HashSet<EdgeKey> = boundary.iter().copied().collect();
+        let key = |p: Vec3| ((p.x * 1000.0) as i32, (p.y * 1000.0) as i32);
+        let mut out = std::collections::HashSet::new();
+        for edge in mesh.edge_keys() {
+            if boundary_set.contains(&edge) {
+                continue;
+            }
+            let [a, b] = mesh.edge_vert_keys(edge);
+            let ka = key(mesh.vertex_position(a));
+            let kb = key(mesh.vertex_position(b));
+            out.insert(if ka <= kb { (ka, kb) } else { (kb, ka) });
+        }
+        out
+    }
+
+    #[test]
+    fn beauty_on_annulus_preserves_hole_and_boundary() {
+        // §6 over a with-holes fill (§1.2.4): beautify must rotate only genuine
+        // interior diagonals — never a loop edge, hole rim, or the bridge slit —
+        // so the hole stays empty, every boundary/hole-rim edge survives, and
+        // the band is still a valid all-triangle fill.
+        let mut mesh = LoopMesh::new();
+        let (outer, inner) =
+            rect_annulus(&mut mesh, Vec2::new(4.0, 4.0), Vec2::new(1.0, 1.0));
+        let mut edges = outer.clone();
+        edges.extend(inner.iter().copied());
+
+        let result = mesh.triangle_fill(
+            &edges,
+            &TriangleFillParams {
+                use_beauty: true,
+                use_dissolve: false,
+                normal: None,
+            },
+        );
+
+        assert_eq!(mesh.vertex_count(), 8, "beautify creates no vertex");
+        assert!(!result.faces().is_empty(), "band must be filled");
+        for face in mesh.face_keys() {
+            assert_eq!(mesh.face_len(face), 3, "every band face is a triangle");
+        }
+        // Every outer-loop and hole-rim edge survives beautify untouched.
+        for &boundary_edge in outer.iter().chain(inner.iter()) {
+            assert!(
+                mesh.edges.try_get(boundary_edge).is_some(),
+                "boundary edge {boundary_edge:?} must survive beautify"
+            );
+        }
+        // The hole stays empty: each inner edge carries exactly the band face on
+        // one side, never two.
+        for &inner_edge in &inner {
+            assert_eq!(
+                mesh.edge_loop_keys(inner_edge).len(),
+                1,
+                "inner edge {inner_edge:?} must keep the hole empty after beautify"
+            );
+        }
+        // No triangle has all three corners on the inner loop (a hole-covering
+        // triangle), and no fill edge connects two inner-loop vertices that are
+        // not an original hole rim — that would be a diagonal rotated across the
+        // hole.
+        let inner_verts: std::collections::HashSet<VertexKey> = inner
+            .iter()
+            .flat_map(|&e| mesh.edge_vert_keys(e))
+            .collect();
+        for face in mesh.face_keys() {
+            let all_inner = mesh
+                .face_vert_keys(face)
+                .iter()
+                .all(|v| inner_verts.contains(v));
+            assert!(!all_inner, "beautify must not fill the hole interior");
+        }
+        let inner_rim: std::collections::HashSet<EdgeKey> = inner.iter().copied().collect();
+        for edge in mesh.edge_keys() {
+            let [a, b] = mesh.edge_vert_keys(edge);
+            if inner_verts.contains(&a) && inner_verts.contains(&b) && !inner_rim.contains(&edge) {
+                panic!("beautify rotated a diagonal across the hole: {edge:?}");
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn beauty_changes_annulus_raw_fill() {
+        // Contrast: an annulus with a strongly *off-centre* hole (hugging the
+        // left of a wide outer rectangle). The skewed band quads make the raw
+        // bridged ear-clip pick a long across-the-band diagonal; beautify must
+        // rotate at least one such diagonal toward the shorter, Delaunay-like
+        // choice — so the two interior-diagonal sets must differ.
+        let outer_lo = Vec2::new(-10.0, -3.0);
+        let outer_hi = Vec2::new(10.0, 3.0);
+        let inner_lo = Vec2::new(-9.0, -2.0);
+        let inner_hi = Vec2::new(-2.0, 2.0);
+
+        let mut raw_mesh = LoopMesh::new();
+        let (raw_outer, raw_inner) =
+            rect_annulus_box(&mut raw_mesh, outer_lo, outer_hi, inner_lo, inner_hi);
+        let mut raw_edges = raw_outer.clone();
+        raw_edges.extend(raw_inner.iter().copied());
+        raw_mesh.triangle_fill(
+            &raw_edges,
+            &TriangleFillParams {
+                use_beauty: false,
+                use_dissolve: false,
+                normal: None,
+            },
+        );
+        let raw_boundary: Vec<EdgeKey> =
+            raw_outer.iter().chain(raw_inner.iter()).copied().collect();
+        let raw_diagonals = interior_diagonal_positions(&raw_mesh, &raw_boundary);
+        raw_mesh.validate_topology();
+
+        let mut beauty_mesh = LoopMesh::new();
+        let (beauty_outer, beauty_inner) =
+            rect_annulus_box(&mut beauty_mesh, outer_lo, outer_hi, inner_lo, inner_hi);
+        let mut beauty_edges = beauty_outer.clone();
+        beauty_edges.extend(beauty_inner.iter().copied());
+        beauty_mesh.triangle_fill(
+            &beauty_edges,
+            &TriangleFillParams {
+                use_beauty: true,
+                use_dissolve: false,
+                normal: None,
+            },
+        );
+        let beauty_boundary: Vec<EdgeKey> = beauty_outer
+            .iter()
+            .chain(beauty_inner.iter())
+            .copied()
+            .collect();
+        let beauty_diagonals = interior_diagonal_positions(&beauty_mesh, &beauty_boundary);
+        beauty_mesh.validate_topology();
+
+        assert_ne!(
+            raw_diagonals, beauty_diagonals,
+            "beautify must change the with-holes interior triangulation"
+        );
+        // The beautified fill is still a valid all-triangle annulus with an
+        // empty hole (sanity, so "changed" can't mean "corrupted").
+        for face in beauty_mesh.face_keys() {
+            assert_eq!(beauty_mesh.face_len(face), 3);
+        }
+        for &inner_edge in &beauty_inner {
+            assert_eq!(
+                beauty_mesh.edge_loop_keys(inner_edge).len(),
+                1,
+                "hole stays empty in the beautified off-centre annulus"
+            );
+        }
+    }
+
     #[test]
     fn loose_dangling_edges_create_nothing() {
         // §1.2.2: a closed triangle with a dangling tail. The tail is trimmed
@@ -1405,3 +1684,4 @@ mod tests {
         assert_eq!(mesh.face_count(), 0);
     }
 }
+
