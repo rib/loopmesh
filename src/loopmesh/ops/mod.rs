@@ -40,6 +40,7 @@ mod inset_region;
 mod join_triangles;
 mod mean_value;
 mod mirror;
+mod planar_faces;
 mod pointmerge;
 mod recalc_face_normals;
 mod remove_doubles;
