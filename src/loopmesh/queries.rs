@@ -458,11 +458,17 @@ impl LoopMesh {
                     continue;
                 }
 
+                // Anchor the comparison on `l` (the loop that actually starts at
+                // `verts[0]`), not on the face's canonical `first_edge_loop`: a
+                // face's stored start loop is an arbitrary rotation of its cycle,
+                // so anchoring there would only match queries whose `verts[0]`
+                // happens to coincide with it. Walking forward/backward from `l`
+                // makes the match rotation-insensitive — any rotation of the same
+                // vertex loop (forward) or its reflection (reverse) is found.
+
                 // Try matching the vertices with a forwards winding order first...
 
-                let iter_forward = self
-                    .face_loop_iter(self.faces.get(face).first_edge_loop)
-                    .skip(1);
+                let iter_forward = self.face_loop_iter(l).skip(1);
 
                 let mut i = 1;
                 for fl in iter_forward {
@@ -477,9 +483,7 @@ impl LoopMesh {
 
                 // Then try matching the vertices with a reverse winding order...
 
-                let iter_backwards = self
-                    .face_loop_reverse_iter(self.faces.get(face).first_edge_loop)
-                    .skip(1);
+                let iter_backwards = self.face_loop_reverse_iter(l).skip(1);
 
                 i = 1;
                 for fl in iter_backwards {
@@ -530,5 +534,63 @@ impl LoopMesh {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec3;
+
+    use crate::loopmesh::*;
+
+    /// `face_exists` must match an existing face regardless of which of its
+    /// vertices the query lists first (any rotation), and regardless of traversal
+    /// direction (the reflection). The match anchors on the loop that actually
+    /// starts at the query's `verts[0]`, not on the face's arbitrary stored start
+    /// loop — so a find-or-create cannot miss an existing face and mint a
+    /// duplicate just because the query rotated the vertex list.
+    #[test]
+    fn face_exists_is_rotation_and_reflection_insensitive() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let face = mesh.face_create_verts(&[a, b, c], FaceCreateFlags::NO_DUPLICATE);
+
+        // Every rotation of the forward winding finds the same face.
+        for query in [[a, b, c], [b, c, a], [c, a, b]] {
+            assert_eq!(
+                mesh.face_exists(&query),
+                Some(face),
+                "forward rotation {query:?} must find the existing face"
+            );
+        }
+        // Every rotation of the reverse winding finds it too.
+        for query in [[a, c, b], [c, b, a], [b, a, c]] {
+            assert_eq!(
+                mesh.face_exists(&query),
+                Some(face),
+                "reverse rotation {query:?} must find the existing face"
+            );
+        }
+    }
+
+    /// The duplicate-mint guard, end to end: `face_create_verts(NO_DUPLICATE)` on
+    /// a rotated vertex list must reuse the existing face, not mint a second face
+    /// on the same three edges.
+    #[test]
+    fn face_create_no_duplicate_reuses_rotated_face() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let face = mesh.face_create_verts(&[a, b, c], FaceCreateFlags::NO_DUPLICATE);
+        let faces_before = mesh.face_count();
+
+        let again = mesh.face_create_verts(&[b, c, a], FaceCreateFlags::NO_DUPLICATE);
+
+        assert_eq!(again, face, "a rotated query reuses the existing face");
+        assert_eq!(mesh.face_count(), faces_before, "no duplicate face is minted");
+        mesh.validate_topology();
     }
 }

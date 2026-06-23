@@ -473,20 +473,31 @@ fn merge_coplanar(points: &[DVec3], faces: &[WorkFace]) -> HullTopology {
         }
     }
 
-    // Gather each component's triangles, then extract its boundary polygon.
-    let mut component_faces: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
+    // Gather each component's triangles in a deterministic order. We iterate the
+    // alive faces in ascending index order and bucket each into its union-find
+    // root; the root's *first appearance* fixes the component's emission slot, so
+    // the facet list is hash-independent (a default-hasher map here would emit
+    // facets — and therefore their anchor vertices downstream — in a per-process
+    // order, the root of the reuse-path nondeterminism).
+    let mut component_slot = vec![usize::MAX; alive.len()];
+    let mut component_triangles: Vec<Vec<usize>> = Vec::new();
     for (compact, &face_index) in alive.iter().enumerate() {
-        component_faces
-            .entry(groups.find(compact))
-            .or_default()
-            .push(face_index);
+        let root = groups.find(compact);
+        let slot = if component_slot[root] == usize::MAX {
+            let slot = component_triangles.len();
+            component_slot[root] = slot;
+            component_triangles.push(Vec::new());
+            slot
+        } else {
+            component_slot[root]
+        };
+        component_triangles[slot].push(face_index);
     }
 
     let mut topo = HullTopology::default();
     let mut on_hull = vec![false; points.len()];
 
-    for triangles in component_faces.values() {
+    for triangles in &component_triangles {
         let face = extract_boundary_polygon(faces, triangles);
         for &index in &face.vertices {
             on_hull[index] = true;
@@ -526,8 +537,11 @@ fn extract_boundary_polygon(faces: &[WorkFace], triangles: &[usize]) -> HullFace
     // next[start] = end for each surviving boundary edge. A correct convex-hull
     // facet boundary is a simple disc, so each vertex has exactly one outgoing
     // boundary edge; a collision would mean the component pinched at a vertex,
-    // which is unreachable for valid hull input.
-    let mut next: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // which is unreachable for valid hull input. A `BTreeMap` keeps the keys in
+    // ascending order so the walk's start vertex (the smallest boundary index) is
+    // deterministic — the emitted n-gon's anchor vertex must not depend on the
+    // hash seed, or a downstream find-or-create can miss an existing face.
+    let mut next: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for &face_index in triangles {
         for (edge_start, edge_end) in faces[face_index].edges() {
             if !internal.contains(&(edge_end, edge_start)) {
@@ -540,6 +554,8 @@ fn extract_boundary_polygon(faces: &[WorkFace], triangles: &[usize]) -> HullFace
         }
     }
 
+    // The smallest boundary vertex index is the deterministic anchor; the walk
+    // then follows the CCW `next` chain, so the winding is preserved.
     let start = *next
         .keys()
         .next()

@@ -482,3 +482,78 @@ fn cospherical_with_coplanar_subsets_merges_faces() {
 
     assert_hull_invariants(&points, &topo);
 }
+
+/// Each emitted facet must be anchored on its smallest vertex index — the
+/// hash-independent anchor the deterministic merge pass guarantees (the boundary
+/// walk starts at the minimum boundary index). A floating anchor would leave the
+/// facet winding at the mercy of the per-process hash seed, the root of the
+/// convex_hull reuse-path nondeterminism, and would let a downstream
+/// find-or-create miss an existing face.
+///
+/// We also assert the full emission is stable run-to-run by recomputing the hull
+/// and comparing the two outputs structurally — within a process the hash seed
+/// is fixed, so this catches any *intra*-run reordering and pins the output as a
+/// pure function of the input.
+fn assert_facet_emission_is_deterministic(points: &[DVec3], topo: &HullTopology) {
+    for face in &topo.faces {
+        let min_index = *face.vertices.iter().min().expect("facet has vertices");
+        assert_eq!(
+            face.vertices[0], min_index,
+            "facet must be anchored on its smallest vertex index for a stable winding"
+        );
+    }
+
+    let again = convex_hull(points).expect("hull recomputes");
+    assert_eq!(again.vertices, topo.vertices, "on-hull set is a pure function of input");
+    assert_eq!(
+        again.faces.len(),
+        topo.faces.len(),
+        "facet count is a pure function of input"
+    );
+    for (lhs, rhs) in topo.faces.iter().zip(&again.faces) {
+        assert_eq!(lhs.vertices, rhs.vertices, "each facet re-emits identically");
+    }
+}
+
+#[test]
+fn cube_facet_emission_is_deterministic() {
+    // The cube exercises the coplanar-merge pass (six quad facets). Pin that the
+    // merge emits each facet anchored on its minimum vertex and the facets in
+    // ascending-anchor order, so the downstream face find-or-create sees a stable
+    // anchor regardless of the hash seed.
+    let points = vec![
+        DVec3::new(0.0, 0.0, 0.0),
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, 1.0, 0.0),
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
+    ];
+    let topo = convex_hull(&points).expect("cube has a hull");
+    assert_eq!(topo.faces.len(), 6, "cube merges to six coplanar quads");
+    assert_facet_emission_is_deterministic(&points, &topo);
+    assert_hull_invariants(&points, &topo);
+}
+
+#[test]
+fn bipyramid_facet_emission_is_deterministic() {
+    // A triangular bipyramid: two apexes over a shared equatorial triangle, all
+    // six facets genuine triangles (no coplanar merge). This is the reuse-path
+    // fixture's geometry; pin its facet anchors/order are hash-independent.
+    let points = vec![
+        DVec3::new(1.0, 0.0, 0.0),
+        DVec3::new(-0.5, 0.866_025, 0.0),
+        DVec3::new(-0.5, -0.866_025, 0.0),
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(0.0, 0.0, -1.0),
+    ];
+    let topo = convex_hull(&points).expect("bipyramid has a hull");
+    assert_eq!(topo.faces.len(), 6, "triangular bipyramid has six triangular facets");
+    for face in &topo.faces {
+        assert_eq!(face.vertices.len(), 3, "every bipyramid facet is a triangle");
+    }
+    assert_facet_emission_is_deterministic(&points, &topo);
+    assert_hull_invariants(&points, &topo);
+}

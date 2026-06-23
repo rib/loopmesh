@@ -1143,6 +1143,90 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// Five corners of a triangular bipyramid: an equatorial triangle (verts
+    /// 0,1,2) with an apex above (3) and below (4). All six facets are genuine
+    /// triangles — no coplanar merge — so it isolates the reuse-build path from
+    /// the facet-set wobble a cospherical cloud would add.
+    fn bipyramid_positions() -> Vec<Vec3> {
+        vec![
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.866_025, 0.0),
+            Vec3::new(-0.5, -0.866_025, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        ]
+    }
+
+    #[test]
+    fn use_existing_faces_true_partial_patch_is_deterministic_and_outward() {
+        // The reuse-build path: pre-build the two upper-apex facets of a
+        // bipyramid, then hull with use_existing_faces = true. The pre-built
+        // facets must be reused-as-holes (reported under their original keys, no
+        // duplicate face minted on the same edges), and the remaining facets must
+        // be built fresh with outward winding — deterministically, not at the
+        // mercy of the hash seed (CONVEX_HULL.md §5, §3.2). This pins the bug the
+        // partial-patch A/B test exposed.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &bipyramid_positions());
+
+        // Two upper facets sharing apex 3, wound outward (apex away from the
+        // bipyramid centroid at the origin).
+        let pre_upper_a = mesh.face_create_verts(
+            &[input[0], input[1], input[3]],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+        let pre_upper_b = mesh.face_create_verts(
+            &[input[1], input[2], input[3]],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+        let pre_faces = [pre_upper_a, pre_upper_b];
+        let faces_before = mesh.face_count();
+
+        let result = mesh.convex_hull_with_faces(&input, &pre_faces, true);
+
+        // The reused facets must be reported under their *original* keys — no
+        // fresh key, no duplicate mint.
+        let holes: std::collections::HashSet<FaceKey> =
+            result.hole_faces().iter().copied().collect();
+        for &pre in &pre_faces {
+            assert!(
+                holes.contains(&pre),
+                "pre-built facet {pre:?} must be reused under its own key"
+            );
+        }
+
+        // No duplicate face is minted on the reused footprints: the total face
+        // count is exactly the two pre-built facets plus the built remainder.
+        assert_eq!(
+            mesh.face_count(),
+            faces_before + result.faces().len(),
+            "every new face is genuinely new — no duplicate minted over a reused facet"
+        );
+
+        // The two reused facets are not double-counted as built.
+        let built: std::collections::HashSet<FaceKey> =
+            result.faces().iter().copied().collect();
+        for &pre in &pre_faces {
+            assert!(!built.contains(&pre), "a reused facet is not also a built face");
+        }
+
+        // Every built face is outward-wound (normal points away from the
+        // origin centroid), deterministically.
+        let center = centroid(&mesh, &input);
+        let built_faces: Vec<FaceKey> = result.faces().to_vec();
+        for face in built_faces {
+            mesh.face_normal_update(face);
+            let normal = mesh.face_normal(face);
+            let face_point =
+                mesh.vertex_position(mesh.loop_vertex(mesh.face_first_loop(face)));
+            assert!(
+                normal.dot(face_point - center) > 0.0,
+                "built hull face {face:?} must be wound outward"
+            );
+        }
+        mesh.validate_topology();
+    }
+
     #[test]
     fn convex_hull_default_leaves_holes_empty() {
         // The plain verts-only entrypoint delegates with use_existing_faces =
