@@ -8,19 +8,23 @@ use crate::loopmesh::*;
 /// that lies **on the built hull surface** — the on-hull input vertices, the
 /// hull edges, and the materialised hull faces (CONVEX_HULL.md §1, §4.3).
 ///
-/// This cycle implements the additive surgery for a verts-only input cloud
-/// with no face reuse (`use_existing_faces = false`), so `geom_out` is exactly
-/// the freshly-built hull surface. The `geom_interior.out` / `geom_unused.out`
-/// **vertex** classification (CONVEX_HULL.md §4, §4.1, §7) is populated; the
-/// edge / face classification and the holes slot (CONVEX_HULL.md §4.2, §5)
-/// remain unpopulated (mixed edge/face input is not yet accepted).
+/// The `geom_interior.out` / `geom_unused.out` slots carry the full vertex,
+/// edge, and face classification (CONVEX_HULL.md §4, §4.1, §4.2, §7) when mixed
+/// edge/face input is supplied via [`LoopMesh::convex_hull_with_input`]; the
+/// verts-only [`LoopMesh::convex_hull`] populates only the vertex half (its
+/// input edge/face sets are empty). The holes slot (CONVEX_HULL.md §5) is
+/// populated by the `use_existing_faces` path.
 #[derive(Clone, Debug, Default)]
 pub struct ConvexHullResult {
     verts: Vec<VertexKey>,
     edges: Vec<EdgeKey>,
     faces: Vec<FaceKey>,
     interior_verts: Vec<VertexKey>,
+    interior_edges: Vec<EdgeKey>,
+    interior_faces: Vec<FaceKey>,
     unused_verts: Vec<VertexKey>,
+    unused_edges: Vec<EdgeKey>,
+    unused_faces: Vec<FaceKey>,
     hole_edges: Vec<EdgeKey>,
     hole_faces: Vec<FaceKey>,
 }
@@ -59,31 +63,67 @@ impl ConvexHullResult {
     /// Interior (buried) input vertices — every input vert that is *not* a hull
     /// corner: the culled coplanar-interior point, the collinear intermediate
     /// points, a coincident duplicate's key, and any 3D buried point
-    /// (CONVEX_HULL.md §4, §4.1). Verts-only this cycle, so input edges/faces
-    /// are not classified.
+    /// (CONVEX_HULL.md §4, §4.1).
     pub fn interior_verts(&self) -> &[VertexKey] {
         &self.interior_verts
     }
 
-    /// The `geom_interior.out` slot. Verts-only this cycle: contains only the
-    /// interior vertices (CONVEX_HULL.md §4); interior edge/face classification
-    /// is not yet implemented.
+    /// Interior (buried) input edges — every input edge whose endpoint pair is
+    /// *not* a hull edge: a chord cutting through the polytope's interior
+    /// (CONVEX_HULL.md §4.2).
+    pub fn interior_edges(&self) -> &[EdgeKey] {
+        &self.interior_edges
+    }
+
+    /// Interior input faces — every input face except those *reused* as a hull
+    /// facet under `use_existing_faces` (CONVEX_HULL.md §4.2, §5). Reuse clears
+    /// the interior flag at reuse time, so a reused facet later un-holed as a
+    /// patch border (and thus absent from [`Self::hole_faces`]) is still not
+    /// interior.
+    pub fn interior_faces(&self) -> &[FaceKey] {
+        &self.interior_faces
+    }
+
+    /// The `geom_interior.out` slot as a single mixed element set: the interior
+    /// verts, edges, and faces (CONVEX_HULL.md §1 `geom_interior.out`, §4.2).
     pub fn geom_interior_out(&self) -> Vec<GeomKey> {
-        self.interior_verts.iter().copied().map(GeomKey::from).collect()
+        let mut out = Vec::with_capacity(
+            self.interior_verts.len() + self.interior_edges.len() + self.interior_faces.len(),
+        );
+        out.extend(self.interior_verts.iter().copied().map(GeomKey::from));
+        out.extend(self.interior_edges.iter().copied().map(GeomKey::from));
+        out.extend(self.interior_faces.iter().copied().map(GeomKey::from));
+        out
     }
 
     /// Interior vertices that are *unused* — safe to delete because every
     /// incident edge and face is itself an input element (CONVEX_HULL.md §7).
-    /// For a verts-only cloud the buried verts are loose, so they qualify.
     pub fn unused_verts(&self) -> &[VertexKey] {
         &self.unused_verts
     }
 
-    /// The `geom_unused.out` slot. Verts-only this cycle: contains only the
-    /// unused interior vertices (CONVEX_HULL.md §7); interior edge/face
-    /// classification is not yet implemented.
+    /// Interior edges that are *unused* — every incident face is an input face
+    /// (an interior edge with no faces is trivially unused) (CONVEX_HULL.md §7).
+    pub fn unused_edges(&self) -> &[EdgeKey] {
+        &self.unused_edges
+    }
+
+    /// Interior faces that are *unused* — every interior face is unused, a face
+    /// being a top-level element nothing else depends on (CONVEX_HULL.md §7).
+    pub fn unused_faces(&self) -> &[FaceKey] {
+        &self.unused_faces
+    }
+
+    /// The `geom_unused.out` slot as a single mixed element set: the unused
+    /// verts, edges, and faces (CONVEX_HULL.md §1 `geom_unused.out`, §7).
     pub fn geom_unused_out(&self) -> Vec<GeomKey> {
-        self.unused_verts.iter().copied().map(GeomKey::from).collect()
+        let mut out = Vec::with_capacity(
+            self.unused_verts.len() + self.unused_edges.len() + self.unused_faces.len(),
+        );
+        out.extend(self.unused_verts.iter().copied().map(GeomKey::from));
+        out.extend(self.unused_edges.iter().copied().map(GeomKey::from));
+        out.extend(self.unused_faces.iter().copied().map(GeomKey::from));
+        out
     }
 
     /// Reused on-hull faces tagged as **holes** under `use_existing_faces`: a
@@ -139,16 +179,17 @@ impl LoopMesh {
     /// verbatim into each created face, so the hull surface has coherent outward
     /// normals.
     ///
-    /// **Scope (this cycle):** any vertex cloud (full-3D, coplanar, collinear,
-    /// or coincident) with `use_existing_faces = false` and no input faces. The
-    /// result reports `geom.out` (the built on-hull surface, CONVEX_HULL.md
-    /// §4.3) and the **vertex** half of the `geom_interior.out` /
-    /// `geom_unused.out` classification (CONVEX_HULL.md §4, §4.1, §7): every
-    /// input vert not on the hull is interior, and an interior vert is unused
-    /// when all its incident elements are themselves input. Input edge/face
-    /// classification (§4.2, §7) and the customdata example-face seed (§6.1) are
-    /// not yet implemented. For the `use_existing_faces` reuse path (§5) and the
-    /// `geom_holes.out` slot, see [`Self::convex_hull_with_faces`].
+    /// **Scope:** any vertex cloud (full-3D, coplanar, collinear, or coincident)
+    /// with `use_existing_faces = false` and no input edges or faces. The result
+    /// reports `geom.out` (the built on-hull surface, CONVEX_HULL.md §4.3) and
+    /// the **vertex** half of the `geom_interior.out` / `geom_unused.out`
+    /// classification (CONVEX_HULL.md §4, §4.1, §7): every input vert not on the
+    /// hull is interior, and an interior vert is unused when all its incident
+    /// elements are themselves input (verts-only ⇒ a buried vert is loose ⇒
+    /// unused). The customdata example-face seed (§6.1) is not yet implemented.
+    /// For mixed input (input edges/faces routed into the classification) see
+    /// [`Self::convex_hull_with_input`]; for the `use_existing_faces` reuse path
+    /// (§5) and the `geom_holes.out` slot see [`Self::convex_hull_with_faces`].
     ///
     /// Degenerate clouds (CONVEX_HULL.md §8) are handled, not errors:
     /// - **Coplanar** input yields a single planar facet, fanned into a flat
@@ -166,7 +207,7 @@ impl LoopMesh {
     /// the provider returns no hull of any dimension (fewer than two distinct
     /// positions).
     pub fn convex_hull(&mut self, input: &[VertexKey]) -> ConvexHullResult {
-        self.convex_hull_with_faces(input, &[], false)
+        self.convex_hull_with_input(input, &[], &[], false)
     }
 
     /// Mixed-input convex hull (CONVEX_HULL.md §1): the `verts` cloud drives the
@@ -186,13 +227,47 @@ impl LoopMesh {
     /// unconditionally (stacking on any coincident input face, which can yield
     /// non-manifold edges — §2) and `geom_holes.out` comes back empty.
     ///
-    /// **Deferred (still 📝):** input edge/face interior/unused classification
-    /// (§4.2, §7) — `input_faces` are not yet routed into `geom_interior.out` /
-    /// `geom_unused.out`, only into the reuse/holes path. The customdata
-    /// example-face seed (§6.1) is also not yet implemented.
+    /// `input_faces` are routed into `geom_interior.out` / `geom_unused.out`
+    /// (§4.2, §7) exactly as [`Self::convex_hull_with_input`] with an empty
+    /// input-edge set — every input face is interior unless reused as a hole,
+    /// and an interior face is always unused. The customdata example-face seed
+    /// (§6.1) is not yet implemented.
     pub fn convex_hull_with_faces(
         &mut self,
         verts: &[VertexKey],
+        input_faces: &[FaceKey],
+        use_existing_faces: bool,
+    ) -> ConvexHullResult {
+        self.convex_hull_with_input(verts, &[], input_faces, use_existing_faces)
+    }
+
+    /// Mixed-input convex hull with the full §4.2 / §7 edge + face
+    /// classification: the `verts` cloud drives the hull geometry (§1.1), while
+    /// `input_edges` and `input_faces` are the pre-existing input elements the
+    /// classification passes inspect. Only the verts contribute hull points; the
+    /// input edges/faces participate only in classification, reuse, and the
+    /// unused guard.
+    ///
+    /// **§4.2 interior edges/faces.** After the hull triangles are known, an
+    /// input **edge** whose endpoint pair is not a hull edge (a buried chord) is
+    /// tagged interior, and every input **face** is tagged interior — except a
+    /// face reused as a hole under `use_existing_faces` (§5), which is un-marked.
+    ///
+    /// **§7 unused guard (general).** An interior **vertex** is unused iff every
+    /// incident edge is an input edge *and* every incident face is an input
+    /// face; an interior **edge** is unused iff every incident face is an input
+    /// face (no faces ⇒ trivially unused); every interior **face** is unused. A
+    /// non-input edge or face leaning on an element keeps it out of
+    /// `geom_unused.out` so a downstream delete can't disturb unselected
+    /// geometry.
+    ///
+    /// `use_existing_faces` (§5) behaves exactly as
+    /// [`Self::convex_hull_with_faces`]. The customdata example-face seed (§6.1)
+    /// is not yet implemented.
+    pub fn convex_hull_with_input(
+        &mut self,
+        verts: &[VertexKey],
+        input_edges: &[EdgeKey],
         input_faces: &[FaceKey],
         use_existing_faces: bool,
     ) -> ConvexHullResult {
@@ -291,6 +366,15 @@ impl LoopMesh {
             }
         }
 
+        // The set of faces *reused* as hull facets (§5 step 1) — every face
+        // `find_reusable_face` matched, captured *before* the cleanup pass runs.
+        // A reused face is reclassified out of interior at reuse time (§4.2:
+        // "reused-and-reclassified"); the §5 cleanup may later un-hole a border
+        // face, but that only clears its *hole* flag, never re-marks it interior.
+        // So the §4.2 interior-face pass must exclude the whole reused set, not
+        // just the post-cleanup surviving holes.
+        let reused_faces: HashSet<FaceKey> = hole_faces.iter().copied().collect();
+
         // §5 — hole cleanup pass. A hole face touching a boundary edge (fewer
         // than two incident faces) is on the patch's border, not a true interior
         // hole, so it is un-holed. Then every edge all of whose faces are holes
@@ -335,39 +419,86 @@ impl LoopMesh {
         result.edges = on_hull_edges.into_iter().collect();
         result.edges.sort_unstable_by_key(ElementKey::as_usize);
 
-        // §4 / §4.1 / §7 — classify input vertices. Every input vert is
-        // optimistically interior; a vert that turned out to be a hull corner has
-        // its tag cleared. The remaining interior verts are the buried ones: the
-        // culled coplanar-interior point, collinear intermediates, a coincident
+        let input_edge_set: HashSet<EdgeKey> = input_edges.iter().copied().collect();
+
+        // §4 / §4.1 — classify input vertices. Every input vert is optimistically
+        // interior; a vert that turned out to be a hull corner has its tag
+        // cleared. The remaining interior verts are the buried ones: the culled
+        // coplanar-interior point, collinear intermediates, a coincident
         // duplicate's key, and any 3D buried point.
-        let mut seen_interior: HashSet<VertexKey> = HashSet::new();
+        let mut seen_interior_verts: HashSet<VertexKey> = HashSet::new();
         for &vert in verts {
-            if on_hull_verts.contains(&vert) || !seen_interior.insert(vert) {
+            if on_hull_verts.contains(&vert) || !seen_interior_verts.insert(vert) {
                 continue;
             }
             result.interior_verts.push(vert);
 
-            // §7 — verts-only shortcut: a buried vert with no incident geometry
-            // is unused. §7's full test ("every incident edge is an input edge
-            // AND every incident face is an input face") is deferred to the
-            // mixed-input cycle; for a verts-only cloud the input edge/face sets
-            // are empty, so a loose buried vert is the only thing that qualifies.
-            if self.vertex_is_loose(vert) {
+            // §7 — an interior vertex is unused iff *every* incident edge is an
+            // input edge AND *every* incident face is an input face. A non-input
+            // edge or face leaning on it keeps it out of the unused slot.
+            if self.vertex_incidence_all_input(vert, &input_edge_set, &input_face_set) {
                 result.unused_verts.push(vert);
             }
+        }
+
+        // §4.2 — an input edge whose endpoint pair is not a hull edge is a buried
+        // chord, tagged interior. §7 — that interior edge is unused iff every
+        // incident face is an input face (no faces ⇒ trivially unused).
+        let mut seen_interior_edges: HashSet<EdgeKey> = HashSet::new();
+        for &edge in input_edges {
+            let [u, v] = self.edge_vertices(edge);
+            if hull_edge_pairs.contains(&undirected(u, v)) || !seen_interior_edges.insert(edge) {
+                continue;
+            }
+            result.interior_edges.push(edge);
+
+            if self.edge_faces_all_input(edge, &input_face_set) {
+                result.unused_edges.push(edge);
+            }
+        }
+
+        // §4.2 — every input face is interior except one *reused* as a hull
+        // facet (§5). A reused face is reclassified out of interior at reuse
+        // time, whether or not the cleanup pass later un-holed it as a border
+        // face — so an un-holed border facet stays out of interior (and thus out
+        // of §7 unused) even though it is absent from `result.hole_faces`. §7 —
+        // every interior face is unused.
+        let mut seen_interior_faces: HashSet<FaceKey> = HashSet::new();
+        for &face in input_faces {
+            if reused_faces.contains(&face) || !seen_interior_faces.insert(face) {
+                continue;
+            }
+            result.interior_faces.push(face);
+            result.unused_faces.push(face);
         }
 
         result
     }
 
-    /// Verts-only shortcut for CONVEX_HULL.md §7's unused test: a buried vert
-    /// with no incident geometry is unused. §7's full rule is "every incident
-    /// edge is an *input* edge AND every incident face is an *input* face"; for
-    /// a verts-only cloud the input edge/face sets are empty, so the only buried
-    /// vert that can pass is a loose one. The general all-incident-input test is
-    /// deferred to the mixed-input cycle — do *not* read this as that guard.
-    fn vertex_is_loose(&self, vertex: VertexKey) -> bool {
-        self.iter_disk_edges(vertex).next().is_none()
+    /// CONVEX_HULL.md §7 vertex-unused test. A loose vertex passes vacuously.
+    fn vertex_incidence_all_input(
+        &self,
+        vertex: VertexKey,
+        input_edges: &HashSet<EdgeKey>,
+        input_faces: &HashSet<FaceKey>,
+    ) -> bool {
+        for edge in self.iter_disk_edges(vertex) {
+            if !input_edges.contains(&edge) {
+                return false;
+            }
+            for loop_key in self.iter_radial_loops(edge) {
+                if !input_faces.contains(&self.loop_face(loop_key)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// CONVEX_HULL.md §7 edge-unused test. A faceless edge passes vacuously.
+    fn edge_faces_all_input(&self, edge: EdgeKey, input_faces: &HashSet<FaceKey>) -> bool {
+        self.iter_radial_loops(edge)
+            .all(|loop_key| input_faces.contains(&self.loop_face(loop_key)))
     }
 
     /// CONVEX_HULL.md §5 reuse test, per hull triangle: find an input face whose
@@ -964,6 +1095,158 @@ mod tests {
         mesh.validate_topology();
     }
 
+    #[test]
+    fn input_chord_edge_buried_in_hull_is_interior_and_unused() {
+        // §4.2 / §7 — a chord edge between two cube corners that is not a hull
+        // edge (a face diagonal across the cube's interior) is interior, and —
+        // with no faces touching it — unused. The two on-hull endpoints stay on
+        // the hull; only the chord itself is interior.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &cube_corners());
+        // corners[0] = (-1,-1,-1), corners[7] = (1,1,1): the cube's space
+        // diagonal — a body chord through the interior, sharing no facet, so it
+        // is never a hull triangle edge (a face diagonal could coincide with a
+        // fan diagonal; the space diagonal cannot).
+        let chord = mesh.create_edge([input[0], input[7]], EdgeCreateFlags::NO_DUPLICATE);
+
+        let result = mesh.convex_hull_with_input(&input, &[chord], &[], false);
+
+        assert_eq!(
+            result.interior_edges(),
+            &[chord],
+            "the buried chord edge is interior"
+        );
+        assert_eq!(
+            result.unused_edges(),
+            &[chord],
+            "the chord has no faces, so it is unused"
+        );
+        // The chord must not be reported on the hull surface.
+        assert!(
+            !result.edges().contains(&chord),
+            "an interior chord is not a hull edge"
+        );
+        // geom_interior.out / geom_unused.out carry it as an edge.
+        let interior_edges: std::collections::HashSet<EdgeKey> = result
+            .geom_interior_out()
+            .into_iter()
+            .filter_map(|g| match g {
+                GeomKey::Edge(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(interior_edges.contains(&chord), "geom_interior.out carries the chord");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn input_face_buried_in_hull_is_interior_and_unused() {
+        // §4.2 / §7 — an input face buried inside the hull (using a buried
+        // interior vertex) is interior, and every interior face is unused. The
+        // hull surface is built fresh over the extremal verts.
+        let mut mesh = LoopMesh::new();
+        let mut positions = tetra_positions();
+        positions.push(Vec3::new(0.4, 0.4, 0.4)); // buried interior point
+        let input = cloud(&mut mesh, &positions);
+        let interior_vert = *input.last().unwrap();
+
+        // A face leaning on the buried vertex — never a hull facet.
+        let buried_face = mesh.face_create_verts(
+            &[input[0], input[1], interior_vert],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+
+        let result = mesh.convex_hull_with_input(&input, &[], &[buried_face], false);
+
+        assert_eq!(
+            result.interior_faces(),
+            &[buried_face],
+            "the buried input face is interior"
+        );
+        assert_eq!(
+            result.unused_faces(),
+            &[buried_face],
+            "every interior face is unused"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn interior_vert_all_input_incidence_is_unused() {
+        // §7 discriminating case (distinct from the loose-vert case): a buried
+        // vertex wired by an *input* edge to another buried vertex, both leaning
+        // only on input geometry, is unused — the general all-incident-input
+        // guard passes even though the vert is not loose.
+        let mut mesh = LoopMesh::new();
+        let mut positions = cube_corners();
+        positions.push(Vec3::new(0.0, 0.0, 0.0)); // buried A
+        positions.push(Vec3::new(0.1, 0.1, 0.1)); // buried B
+        let input = cloud(&mut mesh, &positions);
+        let buried_a = input[8];
+        let buried_b = input[9];
+
+        // An input edge between the two buried points: its only incidence is
+        // itself an input element.
+        let inner = mesh.create_edge([buried_a, buried_b], EdgeCreateFlags::NO_DUPLICATE);
+
+        let result = mesh.convex_hull_with_input(&input, &[inner], &[], false);
+
+        let interior = vert_set(result.interior_verts());
+        assert_eq!(interior, vert_set(&[buried_a, buried_b]), "both buried points interior");
+        // Both are unused: each one's only incident edge is the input `inner`,
+        // which has no faces — the general guard passes though neither is loose.
+        let _ = inner;
+        assert_eq!(
+            vert_set(result.unused_verts()),
+            vert_set(&[buried_a, buried_b]),
+            "all-input-incidence buried verts are unused (not loose, but guarded)"
+        );
+        // The shared input edge is itself interior + unused (faceless).
+        assert_eq!(result.interior_edges(), &[inner], "the inner edge is interior");
+        assert_eq!(result.unused_edges(), &[inner], "the faceless inner edge is unused");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn non_input_incidence_blocks_unused_for_vert_and_edge() {
+        // §7 — the discriminating guard: a buried vertex and an input chord edge
+        // are both interior, but a *non-input* face leaning on them keeps both
+        // out of the unused slot, since deleting them would disturb unselected
+        // geometry.
+        let mut mesh = LoopMesh::new();
+        let mut positions = cube_corners();
+        positions.push(Vec3::new(0.0, 0.0, 0.0)); // buried interior point
+        let input = cloud(&mut mesh, &positions);
+        let buried = input[8];
+
+        // An input chord edge from a cube corner to the buried point.
+        let chord = mesh.create_edge([input[0], buried], EdgeCreateFlags::NO_DUPLICATE);
+        // A NON-input face that uses both the buried vert and the chord edge.
+        let _non_input_face = mesh.face_create_verts(
+            &[input[0], buried, input[1]],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+
+        // Only the chord is an input edge; the non-input face is not in the input
+        // face set.
+        let result = mesh.convex_hull_with_input(&input, &[chord], &[], false);
+
+        // Both are interior.
+        assert!(result.interior_verts().contains(&buried), "buried vert interior");
+        assert!(result.interior_edges().contains(&chord), "chord edge interior");
+
+        // Neither is unused: the non-input face leans on both.
+        assert!(
+            !result.unused_verts().contains(&buried),
+            "a vert touched by a non-input face is not unused"
+        );
+        assert!(
+            !result.unused_edges().contains(&chord),
+            "an edge with a non-input face is not unused"
+        );
+        mesh.validate_topology();
+    }
+
     /// The four corners of a regular-ish tetrahedron whose four facets are all
     /// triangles — the cleanest fixture for the reuse path, since a triangular
     /// hull facet has no triangulation ambiguity (the facet *is* the triangle).
@@ -1138,6 +1421,74 @@ mod tests {
         // The patch's facet is still reported on the hull surface (§6.2): its
         // three verts and three edges are in geom.out even though nothing built.
         assert!(result.faces().is_empty(), "the only facet was reused, none built");
+        assert_eq!(result.verts().len(), 3, "all three corners on-hull");
+        assert_eq!(result.edges().len(), 3, "all three facet edges on-hull");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_existing_faces_true_un_holed_border_face_is_not_interior_or_unused() {
+        // §4.2 / §5 — a face *reused* as a hull facet is reclassified out of
+        // interior at reuse time, independent of whether the §5 cleanup later
+        // un-holes it as a patch border. The flat single-triangle hull reuses
+        // its one coincident face (skipped, not rebuilt) and the cleanup pass
+        // then un-holes it (all three edges are boundary). The un-holed face
+        // must NOT fall back to interior — it is on the hull surface — and the
+        // §7 every-interior-face-unused rule must NOT route it to unused.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, 2.0, 0.0),
+            ],
+        );
+        let patch = mesh.face_create_verts(&input, FaceCreateFlags::NO_DUPLICATE);
+
+        let result = mesh.convex_hull_with_faces(&input, &[patch], true);
+
+        // Reused-and-then-un-holed: not a (surviving) hole, none built.
+        assert!(result.hole_faces().is_empty(), "the border face is un-holed");
+        assert!(result.faces().is_empty(), "the facet was reused, none built");
+
+        // The crux: the reused face is on the hull surface, so it is neither
+        // interior nor unused — reporting it would name a hull-surface face as
+        // safe-to-delete.
+        assert!(
+            !result.interior_faces().contains(&patch),
+            "a reused (then un-holed) facet is not interior"
+        );
+        assert!(
+            !result.unused_faces().contains(&patch),
+            "a reused (then un-holed) facet is not unused"
+        );
+        let interior_faces: std::collections::HashSet<FaceKey> = result
+            .geom_interior_out()
+            .into_iter()
+            .filter_map(|g| match g {
+                GeomKey::Face(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !interior_faces.contains(&patch),
+            "geom_interior.out must not carry the reused facet"
+        );
+        let unused_faces: std::collections::HashSet<FaceKey> = result
+            .geom_unused_out()
+            .into_iter()
+            .filter_map(|g| match g {
+                GeomKey::Face(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !unused_faces.contains(&patch),
+            "geom_unused.out must not carry the reused facet"
+        );
+
+        // The reused facet's verts and edges are still reported on-hull (§6.2).
         assert_eq!(result.verts().len(), 3, "all three corners on-hull");
         assert_eq!(result.edges().len(), 3, "all three facet edges on-hull");
         mesh.validate_topology();
