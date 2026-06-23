@@ -79,8 +79,9 @@ pub use mid::EdgeCollapseFlags;
 pub use ops::{
     Axis, BevelAffect, BevelOffsetType, BevelOptions, BevelResult, BisectGeom, BisectParams,
     BisectResult, BridgeLoopsParams, BridgeLoopsResult, CenterMode, ConnectVertsNonplanarOut,
-    DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult, DissolveFacesOptions,
-    DissolveFacesResult, DissolveLimitParams, DissolveLimitResult, DissolveVertsParams,
+    ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
+    DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
+    DissolveVertsParams,
     DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams, InsetIndividualResult,
     InsetRegionParams, InsetRegionResult, JoinTrianglesParams, JoinTrianglesResult, MirrorParams,
     MirrorResult, MixedSeed, NgonMethod, ProfileShape, QuadCornerType, QuadMethod, RingInterp,
