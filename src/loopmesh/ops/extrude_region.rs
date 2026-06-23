@@ -50,7 +50,7 @@ impl LoopMesh {
     /// other way. Topology (counts, incidence) is identical either way — only
     /// the per-wall loop direction differs.
     pub fn extrude_region_ex(&mut self, faces: &[FaceKey], use_normal_flip: bool) -> ExtrudeResult {
-        self.extrude_region_impl(faces, &[], false, use_normal_flip, false)
+        self.extrude_region_impl(faces, &[], false, use_normal_flip, false, false)
     }
 
     /// [`extrude_region_ex`](Self::extrude_region_ex) with per-edge wall
@@ -81,7 +81,33 @@ impl LoopMesh {
         use_keep_orig: bool,
         use_normal_flip: bool,
     ) -> ExtrudeResult {
-        self.extrude_region_impl(faces, edges_exclude, use_keep_orig, use_normal_flip, false)
+        self.extrude_region_impl(
+            faces,
+            edges_exclude,
+            use_keep_orig,
+            use_normal_flip,
+            false,
+            false,
+        )
+    }
+
+    /// Kept-original region extrude with the EXTRUDE.md §6.1 winding flip
+    /// suppressed (`skip_input_flip`).
+    ///
+    /// Identical to
+    /// [`extrude_region_exclude`](Self::extrude_region_exclude) with
+    /// `use_keep_orig = true`, `use_normal_flip = false`, and no excluded
+    /// edges — each input face is kept in place, a fresh duplicate cap and the
+    /// boundary side walls are built — *except* that the kept originals are
+    /// **not** put through the §6.1 cleanup flip. Their loop-cycle winding is
+    /// preserved exactly as it was on input.
+    ///
+    /// This is the escape hatch chained operators (e.g. spin) want: they need
+    /// both copies for the next iteration but manage the originals' orientation
+    /// themselves, so the §6.1 flip — which would reverse the kept originals to
+    /// face outward of the wall cavity — must not fire.
+    pub fn extrude_region_keep_orig_skip_input_flip(&mut self, faces: &[FaceKey]) -> ExtrudeResult {
+        self.extrude_region_impl(faces, &[], true, false, false, true)
     }
 
     /// [`extrude_region_ex`](Self::extrude_region_ex) with the
@@ -111,7 +137,14 @@ impl LoopMesh {
         use_normal_flip: bool,
         use_normal_from_adjacent: bool,
     ) -> ExtrudeResult {
-        self.extrude_region_impl(faces, &[], false, use_normal_flip, use_normal_from_adjacent)
+        self.extrude_region_impl(
+            faces,
+            &[],
+            false,
+            use_normal_flip,
+            use_normal_from_adjacent,
+            false,
+        )
     }
 
     /// [`extrude_region_ex`](Self::extrude_region_ex) with the
@@ -141,7 +174,7 @@ impl LoopMesh {
         use_normal_flip: bool,
         use_dissolve_ortho_edges: bool,
     ) -> ExtrudeResult {
-        let result = self.extrude_region_impl(faces, &[], false, use_normal_flip, false);
+        let result = self.extrude_region_impl(faces, &[], false, use_normal_flip, false, false);
         if use_dissolve_ortho_edges {
             self.dissolve_ortho_walls(faces, &result);
         }
@@ -319,6 +352,7 @@ impl LoopMesh {
         use_keep_orig: bool,
         use_normal_flip: bool,
         use_normal_from_adjacent: bool,
+        skip_input_flip: bool,
     ) -> ExtrudeResult {
         // Mark the selection. Bit 0 = "in region".
         let sel = self.push_face_op_flag_layer();
@@ -673,7 +707,12 @@ impl LoopMesh {
         // parameter — so a surround-free input under `use_keep_orig = false` is
         // flipped too (§3.2.1). When the delete pass runs the originals are gone
         // (re-anchored) and the flip question never arises.
-        if keep_originals {
+        //
+        // §6.1 escape hatch: `skip_input_flip` suppresses exactly this cleanup
+        // flip while leaving every other kept-original behaviour (the duplicate
+        // cap, the walls) intact. Chained operators (e.g. spin) set it to keep
+        // the originals' input orientation and manage normals themselves.
+        if keep_originals && !skip_input_flip {
             for &f in faces {
                 self.euler_loop_reverse(f);
             }
@@ -1923,6 +1962,81 @@ mod tests {
             "duplicate cap keeps the original +Z orientation: got {cap_normal:?}"
         );
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_skip_input_flip_preserves_kept_original_winding() {
+        // EXTRUDE.md §6.1 escape hatch: with skip_input_flip set, the kept
+        // original is NOT put through the cleanup flip, so an isolated CCW (+Z)
+        // quad keeps its +Z winding rather than flipping to -Z. The duplicate
+        // cap and walls are built exactly as the plain kept-original path does.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        assert!(mesh.face_normal(face).z > 0.9, "unit quad starts +Z");
+
+        let result = mesh.extrude_region_keep_orig_skip_input_flip(&[face]);
+
+        mesh.all_indices_ensure();
+        mesh.calc_face_normals();
+        let normal_after = mesh.face_normal(face);
+        assert!(
+            normal_after.z > 0.9,
+            "skip_input_flip must preserve the kept original's +Z winding: got {normal_after:?}"
+        );
+
+        // The fresh cap keeps the original orientation (+Z) regardless of the
+        // flip; topology is identical to the plain kept-original path.
+        assert_eq!(result.cap_faces.len(), 1);
+        let cap_normal = mesh.face_normal(result.cap_faces[0]);
+        assert!(
+            cap_normal.z > 0.9,
+            "duplicate cap keeps the original +Z orientation: got {cap_normal:?}"
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        // original + cap + 4 walls.
+        assert_eq!(mesh.face_count(), 6);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn extrude_region_skip_input_flip_contrasts_with_default_flip() {
+        // The flag must be observable: the suppressed-flip kept original retains
+        // its input winding while the default kept-original path (§6.1 flip
+        // fires) reverses it. Same surround-free quad both ways.
+        let mut mesh_suppressed = LoopMesh::new();
+        let f_suppressed = unit_quad(&mut mesh_suppressed);
+        mesh_suppressed.extrude_region_keep_orig_skip_input_flip(&[f_suppressed]);
+        mesh_suppressed.all_indices_ensure();
+        mesh_suppressed.calc_face_normals();
+        let suppressed_normal = mesh_suppressed.face_normal(f_suppressed);
+
+        let mut mesh_flipped = LoopMesh::new();
+        let f_flipped = unit_quad(&mut mesh_flipped);
+        mesh_flipped.extrude_region_exclude(
+            &[f_flipped],
+            &[],
+            /* use_keep_orig */ true,
+            /* use_normal_flip */ false,
+        );
+        mesh_flipped.all_indices_ensure();
+        mesh_flipped.calc_face_normals();
+        let flipped_normal = mesh_flipped.face_normal(f_flipped);
+
+        assert!(
+            suppressed_normal.z > 0.9,
+            "suppressed: kept original keeps +Z, got {suppressed_normal:?}"
+        );
+        assert!(
+            flipped_normal.z < -0.9,
+            "default §6.1 flip fires: kept original is -Z, got {flipped_normal:?}"
+        );
+        // Topology (counts) is identical either way — only the kept original's
+        // loop direction differs.
+        assert_eq!(mesh_suppressed.face_count(), mesh_flipped.face_count());
+        assert_eq!(mesh_suppressed.vertex_count(), mesh_flipped.vertex_count());
+        assert_eq!(mesh_suppressed.edge_count(), mesh_flipped.edge_count());
     }
 
     #[test]
