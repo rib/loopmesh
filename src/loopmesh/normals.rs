@@ -212,7 +212,7 @@ impl LoopMesh {
     /// the `sqrt` argument is never negative and the result never `NaN`.
     /// Maximum absolute error over `[-1, 1]` is ~1.97e-5 rad, below the guide's
     /// 4.5e-5 target (see `acos_approx_max_error` self-test).
-    fn acos_approx(x: f32) -> f32 {
+    pub(crate) fn acos_approx(x: f32) -> f32 {
         let x = x.clamp(-1.0, 1.0);
         let abs_x = x.abs();
         // Horner evaluation of the degree-4 fit of acos(t)/sqrt(1-t) over [0,1].
