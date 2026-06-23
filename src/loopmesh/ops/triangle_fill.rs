@@ -268,6 +268,14 @@ impl LoopMesh {
 
         let mut interior_edges: Vec<EdgeKey> = Vec::new();
         let mut created_faces: Vec<FaceKey> = Vec::new();
+        // §7/§8 — the §1.2.4 bridge/slit edges that separate a band from its
+        // hole. The dissolve pass must never JFKE-join across one of these, or
+        // the hole rim merges into the outer disk and the hole fills (χ would
+        // collapse from 0 to 1). Only the with-holes path ever populates this;
+        // the single-simple-loop path leaves it empty, so its dissolve is
+        // bit-for-bit unchanged.
+        let mut protected_edges: std::collections::HashSet<EdgeKey> =
+            std::collections::HashSet::new();
 
         if let Some(loop_verts) = self.triangle_fill_order_single_loop(edges) {
             // Fast path: the whole edge set is one simple closed loop.
@@ -277,6 +285,7 @@ impl LoopMesh {
                 params,
                 &mut interior_edges,
                 &mut created_faces,
+                &mut protected_edges,
             );
         } else {
             // §1.2 region-discovery path: multiple loops, an annulus/hole, an
@@ -289,6 +298,7 @@ impl LoopMesh {
                     params,
                     &mut interior_edges,
                     &mut created_faces,
+                    &mut protected_edges,
                 );
             }
         }
@@ -302,7 +312,12 @@ impl LoopMesh {
             // face whose edges are never visited as a manifold interior edge
             // (e.g. the lone triangle of a 3-edge loop) is still reported in
             // geom.out (§1/§7).
-            self.triangle_fill_dissolve(&interior_edges, created_faces, &mut result);
+            self.triangle_fill_dissolve(
+                &interior_edges,
+                created_faces,
+                &protected_edges,
+                &mut result,
+            );
         } else {
             result.faces = created_faces;
             result.edges = interior_edges;
@@ -326,6 +341,7 @@ impl LoopMesh {
         params: &TriangleFillParams,
         interior_edges: &mut Vec<EdgeKey>,
         created_faces: &mut Vec<FaceKey>,
+        protected_edges: &mut std::collections::HashSet<EdgeKey>,
     ) {
         let outer = &region_loops[0];
         if outer.len() < 3 {
@@ -359,7 +375,7 @@ impl LoopMesh {
         // single simple-polygon vertex sequence whose triangulation leaves the
         // hole empty. With no holes this is just the outer loop verbatim.
         let has_holes = region_loops.len() > 1;
-        let sweep_verts = self.triangle_fill_bridge_holes(region_loops, &project);
+        let (sweep_verts, bridge_pairs) = self.triangle_fill_bridge_holes(region_loops, &project);
         let projected: Vec<Vec2> = sweep_verts.iter().map(|&v| project(self, v)).collect();
 
         let mut tris: Vec<[u32; 3]> = Vec::with_capacity(sweep_verts.len());
@@ -448,6 +464,17 @@ impl LoopMesh {
                 }
             }
         }
+
+        // §7/§8 — protect each bridge edge (the §1.2.4 splice that joins a hole
+        // rim into the outer boundary) from the dissolve pass. A bridge separates
+        // the band from the hole; JFKE-joining across it would merge the hole rim
+        // into the outer disk and fill the hole. Keeping it as a surviving slit
+        // edge leaves the dissolved annulus with its hole empty (χ = 0).
+        for (va, vb) in bridge_pairs {
+            if let Some(edge) = self.query_edge_exists(va, vb) {
+                protected_edges.insert(edge);
+            }
+        }
     }
 
     /// §1.2.4 — splice every hole loop of a region into its outer loop with a
@@ -456,14 +483,21 @@ impl LoopMesh {
     /// fillable while the hole interior is left empty. Each hole is wound
     /// opposite to the outer loop (in projection) so the bridged polygon stays
     /// simple.
+    ///
+    /// Returns the spliced chain and, for each hole, the undirected VertexKey
+    /// pair of its bridge endpoints (outer vertex, hole vertex). Those pairs are
+    /// the bridge/slit edges the §7 dissolve must protect: a bridge separates the
+    /// band from the hole, so joining across it would merge the hole rim into the
+    /// outer disk and fill the hole (§8 requires the hole to stay empty).
     fn triangle_fill_bridge_holes(
         &self,
         region_loops: &[Vec<VertexKey>],
         project: &impl Fn(&LoopMesh, VertexKey) -> Vec2,
-    ) -> Vec<VertexKey> {
+    ) -> (Vec<VertexKey>, Vec<(VertexKey, VertexKey)>) {
         let mut chain: Vec<VertexKey> = region_loops[0].clone();
+        let mut bridge_pairs: Vec<(VertexKey, VertexKey)> = Vec::new();
         if region_loops.len() == 1 {
-            return chain;
+            return (chain, bridge_pairs);
         }
 
         let outer_ccw = self.triangle_fill_loop_is_ccw(&chain, project);
@@ -482,6 +516,7 @@ impl LoopMesh {
             // the least likely to cross the band geometry).
             let (outer_index, hole_index) =
                 self.triangle_fill_closest_pair(&chain, &hole_seq, project);
+            bridge_pairs.push(unordered_pair(chain[outer_index], hole_seq[hole_index]));
 
             // Splice: ... outer[outer_index], hole[hole_index..], hole[hole_index],
             // outer[outer_index] ... — the repeated outer and hole vertices are
@@ -496,7 +531,7 @@ impl LoopMesh {
             spliced.extend_from_slice(&chain[outer_index..]);
             chain = spliced;
         }
-        chain
+        (chain, bridge_pairs)
     }
 
     /// Collect every region-boundary edge as an undirected VertexKey pair: the
@@ -935,6 +970,24 @@ impl LoopMesh {
         tally > 0
     }
 
+    /// True when `face_a` and `face_b` share — besides `joining_edge` — at least
+    /// one *protected* edge. Joining the pair across `joining_edge` would then
+    /// strand that protected edge as a same-face filament (and the join surgery
+    /// would dissolve it), filling a hole the §1.2.4 bridge was keeping open.
+    fn faces_share_protected_edge(
+        &self,
+        face_a: FaceKey,
+        face_b: FaceKey,
+        joining_edge: EdgeKey,
+        protected_edges: &std::collections::HashSet<EdgeKey>,
+    ) -> bool {
+        let edges_b: std::collections::HashSet<EdgeKey> =
+            self.face_edge_keys(face_b).into_iter().collect();
+        self.face_edge_keys(face_a).into_iter().any(|edge| {
+            edge != joining_edge && protected_edges.contains(&edge) && edges_b.contains(&edge)
+        })
+    }
+
     /// §7 dissolve pass: JFKE-join the two fill triangles flanking each new
     /// manifold interior edge, removing the edge; report the surviving joined
     /// faces and any surviving fill edges in `geom.out`.
@@ -942,6 +995,7 @@ impl LoopMesh {
         &mut self,
         interior_edges: &[EdgeKey],
         created_faces: Vec<FaceKey>,
+        protected_edges: &std::collections::HashSet<EdgeKey>,
         result: &mut TriangleFillResult,
     ) {
         // Seed with every fill face created during materialisation (§5); each
@@ -956,6 +1010,15 @@ impl LoopMesh {
             if self.edges.try_get(edge).is_none() {
                 continue;
             }
+            // §7/§8 — a §1.2.4 bridge/slit edge separates the band from its
+            // hole; JFKE-joining across it would fill the hole. Leave it as a
+            // surviving fill edge so a dissolved annulus keeps its hole empty
+            // (χ = 0). The no-holes path never protects any edge, so its
+            // dissolve is unaffected.
+            if protected_edges.contains(&edge) {
+                result.edges.push(edge);
+                continue;
+            }
             let radial = self.edge_loop_keys(edge);
             match radial.len() {
                 2 => {
@@ -963,6 +1026,22 @@ impl LoopMesh {
                     let face_b = self.loop_face(radial[1]);
                     if face_a == face_b {
                         // Same-face filament — joining is undefined; leave it.
+                        result.edges.push(edge);
+                        continue;
+                    }
+                    // §7/§8 — when the two flanking faces share a *protected*
+                    // edge in addition to `edge` (the case where dissolving the
+                    // band's last spoke would close the annular ring), the join
+                    // would consume the protected §1.2.4 bridge as a same-face
+                    // filament and fill the hole. The JFKE precondition (a clean
+                    // single-shared-edge merge that introduces no internal
+                    // duplicate vertex) is violated, so the join is refused and
+                    // `edge` survives — leaving the dissolved annulus open
+                    // (χ = 0). Only the with-holes path populates `protected_
+                    // edges`, so the no-holes dissolve is unaffected.
+                    if !protected_edges.is_empty()
+                        && self.faces_share_protected_edge(face_a, face_b, edge, protected_edges)
+                    {
                         result.edges.push(edge);
                         continue;
                     }
@@ -1405,6 +1484,84 @@ mod tests {
                 .all(|v| inner_verts.contains(v));
             assert!(!all_inner, "no triangle may fill the hole interior");
         }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn annulus_dissolve_keeps_hole_empty() {
+        // §7/§8 + §1.2.4: a dissolved annulus must keep its hole empty. The
+        // dissolve pass JFKE-joins the band's interior diagonals into n-gons,
+        // but it must NOT join across the §1.2.4 bridge/slit edge that splices
+        // the hole rim into the outer boundary — joining there would merge the
+        // hole rim into the outer disk and fill the hole (χ would collapse from
+        // 0 to 1). The surviving annulus has χ = 0.
+        let mut mesh = LoopMesh::new();
+        let outer = wire_ring_at(&mut mesh, 4, Vec3::ZERO, 4.0);
+        let inner = wire_ring_at(&mut mesh, 4, Vec3::ZERO, 1.0);
+        let mut edges = outer.clone();
+        edges.extend(inner.iter().copied());
+
+        let result = mesh.triangle_fill(
+            &edges,
+            &TriangleFillParams {
+                use_beauty: false,
+                use_dissolve: true,
+                normal: None,
+            },
+        );
+
+        assert_eq!(mesh.vertex_count(), 8, "no vertex created");
+        assert!(!result.faces().is_empty(), "dissolved band must survive");
+
+        // The four inner edges still bound the empty hole: each carries exactly
+        // one face (the band side), never two — the hole stays empty after the
+        // dissolve.
+        for &inner_edge in &inner {
+            let face_count = mesh.edge_loop_keys(inner_edge).len();
+            assert_eq!(
+                face_count, 1,
+                "inner edge {inner_edge:?} keeps the band on one side only (hole empty)"
+            );
+        }
+        // The four outer edges likewise survive verbatim (input edges are never
+        // dissolved, §7).
+        for &outer_edge in &outer {
+            assert!(
+                mesh.edges.try_get(outer_edge).is_some(),
+                "outer boundary edge {outer_edge:?} must survive the dissolve"
+            );
+        }
+
+        // No surviving face may have all corners on the inner loop — that would
+        // mean the hole got covered.
+        let inner_verts: std::collections::HashSet<VertexKey> = inner
+            .iter()
+            .flat_map(|&e| mesh.edge_vert_keys(e))
+            .collect();
+        for face in mesh.face_keys() {
+            let all_inner = mesh
+                .face_vert_keys(face)
+                .iter()
+                .all(|v| inner_verts.contains(v));
+            assert!(!all_inner, "no surviving face may fill the hole interior");
+        }
+
+        // χ = V − E + F = 0 for a topological annulus (one face per side of the
+        // band's loop, two boundary loops, hole empty). A filled hole would push
+        // χ to 1.
+        let chi = mesh.vertex_count() as i64 - mesh.edge_count() as i64
+            + mesh.face_count() as i64;
+        assert_eq!(chi, 0, "dissolved annulus has Euler characteristic 0 (hole empty)");
+
+        // The band dissolves as far as the manifold-join rule allows (§7/§8):
+        // the §1.2.4 bridge survives, and so does the one ring-closing spoke
+        // whose join would have consumed the bridge as a filament (closing the
+        // annular ring would fill the hole). The band ends up as two large
+        // faces separated by bridge + spoke. 8 verts, 8 boundary + 2 surviving
+        // interior = 10 edges, 2 faces (χ = 8 − 10 + 2 = 0).
+        assert_eq!(mesh.edge_count(), 10, "8 boundary edges + the bridge + the ring-closing spoke");
+        assert_eq!(mesh.face_count(), 2, "the band dissolves to two large n-gons, not one ring");
+
         mesh.validate_topology();
     }
 
