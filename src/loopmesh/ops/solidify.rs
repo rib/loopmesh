@@ -89,6 +89,21 @@ impl LoopMesh {
             self.face_calc_normal(face);
         }
 
+        // §4.4 fallback-1 / §7.4: the region-non-manifold fallback accumulates
+        // each incident face's *stored* normal over the duplicate vert's
+        // post-extrude disk, walls included. A side wall is a zero-area
+        // degenerate quad at this pre-offset moment (its duplicate edge is still
+        // coincident with its rim edge), so its geometric normal is undefined —
+        // recomputing it would zero the wall's contribution and the fallback
+        // would sum only the duplicate wings, offsetting a symmetric spine
+        // wrongly. Instead each wall inherits the **stored normal of the
+        // kept-original wing across its rim (base) edge**: that wing was flipped
+        // in phase 1 and flipped back by extrude (§6.1), so it sits at its
+        // original winding and its geometric normal is the *un-flipped* original
+        // wing normal — the negation of the paired duplicate wing's normal, so
+        // the (wing, wall) pair cancels on a symmetric fan.
+        self.solidify_inherit_wall_normals(region);
+
         // §4.1: tag the duplicate region's verts and edges, and count per edge
         // how many region faces use it. The smoothed estimate is built only
         // from the marked region.
@@ -200,10 +215,17 @@ impl LoopMesh {
             }
             let v = VertexKey::from_usize(slot);
             if vert_region_nonmanifold[slot] {
-                // §4.4 fallback 1: plain geometric vertex normal over the full
-                // mesh.
-                self.vert_normal_update(v);
-                smoothed_normal[slot] = self.vertex_normal(v);
+                // §4.4 fallback 1: the plain angle-weighted vertex normal
+                // accumulated over the *duplicate* vert's post-extrude incident
+                // faces — duplicate region faces **and** the side walls stitched
+                // around its boundary edges (§4.3, §4.4 fallback 1, §7.4). Not
+                // the input vertex's faces, not restricted to the marked region.
+                // When that accumulation normalises to zero (the symmetric
+                // T-junction cancellation), the vert receives NO offset: it
+                // stays coincident with the kept shell. We therefore keep the
+                // raw zero here rather than substituting any non-zero fallback,
+                // and the §5.3 `thickness · 0` path leaves the vert in place.
+                smoothed_normal[slot] = self.solidify_nonmanifold_fallback_normal(v);
                 continue;
             }
             let unit = LoopMesh::normalize_or_zero(accumulator[slot]);
@@ -276,6 +298,100 @@ impl LoopMesh {
             0.0
         } else {
             thickness * (weighted_sum / angle_sum)
+        }
+    }
+
+    /// §4.4 fallback 1: the plain angle-weighted vertex normal for a
+    /// region-non-manifold vertex, accumulated over *all* faces incident to the
+    /// (duplicate) vertex in the post-extrude mesh — duplicate region faces
+    /// **and** the side walls stitched around its boundary edges — using each
+    /// face's current stored normal, weighted by the interior corner angle the
+    /// face subtends at `v` (Thürmer–Wüthrich weighting, BMESH.md §11).
+    ///
+    /// Unlike the general [`Self::vert_normal_update`], this returns the **raw
+    /// zero vector** when the accumulation cancels (the symmetric T-junction
+    /// case, §7.4) rather than substituting `normalize(position)`. A zero normal
+    /// here flows into §5.3 as `thickness · 0`, so the vert receives no offset
+    /// and pins to the kept shell — which is exactly the documented behaviour.
+    fn solidify_nonmanifold_fallback_normal(&self, v: VertexKey) -> Vec3 {
+        let apex = self.vertices.get(v).position;
+        let mut acc = Vec3::ZERO;
+        let mut disk = self.disk_edges(v);
+        while let Some(e) = disk.next(self) {
+            let far_vertex = match self.edges.get(e).other_vertex(v) {
+                Some(w) => w,
+                None => continue,
+            };
+            let out_ray =
+                LoopMesh::normalize_or_zero(self.vertices.get(far_vertex).position - apex);
+            let mut radial = self.radial_loops(e);
+            while let Some(l) = radial.next(self) {
+                let loop_data = self.loops.get(l);
+                if loop_data.vertex != v {
+                    continue;
+                }
+                let face = loop_data.face;
+                let prev_vertex = self.loops.get(self.loop_prev(l)).vertex;
+                let in_ray =
+                    LoopMesh::normalize_or_zero(self.vertices.get(prev_vertex).position - apex);
+                let dot = in_ray.dot(out_ray).clamp(-1.0, 1.0);
+                let weight = LoopMesh::acos_approx(dot);
+                acc += weight * self.faces.get(face).normal;
+            }
+        }
+        LoopMesh::normalize_or_zero(acc)
+    }
+
+    /// §4.4 fallback-1 / §7.4: give each side wall the stored normal it should
+    /// inherit from the kept-original wing across its rim (base) edge.
+    ///
+    /// The wall is a degenerate zero-area quad at this pre-offset moment, so it
+    /// has no meaningful geometric normal of its own. The kept-original wing
+    /// across the wall's base edge is a real, non-degenerate face sitting at its
+    /// *original* winding (flipped in phase 1, flipped back by extrude §6.1), so
+    /// its geometric normal is the un-flipped original wing normal — exactly the
+    /// negation of the paired duplicate wing's normal. Threading it onto the
+    /// wall makes the (duplicate wing, wall) pairs at a non-manifold spine carry
+    /// equal-and-opposite stored normals, so the symmetric fan cancels (§7.4).
+    fn solidify_inherit_wall_normals(&mut self, region: &ExtrudeResult) {
+        if region.wall_faces.is_empty() {
+            return;
+        }
+        let vert_watermark = self.vertices.key_watermark();
+        let mut vert_is_kept_original: Vec<bool> = vec![false; vert_watermark];
+        for &(original, _dup) in &region.vert_map {
+            vert_is_kept_original[original.as_usize()] = true;
+        }
+
+        for &wall in &region.wall_faces {
+            // The wall's base (rim) edge is the one whose both endpoints are
+            // kept-original verts; the other three edges touch a duplicate vert.
+            let base_edge = self.face_edge_keys(wall).into_iter().find(|&e| {
+                let [a, b] = self.edge_vertices(e);
+                vert_is_kept_original[a.as_usize()] && vert_is_kept_original[b.as_usize()]
+            });
+            let base_edge = match base_edge {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // The kept-original wing is the face across the base edge that is
+            // neither the wall itself nor (defensively) another wall — i.e. the
+            // surviving original face on the rim. Compute its geometric normal
+            // from its real (non-degenerate) geometry and store it on the wall.
+            let mut wing_normal = None;
+            let mut radial = self.radial_loops(base_edge);
+            while let Some(l) = radial.next(self) {
+                let face = self.loops.get(l).face;
+                if face == wall || region.wall_faces.contains(&face) {
+                    continue;
+                }
+                wing_normal = Some(self.face_compute_normal(face));
+                break;
+            }
+            if let Some(normal) = wing_normal {
+                self.faces.get_mut(wall).normal = normal;
+            }
         }
     }
 
@@ -470,5 +586,161 @@ mod tests {
             max_len > 0.5 + 1e-3,
             "fold verts should overshoot the flat thickness, max move = {max_len}"
         );
+    }
+
+    #[test]
+    fn three_wing_nonmanifold_spine_gets_no_offset() {
+        // SOLIDIFY.md §4.4 fallback 1 / §7.4: on the symmetric three-quad
+        // T-junction the spine vert's §4.4-fallback-1 normal — accumulated over
+        // the duplicate vert's post-extrude incident faces (the three duplicate
+        // wings AND the three side walls) — cancels to the zero vector, so the
+        // duplicate spine verts receive NO offset and stay coincident with the
+        // kept spine. The cancelling is wing-against-its-own-wall: two coplanar
+        // wings reinforce (same stored normal), and each is annihilated by its
+        // paired wall carrying the un-flipped kept-original wing normal. An
+        // accumulation that omitted the walls (or used their degenerate
+        // geometric normal) would sum the three wings alone to a non-zero
+        // direction and offset the spine wrongly.
+        let mut mesh = LoopMesh::new();
+        let (faces, s0, s1) = three_wing_tjunction(&mut mesh);
+        let result = mesh.solidify(&faces, 0.5);
+        mesh.validate_topology();
+
+        let mut spine_pairs = 0;
+        let mut wing_offsets = 0;
+        for &(original, dup) in &result.vert_map {
+            let original_pos = mesh.vertex_position(original);
+            let dup_pos = mesh.vertex_position(dup);
+            let delta = (dup_pos - original_pos).length();
+            if original == s0 || original == s1 {
+                spine_pairs += 1;
+                assert!(
+                    delta < 1e-5,
+                    "symmetric spine vert must pin to the kept shell (delta = {delta})"
+                );
+            } else if delta > 1e-3 {
+                wing_offsets += 1;
+            }
+        }
+        assert_eq!(spine_pairs, 2, "both spine verts present in the vert map");
+        assert!(
+            wing_offsets > 0,
+            "wing corners away from the spine must still offset"
+        );
+    }
+
+    #[test]
+    fn asymmetric_nonmanifold_spine_gets_nonzero_offset() {
+        // SOLIDIFY.md §4.4 fallback 1 / §7.4: the same fallback over an
+        // asymmetric non-manifold fan does NOT cancel — the angle-weighted
+        // normal over the duplicate spine vert's post-extrude incident faces is
+        // non-zero, so the duplicate spine verts DO offset. This rules out an
+        // incorrect "non-manifold ⇒ never offset" shortcut.
+        let mut mesh = LoopMesh::new();
+        let (faces, s0, s1) = asymmetric_fan(&mut mesh);
+        let result = mesh.solidify(&faces, 0.5);
+        mesh.validate_topology();
+
+        let mut spine_pairs = 0;
+        for &(original, dup) in &result.vert_map {
+            if original == s0 || original == s1 {
+                spine_pairs += 1;
+                let delta = (mesh.vertex_position(dup) - mesh.vertex_position(original)).length();
+                assert!(
+                    delta > 1e-3,
+                    "asymmetric spine vert must offset (delta = {delta})"
+                );
+            }
+        }
+        assert_eq!(spine_pairs, 2, "both spine verts present in the vert map");
+    }
+
+    /// An asymmetric region-non-manifold fan: three quad wings off a shared
+    /// vertical spine S0--S1, at irregular directions with no mirror symmetry.
+    /// Its §4.4-fallback-1 normal does NOT cancel, so the spine verts offset.
+    fn asymmetric_fan(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey, VertexKey) {
+        let s0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let s1 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let wings: [(Vec3, bool); 3] = [
+            (Vec3::new(1.0, 0.2, 0.0), true),
+            (Vec3::new(0.3, 1.0, 0.0), true),
+            (Vec3::new(-0.7, 0.4, 0.0), true),
+        ];
+        let mut faces = Vec::new();
+        for (dir, forward) in wings {
+            faces.push(make_wing(mesh, s0, s1, dir, forward));
+        }
+        (faces, s0, s1)
+    }
+
+    /// The symmetric three-quad T-junction of SOLIDIFY.md §7.4's worked
+    /// example. The spine runs along `y` from `0 = (0,0,0)` to `1 = (0,1,0)`;
+    /// three quad wings hang off the shared radial-3 spine edge `{0,1}`:
+    ///
+    /// ```text
+    /// wing 0 (+x, in z=0):  0,2,3,1   (2=(1,0,0),  3=(1,1,0))   normal +z
+    /// wing 1 (−x, in z=0):  0,1,5,4   (4=(−1,0,0), 5=(−1,1,0))  normal +z
+    /// wing 2 (+z, in x=0):  0,1,7,6   (6=(0,0,1),  7=(0,1,1))   normal +x
+    /// ```
+    ///
+    /// Wings 0 and 1 are coplanar in `z=0` and **reinforcing** (both +z); the
+    /// cancellation that zeroes the spine offset is each wing against its own
+    /// paired wall, not wing-against-wing. Returns (region faces, spine vert s0,
+    /// spine vert s1). All three wings are solidified together.
+    fn three_wing_tjunction(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey, VertexKey) {
+        let s0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0)); // vert 0
+        let s1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0)); // vert 1
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(-1.0, 1.0, 0.0));
+        let v6 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let v7 = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+        // Exact §7.4 winding: wing 0 = 0,2,3,1 (normal +z); wing 1 = 0,1,5,4
+        // (coplanar with wing 0, also +z — they reinforce); wing 2 = 0,1,7,6
+        // (normal +x). The spine edge {0,1} is shared by all three (radial-3).
+        let faces = vec![
+            make_ring_wing(mesh, [s0, v2, v3, s1]),
+            make_ring_wing(mesh, [s0, s1, v5, v4]),
+            make_ring_wing(mesh, [s0, s1, v7, v6]),
+        ];
+        (faces, s0, s1)
+    }
+
+    /// Build one quad wing from an explicit 4-vertex ring, deduplicating shared
+    /// edges (so the spine edge is shared across wings, making it radial-3).
+    fn make_ring_wing(mesh: &mut LoopMesh, ring: [VertexKey; 4]) -> FaceKey {
+        let mut edges = [EdgeKey::from_usize(0); 4];
+        for i in 0..4 {
+            edges[i] =
+                mesh.create_edge([ring[i], ring[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE);
+        }
+        mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+    }
+
+    /// Build one quad wing sharing the spine edge s0--s1. `forward` chooses the
+    /// winding so callers can produce mirror-opposed coplanar wings.
+    fn make_wing(
+        mesh: &mut LoopMesh,
+        s0: VertexKey,
+        s1: VertexKey,
+        dir: Vec3,
+        forward: bool,
+    ) -> FaceKey {
+        let a = mesh.create_vertex(dir);
+        let b = mesh.create_vertex(dir + Vec3::new(0.0, 0.0, 1.0));
+        let ring = if forward {
+            [s0, s1, b, a]
+        } else {
+            [s0, a, b, s1]
+        };
+        let mut edges = [EdgeKey::from_usize(0); 4];
+        for i in 0..4 {
+            edges[i] = mesh.create_edge(
+                [ring[i], ring[(i + 1) % 4]],
+                EdgeCreateFlags::NO_DUPLICATE,
+            );
+        }
+        mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
     }
 }
