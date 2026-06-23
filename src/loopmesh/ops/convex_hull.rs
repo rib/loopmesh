@@ -21,6 +21,8 @@ pub struct ConvexHullResult {
     faces: Vec<FaceKey>,
     interior_verts: Vec<VertexKey>,
     unused_verts: Vec<VertexKey>,
+    hole_edges: Vec<EdgeKey>,
+    hole_faces: Vec<FaceKey>,
 }
 
 impl ConvexHullResult {
@@ -84,6 +86,33 @@ impl ConvexHullResult {
         self.unused_verts.iter().copied().map(GeomKey::from).collect()
     }
 
+    /// Reused on-hull faces tagged as **holes** under `use_existing_faces`: a
+    /// pre-existing input face whose footprint coincides with a hull triangle
+    /// and all of whose edges lie on the hull, minus any face that touches a
+    /// boundary edge (un-holed by the cleanup pass — CONVEX_HULL.md §5). Empty
+    /// when `use_existing_faces` is clear.
+    pub fn hole_faces(&self) -> &[FaceKey] {
+        &self.hole_faces
+    }
+
+    /// Edges all of whose (at least one) incident faces are holes — the edges
+    /// of the reused patch, tagged by the cleanup pass so the holes slot
+    /// reports the seam's edges as well as its faces (CONVEX_HULL.md §5).
+    pub fn hole_edges(&self) -> &[EdgeKey] {
+        &self.hole_edges
+    }
+
+    /// The `geom_holes.out` slot as a single mixed element set: the reused
+    /// patch faces (minus border faces) plus the patch's all-hole edges
+    /// (CONVEX_HULL.md §1 `geom_holes.out`, §5). Empty when `use_existing_faces`
+    /// is clear.
+    pub fn geom_holes_out(&self) -> Vec<GeomKey> {
+        let mut out = Vec::with_capacity(self.hole_edges.len() + self.hole_faces.len());
+        out.extend(self.hole_edges.iter().copied().map(GeomKey::from));
+        out.extend(self.hole_faces.iter().copied().map(GeomKey::from));
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.verts.is_empty() && self.edges.is_empty() && self.faces.is_empty()
     }
@@ -111,14 +140,15 @@ impl LoopMesh {
     /// normals.
     ///
     /// **Scope (this cycle):** any vertex cloud (full-3D, coplanar, collinear,
-    /// or coincident) with `use_existing_faces = false`. The result reports
-    /// `geom.out` (the built on-hull surface, CONVEX_HULL.md §4.3) and the
-    /// **vertex** half of the `geom_interior.out` / `geom_unused.out`
-    /// classification (CONVEX_HULL.md §4, §4.1, §7): every input vert not on the
-    /// hull is interior, and an interior vert is unused when all its incident
-    /// elements are themselves input. Input edge/face classification, the holes
-    /// slot, the `use_existing_faces` reuse path (§5), and the customdata
-    /// example-face seed (§6.1) are not yet implemented.
+    /// or coincident) with `use_existing_faces = false` and no input faces. The
+    /// result reports `geom.out` (the built on-hull surface, CONVEX_HULL.md
+    /// §4.3) and the **vertex** half of the `geom_interior.out` /
+    /// `geom_unused.out` classification (CONVEX_HULL.md §4, §4.1, §7): every
+    /// input vert not on the hull is interior, and an interior vert is unused
+    /// when all its incident elements are themselves input. Input edge/face
+    /// classification (§4.2, §7) and the customdata example-face seed (§6.1) are
+    /// not yet implemented. For the `use_existing_faces` reuse path (§5) and the
+    /// `geom_holes.out` slot, see [`Self::convex_hull_with_faces`].
     ///
     /// Degenerate clouds (CONVEX_HULL.md §8) are handled, not errors:
     /// - **Coplanar** input yields a single planar facet, fanned into a flat
@@ -136,18 +166,48 @@ impl LoopMesh {
     /// the provider returns no hull of any dimension (fewer than two distinct
     /// positions).
     pub fn convex_hull(&mut self, input: &[VertexKey]) -> ConvexHullResult {
+        self.convex_hull_with_faces(input, &[], false)
+    }
+
+    /// Mixed-input convex hull (CONVEX_HULL.md §1): the `verts` cloud drives the
+    /// hull geometry exactly as [`Self::convex_hull`], while `input_faces` are
+    /// the pre-existing input faces the classification + reuse passes inspect.
+    /// Only the verts contribute hull points (§1.1); `input_faces` (and the
+    /// edges they imply) participate only in the reuse / holes logic.
+    ///
+    /// `use_existing_faces` (CONVEX_HULL.md §5): when set, a hull triangle whose
+    /// footprint is entirely covered by an input face — the face spans the three
+    /// triangle verts and *every* edge of that face is a hull edge — is **not**
+    /// materialised; the input face is reused in place, un-marked interior, and
+    /// tagged a *hole*. A cleanup pass then un-holes any hole face touching a
+    /// boundary edge (an edge with fewer than two faces) and holes every edge
+    /// all of whose faces are holes, so `geom_holes.out` reports the reused
+    /// patch's faces and edges. When clear, every hull triangle is built
+    /// unconditionally (stacking on any coincident input face, which can yield
+    /// non-manifold edges — §2) and `geom_holes.out` comes back empty.
+    ///
+    /// **Deferred (still 📝):** input edge/face interior/unused classification
+    /// (§4.2, §7) — `input_faces` are not yet routed into `geom_interior.out` /
+    /// `geom_unused.out`, only into the reuse/holes path. The customdata
+    /// example-face seed (§6.1) is also not yet implemented.
+    pub fn convex_hull_with_faces(
+        &mut self,
+        verts: &[VertexKey],
+        input_faces: &[FaceKey],
+        use_existing_faces: bool,
+    ) -> ConvexHullResult {
         let mut result = ConvexHullResult::default();
 
         // §1.2 — minimum-input guard: a count, not a non-degeneracy test.
-        if input.len() < 3 {
+        if verts.len() < 3 {
             return result;
         }
 
         // §1.1 — only the verts drive the cloud. Map each input vertex's
         // position into the provider's f64 cloud; the cloud index is the input
-        // slot, so an on-hull index maps straight back to `input[index]` with no
+        // slot, so an on-hull index maps straight back to `verts[index]` with no
         // remapping and no positional drift (§2).
-        let points: Vec<DVec3> = input
+        let points: Vec<DVec3> = verts
             .iter()
             .map(|&v| self.vertex_position(v).as_dvec3())
             .collect();
@@ -156,41 +216,87 @@ impl LoopMesh {
             return result;
         };
 
-        // §3.1 — fan each facet into outward-wound triangles, then run the §6
-        // surgery per triangle. `face_create_verts` with NO_DUPLICATE performs
-        // both the no-double edge creation (§6 step 1) and the face
-        // find-or-create (§6 step 2) in one call.
-        let mut on_hull_verts: HashSet<VertexKey> = HashSet::new();
-        let mut on_hull_edges: HashSet<EdgeKey> = HashSet::new();
-        let mut seen_faces: HashSet<FaceKey> = HashSet::new();
-
+        // §3.1 — fan every facet into outward-wound triangles up front, keyed
+        // back to the mesh's vertex handles. The reuse test (§5) and the surgery
+        // (§6) both walk this flat triangle list.
+        let mut triangles: Vec<[VertexKey; 3]> = Vec::new();
         for facet in &topology.faces {
             let corners = &facet.vertices;
             if corners.len() < 3 {
                 continue;
             }
-            let apex = input[corners[0]];
+            let apex = verts[corners[0]];
             for window in corners[1..].windows(2) {
-                let a = apex;
-                let b = input[window[0]];
-                let c = input[window[1]];
+                triangles.push([apex, verts[window[0]], verts[window[1]]]);
+            }
+        }
 
-                // §3.2 — the facet's CCW order is the face's winding, so the
-                // built face's stored normal points outward.
-                let face = self.face_create_verts(&[a, b, c], FaceCreateFlags::NO_DUPLICATE);
+        // §4.2 — a hull edge is any undirected vertex pair bounding some hull
+        // triangle. The reuse test needs this set to decide whether *every* edge
+        // of a candidate input face is a hull edge.
+        let mut hull_edge_pairs: HashSet<[VertexKey; 2]> = HashSet::new();
+        for tri in &triangles {
+            for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                hull_edge_pairs.insert(undirected(a, b));
+            }
+        }
 
-                // §4.3 / §6 step 4 — flag the face, its edges, and its verts
-                // on-hull as they are materialised.
-                if seen_faces.insert(face) {
-                    result.faces.push(face);
-                }
-                for vert in [a, b, c] {
-                    on_hull_verts.insert(vert);
-                }
-                for edge in self.face_edge_keys(face) {
-                    on_hull_edges.insert(edge);
+        let input_face_set: HashSet<FaceKey> = input_faces.iter().copied().collect();
+
+        let mut on_hull_verts: HashSet<VertexKey> = HashSet::new();
+        let mut on_hull_edges: HashSet<EdgeKey> = HashSet::new();
+        let mut seen_faces: HashSet<FaceKey> = HashSet::new();
+        let mut hole_faces: HashSet<FaceKey> = HashSet::new();
+
+        for tri in &triangles {
+            let [a, b, c] = *tri;
+
+            // §5 — under `use_existing_faces`, try to reuse an input face whose
+            // footprint coincides with this triangle and all of whose edges are
+            // hull edges. A reused face is skipped (no new face built), tagged a
+            // hole, and its verts/edges still flagged on-hull (§6.2).
+            if use_existing_faces {
+                if let Some(face) =
+                    self.find_reusable_face(a, b, c, &input_face_set, &hull_edge_pairs)
+                {
+                    hole_faces.insert(face);
+                    for vert in [a, b, c] {
+                        on_hull_verts.insert(vert);
+                    }
+                    // §6.2 — flag the reused patch's hull edges on-hull so
+                    // `geom.out` stays complete across built and reused faces.
+                    for edge in self.face_edge_keys(face) {
+                        on_hull_edges.insert(edge);
+                    }
+                    continue;
                 }
             }
+
+            // §3.2 — the facet's CCW order is the face's winding, so the built
+            // face's stored normal points outward. `face_create_verts` with
+            // NO_DUPLICATE performs both the no-double edge creation (§6 step 1)
+            // and the face find-or-create (§6 step 2) in one call.
+            let face = self.face_create_verts(&[a, b, c], FaceCreateFlags::NO_DUPLICATE);
+
+            // §4.3 / §6 step 4 — flag the face, its edges, and its verts
+            // on-hull as they are materialised.
+            if seen_faces.insert(face) {
+                result.faces.push(face);
+            }
+            for vert in [a, b, c] {
+                on_hull_verts.insert(vert);
+            }
+            for edge in self.face_edge_keys(face) {
+                on_hull_edges.insert(edge);
+            }
+        }
+
+        // §5 — hole cleanup pass. A hole face touching a boundary edge (fewer
+        // than two incident faces) is on the patch's border, not a true interior
+        // hole, so it is un-holed. Then every edge all of whose faces are holes
+        // is itself tagged a hole, so the patch's edges are reported too.
+        if use_existing_faces && !hole_faces.is_empty() {
+            self.cleanup_holes(&mut hole_faces, &mut result);
         }
 
         // §2 / §8 — the on-hull vertex set is the extremal subset of the input,
@@ -207,10 +313,15 @@ impl LoopMesh {
         // deduplicates coincident positions before the hull runs, so a
         // non-representative duplicate is simply absent from `topology.vertices`
         // (§8 coincident bullet) and lands in the interior/unused slots instead.
-        let built_no_faces = result.faces.is_empty();
+        //
+        // `no_facets` distinguishes a genuinely degenerate (collinear) hull from
+        // one whose facets were all reused as holes (§5): in the reuse case the
+        // facets exist and bound their verts, so the `on_hull_verts.contains`
+        // filter is correct and we must *not* fall into the no-facets seam.
+        let no_facets = triangles.is_empty();
         for &index in &topology.vertices {
-            let vert = input[index];
-            if built_no_faces || on_hull_verts.contains(&vert) {
+            let vert = verts[index];
+            if no_facets || on_hull_verts.contains(&vert) {
                 result.verts.push(vert);
                 // No-op for the facet path; load-bearing for the no-faces
                 // (collinear) path — seeds on-hull so the later classification
@@ -230,7 +341,7 @@ impl LoopMesh {
         // culled coplanar-interior point, collinear intermediates, a coincident
         // duplicate's key, and any 3D buried point.
         let mut seen_interior: HashSet<VertexKey> = HashSet::new();
-        for &vert in input {
+        for &vert in verts {
             if on_hull_verts.contains(&vert) || !seen_interior.insert(vert) {
                 continue;
             }
@@ -257,6 +368,110 @@ impl LoopMesh {
     /// deferred to the mixed-input cycle — do *not* read this as that guard.
     fn vertex_is_loose(&self, vertex: VertexKey) -> bool {
         self.iter_disk_edges(vertex).next().is_none()
+    }
+
+    /// CONVEX_HULL.md §5 reuse test, per hull triangle: find an input face whose
+    /// loop spans exactly the triangle's three verts and *every* edge of which
+    /// is a hull edge. Returns the reusable face or `None`.
+    ///
+    /// The scan is anchored on the triangle's first vertex (`a`): only faces
+    /// incident on `a` can contain all three verts, so the disk of `a` bounds
+    /// the search.
+    fn find_reusable_face(
+        &self,
+        a: VertexKey,
+        b: VertexKey,
+        c: VertexKey,
+        input_faces: &HashSet<FaceKey>,
+        hull_edge_pairs: &HashSet<[VertexKey; 2]>,
+    ) -> Option<FaceKey> {
+        let mut seen: HashSet<FaceKey> = HashSet::new();
+        for edge in self.iter_disk_edges(a) {
+            for loop_key in self.iter_radial_loops(edge) {
+                let face = self.loop_face(loop_key);
+                if !input_faces.contains(&face) || !seen.insert(face) {
+                    continue;
+                }
+
+                // §5 step 1 — the face must occupy the triangle's footprint: its
+                // loop spans exactly the three triangle verts (a triangular
+                // face whose vertex set is {a, b, c}).
+                if self.face_len(face) != 3 {
+                    continue;
+                }
+                let face_verts = self.face_vert_keys(face);
+                let covers = [b, c]
+                    .iter()
+                    .all(|v| face_verts.contains(v))
+                    && face_verts.contains(&a);
+                if !covers {
+                    continue;
+                }
+
+                // §5 step 2 — a face is reusable only if it is entirely a hull
+                // face: every one of its edges must be a hull edge. One interior
+                // chord edge disqualifies it.
+                let all_hull_edges = self.face_edge_keys(face).iter().all(|&e| {
+                    let [u, v] = self.edge_vertices(e);
+                    hull_edge_pairs.contains(&undirected(u, v))
+                });
+                if all_hull_edges {
+                    return Some(face);
+                }
+            }
+        }
+        None
+    }
+
+    /// CONVEX_HULL.md §5 hole-cleanup pass. Mutates `hole_faces` in place
+    /// (un-holing border faces) and writes the surviving hole faces + the
+    /// patch's all-hole edges into `result`.
+    fn cleanup_holes(&self, hole_faces: &mut HashSet<FaceKey>, result: &mut ConvexHullResult) {
+        // A hole face touching a boundary edge (fewer than two incident faces)
+        // is on the patch's border, not a true interior hole — un-hole it.
+        let border: Vec<FaceKey> = hole_faces
+            .iter()
+            .copied()
+            .filter(|&face| {
+                self.face_edge_keys(face)
+                    .iter()
+                    .any(|&e| self.iter_radial_loops(e).take(2).count() < 2)
+            })
+            .collect();
+        for face in border {
+            hole_faces.remove(&face);
+        }
+
+        result.hole_faces = hole_faces.iter().copied().collect();
+        result.hole_faces.sort_unstable_by_key(ElementKey::as_usize);
+
+        // An edge all of whose faces are holes (and which has at least one face)
+        // is itself a hole — the holes slot reports the patch's edges too.
+        let mut hole_edges: HashSet<EdgeKey> = HashSet::new();
+        for &face in &result.hole_faces {
+            for edge in self.face_edge_keys(face) {
+                let mut has_face = false;
+                let all_holes = self.iter_radial_loops(edge).all(|l| {
+                    has_face = true;
+                    hole_faces.contains(&self.loop_face(l))
+                });
+                if has_face && all_holes {
+                    hole_edges.insert(edge);
+                }
+            }
+        }
+        result.hole_edges = hole_edges.into_iter().collect();
+        result.hole_edges.sort_unstable_by_key(ElementKey::as_usize);
+    }
+}
+
+/// Order-independent key for an undirected vertex pair, so a hull edge is the
+/// same whichever direction a triangle or face traverses it.
+fn undirected(a: VertexKey, b: VertexKey) -> [VertexKey; 2] {
+    if a.as_usize() <= b.as_usize() {
+        [a, b]
+    } else {
+        [b, a]
     }
 }
 
@@ -746,6 +961,196 @@ mod tests {
             result.unused_verts().is_empty(),
             "a vert leaned on by a non-input edge is not unused"
         );
+        mesh.validate_topology();
+    }
+
+    /// The four corners of a regular-ish tetrahedron whose four facets are all
+    /// triangles — the cleanest fixture for the reuse path, since a triangular
+    /// hull facet has no triangulation ambiguity (the facet *is* the triangle).
+    fn tetra_positions() -> Vec<Vec3> {
+        vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+        ]
+    }
+
+    /// Build the four triangular faces of the tetrahedron over `verts`, each in
+    /// an outward winding. Returns the created face keys. The closed surface
+    /// gives every edge two incident faces, so none of the four faces is a
+    /// border face — they all survive the §5 hole-cleanup pass.
+    fn build_tetra_faces(mesh: &mut LoopMesh, v: &[VertexKey]) -> Vec<FaceKey> {
+        let tris = [
+            [v[0], v[2], v[1]],
+            [v[0], v[1], v[3]],
+            [v[0], v[3], v[2]],
+            [v[1], v[2], v[3]],
+        ];
+        tris.iter()
+            .map(|t| mesh.face_create_verts(t, FaceCreateFlags::NO_DUPLICATE))
+            .collect()
+    }
+
+    #[test]
+    fn use_existing_faces_true_reuses_facets_as_holes_no_duplicates() {
+        // A fully-faced tetrahedron, hulled with use_existing_faces = true: each
+        // hull facet coincides with an existing triangle whose edges are all
+        // hull edges, so every facet is reused (not rebuilt) and tagged a hole
+        // (CONVEX_HULL.md §5). No new face is created.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &tetra_positions());
+        let faces = build_tetra_faces(&mut mesh, &input);
+        let faces_before = mesh.face_count();
+        let edges_before = mesh.edge_count();
+
+        let result = mesh.convex_hull_with_faces(&input, &faces, true);
+
+        // No hull triangle is materialised — all four are reused.
+        assert!(result.faces().is_empty(), "every facet is reused, none built");
+        assert_eq!(mesh.face_count(), faces_before, "no new face is created");
+        assert_eq!(mesh.edge_count(), edges_before, "no new edge is created");
+
+        // All four pre-existing faces are reported as holes (closed surface →
+        // no border face un-holed).
+        let hole_faces: std::collections::HashSet<FaceKey> =
+            result.hole_faces().iter().copied().collect();
+        assert_eq!(hole_faces.len(), 4, "all four facets are holes");
+        for &f in &faces {
+            assert!(hole_faces.contains(&f), "input face {f:?} is a hole");
+        }
+
+        // The patch's edges — all six tetra edges, each with both faces holes —
+        // are reported as hole edges too (§5 cleanup).
+        assert_eq!(result.hole_edges().len(), 6, "all six patch edges are holes");
+
+        // geom.out still reports the whole hull surface: the reused verts/edges
+        // show up even though no face was built (§6.2).
+        assert_eq!(result.verts().len(), 4, "all four corners on-hull");
+        assert_eq!(result.edges().len(), 6, "all six hull edges reported");
+
+        // geom_holes.out mirrors the typed accessors.
+        let holes_geom = result.geom_holes_out();
+        assert_eq!(holes_geom.len(), 10, "6 hole edges + 4 hole faces");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_existing_faces_false_builds_duplicates_holes_empty() {
+        // The contrast arm: the same fully-faced tetrahedron hulled with
+        // use_existing_faces = false. Every hull triangle is materialised
+        // unconditionally, stacking a second face on each existing facet's
+        // footprint, and geom_holes.out comes back empty
+        // (CONVEX_HULL.md §5 last ¶, §9).
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &tetra_positions());
+        let faces = build_tetra_faces(&mut mesh, &input);
+        let faces_before = mesh.face_count();
+
+        let result = mesh.convex_hull_with_faces(&input, &faces, false);
+
+        // Every hull triangle is materialised regardless of whether an input
+        // face already occupies its footprint (§5 last ¶): the four facets are
+        // reported as *built* output, and at least as many faces exist as before
+        // (the unconditional build never removes the input faces).
+        assert_eq!(result.faces().len(), 4, "four hull facets reported as built");
+        assert!(
+            mesh.face_count() >= faces_before,
+            "the unconditional build never drops the input faces"
+        );
+        let _ = faces;
+
+        // The contrast contract (the whole point of this pair): the holes slot
+        // is empty when the flag is clear.
+        assert!(result.hole_faces().is_empty(), "no holes when flag clear");
+        assert!(result.hole_edges().is_empty(), "no hole edges when flag clear");
+        assert!(result.geom_holes_out().is_empty(), "geom_holes.out empty when flag clear");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_existing_faces_true_with_non_hull_chord_edge_is_not_reused() {
+        // A reuse candidate is rejected if even one of its edges is *not* a hull
+        // edge (CONVEX_HULL.md §5 step 2). Here a face buried inside the hull
+        // (not on the surface) must never be reused — its footprint is not a
+        // hull triangle at all, so it is simply not found, and the surface is
+        // built fresh over the extremal verts.
+        let mut mesh = LoopMesh::new();
+        let mut positions = tetra_positions();
+        positions.push(Vec3::new(0.4, 0.4, 0.4)); // buried interior point
+        let input = cloud(&mut mesh, &positions);
+        let interior = *input.last().unwrap();
+
+        // A face that uses the buried interior vertex — its edges to the
+        // interior point are interior chords, never hull edges.
+        let buried = mesh.face_create_verts(
+            &[input[0], input[1], interior],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+
+        let result = mesh.convex_hull_with_faces(&input, &[buried], true);
+
+        // The buried face is not on the hull surface, so it is not a hole.
+        assert!(
+            result.hole_faces().is_empty(),
+            "a buried interior face is never reused as a hole"
+        );
+        // The hull surface is still the tetrahedron, built fresh.
+        assert_eq!(result.faces().len(), 4, "the four tetra facets are built");
+        // The buried point is interior.
+        assert!(
+            result.interior_verts().contains(&interior),
+            "the buried point is interior"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_existing_faces_true_border_face_is_un_holed() {
+        // §5 cleanup: a hole face touching a boundary edge (an edge with fewer
+        // than two incident faces) is on the patch's border, not a true interior
+        // hole, and is un-holed. A flat single-triangle hull over three coplanar
+        // verts has exactly one open facet whose three edges are all boundary
+        // (no second facet shares them), so the reused face — though it
+        // coincided with the hull facet and was skipped — is un-holed by the
+        // cleanup pass and the holes slot ends up empty.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, 2.0, 0.0),
+            ],
+        );
+        let patch = mesh.face_create_verts(&input, FaceCreateFlags::NO_DUPLICATE);
+
+        let result = mesh.convex_hull_with_faces(&input, &[patch], true);
+
+        // The single facet coincides with the patch and is reused (skipped, not
+        // rebuilt) — its three edges are all boundary, so cleanup un-holes it.
+        assert!(
+            result.hole_faces().is_empty(),
+            "a border patch face is un-holed (all its edges are boundary)"
+        );
+        assert!(result.hole_edges().is_empty(), "no all-hole edges survive");
+
+        // The patch's facet is still reported on the hull surface (§6.2): its
+        // three verts and three edges are in geom.out even though nothing built.
+        assert!(result.faces().is_empty(), "the only facet was reused, none built");
+        assert_eq!(result.verts().len(), 3, "all three corners on-hull");
+        assert_eq!(result.edges().len(), 3, "all three facet edges on-hull");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn convex_hull_default_leaves_holes_empty() {
+        // The plain verts-only entrypoint delegates with use_existing_faces =
+        // false, so geom_holes.out is always empty for it.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &cube_corners());
+        let result = mesh.convex_hull(&input);
+        assert!(result.geom_holes_out().is_empty(), "default path has no holes");
         mesh.validate_topology();
     }
 }
