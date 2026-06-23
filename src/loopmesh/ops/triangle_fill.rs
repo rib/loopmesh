@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use glam::{Vec2, Vec3};
 
 use crate::loopmesh::*;
-use crate::triangulate::{axis_dominant_basis, axis_dominant_basis_negated, ear_clip};
+use crate::triangulate::{axis_dominant_basis, axis_dominant_basis_negated, beautify_polygon, ear_clip};
 
 /// Axis-aligned 2D bounding box of a component's projected vertices,
 /// used by the §1.2.3 hole-coalesce pass.
@@ -170,10 +170,11 @@ const MIN_NORMAL_LEN_SQ: f32 = 1e-12;
 /// §1.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TriangleFillParams {
-    /// When set, request the beautify edge-rotation pass after the raw fill
-    /// (§6). The beautify pass itself is **not yet applied** — see
-    /// [`LoopMesh::triangle_fill`] — so setting this currently produces the
-    /// un-beautified fill (a valid triangulation, just not Delaunay-rotated).
+    /// When set, run the beautify edge-rotation pass after the raw fill (§6):
+    /// rotate the fill's interior diagonals toward a Delaunay-like
+    /// triangulation. Applied to the single-loop (no-holes) fill before the §7
+    /// dissolve, so beautify runs before dissolve when both flags are set. The
+    /// with-holes/keyhole fill (§1.2.4) is not yet beautified.
     pub use_beauty: bool,
     /// When set, dissolve the fill's new interior edges into larger n-gons
     /// after the fill (§7).
@@ -234,9 +235,10 @@ impl LoopMesh {
     /// an enclosed inner loop empty (§1.2.4). Multiple disjoint regions fill
     /// independently in the one call; loose edges create nothing.
     ///
-    /// **`use_beauty`:** the beautify post-pass (§6) is not yet applied — the
-    /// flag is accepted but ignored, producing the un-beautified (still valid)
-    /// fill rather than aborting, since `use_beauty` is a caller-settable input.
+    /// **`use_beauty`:** when set, the beautify post-pass (§6) rotates the
+    /// fill's interior diagonals toward a Delaunay-like triangulation before the
+    /// §7 dissolve. Applied to the single-loop (no-holes) fill; the
+    /// with-holes/keyhole fill (§1.2.4) is not yet beautified.
     pub fn triangle_fill(
         &mut self,
         edges: &[EdgeKey],
@@ -358,6 +360,19 @@ impl LoopMesh {
         }
         if tris.is_empty() {
             return;
+        }
+
+        // §6 — beautify post-pass: rotate the fill's interior diagonals toward
+        // a Delaunay-like triangulation before any faces are materialised. Only
+        // which interior diagonals exist changes; the boundary edges and the
+        // vertex set are untouched. Mutating `tris` here (before face creation,
+        // hence before the §7 dissolve in `triangle_fill`) is what satisfies
+        // §6's "beautify before dissolve" ordering. Scoped to the no-holes path:
+        // the bridged keyhole's repeated bridge vertices and zero-width slit
+        // (§1.2.4) are not a simple polygon in the sense the rotation kernel
+        // assumes, so beautify is not yet run for the with-holes case.
+        if params.use_beauty && !has_holes {
+            beautify_polygon(&projected, &mut tris);
         }
 
         // §4 — winding vote: only when the normal was derived and some input
@@ -992,8 +1007,9 @@ mod tests {
 
     #[test]
     fn use_beauty_does_not_panic_and_fills() {
-        // use_beauty is a caller-settable input: it must not abort. The
-        // beautify pass is not yet applied, so this is just a valid fill.
+        // use_beauty is a caller-settable input: it must not abort, and the
+        // beautified fill must still be a valid triangulation with the boundary
+        // preserved.
         let mut mesh = LoopMesh::new();
         let edges = convex_wire_ring(&mut mesh, 6);
         let result = mesh.triangle_fill(
@@ -1004,9 +1020,92 @@ mod tests {
                 normal: None,
             },
         );
+        assert_eq!(mesh.vertex_count(), 6, "no vertex created");
         assert_eq!(mesh.face_count(), 4, "hexagon → n-2 = 4 triangles");
         assert_eq!(result.faces().len(), 4);
+        for face in mesh.face_keys() {
+            assert_eq!(mesh.face_len(face), 3, "every fill face is a triangle");
+        }
+        // All six boundary edges survive (the beautify pass only re-routes
+        // interior diagonals, never boundary edges).
+        for &boundary in &edges {
+            assert!(
+                mesh.edges.try_get(boundary).is_some(),
+                "boundary edge {boundary:?} must survive beautify"
+            );
+        }
         mesh.validate_topology();
+    }
+
+    /// A "thin" non-convex quad-ish loop whose raw ear-clip diagonal differs
+    /// from the beautified (Delaunay-like) diagonal. The four corners sit on a
+    /// very flat rhombus: the horizontal diagonal is far shorter than the
+    /// vertical one, so a quality-driven rotation prefers the short diagonal.
+    fn thin_quad_ring(mesh: &mut LoopMesh) -> [VertexKey; 4] {
+        // Corners 0,1,2,3 in CCW order. 0 and 2 are close together on the x
+        // axis (short diagonal 0-2); 1 and 3 are far apart on the y axis (long
+        // diagonal 1-3).
+        let v0 = mesh.create_vertex(Vec3::new(-0.2, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 3.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(0.2, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, -3.0, 0.0));
+        [v0, v1, v2, v3]
+    }
+
+    /// Returns the single interior diagonal of a quad fill as the unordered
+    /// vertex pair `{a, b}` plus the live mesh: a fill of a 4-vertex loop emits
+    /// 2 triangles sharing exactly one interior diagonal. `quad` is the four
+    /// corner verts in CCW order, so `quad[0]`/`quad[2]` is the short diagonal
+    /// and `quad[1]`/`quad[3]` the long one.
+    fn quad_fill_diagonal(use_beauty: bool) -> ([VertexKey; 4], VertexKey, VertexKey, LoopMesh) {
+        let mut mesh = LoopMesh::new();
+        let quad = thin_quad_ring(&mut mesh);
+        let [v0, v1, v2, v3] = quad;
+        let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NO_DUPLICATE);
+        let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NO_DUPLICATE);
+        let e2 = mesh.create_edge([v2, v3], EdgeCreateFlags::NO_DUPLICATE);
+        let e3 = mesh.create_edge([v3, v0], EdgeCreateFlags::NO_DUPLICATE);
+        let result = mesh.triangle_fill(
+            &[e0, e1, e2, e3],
+            &TriangleFillParams {
+                use_beauty,
+                use_dissolve: false,
+                normal: None,
+            },
+        );
+        assert_eq!(result.faces().len(), 2, "quad → 2 triangles");
+        assert_eq!(result.edges().len(), 1, "quad fill has one interior diagonal");
+        let diagonal = result.edges()[0];
+        let [a, b] = mesh.edge_vert_keys(diagonal);
+        (quad, a, b, mesh)
+    }
+
+    #[test]
+    fn use_beauty_rotates_interior_diagonal() {
+        // The thin quad's two diagonals are very different lengths: the short
+        // one is quad[0]-quad[2] (|x| ≈ 0.4), the long one quad[1]-quad[3]
+        // (|y| = 6). The beautify pass must always settle on the short,
+        // Delaunay-preferred diagonal regardless of which one the raw ear-clip
+        // happened to pick (its starting corner is set-ordering dependent).
+        let (quad, beauty_a, beauty_b, beauty_mesh) = quad_fill_diagonal(true);
+        let short_pair = (quad[0], quad[2]);
+        let on_short = (beauty_a == short_pair.0 && beauty_b == short_pair.1)
+            || (beauty_a == short_pair.1 && beauty_b == short_pair.0);
+        assert!(
+            on_short,
+            "beautify must land on the short (Delaunay-preferred) diagonal"
+        );
+        let beauty_len = beauty_mesh
+            .vertex_position(beauty_a)
+            .distance(beauty_mesh.vertex_position(beauty_b));
+        let long_len = beauty_mesh
+            .vertex_position(quad[1])
+            .distance(beauty_mesh.vertex_position(quad[3]));
+        assert!(
+            beauty_len < long_len,
+            "beautified diagonal ({beauty_len}) must be the short one, not the long ({long_len})"
+        );
+        beauty_mesh.validate_topology();
     }
 
     /// Fill a fresh n-gon ring with the supplied projection normal and return
