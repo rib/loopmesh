@@ -76,17 +76,28 @@ impl LoopMesh {
     /// verbatim into each created face, so the hull surface has coherent outward
     /// normals.
     ///
-    /// **Scope (this cycle):** a non-degenerate vertex cloud with
-    /// `use_existing_faces = false`. The result reports only `geom.out` — the
-    /// built on-hull surface (CONVEX_HULL.md §4.3). The interior / unused /
-    /// holes classification (CONVEX_HULL.md §4–§7), the `use_existing_faces`
-    /// reuse path (§5), the customdata example-face seed (§6.1), and the
-    /// degenerate coplanar/collinear paths (§8) are not yet implemented.
+    /// **Scope (this cycle):** any vertex cloud (full-3D, coplanar, collinear,
+    /// or coincident) with `use_existing_faces = false`. The result reports only
+    /// `geom.out` — the built on-hull surface (CONVEX_HULL.md §4.3). The
+    /// interior / unused / holes classification (CONVEX_HULL.md §4–§7), the
+    /// `use_existing_faces` reuse path (§5), and the customdata example-face
+    /// seed (§6.1) are not yet implemented.
+    ///
+    /// Degenerate clouds (CONVEX_HULL.md §8) are handled, not errors:
+    /// - **Coplanar** input yields a single planar facet, fanned into a flat
+    ///   outward-wound triangle patch; culled interior points are absent from
+    ///   the provider's on-hull set and so from `geom.out`.
+    /// - **Collinear** input yields a 1D hull — two extreme endpoints, no
+    ///   facet. No faces are built; the two endpoints are reported as on-hull
+    ///   verts in `geom.out`.
+    /// - **Coincident** duplicate input verts are deduplicated by the provider
+    ///   before the hull runs, so a non-representative duplicate never appears
+    ///   in the on-hull set.
     ///
     /// Returns an empty result and makes no changes when given **fewer than
-    /// three** input vertices (the count guard, CONVEX_HULL.md §1.2), or when the
-    /// cloud is degenerate enough that the provider builds no facet (a collinear
-    /// or near-coincident cloud — handled fully in a later cycle).
+    /// three** input vertices (the count guard, CONVEX_HULL.md §1.2), or when
+    /// the provider returns no hull of any dimension (fewer than two distinct
+    /// positions).
     pub fn convex_hull(&mut self, input: &[VertexKey]) -> ConvexHullResult {
         let mut result = ConvexHullResult::default();
 
@@ -145,11 +156,22 @@ impl LoopMesh {
             }
         }
 
-        // §2 — the on-hull vertex set is the extremal subset of the input; emit
-        // it in the provider's ascending-index order so the slot is stable.
+        // §2 / §8 — the on-hull vertex set is the extremal subset of the input,
+        // emitted in the provider's ascending-index order so the slot is stable.
+        //
+        // When the provider built facets (the full-3D and coplanar flat-hull
+        // paths), a hull vertex is on-hull iff it was a corner of a materialised
+        // triangle (§4.3 / §6 step 4). When the provider built **no** facets, the
+        // cloud is a 1D collinear hull (§8 collinear bullet): its two extreme
+        // endpoints are still on-hull and reported as verts even though no face
+        // bounds them. Coincident duplicates never reach here — the provider
+        // deduplicates coincident positions before the hull runs, so a
+        // non-representative duplicate is simply absent from `topology.vertices`
+        // (§8 coincident bullet) and lands in the interior/unused slots instead.
+        let built_no_faces = result.faces.is_empty();
         for &index in &topology.vertices {
             let vert = input[index];
-            if on_hull_verts.contains(&vert) {
+            if built_no_faces || on_hull_verts.contains(&vert) {
                 result.verts.push(vert);
             }
         }
@@ -327,6 +349,134 @@ mod tests {
         assert_eq!(mesh.edge_count(), 18, "no duplicate edge is minted");
         assert_eq!(result.faces().len(), 12);
         assert_closed_hull_invariants(&mut mesh, &result, &input);
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn coplanar_square_builds_flat_fan_with_interior_culled() {
+        // Four square corners (z = 0) plus one strictly-interior centre point:
+        // the hull is the flat square patch, the centre is culled
+        // (CONVEX_HULL.md §8 coplanar bullet). The provider returns one planar
+        // facet over the four corners, fanned into a flat outward-wound
+        // triangle patch (§3.1). A strictly-interior point avoids the
+        // on-boundary-edge ambiguity a denser grid would introduce.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0), // strictly interior — culled
+            ],
+        );
+        let center = *input.last().unwrap();
+
+        let result = mesh.convex_hull(&input);
+
+        assert_eq!(mesh.vertex_count(), 5, "no vertex is created");
+
+        let on_hull: std::collections::HashSet<VertexKey> =
+            result.verts().iter().copied().collect();
+        assert!(
+            !on_hull.contains(&center),
+            "the strictly-interior centre point is culled from the flat hull"
+        );
+        assert_eq!(
+            result.verts().len(),
+            4,
+            "the four square corners are on the flat hull"
+        );
+
+        // A flat patch is a disk, not a closed surface: it is fanned into
+        // triangles, every face stays in the input plane (no invented vertex).
+        // A quad facet fans into 4 − 2 = 2 triangles.
+        assert_eq!(result.faces().len(), 2, "the quad facet fans to two triangles");
+        for &face in result.faces() {
+            assert_eq!(mesh.face_len(face), 3, "the flat facet is fanned to triangles");
+        }
+        for &v in result.verts() {
+            assert!(
+                mesh.vertex_position(v).z.abs() < 1e-6,
+                "flat-hull verts stay in the input plane"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn collinear_cloud_builds_no_faces_two_endpoints_on_hull() {
+        // Five points strung along the x axis: the hull is a 1D segment with two
+        // extreme endpoints and no facet (CONVEX_HULL.md §8 collinear bullet).
+        // The operator builds no faces; the two endpoints are on-hull verts.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(-2.0, 0.0, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+        );
+
+        let result = mesh.convex_hull(&input);
+
+        assert!(result.faces().is_empty(), "a 1D hull builds no faces");
+        assert!(result.edges().is_empty(), "a 1D hull builds no hull edges");
+        assert_eq!(mesh.face_count(), 0, "no face is materialised");
+        assert_eq!(mesh.edge_count(), 0, "no edge is materialised");
+
+        // The two extreme endpoints (x = -2 and x = 2) are the on-hull verts.
+        let on_hull: std::collections::HashSet<VertexKey> =
+            result.verts().iter().copied().collect();
+        assert_eq!(result.verts().len(), 2, "exactly the two extreme endpoints");
+        assert!(on_hull.contains(&input[0]), "x = -2 endpoint is on-hull");
+        assert!(on_hull.contains(&input[4]), "x = 2 endpoint is on-hull");
+        for interior in [input[1], input[2], input[3]] {
+            assert!(
+                !on_hull.contains(&interior),
+                "the three interior collinear points are not on-hull"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn coincident_duplicate_is_deduplicated_off_the_hull() {
+        // Tetrahedron corners plus an exact duplicate of corner 0. The provider
+        // deduplicates coincident positions before the hull runs, so the
+        // duplicate never becomes a distinct hull corner (CONVEX_HULL.md §8
+        // coincident bullet). The hull is the same four-triangle tetrahedron and
+        // the duplicate is absent from the on-hull set.
+        let mut mesh = LoopMesh::new();
+        let mut positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        positions.push(positions[0]); // exact duplicate of corner 0
+        let input = cloud(&mut mesh, &positions);
+        let duplicate = *input.last().unwrap();
+
+        let result = mesh.convex_hull(&input);
+
+        assert_eq!(mesh.vertex_count(), 5, "no vertex is created");
+        assert_eq!(result.faces().len(), 4, "the hull is still a four-triangle tetrahedron");
+
+        let on_hull: std::collections::HashSet<VertexKey> =
+            result.verts().iter().copied().collect();
+        assert!(
+            !on_hull.contains(&duplicate),
+            "the non-representative duplicate is not on the hull"
+        );
+        // Exactly one of {corner 0, its duplicate} represents that position; the
+        // on-hull set is the four distinct tetrahedron corners.
+        assert_eq!(result.verts().len(), 4, "four distinct extremal corners");
+        assert!(on_hull.contains(&input[0]), "the representative corner 0 is on-hull");
         mesh.validate_topology();
     }
 }
