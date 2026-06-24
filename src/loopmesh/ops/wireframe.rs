@@ -5,6 +5,30 @@ use crate::loopmesh::*;
 /// the tangent falls back to a face-plane perpendicular (WIREFRAME.md §4.3).
 const BISECTOR_EPS_SQ: f32 = 1.0e-12;
 
+/// Near-flat guard for the even-offset shell-angle factor (WIREFRAME.md §4.3):
+/// a corner whose interior angle is (near-)straight has `sin(α/2) → 1`, so the
+/// factor is `1`; this guard keeps a near-flat corner at factor `1` rather than
+/// dividing by a value that has drifted just past `1`.
+const EVEN_FACTOR_EPS: f32 = 1.0e-6;
+
+/// The §4.3 shell-angle factor for the inset distance at a corner whose two
+/// incident edge directions (leaving the corner, unit length) are `to_prev` and
+/// `to_next`. The interior corner angle `α` satisfies `cos α = to_prev · to_next`,
+/// and the factor is `1 / cos(half_corner_deficit) = 1 / sin(α/2)` so that a
+/// sharp corner pushes the inset frame correspondingly further along the
+/// bisector to keep the wire's apparent width even. There is no upper clamp; a
+/// near-flat corner (`sin(α/2) → 1`) is guarded back to `1`.
+fn even_offset_factor(to_prev: Vec3, to_next: Vec3) -> f32 {
+    let cos_angle = to_prev.dot(to_next).clamp(-1.0, 1.0);
+    // sin(α/2) = sqrt((1 - cos α) / 2), the half-angle identity.
+    let sin_half = (0.5 * (1.0 - cos_angle)).max(0.0).sqrt();
+    if sin_half > EVEN_FACTOR_EPS {
+        1.0 / sin_half
+    } else {
+        1.0
+    }
+}
+
 /// The three signed distances along the vertex normal that fix the wire's
 /// cross-section (WIREFRAME.md §5.1), for thickness `t` and off-centre bias
 /// `b ∈ [-1, 1]`. The near distance bounds `shell_neg`, the far distance bounds
@@ -66,9 +90,10 @@ impl LoopMesh {
         thickness: f32,
         use_boundary: bool,
     ) -> WireframeResult {
-        // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`)
-        // and the originals are kept (`use_replace = false`).
-        self.wireframe_with_replace(faces, thickness, 0.0, use_boundary, false)
+        // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`),
+        // the originals are kept (`use_replace = false`), and the inset uses the
+        // plain flat distance (`use_even_offset = false`).
+        self.wireframe_core(faces, thickness, 0.0, use_boundary, false, false)
     }
 
     /// As [`Self::wireframe`], but with the `[-1, 1]` off-centre bias `offset`
@@ -86,7 +111,29 @@ impl LoopMesh {
         offset: f32,
         use_boundary: bool,
     ) -> WireframeResult {
-        self.wireframe_with_replace(faces, thickness, offset, use_boundary, false)
+        self.wireframe_core(faces, thickness, offset, use_boundary, false, false)
+    }
+
+    /// As [`Self::wireframe_with_offset`], but with the `use_even_offset`
+    /// shell-angle correction of WIREFRAME.md §4.3: when `use_even_offset` is
+    /// set, each corner's in-plane inset distance is scaled by
+    /// `1 / cos(half_corner_deficit) = 1 / sin(interior_angle / 2)` so the wire
+    /// keeps an even apparent thickness through sharp corners rather than
+    /// pinching. The correction is the same construction inset's in-plane
+    /// even-offset uses (see [`Self::inset_region`]); it is a pure scale on the
+    /// per-corner inset push, adding no new geometry. A near-flat corner is
+    /// guarded back to factor `1` and there is no upper clamp, so a very sharp
+    /// corner produces a correspondingly large push. When `use_even_offset` is
+    /// clear the result is identical to the plain flat-inset path.
+    pub fn wireframe_with_even_offset(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+        use_even_offset: bool,
+    ) -> WireframeResult {
+        self.wireframe_core(faces, thickness, offset, use_boundary, false, use_even_offset)
     }
 
     /// As [`Self::wireframe_with_offset`], but with the `use_replace` axis of
@@ -104,6 +151,22 @@ impl LoopMesh {
         offset: f32,
         use_boundary: bool,
         use_replace: bool,
+    ) -> WireframeResult {
+        self.wireframe_core(faces, thickness, offset, use_boundary, use_replace, false)
+    }
+
+    /// The shared wireframe core driving every public entry point: per-face
+    /// inset-frame + two-sided strut bridge, with the `offset` bias (§5.1/§5.3),
+    /// the `use_boundary` rim cap (§6), the `use_replace` removal (§7), and the
+    /// `use_even_offset` shell-angle correction (§4.3) all selected by argument.
+    fn wireframe_core(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+        use_replace: bool,
+        use_even_offset: bool,
     ) -> WireframeResult {
         if faces.is_empty() {
             return WireframeResult::default();
@@ -172,12 +235,20 @@ impl LoopMesh {
                 let v = self.loop_vertex(l);
                 let tangent = self.wireframe_inward_tangent(l, face_normal);
                 let corner = self.vertex_position(v);
+                // §4.3: with `use_even_offset` the in-plane push is lengthened by
+                // the corner's shell-angle factor so a sharp corner keeps an even
+                // apparent wire width; the factor is `1` (no scale) otherwise.
+                let corner_inset = if use_even_offset {
+                    inset_dist * self.wireframe_even_factor(l)
+                } else {
+                    inset_dist
+                };
                 // §4.2: the in-plane inset push gives the wire its width. When
                 // the bias is non-zero the inset frame additionally rides along
                 // the vertex normal by the cross-section centre (§5.3), so the
                 // frame stays aligned with the shifted cross-section rather than
                 // pinned in the surface.
-                let mut frame_pos = corner + tangent * inset_dist;
+                let mut frame_pos = corner + tangent * corner_inset;
                 if offset != 0.0 {
                     frame_pos += self.vertex_normal(v) * centre_offset;
                 }
@@ -368,6 +439,20 @@ impl LoopMesh {
                 perp
             }
         }
+    }
+
+    /// §4.3 — the even-offset shell-angle factor at loop `l`: derived from the
+    /// interior corner angle between the two edges meeting at the corner, the
+    /// same construction inset's in-plane even-offset uses. See
+    /// [`even_offset_factor`].
+    fn wireframe_even_factor(&self, l: LoopKey) -> f32 {
+        let v = self.loop_vertex(l);
+        let prev_v = self.loop_vertex(self.loop_prev(l));
+        let next_v = self.loop_vertex(self.loop_next(l));
+        let here = self.vertex_position(v);
+        let to_prev = LoopMesh::normalize_or_zero(self.vertex_position(prev_v) - here);
+        let to_next = LoopMesh::normalize_or_zero(self.vertex_position(next_v) - here);
+        even_offset_factor(to_prev, to_next)
     }
 
     /// §3 — an edge is a region boundary with respect to the tagged region if
@@ -792,6 +877,132 @@ mod tests {
         }
         assert_eq!(quad_faces, 17, "all surviving + strut faces are quads");
         replaced.validate_topology();
+    }
+
+    /// A flat equilateral triangle lying in z = 0, wound so its face normal
+    /// points +Z. Every interior corner is 60°, so the §4.3 even-offset factor
+    /// is `1/cos(60°) = 1/sin(30°) = 2.0`.
+    fn flat_equilateral_tri(mesh: &mut LoopMesh) -> FaceKey {
+        let h = (3.0_f32).sqrt() / 2.0;
+        create_face_from_verts(
+            mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.5, h, 0.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn even_offset_zero_matches_flat_inset() {
+        // WIREFRAME.md §4.3: `use_even_offset = false` must be bit-identical to
+        // the existing flat-inset path. The new entry point with the flag clear
+        // and the old `wireframe_with_offset` build the same verts in the same
+        // order, so every position matches exactly.
+        let mut flat = LoopMesh::new();
+        let ff = flat_equilateral_tri(&mut flat);
+        let flat_result = flat.wireframe_with_offset(&[ff], 0.3, 0.0, false);
+
+        let mut even_off = LoopMesh::new();
+        let fe = flat_equilateral_tri(&mut even_off);
+        let even_result = even_off.wireframe_with_even_offset(&[fe], 0.3, 0.0, false, false);
+
+        assert_eq!(flat_result.strut_faces.len(), even_result.strut_faces.len());
+        assert_eq!(flat.vertex_count(), even_off.vertex_count());
+        assert_eq!(flat.face_count(), even_off.face_count());
+        for slot in 0..flat.vertex_count() {
+            let a = flat.vertex_position(VertexKey::from_usize(slot));
+            let b = even_off.vertex_position(VertexKey::from_usize(slot));
+            assert_eq!(a, b, "vert {slot}: use_even_offset=false must equal flat path");
+        }
+        even_off.validate_topology();
+    }
+
+    #[test]
+    fn even_offset_doubles_inset_at_sixty_degree_corner() {
+        // WIREFRAME.md §4.3: on a flat equilateral triangle every corner is 60°,
+        // so the shell-angle factor is `1/sin(30°) = 2.0`. The even arm pushes
+        // each inset-frame vert inward along the bisector by exactly twice the
+        // flat arm's distance from the corner; the original corners and the
+        // shell verts (offset along the +Z normal, unaffected by the in-plane
+        // scale) are untouched between the two arms.
+        let thickness = 0.3_f32;
+
+        let mut flat = LoopMesh::new();
+        let ff = flat_equilateral_tri(&mut flat);
+        flat.wireframe_with_even_offset(&[ff], thickness, 0.0, false, false);
+
+        let mut even_on = LoopMesh::new();
+        let fe = flat_equilateral_tri(&mut even_on);
+        even_on.wireframe_with_even_offset(&[fe], thickness, 0.0, false, true);
+
+        // Topology is identical between the two arms — the correction is a pure
+        // in-plane inset-distance scale (no new verts).
+        assert_eq!(flat.vertex_count(), even_on.vertex_count());
+        assert_eq!(flat.face_count(), even_on.face_count());
+
+        // The three original corners (slots 0..3) are flat-z and shared; the
+        // three inset-frame verts (one per loop) sit in the surface plane
+        // (z = 0 at offset = 0) and carry the in-plane scale. Identify them as
+        // the new verts at z ≈ 0; their displacement from the corner doubles.
+        let mut compared = 0;
+        for slot in 3..flat.vertex_count() {
+            let pf = flat.vertex_position(VertexKey::from_usize(slot));
+            let pe = even_on.vertex_position(VertexKey::from_usize(slot));
+            if pf.z.abs() < 1.0e-6 && pe.z.abs() < 1.0e-6 {
+                // An inset-frame vert (in the surface plane). Find its source
+                // corner: the nearest original corner. The even displacement is
+                // exactly 2× the flat one along the same bisector.
+                let mut nearest = Vec3::ZERO;
+                let mut best = f32::MAX;
+                for c in 0..3 {
+                    let corner = flat.vertex_position(VertexKey::from_usize(c));
+                    let d = (corner - pf).length_squared();
+                    if d < best {
+                        best = d;
+                        nearest = corner;
+                    }
+                }
+                let flat_disp = pf - nearest;
+                let even_disp = pe - nearest;
+                assert!(
+                    (even_disp - flat_disp * 2.0).length() < 1.0e-5,
+                    "vert {slot}: even displacement {even_disp:?} should be 2× flat {flat_disp:?}",
+                );
+                compared += 1;
+            } else {
+                // A shell vert: offset purely along the +Z normal, identical
+                // between the two arms (the in-plane scale never touches it).
+                assert!(
+                    (pf - pe).length() < 1.0e-6,
+                    "vert {slot}: shell verts must be unaffected by even-offset",
+                );
+            }
+        }
+        assert_eq!(compared, 3, "all three inset-frame verts compared");
+        even_on.validate_topology();
+    }
+
+    #[test]
+    fn even_offset_factor_matches_known_angles() {
+        // WIREFRAME.md §4.3: spot-check the shell-angle factor against analytic
+        // values. 60° → 2.0, 90° → √2, and a (near-)flat 180° corner → 1.0
+        // (the near-flat guard, no upper clamp).
+        let dir = |deg: f32| {
+            let r = deg.to_radians();
+            Vec3::new(r.cos(), r.sin(), 0.0)
+        };
+        // Interior angle is the angle between the two edge directions.
+        let f60 = super::even_offset_factor(dir(0.0), dir(60.0));
+        assert!((f60 - 2.0).abs() < 1.0e-4, "60° factor {f60} should be 2.0");
+        let f90 = super::even_offset_factor(dir(0.0), dir(90.0));
+        assert!(
+            (f90 - 2.0_f32.sqrt()).abs() < 1.0e-4,
+            "90° factor {f90} should be √2",
+        );
+        let f180 = super::even_offset_factor(dir(0.0), dir(180.0));
+        assert!((f180 - 1.0).abs() < 1.0e-4, "flat corner factor {f180} should be 1.0");
     }
 
     #[test]
