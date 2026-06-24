@@ -111,7 +111,13 @@ impl LoopMesh {
                 for f in self.edge_face_keys(edge) {
                     self.face_op_flag_set(tagged_faces, f, BIT_TAGGED_FACE);
                 }
-                let (v_new, _e_new) = self.euler_split_edge_make_vert(v, edge);
+                // §3.3 / §7: split at `t = 1.0` from the far endpoint — i.e.
+                // coincident with the mixed/selection vert `v`. In `edge_split`
+                // terms `v` is the near vertex and `fac = 0.0` places the new
+                // vert on top of it; the same `fac` drives the §7 degenerate
+                // two-source CD blend, so the rail vert inherits `v`'s per-vert
+                // customdata and the new corner loops inherit `v`'s loop CD.
+                let (v_new, _e_new) = self.edge_split(edge, v, 0.0);
                 self.vert_op_flag_set(new_verts, v_new, BIT_NEW_VERT);
             }
             endpoint_junction.push(tagged_count == 1);
@@ -590,6 +596,124 @@ mod tests {
         );
         // Inner + outer rail around the 4-edge loop: +8V +16E +8F, 8 rail edges.
         assert_eq!(res_true_counts, (44, 76, 33), "closed-loop offset counts");
+    }
+
+    #[test]
+    fn rail_vert_inherits_selection_vert_cd() {
+        // §7: each rail vert is dropped at t = 1.0 from its host edge's far
+        // endpoint — coincident with the selection (mixed) vert — so it inherits
+        // that vert's per-vert CD (the degenerate two-source blend). Decorate
+        // every vert with a distinct scalar, offset, and assert every coincident
+        // rail vert reads its selection vert's value (not default 0.0).
+        let (mut mesh, v) = grid(3, 3);
+        let cd = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("vcd"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        // Give every existing vert a unique nonzero value keyed off position so
+        // a coincident rail vert can be matched back to its source.
+        let value_of = |p: Vec3| (p.x + 1.0) * 100.0 + (p.y + 1.0);
+        for &vk in &mesh.vert_keys() {
+            let val = value_of(mesh.vertex_position(vk));
+            mesh.vertex_attribs_mut().set_f32(cd, vk.as_usize(), val);
+        }
+        // Selection: the interior horizontal run (verts v[2][0..3]).
+        let run = [
+            mesh.query_edge_exists(v[2][0], v[2][1]).unwrap(),
+            mesh.query_edge_exists(v[2][1], v[2][2]).unwrap(),
+            mesh.query_edge_exists(v[2][2], v[2][3]).unwrap(),
+        ];
+        let pre: std::collections::HashSet<VertexKey> = mesh.vert_keys().into_iter().collect();
+
+        mesh.offset_edgeloops(&run, false);
+
+        // Every freshly-minted rail vert must read the CD of the existing vert it
+        // landed coincident with — never default 0.0.
+        let mut checked = 0;
+        for &rv in &mesh.vert_keys() {
+            if pre.contains(&rv) {
+                continue; // existing vert, not a rail vert
+            }
+            let p = mesh.vertex_position(rv);
+            let source = mesh
+                .vert_keys()
+                .into_iter()
+                .find(|&w| pre.contains(&w) && mesh.vertex_position(w).distance(p) < 1e-6)
+                .expect("rail vert is coincident with an existing selection vert");
+            let expected = mesh.vertex_attribs().get_f32(cd, source.as_usize()).unwrap();
+            let got = mesh.vertex_attribs().get_f32(cd, rv.as_usize()).unwrap();
+            assert!(expected.abs() > 0.0, "source value is nonzero");
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "rail vert inherits selection vert CD: expected {expected}, got {got}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "at least one rail vert exists to check");
+    }
+
+    #[test]
+    fn rail_loop_inherits_selection_loop_uv() {
+        // §7: loops gaining the new rail vert as a corner take per-loop CD
+        // interpolated along their edge at t = 1.0 — i.e. the selection-vert
+        // corner loop's values. Decorate every loop with a UV keyed to its own
+        // vertex; after offset, each rail-vert corner loop must read the UV of
+        // the coincident selection vert's corner (not default [0,0]).
+        let (mut mesh, v) = grid(3, 3);
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+        // Key each loop's UV to its corner vertex's position so a rail-vert loop
+        // can be matched to the selection-vert corner it inherited from.
+        let uv_of = |p: Vec3| [p.x + 1.0, p.y + 1.0];
+        for &l in &mesh.loop_keys() {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_of(p));
+        }
+        let run = [
+            mesh.query_edge_exists(v[2][0], v[2][1]).unwrap(),
+            mesh.query_edge_exists(v[2][1], v[2][2]).unwrap(),
+            mesh.query_edge_exists(v[2][2], v[2][3]).unwrap(),
+        ];
+        let pre_verts: std::collections::HashSet<VertexKey> =
+            mesh.vert_keys().into_iter().collect();
+        let pre_loops: std::collections::HashSet<LoopKey> =
+            mesh.loop_keys().into_iter().collect();
+
+        mesh.offset_edgeloops(&run, false);
+
+        // Any new loop anchored at a rail vert inherits the coincident selection
+        // vert's keyed UV — the value the selection corner would carry.
+        let mut checked = 0;
+        for &l in &mesh.loop_keys() {
+            if pre_loops.contains(&l) {
+                continue;
+            }
+            let lv = mesh.loop_vertex(l);
+            if pre_verts.contains(&lv) {
+                continue; // new loop, but at an existing corner (a face-split
+                          // loop at a selection vert) — not a rail-vert loop
+            }
+            let p = mesh.vertex_position(lv);
+            let source = mesh
+                .vert_keys()
+                .into_iter()
+                .find(|&w| pre_verts.contains(&w) && mesh.vertex_position(w).distance(p) < 1e-6)
+                .expect("rail vert coincident with a selection vert");
+            let expected = uv_of(mesh.vertex_position(source));
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert!(
+                (got[0] - expected[0]).abs() < 1e-4 && (got[1] - expected[1]).abs() < 1e-4,
+                "rail loop inherits selection-vert corner UV: expected {expected:?}, got {got:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "at least one rail-vert loop exists to check");
     }
 
     /// The four edges bounding the centre face of a 5x5 grid.
