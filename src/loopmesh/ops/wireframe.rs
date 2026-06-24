@@ -5,6 +5,20 @@ use crate::loopmesh::*;
 /// the tangent falls back to a face-plane perpendicular (WIREFRAME.md §4.3).
 const BISECTOR_EPS_SQ: f32 = 1.0e-12;
 
+/// The three signed distances along the vertex normal that fix the wire's
+/// cross-section (WIREFRAME.md §5.1), for thickness `t` and off-centre bias
+/// `b ∈ [-1, 1]`. The near distance bounds `shell_neg`, the far distance bounds
+/// `shell_pos`, and their midpoint is the cross-section centre. The span between
+/// near and far is always the full thickness `t`; `b` only decides where that
+/// span sits relative to the surface (`b = 0` centres it, `b = ±1` slides it
+/// fully to one side).
+fn shell_distances(t: f32, b: f32) -> (f32, f32, f32) {
+    let near_offset = -(1.0 - b) * 0.5 * t;
+    let far_offset = near_offset + t;
+    let centre_offset = (near_offset + far_offset) * 0.5;
+    (near_offset, far_offset, centre_offset)
+}
+
 /// The generated geometry of a wireframe run: the strut quads lining the
 /// region's edges, plus the rim-cap quads added under `use_boundary`. This is
 /// the analogue of the operator's `faces.out` slot (WIREFRAME.md §1) — it holds
@@ -51,6 +65,25 @@ impl LoopMesh {
         thickness: f32,
         use_boundary: bool,
     ) -> WireframeResult {
+        // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`).
+        self.wireframe_with_offset(faces, thickness, 0.0, use_boundary)
+    }
+
+    /// As [`Self::wireframe`], but with the `[-1, 1]` off-centre bias `offset`
+    /// that slides the wire's cross-section relative to the surface
+    /// (WIREFRAME.md §5.1, §5.3). At `0` the tube straddles the surface
+    /// symmetrically; at `±1` it sits entirely to one side. The in-plane
+    /// half-width (`thickness/2`) is independent of the bias; the bias only
+    /// shifts the near/far shell distances and, when non-zero, rides the
+    /// inset-frame vert along the vertex normal by the cross-section centre
+    /// (§4.2 / §5.3).
+    pub fn wireframe_with_offset(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+    ) -> WireframeResult {
         if faces.is_empty() {
             return WireframeResult::default();
         }
@@ -60,11 +93,13 @@ impl LoopMesh {
         // oracle carries.
         self.mesh_normals_update();
 
-        // §5.1 with offset = 0: the cross-section straddles the surface
-        // symmetrically — one shell vert half a thickness to each side, the
-        // inset frame in the surface plane.
-        let near_offset = -thickness * 0.5;
-        let far_offset = thickness * 0.5;
+        // §5.1: the bias `b` slides the cross-section. The near distance
+        // retreats from the surface by the fraction `(1 - b)/2` of the
+        // thickness, the far distance is one full thickness beyond, and the
+        // centre is their midpoint. At `b = 0` this collapses to the symmetric
+        // straddle (near = -t/2, far = +t/2, centre = 0).
+        let (near_offset, far_offset, centre_offset) = shell_distances(thickness, offset);
+        // The in-plane half-width is independent of the bias (§5.1).
         let inset_dist = thickness * 0.5;
 
         let face_tag = self.push_face_op_flag_layer();
@@ -114,7 +149,16 @@ impl LoopMesh {
                 let v = self.loop_vertex(l);
                 let tangent = self.wireframe_inward_tangent(l, face_normal);
                 let corner = self.vertex_position(v);
-                let frame = self.create_vertex(corner + tangent * inset_dist);
+                // §4.2: the in-plane inset push gives the wire its width. When
+                // the bias is non-zero the inset frame additionally rides along
+                // the vertex normal by the cross-section centre (§5.3), so the
+                // frame stays aligned with the shifted cross-section rather than
+                // pinned in the surface.
+                let mut frame_pos = corner + tangent * inset_dist;
+                if offset != 0.0 {
+                    frame_pos += self.vertex_normal(v) * centre_offset;
+                }
+                let frame = self.create_vertex(frame_pos);
                 self.vertex_attribs.copy_into(frame.as_usize(), v.as_usize());
                 inset_of_loop[l.as_usize()] = Some(frame);
             }
@@ -498,6 +542,69 @@ mod tests {
             assert_eq!(mesh.face_len(f), 4, "surrounding faces untouched");
         }
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn offset_plus_one_shifts_every_vert_along_normal() {
+        // WIREFRAME.md §5.1/§5.3: the off-centre bias is position-only. A lone
+        // flat quad (face normal +Z) wired at `offset = +1` builds the same
+        // topology as `offset = 0` (9 faces, 16 verts) but every freshly built
+        // shell + inset-frame vert shifts along the vertex normal by the bias.
+        //
+        // At `offset = 0`: near = -t/2, far = +t/2, centre = 0 — shell verts
+        // straddle z = ±t/2, inset frame at z = 0.
+        // At `offset = +1`: near = 0, far = +t, centre = +t/2 — the whole
+        // cross-section slides to the +Z side, so every new vert is +t/2 higher
+        // than its `offset = 0` counterpart.
+        let thickness = 0.2_f32;
+        let half = thickness * 0.5;
+
+        let mut zero = LoopMesh::new();
+        let fz = flat_quad(&mut zero);
+        let zero_result = zero.wireframe_with_offset(&[fz], thickness, 0.0, false);
+
+        let mut plus = LoopMesh::new();
+        let fp = flat_quad(&mut plus);
+        let plus_result = plus.wireframe_with_offset(&[fp], thickness, 1.0, false);
+
+        // Topology is identical between the two bias values.
+        assert_eq!(zero_result.strut_faces.len(), 8);
+        assert_eq!(plus_result.strut_faces.len(), 8);
+        assert_eq!(zero.face_count(), plus.face_count());
+        assert_eq!(zero.vertex_count(), 16);
+        assert_eq!(plus.vertex_count(), 16);
+
+        // The four original corner verts (slots 0..4, created by `flat_quad`)
+        // are untouched by either run; every vert beyond them is freshly built.
+        // Each new `+1` vert sits exactly `+half` in z above its `0` twin —
+        // the new verts are created in the same order by both runs.
+        for slot in 4..16 {
+            let z0 = zero.vertex_position(VertexKey::from_usize(slot)).z;
+            let zp = plus.vertex_position(VertexKey::from_usize(slot)).z;
+            assert!(
+                (zp - z0 - half).abs() < 1.0e-6,
+                "vert {slot}: offset=+1 z {zp} should be {half} above offset=0 z {z0}",
+            );
+        }
+
+        // Sanity on the absolute placements at offset=0: shell verts straddle
+        // z = ±half, inset-frame verts sit in the surface (z = 0).
+        let mut saw_neg = false;
+        let mut saw_pos = false;
+        let mut saw_surface = false;
+        for slot in 4..16 {
+            let z = zero.vertex_position(VertexKey::from_usize(slot)).z;
+            if (z + half).abs() < 1.0e-6 {
+                saw_neg = true;
+            } else if (z - half).abs() < 1.0e-6 {
+                saw_pos = true;
+            } else if z.abs() < 1.0e-6 {
+                saw_surface = true;
+            }
+        }
+        assert!(saw_neg && saw_pos && saw_surface, "offset=0 straddles symmetrically");
+
+        plus.validate_topology();
     }
 
     #[test]
