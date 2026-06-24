@@ -66,6 +66,7 @@ mod translate;
 mod triangle_fill;
 mod unsubdivide;
 mod weld_verts;
+mod wireframe;
 
 pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult};
 pub use bisect_edges::BisectGeom;
@@ -106,3 +107,4 @@ pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;
 pub use triangle_fill::{TriangleFillParams, TriangleFillResult};
 pub use translate::TranslateParams;
+pub use wireframe::WireframeResult;

@@ -89,8 +89,8 @@ pub use ops::{
     RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothVertParams,
     SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
     SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult, TransformParams,
-    TranslateParams, TriangleFillParams, TriangleFillResult, DELIMIT_MATERIAL, DELIMIT_NORMAL,
-    DELIMIT_SEAM,
+    TranslateParams, TriangleFillParams, TriangleFillResult, WireframeResult, DELIMIT_MATERIAL,
+    DELIMIT_NORMAL, DELIMIT_SEAM,
     DELIMIT_SHARP, DELIMIT_UV,
 };
 
