@@ -29,6 +29,26 @@ fn even_offset_factor(to_prev: Vec3, to_next: Vec3) -> f32 {
     }
 }
 
+/// The per-vertex relative-offset factor (WIREFRAME.md §5.4): the median length
+/// of the tagged edges incident to a vertex, used to scale that vertex's whole
+/// cross-section so the wire thickness tracks local geometry scale. `lengths`
+/// are the tagged-edge lengths around one vertex; an even count averages the two
+/// middle values (for a two-edge fan this reduces to the mean), an odd count
+/// takes the single middle value. A vertex with no tagged edges falls back to
+/// `1.0` (absolute thickness).
+fn median_edge_length(lengths: &mut [f32]) -> f32 {
+    if lengths.is_empty() {
+        return 1.0;
+    }
+    lengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = lengths.len() / 2;
+    if lengths.len() % 2 == 0 {
+        (lengths[mid - 1] + lengths[mid]) * 0.5
+    } else {
+        lengths[mid]
+    }
+}
+
 /// The three signed distances along the vertex normal that fix the wire's
 /// cross-section (WIREFRAME.md §5.1), for thickness `t` and off-centre bias
 /// `b ∈ [-1, 1]`. The near distance bounds `shell_neg`, the far distance bounds
@@ -93,7 +113,7 @@ impl LoopMesh {
         // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`),
         // the originals are kept (`use_replace = false`), and the inset uses the
         // plain flat distance (`use_even_offset = false`).
-        self.wireframe_core(faces, thickness, 0.0, use_boundary, false, false)
+        self.wireframe_core(faces, thickness, 0.0, use_boundary, false, false, false)
     }
 
     /// As [`Self::wireframe`], but with the `[-1, 1]` off-centre bias `offset`
@@ -111,7 +131,7 @@ impl LoopMesh {
         offset: f32,
         use_boundary: bool,
     ) -> WireframeResult {
-        self.wireframe_core(faces, thickness, offset, use_boundary, false, false)
+        self.wireframe_core(faces, thickness, offset, use_boundary, false, false, false)
     }
 
     /// As [`Self::wireframe_with_offset`], but with the `use_even_offset`
@@ -133,7 +153,15 @@ impl LoopMesh {
         use_boundary: bool,
         use_even_offset: bool,
     ) -> WireframeResult {
-        self.wireframe_core(faces, thickness, offset, use_boundary, false, use_even_offset)
+        self.wireframe_core(
+            faces,
+            thickness,
+            offset,
+            use_boundary,
+            false,
+            use_even_offset,
+            false,
+        )
     }
 
     /// As [`Self::wireframe_with_offset`], but with the `use_replace` axis of
@@ -152,13 +180,49 @@ impl LoopMesh {
         use_boundary: bool,
         use_replace: bool,
     ) -> WireframeResult {
-        self.wireframe_core(faces, thickness, offset, use_boundary, use_replace, false)
+        self.wireframe_core(faces, thickness, offset, use_boundary, use_replace, false, false)
+    }
+
+    /// As [`Self::wireframe_with_offset`], but with the `use_relative_offset`
+    /// per-vertex edge-length scale of WIREFRAME.md §5.4: when
+    /// `use_relative_offset` is set, every per-vertex magnitude (the in-plane
+    /// inset half-width and all three shell distances) is multiplied by that
+    /// vertex's **relative factor** — the median length of the tagged edges
+    /// incident to it. The wire thickness then tracks the local geometry scale:
+    /// a vertex surrounded by long edges gets a thicker wire than one in a
+    /// finely subdivided region. For a vertex whose tagged fan is two edges the
+    /// median reduces to their mean. When `use_relative_offset` is clear the
+    /// factor is `1.0` everywhere and the result is bit-identical to
+    /// [`Self::wireframe_with_offset`] (absolute thickness).
+    ///
+    /// This implements only the all-tagged-edge fan case (the median is taken
+    /// over the tagged edges of the region); the mixed tagged/untagged edge-fan
+    /// behaviour of §14 is out of scope.
+    pub fn wireframe_with_relative_offset(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+        use_relative_offset: bool,
+    ) -> WireframeResult {
+        self.wireframe_core(
+            faces,
+            thickness,
+            offset,
+            use_boundary,
+            false,
+            false,
+            use_relative_offset,
+        )
     }
 
     /// The shared wireframe core driving every public entry point: per-face
     /// inset-frame + two-sided strut bridge, with the `offset` bias (§5.1/§5.3),
-    /// the `use_boundary` rim cap (§6), the `use_replace` removal (§7), and the
-    /// `use_even_offset` shell-angle correction (§4.3) all selected by argument.
+    /// the `use_boundary` rim cap (§6), the `use_replace` removal (§7), the
+    /// `use_even_offset` shell-angle correction (§4.3), and the
+    /// `use_relative_offset` per-vertex edge-length scale (§5.4) all selected by
+    /// argument.
     fn wireframe_core(
         &mut self,
         faces: &[FaceKey],
@@ -167,6 +231,7 @@ impl LoopMesh {
         use_boundary: bool,
         use_replace: bool,
         use_even_offset: bool,
+        use_relative_offset: bool,
     ) -> WireframeResult {
         if faces.is_empty() {
             return WireframeResult::default();
@@ -192,15 +257,46 @@ impl LoopMesh {
         }
 
         // §3: tag every vertex of a tagged face (a tagged vertex gets a shell
-        // pair). The shell-pair lookup is keyed by original vertex slot.
-        // Snapshot the original element watermarks so the §7 replace pass can
-        // tell originals (slot < watermark) from freshly built wire geometry.
+        // pair) and every edge of a tagged face (the tagged edges whose median
+        // length drives the §5.4 relative scale). The shell-pair lookup is keyed
+        // by original vertex slot. Snapshot the original element watermarks so
+        // the §7 replace pass can tell originals (slot < watermark) from freshly
+        // built wire geometry.
         let vert_watermark = self.vertices.key_watermark();
+        let edge_watermark = self.edges.key_watermark();
         let mut vert_tagged: Vec<bool> = vec![false; vert_watermark];
+        let mut edge_tagged: Vec<bool> = vec![false; edge_watermark];
         for &face in faces {
             let mut loops = self.face_loops(face);
             while let Some(l) = loops.next(self) {
                 vert_tagged[self.loop_vertex(l).as_usize()] = true;
+                edge_tagged[self.loop_edge(l).as_usize()] = true;
+            }
+        }
+
+        // §5.4: the per-vertex relative factor — the median length of the tagged
+        // edges incident to each tagged vertex — scaling that vertex's whole
+        // cross-section. With `use_relative_offset` clear the factor is `1.0`
+        // everywhere, so the cross-section keeps its absolute size and the path
+        // is bit-identical to the flat behaviour.
+        let mut relative_scale: Vec<f32> = vec![1.0; vert_watermark];
+        if use_relative_offset {
+            let mut lengths: Vec<f32> = Vec::new();
+            for slot in 0..vert_watermark {
+                if !vert_tagged[slot] {
+                    continue;
+                }
+                let v = VertexKey::from_usize(slot);
+                lengths.clear();
+                for edge in self.vertex_disk_iter(v) {
+                    if !edge_tagged[edge.as_usize()] {
+                        continue;
+                    }
+                    let [a, b] = self.edge_vertices(edge);
+                    let length = (self.vertex_position(a) - self.vertex_position(b)).length();
+                    lengths.push(length);
+                }
+                relative_scale[slot] = median_edge_length(&mut lengths);
             }
         }
 
@@ -214,10 +310,13 @@ impl LoopMesh {
             let v = VertexKey::from_usize(slot);
             let base = self.vertex_position(v);
             let normal = self.vertex_normal(v);
+            // §5.4: scale the near/far shell distances by the vertex's relative
+            // factor (`1.0` unless `use_relative_offset`).
+            let scale = relative_scale[slot];
 
-            let neg = self.create_vertex(base + normal * near_offset);
+            let neg = self.create_vertex(base + normal * (near_offset * scale));
             self.vertex_attribs.copy_into(neg.as_usize(), slot);
-            let pos = self.create_vertex(base + normal * far_offset);
+            let pos = self.create_vertex(base + normal * (far_offset * scale));
             self.vertex_attribs.copy_into(pos.as_usize(), slot);
 
             shell[slot] = Some(ShellPair { neg, pos });
@@ -235,13 +334,16 @@ impl LoopMesh {
                 let v = self.loop_vertex(l);
                 let tangent = self.wireframe_inward_tangent(l, face_normal);
                 let corner = self.vertex_position(v);
+                // §5.4: the vertex's relative factor scales the in-plane
+                // half-width and the centre-offset normal push together.
+                let scale = relative_scale[v.as_usize()];
                 // §4.3: with `use_even_offset` the in-plane push is lengthened by
                 // the corner's shell-angle factor so a sharp corner keeps an even
                 // apparent wire width; the factor is `1` (no scale) otherwise.
                 let corner_inset = if use_even_offset {
-                    inset_dist * self.wireframe_even_factor(l)
+                    inset_dist * scale * self.wireframe_even_factor(l)
                 } else {
-                    inset_dist
+                    inset_dist * scale
                 };
                 // §4.2: the in-plane inset push gives the wire its width. When
                 // the bias is non-zero the inset frame additionally rides along
@@ -250,7 +352,7 @@ impl LoopMesh {
                 // pinned in the surface.
                 let mut frame_pos = corner + tangent * corner_inset;
                 if offset != 0.0 {
-                    frame_pos += self.vertex_normal(v) * centre_offset;
+                    frame_pos += self.vertex_normal(v) * (centre_offset * scale);
                 }
                 let frame = self.create_vertex(frame_pos);
                 self.vertex_attribs.copy_into(frame.as_usize(), v.as_usize());
@@ -307,8 +409,14 @@ impl LoopMesh {
                     let boundary_a = match boundary_frame[va.as_usize()] {
                         Some(existing) => existing,
                         None => {
+                            // §5.4: the boundary frame rides the same per-vertex
+                            // relative scale as the per-loop inset (§4.2).
                             let frame = self.wireframe_boundary_frame(
-                                va, face, face_normal, face_tag, inset_dist,
+                                va,
+                                face,
+                                face_normal,
+                                face_tag,
+                                inset_dist * relative_scale[va.as_usize()],
                             );
                             boundary_frame[va.as_usize()] = Some(frame);
                             frame
@@ -318,7 +426,11 @@ impl LoopMesh {
                         Some(existing) => existing,
                         None => {
                             let frame = self.wireframe_boundary_frame(
-                                vb, face, face_normal, face_tag, inset_dist,
+                                vb,
+                                face,
+                                face_normal,
+                                face_tag,
+                                inset_dist * relative_scale[vb.as_usize()],
                             );
                             boundary_frame[vb.as_usize()] = Some(frame);
                             frame
@@ -1003,6 +1115,189 @@ mod tests {
         );
         let f180 = super::even_offset_factor(dir(0.0), dir(180.0));
         assert!((f180 - 1.0).abs() < 1.0e-4, "flat corner factor {f180} should be 1.0");
+    }
+
+    /// An axis-irregular planar quad lying in z = 0, wound +Z, whose four edges
+    /// all have distinct lengths so each corner's median tagged-edge length is
+    /// different. Corners (in winding order):
+    ///   c0 = (0, 0)   c1 = (4, 0)   c2 = (4, 3)   c3 = (0, 3)
+    /// Edge lengths around the loop: |c0c1| = 4, |c1c2| = 3, |c2c3| = 4,
+    /// |c3c0| = 3. Each corner has exactly two tagged edges (the lone-quad fan),
+    /// so its relative factor is their mean:
+    ///   c0: mean(4, 3) = 3.5   c1: mean(4, 3) = 3.5
+    ///   c2: mean(3, 4) = 3.5   c3: mean(4, 3) = 3.5
+    /// — uniform here, so for a *non-uniform* per-corner factor we stretch one
+    /// edge; see `relative_offset_scales_shell_per_vertex`.
+    fn irregular_planar_quad(mesh: &mut LoopMesh) -> ([VertexKey; 4], FaceKey) {
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+            Vec3::new(4.0, 3.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+        ];
+        let verts = [
+            mesh.create_vertex(corners[0]),
+            mesh.create_vertex(corners[1]),
+            mesh.create_vertex(corners[2]),
+            mesh.create_vertex(corners[3]),
+        ];
+        let edges = [
+            mesh.create_edge([verts[0], verts[1]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[1], verts[2]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[2], verts[3]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[3], verts[0]], EdgeCreateFlags::NO_DUPLICATE),
+        ];
+        let face = mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+        (verts, face)
+    }
+
+    #[test]
+    fn relative_offset_zero_matches_absolute_path() {
+        // WIREFRAME.md §5.4: with `use_relative_offset` clear the per-vertex
+        // factor is `1.0` everywhere, so the new entry point must be
+        // bit-identical to `wireframe_with_offset` — same verts, same order,
+        // exact positions.
+        let mut absolute = LoopMesh::new();
+        let (_, fa) = irregular_planar_quad(&mut absolute);
+        let abs_result = absolute.wireframe_with_offset(&[fa], 0.3, 0.0, false);
+
+        let mut rel_clear = LoopMesh::new();
+        let (_, fr) = irregular_planar_quad(&mut rel_clear);
+        let rel_result = rel_clear.wireframe_with_relative_offset(&[fr], 0.3, 0.0, false, false);
+
+        assert_eq!(abs_result.strut_faces.len(), rel_result.strut_faces.len());
+        assert_eq!(absolute.vertex_count(), rel_clear.vertex_count());
+        assert_eq!(absolute.face_count(), rel_clear.face_count());
+        for slot in 0..absolute.vertex_count() {
+            let a = absolute.vertex_position(VertexKey::from_usize(slot));
+            let b = rel_clear.vertex_position(VertexKey::from_usize(slot));
+            assert_eq!(a, b, "vert {slot}: relative-offset clear must equal absolute path");
+        }
+        rel_clear.validate_topology();
+    }
+
+    #[test]
+    fn relative_offset_scales_shell_per_vertex() {
+        // WIREFRAME.md §5.4: each corner's whole cross-section scales by the
+        // median length of its tagged edges. Build a quad whose four edges have
+        // distinct lengths so each corner has a *different* median:
+        //   c0 = (0,0)  c1 = (5,0)  c2 = (5,2)  c3 = (0,2)
+        //   |c0c1| = 5  |c1c2| = 2  |c2c3| = 5  |c3c0| = 2
+        // Each corner has two tagged edges → factor = their mean:
+        //   c0: mean(5, 2) = 3.5   c1: mean(5, 2) = 3.5
+        //   c2: mean(2, 5) = 3.5   c3: mean(5, 2) = 3.5   (still uniform)
+        // To force distinct per-corner factors, displace c1 so the two edges at
+        // each corner differ corner-to-corner:
+        //   c0 = (0,0)  c1 = (6,0)  c2 = (6,2)  c3 = (0,2)
+        //   |c0c1| = 6  |c1c2| = 2  |c2c3| = 6  |c3c0| = 2
+        //   c0: mean(6, 2) = 4   c1: mean(6, 2) = 4 ...  (a rectangle is always
+        // uniform). A genuinely non-uniform fan needs a non-rectangular quad:
+        //   c0 = (0,0)  c1 = (6,0)  c2 = (5,4)  c3 = (0,2)
+        //   |c0c1| = 6
+        //   |c1c2| = sqrt(1 + 16) = sqrt(17)        ≈ 4.1231
+        //   |c2c3| = sqrt(25 + 4) = sqrt(29)        ≈ 5.3852
+        //   |c3c0| = 2
+        //   c0: mean(|c3c0|, |c0c1|) = mean(2, 6)            = 4.0
+        //   c1: mean(|c0c1|, |c1c2|) = mean(6, sqrt(17))     ≈ 5.0616
+        //   c2: mean(|c1c2|, |c2c3|) = mean(sqrt(17), sqrt(29)) ≈ 4.7541
+        //   c3: mean(|c2c3|, |c3c0|) = mean(sqrt(29), 2)     ≈ 3.6926
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(6.0, 0.0, 0.0),
+            Vec3::new(5.0, 4.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        ];
+        let len = |a: usize, b: usize| (corners[a] - corners[b]).length();
+        let factor = [
+            (len(3, 0) + len(0, 1)) * 0.5,
+            (len(0, 1) + len(1, 2)) * 0.5,
+            (len(1, 2) + len(2, 3)) * 0.5,
+            (len(2, 3) + len(3, 0)) * 0.5,
+        ];
+
+        let mut mesh = LoopMesh::new();
+        let verts = [
+            mesh.create_vertex(corners[0]),
+            mesh.create_vertex(corners[1]),
+            mesh.create_vertex(corners[2]),
+            mesh.create_vertex(corners[3]),
+        ];
+        let edges = [
+            mesh.create_edge([verts[0], verts[1]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[1], verts[2]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[2], verts[3]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([verts[3], verts[0]], EdgeCreateFlags::NO_DUPLICATE),
+        ];
+        let face = mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+
+        let thickness = 0.2_f32;
+        let half = thickness * 0.5;
+        mesh.wireframe_with_relative_offset(&[face], thickness, 0.0, false, true);
+
+        // Topology unchanged: lone quad → 8 struts + 1 retained source, 16 verts.
+        assert_eq!(mesh.face_count(), 9);
+        assert_eq!(mesh.vertex_count(), 16);
+
+        // The quad is planar (z = 0, +Z normal) so every shell vert is offset
+        // purely along ±Z, landing at z = ±half·factor[c]. Group the 8 shell
+        // verts (the new verts with non-zero z) by nearest corner and assert
+        // their |z| equals half × that corner's median factor. The inset-frame
+        // verts stay in the plane (z = 0); the four originals are at z = 0 too.
+        let mut shell_hits = 0;
+        for slot in 4..16 {
+            let p = mesh.vertex_position(VertexKey::from_usize(slot));
+            if p.z.abs() < 1.0e-6 {
+                continue; // inset-frame vert, in the surface plane
+            }
+            // Nearest original corner in the xy plane.
+            let mut nearest = 0usize;
+            let mut best = f32::MAX;
+            for c in 0..4 {
+                let d = (Vec3::new(corners[c].x, corners[c].y, 0.0)
+                    - Vec3::new(p.x, p.y, 0.0))
+                .length_squared();
+                if d < best {
+                    best = d;
+                    nearest = c;
+                }
+            }
+            let expected = half * factor[nearest];
+            assert!(
+                (p.z.abs() - expected).abs() < 1.0e-5,
+                "shell vert {slot} near corner {nearest}: |z| {} should be half·factor {expected}",
+                p.z.abs(),
+            );
+            shell_hits += 1;
+        }
+        assert_eq!(shell_hits, 8, "all eight shell verts (a +/- pair per corner) checked");
+
+        // The per-corner factors are genuinely distinct here — the test would be
+        // vacuous on a rectangle (uniform factor).
+        assert!(
+            factor[0] != factor[1] && factor[1] != factor[2] && factor[2] != factor[3],
+            "fixture must give a non-uniform per-corner median",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn relative_offset_two_edge_fan_is_mean() {
+        // WIREFRAME.md §5.4: for a vertex whose tagged fan is exactly two edges
+        // the median reduces to their mean. On a lone tagged quad every corner
+        // has a two-edge fan, so the relative factor at a corner is the mean of
+        // its two incident edge lengths. Pin that directly via `median_edge_length`
+        // and via the resulting shell offset on an isosceles right-corner quad.
+        let mut two = [3.0_f32, 7.0];
+        assert_eq!(super::median_edge_length(&mut two), 5.0, "two-edge fan → mean");
+
+        let mut three = [2.0_f32, 10.0, 6.0];
+        assert_eq!(super::median_edge_length(&mut three), 6.0, "odd count → middle value");
+
+        let mut four = [1.0_f32, 2.0, 8.0, 9.0];
+        assert_eq!(super::median_edge_length(&mut four), 5.0, "even count → mean of middles");
+
+        let mut empty: [f32; 0] = [];
+        assert_eq!(super::median_edge_length(&mut empty), 1.0, "no tagged edges → 1.0 fallback");
     }
 
     #[test]
