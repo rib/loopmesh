@@ -52,10 +52,11 @@ impl LoopMesh {
     /// pair unless `use_boundary` caps its outer side with a rim strut pair
     /// (§6).
     ///
-    /// This kernel-operator form **retains** the original input faces (it does
+    /// This three-argument form **retains** the original input faces (it does
     /// not delete them) and leaves the original vertices in place — the
-    /// `use_replace` removal of §7 is a separate, not-yet-implemented axis. The
-    /// returned [`WireframeResult`] carries only the generated strut/cap quads.
+    /// `use_replace` removal of §7 is selected through
+    /// [`Self::wireframe_with_replace`]. The returned [`WireframeResult`]
+    /// carries only the generated strut/cap quads.
     ///
     /// See `radial-mesh-guides/operators/WIREFRAME.md` for the full algorithm
     /// and parity contract.
@@ -65,8 +66,9 @@ impl LoopMesh {
         thickness: f32,
         use_boundary: bool,
     ) -> WireframeResult {
-        // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`).
-        self.wireframe_with_offset(faces, thickness, 0.0, use_boundary)
+        // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`)
+        // and the originals are kept (`use_replace = false`).
+        self.wireframe_with_replace(faces, thickness, 0.0, use_boundary, false)
     }
 
     /// As [`Self::wireframe`], but with the `[-1, 1]` off-centre bias `offset`
@@ -83,6 +85,25 @@ impl LoopMesh {
         thickness: f32,
         offset: f32,
         use_boundary: bool,
+    ) -> WireframeResult {
+        self.wireframe_with_replace(faces, thickness, offset, use_boundary, false)
+    }
+
+    /// As [`Self::wireframe_with_offset`], but with the `use_replace` axis of
+    /// WIREFRAME.md §7: when `use_replace` is set, the original tagged faces are
+    /// consumed and the original tagged vertices are deleted once the wire is
+    /// built, so only the strut network remains. The deletion is guarded against
+    /// over-removal on a *partial* selection — a tagged vertex still used by any
+    /// un-tagged surviving face is kept alive (the boundary-of-region guard, §7).
+    /// When `use_replace` is clear the original faces are retained and no
+    /// original vertex is removed (they persist as face-less points).
+    pub fn wireframe_with_replace(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+        use_replace: bool,
     ) -> WireframeResult {
         if faces.is_empty() {
             return WireframeResult::default();
@@ -109,6 +130,8 @@ impl LoopMesh {
 
         // §3: tag every vertex of a tagged face (a tagged vertex gets a shell
         // pair). The shell-pair lookup is keyed by original vertex slot.
+        // Snapshot the original element watermarks so the §7 replace pass can
+        // tell originals (slot < watermark) from freshly built wire geometry.
         let vert_watermark = self.vertices.key_watermark();
         let mut vert_tagged: Vec<bool> = vec![false; vert_watermark];
         for &face in faces {
@@ -254,8 +277,69 @@ impl LoopMesh {
             }
         }
 
+        // §7: with `use_replace` set, consume the original tagged faces and
+        // delete the original tagged verts — guarding a tagged vert against
+        // removal when any un-tagged surviving face still uses it (the
+        // boundary-of-region keep-alive guard).
+        if use_replace {
+            self.wireframe_replace_originals(&vert_tagged, vert_watermark, face_tag);
+        }
+
         self.pop_face_op_flag_layer(face_tag);
         result
+    }
+
+    /// §7 — the `use_replace` removal pass. Each tagged original vertex is
+    /// deleted unless an un-tagged surviving face still uses it; the original
+    /// tagged faces are consumed as a *cascade* of that vertex removal (deleting
+    /// a vert kills its incident edges and their faces), so a fully-wired region
+    /// loses its source faces while a partial region whose border verts are all
+    /// kept alive retains them.
+    ///
+    /// The keep-alive guard walks every *surviving original* face (any face not
+    /// tagged for wiring — the freshly built strut quads use new verts, slot >=
+    /// the pre-build watermark, so they never anchor an original) and marks every
+    /// original vertex it touches as kept-alive, so a vertex on the border
+    /// between the wired region and the surrounding un-wired faces is preserved.
+    /// Only then are the tagged, un-kept original verts removed.
+    fn wireframe_replace_originals(
+        &mut self,
+        vert_tagged: &[bool],
+        vert_watermark: usize,
+        face_tag: crate::op_flags::FaceOpFlagLayer,
+    ) {
+        // §7.1 — mark every original vert that a surviving (un-tagged) face still
+        // uses. Strut faces are skipped implicitly because their corner verts are
+        // new (slot >= vert_watermark); the tagged source faces are skipped by
+        // the tag test (they are consumed by the §7.2 cascade).
+        let mut keep_alive: Vec<bool> = vec![false; vert_watermark];
+        let mut face_iter = MeshFaces::default();
+        while let Some(face) = face_iter.next(self) {
+            if self.face_op_flag_test(face_tag, face, 0) {
+                continue;
+            }
+            let mut loops = self.face_loops(face);
+            while let Some(l) = loops.next(self) {
+                let slot = self.loop_vertex(l).as_usize();
+                if slot < vert_watermark {
+                    keep_alive[slot] = true;
+                }
+            }
+        }
+
+        // §7.2 — delete every tagged original vert not kept alive. `vertex_kill`
+        // cascades through the vert's perimeter edges, killing the original
+        // source face with them; a kept vert (still anchored by a surviving
+        // face) is left untouched, and its source face rides along.
+        for slot in 0..vert_watermark {
+            if !vert_tagged[slot] || keep_alive[slot] {
+                continue;
+            }
+            let v = VertexKey::from_usize(slot);
+            if self.vertices.try_get(v).is_some() {
+                self.vertex_kill(v);
+            }
+        }
     }
 
     /// §4.3 — the unit inward face tangent at loop `l`: the bisector of the two
@@ -605,6 +689,109 @@ mod tests {
         assert!(saw_neg && saw_pos && saw_surface, "offset=0 straddles symmetrically");
 
         plus.validate_topology();
+    }
+
+    #[test]
+    fn use_replace_lone_quad_removes_originals() {
+        // WIREFRAME.md §7 (whole-mesh wire): with `use_replace` set and the
+        // whole mesh tagged, the keep-alive guard is vacuous — no un-tagged face
+        // survives to anchor the four originals — so the source face is consumed
+        // and all four original verts are removed. Counts drop from the kept
+        // case (16 verts / 9 faces) to 12 verts (4 inset-frame + 8 shell) / 8
+        // faces (struts only, source consumed).
+        let mut kept = LoopMesh::new();
+        let fk = flat_quad(&mut kept);
+        let kept_result = kept.wireframe_with_replace(&[fk], 0.2, 0.0, false, false);
+        assert_eq!(kept_result.strut_faces.len(), 8);
+        assert_eq!(kept.face_count(), 9, "source retained when use_replace clear");
+        assert_eq!(kept.vertex_count(), 16, "4 original kept + 4 inset + 8 shell");
+        kept.validate_topology();
+
+        let mut replaced = LoopMesh::new();
+        let fr = flat_quad(&mut replaced);
+        let replaced_result = replaced.wireframe_with_replace(&[fr], 0.2, 0.0, false, true);
+        assert_eq!(replaced_result.strut_faces.len(), 8, "struts unchanged by replace");
+        assert_eq!(replaced.face_count(), 8, "source face consumed under use_replace");
+        assert_eq!(
+            replaced.vertex_count(),
+            12,
+            "all 4 originals removed (12 = 4 inset + 8 shell)"
+        );
+        replaced.validate_topology();
+    }
+
+    #[test]
+    fn use_replace_grid_3x3_centre_keeps_shared_border_verts() {
+        // WIREFRAME.md §7 / §11.2 keep-alive guard: wiring only the centre face
+        // of a 3×3 grid with `use_replace` set must *not* remove the centre
+        // face's four corner verts — each is shared with the eight surrounding
+        // un-tagged faces, which still need them. The guard keeps them alive, so
+        // the counts match the `use_replace = false` centre-face wire exactly:
+        // 28 verts (16 grid + 4 inset + 8 shell) and 17 faces (9 grid − 1
+        // consumed centre + 8 struts + ... ) — concretely 16 surviving grid
+        // faces + ... see below.
+        let build = |use_replace: bool| -> LoopMesh {
+            let mut mesh = LoopMesh::new();
+            let mut verts = [[VertexKey::from_usize(0); 4]; 4];
+            for (iy, row) in verts.iter_mut().enumerate() {
+                for (ix, slot) in row.iter_mut().enumerate() {
+                    *slot = mesh.create_vertex(Vec3::new(ix as f32, iy as f32, 0.0));
+                }
+            }
+            let mut faces = Vec::new();
+            for y in 0..3 {
+                for x in 0..3 {
+                    let ring = [
+                        verts[y][x],
+                        verts[y][x + 1],
+                        verts[y + 1][x + 1],
+                        verts[y + 1][x],
+                    ];
+                    let edges = [
+                        mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                        mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                        mesh.create_edge([ring[2], ring[3]], EdgeCreateFlags::NO_DUPLICATE),
+                        mesh.create_edge([ring[3], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+                    ];
+                    faces.push(mesh.face_create(&ring, &edges, FaceCreateFlags::NONE));
+                }
+            }
+            let centre = faces[4];
+            mesh.wireframe_with_replace(&[centre], 0.1, 0.0, false, use_replace);
+            mesh
+        };
+
+        // Clear case: centre face retained, 16 grid verts + 4 inset + 8 shell =
+        // 28 verts; 9 grid faces + 8 struts = 17 faces.
+        let kept = build(false);
+        assert_eq!(kept.vertex_count(), 28);
+        assert_eq!(kept.face_count(), 17);
+        kept.validate_topology();
+
+        // Replace case: the four shared border verts are kept alive by the eight
+        // surrounding faces, so only the centre face is consumed and *no* vert
+        // is removed — the counts are unchanged from the clear case.
+        let replaced = build(true);
+        assert_eq!(
+            replaced.vertex_count(),
+            28,
+            "keep-alive guard preserves the 4 shared border verts"
+        );
+        assert_eq!(
+            replaced.face_count(),
+            17,
+            "centre consumed but 8 surrounding faces + 8 struts intact"
+        );
+        // The eight surrounding faces stay quads (nothing torn out under them).
+        let mut quad_faces = 0;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&replaced) {
+            if replaced.face_len(f) == 4 {
+                quad_faces += 1;
+            }
+        }
+        assert_eq!(quad_faces, 17, "all surviving + strut faces are quads");
+        replaced.validate_topology();
     }
 
     #[test]
