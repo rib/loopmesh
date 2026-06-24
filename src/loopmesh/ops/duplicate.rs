@@ -74,10 +74,13 @@ impl LoopMesh {
     /// source — never an interpolation (DUPLICATE.md §4). The returned maps
     /// report the source/clone correspondence (§5, §6).
     ///
-    /// `use_edge_flip_from_face` is accepted for interface stability but its
-    /// non-default (`true`) behaviour — the §7 boundary-edge endpoint swap for
-    /// the duplicate-then-extrude composition — is a by-design deferral and is
-    /// not yet implemented; only the default (`false`) path runs.
+    /// When `use_edge_flip_from_face` is set, a cloned **boundary** edge (its
+    /// source edge has exactly one incident face) whose source face traverses
+    /// it "v1-first" has its two clone endpoints swapped, so a downstream
+    /// extrude building a wall off the clone gets a consistent winding
+    /// (DUPLICATE.md §7). The swap touches only the clone edge's internal
+    /// endpoint order — never which two verts it connects, nor any incidence —
+    /// so it is invisible to a topology-only comparison.
     ///
     /// See `radial-mesh-guides/operators/DUPLICATE.md` for the full algorithm
     /// and parity contract.
@@ -86,12 +89,6 @@ impl LoopMesh {
         geom: &[GeomKey],
         use_edge_flip_from_face: bool,
     ) -> DuplicateResult {
-        debug_assert!(
-            !use_edge_flip_from_face,
-            "duplicate: use_edge_flip_from_face=true is a by-design deferral (DUPLICATE.md §7)"
-        );
-        let _ = use_edge_flip_from_face;
-
         let mut result = DuplicateResult::default();
 
         // Selection membership, keyed by source slot, so the §6 classification
@@ -141,6 +138,7 @@ impl LoopMesh {
                 &mut vert_ledger,
                 &mut edge_ledger,
                 &face_selected,
+                use_edge_flip_from_face,
                 &mut result,
             );
         }
@@ -159,6 +157,7 @@ impl LoopMesh {
                 &mut vert_ledger,
                 &mut edge_ledger,
                 &face_selected,
+                use_edge_flip_from_face,
                 &mut result,
             );
         }
@@ -188,13 +187,23 @@ impl LoopMesh {
         vert_ledger: &mut HashMap<VertexKey, VertexKey>,
         edge_ledger: &mut HashMap<EdgeKey, EdgeKey>,
         face_selected: &[bool],
+        use_edge_flip_from_face: bool,
         result: &mut DuplicateResult,
     ) -> EdgeKey {
         let [v0, v1] = self.edge_vertices(source);
         let c0 = self.closure_vertex(v0, vert_ledger, result);
         let c1 = self.closure_vertex(v1, vert_ledger, result);
 
-        let clone = self.create_edge([c0, c1], EdgeCreateFlags::NONE);
+        // §7: a boundary edge whose sole source face traverses it v1-first has
+        // its clone endpoints swapped, fixing the downstream extrude wall's
+        // winding. The endpoint *set* is unchanged — only the internal order.
+        let endpoints = if use_edge_flip_from_face && self.edge_flips_from_face(source) {
+            [c1, c0]
+        } else {
+            [c0, c1]
+        };
+
+        let clone = self.create_edge(endpoints, EdgeCreateFlags::NONE);
         self.edge_attribs
             .copy_into(clone.as_usize(), source.as_usize());
         result.edge_map.insert(source, clone);
@@ -218,6 +227,7 @@ impl LoopMesh {
         vert_ledger: &mut HashMap<VertexKey, VertexKey>,
         edge_ledger: &mut HashMap<EdgeKey, EdgeKey>,
         face_selected: &[bool],
+        use_edge_flip_from_face: bool,
         result: &mut DuplicateResult,
     ) -> FaceKey {
         // Snapshot the source face's loops in cycle order so the clone is built
@@ -241,7 +251,14 @@ impl LoopMesh {
             .iter()
             .map(|&e| match edge_ledger.get(&e) {
                 Some(&existing) => existing,
-                None => self.clone_edge(e, vert_ledger, edge_ledger, face_selected, result),
+                None => self.clone_edge(
+                    e,
+                    vert_ledger,
+                    edge_ledger,
+                    face_selected,
+                    use_edge_flip_from_face,
+                    result,
+                ),
             })
             .collect();
 
@@ -304,6 +321,23 @@ impl LoopMesh {
             }
         }
         true
+    }
+
+    /// §7 swap precondition: true when `source` is a **boundary** edge (exactly
+    /// one incident face) and that face traverses the edge **v1-first** — its
+    /// loop on the edge starts at the edge's `v1` (loop direction v1 -> v0
+    /// relative to the stored `[v0, v1]` order). A loop's vertex is the corner
+    /// it emanates from, so "starts at v1" is `loop_vertex(loop) == v1`.
+    fn edge_flips_from_face(&self, source: EdgeKey) -> bool {
+        let [_v0, v1] = self.edge_vertices(source);
+        let mut radial = self.iter_radial_loops(source);
+        let Some(only_loop) = radial.next() else {
+            return false;
+        };
+        if radial.next().is_some() {
+            return false; // not a boundary edge (>= 2 incident faces)
+        }
+        self.loop_vertex(only_loop) == v1
     }
 
     /// §6.1 in-selection radial count: how many of `source`'s incident faces are
@@ -622,6 +656,110 @@ mod tests {
         let fa_verts: HashSet<VertexKey> = mesh.face_vert_keys(clone_fa).into_iter().collect();
         let fb_verts: HashSet<VertexKey> = mesh.face_vert_keys(clone_fb).into_iter().collect();
         assert!(fa_verts.is_disjoint(&fb_verts), "disjoint clones");
+        mesh.validate_topology();
+    }
+
+    /// Build a single quad whose boundary edge `{v0, v1}` is traversed
+    /// **v1-first** by the face — the §7 swap precondition. The face visits the
+    /// corners a -> b -> c -> d, but the a–b edge is *stored* as `[b, a]`, so
+    /// the face loop on it starts at the edge's `v1` (= a). Returns the face and
+    /// that boundary edge.
+    fn quad_with_v1_first_edge(mesh: &mut LoopMesh) -> (FaceKey, EdgeKey) {
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // Stored [b, a]: v0 = b, v1 = a. The face loop runs a -> b on it, so the
+        // loop starts at a = the edge's v1 -> v1-first.
+        let e_ab = mesh.create_edge([b, a], EdgeCreateFlags::NONE);
+        let e_bc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e_cd = mesh.create_edge([c, d], EdgeCreateFlags::NONE);
+        let e_da = mesh.create_edge([d, a], EdgeCreateFlags::NONE);
+        let face = mesh.face_create(&[a, b, c, d], &[e_ab, e_bc, e_cd, e_da], FaceCreateFlags::NONE);
+        (face, e_ab)
+    }
+
+    #[test]
+    fn edge_flip_from_face_reverses_boundary_clone_edge_order() {
+        // §7 / §7.1: selecting a face's boundary edge WITHOUT the face produces a
+        // face-less wire clone whose *source* still satisfies the boundary
+        // precondition (one incident face). With use_edge_flip_from_face = true
+        // and the source face traversing that edge v1-first, the clone edge's
+        // endpoint order is the exact REVERSE of the flag-false clone order,
+        // while the endpoint *set* is unchanged.
+        let edge_order = |flag: bool| -> ([VertexKey; 2], [Vec3; 2]) {
+            let mut mesh = LoopMesh::new();
+            let (_face, edge) = quad_with_v1_first_edge(&mut mesh);
+
+            let result = mesh.duplicate(&[edge.into()], flag);
+            let clone = result.boundary_map.get(&edge).copied().unwrap();
+            let [c0, c1] = mesh.edge_vertices(clone);
+            ([c0, c1], [mesh.vertex_position(c0), mesh.vertex_position(c1)])
+        };
+
+        let (false_keys, false_pos) = edge_order(false);
+        let (true_keys, true_pos) = edge_order(true);
+
+        // The flag reverses the clone edge's internal endpoint order.
+        assert_eq!(
+            true_pos,
+            [false_pos[1], false_pos[0]],
+            "flag=true clone edge order is the reverse of flag=false (§7.1)"
+        );
+        // The endpoint *set* (by position) is unchanged — same two verts joined.
+        let set = |p: [Vec3; 2]| {
+            let mut s = [p[0], p[1]];
+            s.sort_by(|x, y| {
+                (x.x, x.y, x.z)
+                    .partial_cmp(&(y.x, y.y, y.z))
+                    .unwrap()
+            });
+            s
+        };
+        assert_eq!(set(false_pos), set(true_pos), "endpoint set unchanged");
+        // Distinct clone identities either way (the order axis is internal).
+        assert_ne!(true_keys, false_keys);
+    }
+
+    #[test]
+    fn edge_flip_from_face_default_keeps_source_order() {
+        // §7 contrast: with the flag OFF, the boundary edge's clone keeps the
+        // source edge's stored [v0, v1] order regardless of face traversal.
+        let mut mesh = LoopMesh::new();
+        let (_face, edge) = quad_with_v1_first_edge(&mut mesh);
+        let [v0, v1] = mesh.edge_vertices(edge);
+        let src_pos = [mesh.vertex_position(v0), mesh.vertex_position(v1)];
+
+        let result = mesh.duplicate(&[edge.into()], false);
+        let clone = result.boundary_map.get(&edge).copied().unwrap();
+        let [c0, c1] = mesh.edge_vertices(clone);
+        assert_eq!(
+            [mesh.vertex_position(c0), mesh.vertex_position(c1)],
+            src_pos,
+            "flag=false clone keeps source endpoint order"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn edge_flip_from_face_no_swap_when_v0_first() {
+        // §7: the swap fires ONLY when the source face is v1-first. A standard
+        // quad built by create_face_from_verts traverses every perimeter edge
+        // v0-first, so even with the flag ON the clone keeps the source order.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let edge = mesh.face_edge_keys(face)[0];
+        let [v0, v1] = mesh.edge_vertices(edge);
+        let src_pos = [mesh.vertex_position(v0), mesh.vertex_position(v1)];
+
+        let result = mesh.duplicate(&[edge.into()], true);
+        let clone = result.boundary_map.get(&edge).copied().unwrap();
+        let [c0, c1] = mesh.edge_vertices(clone);
+        assert_eq!(
+            [mesh.vertex_position(c0), mesh.vertex_position(c1)],
+            src_pos,
+            "v0-first source face: no swap even with flag on"
+        );
         mesh.validate_topology();
     }
 
