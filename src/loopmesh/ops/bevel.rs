@@ -52,6 +52,27 @@ impl Default for BevelOffsetType {
     }
 }
 
+/// How a multi-edge junction's corner patch is filled at `segments ≥ 2`
+/// (BEVEL.md §1.2 / §8.3).
+///
+/// [`BevelVmeshMethod::Adj`] is the default rounded adjacency grid that blends the
+/// arriving profile strips (a documented-as-future stub, BEVEL.md §8.4).
+/// [`BevelVmeshMethod::Cutoff`] slices the corner off flat: one cut face per
+/// sector spanning that sector's profile chain plus two bottom corner verts, the
+/// bottom corner ring closed by one bottom face — or, at a 3-way junction whose
+/// corner verts coincide, collapsed to a single apex (BEVEL.md §8.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BevelVmeshMethod {
+    Adj,
+    Cutoff,
+}
+
+impl Default for BevelVmeshMethod {
+    fn default() -> Self {
+        BevelVmeshMethod::Adj
+    }
+}
+
 /// Parameters for [`LoopMesh::bevel`]. The foundational case (BEVEL.md §3) is
 /// reachable by setting only `offset` and leaving every other field at its
 /// default: `affect = Vertices`, `segments = 1`, `offset_type = Offset`.
@@ -97,6 +118,12 @@ pub struct BevelOptions {
     /// §6.7). Runs the identical junction bridging on the sharp bit, independently
     /// of `mark_seam`. Defaults to `false`.
     pub mark_sharp: bool,
+    /// How a multi-edge junction's corner patch is filled at `segments ≥ 2`
+    /// (BEVEL.md §1.2 / §8.3). Only consulted for `affect = Edges`,
+    /// `segments ≥ 2`. Defaults to `Adj` (the rounded grid; still a stub). The
+    /// `Cutoff` flat-cut fill is implemented for the multi-edge junction at the
+    /// default profile (BEVEL.md §8.2 / §8.3).
+    pub vmesh_method: BevelVmeshMethod,
 }
 
 impl Default for BevelOptions {
@@ -110,6 +137,7 @@ impl Default for BevelOptions {
             material: -1,
             mark_seam: false,
             mark_sharp: false,
+            vmesh_method: BevelVmeshMethod::Adj,
         }
     }
 }
@@ -187,7 +215,23 @@ impl LoopMesh {
     pub fn bevel(&mut self, geom: &[GeomKey], options: BevelOptions) -> BevelResult {
         let mut result = BevelResult::default();
 
-        if options.segments != 1 || options.offset <= 0.0 {
+        if options.offset <= 0.0 {
+            return result;
+        }
+
+        // The multi-segment cutoff edge-bevel junction (BEVEL.md §8.2 / §8.3) is
+        // the only `segments ≥ 2` path implemented; everything else still no-ops
+        // for `segments != 1` (the ADJ grid / vertex multi-segment are stubs).
+        if options.segments >= 2 {
+            if options.affect == BevelAffect::Edges
+                && options.vmesh_method == BevelVmeshMethod::Cutoff
+            {
+                return self.bevel_edges(geom, &options);
+            }
+            return result;
+        }
+
+        if options.segments != 1 {
             return result;
         }
 
@@ -315,6 +359,14 @@ impl LoopMesh {
             .filter(|(_, count)| *count >= 2)
             .map(|(v, _)| *v)
             .collect();
+
+        // Multi-segment cutoff (BEVEL.md §8.2 / §8.3) needs at least one
+        // multi-beveled-edge junction to fill — an all-isolated edge set has no
+        // cutoff corner. The orchestrator itself no-ops on the junction-free case.
+        if options.segments >= 2 {
+            self.bevel_edges_cutoff_multisegment(&beveled, &junctions, options, &mut result);
+            return result;
+        }
 
         if junctions.is_empty() {
             // No shared endpoint: every edge is isolated, every endpoint terminal
@@ -661,6 +713,668 @@ impl LoopMesh {
         // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
         for &endpoint in &endpoints {
             self.free_loose_vertex(endpoint);
+        }
+    }
+
+    /// Multi-segment cutoff edge bevel at a multi-edge junction (BEVEL.md §8.2 /
+    /// §8.3). Drives the `segments ≥ 2`, `vmesh_method = Cutoff` case.
+    ///
+    /// The boundvert ring at every endpoint is the §7.6.2 / §7.5 ring, unchanged
+    /// by `segments` (§8.2.1). What `segments ≥ 2` adds is, per beveled edge per
+    /// endpoint, a **profile chain** of `segments + 1` arc-sampled verts spanning
+    /// that edge's two flanking boundverts (§8.2.2 / §8.2.2.1), the `segments`-wide
+    /// **strip** along each edge (§8.3.0), and, at each multi-beveled-edge
+    /// **junction**, the **cutoff fill**: one flat cut face per sector plus a
+    /// bottom face — or, when the corner verts coincide (the `s = 3` cube corner),
+    /// a single collapsed apex (§8.3.2 / §8.3.4). A valence-3 **terminal** builds
+    /// no fill face: its edge's strip runs through with the chain mirrored, the
+    /// surviving faces absorbing the `segments + 1`-wide run (§8.3.0.1).
+    fn bevel_edges_cutoff_multisegment(
+        &mut self,
+        beveled: &[EdgeKey],
+        junctions: &[VertexKey],
+        options: &BevelOptions,
+        result: &mut BevelResult,
+    ) {
+        let offset = options.offset;
+        let material = options.material;
+        let segments = options.segments;
+
+        // §8.3: the cutoff fill needs at least one multi-beveled-edge junction —
+        // an all-isolated / junction-free edge set has no corner to fold, so it is
+        // a clean no-op rather than partial through-strip geometry.
+        if junctions.is_empty() {
+            return;
+        }
+
+        let mut beveled_manifold: Vec<EdgeKey> = Vec::new();
+        for &edge in beveled {
+            if self.edge_radial_iter(edge).count() == 2 {
+                beveled_manifold.push(edge);
+            }
+        }
+        if beveled_manifold.is_empty() {
+            return;
+        }
+        let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
+
+        let strip_material: Vec<(EdgeKey, i32)> = beveled_manifold
+            .iter()
+            .map(|&edge| {
+                let representative = self
+                    .edge_loop_keys(edge)
+                    .first()
+                    .map(|&l| self.face_material_index(self.loop_face(l)))
+                    .unwrap_or(0);
+                (edge, representative)
+            })
+            .collect();
+
+        let mut endpoints: Vec<VertexKey> = Vec::new();
+        for &edge in &beveled_manifold {
+            for endpoint in self.edge_vert_keys(edge) {
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+
+        // Phase 1 (pristine mesh): per endpoint, place its boundvert ring and build
+        // each incident beveled edge's profile chain. `chains` keys each chain by
+        // (edge, endpoint); `face_subst` records per (vertex, face) the ordered
+        // vert run the re-stitch swaps the corner for; `junction_cuts` carries the
+        // per-junction cutoff-fill data.
+        let mut chains: Vec<EdgeEndChain> = Vec::new();
+        let mut face_subst: Vec<FaceSubstitution> = Vec::new();
+        let mut junction_cuts: Vec<JunctionCut> = Vec::new();
+
+        for &endpoint in &endpoints {
+            if junctions.contains(&endpoint) {
+                self.build_junction_chains(
+                    endpoint,
+                    &is_beveled,
+                    offset,
+                    segments,
+                    &mut chains,
+                    &mut face_subst,
+                    &mut junction_cuts,
+                    result,
+                );
+            } else {
+                self.build_terminal_chains(
+                    endpoint,
+                    &beveled_manifold,
+                    offset,
+                    segments,
+                    &mut chains,
+                    &mut face_subst,
+                    result,
+                );
+            }
+        }
+
+        // Phase 2: re-stitch every incident face once, swapping each consumed
+        // endpoint corner for its recorded vert run (§8.3.0.1 absorb / sector
+        // 1-for-1).
+        let mut incident_faces: Vec<FaceKey> = Vec::new();
+        for &endpoint in &endpoints {
+            for face in self.vert_face_keys(endpoint) {
+                if !incident_faces.contains(&face) {
+                    incident_faces.push(face);
+                }
+            }
+        }
+        for face in incident_faces {
+            self.restitch_junction_face(face, &endpoints, &face_subst);
+        }
+
+        // Phase 3: one strip (segments quads) per beveled edge over its two
+        // endpoint chains (§8.3.0).
+        for &edge in &beveled_manifold {
+            let representative = strip_material
+                .iter()
+                .find_map(|&(e, m)| (e == edge).then_some(m))
+                .unwrap_or(0);
+            self.build_multisegment_strip(
+                edge,
+                segments,
+                &chains,
+                material,
+                representative,
+                result,
+            );
+        }
+
+        // Phase 4: the cutoff fill at each junction (§8.3.2 / §8.3.4).
+        for cut in &junction_cuts {
+            self.build_cutoff_fill(cut, &chains, segments, material, result);
+        }
+
+        // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
+        for &endpoint in &endpoints {
+            self.free_loose_vertex(endpoint);
+        }
+    }
+
+    /// Place a junction's boundvert ring and build each sector's profile chain
+    /// (BEVEL.md §8.2 / §8.3.0). One boundvert per sector at the §7.6.2 meet; one
+    /// chain per consecutive boundvert pair, crossing the beveled edge shared by
+    /// the two sectors. Records the cutoff-fill data for the junction.
+    #[allow(clippy::too_many_arguments)]
+    fn build_junction_chains(
+        &mut self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+        segments: u32,
+        chains: &mut Vec<EdgeEndChain>,
+        face_subst: &mut Vec<FaceSubstitution>,
+        junction_cuts: &mut Vec<JunctionCut>,
+        result: &mut BevelResult,
+    ) {
+        let corners = self.vertex_corner_ring(vertex);
+        let sectors = sector_split(&corners, is_beveled);
+        let vertex_position = self.vertex_position(vertex);
+
+        let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors.len());
+        // Per sector, the beveled edge that *opens* it (`g_k` for `B_k`).
+        let mut opening_edges: Vec<EdgeKey> = Vec::with_capacity(sectors.len());
+
+        for sector in &sectors {
+            let position = self.solve_meet_point(vertex, vertex_position, sector, offset);
+            let boundvert = self.create_vertex(position);
+            result.verts.push(boundvert);
+            boundverts.push(boundvert);
+            opening_edges.push(sector.bounding_edges[0]);
+
+            // Each sector face collapses its corner to this one boundvert (1-for-1).
+            for &(_, face) in &sector.corners {
+                set_face_substitution(face_subst, vertex, face, vec![boundvert]);
+            }
+        }
+
+        let outward = self.junction_outward_normal(vertex);
+        let count = boundverts.len();
+
+        // One chain per consecutive boundvert pair (B_k → B_{k+1}), crossing the
+        // beveled edge shared by sectors k and k+1 (= the edge opening sector k+1).
+        for k in 0..count {
+            let next = (k + 1) % count;
+            let crossing = opening_edges[next];
+            let interior = self.build_chain_between(
+                boundverts[k],
+                boundverts[next],
+                crossing,
+                segments,
+                result,
+            );
+            chains.push(EdgeEndChain {
+                edge: crossing,
+                endpoint: vertex,
+                start: boundverts[k],
+                interior,
+                end: boundverts[next],
+            });
+        }
+
+        junction_cuts.push(JunctionCut {
+            vertex,
+            boundverts,
+            opening_edges,
+            outward,
+        });
+    }
+
+    /// Place a valence-3 terminal's two boundverts and build its single edge's
+    /// chain (BEVEL.md §8.3.0.1). No fill face: the two boundverts are E's two
+    /// perpendicular strip verts (the §7.5 planar offset), the chain runs between
+    /// them, and the surviving third face(s) absorb the whole `segments + 1` run.
+    #[allow(clippy::too_many_arguments)]
+    fn build_terminal_chains(
+        &mut self,
+        vertex: VertexKey,
+        beveled: &[EdgeKey],
+        offset: f32,
+        segments: u32,
+        chains: &mut Vec<EdgeEndChain>,
+        face_subst: &mut Vec<FaceSubstitution>,
+        result: &mut BevelResult,
+    ) {
+        let edge = self
+            .iter_disk_edges(vertex)
+            .find(|&e| beveled.contains(&e))
+            .expect("a terminal endpoint has its one beveled edge");
+
+        let radial_faces: Vec<FaceKey> = self
+            .edge_loop_keys(edge)
+            .iter()
+            .map(|&l| self.loop_face(l))
+            .collect();
+        if radial_faces.len() != 2 {
+            return;
+        }
+        let face_left = radial_faces[0];
+        let face_right = radial_faces[1];
+
+        let [a, b] = self.edge_vert_keys(edge);
+        let far = if a == vertex { b } else { a };
+        let direction = {
+            let segment = self.vertex_position(far) - self.vertex_position(vertex);
+            let length = segment.length();
+            if length <= f32::EPSILON {
+                return;
+            }
+            segment / length
+        };
+
+        // Only the valence-3 terminal close is implemented (§8.3.0.1): the
+        // surviving third face absorbs the run. Valence ≥ 4 (the fan/poly fill)
+        // remains a stub.
+        if self.iter_disk_edges(vertex).count() != 3 {
+            return;
+        }
+
+        let strip_for_face = |this: &mut Self, face: FaceKey, result: &mut BevelResult| {
+            let normal = this.face_plane_normal(face);
+            let center = this.face_center_of_mass(face);
+            let position = strip_vert_position(
+                this.vertex_position(vertex),
+                direction,
+                normal,
+                center,
+                offset,
+            );
+            let strip_vert = this.create_vertex(position);
+            result.verts.push(strip_vert);
+            strip_vert
+        };
+
+        let strip_left = strip_for_face(self, face_left, result);
+        let strip_right = strip_for_face(self, face_right, result);
+
+        // The chain crosses E between the two strip verts (§8.3.0.1). face_left's
+        // strip vert is the chain's `start`, face_right's its `end` — matching the
+        // strip builder's face_left-first ordering of E's radial faces.
+        let interior = self.build_chain_between(strip_left, strip_right, edge, segments, result);
+
+        // Each E-adjacent radial face collapses its corner to its one strip vert.
+        for &(face, strip_vert) in &[(face_left, strip_left), (face_right, strip_right)] {
+            set_face_substitution(face_subst, vertex, face, vec![strip_vert]);
+        }
+
+        // The third face(s) absorb the full chain run, ordered so the strip vert
+        // sharing the incoming leg sits next to `prev` (§8.3.0.1 / §7.4).
+        let left_other = self.face_other_edge_at(face_left, vertex, edge);
+        let right_other = self.face_other_edge_at(face_right, vertex, edge);
+        let mut forward_run = Vec::with_capacity(segments as usize + 1);
+        forward_run.push(strip_left);
+        forward_run.extend_from_slice(&interior);
+        forward_run.push(strip_right);
+        let mut reverse_run = forward_run.clone();
+        reverse_run.reverse();
+
+        for face in self.vert_face_keys(vertex) {
+            if face == face_left || face == face_right {
+                continue;
+            }
+            let cycle_verts = self.face_vert_keys(face);
+            let cycle_length = cycle_verts.len();
+            // A malformed third face (wire-edge sharing, non-manifold) may not
+            // carry the endpoint as a clean corner, or its incoming corner edge
+            // may not resolve. Skip such a face rather than panic — the gate does
+            // not enforce these as preconditions (rubric-5: panics are for
+            // internal invariants only).
+            let index = match cycle_verts.iter().position(|&w| w == vertex) {
+                Some(index) => index,
+                None => continue,
+            };
+            let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
+            let incoming_edge = match self.query_edge_exists(prev_vertex, vertex) {
+                Some(edge) => edge,
+                None => continue,
+            };
+            let ordered = if incoming_edge == right_other {
+                reverse_run.clone()
+            } else if incoming_edge == left_other {
+                forward_run.clone()
+            } else {
+                forward_run.clone()
+            };
+            set_face_substitution(face_subst, vertex, face, ordered);
+        }
+
+        chains.push(EdgeEndChain {
+            edge,
+            endpoint: vertex,
+            start: strip_left,
+            interior,
+            end: strip_right,
+        });
+    }
+
+    /// Build a profile chain's `segments − 1` interior verts between two ring
+    /// boundverts crossing beveled edge `edge` (BEVEL.md §8.2.2.1 / §8.3.6). The
+    /// endpoints are passed in; the interior arc samples are minted here.
+    fn build_chain_between(
+        &mut self,
+        start: VertexKey,
+        end: VertexKey,
+        edge: EdgeKey,
+        segments: u32,
+        result: &mut BevelResult,
+    ) -> Vec<VertexKey> {
+        let start_position = self.vertex_position(start);
+        let end_position = self.vertex_position(end);
+        let [ea, eb] = self.edge_vert_keys(edge);
+        let edge_point = self.vertex_position(ea);
+        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
+
+        let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
+        let positions = cell.chain_positions(segments);
+
+        let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
+        for position in positions.iter().take(positions.len() - 1).skip(1) {
+            let vertex = self.create_vertex(*position);
+            result.verts.push(vertex);
+            interior.push(vertex);
+        }
+        interior
+    }
+
+    /// Build one beveled edge's `segments`-wide strip (BEVEL.md §8.3.0): `segments`
+    /// quads joining the edge's two endpoint chains rung-to-rung, `p`'s sample `k`
+    /// against `q`'s sample `segments − k`. Each quad shares its rung edges with
+    /// the cut / third faces and its long edges with the re-stitched radial faces.
+    fn build_multisegment_strip(
+        &mut self,
+        edge: EdgeKey,
+        segments: u32,
+        chains: &[EdgeEndChain],
+        material: i32,
+        representative: i32,
+        result: &mut BevelResult,
+    ) {
+        let [a, b] = self.edge_vert_keys(edge);
+        let chain_a = chains.iter().find(|c| c.edge == edge && c.endpoint == a);
+        let chain_b = chains.iter().find(|c| c.edge == edge && c.endpoint == b);
+        let (chain_a, chain_b) = match (chain_a, chain_b) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+
+        // The §8.3.0 rung join pairs `p` sample k with the `q` sample on the *same
+        // physical face side* of E. Orient `q` so its `start` sits on the same side
+        // as `p`'s — the rails then run *along* E (short) instead of crossing it.
+        // Picked by the shorter total rail length, which is unambiguous since the
+        // two endpoints' chains face each other across E.
+        let p_samples = chain_a.samples();
+        let mut q_samples = chain_b.samples();
+        let aligned = (self.vertex_position(p_samples[0])
+            - self.vertex_position(q_samples[0]))
+        .length()
+            + (self.vertex_position(p_samples[p_samples.len() - 1])
+                - self.vertex_position(q_samples[q_samples.len() - 1]))
+            .length();
+        let swapped = (self.vertex_position(p_samples[0])
+            - self.vertex_position(q_samples[q_samples.len() - 1]))
+        .length()
+            + (self.vertex_position(p_samples[p_samples.len() - 1])
+                - self.vertex_position(q_samples[0]))
+            .length();
+        if swapped < aligned {
+            q_samples.reverse();
+        }
+        if p_samples.len() != segments as usize + 1 || q_samples.len() != segments as usize + 1 {
+            return;
+        }
+
+        for k in 1..=segments as usize {
+            let ring = [
+                p_samples[k - 1],
+                p_samples[k],
+                q_samples[k],
+                q_samples[k - 1],
+            ];
+            let mut distinct: Vec<VertexKey> = Vec::with_capacity(4);
+            for &v in &ring {
+                if !distinct.contains(&v) {
+                    distinct.push(v);
+                }
+            }
+            if distinct.len() < 3 {
+                continue;
+            }
+            // Wind opposite the re-stitched face traversal on the long edge so each
+            // long edge stays radial-2 (§5.1).
+            let mut quad = distinct;
+            if let Some(long_edge) = self.query_edge_exists(ring[0], ring[1]) {
+                let runs_forward = self
+                    .edge_loop_keys(long_edge)
+                    .first()
+                    .map(|&l| {
+                        let start = self.loop_vertex(l);
+                        let next = self.loop_vertex(self.loop_next(l));
+                        start == ring[0] && next == ring[1]
+                    })
+                    .unwrap_or(false);
+                if runs_forward {
+                    quad.reverse();
+                }
+            }
+            let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
+            self.assign_bevel_face_material(face, material, representative);
+            result.faces.push(face);
+            self.collect_face_edges(face, result);
+        }
+    }
+
+    /// Build the cutoff fill at one junction (BEVEL.md §8.3.2 / §8.3.4): one cut
+    /// face per sector spanning its chain plus two bottom corner verts, the corner
+    /// ring closed by a bottom face — or collapsed to a single apex when the corner
+    /// verts coincide (the `s = 3` case, §8.3.4).
+    fn build_cutoff_fill(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        material: i32,
+        result: &mut BevelResult,
+    ) {
+        let count = cut.boundverts.len();
+        if count < 2 {
+            return;
+        }
+        let representative = cut.representative_material(self);
+
+        // Per boundvert, its down-pushed corner-vert position (§8.3.3).
+        let mut corner_positions: Vec<Vec3> = Vec::with_capacity(count);
+        for k in 0..count {
+            corner_positions.push(self.corner_vert_position(cut, chains, k));
+        }
+
+        // §8.3.4 apex collapse: at a 3-way junction whose corner verts coincide,
+        // weld them into one apex and omit the bottom face.
+        let collapsed = count == 3 && corner_verts_coincide(&corner_positions);
+
+        let corner_verts: Vec<VertexKey> = if collapsed {
+            let apex_position =
+                (corner_positions[0] + corner_positions[1] + corner_positions[2]) / 3.0;
+            let apex = self.create_vertex(apex_position);
+            result.verts.push(apex);
+            vec![apex; count]
+        } else {
+            corner_positions
+                .iter()
+                .map(|&position| {
+                    let corner = self.create_vertex(position);
+                    result.verts.push(corner);
+                    corner
+                })
+                .collect()
+        };
+
+        // One cut face per sector: C_k → chain(B_k → B_{k+1}) → C_{k+1} → C_k.
+        for k in 0..count {
+            let next = (k + 1) % count;
+            let start_boundvert = cut.boundverts[k];
+            let end_boundvert = cut.boundverts[next];
+            let chain = chains.iter().find(|c| {
+                c.endpoint == cut.vertex
+                    && ((c.start == start_boundvert && c.end == end_boundvert)
+                        || (c.start == end_boundvert && c.end == start_boundvert))
+            });
+            let chain = match chain {
+                Some(chain) => chain.oriented_from(start_boundvert),
+                None => continue,
+            };
+
+            let mut loop_verts: Vec<VertexKey> = Vec::with_capacity(segments as usize + 3);
+            loop_verts.push(corner_verts[k]);
+            loop_verts.extend_from_slice(&chain);
+            loop_verts.push(corner_verts[next]);
+
+            // Drop consecutive duplicates (a collapsed apex makes C_k == C_{k+1}).
+            let mut deduped: Vec<VertexKey> = Vec::with_capacity(loop_verts.len());
+            for &v in &loop_verts {
+                if deduped.last() != Some(&v) {
+                    deduped.push(v);
+                }
+            }
+            if deduped.len() >= 2 && deduped.first() == deduped.last() {
+                deduped.pop();
+            }
+            if deduped.len() < 3 {
+                continue;
+            }
+
+            // Wind opposite the strip's traversal of the first chain edge so the cut
+            // face stays radial-2 against the strip (§8.3.2).
+            let mut face_verts = deduped;
+            if let Some(chain_edge) = self.query_edge_exists(chain[0], chain[1]) {
+                let runs_forward = self
+                    .edge_loop_keys(chain_edge)
+                    .first()
+                    .map(|&l| {
+                        let start = self.loop_vertex(l);
+                        let next = self.loop_vertex(self.loop_next(l));
+                        start == chain[0] && next == chain[1]
+                    })
+                    .unwrap_or(false);
+                if runs_forward {
+                    face_verts.reverse();
+                }
+            }
+            let face = self.face_create_verts(&face_verts, FaceCreateFlags::NONE);
+            self.assign_bevel_face_material(face, material, representative);
+            result.faces.push(face);
+            self.collect_face_edges(face, result);
+        }
+
+        // The bottom face over the corner ring (omitted on the apex collapse).
+        if !collapsed && count >= 3 {
+            let mut ring = corner_verts.clone();
+            if let Some(bottom_edge) = self.query_edge_exists(ring[0], ring[1]) {
+                let cut_runs_forward = self
+                    .edge_loop_keys(bottom_edge)
+                    .first()
+                    .map(|&l| {
+                        let start = self.loop_vertex(l);
+                        let next = self.loop_vertex(self.loop_next(l));
+                        start == ring[0] && next == ring[1]
+                    })
+                    .unwrap_or(false);
+                if cut_runs_forward {
+                    ring.reverse();
+                }
+            }
+            let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+            self.assign_bevel_face_material(face, material, representative);
+            result.faces.push(face);
+            self.collect_face_edges(face, result);
+        }
+    }
+
+    /// One boundvert's down-pushed corner-vert position (BEVEL.md §8.3.3): `B_k`
+    /// plus the cross of the two adjacent sectors' mid-plane normals (the fold
+    /// crease), scaled by the average of the two profiles' `height/√2`, oriented
+    /// into the corner.
+    fn corner_vert_position(&self, cut: &JunctionCut, chains: &[EdgeEndChain], k: usize) -> Vec3 {
+        let count = cut.boundverts.len();
+        let boundvert = cut.boundverts[k];
+        let before = (k + count - 1) % count; // sector ending at B_k
+        let after = k; // sector starting at B_k
+
+        let cell_before = self.sector_cell(cut, chains, before);
+        let cell_after = self.sector_cell(cut, chains, after);
+
+        let boundvert_position = self.vertex_position(boundvert);
+        let (normal_before, height_before) = cell_before
+            .map(|c| (c.mid_plane_normal, c.height()))
+            .unwrap_or((Vec3::ZERO, 0.0));
+        let (normal_after, height_after) = cell_after
+            .map(|c| (c.mid_plane_normal, c.height()))
+            .unwrap_or((Vec3::ZERO, 0.0));
+
+        let mut down = normal_before.cross(normal_after);
+        if down.length_squared() <= 1.0e-12 {
+            return boundvert_position;
+        }
+        down = down.normalize();
+        if down.dot(cut.outward) > 0.0 {
+            down = -down;
+        }
+
+        let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+        let push = (height_before * inv_sqrt2 + height_after * inv_sqrt2) / 2.0;
+        boundvert_position + down * push
+    }
+
+    /// The profile cell of sector `k` at the junction (BEVEL.md §8.2.2.1), rebuilt
+    /// from that sector's chain (B_k → B_{k+1}) and its crossing beveled edge.
+    fn sector_cell(
+        &self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        k: usize,
+    ) -> Option<ProfileCell> {
+        let count = cut.boundverts.len();
+        let next = (k + 1) % count;
+        let start_boundvert = cut.boundverts[k];
+        let end_boundvert = cut.boundverts[next];
+        let chain = chains.iter().find(|c| {
+            c.endpoint == cut.vertex
+                && ((c.start == start_boundvert && c.end == end_boundvert)
+                    || (c.start == end_boundvert && c.end == start_boundvert))
+        })?;
+        let [ea, eb] = self.edge_vert_keys(chain.edge);
+        let edge_point = self.vertex_position(ea);
+        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
+        Some(ProfileCell::new(
+            self.vertex_position(start_boundvert),
+            self.vertex_position(end_boundvert),
+            edge_point,
+            edge_dir,
+        ))
+    }
+
+    /// A junction vertex's outward surface normal: the summed plane normals of its
+    /// incident faces (BEVEL.md §8.3.3 down-push sign reference). Used only to
+    /// decide which way the fold crease points (into the solid).
+    fn junction_outward_normal(&self, vertex: VertexKey) -> Vec3 {
+        let mut sum = Vec3::ZERO;
+        for face in self.vert_face_keys(vertex) {
+            sum += self.face_plane_normal(face);
+        }
+        sum.normalize_or_zero()
+    }
+
+    /// Push every edge of `face` into the result's edge set (de-duplicated).
+    fn collect_face_edges(&self, face: FaceKey, result: &mut BevelResult) {
+        for loop_key in self.face_loop_keys(face) {
+            let edge = self.loop_edge(loop_key);
+            if !result.edges.contains(&edge) {
+                result.edges.push(edge);
+            }
         }
     }
 
@@ -1981,6 +2695,62 @@ struct JunctionPatch {
     opening_edges: Vec<EdgeKey>,
 }
 
+/// One beveled edge's profile chain at one endpoint (BEVEL.md §8.2.2 / §8.3.0):
+/// the two ring boundverts (`start` / `end`) it spans plus the `segments − 1`
+/// interior arc samples between them. `start` is the boundvert on the edge's first
+/// radial face, so both ends of the edge order their chains consistently for the
+/// strip's rung-to-rung join.
+struct EdgeEndChain {
+    edge: EdgeKey,
+    endpoint: VertexKey,
+    start: VertexKey,
+    interior: Vec<VertexKey>,
+    end: VertexKey,
+}
+
+impl EdgeEndChain {
+    /// The chain's `segments + 1` verts in order `start → interior → end`.
+    fn samples(&self) -> Vec<VertexKey> {
+        let mut samples = Vec::with_capacity(self.interior.len() + 2);
+        samples.push(self.start);
+        samples.extend_from_slice(&self.interior);
+        samples.push(self.end);
+        samples
+    }
+
+    /// The chain's verts ordered to begin at `first` (either endpoint).
+    fn oriented_from(&self, first: VertexKey) -> Vec<VertexKey> {
+        let mut samples = self.samples();
+        if self.start != first {
+            samples.reverse();
+        }
+        samples
+    }
+}
+
+/// One multi-edge junction's cutoff-fill data (BEVEL.md §8.3): its ordered
+/// boundvert ring, the per-sector opening beveled edge, and the outward surface
+/// normal that orients the down-push (§8.3.3).
+struct JunctionCut {
+    vertex: VertexKey,
+    boundverts: Vec<VertexKey>,
+    #[allow(dead_code)]
+    opening_edges: Vec<EdgeKey>,
+    outward: Vec3,
+}
+
+impl JunctionCut {
+    /// The `material < 0` inherit source for this junction's new fill faces
+    /// (BEVEL.md §6.6.1): a face incident to the junction vertex. The vertex is
+    /// consumed during surgery, so this is only valid before phase 5.
+    fn representative_material(&self, mesh: &LoopMesh) -> i32 {
+        mesh.vert_face_keys(self.vertex)
+            .first()
+            .map(|&face| mesh.face_material_index(face))
+            .unwrap_or(0)
+    }
+}
+
 /// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
 /// §7.6.1): the ordered near-corner vert(s) the re-stitch substitutes for the
 /// single corner vertex `vertex` on `face`. One vert for a 1-for-1 swap (a strip's
@@ -2055,6 +2825,18 @@ fn near_corner(
         .find(|c| c.edge == edge && c.vertex == vertex && c.face == face)
         .map(|c| c.near_vert)
         .expect("every beveled corner has a recorded near-corner vert")
+}
+
+/// True when all the corner-vert positions coincide within tolerance (the §8.3.4
+/// 3-way apex collapse test).
+fn corner_verts_coincide(positions: &[Vec3]) -> bool {
+    if positions.len() < 2 {
+        return true;
+    }
+    let first = positions[0];
+    positions
+        .iter()
+        .all(|&position| (position - first).length() <= 1.0e-4)
 }
 
 /// True if `ring` contains the same vertex twice (a collapsed strip side, §7.6.3).
@@ -2917,6 +3699,267 @@ mod tests {
                 "each patch edge is manifold (shared with one strip)",
             );
         }
+        mesh.validate_topology();
+    }
+
+    /// Build the cube-corner `s = 3` cutoff junction at `segments = 2` and return
+    /// the mesh + result for the cutoff tests below (BEVEL.md §8.2 / §8.3). Vertex
+    /// 0 = (1,-1,-1) is the junction; its three edges to 1/3/4 are beveled.
+    fn cube_corner_cutoff_segments2() -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.3.2 / §8.3.4 / §8.3.0.1: the `s = 3`, `segments = 2` cube-corner
+    /// cutoff junction folds the corner flat — three cut faces collapsing to one
+    /// apex (§8.3.4), no bottom face — while the three valence-3 terminals build no
+    /// fill face, their strips running through (§8.3.0.1). The result stays a closed
+    /// manifold.
+    #[test]
+    fn cutoff_junction_segments2_topology() {
+        let (mesh, result) = cube_corner_cutoff_segments2();
+
+        mesh.validate_topology();
+
+        // The §8.3.4 apex collapse: all three sectors' corner verts coincide, so
+        // there is one apex vert (BEVEL.md §8.3.4) — the common corner of the three
+        // cut faces. Each cut face is a quad: apex + the 3-point chain (`segments + 2
+        // = 4` corners, §8.3.5).
+        let apex_position = Vec3::new(0.75, -0.75, -0.75);
+        let apex: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
+            .collect();
+        assert_eq!(apex.len(), 1, "the three corner verts collapse to one apex");
+        let apex = apex[0];
+
+        let cut_faces: Vec<FaceKey> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&f| mesh.face_vert_keys(f).contains(&apex))
+            .collect();
+        assert_eq!(cut_faces.len(), 3, "three cut faces meet at the apex");
+        for &face in &cut_faces {
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "collapsed cut face is a quad (apex + 3-point chain)",
+            );
+        }
+
+        // The cube corner cutoff is a closed manifold: every edge radial-2.
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let edge = mesh.loop_edge(loop_key);
+                assert_eq!(
+                    mesh.edge_radial_iter(edge).count(),
+                    2,
+                    "every edge is shared with exactly one other face",
+                );
+            }
+        }
+
+        // No bottom face beyond the three cut faces: the collapse omits it (§8.3.4).
+        // The new geometry is 6 strip quads + 3 cut quads = 9 faces.
+        assert_eq!(result.faces.len(), 9, "6 strip quads + 3 cut quads, no bottom");
+    }
+
+    /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
+    /// the circular-arc 45° point in the profile cell — bulged toward the beveled
+    /// edge, **not** the straight chord midpoint. For the Front↔Bottom chain across
+    /// edge {0,1} it lands at (0.75, -0.927, -0.927), a radius 0.25·√2/2 from the
+    /// arc center, distinct from the chord midpoint (0.75, -0.875, -0.875).
+    #[test]
+    fn cutoff_segments2_interior_vert_is_arc_sample() {
+        let (mesh, result) = cube_corner_cutoff_segments2();
+
+        let arc_point = Vec3::new(0.75, -0.926_776_7, -0.926_776_7);
+        let chord_midpoint = Vec3::new(0.75, -0.875, -0.875);
+
+        let near_arc = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - arc_point).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            near_arc, 1,
+            "the Front-Bottom interior chain vert sits at the arc 45° point",
+        );
+
+        let near_chord = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - chord_midpoint).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            near_chord, 0,
+            "no interior chain vert sits at the straight chord midpoint (§8.3.6)",
+        );
+
+        // Every interior arc sample lies on a circle of radius offset (0.25) about
+        // its cell's arc center: the chain bulges, it is not straight-subdivided.
+        let arc_center = Vec3::new(0.75, -0.75, -0.75);
+        let radius = (arc_point - arc_center).length();
+        assert!(
+            (radius - 0.25).abs() < 1.0e-4,
+            "arc sample sits radius=offset from the (0,0) cell corner",
+        );
+    }
+
+    /// BEVEL.md §8.2.1: the boundvert ring is segment-count-independent — the
+    /// `segments = 2` cutoff places the same three boundverts (offset·√2 from the
+    /// corner) as the single-segment junction.
+    #[test]
+    fn cutoff_segments2_ring_matches_single_segment() {
+        let (mesh, result) = cube_corner_cutoff_segments2();
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let expected = 0.25 * 2.0_f32.sqrt();
+
+        // The three boundverts (planar 2-line meets) sit offset·√2 from the corner.
+        let ring_verts = result
+            .verts
+            .iter()
+            .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - expected).abs() < 1.0e-4)
+            .count();
+        assert_eq!(ring_verts, 3, "three §7.6.2 boundverts, unchanged by segments");
+
+        // The junction corner and all three far endpoints are consumed.
+        for removed in [
+            corner,
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ] {
+            assert!(
+                !mesh
+                    .vert_keys()
+                    .into_iter()
+                    .any(|v| mesh.vertex_position(v) == removed),
+                "original endpoint {removed:?} removed",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.1: a valence-3 terminal builds no fill face — only the
+    /// through-strip quads. The whole result is a closed manifold (every edge
+    /// radial-2), confirming the terminals close by the absorb path, not a cutoff.
+    #[test]
+    fn cutoff_segments2_terminals_have_no_fill_and_strips_run_through() {
+        let (mesh, _result) = cube_corner_cutoff_segments2();
+
+        // The three beveled edges each shed `segments = 2` strip quads = 6 strip
+        // quads; the junction adds 3 cut faces. Every face edge is manifold.
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let edge = mesh.loop_edge(loop_key);
+                assert_eq!(
+                    mesh.edge_radial_iter(edge).count(),
+                    2,
+                    "closed manifold: every edge shared by exactly two faces",
+                );
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.3: the cutoff path is gated — `segments ≥ 2` with the default
+    /// `Adj` vmesh method (the still-stubbed grid) is a no-op, as is multi-segment
+    /// vertex bevel.
+    #[test]
+    fn multisegment_adj_and_vertex_are_noops() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let before = counts(&mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+
+        // segments ≥ 2 + Adj fill: still a stub, no-op.
+        mesh.bevel(
+            &[e01.into(), e03.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "segments≥2 + Adj is a no-op");
+
+        // segments ≥ 2 vertex bevel: still a stub, no-op.
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Vertices,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "segments≥2 vertex bevel is a no-op");
+    }
+
+    /// BEVEL.md §8.3: the cutoff fill needs at least one multi-beveled-edge
+    /// junction. A `segments ≥ 2`, `Cutoff` call over a junction-free edge set
+    /// (here two disjoint, non-shared cube edges) is a clean no-op — it must not
+    /// emit partial through-strip geometry.
+    #[test]
+    fn cutoff_no_junction_is_noop() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let before = counts(&mesh);
+
+        // Two disjoint edges with no shared endpoint: every endpoint is terminal,
+        // so there is no junction for the cutoff to fold.
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e_far = cube_edge(&mesh, Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e_far.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(counts(&mesh), before, "junction-free cutoff is a no-op");
+        assert!(result.verts.is_empty(), "no new verts");
+        assert!(result.edges.is_empty(), "no new edges");
+        assert!(result.faces.is_empty(), "no new faces");
         mesh.validate_topology();
     }
 
@@ -4634,4 +5677,130 @@ fn order_ring_cycle(
     } else {
         None
     }
+}
+
+/// The 3-D frame of one sector's profile cell (BEVEL.md §8.2.2.1): the three
+/// control points `start` / `end` / `mid` plus the derived in-plane axes and the
+/// mid-plane normal. `start` / `end` are the two ring boundverts the chain spans;
+/// `mid` is the bulge control point on the crossed beveled edge's line. A
+/// degenerate (collinear) corner is flagged so the chain collapses to a straight
+/// chord (the flat-profile branch, §8.2.2.1).
+#[derive(Clone, Copy)]
+struct ProfileCell {
+    start: Vec3,
+    end: Vec3,
+    mid: Vec3,
+    mid_plane_normal: Vec3,
+    /// Unit direction of the crossed beveled edge, used to project each cell
+    /// sample onto the mid-plane (BEVEL.md §8.2.2.1). Zero requests no projection.
+    edge_dir: Vec3,
+    collinear: bool,
+}
+
+impl ProfileCell {
+    /// Build the cell from the two ring boundverts and the crossed beveled edge
+    /// (BEVEL.md §8.2.2.1). `mid` is the foot on the edge's line of the
+    /// closest-approach pair between that line and the `start`–`end` line.
+    fn new(start: Vec3, end: Vec3, edge_point: Vec3, edge_dir: Vec3) -> Self {
+        let mid = line_line_nearest_on_first(edge_point, edge_dir, start, end - start)
+            .unwrap_or((start + end) * 0.5);
+
+        let a_axis = mid - start;
+        let b_axis = mid - end;
+        let cross = a_axis.cross(b_axis);
+        let collinear = cross.length() <= 1.0e-6;
+        let mid_plane_normal = if collinear {
+            Vec3::ZERO
+        } else {
+            cross.normalize()
+        };
+
+        ProfileCell {
+            start,
+            end,
+            mid,
+            mid_plane_normal,
+            edge_dir,
+            collinear,
+        }
+    }
+
+    /// Map a cell coordinate `(u, v)` into 3-D (BEVEL.md §8.2.2.1):
+    /// `origin + u·a_axis + v·b_axis` with `origin = start + end − mid`, then
+    /// project along the edge direction onto the mid-plane.
+    fn sample(&self, u: f32, v: f32) -> Vec3 {
+        let origin = self.start + self.end - self.mid;
+        let raw = origin + u * (self.mid - self.start) + v * (self.mid - self.end);
+        if self.edge_dir.length_squared() <= f32::EPSILON || self.collinear {
+            return raw;
+        }
+        intersect_line_plane(raw, self.edge_dir, self.start, self.mid_plane_normal).unwrap_or(raw)
+    }
+
+    /// The chain's `segments + 1` sample positions (BEVEL.md §8.3.6). Endpoint
+    /// samples are the ring boundverts; interior samples are the circular-arc
+    /// angle-spaced cell coordinates `(sin θ_k, cos θ_k)` mapped through the cell
+    /// (the default-profile shortcut, §8.3.6). A collinear (flat) corner falls
+    /// back to the even straight subdivision of the chord (§8.2.2.1).
+    fn chain_positions(&self, segments: u32) -> Vec<Vec3> {
+        let mut positions = Vec::with_capacity(segments as usize + 1);
+        positions.push(self.start);
+        for k in 1..segments {
+            if self.collinear {
+                let t = k as f32 / segments as f32;
+                positions.push(self.start + (self.end - self.start) * t);
+            } else {
+                let theta = k as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
+                positions.push(self.sample(theta.sin(), theta.cos()));
+            }
+        }
+        positions.push(self.end);
+        positions
+    }
+
+    /// The profile's "height" (BEVEL.md §8.3.3): the span between the cell's
+    /// `(0,0)` corner (the arc center `start + end − mid`) and its `(1,1)` corner
+    /// (the bulge `mid`), i.e. `|2·mid − start − end|`.
+    fn height(&self) -> f32 {
+        (2.0 * self.mid - self.start - self.end).length()
+    }
+}
+
+/// The point on the first line (`p0 + t·d0`) nearest the second line
+/// (`p1 + s·d1`) — the first-line foot of the mutual closest-approach pair
+/// (BEVEL.md §8.2.2.1 `mid` solve). `None` when the lines are parallel.
+fn line_line_nearest_on_first(p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3) -> Option<Vec3> {
+    let d0n = d0.normalize_or_zero();
+    if d0n.length_squared() <= f32::EPSILON || d1.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    let r = p0 - p1;
+    let a = d0n.dot(d0n);
+    let b = d0n.dot(d1);
+    let c = d1.dot(d1);
+    let d = d0n.dot(r);
+    let e = d1.dot(r);
+    let denominator = a * c - b * b;
+    if denominator.abs() <= 1.0e-9 {
+        return None;
+    }
+    let t = (b * e - c * d) / denominator;
+    Some(p0 + d0n * t)
+}
+
+/// Intersect the line `point + t·direction` with the plane through `plane_point`
+/// with normal `plane_normal` (BEVEL.md §8.2.2.1 projection). `None` when the
+/// line is parallel to the plane.
+fn intersect_line_plane(
+    point: Vec3,
+    direction: Vec3,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Option<Vec3> {
+    let denominator = direction.dot(plane_normal);
+    if denominator.abs() <= 1.0e-9 {
+        return None;
+    }
+    let t = (plane_point - point).dot(plane_normal) / denominator;
+    Some(point + direction * t)
 }

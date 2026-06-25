@@ -68,7 +68,7 @@ mod unsubdivide;
 mod weld_verts;
 mod wireframe;
 
-pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult};
+pub use bevel::{BevelAffect, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod};
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
 pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};
