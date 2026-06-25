@@ -138,6 +138,17 @@ pub struct BevelOptions<'a> {
     /// corner's offset uniformly across all its incident edges before the §4
     /// slide. Defaults to an empty slice.
     pub vert_weights: &'a [(VertexKey, f32)],
+    /// Slide a junction boundvert **onto a single unbeveled edge** rather than
+    /// leaving it at the two-strip meet-point (BEVEL.md §8.8). A pure placement
+    /// perturbation: it changes no topology and no surgery, only where one
+    /// boundvert lands in a junction sector. It fires for a sector with exactly
+    /// one silhouette leg (or, absent silhouette legs, exactly one in-plane leg)
+    /// when the slide does not fold either flanking side (§8.8.2), placing the
+    /// boundvert on that leg's line by the meet-then-average rule of §8.8.3.
+    /// Realised at `segments = 1` on the landed junction meet-point (§7.6.2); a
+    /// no-op at a symmetric junction, diverging only at an irregular one
+    /// (§8.8.5). Defaults to `false`.
+    pub loop_slide: bool,
 }
 
 impl Default for BevelOptions<'_> {
@@ -154,6 +165,7 @@ impl Default for BevelOptions<'_> {
             vmesh_method: BevelVmeshMethod::Adj,
             use_weights: false,
             vert_weights: &[],
+            loop_slide: false,
         }
     }
 }
@@ -651,6 +663,7 @@ impl LoopMesh {
                     endpoint,
                     &is_beveled,
                     offset,
+                    options.loop_slide,
                     &mut corner_vert,
                     &mut substitutions,
                     &mut junction_patches,
@@ -1545,6 +1558,7 @@ impl LoopMesh {
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         offset: f32,
+        loop_slide: bool,
         corner_vert: &mut Vec<CornerVert>,
         substitutions: &mut Vec<FaceSubstitution>,
         junction_patches: &mut Vec<JunctionPatch>,
@@ -1565,7 +1579,18 @@ impl LoopMesh {
         let mut opening_edges: Vec<EdgeKey> = Vec::with_capacity(sectors.len());
 
         for sector in &sectors {
-            let boundvert_position = self.solve_meet_point(vertex, vertex_position, sector, offset);
+            // §8.8: when `loop_slide` is set and this sector fires (exactly one
+            // silhouette/in-plane leg, slide not folding either flank), place the
+            // boundvert on that leg's line instead of at the §7.6.2 meet-point.
+            // §8.8.4: flank-sine ratio not threaded — the width pass is a no-op at
+            // uniform offset, so this realises the slide at `segments = 1` without it.
+            let slid = if loop_slide {
+                self.slide_boundvert(vertex, vertex_position, sector, is_beveled, offset)
+            } else {
+                None
+            };
+            let boundvert_position =
+                slid.unwrap_or_else(|| self.solve_meet_point(vertex, vertex_position, sector, offset));
             let boundvert = self.create_vertex(boundvert_position);
             result.verts.push(boundvert);
             boundverts.push(boundvert);
@@ -1847,6 +1872,164 @@ impl LoopMesh {
         }
 
         solve_normal_equations(&rows, vertex_position).unwrap_or(vertex_position)
+    }
+
+    /// Try to place a sector's boundvert by the `loop_slide` rule (BEVEL.md §8.8):
+    /// slide it onto a single unbeveled leg's line instead of the §7.6.2
+    /// meet-point. Returns `Some(position)` when the sector fires (§8.8.2) and the
+    /// slide is accepted, `None` to fall back to the plain meet-point.
+    fn slide_boundvert(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        sector: &Sector,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> Option<Vec3> {
+        if sector.bounding_edges.len() != 2 {
+            return None;
+        }
+
+        // The sector's corners are the ordered (edge, face) stream the disk walk
+        // produced, opening on `g_k` and closing on `g_(k+1)` (§7.6.1). Each
+        // consecutive pair shares the next entry's edge as the leg between their two
+        // faces, so the unbeveled outgoing edges between the two bounding beveled
+        // edges *are* the legs, already in disk order — the same representation
+        // `solve_meet_point` reads. Take them straight from that stream rather than
+        // a face-dedup → shared-edge round trip (which mis-orders if a face recurs
+        // non-contiguously).
+        let mut legs: Vec<(EdgeKey, FaceKey, FaceKey)> = Vec::new();
+        for pair in sector.corners.windows(2) {
+            let (leg, face_after) = pair[1];
+            let face_before = pair[0].1;
+            // `leg` is the closing beveled edge for the final pair and any beveled
+            // edge mid-sector; only unbeveled legs slide. A non-shared/degenerate
+            // pair is skipped, not aborted: the firing decision must still see the
+            // legs that genuinely exist (§8.8.2).
+            if is_beveled(leg) {
+                continue;
+            }
+            legs.push((leg, face_before, face_after));
+        }
+        if legs.is_empty() {
+            return None;
+        }
+
+        // Classify each leg in-plane vs silhouette by the dot of its two flanking
+        // face normals (§8.8.2): coplanar (≈ ±1) is in-plane, else silhouette.
+        let silhouette: Vec<&(EdgeKey, FaceKey, FaceKey)> = legs
+            .iter()
+            .filter(|&&(_, fa, fb)| {
+                let dot = self.face_plane_normal(fa).dot(self.face_plane_normal(fb));
+                dot.abs() < 1.0 - LOOP_SLIDE_TOLERANCE
+            })
+            .collect();
+
+        // Firing condition (§8.8.2) part 1: exactly one silhouette leg, or — absent
+        // any silhouette leg — exactly one in-plane leg. Anything else falls back.
+        let slide_leg = if !silhouette.is_empty() {
+            if silhouette.len() != 1 {
+                return None;
+            }
+            silhouette[0].0
+        } else {
+            if legs.len() != 1 {
+                return None;
+            }
+            legs[0].0
+        };
+
+        let leg_direction = self.edge_direction_from(slide_leg, vertex, vertex_position)?;
+        let edge_before = sector.bounding_edges[0];
+        let edge_after = sector.bounding_edges[1];
+        let dir_before = self.edge_direction_from(edge_before, vertex, vertex_position)?;
+        let dir_after = self.edge_direction_from(edge_after, vertex, vertex_position)?;
+
+        // Firing condition (§8.8.2) part 2 — the "good offset" guard. Viewed from the
+        // junction's normal side, both sub-meets must sweep *forward*: `g_k → e_mid`
+        // and `e_mid → g_(k+1)` must each open a non-reflex, non-degenerate angle. A
+        // reflex sub-meet would crease the surface backward, so the slide is rejected
+        // and the sector keeps its §7.6.2 meet-point (return `None`).
+        //
+        // The *direction* the sweep turns decides forward vs reflex; the *magnitude*
+        // of the opening angle decides how far along the leg the meet sits. These are
+        // two separate quantities and must be read separately: `.length()` of a cross
+        // product is a true |sin α| but discards the turn direction, while projecting
+        // the cross product onto the sector normal recovers the sign but shrinks the
+        // magnitude whenever that normal is tilted (a creased corner). So use the
+        // signed projection only to *gate* (forward iff positive) and the unsigned
+        // length for the *placement* distance `offset / sin α`.
+        let sector_normal = match self.sector_normal(vertex, vertex_position, sector) {
+            // Orient so the full opening `g_k → g_(k+1)` is a positive sweep; each
+            // sub-sweep is then forward iff its signed projection is positive. This is
+            // robust to the absolute sign the summed face normals happen to carry.
+            Some(normal) => {
+                if dir_before.cross(dir_after).dot(normal) < 0.0 {
+                    -normal
+                } else {
+                    normal
+                }
+            }
+            None => return None,
+        };
+        let turn_before = dir_before.cross(leg_direction).dot(sector_normal);
+        let turn_after = leg_direction.cross(dir_after).dot(sector_normal);
+        if turn_before <= LOOP_SLIDE_TOLERANCE || turn_after <= LOOP_SLIDE_TOLERANCE {
+            return None;
+        }
+
+        // The two sub-meets sit `offset / sin(α)` along the leg from `v`, where α is
+        // the (true) opening angle of the flanking beveled edge against the leg
+        // (§8.8.3). The gate above guarantees both are forward and non-degenerate.
+        let sin_alpha_before = dir_before.cross(leg_direction).length();
+        let sin_alpha_after = dir_after.cross(leg_direction).length();
+        let m1 = vertex_position + leg_direction * (offset / sin_alpha_before);
+        let m2 = vertex_position + leg_direction * (offset / sin_alpha_after);
+
+        // §8.8.3 averaging: both sub-meets lie on the leg's line, so their midpoint
+        // does too.
+        Some((m1 + m2) * 0.5)
+    }
+
+    /// The summed plane normal of a junction sector's bounding-beveled faces
+    /// (BEVEL.md §8.8.2 "viewed from the junction's normal side"), normalized, or
+    /// `None` when the faces cancel to no consistent normal. Mirrors the
+    /// `sector_normal` accumulation `solve_meet_point` builds for the embedding row.
+    fn sector_normal(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        sector: &Sector,
+    ) -> Option<Vec3> {
+        let mut sector_normal = Vec3::ZERO;
+        for &(edge, face) in &sector.corners {
+            if !sector.bounding_edges.contains(&edge) {
+                continue;
+            }
+            if self
+                .edge_direction_from(edge, vertex, vertex_position)
+                .is_none()
+            {
+                continue;
+            }
+            sector_normal += self.face_plane_normal(face);
+        }
+        (sector_normal.length() > f32::EPSILON).then(|| sector_normal.normalize())
+    }
+
+    /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
+    /// degenerate (zero-length) edge.
+    fn edge_direction_from(
+        &self,
+        edge: EdgeKey,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+    ) -> Option<Vec3> {
+        let [a, b] = self.edge_vert_keys(edge);
+        let far = if a == vertex { b } else { a };
+        let segment = self.vertex_position(far) - vertex_position;
+        let length = segment.length();
+        (length > f32::EPSILON).then(|| segment / length)
     }
 
     /// Re-stitch one face incident to a consumed endpoint (BEVEL.md §7.4 /
@@ -5962,6 +6145,304 @@ mod tests {
         );
         mesh.validate_topology();
     }
+
+    /// An irregular apex junction (BEVEL.md §8.8.5): apex `v0` fanned by four
+    /// quads to four spokes `v1..v4` at unequal directions and heights, so every
+    /// spoke is a silhouette edge (its two flanking quads are non-coplanar). The
+    /// four quads each span the apex plus two consecutive spokes plus one outer
+    /// rim vert. Beveling spokes {0,1} and {0,3} leaves spoke {0,2} as the lone
+    /// silhouette leg in the sector between them — the §8.8.2 firing sector.
+    /// Returns (mesh, apex, [v1,v2,v3,v4], beveled edges {0,1} and {0,3}).
+    fn irregular_apex_junction() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2]) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        // Spokes at unequal xy-directions and z-heights so the surface bends
+        // across each (silhouette) and the {0,1}/{0,3} sector is irregular.
+        let s1 = mesh.create_vertex(Vec3::new(1.0, 0.0, -0.3));
+        let s2 = mesh.create_vertex(Vec3::new(0.35, 0.95, -0.7));
+        let s3 = mesh.create_vertex(Vec3::new(-1.0, 0.15, -0.25));
+        let s4 = mesh.create_vertex(Vec3::new(-0.25, -1.0, -0.55));
+        let spokes = [s1, s2, s3, s4];
+        // Outer rim verts, one between each consecutive spoke pair, pushed out and
+        // down so the quads are non-planar petals.
+        let outers: Vec<VertexKey> = (0..4)
+            .map(|i| {
+                let a = mesh.vertex_position(spokes[i]);
+                let b = mesh.vertex_position(spokes[(i + 1) % 4]);
+                let mid = (a + b) * 0.5;
+                mesh.create_vertex(mid * 1.8 + Vec3::new(0.0, 0.0, -0.4))
+            })
+            .collect();
+
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        for i in 0..4 {
+            let sa = spokes[i];
+            let sb = spokes[(i + 1) % 4];
+            let outer = outers[i];
+            let e_apex_a = mesh
+                .query_edge_exists(apex, sa)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sa));
+            let e_a_outer = edge(&mut mesh, sa, outer);
+            let e_outer_b = edge(&mut mesh, outer, sb);
+            let e_b_apex = mesh
+                .query_edge_exists(apex, sb)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sb));
+            mesh.face_create(
+                &[apex, sa, outer, sb],
+                &[e_apex_a, e_a_outer, e_outer_b, e_b_apex],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let e01 = mesh.query_edge_exists(apex, s1).expect("spoke {0,1}");
+        let e03 = mesh.query_edge_exists(apex, s3).expect("spoke {0,3}");
+        (mesh, apex, spokes, [e01, e03])
+    }
+
+    /// The boundvert of the firing sector (the new vert nearest spoke {0,2}'s
+    /// line through the apex) — the one `loop_slide` slides onto leg {0,2}.
+    fn firing_boundvert(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        apex_pos: Vec3,
+        leg_dir: Vec3,
+    ) -> Vec3 {
+        result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .min_by(|&a, &b| {
+                let da = ((a - apex_pos) - leg_dir * (a - apex_pos).dot(leg_dir)).length();
+                let db = ((b - apex_pos) - leg_dir * (b - apex_pos).dot(leg_dir)).length();
+                da.partial_cmp(&db).unwrap()
+            })
+            .expect("the junction produced boundverts")
+    }
+
+    /// BEVEL.md §8.8: `loop_slide = true` slides the firing sector's boundvert
+    /// onto the silhouette leg's line, where `loop_slide = false` leaves it at the
+    /// §7.6.2 two-strip meet-point. At an irregular junction the two placements
+    /// differ (§8.8.5) while the topology is byte-identical — only one vertex
+    /// moves.
+    #[test]
+    fn edge_bevel_loop_slide_diverges_at_irregular_junction() {
+        let offset = 0.2;
+
+        let (mut mesh_off, apex_off, _spokes_off, [e01_off, e03_off]) = irregular_apex_junction();
+        let off = mesh_off.bevel(
+            &[e01_off.into(), e03_off.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                loop_slide: false,
+                ..Default::default()
+            },
+        );
+        let counts_off = counts(&mesh_off);
+        mesh_off.validate_topology();
+
+        let (mut mesh_on, apex_on, spokes_on, [e01_on, e03_on]) = irregular_apex_junction();
+        let apex_pos = mesh_on.vertex_position(apex_on);
+        let leg_dir = (mesh_on.vertex_position(spokes_on[1]) - apex_pos).normalize();
+        let on = mesh_on.bevel(
+            &[e01_on.into(), e03_on.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                loop_slide: true,
+                ..Default::default()
+            },
+        );
+        mesh_on.validate_topology();
+
+        // §8.8: pure placement perturbation — no topology change.
+        assert_eq!(
+            counts(&mesh_on),
+            counts_off,
+            "loop_slide changes no topology (same V/E/F)",
+        );
+
+        // §8.8.5: the firing boundvert moves — on ≠ off at an irregular junction.
+        let b_off = firing_boundvert(&mesh_off, &off, apex_pos, leg_dir);
+        let b_on = firing_boundvert(&mesh_on, &on, apex_pos, leg_dir);
+        assert!(
+            (b_on - b_off).length() > 1.0e-3,
+            "loop_slide on must move the firing boundvert (irregular junction), \
+             got on={b_on:?} off={b_off:?}",
+        );
+
+        // §8.8.3: the slid boundvert lies on the leg's line through the apex, so
+        // its component perpendicular to the leg direction vanishes.
+        let perpendicular =
+            ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
+        assert!(
+            perpendicular < 1.0e-4,
+            "slid boundvert sits on the silhouette leg's line, perp={perpendicular}",
+        );
+
+        // The off boundvert (the §7.6.2 meet) floats off that line.
+        let perpendicular_off =
+            ((b_off - apex_pos) - leg_dir * (b_off - apex_pos).dot(leg_dir)).length();
+        assert!(
+            perpendicular_off > 1.0e-4,
+            "meet-point boundvert floats off the leg's line, perp={perpendicular_off}",
+        );
+    }
+
+    /// BEVEL.md §8.8.5: at a *symmetric* junction the slide is a no-op — the slid
+    /// point coincides with the bisector meet-point, so `loop_slide` on and off
+    /// produce the identical boundvert. A symmetric cube corner with one
+    /// unbeveled silhouette leg between the two beveled edges is the canonical
+    /// no-op fixture.
+    #[test]
+    fn edge_bevel_loop_slide_is_noop_at_symmetric_junction() {
+        let build = |loop_slide: bool| {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            // v0 = [1,-1,-1]; bevel {0,1} and {0,4}, leaving {0,3} as the lone
+            // unbeveled leg of the sector between them. The cube corner is
+            // symmetric, so the slide must not move the boundvert.
+            let p0 = Vec3::new(1.0, -1.0, -1.0);
+            let e01 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+            let e04 = cube_edge(&mesh, p0, Vec3::new(1.0, -1.0, 1.0));
+            let result = mesh.bevel(
+                &[e01.into(), e04.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    loop_slide,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let mut positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
+            positions.sort_by(|a, b| {
+                (a.x, a.y, a.z)
+                    .partial_cmp(&(b.x, b.y, b.z))
+                    .unwrap()
+            });
+            positions
+        };
+
+        let off = build(false);
+        let on = build(true);
+        assert_eq!(off.len(), on.len(), "same boundvert count");
+        for (a, b) in off.iter().zip(on.iter()) {
+            assert!(
+                (*a - *b).length() < 1.0e-5,
+                "symmetric junction: loop_slide is a no-op, {a:?} vs {b:?}",
+            );
+        }
+    }
+
+    /// Like `irregular_apex_junction`, but the firing sector's silhouette leg
+    /// (spoke {0,2}) points *outside* the angular wedge spanned by its two bounding
+    /// beveled edges {0,1} and {0,3}: it swings into the lower-y half-plane so the
+    /// `g_k → e_mid` sub-meet sweeps *backward*. The sector still has exactly one
+    /// silhouette leg (so §8.8.2 condition 1 fires), but one flanking sub-meet is
+    /// reflex (so condition 2 must reject the slide).
+    /// Returns (mesh, apex, [v1,v2,v3,v4], beveled edges {0,1} and {0,3}).
+    fn reflex_apex_junction() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2]) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        // s1, s3 bound the firing sector. s2 — the leg — is placed so that, viewed
+        // from the sector's (summed-face) normal side, the `e_mid → g_(k+1)` sub-meet
+        // sweeps *backward*: it folds reflex while the `g_k → e_mid` side stays
+        // forward. The petals stay non-planar so s2 remains a silhouette leg.
+        let s1 = mesh.create_vertex(Vec3::new(1.0, 0.2, -0.1));
+        let s2 = mesh.create_vertex(Vec3::new(-0.2, 0.0, 0.2));
+        let s3 = mesh.create_vertex(Vec3::new(0.2, 1.0, -0.1));
+        let s4 = mesh.create_vertex(Vec3::new(-0.7, -0.7, -0.3));
+        let spokes = [s1, s2, s3, s4];
+        let outers: Vec<VertexKey> = (0..4)
+            .map(|i| {
+                let a = mesh.vertex_position(spokes[i]);
+                let b = mesh.vertex_position(spokes[(i + 1) % 4]);
+                let mid = (a + b) * 0.5;
+                mesh.create_vertex(mid * 1.8 + Vec3::new(0.0, 0.0, -0.4))
+            })
+            .collect();
+
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        for i in 0..4 {
+            let sa = spokes[i];
+            let sb = spokes[(i + 1) % 4];
+            let outer = outers[i];
+            let e_apex_a = mesh
+                .query_edge_exists(apex, sa)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sa));
+            let e_a_outer = edge(&mut mesh, sa, outer);
+            let e_outer_b = edge(&mut mesh, outer, sb);
+            let e_b_apex = mesh
+                .query_edge_exists(apex, sb)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sb));
+            mesh.face_create(
+                &[apex, sa, outer, sb],
+                &[e_apex_a, e_a_outer, e_outer_b, e_b_apex],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let e01 = mesh.query_edge_exists(apex, s1).expect("spoke {0,1}");
+        let e03 = mesh.query_edge_exists(apex, s3).expect("spoke {0,3}");
+        (mesh, apex, spokes, [e01, e03])
+    }
+
+    /// BEVEL.md §8.8.2 condition 2 (the "good offset" guard): firing requires
+    /// *both* that the sector has exactly one silhouette leg *and* that neither
+    /// flanking sub-meet folds back. When a sub-meet is reflex the slide is
+    /// rejected and the sector keeps its §7.6.2 meet-point — so on a reflex fixture
+    /// `loop_slide = true` yields the *same* firing boundvert as `loop_slide =
+    /// false`. (Condition 1 alone fires here; condition 2 is what vetoes the slide.)
+    #[test]
+    fn edge_bevel_loop_slide_rejected_when_flank_is_reflex() {
+        let offset = 0.2;
+
+        let build = |loop_slide: bool| {
+            let (mut mesh, apex, spokes, [e01, e03]) = reflex_apex_junction();
+            let apex_pos = mesh.vertex_position(apex);
+            let leg_dir = (mesh.vertex_position(spokes[1]) - apex_pos).normalize();
+            let result = mesh.bevel(
+                &[e01.into(), e03.into()],
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    loop_slide,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let boundvert = firing_boundvert(&mesh, &result, apex_pos, leg_dir);
+            (apex_pos, leg_dir, boundvert)
+        };
+
+        let (apex_pos, leg_dir, b_off) = build(false);
+        let (_, _, b_on) = build(true);
+
+        // Condition 2 vetoes the slide: the firing boundvert must NOT move.
+        assert!(
+            (b_on - b_off).length() < 1.0e-5,
+            "reflex flank: loop_slide must fall back to the meet-point, \
+             got on={b_on:?} off={b_off:?}",
+        );
+
+        // And — the point of the guard — that retained meet-point genuinely floats
+        // off the leg's line (the slide it rejected would have pinned it on-line).
+        let perpendicular =
+            ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
+        assert!(
+            perpendicular > 1.0e-4,
+            "rejected slide keeps the off-line §7.6.2 meet, perp={perpendicular}",
+        );
+    }
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
@@ -6100,6 +6581,14 @@ fn far_end_rate(frames: &[BevelFrame], edge: EdgeKey, near_vertex: VertexKey) ->
 /// (BEVEL.md §4.3): a hundredth of `offset`, the established fallback when the
 /// `WIDTH` / `DEPTH` denominator underflows rather than dividing by ~0.
 const DEGENERATE_SLIDE_FRACTION: f32 = 0.01;
+
+/// Coincidence / co-linearity tolerance for the `loop_slide` placement
+/// (BEVEL.md §8.8.2 / §8.8.3). The guide is silent on the numeric value; this
+/// reuses the same `1e-4` length tolerance `corner_verts_coincide` already
+/// applies to position coincidence in this file, so the silhouette classifier's
+/// normal-dot test and the sub-meet `sin α` degeneracy test share one
+/// crate-local convention rather than introducing a fresh magic number.
+const LOOP_SLIDE_TOLERANCE: f32 = 1.0e-4;
 
 /// Per-edge slide distance `d_i` for a single-segment vertex bevel (BEVEL.md
 /// §4 / §4.3). Each `offset_type` interprets `offset` as a different physical
