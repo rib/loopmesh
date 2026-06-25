@@ -1580,50 +1580,65 @@ impl LoopMesh {
             // silhouette/in-plane leg, slide not folding either flank), place the
             // boundvert on that leg's line instead of at the §7.6.2 meet-point.
             let slid = if loop_slide {
-                self.slide_boundvert(vertex, vertex_position, sector, is_beveled, offset)
+                self.slide_boundvert(vertex, vertex_position, sector, is_beveled)
             } else {
                 None
             };
-            if let Some((_, flank_sine_ratio)) = slid {
-                // §7.6.4 / §8.8.4: thread the firing sector's flank-sine ratio into
-                // the width pass. The §7.6.4 reconciliation solves the per-edge offsets
-                // as a weighted least-squares: a width residual drives the two flanking
-                // strips to meet the slid boundvert flush — pinning only the *ratio*
-                // `o_k : o_(k+1) = sin α₁ : sin α₂` (so `o_k = t·sin α_k` on the ratio
-                // manifold) — while a spec-pull residual sets the *absolute scale*
-                // `t` toward the user offset. Minimising `Σ(t·sin α_k − offset)²` over
-                // the single scale `t` gives `t* = offset·(sin α₁+sin α₂)/(sin²α₁+sin²α₂)`,
-                // not the meet-at-B scale `(offset/sin α₁ + offset/sin α₂)/2` (which
-                // over-pins the meet onto the spec-offset boundvert and overshoots).
-                // With `r = sin(α₂)/sin(α₁)` the reconciled offsets reduce to
-                // `o₁ = offset·(1+r)/(1+r²)` and `o₂ = offset·r·(1+r)/(1+r²)`. At a
-                // symmetric junction `r = 1` so both collapse to the spec offset and the
-                // pass is a bit-exact no-op. `g_k` opens the sector (`corners.first`),
-                // `g_(k+1)` closes it (`corners.last`); each reconciled width is keyed by
-                // the edge's radial face bordering this sector so it ripples down that
-                // edge to its far end, where a terminal close (§7.5.1) reads it (§8.8.5).
+            let boundvert_position = if let Some(record) = slid {
+                // §7.6.4.5 construct→reconcile→rebuild, in closed form for the single
+                // firing junction (§7.6.4.3). The slid boundvert constrains its two
+                // flanking edges' *apex-end* offsets to the flank-sine ratio
+                // `o_k : o_(k+1) = sin α₁ : sin α₂` (width family, weight `1.0`) while a
+                // spec-pull (weight `w = 0.2`) anchors the absolute scale to the user
+                // offset. With `r = sin(α₂)/sin(α₁)` the apex offsets solve to
+                // `o₁ = offset·(1+r)/(1+r²)` (g_k side) and `o₂ = r·o₁` (g_(k+1) side),
+                // independent of `w` (§7.6.4.3). At a symmetric junction `r = 1` so both
+                // collapse to the spec offset and the whole pass is a bit-exact no-op.
                 let g_k = sector.bounding_edges[0];
                 let g_k1 = sector.bounding_edges[1];
-                let r = flank_sine_ratio;
-                let spec_pull_scale = (1.0 + r) / (1.0 + r * r);
+                let r = record.flank_sine_ratio;
+                let apex_scale = (1.0 + r) / (1.0 + r * r);
+                let o1 = offset * apex_scale;
+                let o2 = offset * r * apex_scale;
+
+                // §7.6.4.1 / §7.6.4.3: the *far end* of each flanking edge is its own
+                // variable — the damped blend `(apex_offset + w²·O) / (1 + w²)`, not the
+                // apex offset carried unchanged (which overshoots the terminal by the
+                // fixed `1 + w² = 1.04`, §7.6.4.4). Keyed by `(edge, face)` — the edge's
+                // radial face bordering this sector — so it ripples down that edge to its
+                // far end, where a terminal close (§7.5.1) reads it (§8.8.5). At `r = 1`
+                // the damped blend is exactly the spec offset, so a symmetric firing
+                // junction leaves the termini static.
+                let damp = |apex_offset: f32| {
+                    (apex_offset + WIDTH_SPEC_WEIGHT_SQ * offset) / (1.0 + WIDTH_SPEC_WEIGHT_SQ)
+                };
                 if let Some(&(_, face)) = sector.corners.first() {
                     reconciled.push(ReconciledOffset {
                         edge: g_k,
                         face,
-                        offset: offset * spec_pull_scale,
+                        offset: damp(o1),
                     });
                 }
                 if let Some(&(_, face)) = sector.corners.last() {
                     reconciled.push(ReconciledOffset {
                         edge: g_k1,
                         face,
-                        offset: offset * r * spec_pull_scale,
+                        offset: damp(o2),
                     });
                 }
-            }
-            let boundvert_position = slid
-                .map(|(position, _)| position)
-                .unwrap_or_else(|| self.solve_meet_point(vertex, vertex_position, sector, offset));
+
+                // §8.8.3.1 rebuild: re-place the apex off the *reconciled* offsets. The
+                // reconciled pair makes the two sub-meets coincide —
+                // `m₁ = v + (o₁/sin α₁)·d_leg` and
+                // `m₂ = v + (o₂/sin α₂)·d_leg = v + (r·o₁/sin α₂)·d_leg = m₁`
+                // (since `r = sin α₂/sin α₁`) — so the apex lands exactly at the single
+                // reconciled point, not at the construct pass's average of two *unequal*
+                // spec sub-meets `(O/sin α₁ + O/sin α₂)/2`. Both terms run along the
+                // un-projected `d_leg`, so the apex stays on the leg's line (§8.8.3).
+                vertex_position + record.leg_direction * (o1 / record.sin_alpha_before)
+            } else {
+                self.solve_meet_point(vertex, vertex_position, sector, offset)
+            };
             let boundvert = self.create_vertex(boundvert_position);
             result.verts.push(boundvert);
             boundverts.push(boundvert);
@@ -2296,8 +2311,7 @@ impl LoopMesh {
         vertex_position: Vec3,
         sector: &Sector,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
-        offset: f32,
-    ) -> Option<(Vec3, f32)> {
+    ) -> Option<SlideRecord> {
         if sector.bounding_edges.len() != 2 {
             return None;
         }
@@ -2381,13 +2395,13 @@ impl LoopMesh {
         // the (true) opening angle of the flanking beveled edge against the leg
         // (§8.8.3). The gate above guarantees both are forward and non-degenerate, so
         // §8.8.3's single-survivor (one sub-meet reflex) and both-degenerate (all
-        // three lines collinear) fallback branches are intentionally not built here:
-        // `subsweep_is_good` already rejected the whole slide if either side was bad,
-        // so both `m1` and `m2` are always valid when this point is reached.
+        // three lines collinear) fallback branches are intentionally not built here.
+        // The position itself is not computed in this construct pass: it is re-derived
+        // by the caller's §7.6.4.5 rebuild off the reconciled offsets (§8.8.3.1), where
+        // the reconciled pair makes the two sub-meets coincide — so only the slide
+        // parameters (`d_leg`, `sin α₁`, the flank-sine ratio) are returned.
         let sin_alpha_before = dir_before.cross(leg_direction).length();
         let sin_alpha_after = dir_after.cross(leg_direction).length();
-        let m1 = vertex_position + leg_direction * (offset / sin_alpha_before);
-        let m2 = vertex_position + leg_direction * (offset / sin_alpha_after);
 
         // §8.8.4: record the flank-sine ratio `sin(α₂)/sin(α₁)` — a pure measure of
         // how lopsided the two flanking angles are — for the §7.6.4 width pass to
@@ -2403,9 +2417,11 @@ impl LoopMesh {
             sin_alpha_after / sin_alpha_before
         };
 
-        // §8.8.3 averaging: both sub-meets lie on the leg's line, so their midpoint
-        // does too.
-        Some(((m1 + m2) * 0.5, flank_sine_ratio))
+        Some(SlideRecord {
+            flank_sine_ratio,
+            leg_direction,
+            sin_alpha_before,
+        })
     }
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
@@ -3424,17 +3440,34 @@ struct CornerVert {
     near_vert: VertexKey,
 }
 
-/// One beveled-edge side's width-reconciled offset (BEVEL.md §7.6.4 / §8.8.4). When
-/// `loop_slide` fires at a junction sector, the slid boundvert constrains its two
-/// flanking edges' offsets to the flank-sine ratio so both strips meet it flush; the
-/// reconciled width is keyed by `(edge, face)` — that edge's radial face bordering
-/// the firing sector — and ripples down the edge to its far end, where a terminal
-/// close (§7.5.1) places its strip vert from it (§8.8.5). An edge-side that no firing
-/// sector constrained keeps the spec offset.
+/// One beveled-edge side's **terminal-end** width-reconciled offset
+/// (BEVEL.md §7.6.4 / §8.8.4). When `loop_slide` fires at a junction sector, the slid
+/// boundvert constrains its two flanking edges' *apex-end* offsets to the flank-sine
+/// ratio (§7.6.4.3's `o₁`, `o₂`); the **far end** of each flanking edge is its own
+/// reconciliation variable (§7.6.4.1), the damped blend
+/// `(apex_offset + w²·O) / (1 + w²)` (§7.6.4.3). It is *that* damped value — not the
+/// apex offset carried unchanged, which overshoots by `1.04×` (§7.6.4.4) — that is
+/// stored here, keyed by `(edge, face)` (the edge's radial face bordering the firing
+/// sector), and read by the terminal close (§7.5.1) at the edge's far end (§8.8.5).
+/// An edge-side that no firing sector constrained keeps the spec offset.
 struct ReconciledOffset {
     edge: EdgeKey,
     face: FaceKey,
     offset: f32,
+}
+
+/// The slide parameters of a firing `loop_slide` sector (BEVEL.md §8.8.3 / §8.8.4),
+/// returned by `slide_boundvert` so the caller can run the §7.6.4.5 *rebuild* pass:
+/// re-derive both the apex boundvert (§8.8.3.1) and the flanking terminal offsets
+/// (§7.6.4.3) from the reconciled offsets, rather than placing the apex once off the
+/// spec offset. `leg_direction` and `sin_alpha_before` are the un-projected leg
+/// direction `d_leg` and `sin α₁` of §8.8.3 — the apex rebuild lands at
+/// `v + (o₁ / sin α₁) · d_leg`, where the reconciled pair makes the two sub-meets
+/// coincide.
+struct SlideRecord {
+    flank_sine_ratio: f32,
+    leg_direction: Vec3,
+    sin_alpha_before: f32,
 }
 
 /// The §7.6.4-reconciled offset for the `(edge, face)` side, or `spec` when no firing
@@ -6769,6 +6802,20 @@ mod tests {
             .expect("the junction produced boundverts")
     }
 
+    /// Like `firing_boundvert`, but over a bare position list (the new verts already
+    /// collected): the vert with the smallest perpendicular distance to `leg_dir`'s
+    /// line through `apex_pos` — the boundvert that slid onto that leg.
+    fn firing_boundvert_from(positions: &[Vec3], apex_pos: Vec3, leg_dir: Vec3) -> Vec3 {
+        let perp = |p: Vec3| {
+            let rel = p - apex_pos;
+            (rel - leg_dir * rel.dot(leg_dir)).length()
+        };
+        *positions
+            .iter()
+            .min_by(|&&a, &&b| perp(a).partial_cmp(&perp(b)).unwrap())
+            .expect("the junction produced boundverts")
+    }
+
     /// BEVEL.md §8.8: `loop_slide = true` slides the firing sector's boundvert
     /// onto the silhouette leg's line, where `loop_slide = false` leaves it at the
     /// §7.6.2 two-strip meet-point. At an irregular junction the two placements
@@ -7015,6 +7062,62 @@ mod tests {
         (mesh, apex, spokes, [e01, e03])
     }
 
+    /// Like `irregular_apex_junction_planar_leg`, but the beveled spokes {0,1}/{0,3}
+    /// are **clustered** so the {0,2} firing sector is strongly *lopsided* — leg s2
+    /// sits ~0.61 rad off e01 but ~1.54 rad off e03 (flank-sine ratio `r ≈ 1.73`,
+    /// well clear of `1`). That makes the §7.6.4 reconciliation observable at full
+    /// magnitude: the apex offset solves to `o₁ ≈ 0.68·O` (not the spec `O`), the
+    /// §8.8.3.1 coincident rebuild differs from the construct average by ~13%, and the
+    /// §7.6.4.3 terminal damping is a few thousandths — all far above f32 noise. Leg
+    /// s2 lies in `z = 0` so its slid apex keeps `z ≈ 0`. Returns
+    /// (mesh, apex, [s1..s4], beveled edges {0,1} and {0,3}).
+    fn lopsided_apex_junction() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2]) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        // s1/s3 are the beveled flanks, clustered into one half; s2 (the silhouette
+        // leg, in z = 0) sits close to s1, so the {0,2} sector's two flank angles are
+        // very unequal. s4 fills the opposite sector.
+        let s1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.35));
+        let s2 = mesh.create_vertex(Vec3::new(0.866, 0.5, 0.0));
+        let s3 = mesh.create_vertex(Vec3::new(-0.4226, 0.9063, 0.45));
+        let s4 = mesh.create_vertex(Vec3::new(-0.4226, -0.9063, 0.30));
+        let spokes = [s1, s2, s3, s4];
+        let outers: Vec<VertexKey> = (0..4)
+            .map(|i| {
+                let a = mesh.vertex_position(spokes[i]);
+                let b = mesh.vertex_position(spokes[(i + 1) % 4]);
+                let mid = (a + b) * 0.5;
+                mesh.create_vertex(mid * 1.8 + Vec3::new(0.0, 0.0, -0.4))
+            })
+            .collect();
+
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        for i in 0..4 {
+            let sa = spokes[i];
+            let sb = spokes[(i + 1) % 4];
+            let outer = outers[i];
+            let e_apex_a = mesh
+                .query_edge_exists(apex, sa)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sa));
+            let e_a_outer = edge(&mut mesh, sa, outer);
+            let e_outer_b = edge(&mut mesh, outer, sb);
+            let e_b_apex = mesh
+                .query_edge_exists(apex, sb)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sb));
+            mesh.face_create(
+                &[apex, sa, outer, sb],
+                &[e_apex_a, e_a_outer, e_outer_b, e_b_apex],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let e01 = mesh.query_edge_exists(apex, s1).expect("spoke {0,1}");
+        let e03 = mesh.query_edge_exists(apex, s3).expect("spoke {0,3}");
+        (mesh, apex, spokes, [e01, e03])
+    }
+
     /// BEVEL.md §8.8.3: the slid boundvert is built parametrically on the
     /// *un-projected* leg line `v + t·d_leg`, so it lands **on** the silhouette
     /// edge by construction — no face-plane / junction-normal projection drifts it
@@ -7126,6 +7229,158 @@ mod tests {
         assert_eq!(
             drifted, 6,
             "both apex sectors slide (case A) and the four termini ripple (case B)",
+        );
+    }
+
+    /// BEVEL.md §7.6.4.3–§7.6.4.5 / §8.8.3.1: the two-pass construct→reconcile→rebuild
+    /// pins the *magnitudes*, not just the directions. This test fails against the
+    /// earlier single-pass placement (apex left at the construct average of two unequal
+    /// spec sub-meets; terminals fed the apex offset carried unchanged) and passes once
+    /// both ends read the reconciled offsets.
+    ///
+    /// **Coincident-sub-meet apex (§8.8.3.1).** The rebuilt apex sits at the single
+    /// reconciled distance `t* = O·(sin α₁ + sin α₂) / (sin²α₁ + sin²α₂)` along the leg
+    /// — where the two sub-meets coincide — not the construct average
+    /// `O·(sin α₁ + sin α₂) / (2·sin α₁·sin α₂)`.
+    ///
+    /// **Damped terminal ripple (§7.6.4.3 / §7.6.4.4).** Each terminal strip vert is
+    /// fed the damped blend `(apex_offset + 0.04·O) / 1.04`, not the apex offset itself
+    /// (which overshoots by exactly `1.04×`). The terminal recipe (§7.5.1) is linear in
+    /// the offset it consumes, so an off-run affine probe at `O` and `2O` recovers each
+    /// terminal's *fed* offset; the recovered multiset must match the four damped
+    /// apex-offsets and be distinct from the undamped apex-offsets.
+    #[test]
+    fn edge_bevel_loop_slide_apex_and_termini_use_reconciled_offsets() {
+        let o = 0.2_f32;
+
+        let build = |loop_slide: bool, offset: f32| {
+            let (mut mesh, apex, spokes, [e01, e03]) = lopsided_apex_junction();
+            let apex_pos = mesh.vertex_position(apex);
+            let leg2 = (mesh.vertex_position(spokes[1]) - apex_pos).normalize();
+            let leg4 = (mesh.vertex_position(spokes[3]) - apex_pos).normalize();
+            let edge01 = (mesh.vertex_position(spokes[0]) - apex_pos).normalize();
+            let edge03 = (mesh.vertex_position(spokes[2]) - apex_pos).normalize();
+            let result = mesh.bevel(
+                &[e01.into(), e03.into()],
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    loop_slide,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let positions: Vec<Vec3> =
+                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            (apex_pos, leg2, leg4, edge01, edge03, positions)
+        };
+
+        let (apex_pos, leg2, leg4, edge01, edge03, off_o) = build(false, o);
+        let (_, _, _, _, _, off_2o) = build(false, 2.0 * o);
+        let (_, _, _, _, _, on_o) = build(true, o);
+
+        assert_eq!(off_o.len(), 6);
+        assert_eq!(off_2o.len(), 6);
+        assert_eq!(on_o.len(), 6);
+
+        // The firing apex boundverts sit on their legs near the apex; the terminal
+        // strip verts sit out by the far endpoints (≈ 1 away). Classify on the off@O
+        // run; the same indices carry across runs (stable construction order).
+        let sin = |u: Vec3, v: Vec3| u.cross(v).length();
+
+        // §8.8.3.1 coincident-sub-meet apex distance, per firing sector.
+        let apex_distance = |on_position: Vec3, leg: Vec3| (on_position - apex_pos).dot(leg);
+        let b2_on = firing_boundvert_from(&on_o, apex_pos, leg2);
+        let b4_on = firing_boundvert_from(&on_o, apex_pos, leg4);
+        let t2 = apex_distance(b2_on, leg2);
+        let t4 = apex_distance(b4_on, leg4);
+
+        let s1_2 = sin(edge01, leg2);
+        let s3_2 = sin(edge03, leg2);
+        let s1_4 = sin(edge01, leg4);
+        let s3_4 = sin(edge03, leg4);
+
+        let expected_new = |sa: f32, sb: f32| o * (sa + sb) / (sa * sa + sb * sb);
+        let expected_old = |sa: f32, sb: f32| o * (sa + sb) / (2.0 * sa * sb);
+
+        // Both apex boundverts land at the reconciled (coincident) distance, not the
+        // construct average. On the lopsided {0,2} sector the two differ by ~13%, which
+        // is what fails the single-pass placement; the near-symmetric {0,4} sector
+        // matches `new` too (where `new ≈ old`).
+        let mut max_apex_gap: f32 = 0.0;
+        for (t, sa, sb) in [(t2, s1_2, s3_2), (t4, s1_4, s3_4)] {
+            let new = expected_new(sa, sb);
+            let old = expected_old(sa, sb);
+            assert!(
+                (t - new).abs() < 1.0e-4,
+                "apex slides to the reconciled coincident distance t*={new}, got {t}",
+            );
+            let gap = (new - old).abs();
+            max_apex_gap = max_apex_gap.max(gap);
+            if gap > 5.0e-4 {
+                assert!(
+                    (t - old).abs() > (t - new).abs(),
+                    "apex is the rebuilt coincident point, not the construct average \
+                     (t={t}, new={new}, old={old})",
+                );
+            }
+        }
+        assert!(
+            max_apex_gap > 1.0e-3,
+            "the lopsided sector exercises a real apex magnitude differential \
+             (max_gap={max_apex_gap})",
+        );
+
+        // §7.6.4.3 terminal damping. The apex offset of each flanking edge in a sector
+        // is `t* · sin(angle(edge, leg))`; the terminal far end is fed the damped blend.
+        let damp = |apex_offset: f32| (apex_offset + 0.04 * o) / 1.04;
+        let apex_offsets = [t2 * s1_2, t2 * s3_2, t4 * s1_4, t4 * s3_4];
+        let mut damped: Vec<f32> = apex_offsets.iter().map(|&a| damp(a)).collect();
+        damped.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Recover each terminal strip vert's fed offset via the off-run affine probe.
+        let mut recovered: Vec<f32> = Vec::new();
+        for index in 0..6 {
+            if (off_o[index] - apex_pos).length() <= 0.5 {
+                continue; // an apex boundvert, not a terminal
+            }
+            let dir = off_2o[index] - off_o[index]; // = O · (per-unit-offset slope)
+            let fraction = (on_o[index] - off_o[index]).dot(dir) / dir.dot(dir);
+            recovered.push(o + fraction * o);
+        }
+        recovered.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(recovered.len(), 4, "four terminal strip verts");
+
+        let mut apex_sorted = apex_offsets.to_vec();
+        apex_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // The recovered fed offsets are the damped values, edge-for-edge (damp is
+        // monotone in the apex offset, so sorting all three keeps them aligned), and on
+        // the lopsided sector they are distinguishably *not* the undamped apex offsets
+        // the overshoot bug carried to the terminal.
+        let mut max_damp_gap: f32 = 0.0;
+        for (got, (want_damped, want_apex)) in recovered
+            .iter()
+            .zip(damped.iter().zip(apex_sorted.iter()))
+        {
+            assert!(
+                (got - want_damped).abs() < 5.0e-4,
+                "terminal fed the §7.6.4.3 damped offset {want_damped}, got {got}",
+            );
+            let gap = (want_apex - want_damped).abs();
+            max_damp_gap = max_damp_gap.max(gap);
+            if gap > 5.0e-4 {
+                assert!(
+                    (got - want_damped).abs() < (got - want_apex).abs(),
+                    "terminal is the §7.6.4.3 damped offset, not the apex offset carried \
+                     unchanged (got={got}, damped={want_damped}, apex={want_apex})",
+                );
+            }
+        }
+        assert!(
+            max_damp_gap > 1.0e-3,
+            "the lopsided sector exercises a real terminal damping differential \
+             (max_gap={max_damp_gap})",
         );
     }
 
@@ -7631,6 +7886,15 @@ const DEGENERATE_SLIDE_FRACTION: f32 = 0.01;
 /// normal-dot test and the sub-meet `sin α` degeneracy test share one
 /// crate-local convention rather than introducing a fresh magic number.
 const LOOP_SLIDE_TOLERANCE: f32 = 1.0e-4;
+
+/// The §7.6.4.2 width-reconciliation spec-match weight, *squared*. The two residual
+/// families are stacked with width-match coefficient `1.0` and spec-match
+/// coefficient `w = 0.2`; the normal equations square the coefficients, so the spec
+/// family enters the solve with effective weight `w² = 0.04` — width matching is
+/// weighted 25× more heavily than spec matching. This finite ratio sets the
+/// terminal-end damping `1 / (1 + w²) = 1 / 1.04` of §7.6.4.3 and must not be a
+/// "hard width / soft spec" limit (which would drop the `1.04`).
+const WIDTH_SPEC_WEIGHT_SQ: f32 = 0.04;
 
 /// Angular band (radians) within which a §8.8.2.1 sub-meet's un-projected opening
 /// angle is rejected as degenerate — within ~0.1 rad of either `0` or `π`. This is
