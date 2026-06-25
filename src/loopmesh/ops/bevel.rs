@@ -462,54 +462,39 @@ impl LoopMesh {
             segment / length
         };
 
-        let left_normal = self.face_plane_normal(face_left);
-        let right_normal = self.face_plane_normal(face_right);
-        let left_center = self.face_center_of_mass(face_left);
-        let right_center = self.face_center_of_mass(face_right);
+        let _ = direction;
 
-        // §7.3: strip vert = endpoint + offset · (in-face perpendicular to E),
-        // the perpendicular chosen to point into the face interior (toward its
-        // centroid). The face normal disambiguates the in-plane perpendicular.
-        let strip_a_left = self.create_vertex(strip_vert_position(
-            self.vertex_position(a),
-            direction,
-            left_normal,
-            left_center,
-            offset,
-        ));
-        let strip_a_right = self.create_vertex(strip_vert_position(
-            self.vertex_position(a),
-            direction,
-            right_normal,
-            right_center,
-            offset,
-        ));
-        let strip_b_left = self.create_vertex(strip_vert_position(
-            self.vertex_position(b),
-            direction,
-            left_normal,
-            left_center,
-            offset,
-        ));
-        let strip_b_right = self.create_vertex(strip_vert_position(
-            self.vertex_position(b),
-            direction,
-            right_normal,
-            right_center,
-            offset,
-        ));
-        result
-            .verts
-            .extend([strip_a_left, strip_a_right, strip_b_left, strip_b_right]);
-
-        // The non-`E` edge of each radial face at each endpoint. These are the
-        // edges shared between a radial face and the endpoint's *third* face; the
-        // re-stitch re-points them onto the strip verts, so the third face must
-        // place the matching strip vert next to that edge's far end (§7.4).
+        // The non-`E` edge of each radial face at each endpoint — the flanking
+        // unbeveled leg shared between that radial face and the endpoint's *third*
+        // face. The re-stitch re-points them onto the strip verts, so the third face
+        // must place the matching strip vert next to that edge's far end (§7.4); the
+        // §7.5.1 leg meet also places each strip vert against its own flanking leg.
         let left_other_a = self.face_other_edge_at(face_left, a, edge);
         let right_other_a = self.face_other_edge_at(face_right, a, edge);
         let left_other_b = self.face_other_edge_at(face_left, b, edge);
         let right_other_b = self.face_other_edge_at(face_right, b, edge);
+
+        // §7.5.1: each terminal strip vert is the leg meet of E (offset) against its
+        // own flanking leg (offset 0), built from the local edge-cross normal — not
+        // the §7.3 perpendicular-in-face slide, which only coincides on a planar,
+        // square terminal and diverges at an irregular non-planar one.
+        let normal_a = self.terminal_surface_normal(a);
+        let normal_b = self.terminal_surface_normal(b);
+        let strip_a_left = self.create_vertex(
+            self.terminal_strip_vert(a, edge, left_other_a, face_left, offset, normal_a),
+        );
+        let strip_a_right = self.create_vertex(
+            self.terminal_strip_vert(a, edge, right_other_a, face_right, offset, normal_a),
+        );
+        let strip_b_left = self.create_vertex(
+            self.terminal_strip_vert(b, edge, left_other_b, face_left, offset, normal_b),
+        );
+        let strip_b_right = self.create_vertex(
+            self.terminal_strip_vert(b, edge, right_other_b, face_right, offset, normal_b),
+        );
+        result
+            .verts
+            .extend([strip_a_left, strip_a_right, strip_b_left, strip_b_right]);
 
         let substitutions = EdgeBevelSubstitutions {
             a,
@@ -1020,23 +1005,25 @@ impl LoopMesh {
             return;
         }
 
-        let strip_for_face = |this: &mut Self, face: FaceKey, result: &mut BevelResult| {
-            let normal = this.face_plane_normal(face);
-            let center = this.face_center_of_mass(face);
-            let position = strip_vert_position(
-                this.vertex_position(vertex),
-                direction,
-                normal,
-                center,
-                offset,
-            );
-            let strip_vert = this.create_vertex(position);
-            result.verts.push(strip_vert);
-            strip_vert
-        };
+        // The two flanking unbeveled legs share E's two radial faces (§7.5.1); each
+        // strip vert is the leg meet of E against its own flanking leg. `direction`
+        // is the chain axis, not the strip placement.
+        let _ = direction;
+        let left_other = self.face_other_edge_at(face_left, vertex, edge);
+        let right_other = self.face_other_edge_at(face_right, vertex, edge);
+        let surface_normal = self.terminal_surface_normal(vertex);
 
-        let strip_left = strip_for_face(self, face_left, result);
-        let strip_right = strip_for_face(self, face_right, result);
+        let strip_for_leg =
+            |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
+                let position =
+                    this.terminal_strip_vert(vertex, edge, leg, face, offset, surface_normal);
+                let strip_vert = this.create_vertex(position);
+                result.verts.push(strip_vert);
+                strip_vert
+            };
+
+        let strip_left = strip_for_leg(self, left_other, face_left, result);
+        let strip_right = strip_for_leg(self, right_other, face_right, result);
 
         // The chain crosses E between the two strip verts (§8.3.0.1). face_left's
         // strip vert is the chain's `start`, face_right's its `end` — matching the
@@ -1050,8 +1037,6 @@ impl LoopMesh {
 
         // The third face(s) absorb the full chain run, ordered so the strip vert
         // sharing the incoming leg sits next to `prev` (§8.3.0.1 / §7.4).
-        let left_other = self.face_other_edge_at(face_left, vertex, edge);
-        let right_other = self.face_other_edge_at(face_right, vertex, edge);
         let mut forward_run = Vec::with_capacity(segments as usize + 1);
         forward_run.push(strip_left);
         forward_run.extend_from_slice(&interior);
@@ -1623,13 +1608,16 @@ impl LoopMesh {
         });
     }
 
-    /// Place the two strip verts of a terminal endpoint (BEVEL.md §7.3 / §7.4 /
-    /// §7.5): one per adjacent face of the single beveled edge there, slid
-    /// perpendicular into the face. Each strip's radial face swaps its corner for
-    /// the one strip vert on its side (1-for-1); the surviving **third** face(s)
-    /// between the unbeveled legs swap their corner for *both* strip verts ordered
-    /// so the strip vert sharing the incoming leg stays adjacent to `prev`
-    /// (1-for-2, the absorbed valence-3 corner of §7.4 / §7.5).
+    /// Place the two strip verts of a terminal endpoint (BEVEL.md §7.4 / §7.5.1):
+    /// one per adjacent face of the single beveled edge there. Each strip vert is
+    /// the §7.5.1 **leg meet** — the pairwise offset-line meet of the beveled edge
+    /// `E` (offset) against the flanking unbeveled leg (offset 0) — **not** the
+    /// §7.3 perpendicular-in-face slide, which only coincides at a planar, square
+    /// terminal and diverges at an irregular non-planar one. Each strip's radial
+    /// face swaps its corner for the one strip vert on its side (1-for-1); the
+    /// surviving **third** face(s) between the unbeveled legs swap their corner for
+    /// *both* strip verts ordered so the strip vert sharing the incoming leg stays
+    /// adjacent to `prev` (1-for-2, the absorbed valence-3 corner of §7.4 / §7.5).
     fn place_terminal_strip_verts(
         &mut self,
         vertex: VertexKey,
@@ -1674,23 +1662,26 @@ impl LoopMesh {
             return;
         }
 
-        let strip_for_face = |this: &mut Self, face: FaceKey, result: &mut BevelResult| {
-            let normal = this.face_plane_normal(face);
-            let center = this.face_center_of_mass(face);
-            let position = strip_vert_position(
-                this.vertex_position(vertex),
-                direction,
-                normal,
-                center,
-                offset,
-            );
-            let strip_vert = this.create_vertex(position);
-            result.verts.push(strip_vert);
-            strip_vert
-        };
+        // The two flanking unbeveled legs: `left_other` shares `face_left` with the
+        // strip, `right_other` shares `face_right`. Each strip vert is the §7.5.1
+        // leg meet of `E` against its own flanking leg (offset 0). `direction`
+        // unused for the leg meet (the meet builds its own edge-cross normal).
+        let _ = direction;
+        let left_other = self.face_other_edge_at(face_left, vertex, edge);
+        let right_other = self.face_other_edge_at(face_right, vertex, edge);
+        let surface_normal = self.terminal_surface_normal(vertex);
 
-        let strip_left = strip_for_face(self, face_left, result);
-        let strip_right = strip_for_face(self, face_right, result);
+        let strip_for_leg =
+            |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
+                let position =
+                    this.terminal_strip_vert(vertex, edge, leg, face, offset, surface_normal);
+                let strip_vert = this.create_vertex(position);
+                result.verts.push(strip_vert);
+                strip_vert
+            };
+
+        let strip_left = strip_for_leg(self, left_other, face_left, result);
+        let strip_right = strip_for_leg(self, right_other, face_right, result);
 
         // 1-for-1 on each radial face, plus the per-edge record for the strip.
         for &(face, strip_vert) in &[(face_left, strip_left), (face_right, strip_right)] {
@@ -1705,8 +1696,6 @@ impl LoopMesh {
 
         // The third face(s): each swaps the corner for both strip verts, ordered so
         // the one sharing the incoming leg sits next to `prev` (§7.4).
-        let left_other = self.face_other_edge_at(face_left, vertex, edge);
-        let right_other = self.face_other_edge_at(face_right, vertex, edge);
         for face in self.vert_face_keys(vertex) {
             if face == face_left || face == face_right {
                 continue;
@@ -1720,6 +1709,130 @@ impl LoopMesh {
                 strip_right,
             );
             set_face_substitution(substitutions, vertex, face, ordered);
+        }
+    }
+
+    /// Place one terminal strip vert as the §7.5.1 **leg meet**: the pairwise
+    /// offset-line meet of the beveled edge `edge` (carrying `offset`) against the
+    /// flanking unbeveled `leg` (carrying offset 0), both lines built from a
+    /// **local edge-cross normal** (`leg × edge`, sign-fixed by `surface_normal`),
+    /// **not** an adjacent face's plane normal. The two lines are generally skew at
+    /// a non-planar terminal, so the meet is their closest-points midpoint
+    /// (`intersect_lines`), then the §7.5.2 zero-offset span clamp anchors it to the
+    /// real leg. Reduces exactly to the §7.3 perpendicular slide on a planar, square
+    /// terminal, where the edge-cross normal coincides with the face normal.
+    ///
+    /// `face` is `E`'s radial face on this leg's side; it is used **only** to pick
+    /// the discrete straddle branch (which side of `E` this strip vert sits on) — its
+    /// plane normal is **not** used to build the offset perpendicular, which is the
+    /// edge-cross local normal alone. The two flanking legs land on opposite sides of
+    /// `E`. Exactly one input carries the offset (`E`); the leg carries 0.
+    fn terminal_strip_vert(
+        &self,
+        vertex: VertexKey,
+        edge: EdgeKey,
+        leg: EdgeKey,
+        face: FaceKey,
+        offset: f32,
+        surface_normal: Vec3,
+    ) -> Vec3 {
+        let endpoint = self.vertex_position(vertex);
+        // Outward unit directions of `E` and the leg from the endpoint.
+        let edge_out = match self.edge_direction_from(edge, vertex, endpoint) {
+            Some(dir) => dir,
+            None => return endpoint,
+        };
+        let leg_out = match self.edge_direction_from(leg, vertex, endpoint) {
+            Some(dir) => dir,
+            None => return endpoint,
+        };
+
+        // The "sideways" perpendicular is built from the LOCAL edge-cross normal,
+        // oriented to the surface's outward side — the decisive §7.5.1 departure from
+        // §7.3's per-face plane normal. The cross is sign-ambiguous; the surface
+        // normal picks the outward branch. `cross(edge_out, leg_out)` is the
+        // canonical orientation; the per-side straddle is set by the offset-push sign
+        // below, not by re-deriving the normal per leg.
+        let mut local_normal = edge_out.cross(leg_out);
+        let length = local_normal.length();
+        if length <= f32::EPSILON {
+            // Leg parallel to E: no perpendicular. Slide along the leg by `offset`.
+            return self.clamp_zero_offset_terminal(endpoint + leg_out * offset, vertex, leg);
+        }
+        local_normal /= length;
+        if local_normal.dot(surface_normal) < 0.0 {
+            local_normal = -local_normal;
+        }
+
+        // `E`'s offset line is pushed sideways by `offset`, square to `E`, from the
+        // local normal. Its sign is the straddle branch: pick the push that drives
+        // the offset line toward `face`'s interior, so this strip vert sits on the
+        // radial face it belongs to. (The face fixes only this binary side, never the
+        // perpendicular vector.)
+        let mut edge_perp = edge_out.cross(local_normal).normalize_or_zero();
+        let face_center = self.face_center_of_mass(face);
+        if edge_perp.dot(face_center - endpoint) < 0.0 {
+            edge_perp = -edge_perp;
+        }
+
+        // Offset line for `E` (base pushed sideways by `offset`) against the leg's own
+        // line (offset 0 ⇒ base on the endpoint). They generally pass skew at a
+        // non-planar terminal; take the closest-points midpoint.
+        let line_edge = Line {
+            point: endpoint + edge_perp * offset,
+            direction: edge_out,
+        };
+        let line_leg = Line {
+            point: endpoint,
+            direction: leg_out,
+        };
+        let meet = match intersect_lines(&line_edge, &line_leg) {
+            LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+            LineMeet::Collinear => line_leg.point,
+        };
+
+        // §7.5.2: the zero-offset leg must not fling the meet past its own span.
+        self.clamp_zero_offset_terminal(meet, vertex, leg)
+    }
+
+    /// §7.5.2 zero-offset span clamp: the unbeveled leg carries offset 0, so its
+    /// offset line is the leg itself and the meet can land past the leg's far
+    /// endpoint. Snap any such out-of-span meet back to the nearer endpoint of the
+    /// leg's segment (`vertex` … leg's other end).
+    fn clamp_zero_offset_terminal(&self, meet: Vec3, vertex: VertexKey, leg: EdgeKey) -> Vec3 {
+        let [a, b] = self.edge_vert_keys(leg);
+        let far = if a == vertex { b } else { a };
+        let near_position = self.vertex_position(vertex);
+        let far_position = self.vertex_position(far);
+        let segment = far_position - near_position;
+        let length_squared = segment.length_squared();
+        if length_squared <= f32::EPSILON {
+            return near_position;
+        }
+        let parameter = (meet - near_position).dot(segment) / length_squared;
+        if parameter < 0.0 {
+            near_position
+        } else if parameter > 1.0 {
+            far_position
+        } else {
+            meet
+        }
+    }
+
+    /// §7.5.1 "surface normal at the terminal": the outward reference used only to
+    /// fix the *sign* of the edge-cross local normal. The average of the unit
+    /// normals of the faces incident to `vertex`, falling back to the stored vertex
+    /// normal when that average is degenerate (near-zero length).
+    fn terminal_surface_normal(&self, vertex: VertexKey) -> Vec3 {
+        let mut accumulator = Vec3::ZERO;
+        for face in self.vert_face_keys(vertex) {
+            accumulator += self.face_plane_normal(face);
+        }
+        let length = accumulator.length();
+        if length > f32::EPSILON {
+            accumulator / length
+        } else {
+            self.vertex_normal(vertex)
         }
     }
 
@@ -4160,6 +4273,88 @@ mod tests {
         assert_eq!(result.verts.len(), 4, "four strip verts");
         assert_eq!(result.faces.len(), 1, "single strip quad");
         assert_eq!(mesh.face_vert_keys(result.faces[0]).len(), 4, "strip quad");
+        mesh.validate_topology();
+    }
+
+    /// An irregular tetrahedron: a manifold solid whose every vertex is a
+    /// **non-planar valence-3 terminal** with oblique legs. Beveling one edge
+    /// exercises the §7.5.1 terminal placement away from the planar/square cube
+    /// special case the other edge-bevel tests pin.
+    fn irregular_tetra(mesh: &mut LoopMesh) -> [VertexKey; 4] {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(0.5, 2.5, 0.3));
+        let v3 = mesh.create_vertex(Vec3::new(0.4, 0.6, 2.2));
+        // Outward-wound faces (each triangle's normal points away from the centroid).
+        let faces = [[v0, v2, v1], [v0, v1, v3], [v0, v3, v2], [v1, v2, v3]];
+        for ring in faces {
+            let edges = [
+                mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[2], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        [v0, v1, v2, v3]
+    }
+
+    /// BEVEL.md §7.5.1: at a **non-planar** valence-3 terminal each strip vert is
+    /// the leg meet — `E`'s offset line (offset 0.3) against the flanking unbeveled
+    /// leg (offset 0), built from the edge-cross local normal — **not** the §7.3
+    /// perpendicular-in-face slide. Two consequences the slide cannot produce and
+    /// this test pins: (1) every strip vert sits an exact perpendicular `offset`
+    /// from `E`'s original line (the offset-line property), and (2) the strip vert
+    /// on the `v0` corner lands at the leg-meet target, measurably off the §7.3
+    /// face-plane slide (~0.05 mesh unit here at offset 0.3 on the oblique legs).
+    #[test]
+    fn edge_bevel_terminal_leg_meet_on_nonplanar_corner() {
+        let mut mesh = LoopMesh::new();
+        let [v0, v1, _v2, _v3] = irregular_tetra(&mut mesh);
+        let endpoint_a = mesh.vertex_position(v0);
+        let endpoint_b = mesh.vertex_position(v1);
+        let edge = mesh.query_edge_exists(v0, v1).expect("tetra edge {0,1}");
+        let edge_dir = (endpoint_b - endpoint_a).normalize();
+
+        let offset = 0.3_f32;
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.verts.len(), 4, "four terminal strip verts");
+
+        // (1) Offset-line property: every strip vert lies an exact perpendicular
+        // `offset` from `E`'s original line. The §7.3 face-plane slide also satisfies
+        // this, so it is necessary-not-sufficient — assertion (2) separates them.
+        for &strip in &result.verts {
+            let to_strip = mesh.vertex_position(strip) - endpoint_a;
+            let along = to_strip.dot(edge_dir);
+            let perpendicular_distance = (to_strip - edge_dir * along).length();
+            assert!(
+                (perpendicular_distance - offset).abs() < 1.0e-4,
+                "strip vert {perpendicular_distance} must lie offset {offset} from E's line",
+            );
+        }
+
+        // (2) The §7.5.1 leg-meet targets at the `v0` corner, derived by hand from
+        // the edge-cross local normal + closest-points meet (see the scratch
+        // prototype): these are measurably off the §7.3 in-face slide, which would
+        // keep `x = 0` (the slide stays in each face's plane through `v0`).
+        let leg_meet_one = Vec3::new(0.05957, 0.29786, 0.03574);
+        let leg_meet_two = Vec3::new(0.05262, 0.07894, 0.28943);
+        for &target in &[leg_meet_one, leg_meet_two] {
+            let hits = result
+                .verts
+                .iter()
+                .filter(|&&v| (mesh.vertex_position(v) - target).length() < 1.0e-3)
+                .count();
+            assert_eq!(hits, 1, "a strip vert lands at the §7.5.1 leg meet {target:?}");
+            // The §7.3 slide keeps x = 0 at this corner; the leg meet pulls it off.
+            assert!(target.x > 1.0e-2, "leg meet is off the §7.3 in-face slide");
+        }
         mesh.validate_topology();
     }
 
@@ -6974,31 +7169,6 @@ fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
     }
     let clamped = offset.min(length);
     vertex + (direction / length) * clamped
-}
-
-/// Place one edge-bevel strip vert (BEVEL.md §7.3): slide `offset` from the
-/// endpoint, perpendicular to the beveled edge and in the adjacent face's plane,
-/// into the face interior. `face_normal` fixes the in-plane perpendicular
-/// (`cross(direction, normal)`); `face_center` disambiguates its sign so the
-/// vert moves toward the face's interior, away from the crease.
-fn strip_vert_position(
-    endpoint: Vec3,
-    direction: Vec3,
-    face_normal: Vec3,
-    face_center: Vec3,
-    offset: f32,
-) -> Vec3 {
-    let mut into_face = direction.cross(face_normal);
-    let length = into_face.length();
-    if length <= f32::EPSILON {
-        return endpoint; // degenerate: edge parallel to the normal
-    }
-    into_face /= length;
-    // Orient toward the face interior: the centroid lies on the interior side.
-    if into_face.dot(face_center - endpoint) < 0.0 {
-        into_face = -into_face;
-    }
-    endpoint + into_face * offset
 }
 
 /// The corner axis `Σ_i normalize(v − A_i)` (BEVEL.md §4.3): the un-normalised
