@@ -81,6 +81,22 @@ pub struct BevelOptions {
     /// Surviving re-stitched / re-pointed original faces are never re-materialised
     /// by either regime (§6.6.2). Defaults to `-1` (inherit).
     pub material: i32,
+    /// Propagate the **seam** edge flag across a multi-edge junction's bridging
+    /// segments (BEVEL.md §6.7 / §6.7.4). A leaf, flag-only parameter that changes
+    /// no topology and no placement.
+    ///
+    /// It gates **only** mechanism (2) of §6.7.1: the contiguity-bridging of the
+    /// seam across the junction's bridging segments when seamed and non-seamed
+    /// beveled edges are interleaved around the same junction. It is **inert** for
+    /// vertex bevel (§6.7.2) and isolated single-edge bevel (§6.7.3), where the
+    /// flag rides only the unconditional §6.5-style per-edge attribute copy
+    /// (mechanism (1)), corrected by the §6.7.1.1 corner-segment contiguity AND.
+    /// Defaults to `false`.
+    pub mark_seam: bool,
+    /// The same propagation for the **sharp** (not-smooth) edge flag (BEVEL.md
+    /// §6.7). Runs the identical junction bridging on the sharp bit, independently
+    /// of `mark_seam`. Defaults to `false`.
+    pub mark_sharp: bool,
 }
 
 impl Default for BevelOptions {
@@ -92,6 +108,8 @@ impl Default for BevelOptions {
             affect: BevelAffect::Vertices,
             clamp_overlap: false,
             material: -1,
+            mark_seam: false,
+            mark_sharp: false,
         }
     }
 }
@@ -174,7 +192,7 @@ impl LoopMesh {
         }
 
         if options.affect == BevelAffect::Edges {
-            return self.bevel_edges(geom, options.offset, options.material);
+            return self.bevel_edges(geom, &options);
         }
 
         if options.affect != BevelAffect::Vertices {
@@ -266,7 +284,9 @@ impl LoopMesh {
     /// Single segment / symmetric `offset` only. A non-manifold edge or an
     /// endpoint whose terminal close needs valence ≥ 4 (the on-edge-vert fill of
     /// §7.5) is skipped — those remain §7.5 / §8 stubs.
-    fn bevel_edges(&mut self, geom: &[GeomKey], offset: f32, material: i32) -> BevelResult {
+    fn bevel_edges(&mut self, geom: &[GeomKey], options: &BevelOptions) -> BevelResult {
+        let offset = options.offset;
+        let material = options.material;
         let mut result = BevelResult::default();
 
         let mut beveled: Vec<EdgeKey> = Vec::new();
@@ -305,7 +325,7 @@ impl LoopMesh {
             return result;
         }
 
-        self.bevel_edges_with_junctions(&beveled, &junctions, offset, material, &mut result);
+        self.bevel_edges_with_junctions(&beveled, &junctions, options, &mut result);
         result
     }
 
@@ -475,10 +495,11 @@ impl LoopMesh {
         &mut self,
         beveled: &[EdgeKey],
         junctions: &[VertexKey],
-        offset: f32,
-        material: i32,
+        options: &BevelOptions,
         result: &mut BevelResult,
     ) {
+        let offset = options.offset;
+        let material = options.material;
         // Drop any non-manifold beveled edge (§2.1): a junction strip needs each
         // arriving edge to carry exactly two faces.
         let mut beveled_manifold: Vec<EdgeKey> = Vec::new();
@@ -506,6 +527,14 @@ impl LoopMesh {
                     .unwrap_or(0);
                 (edge, representative)
             })
+            .collect();
+        // §6.7.4: capture each beveled edge's seam / sharp state against the
+        // pristine mesh, keyed by edge, for the junction bridging pass. The
+        // beveled edges survive (re-pointed) so their flags persist, but a pristine
+        // snapshot keeps the bridging decision independent of surgery order.
+        let edge_seam_state: Vec<(EdgeKey, bool, bool)> = beveled_manifold
+            .iter()
+            .map(|&edge| (edge, self.edge_seam(edge), self.edge_sharp(edge)))
             .collect();
         let junction_material: Vec<(VertexKey, i32)> = junctions
             .iter()
@@ -604,6 +633,31 @@ impl LoopMesh {
             }
         }
 
+        // Phase 4.25 (§6.7.1 mechanism (1), UNCONDITIONAL — not gated by the
+        // parameters): each beveled edge's two strip long edges descend from that
+        // edge's re-stitched radial faces, so they inherit its seam / sharp exactly
+        // as a re-pointed survivor would (§6.7.1 item 1 / §6.7.3). A seam on an
+        // arriving beveled edge therefore reappears on the strip edges descending
+        // from it whether or not `mark_seam` is set. The perpendicular near edges
+        // (the patch ring segments) are *not* descendants of any single edge — they
+        // are the parameter-gated bridging segments of phase 4.5 below.
+        self.inherit_strip_long_edge_flags(&beveled_manifold, &corner_vert, &edge_seam_state);
+
+        // Phase 4.5 (§6.7.4): the `mark_seam` / `mark_sharp` junction bridging.
+        // Mechanism (2): bridge the seam / sharp flag across each junction's patch
+        // ring segments so the flag runs continuously around the junction, joining
+        // the strip long edges of consecutive seamed beveled edges.
+        if options.mark_seam || options.mark_sharp {
+            for patch in &junction_patches {
+                self.bridge_junction_flags(
+                    patch,
+                    &edge_seam_state,
+                    options.mark_seam,
+                    options.mark_sharp,
+                );
+            }
+        }
+
         // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
         for &endpoint in &endpoints {
             self.free_loose_vertex(endpoint);
@@ -639,12 +693,16 @@ impl LoopMesh {
 
         let vertex_position = self.vertex_position(vertex);
         let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors.len());
+        let mut opening_edges: Vec<EdgeKey> = Vec::with_capacity(sectors.len());
 
         for sector in &sectors {
             let boundvert_position = self.solve_meet_point(vertex, vertex_position, sector, offset);
             let boundvert = self.create_vertex(boundvert_position);
             result.verts.push(boundvert);
             boundverts.push(boundvert);
+            // `bounding_edges[0]` is the beveled edge that opens this sector
+            // (sector_split records the opening edge first) — `g_k` for `B_k`.
+            opening_edges.push(sector.bounding_edges[0]);
 
             // Every face in this sector terminates on this single boundvert: the
             // two bounding beveled edges' strips and any absorbed unbeveled leg's
@@ -664,7 +722,11 @@ impl LoopMesh {
             }
         }
 
-        junction_patches.push(JunctionPatch { vertex, boundverts });
+        junction_patches.push(JunctionPatch {
+            vertex,
+            boundverts,
+            opening_edges,
+        });
     }
 
     /// Place the two strip verts of a terminal endpoint (BEVEL.md §7.3 / §7.4 /
@@ -1115,6 +1177,148 @@ impl LoopMesh {
         }
     }
 
+    /// Inherit each beveled edge's seam / sharp onto its two strip long edges
+    /// (BEVEL.md §6.7.1 mechanism (1), unconditional).
+    ///
+    /// A beveled edge `g = (a, b)` sheds a strip running *along* `g`. The two edges
+    /// of that strip parallel to `g` — one in each of `g`'s two re-stitched radial
+    /// faces, between the near corner at `a` and the near corner at `b` — are the
+    /// edges that descend from `g`'s re-stitched faces (the new `g`-side of each
+    /// face, §7.1 / §7.6.1). They inherit `g`'s per-edge attribute block, seam and
+    /// sharp bits included, exactly as a re-pointed survivor keeps its own
+    /// (§6.7.1 item 1). The perpendicular strip rails — the patch ring segments —
+    /// are *not* descendants of `g` and are left to the parameter-gated bridging.
+    ///
+    /// Unconditional: runs whether or not `mark_seam` / `mark_sharp` is set; the
+    /// flag is read from the *pristine* `edge_seam_state` snapshot.
+    fn inherit_strip_long_edge_flags(
+        &mut self,
+        beveled: &[EdgeKey],
+        corner_vert: &[CornerVert],
+        edge_seam_state: &[(EdgeKey, bool, bool)],
+    ) {
+        for &edge in beveled {
+            let Some(&(_, seam, sharp)) = edge_seam_state.iter().find(|&&(e, ..)| e == edge) else {
+                continue;
+            };
+            if !seam && !sharp {
+                continue;
+            }
+            let [a, b] = self.edge_vert_keys(edge);
+            // One long edge per radial face of the strip: the near corner at `a` to
+            // the near corner at `b` on that face.
+            let mut faces: Vec<FaceKey> = Vec::new();
+            for record in corner_vert {
+                if record.edge == edge && !faces.contains(&record.face) {
+                    faces.push(record.face);
+                }
+            }
+            for face in faces {
+                let near_a = near_corner(corner_vert, edge, a, face);
+                let near_b = near_corner(corner_vert, edge, b, face);
+                if near_a == near_b {
+                    continue; // a collapsed through-junction side, no long edge
+                }
+                if let Some(long_edge) = self.query_edge_exists(near_a, near_b) {
+                    if seam {
+                        self.set_edge_seam(long_edge, true);
+                    }
+                    if sharp {
+                        self.set_edge_sharp(long_edge, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bridge the seam / sharp flag across one junction's patch ring segments
+    /// (BEVEL.md §6.7.4 — mechanism (2), gated by `mark_seam` / `mark_sharp`).
+    ///
+    /// The junction's boundverts `B_0, …, B_(s-1)` are in disk-sector order, with
+    /// `opening_edges[k]` the beveled edge `g_k` opening sector `k` (boundvert
+    /// `B_k` lives in that sector). The patch ring segment between consecutive
+    /// boundverts `(B_(m-1), B_m)` is crossed by the beveled edge `g_m` that
+    /// separates the two adjacent sectors. So each patch segment maps one-to-one to
+    /// a beveled edge it crosses — this `segment ↔ crossing-edge` bijection is the
+    /// ordering-robust frame the bridging walks (it does not depend on which
+    /// boundvert a seamed edge is arbitrarily "anchored" to).
+    ///
+    /// To run the seam continuously around the junction, every pair of *consecutive*
+    /// seamed beveled edges (in cyclic disk order) is joined: the forward arc from
+    /// one seamed edge to the next flags the patch segments crossed by every
+    /// beveled edge strictly after the first up to and including the second. The
+    /// union of all such arcs flags exactly the segments lying between seamed edges
+    /// — which for a junction whose only gap sits between two seamed edges (e.g. the
+    /// three-edge cube corner with the middle edge unseamed) closes the whole ring.
+    ///
+    /// `seam` and `sharp` run the identical walk on independent bits.
+    fn bridge_junction_flags(
+        &mut self,
+        patch: &JunctionPatch,
+        edge_seam_state: &[(EdgeKey, bool, bool)],
+        seam: bool,
+        sharp: bool,
+    ) {
+        let count = patch.boundverts.len();
+        if count < 2 {
+            return;
+        }
+
+        let flag_of = |edge: EdgeKey, want_seam: bool| -> bool {
+            edge_seam_state
+                .iter()
+                .find_map(|&(e, s, h)| (e == edge).then_some(if want_seam { s } else { h }))
+                .unwrap_or(false)
+        };
+
+        // `segment_edge(m)` returns the patch segment `(B_(m-1), B_m)`, crossed by
+        // the beveled edge `g_m = opening_edges[m]`.
+        let segment_edge = |m: usize, this: &Self| -> Option<EdgeKey> {
+            let a = patch.boundverts[(m + count - 1) % count];
+            let b = patch.boundverts[m];
+            this.query_edge_exists(a, b)
+        };
+
+        let mut bridge = |want_seam: bool, this: &mut Self| {
+            // The cyclic indices of seamed beveled edges (`g_k` flagged).
+            let flagged: Vec<usize> = (0..count)
+                .filter(|&k| flag_of(patch.opening_edges[k], want_seam))
+                .collect();
+            // A single seamed edge has nothing to run *to*; none has nothing at all.
+            if flagged.len() < 2 {
+                return;
+            }
+
+            // Join each seamed edge `g_i` to the next seamed edge `g_j` forward:
+            // flag the patch segments crossed by `g_(i+1), …, g_j`.
+            for window in 0..flagged.len() {
+                let i = flagged[window];
+                let j = flagged[(window + 1) % flagged.len()];
+                let mut m = (i + 1) % count;
+                loop {
+                    if let Some(segment) = segment_edge(m, this) {
+                        if want_seam {
+                            this.set_edge_seam(segment, true);
+                        } else {
+                            this.set_edge_sharp(segment, true);
+                        }
+                    }
+                    if m == j {
+                        break;
+                    }
+                    m = (m + 1) % count;
+                }
+            }
+        };
+
+        if seam {
+            bridge(true, self);
+        }
+        if sharp {
+            bridge(false, self);
+        }
+    }
+
     /// Re-stitch one face incident to a beveled edge's endpoint(s) (BEVEL.md §7.4
     /// / §7.5). The two radial faces swap each beveled-edge endpoint corner for the
     /// single matching strip vert (1-for-1); every other face swaps an endpoint
@@ -1453,7 +1657,7 @@ impl LoopMesh {
         // EdgeKey is recorded against the original mesh and survives the in-place
         // re-point below (same key / same CD slot), so it is still readable after
         // the rebuild mints the chamfer edge.
-        let mut chamfer_cd: Vec<(VertexKey, VertexKey, EdgeKey)> = Vec::new();
+        let mut chamfer_cd: Vec<ChamferInheritance> = Vec::new();
 
         let mut rebuilds: Vec<(FaceKey, Vec<VertexKey>)> = Vec::with_capacity(faces.len());
         for &face in &faces {
@@ -1485,7 +1689,19 @@ impl LoopMesh {
                     // (leading_ring, trailing_ring) inherits the per-edge CD of the
                     // **outgoing** original edge — the owning edge of the cap's
                     // leading endpoint (`trailing_ring` in this incident-face walk).
-                    chamfer_cd.push((leading_ring, trailing_ring, outgoing_edge));
+                    //
+                    // §6.7.1.1: its seam / sharp bit, however, is the *logical AND*
+                    // of the two flanking owning edges — the leading owner
+                    // `incoming_edge` (`e_i`) and the trailing owner `outgoing_edge`
+                    // (`e_(i+1)`) — so a single seamed incident edge leaves no
+                    // dead-end spur on the cap. Record both owners.
+                    chamfer_cd.push(ChamferInheritance {
+                        leading_ring,
+                        trailing_ring,
+                        cd_owner: outgoing_edge,
+                        leading_owner: incoming_edge,
+                        trailing_owner: outgoing_edge,
+                    });
 
                     new_cycle.push(leading_ring);
                     new_cycle.push(trailing_ring);
@@ -1518,11 +1734,27 @@ impl LoopMesh {
         // needed). The chamfer edge joins two ring verts of one corner — never a
         // re-pointed surviving edge — so copying here cannot clobber a re-pointed
         // edge's own preserved CD.
-        for (leading_ring, trailing_ring, owning_edge) in chamfer_cd {
-            if let Some(chamfer_edge) = self.query_edge_exists(leading_ring, trailing_ring) {
-                self.edge_attribs
-                    .copy_into(chamfer_edge.as_usize(), owning_edge.as_usize());
-            }
+        for inheritance in chamfer_cd {
+            let Some(chamfer_edge) =
+                self.query_edge_exists(inheritance.leading_ring, inheritance.trailing_ring)
+            else {
+                continue;
+            };
+            self.edge_attribs
+                .copy_into(chamfer_edge.as_usize(), inheritance.cd_owner.as_usize());
+
+            // §6.7.1.1: the whole-block copy above carried the trailing owner's
+            // seam / sharp bit (mechanism (1)'s raw §6.5.1 copy). The corner
+            // segment keeps the flag only when *both* flanking owners carry it, so
+            // re-derive each bit as the AND of the leading and trailing owners,
+            // overriding whatever the block copy left. Unconditional — not gated by
+            // `mark_seam` / `mark_sharp` (§6.7.1 mechanism (1)).
+            let seam = self.edge_seam(inheritance.leading_owner)
+                && self.edge_seam(inheritance.trailing_owner);
+            let sharp = self.edge_sharp(inheritance.leading_owner)
+                && self.edge_sharp(inheritance.trailing_owner);
+            self.set_edge_seam(chamfer_edge, seam);
+            self.set_edge_sharp(chamfer_edge, sharp);
         }
     }
 
@@ -1710,6 +1942,23 @@ struct CapFace {
     chamfer_edges: Vec<EdgeKey>,
 }
 
+/// How one freshly-minted chamfer edge `(leading_ring, trailing_ring)` inherits
+/// its per-edge attributes from the original incident edges of the beveled corner.
+///
+/// - `cd_owner` is the owning edge whose whole per-edge attribute block the
+///   chamfer copies (BEVEL.md §6.5.1, cap-frame leading = the outgoing edge).
+/// - `leading_owner` / `trailing_owner` are the two original incident edges
+///   flanking the corner segment (the leading owner `e_i` of `leading_ring` and
+///   the trailing owner `e_(i+1)` of `trailing_ring`). The chamfer's seam / sharp
+///   bit is the AND of these two (BEVEL.md §6.7.1.1), overriding the block copy.
+struct ChamferInheritance {
+    leading_ring: VertexKey,
+    trailing_ring: VertexKey,
+    cd_owner: EdgeKey,
+    leading_owner: EdgeKey,
+    trailing_owner: EdgeKey,
+}
+
 /// One (beveled edge, endpoint, adjacent face) corner of an edge-bevel junction
 /// group and the **near-corner vert** its strip lands on there (BEVEL.md §7.6.1):
 /// a fresh strip vert at a terminal endpoint, or a shared sector boundvert at a
@@ -1727,6 +1976,12 @@ struct CornerVert {
 struct JunctionPatch {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
+    /// Per boundvert, the beveled edge that *opens* that sector in disk order
+    /// (`g_k` for boundvert `B_k`, BEVEL.md §7.6.1). The patch edge between
+    /// consecutive boundverts `(B_(k-1), B_k)` is crossed by `opening_edges[k]`, so
+    /// this maps each junction bridging segment to the beveled edge it bridges,
+    /// for the §6.7.4 seam / sharp bridging.
+    opening_edges: Vec<EdgeKey>,
 }
 
 /// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
@@ -3562,6 +3817,465 @@ mod tests {
             2,
             "default material is -1 (inherit), so the cap takes the adjacent slot 2"
         );
+    }
+
+    // ---- mark_seam / mark_sharp (BEVEL.md §6.7) ----
+
+    /// The chamfer edge between the ring verts at `near_a` and `near_b`, by
+    /// position. Panics if either ring vert or the edge between them is absent.
+    fn chamfer_edge(mesh: &LoopMesh, near_a: Vec3, near_b: Vec3) -> EdgeKey {
+        let a = vert_at(mesh, near_a);
+        let b = vert_at(mesh, near_b);
+        mesh.query_edge_exists(a, b)
+            .expect("the chamfer edge between these two ring verts exists")
+    }
+
+    /// BEVEL.md §6.7.1.1: a corner segment (chamfer edge) carries the inherited
+    /// seam flag **only when both flanking owning edges are seamed**. A *single*
+    /// seamed incident edge of a beveled corner therefore flags **no** chamfer
+    /// edge — the contiguity AND suppresses the dead-end spur the plain §6.5.1 copy
+    /// would have left on the two chamfers touching that edge's ring vert.
+    #[test]
+    fn single_seamed_incident_edge_flags_no_chamfer() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        // Seam only e0 = {v0, v1} of corner v0 = (1,-1,-1).
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let e0 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+        mesh.set_edge_seam(e0, true);
+
+        let v0 = vert_at(&mesh, p0);
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        // Ring verts: r_e0 = (0.5,-1,-1), r_e3 = (1,-0.5,-1), r_e8 = (1,-1,-0.5).
+        let r_e0 = Vec3::new(0.5, -1.0, -1.0);
+        let r_e3 = Vec3::new(1.0, -0.5, -1.0);
+        let r_e8 = Vec3::new(1.0, -1.0, -0.5);
+
+        // Every chamfer has exactly one seamed owner, so none is seamed (§6.7.1.1).
+        for &(a, b) in &[(r_e0, r_e3), (r_e3, r_e8), (r_e8, r_e0)] {
+            let chamfer = chamfer_edge(&mesh, a, b);
+            assert!(
+                !mesh.edge_seam(chamfer),
+                "chamfer {a:?}-{b:?} has one seamed owner only; the §6.7.1.1 AND \
+                 suppresses the seam spur",
+            );
+        }
+
+        // The surviving re-pointed e0 keeps its own seam (mechanism (1) item 1).
+        let r_e0_vert = vert_at(&mesh, r_e0);
+        assert!(
+            mesh.edge_seam(e0) && mesh.edge_keys().contains(&e0),
+            "the surviving re-pointed e0 keeps its seam",
+        );
+        assert!(
+            mesh.edge_vert_keys(e0).contains(&r_e0_vert),
+            "e0 is re-pointed onto its ring vert r_e0",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.1.1: two adjacent seamed incident edges flag the **one**
+    /// chamfer edge running directly between their two ring verts (its two flanking
+    /// owners are both seamed), and **only** that one — the other two chamfers each
+    /// have an unseamed owner and stay unseamed. The sharp bit follows the
+    /// identical AND on its own bit.
+    #[test]
+    fn two_adjacent_seamed_incident_edges_flag_their_one_chamfer() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let e0 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0)); // -> r_e0
+        let e3 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0)); // -> r_e3
+        // Seam e0 + e3; sharp the same pair to cover the sharp bit identically.
+        mesh.set_edge_seam(e0, true);
+        mesh.set_edge_seam(e3, true);
+        mesh.set_edge_sharp(e0, true);
+        mesh.set_edge_sharp(e3, true);
+
+        let v0 = vert_at(&mesh, p0);
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        let r_e0 = Vec3::new(0.5, -1.0, -1.0);
+        let r_e3 = Vec3::new(1.0, -0.5, -1.0);
+        let r_e8 = Vec3::new(1.0, -1.0, -0.5);
+
+        // The chamfer between r_e0 and r_e3 has both owners (e0, e3) seamed/sharp.
+        let between = chamfer_edge(&mesh, r_e0, r_e3);
+        assert!(mesh.edge_seam(between), "the (r_e0,r_e3) chamfer is seamed");
+        assert!(mesh.edge_sharp(between), "the (r_e0,r_e3) chamfer is sharp");
+
+        // The other two chamfers each have one unseamed owner (e8) and stay clear.
+        for &(a, b) in &[(r_e3, r_e8), (r_e8, r_e0)] {
+            let chamfer = chamfer_edge(&mesh, a, b);
+            assert!(
+                !mesh.edge_seam(chamfer),
+                "chamfer {a:?}-{b:?} has an unseamed owner; not seamed (§6.7.1.1)",
+            );
+            assert!(
+                !mesh.edge_sharp(chamfer),
+                "chamfer {a:?}-{b:?} has a smooth owner; not sharp (§6.7.1.1)",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.1.1: all three incident edges seamed flags **every** chamfer
+    /// (each chamfer's two owners are both seamed) — the cap's ring is a continuous
+    /// seam loop.
+    #[test]
+    fn all_incident_edges_seamed_flag_every_chamfer() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        for far in [
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ] {
+            let edge = cube_edge(&mesh, p0, far);
+            mesh.set_edge_seam(edge, true);
+        }
+
+        let v0 = vert_at(&mesh, p0);
+        mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.5,
+                ..Default::default()
+            },
+        );
+
+        let r_e0 = Vec3::new(0.5, -1.0, -1.0);
+        let r_e3 = Vec3::new(1.0, -0.5, -1.0);
+        let r_e8 = Vec3::new(1.0, -1.0, -0.5);
+        for &(a, b) in &[(r_e0, r_e3), (r_e3, r_e8), (r_e8, r_e0)] {
+            let chamfer = chamfer_edge(&mesh, a, b);
+            assert!(
+                mesh.edge_seam(chamfer),
+                "all owners seamed -> chamfer {a:?}-{b:?} is seamed (§6.7.1.1)",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.2: `mark_seam` / `mark_sharp` are **inert** for vertex bevel —
+    /// no two beveled edges meet at the corner, so mechanism (2) never fires. The
+    /// parameter-ON run must produce the same topology *and* the same per-edge seam
+    /// / sharp flags as the parameter-OFF run; the flags ride mechanism (1)
+    /// identically either way.
+    #[test]
+    fn vertex_bevel_mark_seam_sharp_is_inert() {
+        // Seam/sharp two adjacent incident edges so mechanism (1) *does* flag a
+        // chamfer — the inertness claim must hold even when flags are present.
+        let build = |mark: bool| -> Vec<((u32, u32, u32), (u32, u32, u32), bool, bool)> {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let p0 = Vec3::new(1.0, -1.0, -1.0);
+            let e0 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+            let e3 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0));
+            mesh.set_edge_seam(e0, true);
+            mesh.set_edge_seam(e3, true);
+            mesh.set_edge_sharp(e0, true);
+            mesh.set_edge_sharp(e3, true);
+
+            let v0 = vert_at(&mesh, p0);
+            mesh.bevel(
+                &[v0.into()],
+                BevelOptions {
+                    offset: 0.5,
+                    mark_seam: mark,
+                    mark_sharp: mark,
+                    ..Default::default()
+                },
+            );
+
+            // Read every edge's (endpoints, seam, sharp) so on/off are comparable
+            // by geometry (keys differ run-to-run; positions are stable). Positions
+            // are bit-cast to ordered integer keys for a stable sort.
+            let key = |p: Vec3| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
+            let mut flags: Vec<((u32, u32, u32), (u32, u32, u32), bool, bool)> = mesh
+                .edge_keys()
+                .into_iter()
+                .map(|e| {
+                    let [a, b] = mesh.edge_vert_keys(e);
+                    let mut ka = key(mesh.vertex_position(a));
+                    let mut kb = key(mesh.vertex_position(b));
+                    if kb < ka {
+                        std::mem::swap(&mut ka, &mut kb);
+                    }
+                    (ka, kb, mesh.edge_seam(e), mesh.edge_sharp(e))
+                })
+                .collect();
+            flags.sort();
+            flags
+        };
+
+        let on = build(true);
+        let off = build(false);
+        assert_eq!(
+            on, off,
+            "mark_seam / mark_sharp are inert for vertex bevel (§6.7.2): on == off",
+        );
+    }
+
+    /// BEVEL.md §6.7.3: `mark_seam` / `mark_sharp` are inert for an isolated single
+    /// beveled edge too — each endpoint sees one beveled edge, failing mechanism
+    /// (2)'s "two or more" precondition. Parameter-ON topology + flags must equal
+    /// parameter-OFF.
+    #[test]
+    fn isolated_edge_bevel_mark_seam_is_inert() {
+        let build = |mark: bool| -> Vec<((u32, u32, u32), (u32, u32, u32), bool)> {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let edge = cube_edge(
+                &mesh,
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+            );
+            mesh.set_edge_seam(edge, true);
+
+            mesh.bevel(
+                &[edge.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    mark_seam: mark,
+                    ..Default::default()
+                },
+            );
+
+            let key = |p: Vec3| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
+            let mut flags: Vec<((u32, u32, u32), (u32, u32, u32), bool)> = mesh
+                .edge_keys()
+                .into_iter()
+                .map(|e| {
+                    let [a, b] = mesh.edge_vert_keys(e);
+                    let mut ka = key(mesh.vertex_position(a));
+                    let mut kb = key(mesh.vertex_position(b));
+                    if kb < ka {
+                        std::mem::swap(&mut ka, &mut kb);
+                    }
+                    (ka, kb, mesh.edge_seam(e))
+                })
+                .collect();
+            flags.sort();
+            flags
+        };
+
+        assert_eq!(
+            build(true),
+            build(false),
+            "mark_seam is inert for an isolated single beveled edge (§6.7.3)",
+        );
+    }
+
+    /// Round a position to a stable integer key for set membership (the bevel
+    /// positions here are exact multiples of 0.25 up to f32 noise).
+    fn pos_key(p: Vec3) -> (i32, i32, i32) {
+        let q = |x: f32| (x * 4.0).round() as i32;
+        (q(p.x), q(p.y), q(p.z))
+    }
+
+    /// An undirected edge as the sorted pair of its endpoint position keys.
+    fn edge_pos_pair(
+        mesh: &LoopMesh,
+        edge: EdgeKey,
+    ) -> ((i32, i32, i32), (i32, i32, i32)) {
+        let [a, b] = mesh.edge_vert_keys(edge);
+        let mut ka = pos_key(mesh.vertex_position(a));
+        let mut kb = pos_key(mesh.vertex_position(b));
+        if kb < ka {
+            std::mem::swap(&mut ka, &mut kb);
+        }
+        (ka, kb)
+    }
+
+    /// The set of NEW (result) edges carrying `flag` (seam or sharp), as sorted
+    /// endpoint position-key pairs — an ordering-independent fingerprint.
+    fn flagged_new_edge_set(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        flag: impl Fn(&LoopMesh, EdgeKey) -> bool,
+    ) -> std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))> {
+        result
+            .edges
+            .iter()
+            .filter(|&&e| mesh.edge_keys().contains(&e) && flag(mesh, e))
+            .map(|&e| edge_pos_pair(mesh, e))
+            .collect()
+    }
+
+    /// The three-edge cube-corner junction the bridging arm pins (BEVEL.md §6.7.4):
+    /// v0 = [1,-1,-1], edges e01/e03/e04 beveled at offset 0.25, with the two
+    /// flanking edges e01 (toward [-1,-1,-1]) and e04 (toward [1,-1,1]) flagged and
+    /// e03 (toward [1,1,-1]) the unflagged gap. Returns the beveled mesh + result.
+    fn bevel_three_edge_junction_with_flag(
+        set_flag: impl Fn(&mut LoopMesh, EdgeKey),
+        options: BevelOptions,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let e01 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, p0, Vec3::new(1.0, -1.0, 1.0));
+        set_flag(&mut mesh, e01);
+        set_flag(&mut mesh, e04);
+        let result = mesh.bevel(&[e01.into(), e03.into(), e04.into()], options);
+        (mesh, result)
+    }
+
+    /// The cube corner v0's boundvert ring (the three patch ring positions at
+    /// offset 0.25) and the four parallel strip long edges of the two seamed
+    /// beveled edges e01 / e04. Position keys are in 0.25 units (`pos_key`).
+    fn junction_expected_sets() -> (
+        std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))>,
+        std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))>,
+    ) {
+        let k = |x: f32, y: f32, z: f32| pos_key(Vec3::new(x, y, z));
+        let pair = |a: (i32, i32, i32), b: (i32, i32, i32)| {
+            if a <= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        // Boundverts B0/B1/B2 of v0's junction at offset 0.25.
+        let b0 = k(0.75, -0.75, -1.0);
+        let b1 = k(0.75, -1.0, -0.75);
+        let b2 = k(1.0, -0.75, -0.75);
+        // The three patch ring (bridging) segments.
+        let ring: std::collections::BTreeSet<_> =
+            [pair(b0, b1), pair(b0, b2), pair(b1, b2)].into_iter().collect();
+        // The four parallel strip long edges of e01 (to its two v1-strip verts) and
+        // e04 (to its two v4-strip verts) — mechanism (1).
+        let parallel: std::collections::BTreeSet<_> = [
+            pair(b0, k(-1.0, -0.75, -1.0)),
+            pair(b1, k(-1.0, -1.0, -0.75)),
+            pair(b1, k(0.75, -1.0, 1.0)),
+            pair(b2, k(1.0, -0.75, 1.0)),
+        ]
+        .into_iter()
+        .collect();
+        (ring, parallel)
+    }
+
+    /// BEVEL.md §6.7.1 mechanism (1) is UNCONDITIONAL — with `mark_seam = false`
+    /// the two seamed beveled edges still seam their four parallel strip long edges
+    /// (the edges descending from their re-stitched faces). The patch ring segments
+    /// stay unseamed (no parameter-gated bridging). This pins the unconditional
+    /// inheritance path independently of the parameter.
+    #[test]
+    fn junction_mechanism_one_inherits_with_mark_seam_off() {
+        let (mesh, result) = bevel_three_edge_junction_with_flag(
+            |m, e| m.set_edge_seam(e, true),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                mark_seam: false,
+                ..Default::default()
+            },
+        );
+        let (ring, parallel) = junction_expected_sets();
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+        assert_eq!(
+            seamed, parallel,
+            "mark_seam=false still seams exactly the four parallel strip long edges \
+             of e01/e04 via mechanism (1) (§6.7.1); no patch ring segment is seamed",
+        );
+        assert!(
+            seamed.is_disjoint(&ring),
+            "no patch ring (bridging) segment may be seamed with mark_seam off",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.4 mechanism (2): with `mark_seam = true` the seam bridges the
+    /// e03 gap and runs continuously around the whole junction, so the FULL patch
+    /// ring (all three bridging segments) is seamed — *in addition to* the four
+    /// mechanism-(1) parallel edges that are already seamed regardless. Pins the
+    /// exact bridged edge set, not just a count.
+    #[test]
+    fn junction_mechanism_two_bridges_full_ring_with_mark_seam_on() {
+        let (mesh, result) = bevel_three_edge_junction_with_flag(
+            |m, e| m.set_edge_seam(e, true),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                mark_seam: true,
+                ..Default::default()
+            },
+        );
+        let (ring, parallel) = junction_expected_sets();
+        let mut expected = parallel.clone();
+        expected.extend(ring.iter().copied());
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+        assert_eq!(
+            seamed, expected,
+            "mark_seam=true seams the four mechanism-(1) parallel edges PLUS the full \
+             patch ring (all three bridging segments, §6.7.4) — the seam runs \
+             continuously e01 -> e03 (gap) -> e04 around the junction",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.4: `mark_sharp` runs the identical bridging on the sharp bit,
+    /// independently of `mark_seam`. With it on, the same full ring + four parallel
+    /// edges are sharp; with it off, only the four parallel edges (mechanism (1)).
+    #[test]
+    fn junction_mark_sharp_bridges_full_ring_and_inherits_unconditionally() {
+        let (ring, parallel) = junction_expected_sets();
+
+        let (mesh_off, result_off) = bevel_three_edge_junction_with_flag(
+            |m, e| m.set_edge_sharp(e, true),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                mark_sharp: false,
+                ..Default::default()
+            },
+        );
+        let sharp_off = flagged_new_edge_set(&mesh_off, &result_off, |m, e| m.edge_sharp(e));
+        assert_eq!(
+            sharp_off, parallel,
+            "mark_sharp=false still sharpens the four parallel strip long edges \
+             (mechanism (1), §6.7.1), no ring segment",
+        );
+
+        let (mesh_on, result_on) = bevel_three_edge_junction_with_flag(
+            |m, e| m.set_edge_sharp(e, true),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                mark_sharp: true,
+                ..Default::default()
+            },
+        );
+        let mut expected = parallel.clone();
+        expected.extend(ring.iter().copied());
+        let sharp_on = flagged_new_edge_set(&mesh_on, &result_on, |m, e| m.edge_sharp(e));
+        assert_eq!(
+            sharp_on, expected,
+            "mark_sharp=true bridges the full ring on the sharp bit (§6.7.4)",
+        );
+        mesh_off.validate_topology();
+        mesh_on.validate_topology();
     }
 }
 
