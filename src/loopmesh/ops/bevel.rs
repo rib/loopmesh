@@ -219,13 +219,14 @@ impl LoopMesh {
             return result;
         }
 
-        // The multi-segment cutoff edge-bevel junction (BEVEL.md §8.2 / §8.3) is
-        // the only `segments ≥ 2` path implemented; everything else still no-ops
-        // for `segments != 1` (the ADJ grid / vertex multi-segment are stubs).
+        // The multi-segment edge-bevel junction (BEVEL.md §8.2 / §8.3 / §8.5) is the
+        // only `segments ≥ 2` path implemented; vertex multi-segment still no-ops.
+        // Both vmesh methods (Cutoff flat fill §8.3, Adj rounded fill §8.5) share
+        // the same [P] ring / [S] chains / multi-segment strips; they differ only
+        // in the junction fill. ADJ is distilled for the forced `segments = 2`
+        // 3-way cube-corner case (§8.5); other ADJ cases still no-op below.
         if options.segments >= 2 {
-            if options.affect == BevelAffect::Edges
-                && options.vmesh_method == BevelVmeshMethod::Cutoff
-            {
+            if options.affect == BevelAffect::Edges {
                 return self.bevel_edges(geom, &options);
             }
             return result;
@@ -845,9 +846,19 @@ impl LoopMesh {
             );
         }
 
-        // Phase 4: the cutoff fill at each junction (§8.3.2 / §8.3.4).
+        // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
+        // adjacency grid (§8.5), per `vmesh_method`. ADJ is implemented only for
+        // the forced `segments = 2` 3-way cube-corner (§8.5); a junction outside
+        // that forced case takes no ADJ fill (the general grid is a stub, §8.5.5).
         for cut in &junction_cuts {
-            self.build_cutoff_fill(cut, &chains, segments, material, result);
+            match options.vmesh_method {
+                BevelVmeshMethod::Cutoff => {
+                    self.build_cutoff_fill(cut, &chains, segments, material, result);
+                }
+                BevelVmeshMethod::Adj => {
+                    self.build_adj_fill(cut, &chains, segments, material, result);
+                }
+            }
         }
 
         // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
@@ -1288,6 +1299,128 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+            self.assign_bevel_face_material(face, material, representative);
+            result.faces.push(face);
+            self.collect_face_edges(face, result);
+        }
+    }
+
+    /// Build the rounded adjacency-grid fill at one junction (BEVEL.md §8.5),
+    /// distilled for the forced `segments = 2` 3-way (cube-corner) case: a
+    /// three-quad pinwheel meeting at one welded central apex.
+    ///
+    /// Per §8.5.3 each sector `i` contributes one quad whose corners are
+    /// `B_i` (`(i,0,0)`), sector `i`'s interior chain vert (`(i,0,1)`), the central
+    /// apex (`(i,1,1)`), and sector `i−1`'s interior chain vert (`(i,1,0)`, the
+    /// shared seam vert with the previous sector). The three apex corners weld to
+    /// one vertex, placed closed-form (§8.5.2): the `unit_to_corner` body-diagonal
+    /// direction snapped onto the rounded surface the ring + chain verts lie on, so
+    /// the apex sits *on* the dome rather than pushed down into the solid (§8.5.3).
+    ///
+    /// Only the forced case is handled: exactly three sectors, each with a single
+    /// lone interior chain vert (`segments = 2`). Any other shape is left unfilled
+    /// (the general adjacency grid is a stub, §8.5.5).
+    fn build_adj_fill(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        material: i32,
+        result: &mut BevelResult,
+    ) {
+        let count = cut.boundverts.len();
+        // §8.5: the forced tri-corner case is exactly three sectors at one segment
+        // of fill (`segments = 2`). Higher valence / larger segments are the §8.5.5
+        // general-grid stub.
+        if count != 3 || segments != 2 {
+            return;
+        }
+
+        // Sector i's interior chain vert (i,0,1): the lone interior sample of the
+        // chain that *starts* at B_i (B_i → B_{i+1}).
+        let mut interior_of_sector: Vec<VertexKey> = Vec::with_capacity(count);
+        for k in 0..count {
+            let start = cut.boundverts[k];
+            let next = cut.boundverts[(k + 1) % count];
+            let chain = chains.iter().find(|c| {
+                c.endpoint == cut.vertex
+                    && ((c.start == start && c.end == next) || (c.start == next && c.end == start))
+            });
+            match chain.and_then(|c| c.interior.first().copied()) {
+                Some(interior) => interior_of_sector.push(interior),
+                // A degenerate sector with no interior sample (collinear chain) is
+                // outside the forced cube-corner regime; skip the whole fill.
+                None => return,
+            }
+        }
+
+        let representative = cut.representative_material(self);
+
+        // §8.5.2 closed-form apex. The affine `unit_to_corner` axis-map ((1,0,0)→B_0,
+        // (0,1,0)→B_1, (0,0,1)→B_2, origin→v) sends the unit body-diagonal point to
+        // the corner-interior direction; the apex is that direction *snapped onto the
+        // rounded surface* the ring + chain verts already lie on (the superellipsoid;
+        // for the default profile, the sphere). The naive affine image alone lands the
+        // apex at 2·offset from the corner — pushed off the surface into the solid — so
+        // the snap step is what places it on the dome (§8.5.3).
+        //
+        // That rounded surface is the sphere through the three boundverts (ring) and
+        // the sectors' interior arc samples (chain). Fit it from those on-surface
+        // verts, then take the apex as its point nearest the junction vertex along the
+        // corner's body diagonal: `c + normalize(v − c)·R`.
+        let vertex_position = self.vertex_position(cut.vertex);
+        let on_surface = [
+            self.vertex_position(cut.boundverts[0]),
+            self.vertex_position(cut.boundverts[1]),
+            self.vertex_position(cut.boundverts[2]),
+            self.vertex_position(interior_of_sector[0]),
+        ];
+        let apex_position = match circumsphere(on_surface) {
+            Some((center, radius)) => {
+                let body_diagonal = (vertex_position - center).normalize_or_zero();
+                center + body_diagonal * radius
+            }
+            // Degenerate (co-spherically deficient) ring: fall back to the affine image
+            // of the body-diagonal point so the fill still closes.
+            None => {
+                let axis_sum: Vec3 = cut.boundverts.iter().fold(Vec3::ZERO, |acc, &b| {
+                    acc + (self.vertex_position(b) - vertex_position)
+                });
+                vertex_position + axis_sum / 3.0_f32.sqrt()
+            }
+        };
+        let apex = self.create_vertex(apex_position);
+        result.verts.push(apex);
+
+        // §8.5.3: one pinwheel quad per sector, all sharing the apex. Sector i's
+        // quad is B_i → (i,0,1) → apex → (i−1,0,1).
+        for i in 0..count {
+            let before = (i + count - 1) % count;
+            let mut quad = vec![
+                cut.boundverts[i],
+                interior_of_sector[i],
+                apex,
+                interior_of_sector[before],
+            ];
+
+            // Wind opposite the strip's traversal of the shared `B_i → (i,0,1)` edge
+            // so that edge stays radial-2 against the arriving multi-segment strip
+            // (§8.5.3 / §5.1), the same share-don't-flip discipline as cutoff.
+            if let Some(strip_edge) = self.query_edge_exists(quad[0], quad[1]) {
+                let runs_forward = self
+                    .edge_loop_keys(strip_edge)
+                    .first()
+                    .map(|&l| {
+                        let start = self.loop_vertex(l);
+                        let next = self.loop_vertex(self.loop_next(l));
+                        start == quad[0] && next == quad[1]
+                    })
+                    .unwrap_or(false);
+                if runs_forward {
+                    quad.reverse();
+                }
+            }
+            let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
             self.assign_bevel_face_material(face, material, representative);
             result.faces.push(face);
             self.collect_face_edges(face, result);
@@ -3883,14 +4016,180 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// BEVEL.md §8.3: the cutoff path is gated — `segments ≥ 2` with the default
-    /// `Adj` vmesh method (the still-stubbed grid) is a no-op, as is multi-segment
-    /// vertex bevel.
-    #[test]
-    fn multisegment_adj_and_vertex_are_noops() {
+    /// Build the cube-corner `s = 3` ADJ junction at `segments = 2` (BEVEL.md §8.5).
+    /// Vertex 0 = (1,-1,-1) is the junction; its three edges to 1/3/4 are beveled
+    /// with the default rounded adjacency-grid fill.
+    fn cube_corner_adj_segments2() -> (LoopMesh, BevelResult) {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let before = counts(&mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.5.2 / §8.5.3: the `s = 3`, `segments = 2` cube-corner ADJ junction
+    /// rounds the corner with a three-quad pinwheel meeting at one welded central
+    /// apex — no bottom face. The whole cube grows 8 V / 12 E / 6 F to 20 V / 33 E /
+    /// 15 F (§8.5.3), and the result stays a closed manifold.
+    #[test]
+    fn adj_junction_segments2_topology() {
+        let (mesh, result) = cube_corner_adj_segments2();
+
+        mesh.validate_topology();
+
+        assert_eq!(
+            counts(&mesh),
+            (20, 33, 15),
+            "cube-corner ADJ seg=2 grows the cube to 20 V / 33 E / 15 F (§8.5.3)",
+        );
+
+        // §8.5.2 closed-form apex: the body-diagonal direction snapped onto the
+        // rounded surface (the sphere through the ring + chain verts, here centre
+        // (0.75,-0.75,-0.75), radius = offset 0.25). The apex is that sphere's point
+        // nearest the corner along the body diagonal: centre + offset·(1,-1,-1)/√3,
+        // i.e. ≈ (0.894, -0.894, -0.894) — on the dome, not pushed into the solid.
+        let sphere_center = Vec3::new(0.75, -0.75, -0.75);
+        let apex_position = sphere_center + 0.25 * Vec3::new(1.0, -1.0, -1.0) / 3.0_f32.sqrt();
+        let apex: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
+            .collect();
+        assert_eq!(apex.len(), 1, "the three pinwheel apex corners weld to one apex");
+        let apex = apex[0];
+
+        // §8.5.3: exactly three quad faces meet at the apex (the pinwheel).
+        let pinwheel: Vec<FaceKey> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&f| mesh.face_vert_keys(f).contains(&apex))
+            .collect();
+        assert_eq!(pinwheel.len(), 3, "three pinwheel quads share the apex");
+        for &face in &pinwheel {
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "each pinwheel cell is a quad (§8.5.3)",
+            );
+        }
+
+        // Closed manifold: every edge radial-2. The new geometry is 6 strip quads +
+        // 3 pinwheel quads = 9 new faces; with the cube's 6 originals that is 15.
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let edge = mesh.loop_edge(loop_key);
+                assert_eq!(
+                    mesh.edge_radial_iter(edge).count(),
+                    2,
+                    "every edge is shared with exactly one other face",
+                );
+            }
+        }
+        assert_eq!(result.faces.len(), 9, "6 strip quads + 3 pinwheel quads, no bottom");
+    }
+
+    /// BEVEL.md §8.5.3: the ADJ apex sits *on* the rounded surface (the body-diagonal
+    /// point snapped onto the dome, §8.5.2), distinct from the cutoff apex which is
+    /// pushed *down into* the solid (§8.3.4). The two fills share the same boundvert
+    /// ring and chains but place the central vert at different points.
+    #[test]
+    fn adj_apex_differs_from_cutoff_apex() {
+        let (adj_mesh, adj_result) = cube_corner_adj_segments2();
+        let (cut_mesh, _cut_result) = cube_corner_cutoff_segments2();
+
+        let sphere_center = Vec3::new(0.75, -0.75, -0.75);
+        let adj_apex = sphere_center + 0.25 * Vec3::new(1.0, -1.0, -1.0) / 3.0_f32.sqrt();
+        let cutoff_apex = Vec3::new(0.75, -0.75, -0.75);
+
+        // The ADJ apex lands on the rounded surface (snapped body-diagonal point)...
+        assert_eq!(
+            adj_result
+                .verts
+                .iter()
+                .filter(|&&v| (adj_mesh.vertex_position(v) - adj_apex).length() < 1.0e-4)
+                .count(),
+            1,
+        );
+        // ...which is a different position bucket from the cutoff apex.
+        assert!(
+            (adj_apex - cutoff_apex).length() > 1.0e-2,
+            "ADJ apex (rounded surface) differs from cutoff apex (pushed down)",
+        );
+        // And no ADJ vert lands at the cutoff apex.
+        assert_eq!(
+            adj_result
+                .verts
+                .iter()
+                .filter(|&&v| (adj_mesh.vertex_position(v) - cutoff_apex).length() < 1.0e-4)
+                .count(),
+            0,
+        );
+        // Sanity: the cutoff fixture still has its own apex where expected.
+        assert!(cut_mesh
+            .vert_keys()
+            .into_iter()
+            .any(|v| (cut_mesh.vertex_position(v) - cutoff_apex).length() < 1.0e-4));
+    }
+
+    /// BEVEL.md §8.5.2: the ADJ junction reuses the same segment-count-independent
+    /// boundvert ring (§8.2.1) and the same arc-sampled interior chain verts
+    /// (§8.3.6) as cutoff — only the junction fill differs. The three boundverts sit
+    /// offset·√2 from the corner and the interior chain verts sit at the arc 45°
+    /// point (radius offset from the per-cell arc center), exactly as cutoff.
+    #[test]
+    fn adj_segments2_ring_and_chain_match_cutoff() {
+        let (mesh, result) = cube_corner_adj_segments2();
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let expected = 0.25 * 2.0_f32.sqrt();
+
+        let ring_verts = result
+            .verts
+            .iter()
+            .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - expected).abs() < 1.0e-4)
+            .count();
+        assert_eq!(ring_verts, 3, "three §7.6.2 boundverts, unchanged by vmesh method");
+
+        // The Front-Bottom interior chain vert across edge {0,1} is the arc 45° point
+        // (§8.3.6), shared with cutoff — not the straight chord midpoint.
+        let arc_point = Vec3::new(0.75, -0.926_776_7, -0.926_776_7);
+        let chord_midpoint = Vec3::new(0.75, -0.875, -0.875);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, arc_point),
+            1,
+            "interior chain vert is the arc 45° sample, shared with cutoff",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, chord_midpoint),
+            0,
+            "no interior chain vert at the straight chord midpoint",
+        );
+    }
+
+    /// BEVEL.md §8.5.5: ADJ outside the forced `segments = 2` 3-way cube-corner is
+    /// still a stub. A two-edge (`s = 2`) junction takes no pinwheel fill (the
+    /// through-strips still build, exactly as cutoff), and there is no central apex.
+    /// Multi-segment vertex bevel also remains a no-op.
+    #[test]
+    fn adj_non_forced_and_vertex_are_stubbed() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
         let e01 = cube_edge(
             &mesh,
             Vec3::new(1.0, -1.0, -1.0),
@@ -3898,8 +4197,9 @@ mod tests {
         );
         let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
 
-        // segments ≥ 2 + Adj fill: still a stub, no-op.
-        mesh.bevel(
+        // s = 2 junction at v0, ADJ: no pinwheel fill (the general grid is a stub),
+        // but the through-strip geometry still builds and the mesh stays manifold.
+        let result = mesh.bevel(
             &[e01.into(), e03.into()],
             BevelOptions {
                 offset: 0.25,
@@ -3909,17 +4209,27 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(counts(&mesh), before, "segments≥2 + Adj is a no-op");
+        mesh.validate_topology();
+        // No welded central apex: with s = 2 the §8.5 forced case does not apply.
+        // The apex would have sat along the corner's interior body diagonal; assert
+        // there is no extra fan-center vert by checking the new faces are only the
+        // through-strip quads (4 = 2 edges × 2 segments), no pinwheel quad.
+        assert_eq!(
+            result.faces.len(),
+            4,
+            "s=2 ADJ junction: through-strips only, no pinwheel fill (§8.5.5)",
+        );
 
         // segments ≥ 2 vertex bevel: still a stub, no-op.
-        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let before = counts(&mesh);
+        let v_far = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
         mesh.bevel(
-            &[v0.into()],
+            &[v_far.into()],
             BevelOptions {
                 offset: 0.25,
                 affect: BevelAffect::Vertices,
                 segments: 2,
-                vmesh_method: BevelVmeshMethod::Cutoff,
+                vmesh_method: BevelVmeshMethod::Adj,
                 ..Default::default()
             },
         );
@@ -5786,6 +6096,31 @@ fn line_line_nearest_on_first(p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3) -> Option<
     }
     let t = (b * e - c * d) / denominator;
     Some(p0 + d0n * t)
+}
+
+/// The sphere (center, radius) through four points (BEVEL.md §8.5.2: the rounded
+/// surface the ADJ tri-corner's ring + chain verts lie on). Solves the three
+/// equidistance planes `|x − p_i|² = |x − p_0|²`. `None` when the four points are
+/// (near-)coplanar so the system is singular.
+fn circumsphere(points: [Vec3; 4]) -> Option<(Vec3, f32)> {
+    let base = points[0];
+    let mut rows = [Vec3::ZERO; 3];
+    let mut rhs = [0.0_f32; 3];
+    for i in 0..3 {
+        let p = points[i + 1];
+        rows[i] = 2.0 * (p - base);
+        rhs[i] = p.length_squared() - base.length_squared();
+    }
+    let m = glam::Mat3::from_cols(
+        Vec3::new(rows[0].x, rows[1].x, rows[2].x),
+        Vec3::new(rows[0].y, rows[1].y, rows[2].y),
+        Vec3::new(rows[0].z, rows[1].z, rows[2].z),
+    );
+    if m.determinant().abs() <= 1.0e-9 {
+        return None;
+    }
+    let center = m.inverse() * Vec3::new(rhs[0], rhs[1], rhs[2]);
+    Some((center, (center - base).length()))
 }
 
 /// Intersect the line `point + t·direction` with the plane through `plane_point`
