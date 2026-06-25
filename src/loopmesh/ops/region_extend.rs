@@ -327,6 +327,18 @@ mod tests {
         ring.iter().copied().collect()
     }
 
+    /// `grid_3x3` (four quads sharing the centre vert 4) plus one face-less wire
+    /// edge dangling off the centre vert; the wire's tip vertex is lifted off the
+    /// grid plane so the edge is unambiguously face-less. Returns the mesh, the 9
+    /// lattice verts, the 4 faces, the wire edge, and its tip vert.
+    fn grid_3x3_wire_at_center(
+    ) -> (LoopMesh, Vec<VertexKey>, Vec<FaceKey>, EdgeKey, VertexKey) {
+        let (mut mesh, verts, faces) = vertex_lattice(3);
+        let tip = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
+        let wire = mesh.create_edge([verts[4], tip], EdgeCreateFlags::NO_DUPLICATE);
+        (mesh, verts, faces, wire, tip)
+    }
+
     fn vert_set(mesh: &LoopMesh, idx: &[usize], verts: &[VertexKey]) -> HashSet<GeomKey> {
         let _ = mesh;
         idx.iter().map(|&i| GeomKey::Vert(verts[i])).collect()
@@ -382,6 +394,89 @@ mod tests {
             ring_set(&ring).contains(&GeomKey::Edge(edge01)),
             "the edge spanning the two selected verts is filled in"
         );
+    }
+
+    /// Vert-mode grow, **face step** (REGION_EXTEND.md §4.1) seeded at the centre
+    /// vert of a 3×3 grid carrying a face-less wire edge. The face step rings all
+    /// four incident faces and flushes each face's whole rim, so every one of the
+    /// grid's 9 verts and 12 edges and 4 faces is reported (25 elements). The
+    /// dedicated wire pass then adds the wire edge and its tip vert — a 27-element
+    /// mixed ring spanning all three element kinds.
+    #[test]
+    fn vert_grow_face_step_rings_incident_faces_rims_and_wire() {
+        let (mesh, verts, faces, wire, tip) = grid_3x3_wire_at_center();
+        let ring = mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions {
+                use_contract: false,
+                use_faces: false,
+                use_face_step: true,
+            },
+        );
+        let set = ring_set(&ring);
+        assert_eq!(ring.len(), 27, "9 verts + 12 edges + 4 faces + wire + tip");
+
+        let vert_count = set.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count();
+        let edge_count = set.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count();
+        let face_count = set.iter().filter(|g| matches!(g, GeomKey::Face(_))).count();
+        assert_eq!(vert_count, 10, "9 grid verts + wire tip");
+        assert_eq!(edge_count, 13, "12 grid edges + wire edge");
+        assert_eq!(face_count, 4, "all four incident faces");
+
+        // Every grid vert/edge and all four faces are flushed in via the face step.
+        for &v in &verts {
+            assert!(set.contains(&GeomKey::Vert(v)), "grid vert flushed into ring");
+        }
+        for &f in &faces {
+            assert!(set.contains(&GeomKey::Face(f)), "incident face ringed");
+        }
+        // The dedicated wire pass picks up the face-less wire and its tip (§4.1).
+        assert!(set.contains(&GeomKey::Edge(wire)), "wire edge added by wire pass");
+        assert!(set.contains(&GeomKey::Vert(tip)), "wire tip vert added by wire pass");
+    }
+
+    /// Contrast against [`vert_grow_face_step_rings_incident_faces_rims_and_wire`]:
+    /// the **edge step** (REGION_EXTEND.md §3.1) at the same seed rings only the
+    /// five incident edges (the four grid edges plus the wire) and their five far
+    /// verts — no faces — a 10-element ring. The two rings must differ, so a
+    /// regression that ignored `use_face_step` or dropped the face/wire pass fails.
+    #[test]
+    fn vert_grow_edge_step_rings_incident_edges_and_far_verts_no_faces() {
+        let (mesh, verts, _faces, wire, tip) = grid_3x3_wire_at_center();
+        let ring = mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions {
+                use_contract: false,
+                use_faces: false,
+                use_face_step: false,
+            },
+        );
+        let set = ring_set(&ring);
+        assert_eq!(ring.len(), 10, "5 incident edges + 5 far verts");
+
+        let edge_count = set.iter().filter(|g| matches!(g, GeomKey::Edge(_))).count();
+        let vert_count = set.iter().filter(|g| matches!(g, GeomKey::Vert(_))).count();
+        let face_count = set.iter().filter(|g| matches!(g, GeomKey::Face(_))).count();
+        assert_eq!(edge_count, 5, "four grid edges + wire edge");
+        assert_eq!(vert_count, 5, "verts 1,3,5,7 + wire tip");
+        assert_eq!(face_count, 0, "edge step rings no faces");
+
+        // The wire edge participates in the ordinary edge step too (§3.1).
+        assert!(set.contains(&GeomKey::Edge(wire)), "wire edge crossed by edge step");
+        assert!(set.contains(&GeomKey::Vert(tip)), "wire tip reached by edge step");
+        let far = vert_set(&mesh, &[1, 3, 5, 7], &verts);
+        assert!(far.is_subset(&set), "the four grid-edge far verts are reported");
+
+        // The face step and edge step report genuinely different rings.
+        let face_step = ring_set(&mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions {
+                use_contract: false,
+                use_faces: false,
+                use_face_step: true,
+            },
+        ));
+        assert_ne!(set, face_step, "use_face_step genuinely changes the vert-mode ring");
     }
 
     /// Face-mode grow, edge step (foundational): centre face of grid_3x3_faces.
