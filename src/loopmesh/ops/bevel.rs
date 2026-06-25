@@ -1240,16 +1240,16 @@ impl LoopMesh {
     /// boundverts `(B_(m-1), B_m)` is crossed by the beveled edge `g_m` that
     /// separates the two adjacent sectors. So each patch segment maps one-to-one to
     /// a beveled edge it crosses — this `segment ↔ crossing-edge` bijection is the
-    /// ordering-robust frame the bridging walks (it does not depend on which
-    /// boundvert a seamed edge is arbitrarily "anchored" to).
+    /// ordering-robust frame the bridging rides.
     ///
-    /// To run the seam continuously around the junction, every pair of *consecutive*
-    /// seamed beveled edges (in cyclic disk order) is joined: the forward arc from
-    /// one seamed edge to the next flags the patch segments crossed by every
-    /// beveled edge strictly after the first up to and including the second. The
-    /// union of all such arcs flags exactly the segments lying between seamed edges
-    /// — which for a junction whose only gap sits between two seamed edges (e.g. the
-    /// three-edge cube corner with the middle edge unseamed) closes the whole ring.
+    /// The rule flags the **single direct patch segment spanning each beveled edge
+    /// that lies in a *gap*** — a maximal run of consecutive *unseamed* beveled
+    /// edges flanked on **both** sides by a seamed beveled edge — and flags nothing
+    /// else. It does **not** route the seam the long way around the ring, and a
+    /// seamed run with no enclosing gap (a lone seamed edge, or all edges seamed)
+    /// bridges nothing. Two opposite seamed edges at a ≥4-edge junction enclose two
+    /// separate length-1 gaps and so bridge both; two adjacent seamed edges share a
+    /// length-0 gap (no bridge) and bridge only the far length-2 gap.
     ///
     /// `seam` and `sharp` run the identical walk on independent bits.
     fn bridge_junction_flags(
@@ -1280,33 +1280,30 @@ impl LoopMesh {
         };
 
         let mut bridge = |want_seam: bool, this: &mut Self| {
-            // The cyclic indices of seamed beveled edges (`g_k` flagged).
-            let flagged: Vec<usize> = (0..count)
-                .filter(|&k| flag_of(patch.opening_edges[k], want_seam))
-                .collect();
-            // A single seamed edge has nothing to run *to*; none has nothing at all.
-            if flagged.len() < 2 {
+            let seamed = |k: usize| flag_of(patch.opening_edges[k], want_seam);
+
+            let seamed_count = (0..count).filter(|&k| seamed(k)).count();
+            // No gap exists unless seamed and unseamed beveled edges interleave: a
+            // gap needs a seamed edge on each side, so at least two seamed edges and
+            // at least one unseamed edge.
+            if seamed_count < 2 || seamed_count == count {
                 return;
             }
 
-            // Join each seamed edge `g_i` to the next seamed edge `g_j` forward:
-            // flag the patch segments crossed by `g_(i+1), …, g_j`.
-            for window in 0..flagged.len() {
-                let i = flagged[window];
-                let j = flagged[(window + 1) % flagged.len()];
-                let mut m = (i + 1) % count;
-                loop {
-                    if let Some(segment) = segment_edge(m, this) {
-                        if want_seam {
-                            this.set_edge_seam(segment, true);
-                        } else {
-                            this.set_edge_sharp(segment, true);
-                        }
+            // With at least one seamed edge on the cyclic disk, every maximal
+            // unseamed run is flanked by a seamed edge on both sides — so every
+            // unseamed beveled edge is a gap edge. Flag the single direct patch
+            // segment spanning each.
+            for m in 0..count {
+                if seamed(m) {
+                    continue;
+                }
+                if let Some(segment) = segment_edge(m, this) {
+                    if want_seam {
+                        this.set_edge_seam(segment, true);
+                    } else {
+                        this.set_edge_sharp(segment, true);
                     }
-                    if m == j {
-                        break;
-                    }
-                    m = (m + 1) % count;
                 }
             }
         };
@@ -4141,13 +4138,22 @@ mod tests {
         (mesh, result)
     }
 
+    type EdgeKeySet = std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))>;
+
+    struct JunctionExpectedSets {
+        /// All three patch ring segments (the full boundvert ring).
+        ring: EdgeKeySet,
+        /// The single direct patch segment spanning the unseamed e03 gap edge.
+        gap_segment: EdgeKeySet,
+        /// The four parallel strip long edges of the seamed e01 / e04 (mechanism 1).
+        parallel: EdgeKeySet,
+    }
+
     /// The cube corner v0's boundvert ring (the three patch ring positions at
-    /// offset 0.25) and the four parallel strip long edges of the two seamed
-    /// beveled edges e01 / e04. Position keys are in 0.25 units (`pos_key`).
-    fn junction_expected_sets() -> (
-        std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))>,
-        std::collections::BTreeSet<((i32, i32, i32), (i32, i32, i32))>,
-    ) {
+    /// offset 0.25), the single direct patch segment spanning the e03 gap, and the
+    /// four parallel strip long edges of the two seamed beveled edges e01 / e04.
+    /// Position keys are in 0.25 units (`pos_key`).
+    fn junction_expected_sets() -> JunctionExpectedSets {
         let k = |x: f32, y: f32, z: f32| pos_key(Vec3::new(x, y, z));
         let pair = |a: (i32, i32, i32), b: (i32, i32, i32)| {
             if a <= b {
@@ -4156,13 +4162,17 @@ mod tests {
                 (b, a)
             }
         };
-        // Boundverts B0/B1/B2 of v0's junction at offset 0.25.
+        // Boundverts of v0's junction at offset 0.25.
         let b0 = k(0.75, -0.75, -1.0);
         let b1 = k(0.75, -1.0, -0.75);
         let b2 = k(1.0, -0.75, -0.75);
-        // The three patch ring (bridging) segments.
+        // The three patch ring segments.
         let ring: std::collections::BTreeSet<_> =
             [pair(b0, b1), pair(b0, b2), pair(b1, b2)].into_iter().collect();
+        // The §6.7.4 single direct patch segment spanning the unseamed gap edge e03:
+        // the edge joining e03's two flanking boundverts (both carry y=-0.75, the
+        // slide along e03), i.e. [0.75,-0.75,-1] and [1,-0.75,-0.75].
+        let gap_segment: std::collections::BTreeSet<_> = [pair(b0, b2)].into_iter().collect();
         // The four parallel strip long edges of e01 (to its two v1-strip verts) and
         // e04 (to its two v4-strip verts) — mechanism (1).
         let parallel: std::collections::BTreeSet<_> = [
@@ -4173,7 +4183,11 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        (ring, parallel)
+        JunctionExpectedSets {
+            ring,
+            gap_segment,
+            parallel,
+        }
     }
 
     /// BEVEL.md §6.7.1 mechanism (1) is UNCONDITIONAL — with `mark_seam = false`
@@ -4192,27 +4206,28 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (ring, parallel) = junction_expected_sets();
+        let sets = junction_expected_sets();
         let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
         assert_eq!(
-            seamed, parallel,
+            seamed, sets.parallel,
             "mark_seam=false still seams exactly the four parallel strip long edges \
              of e01/e04 via mechanism (1) (§6.7.1); no patch ring segment is seamed",
         );
         assert!(
-            seamed.is_disjoint(&ring),
+            seamed.is_disjoint(&sets.ring),
             "no patch ring (bridging) segment may be seamed with mark_seam off",
         );
         mesh.validate_topology();
     }
 
     /// BEVEL.md §6.7.4 mechanism (2): with `mark_seam = true` the seam bridges the
-    /// e03 gap and runs continuously around the whole junction, so the FULL patch
-    /// ring (all three bridging segments) is seamed — *in addition to* the four
-    /// mechanism-(1) parallel edges that are already seamed regardless. Pins the
-    /// exact bridged edge set, not just a count.
+    /// e03 gap by the **single** direct patch segment spanning e03 (the edge joining
+    /// e03's two flanking boundverts) — *not* the full ring. The other two patch
+    /// sides (spanning the seamed e01 / e04, where their strips already meet) stay
+    /// unflagged. Pins the exact bridged set = four mechanism-(1) parallel edges +
+    /// the one gap segment, and asserts the over-bridging full-ring result is wrong.
     #[test]
-    fn junction_mechanism_two_bridges_full_ring_with_mark_seam_on() {
+    fn junction_mechanism_two_bridges_single_gap_segment_with_mark_seam_on() {
         let (mesh, result) = bevel_three_edge_junction_with_flag(
             |m, e| m.set_edge_seam(e, true),
             BevelOptions {
@@ -4222,25 +4237,32 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (ring, parallel) = junction_expected_sets();
-        let mut expected = parallel.clone();
-        expected.extend(ring.iter().copied());
+        let sets = junction_expected_sets();
+        let mut expected = sets.parallel.clone();
+        expected.extend(sets.gap_segment.iter().copied());
         let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
         assert_eq!(
             seamed, expected,
-            "mark_seam=true seams the four mechanism-(1) parallel edges PLUS the full \
-             patch ring (all three bridging segments, §6.7.4) — the seam runs \
-             continuously e01 -> e03 (gap) -> e04 around the junction",
+            "mark_seam=true seams the four mechanism-(1) parallel edges PLUS the \
+             single direct patch segment spanning the unseamed e03 gap (§6.7.4) — \
+             NOT the full ring",
+        );
+        // The two patch sides spanning the seamed e01 / e04 stay unflagged.
+        let other_ring: std::collections::BTreeSet<_> =
+            sets.ring.difference(&sets.gap_segment).copied().collect();
+        assert!(
+            seamed.is_disjoint(&other_ring),
+            "the patch sides spanning the seamed edges' own sides are not bridged",
         );
         mesh.validate_topology();
     }
 
-    /// BEVEL.md §6.7.4: `mark_sharp` runs the identical bridging on the sharp bit,
-    /// independently of `mark_seam`. With it on, the same full ring + four parallel
-    /// edges are sharp; with it off, only the four parallel edges (mechanism (1)).
+    /// BEVEL.md §6.7.4: `mark_sharp` runs the identical single-gap-segment bridging
+    /// on the sharp bit, independently of `mark_seam`. On bridges the one gap segment
+    /// (+ four parallel); off bridges nothing (only the four parallel, mechanism 1).
     #[test]
-    fn junction_mark_sharp_bridges_full_ring_and_inherits_unconditionally() {
-        let (ring, parallel) = junction_expected_sets();
+    fn junction_mark_sharp_bridges_single_gap_segment_and_inherits_unconditionally() {
+        let sets = junction_expected_sets();
 
         let (mesh_off, result_off) = bevel_three_edge_junction_with_flag(
             |m, e| m.set_edge_sharp(e, true),
@@ -4253,7 +4275,7 @@ mod tests {
         );
         let sharp_off = flagged_new_edge_set(&mesh_off, &result_off, |m, e| m.edge_sharp(e));
         assert_eq!(
-            sharp_off, parallel,
+            sharp_off, sets.parallel,
             "mark_sharp=false still sharpens the four parallel strip long edges \
              (mechanism (1), §6.7.1), no ring segment",
         );
@@ -4267,15 +4289,114 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut expected = parallel.clone();
-        expected.extend(ring.iter().copied());
+        let mut expected = sets.parallel.clone();
+        expected.extend(sets.gap_segment.iter().copied());
         let sharp_on = flagged_new_edge_set(&mesh_on, &result_on, |m, e| m.edge_sharp(e));
         assert_eq!(
             sharp_on, expected,
-            "mark_sharp=true bridges the full ring on the sharp bit (§6.7.4)",
+            "mark_sharp=true bridges the single gap segment on the sharp bit (§6.7.4)",
         );
         mesh_off.validate_topology();
         mesh_on.validate_topology();
+    }
+
+    /// Drive `bridge_junction_flags` directly over a synthetic `s`-edge junction:
+    /// build a ring of `s` boundverts joined by `s` patch ring segments, plus `s`
+    /// stub "beveled edges" `g_0..g_(s-1)` whose seamed state is `seamed[k]`
+    /// (`opening_edges[k] = g_k`, so segment `(B_(k-1), B_k)` is crossed by `g_k`).
+    /// Returns the set of ring segment indices `m` (segment `(B_(m-1), B_m)`) that
+    /// end up seamed. This exercises the §6.7.4 gap rule independent of the full
+    /// junction surgery (which the ≥4-edge regime does not yet drive end-to-end).
+    fn bridge_synthetic_junction(seamed: &[bool]) -> std::collections::BTreeSet<usize> {
+        let s = seamed.len();
+        let mut mesh = LoopMesh::new();
+        // Ring boundverts on a unit circle, plus the ring edges between consecutive
+        // boundverts; opening_edges are separate stub edges to detached stub verts.
+        let mut boundverts = Vec::with_capacity(s);
+        for k in 0..s {
+            let theta = std::f32::consts::TAU * (k as f32) / (s as f32);
+            boundverts.push(mesh.create_vertex(Vec3::new(theta.cos(), theta.sin(), 0.0)));
+        }
+        for k in 0..s {
+            mesh.create_edge(
+                [boundverts[k], boundverts[(k + 1) % s]],
+                EdgeCreateFlags::NONE,
+            );
+        }
+        // opening_edges[k] = g_k: a stub edge whose seam state encodes `seamed[k]`.
+        let mut opening_edges = Vec::with_capacity(s);
+        let mut edge_seam_state = Vec::with_capacity(s);
+        for k in 0..s {
+            let stub = mesh.create_vertex(Vec3::new(2.0 + k as f32, 0.0, 0.0));
+            let g = mesh.create_edge([boundverts[k], stub], EdgeCreateFlags::NONE);
+            opening_edges.push(g);
+            edge_seam_state.push((g, seamed[k], false));
+        }
+
+        let patch = JunctionPatch {
+            vertex: boundverts[0],
+            boundverts: boundverts.clone(),
+            opening_edges,
+        };
+        mesh.bridge_junction_flags(&patch, &edge_seam_state, true, false);
+
+        // Read back which ring segment (B_(m-1), B_m) ended up seamed.
+        (0..s)
+            .filter(|&m| {
+                let a = boundverts[(m + s - 1) % s];
+                let b = boundverts[m];
+                mesh.query_edge_exists(a, b)
+                    .map(|e| mesh.edge_seam(e))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// BEVEL.md §6.7.4 ≥4-edge generalization. Each case pins which patch ring
+    /// segments the gap rule bridges (segment `m` spans gap-edge `g_m`).
+    #[test]
+    fn junction_gap_rule_generalizes_beyond_three_edges() {
+        // Two OPPOSITE seamed edges (g0,g2) at a valence-4 junction enclose two
+        // separate length-1 gaps (g1 and g3); BOTH are bridged (the seam closes into
+        // a loop). Segments spanning g1 and g3 are seamed; nothing else.
+        assert_eq!(
+            bridge_synthetic_junction(&[true, false, true, false]),
+            [1, 3].into_iter().collect(),
+            "two opposite seamed edges bridge BOTH length-1 gaps, not the full ring",
+        );
+
+        // Two ADJACENT seamed edges (g0,g1): the short side between them (the sector
+        // boundvert they share) is a length-0 gap and bridges nothing; the far
+        // length-2 gap (g2,g3) is bridged by its two consecutive direct segments.
+        assert_eq!(
+            bridge_synthetic_junction(&[true, true, false, false]),
+            [2, 3].into_iter().collect(),
+            "two adjacent seamed edges bridge only the far length-2 gap (2 segments)",
+        );
+
+        // THREE seamed edges (one unseamed g3): a single length-1 gap; only the
+        // segment spanning g3 is bridged.
+        assert_eq!(
+            bridge_synthetic_junction(&[true, true, true, false]),
+            [3].into_iter().collect(),
+            "three seamed edges bridge the one length-1 gap",
+        );
+
+        // The 3-edge cube-corner case: g1 the unseamed gap flanked by g0,g2 seamed —
+        // exactly the segment spanning g1 is bridged (the single direct segment, NOT
+        // the full ring).
+        assert_eq!(
+            bridge_synthetic_junction(&[true, false, true]),
+            [1].into_iter().collect(),
+            "single-gap 3-edge junction bridges exactly one segment (no over-bridge)",
+        );
+
+        // No gap: a lone seamed edge bridges nothing.
+        assert!(bridge_synthetic_junction(&[true, false, false]).is_empty());
+        // No gap: all seamed bridges nothing (the strips already carry the seam).
+        assert!(bridge_synthetic_junction(&[true, true, true]).is_empty());
+        // No gap: none seamed bridges nothing.
+        assert!(bridge_synthetic_junction(&[false, false, false]).is_empty());
     }
 }
 
