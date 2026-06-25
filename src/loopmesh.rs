@@ -86,7 +86,7 @@ pub use ops::{
     DuplicateResult, ExtrudeVertIndivResult, GeomKey, InsetIndividualParams, InsetIndividualResult,
     InsetRegionParams, InsetRegionResult, JoinTrianglesParams, JoinTrianglesResult, MirrorParams,
     MirrorResult, MixedSeed, NgonMethod, OffsetEdgeLoopsResult, ProfileShape, QuadCornerType,
-    QuadMethod, RingInterp,
+    QuadMethod, RegionExtendOptions, RingInterp,
     RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothVertParams,
     SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
     SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult, TransformParams,
