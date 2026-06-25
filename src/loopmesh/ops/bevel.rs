@@ -478,8 +478,8 @@ impl LoopMesh {
         // own flanking leg (offset 0), built from the local edge-cross normal — not
         // the §7.3 perpendicular-in-face slide, which only coincides on a planar,
         // square terminal and diverges at an irregular non-planar one.
-        let normal_a = self.terminal_surface_normal(a);
-        let normal_b = self.terminal_surface_normal(b);
+        let normal_a = self.surface_normal_at(a);
+        let normal_b = self.surface_normal_at(b);
         let strip_a_left = self.create_vertex(
             self.terminal_strip_vert(a, edge, left_other_a, face_left, offset, normal_a),
         );
@@ -1011,7 +1011,7 @@ impl LoopMesh {
         let _ = direction;
         let left_other = self.face_other_edge_at(face_left, vertex, edge);
         let right_other = self.face_other_edge_at(face_right, vertex, edge);
-        let surface_normal = self.terminal_surface_normal(vertex);
+        let surface_normal = self.surface_normal_at(vertex);
 
         let strip_for_leg =
             |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
@@ -1669,7 +1669,7 @@ impl LoopMesh {
         let _ = direction;
         let left_other = self.face_other_edge_at(face_left, vertex, edge);
         let right_other = self.face_other_edge_at(face_right, vertex, edge);
-        let surface_normal = self.terminal_surface_normal(vertex);
+        let surface_normal = self.surface_normal_at(vertex);
 
         let strip_for_leg =
             |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
@@ -1819,11 +1819,12 @@ impl LoopMesh {
         }
     }
 
-    /// §7.5.1 "surface normal at the terminal": the outward reference used only to
-    /// fix the *sign* of the edge-cross local normal. The average of the unit
-    /// normals of the faces incident to `vertex`, falling back to the stored vertex
-    /// normal when that average is degenerate (near-zero length).
-    fn terminal_surface_normal(&self, vertex: VertexKey) -> Vec3 {
+    /// §7.5.1 "surface normal at the terminal" / §8.8 junction `n_v`: the outward
+    /// reference used to fix the *sign* of an edge-cross local normal (§7.5.1) and
+    /// the forward/reflex sign of a `loop_slide` sub-meet (§8.8.2.1). The average of
+    /// the unit normals of the faces incident to `vertex`, falling back to the
+    /// stored vertex normal when that average is degenerate (near-zero length).
+    fn surface_normal_at(&self, vertex: VertexKey) -> Vec3 {
         let mut accumulator = Vec3::ZERO;
         for face in self.vert_face_keys(vertex) {
             accumulator += self.face_plane_normal(face);
@@ -2301,36 +2302,23 @@ impl LoopMesh {
         let dir_before = self.edge_direction_from(edge_before, vertex, vertex_position)?;
         let dir_after = self.edge_direction_from(edge_after, vertex, vertex_position)?;
 
-        // Firing condition (§8.8.2) part 2 — the "good offset" guard. Viewed from the
-        // junction's normal side, both sub-meets must sweep *forward*: `g_k → e_mid`
-        // and `e_mid → g_(k+1)` must each open a non-reflex, non-degenerate angle. A
-        // reflex sub-meet would crease the surface backward, so the slide is rejected
-        // and the sector keeps its §7.6.2 meet-point (return `None`).
-        //
-        // The *direction* the sweep turns decides forward vs reflex; the *magnitude*
-        // of the opening angle decides how far along the leg the meet sits. These are
-        // two separate quantities and must be read separately: `.length()` of a cross
-        // product is a true |sin α| but discards the turn direction, while projecting
-        // the cross product onto the sector normal recovers the sign but shrinks the
-        // magnitude whenever that normal is tilted (a creased corner). So use the
-        // signed projection only to *gate* (forward iff positive) and the unsigned
-        // length for the *placement* distance `offset / sin α`.
-        let sector_normal = match self.sector_normal(vertex, vertex_position, sector) {
-            // Orient so the full opening `g_k → g_(k+1)` is a positive sweep; each
-            // sub-sweep is then forward iff its signed projection is positive. This is
-            // robust to the absolute sign the summed face normals happen to carry.
-            Some(normal) => {
-                if dir_before.cross(dir_after).dot(normal) < 0.0 {
-                    -normal
-                } else {
-                    normal
-                }
-            }
-            None => return None,
-        };
-        let turn_before = dir_before.cross(leg_direction).dot(sector_normal);
-        let turn_after = leg_direction.cross(dir_after).dot(sector_normal);
-        if turn_before <= LOOP_SLIDE_TOLERANCE || turn_after <= LOOP_SLIDE_TOLERANCE {
+        // Firing condition (§8.8.2.1) part 2 — the "good offset" guard, taken in the
+        // genuine junction *vertex-normal* frame `n_v`, never a sector face-plane
+        // frame. Both sub-meets `g_k → e_mid` and `e_mid → g_(k+1)` must sweep
+        // *forward* and open a non-degenerate angle; a reflex sub-meet would crease
+        // the surface backward, so the slide is rejected (return `None`). Forward vs
+        // reflex is the sign of the swept angle viewed from `n_v` (`cross · n_v < 0`
+        // is reflex); `n_v` is the incident-face-average vertex normal (vertex-normal
+        // fallback) shared with §7.5.1/§8.8.3. A *sector face-plane* normal tilts away
+        // from the true corner on an irregular junction's off-plane sectors and flips
+        // this sign, wrongly rejecting the very sectors that should slide (the
+        // under-fire); `n_v` is sign-stable across every sector of the junction.
+        // Degeneracy is measured on the genuine un-projected opening angle (within
+        // ~0.1 rad of 0 or π), separately from the sign.
+        let vertex_normal = self.surface_normal_at(vertex);
+        if !subsweep_is_good(dir_before, leg_direction, vertex_normal)
+            || !subsweep_is_good(leg_direction, dir_after, vertex_normal)
+        {
             return None;
         }
 
@@ -2345,32 +2333,6 @@ impl LoopMesh {
         // §8.8.3 averaging: both sub-meets lie on the leg's line, so their midpoint
         // does too.
         Some((m1 + m2) * 0.5)
-    }
-
-    /// The summed plane normal of a junction sector's bounding-beveled faces
-    /// (BEVEL.md §8.8.2 "viewed from the junction's normal side"), normalized, or
-    /// `None` when the faces cancel to no consistent normal. Mirrors the
-    /// `sector_normal` accumulation `solve_meet_point` builds for the embedding row.
-    fn sector_normal(
-        &self,
-        vertex: VertexKey,
-        vertex_position: Vec3,
-        sector: &Sector,
-    ) -> Option<Vec3> {
-        let mut sector_normal = Vec3::ZERO;
-        for &(edge, face) in &sector.corners {
-            if !sector.bounding_edges.contains(&edge) {
-                continue;
-            }
-            if self
-                .edge_direction_from(edge, vertex, vertex_position)
-                .is_none()
-            {
-                continue;
-            }
-            sector_normal += self.face_plane_normal(face);
-        }
-        (sector_normal.length() > f32::EPSILON).then(|| sector_normal.normalize())
     }
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
@@ -6776,6 +6738,213 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.8.2.1 (firing-frame): the two beveled edges {0,1}/{0,3} split the
+    /// apex into **two** sectors, each holding a single silhouette leg ({0,2} and
+    /// {0,4}). With the firing predicate taken in the genuine *vertex-normal* frame
+    /// (`n_v`), **both** sectors qualify and slide their boundvert onto their leg —
+    /// the under-fire (a sector-face frame slid only the one whose flanking faces
+    /// aligned with that frame, flipping the reflex sign on the off-plane sector) is
+    /// gone. The non-planar legs make each slid boundvert land off the z = 0 plane,
+    /// so "on the leg" is the vanishing perpendicular-to-leg distance, not z ≈ 0.
+    #[test]
+    fn edge_bevel_loop_slide_fires_every_qualifying_sector() {
+        let offset = 0.2;
+        let (mut mesh, apex, spokes, [e01, e03]) = irregular_apex_junction();
+        let apex_pos = mesh.vertex_position(apex);
+        let leg2_dir = (mesh.vertex_position(spokes[1]) - apex_pos).normalize();
+        let leg4_dir = (mesh.vertex_position(spokes[3]) - apex_pos).normalize();
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                loop_slide: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let b2 = firing_boundvert(&mesh, &result, apex_pos, leg2_dir);
+        let b4 = firing_boundvert(&mesh, &result, apex_pos, leg4_dir);
+        let perp = |p: Vec3, leg: Vec3| ((p - apex_pos) - leg * (p - apex_pos).dot(leg)).length();
+
+        // Both sectors' boundverts sit on their own silhouette leg's line (§8.8.3),
+        // and they are distinct verts (each slid onto a different leg).
+        assert!(
+            perp(b2, leg2_dir) < 1.0e-4,
+            "sector {{0,2}} slid onto its leg, perp={}",
+            perp(b2, leg2_dir),
+        );
+        assert!(
+            perp(b4, leg4_dir) < 1.0e-4,
+            "sector {{0,4}} also slid onto its leg, perp={}",
+            perp(b4, leg4_dir),
+        );
+        assert!(
+            (b2 - b4).length() > 1.0e-3,
+            "the two firing boundverts are distinct, b2={b2:?} b4={b4:?}",
+        );
+    }
+
+    /// Like `irregular_apex_junction`, but the firing sector's silhouette leg
+    /// (spoke {0,2}) lies exactly in the `z = 0` plane, so "on the leg's line"
+    /// means `z ≈ 0` directly. The two bounding beveled edges {0,1}/{0,3} rise out
+    /// of that plane at *unequal* angles (an irregular junction, §8.8.5), so the
+    /// §7.6.2 meet floats off `z = 0` while the §8.8.3 slide pins the boundvert back
+    /// onto it. Returns (mesh, apex, [v1..v4], beveled edges {0,1} and {0,3}).
+    fn irregular_apex_junction_planar_leg() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2])
+    {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        // s2 — the silhouette leg — lies in z = 0. s1 and s3 (the beveled flanks)
+        // lift out of the plane at unequal angles so the junction is irregular.
+        let s1 = mesh.create_vertex(Vec3::new(1.0, -0.2, 0.3));
+        let s2 = mesh.create_vertex(Vec3::new(-0.15, -1.0, 0.0));
+        let s3 = mesh.create_vertex(Vec3::new(-0.8, -0.5, 0.9));
+        let s4 = mesh.create_vertex(Vec3::new(0.1, 1.0, 0.5));
+        let spokes = [s1, s2, s3, s4];
+        let outers: Vec<VertexKey> = (0..4)
+            .map(|i| {
+                let a = mesh.vertex_position(spokes[i]);
+                let b = mesh.vertex_position(spokes[(i + 1) % 4]);
+                let mid = (a + b) * 0.5;
+                mesh.create_vertex(mid * 1.8 + Vec3::new(0.0, 0.0, -0.4))
+            })
+            .collect();
+
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        for i in 0..4 {
+            let sa = spokes[i];
+            let sb = spokes[(i + 1) % 4];
+            let outer = outers[i];
+            let e_apex_a = mesh
+                .query_edge_exists(apex, sa)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sa));
+            let e_a_outer = edge(&mut mesh, sa, outer);
+            let e_outer_b = edge(&mut mesh, outer, sb);
+            let e_b_apex = mesh
+                .query_edge_exists(apex, sb)
+                .unwrap_or_else(|| edge(&mut mesh, apex, sb));
+            mesh.face_create(
+                &[apex, sa, outer, sb],
+                &[e_apex_a, e_a_outer, e_outer_b, e_b_apex],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let e01 = mesh.query_edge_exists(apex, s1).expect("spoke {0,1}");
+        let e03 = mesh.query_edge_exists(apex, s3).expect("spoke {0,3}");
+        (mesh, apex, spokes, [e01, e03])
+    }
+
+    /// BEVEL.md §8.8.3: the slid boundvert is built parametrically on the
+    /// *un-projected* leg line `v + t·d_leg`, so it lands **on** the silhouette
+    /// edge by construction — no face-plane / junction-normal projection drifts it
+    /// off. Here the firing sector's leg (spoke {0,2}) lies in `z = 0`, so its slid
+    /// boundvert must have `z ≈ 0`, whereas the §7.6.2 meet (loop_slide off) floats
+    /// off the plane at this irregular junction.
+    ///
+    /// BEVEL.md §8.8.2.1 (firing-frame): the firing predicate is widened to the
+    /// genuine *vertex-normal* frame, so **both** qualifying single-silhouette apex
+    /// sectors slide (spoke {0,2}'s sector and spoke {0,4}'s sector), not just the
+    /// one whose flanking faces happen to align with a sector-face frame. The
+    /// per-sector slide remains a placement perturbation that perturbs *only* the
+    /// two firing boundverts — the four terminal strip verts (§8.8.2.2 case B) are
+    /// byte-identical between on and off.
+    #[test]
+    fn edge_bevel_loop_slide_lands_on_planar_leg_line() {
+        let offset = 0.2;
+
+        let build = |loop_slide: bool| {
+            let (mut mesh, apex, spokes, [e01, e03]) = irregular_apex_junction_planar_leg();
+            let apex_pos = mesh.vertex_position(apex);
+            let leg2_dir = (mesh.vertex_position(spokes[1]) - apex_pos).normalize();
+            let leg4_dir = (mesh.vertex_position(spokes[3]) - apex_pos).normalize();
+            let result = mesh.bevel(
+                &[e01.into(), e03.into()],
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    loop_slide,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let positions: Vec<Vec3> =
+                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            let firing2 = firing_boundvert(&mesh, &result, apex_pos, leg2_dir);
+            let firing4 = firing_boundvert(&mesh, &result, apex_pos, leg4_dir);
+            (apex_pos, leg2_dir, leg4_dir, positions, firing2, firing4)
+        };
+
+        let (apex_pos, leg2_dir, leg4_dir, off_positions, b2_off, b4_off) = build(false);
+        let (_, _, _, on_positions, b2_on, b4_on) = build(true);
+
+        let perp = |p: Vec3, leg: Vec3| ((p - apex_pos) - leg * (p - apex_pos).dot(leg)).length();
+
+        // §8.8.5: both firing boundverts move when the slide is enabled.
+        assert!(
+            (b2_on - b2_off).length() > 1.0e-3,
+            "loop_slide on must move the {{0,2}} boundvert, on={b2_on:?} off={b2_off:?}",
+        );
+        assert!(
+            (b4_on - b4_off).length() > 1.0e-3,
+            "loop_slide on must move the {{0,4}} boundvert, on={b4_on:?} off={b4_off:?}",
+        );
+
+        // §8.8.3: spoke {0,2}'s leg lies in z = 0, so its slid boundvert lands at
+        // z ≈ 0 and exactly on the leg's line (`v + t·d_leg`, un-projected `d_leg`).
+        assert!(
+            b2_on.z.abs() < 1.0e-5,
+            "slid {{0,2}} boundvert keeps z = 0 (leg lies in z = 0), got z={}",
+            b2_on.z,
+        );
+        assert!(
+            perp(b2_on, leg2_dir) < 1.0e-5,
+            "slid {{0,2}} boundvert sits exactly on its leg's line, perp={}",
+            perp(b2_on, leg2_dir),
+        );
+
+        // §8.8.2.1 (firing-frame): the second qualifying sector also slides onto its
+        // own leg (spoke {0,4}) — the n_v frame fires it where a sector-face frame
+        // wrongly rejected it (the under-fire).
+        assert!(
+            perp(b4_on, leg4_dir) < 1.0e-5,
+            "slid {{0,4}} boundvert sits on its leg's line, perp={}",
+            perp(b4_on, leg4_dir),
+        );
+
+        // The §7.6.2 meets (loop_slide off) float off their legs — that is why the
+        // slide is observable (§8.8.5).
+        assert!(
+            b2_off.z.abs() > 1.0e-3,
+            "{{0,2}} meet-point boundvert floats off z = 0, got z={}",
+            b2_off.z,
+        );
+        assert!(
+            perp(b4_off, leg4_dir) > 1.0e-3,
+            "{{0,4}} meet-point boundvert floats off its leg, perp={}",
+            perp(b4_off, leg4_dir),
+        );
+
+        // §8.8.5 / §8.8.2.2: enabling the slide perturbs exactly the two firing apex
+        // boundverts — the four terminal strip verts (case B) are byte-identical
+        // between on and off, so precisely two new verts drift.
+        assert_eq!(on_positions.len(), off_positions.len(), "same vert count");
+        let drifted = on_positions
+            .iter()
+            .zip(off_positions.iter())
+            .filter(|(a, b)| (**a - **b).length() > 1.0e-5)
+            .count();
+        assert_eq!(
+            drifted, 2,
+            "both qualifying apex sectors slide; the terminal strip verts do not drift",
+        );
+    }
+
     /// BEVEL.md §8.8.5: at a *symmetric* junction the slide is a no-op — the slid
     /// point coincides with the bisector meet-point, so `loop_slide` on and off
     /// produce the identical boundvert. A symmetric cube corner with one
@@ -7277,6 +7446,31 @@ const DEGENERATE_SLIDE_FRACTION: f32 = 0.01;
 /// normal-dot test and the sub-meet `sin α` degeneracy test share one
 /// crate-local convention rather than introducing a fresh magic number.
 const LOOP_SLIDE_TOLERANCE: f32 = 1.0e-4;
+
+/// Angular band (radians) within which a §8.8.2.1 sub-meet's un-projected opening
+/// angle is rejected as degenerate — within ~0.1 rad of either `0` or `π`. This is
+/// the *magnitude* half of the "good offset" guard (the *sign* half is the
+/// vertex-normal-frame forward/reflex test); a leg collinear with a flanking
+/// beveled edge (angle near 0 or π) carries no usable slide direction.
+const LOOP_SLIDE_ANGLE_BAND: f32 = 0.1;
+
+/// The §8.8.2.1 "good offset" sub-meet guard, evaluated in the genuine junction
+/// vertex-normal frame `n_v`. The swept angle from `dir_first` to `dir_second`
+/// must be **forward** — viewed from `n_v` it turns positively, i.e.
+/// `cross(dir_first, dir_second) · n_v > 0`; a reflex (`< 0`) sweep folds the
+/// surface backward — **and** **non-degenerate** — its genuine un-projected
+/// opening angle in `[0, π]` must lie outside the `~0.1 rad` band of both `0` and
+/// `π`. Sign and magnitude are read separately (§8.8.2.1): the sign from the
+/// `n_v` projection, the magnitude from the un-projected `atan2(|cross|, dot)`.
+fn subsweep_is_good(dir_first: Vec3, dir_second: Vec3, vertex_normal: Vec3) -> bool {
+    let cross = dir_first.cross(dir_second);
+    if cross.dot(vertex_normal) <= 0.0 {
+        return false;
+    }
+    let opening_angle = cross.length().atan2(dir_first.dot(dir_second));
+    opening_angle > LOOP_SLIDE_ANGLE_BAND
+        && opening_angle < std::f32::consts::PI - LOOP_SLIDE_ANGLE_BAND
+}
 
 /// Angle tolerance (in `cos θ` units) for the §7.6.2 parallel / anti-parallel
 /// special cases: when the two flanking edge directions are within this of being
