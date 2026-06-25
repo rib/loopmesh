@@ -641,7 +641,13 @@ impl LoopMesh {
         let mut corner_vert: Vec<CornerVert> = Vec::new();
         let mut substitutions: Vec<FaceSubstitution> = Vec::new();
         let mut junction_patches: Vec<JunctionPatch> = Vec::new();
+        let mut reconciled: Vec<ReconciledOffset> = Vec::new();
 
+        // §7.6.4 / §8.8.4: place every junction first, so a firing `loop_slide` slide
+        // records its reconciled per-side offsets, then place the terminals which read
+        // them — the width-pass ripple reaches the far ends of the flanking edges
+        // (§8.8.5). At a symmetric junction (or with `loop_slide` off) nothing is
+        // recorded and the terminals fall back to the spec offset, unchanged.
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
                 self.place_junction_boundverts(
@@ -652,13 +658,18 @@ impl LoopMesh {
                     &mut corner_vert,
                     &mut substitutions,
                     &mut junction_patches,
+                    &mut reconciled,
                     result,
                 );
-            } else {
+            }
+        }
+        for &endpoint in &endpoints {
+            if !junctions.contains(&endpoint) {
                 self.place_terminal_strip_verts(
                     endpoint,
                     &beveled_manifold,
                     offset,
+                    &reconciled,
                     &mut corner_vert,
                     &mut substitutions,
                     result,
@@ -1547,6 +1558,7 @@ impl LoopMesh {
         corner_vert: &mut Vec<CornerVert>,
         substitutions: &mut Vec<FaceSubstitution>,
         junction_patches: &mut Vec<JunctionPatch>,
+        reconciled: &mut Vec<ReconciledOffset>,
         result: &mut BevelResult,
     ) {
         // Rotational corner ring: each incident face contributes the pair of its
@@ -1567,15 +1579,51 @@ impl LoopMesh {
             // §8.8: when `loop_slide` is set and this sector fires (exactly one
             // silhouette/in-plane leg, slide not folding either flank), place the
             // boundvert on that leg's line instead of at the §7.6.2 meet-point.
-            // §8.8.4: flank-sine ratio not threaded — the width pass is a no-op at
-            // uniform offset, so this realises the slide at `segments = 1` without it.
             let slid = if loop_slide {
                 self.slide_boundvert(vertex, vertex_position, sector, is_beveled, offset)
             } else {
                 None
             };
-            let boundvert_position =
-                slid.unwrap_or_else(|| self.solve_meet_point(vertex, vertex_position, sector, offset));
+            if let Some((_, flank_sine_ratio)) = slid {
+                // §7.6.4 / §8.8.4: thread the firing sector's flank-sine ratio into
+                // the width pass. The §7.6.4 reconciliation solves the per-edge offsets
+                // as a weighted least-squares: a width residual drives the two flanking
+                // strips to meet the slid boundvert flush — pinning only the *ratio*
+                // `o_k : o_(k+1) = sin α₁ : sin α₂` (so `o_k = t·sin α_k` on the ratio
+                // manifold) — while a spec-pull residual sets the *absolute scale*
+                // `t` toward the user offset. Minimising `Σ(t·sin α_k − offset)²` over
+                // the single scale `t` gives `t* = offset·(sin α₁+sin α₂)/(sin²α₁+sin²α₂)`,
+                // not the meet-at-B scale `(offset/sin α₁ + offset/sin α₂)/2` (which
+                // over-pins the meet onto the spec-offset boundvert and overshoots).
+                // With `r = sin(α₂)/sin(α₁)` the reconciled offsets reduce to
+                // `o₁ = offset·(1+r)/(1+r²)` and `o₂ = offset·r·(1+r)/(1+r²)`. At a
+                // symmetric junction `r = 1` so both collapse to the spec offset and the
+                // pass is a bit-exact no-op. `g_k` opens the sector (`corners.first`),
+                // `g_(k+1)` closes it (`corners.last`); each reconciled width is keyed by
+                // the edge's radial face bordering this sector so it ripples down that
+                // edge to its far end, where a terminal close (§7.5.1) reads it (§8.8.5).
+                let g_k = sector.bounding_edges[0];
+                let g_k1 = sector.bounding_edges[1];
+                let r = flank_sine_ratio;
+                let spec_pull_scale = (1.0 + r) / (1.0 + r * r);
+                if let Some(&(_, face)) = sector.corners.first() {
+                    reconciled.push(ReconciledOffset {
+                        edge: g_k,
+                        face,
+                        offset: offset * spec_pull_scale,
+                    });
+                }
+                if let Some(&(_, face)) = sector.corners.last() {
+                    reconciled.push(ReconciledOffset {
+                        edge: g_k1,
+                        face,
+                        offset: offset * r * spec_pull_scale,
+                    });
+                }
+            }
+            let boundvert_position = slid
+                .map(|(position, _)| position)
+                .unwrap_or_else(|| self.solve_meet_point(vertex, vertex_position, sector, offset));
             let boundvert = self.create_vertex(boundvert_position);
             result.verts.push(boundvert);
             boundverts.push(boundvert);
@@ -1623,6 +1671,7 @@ impl LoopMesh {
         vertex: VertexKey,
         beveled: &[EdgeKey],
         offset: f32,
+        reconciled: &[ReconciledOffset],
         corner_vert: &mut Vec<CornerVert>,
         substitutions: &mut Vec<FaceSubstitution>,
         result: &mut BevelResult,
@@ -1671,10 +1720,16 @@ impl LoopMesh {
         let right_other = self.face_other_edge_at(face_right, vertex, edge);
         let surface_normal = self.surface_normal_at(vertex);
 
+        // §8.8.5: each strip vert reads its edge-side's §7.6.4-reconciled offset —
+        // the spec offset unless a firing slide at this edge's *other* end shifted it
+        // (§8.8.4). The recipe is the §7.5.1 leg meet either way; only the offset it
+        // is fed ripples, so the terminal moves at an irregular firing junction and
+        // stays put at a symmetric one (where the reconciled offset equals the spec).
         let strip_for_leg =
             |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
+                let face_offset = reconciled_offset(reconciled, edge, face, offset);
                 let position =
-                    this.terminal_strip_vert(vertex, edge, leg, face, offset, surface_normal);
+                    this.terminal_strip_vert(vertex, edge, leg, face, face_offset, surface_normal);
                 let strip_vert = this.create_vertex(position);
                 result.verts.push(strip_vert);
                 strip_vert
@@ -2242,7 +2297,7 @@ impl LoopMesh {
         sector: &Sector,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         offset: f32,
-    ) -> Option<Vec3> {
+    ) -> Option<(Vec3, f32)> {
         if sector.bounding_edges.len() != 2 {
             return None;
         }
@@ -2324,15 +2379,33 @@ impl LoopMesh {
 
         // The two sub-meets sit `offset / sin(α)` along the leg from `v`, where α is
         // the (true) opening angle of the flanking beveled edge against the leg
-        // (§8.8.3). The gate above guarantees both are forward and non-degenerate.
+        // (§8.8.3). The gate above guarantees both are forward and non-degenerate, so
+        // §8.8.3's single-survivor (one sub-meet reflex) and both-degenerate (all
+        // three lines collinear) fallback branches are intentionally not built here:
+        // `subsweep_is_good` already rejected the whole slide if either side was bad,
+        // so both `m1` and `m2` are always valid when this point is reached.
         let sin_alpha_before = dir_before.cross(leg_direction).length();
         let sin_alpha_after = dir_after.cross(leg_direction).length();
         let m1 = vertex_position + leg_direction * (offset / sin_alpha_before);
         let m2 = vertex_position + leg_direction * (offset / sin_alpha_after);
 
+        // §8.8.4: record the flank-sine ratio `sin(α₂)/sin(α₁)` — a pure measure of
+        // how lopsided the two flanking angles are — for the §7.6.4 width pass to
+        // thread into the far-end offsets. The explicit guard: if either sine
+        // collapses (a flank gone collinear with the leg) the ratio diverges, so
+        // override it to `1` rather than evaluate the blow-up — an unconstrained side
+        // makes equal demands on the leg, so a balanced ratio adds no bias.
+        let flank_sine_ratio = if sin_alpha_before < LOOP_SLIDE_TOLERANCE
+            || sin_alpha_after < LOOP_SLIDE_TOLERANCE
+        {
+            1.0
+        } else {
+            sin_alpha_after / sin_alpha_before
+        };
+
         // §8.8.3 averaging: both sub-meets lie on the leg's line, so their midpoint
         // does too.
-        Some((m1 + m2) * 0.5)
+        Some(((m1 + m2) * 0.5, flank_sine_ratio))
     }
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
@@ -3349,6 +3422,34 @@ struct CornerVert {
     vertex: VertexKey,
     face: FaceKey,
     near_vert: VertexKey,
+}
+
+/// One beveled-edge side's width-reconciled offset (BEVEL.md §7.6.4 / §8.8.4). When
+/// `loop_slide` fires at a junction sector, the slid boundvert constrains its two
+/// flanking edges' offsets to the flank-sine ratio so both strips meet it flush; the
+/// reconciled width is keyed by `(edge, face)` — that edge's radial face bordering
+/// the firing sector — and ripples down the edge to its far end, where a terminal
+/// close (§7.5.1) places its strip vert from it (§8.8.5). An edge-side that no firing
+/// sector constrained keeps the spec offset.
+struct ReconciledOffset {
+    edge: EdgeKey,
+    face: FaceKey,
+    offset: f32,
+}
+
+/// The §7.6.4-reconciled offset for the `(edge, face)` side, or `spec` when no firing
+/// sector constrained it (BEVEL.md §8.8.4).
+fn reconciled_offset(
+    reconciled: &[ReconciledOffset],
+    edge: EdgeKey,
+    face: FaceKey,
+    spec: f32,
+) -> f32 {
+    reconciled
+        .iter()
+        .find(|record| record.edge == edge && record.face == face)
+        .map(|record| record.offset)
+        .unwrap_or(spec)
 }
 
 /// One junction vertex's ordered boundvert ring (BEVEL.md §7.6.1), capped by the
@@ -6787,6 +6888,80 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.8.4 / §8.8.5: at an **irregular** firing junction the flank-sine
+    /// ratio ≠ 1 redistributes the two flanking edges' §7.6.4 offsets, and the ripple
+    /// runs **along each flanking edge to its far end** — the terminal strip verts.
+    /// On `irregular_apex_junction` the two beveled edges {0,1}/{0,3} run from the
+    /// firing apex out to terminal endpoints (spokes s1/s3), so all four terminal
+    /// strip verts shift by a small width-pass ripple between `loop_slide` on and off.
+    /// This pins the §8.8.5 "missing-ripple" defect: leaving the termini static (their
+    /// spec-offset placement) is the bug, not a preserved invariant. The drift stays a
+    /// few thousandths — a reconciled-offset ripple, not a recipe change — so it is
+    /// bounded well below a gross routing-bug relocation.
+    #[test]
+    fn edge_bevel_loop_slide_ripples_terminal_strip_verts_at_irregular_junction() {
+        let offset = 0.3;
+
+        let build = |loop_slide: bool| {
+            let (mut mesh, apex, _spokes, [e01, e03]) = irregular_apex_junction();
+            let apex_pos = mesh.vertex_position(apex);
+            let result = mesh.bevel(
+                &[e01.into(), e03.into()],
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    loop_slide,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let positions: Vec<Vec3> =
+                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            (apex_pos, positions)
+        };
+
+        let (apex_pos, off_positions) = build(false);
+        let (_, on_positions) = build(true);
+
+        // Two firing apex boundverts (near the apex) + four terminal strip verts (out
+        // by the far endpoints). `result.verts` is built in the same order both runs,
+        // so positions correspond index-for-index.
+        assert_eq!(on_positions.len(), off_positions.len(), "same vert count");
+        assert_eq!(on_positions.len(), 6, "two apex boundverts + four terminal strip verts");
+
+        let mut apex_drift_max: f32 = 0.0;
+        let mut terminal_count = 0;
+        for (on, off) in on_positions.iter().zip(off_positions.iter()) {
+            let drift = (*on - *off).length();
+            // Apex boundverts slide onto the leg near the apex; terminal strip verts
+            // sit out near the far endpoints (distance ≈ 1 from the apex).
+            if (*off - apex_pos).length() > 0.5 {
+                terminal_count += 1;
+                assert!(
+                    drift > 1.0e-4,
+                    "terminal strip vert must ripple at an irregular firing junction \
+                     (not stay at its spec-offset placement), drift={drift}",
+                );
+                // With the §7.6.4 spec-pull scale `t*` (not the meet-at-B `t_B`), the
+                // reconciled offset no longer overshoots, so the ripple is bounded well
+                // below the apex slide and a routing-bug relocation.
+                assert!(
+                    drift < 3.0e-2,
+                    "terminal ripple stays a small width-pass shift, not a routing-bug \
+                     relocation, drift={drift}",
+                );
+            } else {
+                apex_drift_max = apex_drift_max.max(drift);
+            }
+        }
+        assert_eq!(terminal_count, 4, "four terminal strip verts ripple");
+        // The case-A apex slide is the larger, direct placement change (§8.8.5).
+        assert!(
+            apex_drift_max > 1.0e-3,
+            "the firing apex boundverts slide directly (case A), drift={apex_drift_max}",
+        );
+    }
+
     /// Like `irregular_apex_junction`, but the firing sector's silhouette leg
     /// (spoke {0,2}) lies exactly in the `z = 0` plane, so "on the leg's line"
     /// means `z ≈ 0` directly. The two bounding beveled edges {0,1}/{0,3} rise out
@@ -6850,10 +7025,15 @@ mod tests {
     /// BEVEL.md §8.8.2.1 (firing-frame): the firing predicate is widened to the
     /// genuine *vertex-normal* frame, so **both** qualifying single-silhouette apex
     /// sectors slide (spoke {0,2}'s sector and spoke {0,4}'s sector), not just the
-    /// one whose flanking faces happen to align with a sector-face frame. The
-    /// per-sector slide remains a placement perturbation that perturbs *only* the
-    /// two firing boundverts — the four terminal strip verts (§8.8.2.2 case B) are
-    /// byte-identical between on and off.
+    /// one whose flanking faces happen to align with a sector-face frame.
+    ///
+    /// BEVEL.md §8.8.5 / §8.8.4: this is an **irregular** firing junction (the two
+    /// beveled edges rise out of the leg's plane at unequal angles), so the flank-sine
+    /// ratio ≠ 1 redistributes the flanking edges' §7.6.4 offsets and the ripple
+    /// reaches the four terminal strip verts at the edges' far ends — they are **not**
+    /// static here (the case-B recipe is flag-independent, but the reconciled offset it
+    /// consumes is not). So all six new verts drift between on and off: the two firing
+    /// apex boundverts directly (case A) and the four termini by the width-pass ripple.
     #[test]
     fn edge_bevel_loop_slide_lands_on_planar_leg_line() {
         let offset = 0.2;
@@ -6930,18 +7110,22 @@ mod tests {
             perp(b4_off, leg4_dir),
         );
 
-        // §8.8.5 / §8.8.2.2: enabling the slide perturbs exactly the two firing apex
-        // boundverts — the four terminal strip verts (case B) are byte-identical
-        // between on and off, so precisely two new verts drift.
+        // §8.8.5 / §8.8.4: at this irregular firing junction the slide perturbs the
+        // two firing apex boundverts directly (case A) *and* ripples the §7.6.4
+        // reconciled offsets out to the four terminal strip verts (case B), so all six
+        // new verts drift between on and off. The termini move by a small width-pass
+        // ripple — not a recipe change — so their drift is bounded well below the apex
+        // slide's, distinguishing the legitimate ripple from a routing bug (§8.8.5).
         assert_eq!(on_positions.len(), off_positions.len(), "same vert count");
+        assert_eq!(on_positions.len(), 6, "two apex boundverts + four terminal strip verts");
         let drifted = on_positions
             .iter()
             .zip(off_positions.iter())
             .filter(|(a, b)| (**a - **b).length() > 1.0e-5)
             .count();
         assert_eq!(
-            drifted, 2,
-            "both qualifying apex sectors slide; the terminal strip verts do not drift",
+            drifted, 6,
+            "both apex sectors slide (case A) and the four termini ripple (case B)",
         );
     }
 
@@ -7006,9 +7190,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         // s1, s3 bound the firing sector. s2 — the leg — is placed so that, viewed
-        // from the sector's (summed-face) normal side, the `e_mid → g_(k+1)` sub-meet
-        // sweeps *backward*: it folds reflex while the `g_k → e_mid` side stays
-        // forward. The petals stay non-planar so s2 remains a silhouette leg.
+        // from the junction's vertex-normal frame `n_v` (§8.8.2.1, the frame the
+        // forward/reflex guard now uses), the `e_mid → g_(k+1)` sub-meet sweeps
+        // *backward*: it folds reflex while the `g_k → e_mid` side stays forward. The
+        // petals stay non-planar so s2 remains a silhouette leg.
         let s1 = mesh.create_vertex(Vec3::new(1.0, 0.2, -0.1));
         let s2 = mesh.create_vertex(Vec3::new(-0.2, 0.0, 0.2));
         let s3 = mesh.create_vertex(Vec3::new(0.2, 1.0, -0.1));
