@@ -77,7 +77,7 @@ impl Default for BevelVmeshMethod {
 /// reachable by setting only `offset` and leaving every other field at its
 /// default: `affect = Vertices`, `segments = 1`, `offset_type = Offset`.
 #[derive(Clone, Copy, Debug)]
-pub struct BevelOptions {
+pub struct BevelOptions<'a> {
     /// How much material the bevel consumes, measured per `offset_type`. A
     /// non-positive offset is a no-op (BEVEL.md §2.1).
     pub offset: f32,
@@ -124,9 +124,23 @@ pub struct BevelOptions {
     /// `Cutoff` flat-cut fill is implemented for the multi-edge junction at the
     /// default profile (BEVEL.md §8.2 / §8.3).
     pub vmesh_method: BevelVmeshMethod,
+    /// Gate for the per-element bevel-weight prescale (BEVEL.md §8.7.2). When
+    /// `false` (the default), weights are ignored entirely and every beveled
+    /// element slides the full `offset` — byte-identical to the unweighted path.
+    /// When `true`, each beveled vertex's resolved offset is prescaled by its
+    /// weight (BEVEL.md §8.7.3); a beveled vertex *absent* from `vert_weights`
+    /// defaults to weight `0.0` — no slide, no-op for that corner (§8.7.2 case 3).
+    pub use_weights: bool,
+    /// Per-vertex bevel weights consulted when `use_weights` is `true`, for
+    /// `affect = Vertices` (BEVEL.md §8.7.1 / §8.7.3). A slice of
+    /// `(VertexKey, weight)`; a beveled vertex's weight is looked up here, and an
+    /// absent vertex resolves to `0.0` (§8.7.2). The weight multiplies that
+    /// corner's offset uniformly across all its incident edges before the §4
+    /// slide. Defaults to an empty slice.
+    pub vert_weights: &'a [(VertexKey, f32)],
 }
 
-impl Default for BevelOptions {
+impl Default for BevelOptions<'_> {
     fn default() -> Self {
         BevelOptions {
             offset: 0.0,
@@ -138,6 +152,8 @@ impl Default for BevelOptions {
             mark_seam: false,
             mark_sharp: false,
             vmesh_method: BevelVmeshMethod::Adj,
+            use_weights: false,
+            vert_weights: &[],
         }
     }
 }
@@ -267,7 +283,13 @@ impl LoopMesh {
         // Doing surgery per-vertex inline would re-point a shared edge after the
         // first corner and slide the second corner off the recreated chamfer
         // (§6.4.1), so the two phases must stay separated.
-        let frames = self.gather_bevel_frames(&beveled, options.offset, options.offset_type);
+        let frames = self.gather_bevel_frames(
+            &beveled,
+            options.offset,
+            options.offset_type,
+            options.use_weights,
+            options.vert_weights,
+        );
         let clamp_factor = if options.clamp_overlap {
             clamp_factor(options.offset, &beveled, &frames)
         } else {
@@ -2340,6 +2362,8 @@ impl LoopMesh {
         beveled: &[VertexKey],
         offset: f32,
         offset_type: BevelOffsetType,
+        use_weights: bool,
+        vert_weights: &[(VertexKey, f32)],
     ) -> Vec<BevelFrame> {
         let mut frames = Vec::with_capacity(beveled.len());
         for &vertex in beveled {
@@ -2347,6 +2371,13 @@ impl LoopMesh {
             if incident_edges.len() < 2 {
                 continue;
             }
+
+            // §8.7.2 / §8.7.3: the per-corner weight prescales this vertex's
+            // offset uniformly across all its incident edges, *before* the §4 /
+            // §4.3 slide solve. Gate off ⇒ weight 1.0 (full offset); gate on but
+            // absent from the slice ⇒ weight 0.0 (no slide for this corner).
+            let weight = corner_weight(use_weights, vert_weights, vertex);
+            let effective_offset = offset * weight;
 
             let vertex_position = self.vertex_position(vertex);
             let far_verts: Vec<VertexKey> = incident_edges
@@ -2372,18 +2403,23 @@ impl LoopMesh {
                     .zip(&far_verts)
                     .zip(&far_positions)
                     .map(|((&edge, &far_vertex), &far_position)| {
+                        // §8.7.3: prescale the corner offset, then solve the §4 /
+                        // §4.3 slide unchanged. The solve is linear in offset, so
+                        // this is identical to scaling the resolved slide by the
+                        // weight afterward.
                         let slide = slide_distance(
-                            offset,
+                            effective_offset,
                             offset_type,
                             vertex_position,
                             far_position,
                             corner_axis,
                         );
-                        // §4.4.2: the per-offset slide rate `k = d_i / offset`,
-                        // the §4.3 `offset_type` factor used by the collision
-                        // clamp. Derived from the resolved slide so every mode
-                        // (including the angle modes and PERCENT) feeds the same
-                        // collision computation.
+                        // §4.4.2 / §8.7.4: the per-offset slide rate `k = d_i /
+                        // offset`, the §4.3 `offset_type` factor used by the
+                        // collision clamp. Derived from the *weighted* slide
+                        // against the requested offset, so the clamp sees the
+                        // weighted rates (§8.7.4: the weight is the inner scale,
+                        // the clamp the outer).
                         let rate = if offset != 0.0 { slide / offset } else { 0.0 };
                         EdgePlacement {
                             edge,
@@ -5751,6 +5787,181 @@ mod tests {
         // No gap: none seamed bridges nothing.
         assert!(bridge_synthetic_junction(&[false, false, false]).is_empty());
     }
+
+    /// The minimum ring slide of a corner: distance from the original corner
+    /// position to the nearest of `result`'s new ring verts. For a single corner
+    /// at `offset` every ring vert slides exactly `offset` (§4); the *minimum* is
+    /// robust against the other corner's ring verts in a two-corner bevel.
+    fn nearest_ring_slide(mesh: &LoopMesh, result: &BevelResult, corner: Vec3) -> f32 {
+        result
+            .verts
+            .iter()
+            .map(|&v| (mesh.vertex_position(v) - corner).length())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// BEVEL.md §8.7.3 / §8.7.5: distinct weights on two non-adjacent corners in
+    /// one call produce a non-uniform result — the `0.4`-weighted corner slides
+    /// its ring verts only `0.4·offset`, the `1.0`-weighted corner the full
+    /// `offset`. v0 = (1,-1,-1) and v6 = (-1,1,1) are opposite cube corners
+    /// (disjoint one-rings), so each weight scales its corner independently.
+    #[test]
+    fn weighted_vertex_bevel_shrinks_one_corner() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let v6 = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+        let pos0 = mesh.vertex_position(v0);
+        let pos6 = mesh.vertex_position(v6);
+
+        let offset = 0.5;
+        let result = mesh.bevel(
+            &[v0.into(), v6.into()],
+            BevelOptions {
+                offset,
+                use_weights: true,
+                vert_weights: &[(v0, 1.0), (v6, 0.4)],
+                ..Default::default()
+            },
+        );
+
+        let slide_full = nearest_ring_slide(&mesh, &result, pos0);
+        let slide_weighted = nearest_ring_slide(&mesh, &result, pos6);
+        assert!(
+            (slide_full - offset).abs() < 1.0e-5,
+            "weight 1.0 corner slides the full offset {offset}, got {slide_full}",
+        );
+        assert!(
+            (slide_weighted - 0.4 * offset).abs() < 1.0e-5,
+            "weight 0.4 corner slides 0.4·offset = {}, got {slide_weighted}",
+            0.4 * offset,
+        );
+        assert!(
+            slide_weighted < slide_full - 1.0e-5,
+            "the weighted corner must be observably smaller than the full one",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.7.2 case 1 / §8.7.3: uniform weight `1.0` on every beveled
+    /// corner reproduces the unweighted geometry byte-for-byte (weight `1.0` is a
+    /// no-op prescale). Compared against the same bevel with `use_weights` off.
+    #[test]
+    fn uniform_weight_one_reproduces_unweighted() {
+        let corner_slides = |use_weights: bool, weights: &[(VertexKey, f32)]| {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+            let v6 = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+            let pos0 = mesh.vertex_position(v0);
+            let pos6 = mesh.vertex_position(v6);
+            let result = mesh.bevel(
+                &[v0.into(), v6.into()],
+                BevelOptions {
+                    offset: 0.5,
+                    use_weights,
+                    vert_weights: weights,
+                    ..Default::default()
+                },
+            );
+            let mut positions: Vec<Vec3> =
+                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            positions.sort_by(|a, b| {
+                a.to_array()
+                    .partial_cmp(&b.to_array())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            (positions, nearest_ring_slide(&mesh, &result, pos0), nearest_ring_slide(&mesh, &result, pos6))
+        };
+
+        // Build the weighted-1.0 call with the same fixture's keys. The keys are
+        // deterministic across the two identical cube builds, so the all-`1.0`
+        // weighted run and the gate-off run must coincide.
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let v6 = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+
+        let (unweighted, u0, u6) = corner_slides(false, &[]);
+        let (weighted, w0, w6) = corner_slides(true, &[(v0, 1.0), (v6, 1.0)]);
+
+        assert!((u0 - 0.5).abs() < 1.0e-6 && (u6 - 0.5).abs() < 1.0e-6);
+        assert!((w0 - u0).abs() < 1.0e-6 && (w6 - u6).abs() < 1.0e-6);
+        assert_eq!(weighted.len(), unweighted.len());
+        for (a, b) in weighted.iter().zip(&unweighted) {
+            assert!(
+                (*a - *b).length() < 1.0e-6,
+                "all-1.0 weighted bevel must match the unweighted geometry",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.7.2 case 1: with the gate off, the `vert_weights` slice is
+    /// ignored entirely — every corner slides the full offset even though the
+    /// slice would scale one of them down.
+    #[test]
+    fn weights_ignored_when_gate_off() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let v6 = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+        let pos6 = mesh.vertex_position(v6);
+
+        let result = mesh.bevel(
+            &[v0.into(), v6.into()],
+            BevelOptions {
+                offset: 0.5,
+                use_weights: false,
+                vert_weights: &[(v0, 1.0), (v6, 0.4)],
+                ..Default::default()
+            },
+        );
+
+        let slide6 = nearest_ring_slide(&mesh, &result, pos6);
+        assert!(
+            (slide6 - 0.5).abs() < 1.0e-5,
+            "gate off must ignore the 0.4 weight; corner should slide the full 0.5, got {slide6}",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.7.2 case 3 / §8.7.6: gate on, a beveled vertex *absent* from
+    /// `vert_weights` defaults to weight `0.0` — zero effective offset, no slide,
+    /// a clean no-op for that corner (its ring verts coincide with the original
+    /// corner). v0 is written `1.0` and bevels; v6 is omitted and does not.
+    #[test]
+    fn absent_weight_defaults_to_zero_no_op() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let v6 = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+        let pos0 = mesh.vertex_position(v0);
+        let pos6 = mesh.vertex_position(v6);
+
+        let result = mesh.bevel(
+            &[v0.into(), v6.into()],
+            BevelOptions {
+                offset: 0.5,
+                use_weights: true,
+                vert_weights: &[(v0, 1.0)], // v6 absent ⇒ weight 0.0
+                ..Default::default()
+            },
+        );
+
+        let slide0 = nearest_ring_slide(&mesh, &result, pos0);
+        assert!(
+            (slide0 - 0.5).abs() < 1.0e-5,
+            "v0 weighted 1.0 slides the full offset, got {slide0}",
+        );
+        // v6's three ring verts all land at zero slide — coincident with the
+        // original corner — so the nearest ring vert to pos6 is at distance 0.
+        let slide6 = nearest_ring_slide(&mesh, &result, pos6);
+        assert!(
+            slide6 < 1.0e-6,
+            "absent v6 defaults to weight 0.0: ring verts stay at the corner, got {slide6}",
+        );
+        mesh.validate_topology();
+    }
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
@@ -5817,6 +6028,20 @@ fn edge_collision_offset(length: f32, rate_near: f32, rate_far: f32) -> f32 {
     } else {
         length / rate_sum
     }
+}
+
+/// The gated per-corner bevel weight for `affect = Vertices` (BEVEL.md §8.7.2).
+/// The three-way rule: gate off ⇒ `1.0` (full offset, weights ignored); gate on
+/// and the vertex present in the slice ⇒ its stored float; gate on and absent ⇒
+/// `0.0` (no slide — the asymmetric "weighting on but nothing to read" default).
+fn corner_weight(use_weights: bool, vert_weights: &[(VertexKey, f32)], vertex: VertexKey) -> f32 {
+    if !use_weights {
+        return 1.0;
+    }
+    vert_weights
+        .iter()
+        .find_map(|&(key, weight)| (key == vertex).then_some(weight))
+        .unwrap_or(0.0)
 }
 
 /// The §4.4 global clamp factor: gather every beveled edge's collision offset,
