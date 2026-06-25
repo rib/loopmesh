@@ -208,6 +208,35 @@ impl LoopMesh {
         self.vertices.get_mut(v).normal = n;
     }
 
+    /// Set or clear the vertex's persistent HIDDEN header bit. Hidden geometry
+    /// is skipped by the grow direction of `region_extend` and ignored by its
+    /// shrink direction (REGION_EXTEND.md §2.3 / §5.2).
+    pub fn set_vert_hidden(&mut self, v: VertexKey, hidden: bool) {
+        self.vertices.get_mut(v).eflags.set(ElementFlags::HIDDEN, hidden);
+    }
+
+    pub fn is_vert_hidden(&self, v: VertexKey) -> bool {
+        self.vertices.get(v).eflags.contains(ElementFlags::HIDDEN)
+    }
+
+    /// Set or clear the edge's persistent HIDDEN header bit.
+    pub fn set_edge_hidden(&mut self, e: EdgeKey, hidden: bool) {
+        self.edges.get_mut(e).eflags.set(ElementFlags::HIDDEN, hidden);
+    }
+
+    pub fn is_edge_hidden(&self, e: EdgeKey) -> bool {
+        self.edges.get(e).eflags.contains(ElementFlags::HIDDEN)
+    }
+
+    /// Set or clear the face's persistent HIDDEN header bit.
+    pub fn set_face_hidden(&mut self, f: FaceKey, hidden: bool) {
+        self.faces.get_mut(f).eflags.set(ElementFlags::HIDDEN, hidden);
+    }
+
+    pub fn is_face_hidden(&self, f: FaceKey) -> bool {
+        self.faces.get(f).eflags.contains(ElementFlags::HIDDEN)
+    }
+
     pub fn edge_vertices(&self, e: EdgeKey) -> [VertexKey; 2] {
         self.edges.get(e).vertices
     }

@@ -388,8 +388,12 @@ pub(crate) trait Element {
     fn is_hidden(&self) -> bool {
         (self.flags() & ElementFlags::HIDDEN) != ElementFlags::NONE
     }
-    fn set_hidden(&mut self) {
-        self.set_flags(self.flags() | ElementFlags::HIDDEN);
+    fn set_hidden(&mut self, hidden: bool) {
+        if hidden {
+            self.set_flags(self.flags() | ElementFlags::HIDDEN);
+        } else {
+            self.set_flags(self.flags() & !ElementFlags::HIDDEN);
+        }
     }
 }
 

@@ -377,6 +377,63 @@ mod tests {
         );
     }
 
+    /// The public HIDDEN setter flips the per-element bit, and the bit drives
+    /// the direction-dependent hidden handling of `region_extend`
+    /// (REGION_EXTEND.md §2.3 / §5.2): a hidden incident edge is **excluded**
+    /// from a vert-mode grow ring but **included** in a vert-mode shrink ring.
+    /// This pins the grow-skips / shrink-ignores asymmetry through the new API.
+    #[test]
+    fn hidden_edge_skipped_by_grow_but_not_shrink() {
+        let (mut mesh, verts, _faces) = vertex_lattice(3);
+        // The "east" edge out of the centre vert 4 → far vert 5.
+        let east = mesh.query_edge_exists(verts[4], verts[5]).unwrap();
+
+        // Setter toggles the bit and the getter agrees.
+        assert!(!mesh.is_edge_hidden(east));
+        mesh.set_edge_hidden(east, true);
+        assert!(mesh.is_edge_hidden(east));
+
+        // Grow from the centre vert: the hidden east edge and its far vert 5 are
+        // skipped, so the ring shrinks to 3 edges + 3 far verts {1,3,7} (§2.3).
+        let grow = ring_set(&mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions::default(),
+        ));
+        assert!(
+            !grow.contains(&GeomKey::Edge(east)),
+            "grow skips the hidden edge"
+        );
+        assert!(
+            !grow.contains(&GeomKey::Vert(verts[5])),
+            "grow does not reach across the hidden edge"
+        );
+        assert_eq!(grow.len(), 6, "3 non-hidden edges + 3 far verts");
+
+        // Shrink consults no hidden bit (§5.2): the centre vert is a boundary
+        // vert and **all** its incident edges are ringed, hidden one included.
+        let shrink = ring_set(&mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions {
+                use_contract: true,
+                use_faces: false,
+                use_face_step: false,
+            },
+        ));
+        assert!(
+            shrink.contains(&GeomKey::Edge(east)),
+            "shrink ignores the hidden bit and still rings the hidden edge"
+        );
+
+        // Clearing the bit restores the full grow ring (8 elements).
+        mesh.set_edge_hidden(east, false);
+        assert!(!mesh.is_edge_hidden(east));
+        let grow_cleared = mesh.region_extend(
+            &[GeomKey::Vert(verts[4])],
+            RegionExtendOptions::default(),
+        );
+        assert_eq!(grow_cleared.len(), 8, "cleared bit restores the full ring");
+    }
+
     /// REGION_EXTEND.md §3.1 fill-in subtlety: an edge spanning two
     /// originally-selected verts is non-ORIG (only verts are flagged) and so is
     /// reported as a crossing edge.
