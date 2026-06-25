@@ -465,6 +465,55 @@ mod tests {
         assert_ne!(shrink_set, grow, "shrink and grow report different rings");
     }
 
+    /// Face-mode shrink (`use_contract`): the inner boundary band of an interior
+    /// block. REGION_EXTEND.md §5.2 / §6. Selecting the central 3×3 block of a
+    /// 5×5 face grid and shrinking (edge step) reports exactly the band of block
+    /// faces that touch a non-selected neighbour — every block face except the
+    /// fully-interior centre face. The ring is a **strict subset** of the input
+    /// (boundary faces are ORIG *and* RING, §5.2).
+    #[test]
+    fn face_shrink_block_inner_band_excludes_interior() {
+        // dim = 6 vertex lattice → 5×5 face grid; face (r,c) is index r*5 + c.
+        let (mesh, _verts, faces) = vertex_lattice(6);
+        let block_rc = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3)];
+        let idx = |r: usize, c: usize| r * 5 + c;
+        let region: Vec<GeomKey> = block_rc
+            .iter()
+            .map(|&(r, c)| GeomKey::Face(faces[idx(r, c)]))
+            .collect();
+
+        let shrink = mesh.region_extend(
+            &region,
+            RegionExtendOptions {
+                use_contract: true,
+                use_faces: true,
+                use_face_step: false,
+            },
+        );
+        let shrink_set = ring_set(&shrink);
+
+        // The inner band is the 3×3 block minus the fully-interior centre (2,2).
+        let expected: HashSet<GeomKey> = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2), (3, 3)]
+            .iter()
+            .map(|&(r, c)| GeomKey::Face(faces[idx(r, c)]))
+            .collect();
+        assert_eq!(shrink_set, expected, "inner boundary band of the block");
+
+        // The interior face (2,2) = index 12 is excluded — all four of its
+        // edge-adjacent neighbours are inside the region (§5.2 boundary test).
+        assert!(
+            !shrink_set.contains(&GeomKey::Face(faces[idx(2, 2)])),
+            "the fully-interior centre face is not on the boundary"
+        );
+
+        // Shrink reports a strict subset of the input region.
+        let region_set: HashSet<GeomKey> = region.iter().copied().collect();
+        assert!(
+            shrink_set.is_subset(&region_set) && shrink_set != region_set,
+            "shrink ring is a strict subset of the input (§5.2)"
+        );
+    }
+
     /// Fully-selected no-op: growing a region that is the whole face set reaches
     /// nothing new — every candidate neighbour is ORIG. REGION_EXTEND.md §8.
     #[test]
