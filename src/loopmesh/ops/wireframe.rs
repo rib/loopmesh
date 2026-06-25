@@ -591,7 +591,8 @@ impl LoopMesh {
     /// but pushed *outward* along the boundary tangent so the rim cap closes the
     /// tube. The boundary tangent is the negation of the inward bisector taken
     /// over the (up to two) boundary edges of `face` at `v`; a single boundary
-    /// edge falls back to a face-plane perpendicular.
+    /// edge falls back to a face-plane perpendicular whose sign is oriented
+    /// outward (away from the face interior).
     fn wireframe_boundary_frame(
         &mut self,
         v: VertexKey,
@@ -603,14 +604,20 @@ impl LoopMesh {
         let here = self.vertex_position(v);
 
         // The (up to two) boundary edges of `face` incident to `v`, as unit
-        // directions leaving the corner.
+        // directions leaving the corner. `corner_loop` is the loop of `face`
+        // whose own vertex is `v` — used to recover the face-interior reference
+        // direction so a single-edge perpendicular can be oriented outward.
         let mut dirs: [Vec3; 2] = [Vec3::ZERO; 2];
         let mut count = 0usize;
+        let mut corner_loop: Option<LoopKey> = None;
         let first = self.face_first_loop(face);
         let mut l = first;
         loop {
             let lv = self.loop_vertex(l);
             let le = self.loop_edge(l);
+            if lv == v {
+                corner_loop = Some(l);
+            }
             if (lv == v || self.loop_vertex(self.loop_next(l)) == v)
                 && self.wireframe_edge_is_boundary(le, face, face_tag)
             {
@@ -630,6 +637,33 @@ impl LoopMesh {
             }
         }
 
+        // The rim tangent must point *outward* — away from the face interior at
+        // this corner. For a single boundary edge (and the collinear two-edge
+        // fallback) the face-plane perpendicular has two valid signs, and a bare
+        // cross product picks the same one at both ends of a rim that runs in a
+        // single direction; at a fork vertex where the spine continues past the
+        // corner, that is the wrong (inward-pointing) sign at one end. Orient the
+        // perpendicular against the inward face tangent (the §4.3 interior
+        // bisector) so it always points away from the interior, the same
+        // concavity check the inward tangent itself uses.
+        let orient_outward = |perp: Vec3, this: &Self| -> Vec3 {
+            let perp = LoopMesh::normalize_or_zero(perp);
+            if perp == Vec3::ZERO {
+                return Vec3::ZERO;
+            }
+            match corner_loop {
+                Some(cl) => {
+                    let inward = this.wireframe_inward_tangent(cl, face_normal);
+                    if perp.dot(inward) > 0.0 {
+                        -perp
+                    } else {
+                        perp
+                    }
+                }
+                None => perp,
+            }
+        };
+
         let outward = match count {
             2 => {
                 // Inward bisector of the two boundary edges → negate for the
@@ -638,13 +672,14 @@ impl LoopMesh {
                 if inward != Vec3::ZERO {
                     -inward
                 } else {
-                    LoopMesh::normalize_or_zero(face_normal.cross(dirs[0]))
+                    orient_outward(face_normal.cross(dirs[0]), self)
                 }
             }
             1 => {
                 // §6.1 single-boundary-edge degenerate case: derive the tangent
-                // from the one edge alone (a face-plane perpendicular).
-                LoopMesh::normalize_or_zero(face_normal.cross(dirs[0]))
+                // from the one edge alone (a face-plane perpendicular), oriented
+                // outward away from the face interior.
+                orient_outward(face_normal.cross(dirs[0]), self)
             }
             _ => Vec3::ZERO,
         };
@@ -1298,6 +1333,220 @@ mod tests {
 
         let mut empty: [f32; 0] = [];
         assert_eq!(super::median_edge_length(&mut empty), 1.0, "no tagged edges → 1.0 fallback");
+    }
+
+    /// A radial-3 T-junction fan (WIREFRAME.md §11.4): three quads share one
+    /// spine edge `{s0, s1}`, each fanning out to its own two non-spine wing
+    /// verts in a distinct direction so the spine vertices have well-defined
+    /// (non-degenerate) normals. The spine edge is wound the same way in every
+    /// quad (`s0 → wing → wing → s1`), so all three faces are radial users of
+    /// the single shared spine edge — a non-manifold (radial-3) interior edge.
+    /// Returns `(spine_edge, [face; 3])`.
+    fn radial3_tjunction(mesh: &mut LoopMesh) -> (EdgeKey, [FaceKey; 3]) {
+        let s0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let s1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let spine = mesh.create_edge([s0, s1], EdgeCreateFlags::NO_DUPLICATE);
+
+        let mut faces = [FaceKey::from_usize(0); 3];
+        // Three wings at 0°, 120°, 240° in the XZ plane around the spine.
+        for (i, face) in faces.iter_mut().enumerate() {
+            let theta = (i as f32) * std::f32::consts::TAU / 3.0;
+            let (dx, dz) = (theta.cos(), theta.sin());
+            let w0 = mesh.create_vertex(Vec3::new(dx, 0.0, dz));
+            let w1 = mesh.create_vertex(Vec3::new(dx, 1.0, dz));
+            // Winding s0 → w0 → w1 → s1; the closing edge w1→... s1→s0 is the
+            // shared spine. Reuse the spine edge so its radial fan grows.
+            let e_s0w0 = mesh.create_edge([s0, w0], EdgeCreateFlags::NO_DUPLICATE);
+            let e_w0w1 = mesh.create_edge([w0, w1], EdgeCreateFlags::NO_DUPLICATE);
+            let e_w1s1 = mesh.create_edge([w1, s1], EdgeCreateFlags::NO_DUPLICATE);
+            *face = mesh.face_create(
+                &[s0, w0, w1, s1],
+                &[e_s0w0, e_w0w1, e_w1s1, spine],
+                FaceCreateFlags::NONE,
+            );
+        }
+        (spine, faces)
+    }
+
+    #[test]
+    fn radial3_spine_is_interior_others_boundary() {
+        // WIREFRAME.md §11.4: the §3 wire-boundary predicate fires on the
+        // *second* tagged user, so the radial-3 spine edge (three tagged users)
+        // is interior, while every wing edge (one tagged user) is a wire
+        // boundary. Pin the classification before the count tests so the
+        // interior-fan / multi-fork-cap behaviour rests on a verified base.
+        let mut mesh = LoopMesh::new();
+        let (spine, faces) = radial3_tjunction(&mut mesh);
+
+        let tag = mesh.push_face_op_flag_layer();
+        for &f in &faces {
+            mesh.face_op_flag_set(tag, f, 0);
+        }
+
+        // The spine has three radial users, so for any one owner there are two
+        // *other* tagged faces — it is interior with respect to each.
+        for &owner in &faces {
+            assert!(
+                !mesh.wireframe_edge_is_boundary(spine, owner, tag),
+                "radial-3 spine must be interior (a second tagged user exists)",
+            );
+        }
+        // Every wing edge has a single tagged user → wire boundary. Walk each
+        // face's loops; the only interior edge it sees is the spine.
+        let mut interior_seen = 0;
+        let mut boundary_seen = 0;
+        for &owner in &faces {
+            let mut loops = mesh.face_loops(owner);
+            while let Some(l) = loops.next(&mesh) {
+                let e = mesh.loop_edge(l);
+                if mesh.wireframe_edge_is_boundary(e, owner, tag) {
+                    boundary_seen += 1;
+                } else {
+                    interior_seen += 1;
+                }
+            }
+        }
+        // Three faces × 4 edges = 12 loop-edge visits; the spine is interior in
+        // all three (3 interior visits), the 9 distinct wing edges boundary.
+        assert_eq!(interior_seen, 3, "spine interior for all three owners");
+        assert_eq!(boundary_seen, 9, "nine wing edges are wire boundary");
+
+        mesh.pop_face_op_flag_layer(tag);
+    }
+
+    #[test]
+    fn radial3_interior_fan_tube_counts_no_boundary() {
+        // WIREFRAME.md §11.4 worked table (k = 3, use_boundary clear): the spine
+        // is a radial-3 interior edge lined by 2k = 6 strut quads meeting at its
+        // two shared shell hubs; the §11 formulas absorb the fan depth with no
+        // special-casing. L = 4k = 12 corners → 2L = 24 strut faces; F = k = 3
+        // retained source faces → 27 faces. New verts = L + 2·V_t = 12 + 16 = 28
+        // (V_t = 2k+2 = 8), plus the 8 retained originals → 36 verts.
+        let mut mesh = LoopMesh::new();
+        let (spine, faces) = radial3_tjunction(&mut mesh);
+
+        let result = mesh.wireframe(&faces, 0.2, false);
+
+        assert_eq!(
+            result.strut_faces.len(),
+            24,
+            "2 struts per corner × 12 corners (radial depth multiplies per-corner work)",
+        );
+        assert_eq!(mesh.face_count(), 27, "24 struts + 3 retained source faces");
+        assert_eq!(
+            mesh.vertex_count(),
+            36,
+            "12 inset-frame + 16 shell + 8 retained originals",
+        );
+
+        // The shared shell hub is welded: each spine vertex spawns exactly one
+        // +/- shell pair (keyed by original vertex, §4.1), shared by all three
+        // wings' struts. Count the strut quads that reference the spine verts'
+        // shell verts — the 2k = 6 quads lining the spine must all anchor on the
+        // *same* two shell pairs, not per-face duplicates.
+        // The shared shell hub weld (§11.4): the spine's two shell pairs are
+        // keyed by original vertex, so all 2k = 6 strut quads lining the spine
+        // anchor on the *same* two pairs (not per-face duplicates). The spine
+        // itself is untouched (no use_replace), so it still carries its full
+        // radial-3 fan — confirm the fan survived the build.
+        let mut radial = mesh.radial_loops(spine);
+        let mut spine_fan = 0;
+        while radial.next(&mesh).is_some() {
+            spine_fan += 1;
+        }
+        assert_eq!(
+            spine_fan, 3,
+            "spine retains its radial-3 fan (originals kept under no-replace)",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn radial3_use_boundary_caps_multifork_vertex_counts() {
+        // WIREFRAME.md §11.4 worked table (k = 3, use_boundary set): each spine
+        // vertex touches k = 3 boundary edges (a >2-boundary-edge cap vertex);
+        // §6.1's per-vertex guard builds exactly ONE boundary vert there, reused
+        // for all k caps, and §6.2 emits a cap pair for each of the E_b = 3k = 9
+        // boundary edges. Boundary verts = V_b = 2k+2 = 8; cap faces = 2·E_b =
+        // 6k = 18. So 27 + 18 = 45 faces and 36 + 8 = 44 verts.
+        let mut mesh = LoopMesh::new();
+        let (_spine, faces) = radial3_tjunction(&mut mesh);
+
+        let result = mesh.wireframe(&faces, 0.2, true);
+
+        assert_eq!(
+            result.strut_faces.len(),
+            42,
+            "24 inner struts + 18 rim caps (2 per boundary edge × 9 boundary edges)",
+        );
+        assert_eq!(mesh.face_count(), 45, "42 strut/cap faces + 3 retained source");
+        assert_eq!(
+            mesh.vertex_count(),
+            44,
+            "36 (no-boundary case) + 8 boundary verts (one per boundary vertex)",
+        );
+
+        // §6.1 first-touch tangent sign at the >2-boundary-edge fork vertex.
+        // The spine runs +Y from the origin `s0`, so the origin's face interior
+        // lies on the +Y side; the rim cap must close *outward* — away from that
+        // interior — putting the origin's boundary inset-frame vert on the -Y
+        // side. The first-touch face (the θ = 0 wing, in the XY plane) gives a
+        // pure-Y perpendicular, so the fork boundary vert lands at exactly
+        // (0, -thickness/2, 0). The bug this guards: a bare cross product points
+        // the cap *toward* the spine interior (+Y) at this end while the
+        // unambiguous far end (s1 = (0,1,0)) already points outward (+Y, away
+        // from its interior), so the two ends disagree in sign.
+        let half = 0.2_f32 * 0.5;
+        let mut fork_outward = 0usize;
+        let mut fork_inward = 0usize;
+        for v in mesh.vert_keys() {
+            let p = mesh.vertex_position(v);
+            if p.x.abs() < 1.0e-6 && p.z.abs() < 1.0e-6 {
+                if (p.y + half).abs() < 1.0e-6 {
+                    fork_outward += 1;
+                } else if (p.y - half).abs() < 1.0e-6 {
+                    fork_inward += 1;
+                }
+            }
+        }
+        assert_eq!(
+            fork_outward, 1,
+            "origin fork cap vert sits on the -Y (outward) side at (0, -thickness/2, 0)",
+        );
+        assert_eq!(
+            fork_inward, 0,
+            "no fork cap vert points inward toward the +Y spine interior at the origin",
+        );
+
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn radial3_use_boundary_contrast_pins_multifork_cap() {
+        // The contrast that makes the >2-boundary-edge cap observable: the same
+        // radial-3 fan differs by exactly the rim caps between use_boundary
+        // clear and set — +18 cap faces and +8 boundary verts (§11.4). An impl
+        // that mis-counted the multi-fork vertex (e.g. one boundary vert per
+        // boundary *edge* rather than per vertex, or per-face shell duplicates)
+        // would not land this exact delta.
+        let mut open = LoopMesh::new();
+        let (_, fo) = radial3_tjunction(&mut open);
+        let open_result = open.wireframe(&fo, 0.2, false);
+
+        let mut capped = LoopMesh::new();
+        let (_, fc) = radial3_tjunction(&mut capped);
+        let capped_result = capped.wireframe(&fc, 0.2, true);
+
+        assert_eq!(
+            capped_result.strut_faces.len() - open_result.strut_faces.len(),
+            18,
+            "2 cap faces per boundary edge × 9 boundary edges",
+        );
+        assert_eq!(
+            capped.vertex_count() - open.vertex_count(),
+            8,
+            "one boundary vert per boundary vertex (V_b = 2k+2 = 8), not per boundary edge",
+        );
     }
 
     #[test]
