@@ -1815,13 +1815,13 @@ impl LoopMesh {
         ring
     }
 
-    /// Solve a boundvert's constrained meet point (BEVEL.md §7.6.2). Assembles the
-    /// offset-line rows (one per face in the sector, "stay at perpendicular
-    /// `offset` from my bounding beveled edge in my plane") plus, for a single
-    /// planar face, an embedding row (membership in the face plane, zero
-    /// out-of-plane rise), and solves the normal equations `AᵀA·x = Aᵀc`. The
-    /// least-squares form subsumes the exact 2-line intersection of the planar
-    /// case.
+    /// Place a sector's boundvert by the pairwise offset-line meet (BEVEL.md
+    /// §7.6.2). The boundvert is fixed by *only* the sector's two flanking beveled
+    /// edges — never a fit over every incident face. Build the offset line of
+    /// `g_k`'s inner side and the offset line of `g_(k+1)`'s inner side, then
+    /// intersect them. Three sector cases (no in-between edge / all-in-plane /
+    /// non-planar) choose which plane each offset line is built in; the
+    /// parallel / anti-parallel ladder handles the near-degenerate edge angles.
     fn solve_meet_point(
         &self,
         vertex: VertexKey,
@@ -1829,49 +1829,292 @@ impl LoopMesh {
         sector: &Sector,
         offset: f32,
     ) -> Vec3 {
-        // Each face in the sector that is bounded by a beveled edge contributes an
-        // offset row: the unit in-plane perpendicular to that edge, pointing into
-        // the face, with target `offset` (measured relative to `vertex`).
-        let mut rows: Vec<(Vec3, f32)> = Vec::new();
-        let mut sector_normal = Vec3::ZERO;
+        let layout = match self.sector_layout(vertex, vertex_position, sector) {
+            Some(layout) => layout,
+            None => return vertex_position,
+        };
 
-        for &(edge, face) in &sector.corners {
-            if !sector.bounding_edges.contains(&edge) {
-                continue;
+        let dir_first = layout.dir_first;
+        let dir_second = layout.dir_second;
+
+        // §7.6.2 parallel/anti-parallel ladder, gated on the angle between the two
+        // edge *directions*. cos θ = dir_first · dir_second; the two near-degenerate
+        // ends each have a closed-form placement that the line-line solve cannot
+        // produce (parallel lines never cross, anti-parallel collapse to a sliver).
+        let cos_theta = dir_first.dot(dir_second).clamp(-1.0, 1.0);
+        if cos_theta >= 1.0 - MEET_ANGLE_TOLERANCE {
+            // Edges nearly parallel (θ ≈ 0): no well-defined crossing. Push out
+            // perpendicular to both edges by `offset / cos(θ/2)` (→ `offset` as
+            // θ → 0); a finite placement, not the bisector `t / sin(θ/2)` limit.
+            return self.parallel_meet(vertex_position, &layout, offset, cos_theta);
+        }
+        if cos_theta <= -1.0 + MEET_ANGLE_TOLERANCE {
+            // Edges nearly anti-parallel (opening angle ≈ 180°): slide along the
+            // common edge line by the offset; there is no perpendicular to take.
+            return vertex_position + dir_first * offset;
+        }
+
+        // Build the two offset lines as point-plus-direction (§7.6.2 "Building the
+        // two offset lines"). The base point is `v` pushed perpendicular to the
+        // edge, into the sector face, by `offset`; the direction is the edge's own.
+        let line_first = Line {
+            point: vertex_position + layout.perp_first * offset,
+            direction: dir_first,
+        };
+        let line_second = Line {
+            point: vertex_position + layout.perp_second * offset,
+            direction: dir_second,
+        };
+
+        match intersect_lines(&line_first, &line_second) {
+            LineMeet::Crossing(point) => point,
+            LineMeet::Collinear => line_first.point,
+            LineMeet::Skew(midpoint) => {
+                self.drop_onto_sector_face(vertex_position, &layout, midpoint, offset)
             }
-            let [a, b] = self.edge_vert_keys(edge);
-            let far = if a == vertex { b } else { a };
-            let direction = {
-                let segment = self.vertex_position(far) - vertex_position;
-                let length = segment.length();
-                if length <= f32::EPSILON {
-                    continue;
-                }
-                segment / length
+        }
+    }
+
+    /// The geometric layout a §7.6.2 meet needs from a sector: the two flanking
+    /// edge directions and, per the three-case classification, the in-plane
+    /// perpendicular each offset line is built along, plus the in-between faces
+    /// used by the skew face-drop. `None` for a degenerate (zero-length) flank.
+    fn sector_layout(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        sector: &Sector,
+    ) -> Option<SectorLayout> {
+        if sector.bounding_edges.len() != 2 {
+            // A junction's first sector can transiently carry a single bounding
+            // edge only on a malformed open fan; the §7.6.1 closed junction always
+            // has two. Fall back to the vertex position rather than guess.
+            return None;
+        }
+        let edge_first = sector.bounding_edges[0];
+        let edge_second = sector.bounding_edges[1];
+        let dir_first = self.edge_direction_from(edge_first, vertex, vertex_position)?;
+        let dir_second = self.edge_direction_from(edge_second, vertex, vertex_position)?;
+
+        // The sector's face run, in disk order: f0 (just past g_k) … f_last (just
+        // before g_(k+1)). `corners` is `[(g_k,f0),(leg1,f1),…,(g_(k+1),f_last)]`,
+        // so deduping consecutive faces recovers the run, and the unbeveled edges
+        // strictly between the two flanking beveled edges are the in-between legs.
+        let mut faces: Vec<FaceKey> = Vec::new();
+        for &(_, face) in &sector.corners {
+            if faces.last() != Some(&face) {
+                faces.push(face);
+            }
+        }
+        let mut between_edges: Vec<EdgeKey> = Vec::new();
+        for &(edge, _) in &sector.corners {
+            if edge != edge_first && edge != edge_second && !between_edges.contains(&edge) {
+                between_edges.push(edge);
+            }
+        }
+
+        let face_first = *faces.first()?;
+        let face_last = *faces.last()?;
+
+        // Classify the sector into the three §7.6.2 cases by the in-between edges:
+        // out-of-plane (silhouette) legs are the ones whose flanking faces are not
+        // coplanar. Cases 1 and 2 (no legs, or all legs in-plane) share one sector
+        // plane; case 3 (≥1 out-of-plane leg) gives each line its own local normal.
+        let has_out_of_plane = between_edges
+            .iter()
+            .enumerate()
+            .any(|(index, _)| {
+                let before = faces[index];
+                let after = faces[index + 1];
+                let dot = self.face_plane_normal(before).dot(self.face_plane_normal(after));
+                dot.abs() < 1.0 - MEET_PLANAR_TOLERANCE
+            });
+
+        let (normal_first, normal_second) = if has_out_of_plane {
+            // Case 3: two different local planes. Each line's normal is taken from
+            // the corner at its own end of the sector — the cross of that flanking
+            // beveled edge's direction with the nearest in-between leg's direction,
+            // oriented by the adjacent face.
+            let first_leg = between_edges
+                .first()
+                .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
+            let last_leg = between_edges
+                .last()
+                .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
+            let normal_first = match first_leg {
+                Some(leg) => orient_normal(dir_first.cross(leg), self.face_plane_normal(face_first)),
+                None => self.face_plane_normal(face_first),
             };
+            let normal_second = match last_leg {
+                Some(leg) => {
+                    orient_normal(dir_second.cross(leg), self.face_plane_normal(face_last))
+                }
+                None => self.face_plane_normal(face_last),
+            };
+            (normal_first, normal_second)
+        } else {
+            // Cases 1 and 2: one shared sector plane. The first flanking face's
+            // normal serves both perpendiculars (§7.6.2 case 1/2 are identical math).
+            let normal = self.face_plane_normal(face_first);
+            (normal, normal)
+        };
+
+        // Each base-point perpendicular is `cross(edge, sector normal)` — in the
+        // face plane and perpendicular to the edge — oriented toward the face
+        // interior so the offset pushes *into* the sector, not out of it.
+        let perp_first = self.into_face_perpendicular(
+            dir_first,
+            normal_first,
+            face_first,
+            vertex_position,
+        );
+        let perp_second = self.into_face_perpendicular(
+            dir_second,
+            normal_second,
+            face_last,
+            vertex_position,
+        );
+
+        Some(SectorLayout {
+            dir_first,
+            dir_second,
+            perp_first,
+            perp_second,
+            normal_first,
+            normal_second,
+            between_faces: faces,
+            between_edges,
+        })
+    }
+
+    /// The unit in-plane perpendicular to `direction` (in the plane of `normal`)
+    /// pointing toward `face`'s interior. Falls back to the raw cross when the
+    /// edge is parallel to the normal (degenerate, no in-plane perpendicular).
+    fn into_face_perpendicular(
+        &self,
+        direction: Vec3,
+        normal: Vec3,
+        face: FaceKey,
+        vertex_position: Vec3,
+    ) -> Vec3 {
+        let mut perpendicular = direction.cross(normal);
+        let length = perpendicular.length();
+        if length <= f32::EPSILON {
+            return Vec3::ZERO;
+        }
+        perpendicular /= length;
+        let center = self.face_center_of_mass(face);
+        if perpendicular.dot(center - vertex_position) < 0.0 {
+            perpendicular = -perpendicular;
+        }
+        perpendicular
+    }
+
+    /// §7.6.2 parallel special case: with the two edges nearly parallel, the offset
+    /// lines never cross, so place the meet straight out from `v` perpendicular to
+    /// both edges, a distance `offset / cos(θ/2)` along the common direction's
+    /// in-plane perpendicular. `θ` is the (small) angle between the two edge
+    /// directions; `cos(θ/2)` is recovered from `cos θ` by the half-angle identity.
+    fn parallel_meet(
+        &self,
+        vertex_position: Vec3,
+        layout: &SectorLayout,
+        offset: f32,
+        cos_theta: f32,
+    ) -> Vec3 {
+        let common = (layout.dir_first + layout.dir_second).normalize_or_zero();
+        if common == Vec3::ZERO {
+            return vertex_position;
+        }
+        let normal = layout.normal_first;
+        let mut perpendicular = common.cross(normal);
+        let length = perpendicular.length();
+        if length <= f32::EPSILON {
+            // The averaged direction lies along the plane normal: reuse the first
+            // line's already-oriented perpendicular rather than a degenerate cross.
+            perpendicular = layout.perp_first;
+        } else {
+            perpendicular /= length;
+            if perpendicular.dot(layout.perp_first) < 0.0 {
+                perpendicular = -perpendicular;
+            }
+        }
+        let cos_half = ((1.0 + cos_theta) * 0.5).max(0.0).sqrt();
+        let distance = if cos_half > f32::EPSILON {
+            offset / cos_half
+        } else {
+            offset
+        };
+        vertex_position + perpendicular * distance
+    }
+
+    /// §7.6.2 face-drop: a skew-line midpoint floats off the surface, so project it
+    /// onto the first in-walk sector face whose plane projection lands inside that
+    /// face's angular wedge at `v` (the in-wedge predicate). If no face projection
+    /// is in-wedge, the midpoint stands.
+    fn drop_onto_sector_face(
+        &self,
+        vertex_position: Vec3,
+        layout: &SectorLayout,
+        midpoint: Vec3,
+        offset: f32,
+    ) -> Vec3 {
+        // The drop only runs when both flanking offsets are positive (a zero-offset
+        // side is the §8.7 degenerate handled by its own guard, not here).
+        if offset <= 0.0 {
+            return midpoint;
+        }
+        // Walk the sector's edges in disk order starting at the flanking beveled edge
+        // `g_k` itself (not the first in-between leg), advancing up to — but not
+        // including — `g_(k+1)`. The forward face of `g_k` is `between_faces[0]`, of
+        // in-between leg `i` is `between_faces[i + 1]`, so the walk's forward faces
+        // are exactly `between_faces` in order. The projection plane is anchored at
+        // `v` (not the face's own supporting plane), oriented by the face normal; on
+        // a non-planar sector face those differ by up to the offset itself. The wedge
+        // is bounded by the walk edge and the next edge — the two edges sharing that
+        // forward face at `v`.
+        for &face in &layout.between_faces {
             let normal = self.face_plane_normal(face);
-            let center = self.face_center_of_mass(face);
-            let mut into_face = direction.cross(normal);
-            let into_len = into_face.length();
-            if into_len <= f32::EPSILON {
+            let projected = midpoint - normal * (midpoint - vertex_position).dot(normal);
+            let bounds = self.face_edge_directions_at(face, vertex_position);
+            let (dir_one, dir_two) = match bounds {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let to_projected = projected - vertex_position;
+            if to_projected.length() <= f32::EPSILON {
                 continue;
             }
-            into_face /= into_len;
-            if into_face.dot(center - vertex_position) < 0.0 {
-                into_face = -into_face;
+            let dir_projected = to_projected.normalize();
+            if point_in_wedge(dir_one, dir_two, dir_projected, normal) {
+                return projected;
             }
-            rows.push((into_face, offset));
-            sector_normal += normal;
         }
+        midpoint
+    }
 
-        // Embedding row for a planar (single-face) sector: pin membership in the
-        // face plane (no out-of-plane rise for a flat chamfer). Without it two
-        // coplanar offset rows leave the meet free along a whole line (§7.6.2).
-        if sector.corners.len() == 1 && sector_normal.length() > f32::EPSILON {
-            rows.push((sector_normal.normalize(), 0.0));
+    /// The unit directions of `face`'s two edges incident to the corner at
+    /// `vertex_position`, in the face's winding order (the edge entering the corner
+    /// then the edge leaving it). `None` if the corner or a bounding edge is
+    /// degenerate.
+    fn face_edge_directions_at(
+        &self,
+        face: FaceKey,
+        vertex_position: Vec3,
+    ) -> Option<(Vec3, Vec3)> {
+        let verts = self.face_vert_keys(face);
+        let count = verts.len();
+        let index = verts
+            .iter()
+            .position(|&v| (self.vertex_position(v) - vertex_position).length() <= f32::EPSILON)?;
+        let prev = self.vertex_position(verts[(index + count - 1) % count]);
+        let next = self.vertex_position(verts[(index + 1) % count]);
+        let to_prev = prev - vertex_position;
+        let to_next = next - vertex_position;
+        if to_prev.length() <= f32::EPSILON || to_next.length() <= f32::EPSILON {
+            return None;
         }
-
-        solve_normal_equations(&rows, vertex_position).unwrap_or(vertex_position)
+        Some((to_prev.normalize(), to_next.normalize()))
     }
 
     /// Try to place a sector's boundvert by the `loop_slide` rule (BEVEL.md §8.8):
@@ -3247,66 +3490,113 @@ fn sector_split(corners: &[VertexCorner], is_beveled: &dyn Fn(EdgeKey) -> bool) 
     sectors
 }
 
-/// Solve the small constrained meet system by the normal equations
-/// `AᵀA·x = Aᵀc` (BEVEL.md §7.6.2). Each row is `(direction, target)` meaning
-/// `dot(x − anchor, direction) = target`. Returns the solution as
-/// `anchor + offset`, or `None` if `AᵀA` is singular and no minimum-norm fallback
-/// is available.
-fn solve_normal_equations(rows: &[(Vec3, f32)], anchor: Vec3) -> Option<Vec3> {
-    if rows.is_empty() {
-        return None;
-    }
-
-    // Build the symmetric 3×3 normal matrix M = AᵀA and rhs = Aᵀc, with x measured
-    // relative to `anchor` (so the right-hand targets are already relative).
-    let mut m = [[0.0f32; 3]; 3];
-    let mut rhs = [0.0f32; 3];
-    for &(dir, target) in rows {
-        let d = [dir.x, dir.y, dir.z];
-        for i in 0..3 {
-            for j in 0..3 {
-                m[i][j] += d[i] * d[j];
-            }
-            rhs[i] += d[i] * target;
-        }
-    }
-
-    if let Some(solution) = solve_3x3(&m, &rhs) {
-        return Some(anchor + Vec3::new(solution[0], solution[1], solution[2]));
-    }
-
-    // Rank-deficient AᵀA (§7.6.2 degeneracy): fall back to the minimum-norm point,
-    // which anchored at the vertex is the solution nearest the vertex. A
-    // Tikhonov-regularised solve (M + εI) recovers exactly that as ε → 0.
-    let epsilon = 1.0e-6;
-    let mut regularised = m;
-    for i in 0..3 {
-        regularised[i][i] += epsilon;
-    }
-    solve_3x3(&regularised, &rhs).map(|s| anchor + Vec3::new(s[0], s[1], s[2]))
+/// An offset line in point-plus-direction form (BEVEL.md §7.6.2).
+struct Line {
+    point: Vec3,
+    direction: Vec3,
 }
 
-/// Solve a 3×3 linear system by Cramer's rule; `None` when the matrix is singular.
-fn solve_3x3(m: &[[f32; 3]; 3], rhs: &[f32; 3]) -> Option<[f32; 3]> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() <= 1.0e-12 {
-        return None;
+/// The outcome of intersecting two offset lines (BEVEL.md §7.6.2 "Intersecting
+/// the two offset lines").
+enum LineMeet {
+    /// The lines cross — the intersection point.
+    Crossing(Vec3),
+    /// The lines coincide — caller picks a defined on-line point.
+    Collinear,
+    /// The lines are skew — the midpoint of their two closest points.
+    Skew(Vec3),
+}
+
+/// The per-sector geometry a §7.6.2 meet consumes (built by `sector_layout`): the
+/// two flanking edge directions and their offset-line perpendiculars/normals, plus
+/// the in-between faces/edges the skew face-drop walks.
+struct SectorLayout {
+    dir_first: Vec3,
+    dir_second: Vec3,
+    perp_first: Vec3,
+    perp_second: Vec3,
+    normal_first: Vec3,
+    normal_second: Vec3,
+    between_faces: Vec<FaceKey>,
+    between_edges: Vec<EdgeKey>,
+}
+
+/// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
+/// consistent local sector normal for a case-3 offset-line perpendicular.
+fn orient_normal(candidate: Vec3, reference: Vec3) -> Vec3 {
+    let length = candidate.length();
+    if length <= f32::EPSILON {
+        return reference;
     }
-    let mut solution = [0.0f32; 3];
-    for column in 0..3 {
-        let mut replaced = *m;
-        for row in 0..3 {
-            replaced[row][column] = rhs[row];
+    let unit = candidate / length;
+    if unit.dot(reference) < 0.0 {
+        -unit
+    } else {
+        unit
+    }
+}
+
+/// Intersect two lines in 3-D by closest approach (BEVEL.md §7.6.2). Returns the
+/// crossing point when they meet, `Collinear` when they coincide, and the
+/// closest-points midpoint when they are skew.
+fn intersect_lines(first: &Line, second: &Line) -> LineMeet {
+    let d1 = first.direction;
+    let d2 = second.direction;
+    let r = first.point - second.point;
+    let a = d1.dot(d1);
+    let b = d1.dot(d2);
+    let c = d2.dot(d2);
+    let d = d1.dot(r);
+    let e = d2.dot(r);
+    let denominator = a * c - b * b;
+
+    if denominator.abs() <= LINE_PARALLEL_TOLERANCE {
+        // Parallel lines: distinguish coincident (the offset between the two base
+        // points lies along the shared direction) from a true parallel pair. The
+        // parallel-pair case is reached as a fallback only — the §7.6.2 ladder
+        // normally diverts near-parallel edges before the line solve.
+        let along = if a > f32::EPSILON {
+            r - d1 * (d1.dot(r) / a)
+        } else {
+            r
+        };
+        if along.length() <= LINE_COINCIDENT_TOLERANCE {
+            return LineMeet::Collinear;
         }
-        let det_c = replaced[0][0]
-            * (replaced[1][1] * replaced[2][2] - replaced[1][2] * replaced[2][1])
-            - replaced[0][1] * (replaced[1][0] * replaced[2][2] - replaced[1][2] * replaced[2][0])
-            + replaced[0][2] * (replaced[1][0] * replaced[2][1] - replaced[1][1] * replaced[2][0]);
-        solution[column] = det_c / det;
+        // Treat a genuine parallel pair as skew with the midpoint of the two base
+        // points; the drop step recovers a surface point if one is in-wedge.
+        return LineMeet::Skew((first.point + second.point) * 0.5);
     }
-    Some(solution)
+
+    let t = (b * e - c * d) / denominator;
+    let s = (a * e - b * d) / denominator;
+    let closest_first = first.point + d1 * t;
+    let closest_second = second.point + d2 * s;
+    let gap = closest_first - closest_second;
+    if gap.length() <= LINE_COINCIDENT_TOLERANCE {
+        LineMeet::Crossing((closest_first + closest_second) * 0.5)
+    } else {
+        LineMeet::Skew((closest_first + closest_second) * 0.5)
+    }
+}
+
+/// The §7.6.2 in-wedge predicate: is `dir_projected` inside the angular wedge that
+/// runs from `dir_one` to `dir_two` in `normal`'s winding sense? Each unsigned
+/// angle in `[0, π]` is reflexed to `2π − angle` when its directions' cross points
+/// against `normal`, so reflex wedges are measured correctly. In-wedge when the
+/// `dir_one → dir_projected` sweep does not exceed the `dir_one → dir_two` sweep.
+fn point_in_wedge(dir_one: Vec3, dir_two: Vec3, dir_projected: Vec3, normal: Vec3) -> bool {
+    let swept = |from: Vec3, to: Vec3| -> f32 {
+        let angle = from.dot(to).clamp(-1.0, 1.0).acos();
+        if from.cross(to).dot(normal) < 0.0 {
+            std::f32::consts::TAU - angle
+        } else {
+            angle
+        }
+    };
+    let wedge = swept(dir_one, dir_two);
+    let test = swept(dir_one, dir_projected);
+    test <= wedge + WEDGE_ANGLE_TOLERANCE
 }
 
 /// The new strip face and its edges (BEVEL.md §7.1 item 2).
@@ -6443,6 +6733,234 @@ mod tests {
             "rejected slide keeps the off-line §7.6.2 meet, perp={perpendicular}",
         );
     }
+
+    /// BEVEL.md §7.6.2: at an irregular non-planar junction the boundvert is the
+    /// *pairwise* meet of its two flanking edges' offset lines — a local 2-line
+    /// solve, never a fit over every incident face. The local solve stays bounded:
+    /// each boundvert lands within a small multiple of `offset` of the apex (the
+    /// strips meet near the original corner), where the discarded global
+    /// least-squares formulation drove a boundvert far out of position. This pins
+    /// the locality the rewrite restored, with `loop_slide` off so every boundvert
+    /// comes from §7.6.2.
+    #[test]
+    fn edge_bevel_meet_point_is_bounded_at_irregular_junction() {
+        let offset = 0.2;
+        let (mut mesh, apex, _spokes, [e01, e03]) = irregular_apex_junction();
+        let apex_pos = mesh.vertex_position(apex);
+        let result = mesh.bevel(
+            &[e01.into(), e03.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                loop_slide: false,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The two junction boundverts are the new verts nearest the apex (the
+        // strip verts slide out along the spokes, far from it). Both §7.6.2 meets
+        // sit within a few offsets of the apex — the locality the rewrite restored.
+        // The discarded global least-squares could drive a boundvert far out.
+        let mut distances: Vec<f32> = result
+            .verts
+            .iter()
+            .map(|&v| (mesh.vertex_position(v) - apex_pos).length())
+            .collect();
+        distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for &distance in distances.iter().take(2) {
+            assert!(
+                distance < 4.0 * offset,
+                "pairwise meet keeps boundvert near the surface, got {distance} \
+                 (apex-relative) for offset {offset}",
+            );
+        }
+    }
+
+    /// BEVEL.md §7.6.2 cases 1/2: a sector that is a single planar face (or whose
+    /// in-between legs are all in-plane) reduces to the exact 2-line crossing on the
+    /// angle bisector. At a right-angle planar corner with equal offset `t` the
+    /// meet sits `t / sin(45°) = t·√2` from the original corner — the closed-form
+    /// crossing identity, with no out-of-plane excursion.
+    #[test]
+    fn edge_bevel_meet_point_planar_sector_is_exact_bisector_crossing() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let e01 = cube_edge(&mesh, corner, Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, corner, Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, corner, Vec3::new(1.0, -1.0, 1.0));
+        let offset = 0.25;
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let expected = offset * 2.0_f32.sqrt();
+        // The patch face boundverts are the §7.6.2 meet points; strip verts sit
+        // elsewhere, so filter to the triangular patch (matching the existing
+        // three-edge-junction pin).
+        let patch = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_vert_keys(f).len() == 3)
+            .expect("the s=3 junction patch is a triangle");
+        for v in mesh.face_vert_keys(patch) {
+            let distance = (mesh.vertex_position(v) - corner).length();
+            assert!(
+                (distance - expected).abs() < 1.0e-5,
+                "planar meet sits offset·√2 from the corner, got {distance}",
+            );
+        }
+    }
+
+    /// Build a closed non-planar apex fan: apex `v` above an irregular rim of four
+    /// rim verts at differing heights, capped underneath so the apex disk closes.
+    /// Each fan triangle (apex, rim_i, rim_{i+1}) has a different normal, so every
+    /// apex edge sits between two non-coplanar faces — an out-of-plane (silhouette)
+    /// in-between edge whenever it lies inside a bevel sector. Returns (apex, rim).
+    fn irregular_apex_fan(mesh: &mut LoopMesh) -> (VertexKey, Vec<VertexKey>) {
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        // Six rim verts at deliberately irregular radii and heights, so every fan
+        // triangle has a distinct normal and a sector spanning several in-between
+        // edges sees genuinely different candidate faces along its walk.
+        let rim_coords = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.55, 0.9, 0.4),
+            Vec3::new(-0.5, 0.85, 0.15),
+            Vec3::new(-1.0, 0.0, -0.1),
+            Vec3::new(-0.45, -0.8, -0.3),
+            Vec3::new(0.6, -0.95, 0.05),
+        ];
+        let rim: Vec<VertexKey> = rim_coords.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let n = rim.len();
+
+        let spoke: Vec<EdgeKey> = rim
+            .iter()
+            .map(|&r| mesh.create_edge([apex, r], EdgeCreateFlags::NONE))
+            .collect();
+        let mut rim_edge = Vec::new();
+        for i in 0..n {
+            rim_edge.push(mesh.create_edge([rim[i], rim[(i + 1) % n]], EdgeCreateFlags::NONE));
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            mesh.face_create(
+                &[apex, rim[i], rim[j]],
+                &[spoke[i], rim_edge[i], spoke[j]],
+                FaceCreateFlags::NONE,
+            );
+        }
+        // Close the underside so the apex disk is a true closed fan.
+        mesh.face_create(&rim, &rim_edge, FaceCreateFlags::NONE);
+        (apex, rim)
+    }
+
+    /// BEVEL.md §7.6.2 (corrected face-drop step): at a **non-planar** junction the
+    /// two skew offset lines give a provisional midpoint that floats off the surface,
+    /// so it is dropped onto a sector face. The corrected walk **starts at the
+    /// flanking beveled edge `g_k` itself** (testing `g_k`'s forward face first) and
+    /// drops onto a **plane through the junction vertex `v`** carrying that face's
+    /// normal — not the face's own supporting plane. This pins both: each junction
+    /// boundvert lands exactly on the `v`-anchored plane of its sector's `g_k`
+    /// forward face, bounded just out from the apex.
+    #[test]
+    fn junction_face_drop_lands_on_v_anchored_g_k_plane() {
+        let mut mesh = LoopMesh::new();
+        let (apex, rim) = irregular_apex_fan(&mut mesh);
+        let apex_pos = mesh.vertex_position(apex);
+        let n = rim.len();
+        let rim_pos: Vec<Vec3> = rim.iter().map(|&r| mesh.vertex_position(r)).collect();
+
+        // Pre-bevel normal of fan triangle (apex, rim_i, rim_{i+1}), captured before
+        // the surgery rebuilds those faces. The forward face of beveled spoke `e_i`
+        // (the face on the side toward the next spoke) is triangle `i`.
+        let triangle_normal = |i: usize| {
+            let a = rim_pos[i] - apex_pos;
+            let b = rim_pos[(i + 1) % n] - apex_pos;
+            a.cross(b).normalize()
+        };
+
+        // Bevel two spokes three apart: spoke 0 and spoke 3. The +Y sector walks
+        // 0 → 3 (g_k = spoke 0, forward face = triangle 0, two in-between legs); the
+        // −Y sector walks 3 → 0 (g_k = spoke 3, forward face = triangle 3). Both
+        // sectors span out-of-plane legs, so both fire the skew face-drop.
+        let spoke_0 = mesh.query_edge_exists(apex, rim[0]).expect("spoke 0");
+        let spoke_3 = mesh.query_edge_exists(apex, rim[3]).expect("spoke 3");
+        let offset = 0.3_f32;
+        let result = mesh.bevel(
+            &[spoke_0.into(), spoke_3.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        // The two junction-sector boundverts are the result verts near the apex; the
+        // strip ring verts sit out at the rim ends (apex-distance > 1).
+        let junction_verts: Vec<Vec3> = result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|p| (*p - apex_pos).length() < 1.0)
+            .collect();
+        assert_eq!(
+            junction_verts.len(),
+            2,
+            "two junction sectors → two near-apex boundverts",
+        );
+
+        let normal_g_k_plus = triangle_normal(0);
+        let normal_g_k_minus = triangle_normal(3);
+        for point in &junction_verts {
+            let from_apex = *point - apex_pos;
+            // Bounded near the apex: a small on-surface nudge, not floated off (the
+            // v-anchored drop keeps it ≈ offset·few out, never the ~unit rim depth).
+            let radius = from_apex.length();
+            assert!(
+                radius > 1.0e-4 && radius < 4.0 * offset,
+                "junction boundvert sits just out from the apex, got {radius}",
+            );
+            // It lies exactly on the v-anchored plane of *one* flanking g_k forward
+            // face — the corrected drop plane. Either sector's boundvert matches its
+            // own g_k face to f32 round-off.
+            let on_plus = from_apex.dot(normal_g_k_plus).abs();
+            let on_minus = from_apex.dot(normal_g_k_minus).abs();
+            assert!(
+                on_plus < 1.0e-5 || on_minus < 1.0e-5,
+                "boundvert on a v-anchored g_k-face plane; \
+                 +Y dist {on_plus}, -Y dist {on_minus}",
+            );
+        }
+
+        // Pair each boundvert to its own sector's g_k face: the +Y boundvert
+        // (positive Y) must lie on triangle 0's plane, the −Y boundvert on
+        // triangle 3's plane — confirming the walk started at g_k, not a later leg.
+        let plus = junction_verts
+            .iter()
+            .find(|p| p.y > 0.0)
+            .expect("+Y junction boundvert");
+        let minus = junction_verts
+            .iter()
+            .find(|p| p.y < 0.0)
+            .expect("-Y junction boundvert");
+        assert!(
+            (*plus - apex_pos).dot(normal_g_k_plus).abs() < 1.0e-5,
+            "+Y boundvert on spoke-0's forward-face v-plane",
+        );
+        assert!(
+            (*minus - apex_pos).dot(normal_g_k_minus).abs() < 1.0e-5,
+            "-Y boundvert on spoke-3's forward-face v-plane",
+        );
+        mesh.validate_topology();
+    }
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
@@ -6589,6 +7107,30 @@ const DEGENERATE_SLIDE_FRACTION: f32 = 0.01;
 /// normal-dot test and the sub-meet `sin α` degeneracy test share one
 /// crate-local convention rather than introducing a fresh magic number.
 const LOOP_SLIDE_TOLERANCE: f32 = 1.0e-4;
+
+/// Angle tolerance (in `cos θ` units) for the §7.6.2 parallel / anti-parallel
+/// special cases: when the two flanking edge directions are within this of being
+/// parallel (`cos θ ≈ 1`) or anti-parallel (`cos θ ≈ −1`) the line-line solve is
+/// bypassed for the closed-form ladder placement. Matches the crate-local `1e-4`
+/// convention used elsewhere in this file.
+const MEET_ANGLE_TOLERANCE: f32 = 1.0e-4;
+
+/// Coplanarity tolerance (on the dot of two face normals) for the §7.6.2 sector
+/// classification: an in-between leg is out-of-plane (silhouette) when its two
+/// flanking face normals differ from ±1 by more than this.
+const MEET_PLANAR_TOLERANCE: f32 = 1.0e-4;
+
+/// Length tolerance below which the two closest points of two lines are treated as
+/// the same point (a crossing) rather than skew (§7.6.2).
+const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
+
+/// Denominator floor below which the two-line system is treated as parallel
+/// (§7.6.2). `a·c − b²` is the squared sine of the angle between unit directions,
+/// so this is an angular degeneracy guard, not a length.
+const LINE_PARALLEL_TOLERANCE: f32 = 1.0e-7;
+
+/// Angular slack (radians) for the §7.6.2 in-wedge face-drop predicate.
+const WEDGE_ANGLE_TOLERANCE: f32 = 1.0e-4;
 
 /// Per-edge slide distance `d_i` for a single-segment vertex bevel (BEVEL.md
 /// §4 / §4.3). Each `offset_type` interprets `offset` as a different physical
