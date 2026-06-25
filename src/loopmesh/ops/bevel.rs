@@ -68,6 +68,19 @@ pub struct BevelOptions {
     /// self-overlaps (BEVEL.md §4.4). A global, uniform pre-pass on the resolved
     /// slide distances; it changes no topology, only the slide magnitudes.
     pub clamp_overlap: bool,
+    /// Material slot stamped on every face the bevel **creates** (BEVEL.md §6.6).
+    /// A leaf, per-face parameter that changes no topology and no placement:
+    ///
+    /// - `material >= 0` — stamp that slot uniformly on every new bevel face
+    ///   (cap, strip quad, junction patch).
+    /// - `material < 0` (canonically `-1`) — each new face inherits the material
+    ///   of a representative adjacent original face chosen per new face (the cap
+    ///   from an incident face of `v`, a strip from a flanking face, a patch from
+    ///   a junction-adjacent face, §6.6.1).
+    ///
+    /// Surviving re-stitched / re-pointed original faces are never re-materialised
+    /// by either regime (§6.6.2). Defaults to `-1` (inherit).
+    pub material: i32,
 }
 
 impl Default for BevelOptions {
@@ -78,6 +91,7 @@ impl Default for BevelOptions {
             segments: 1,
             affect: BevelAffect::Vertices,
             clamp_overlap: false,
+            material: -1,
         }
     }
 }
@@ -103,6 +117,11 @@ struct BeveledCorner {
     ring_vert_for_edge: Vec<(EdgeKey, VertexKey)>,
     incident_faces: Vec<FaceKey>,
     interior_fan: bool,
+    /// The material slot of the representative incident face used by the cap's
+    /// `material < 0` inherit (BEVEL.md §6.6.1: the cap inherits an incident face
+    /// of `v`). Captured against the pristine mesh in `place_ring_verts` before
+    /// those faces are killed and rebuilt, so it survives the surgery.
+    representative_material: i32,
 }
 
 /// Per-incident-edge placement record gathered in the slide pre-pass: the edge,
@@ -155,7 +174,7 @@ impl LoopMesh {
         }
 
         if options.affect == BevelAffect::Edges {
-            return self.bevel_edges(geom, options.offset);
+            return self.bevel_edges(geom, options.offset, options.material);
         }
 
         if options.affect != BevelAffect::Vertices {
@@ -204,6 +223,13 @@ impl LoopMesh {
         for corner in &corners {
             if corner.interior_fan {
                 if let Some(cap) = self.build_cap_face(&corner.ring_vert_for_edge) {
+                    // §6.6: the cap is a new face — stamp `material` (>= 0) or
+                    // inherit the representative incident face's slot (< 0).
+                    self.assign_bevel_face_material(
+                        cap.face,
+                        options.material,
+                        corner.representative_material,
+                    );
                     result.faces.push(cap.face);
                     result.edges.extend(cap.chamfer_edges);
                 }
@@ -240,7 +266,7 @@ impl LoopMesh {
     /// Single segment / symmetric `offset` only. A non-manifold edge or an
     /// endpoint whose terminal close needs valence ≥ 4 (the on-edge-vert fill of
     /// §7.5) is skipped — those remain §7.5 / §8 stubs.
-    fn bevel_edges(&mut self, geom: &[GeomKey], offset: f32) -> BevelResult {
+    fn bevel_edges(&mut self, geom: &[GeomKey], offset: f32, material: i32) -> BevelResult {
         let mut result = BevelResult::default();
 
         let mut beveled: Vec<EdgeKey> = Vec::new();
@@ -274,19 +300,25 @@ impl LoopMesh {
             // No shared endpoint: every edge is isolated, every endpoint terminal
             // — the foundational §7 path, unchanged.
             for &edge in &beveled {
-                self.bevel_single_edge(edge, offset, &mut result);
+                self.bevel_single_edge(edge, offset, material, &mut result);
             }
             return result;
         }
 
-        self.bevel_edges_with_junctions(&beveled, &junctions, offset, &mut result);
+        self.bevel_edges_with_junctions(&beveled, &junctions, offset, material, &mut result);
         result
     }
 
     /// Bevel one isolated manifold edge (BEVEL.md §7). Places the four strip verts
     /// against the pristine local geometry (§7.5 placement-before-surgery), then
     /// re-stitches every incident face and builds the strip quad.
-    fn bevel_single_edge(&mut self, edge: EdgeKey, offset: f32, result: &mut BevelResult) {
+    fn bevel_single_edge(
+        &mut self,
+        edge: EdgeKey,
+        offset: f32,
+        material: i32,
+        result: &mut BevelResult,
+    ) {
         let [a, b] = self.edge_vert_keys(edge);
 
         // §7.1: the two radial faces of the manifold edge. A non-manifold edge
@@ -301,6 +333,10 @@ impl LoopMesh {
         }
         let face_left = radial_faces[0];
         let face_right = radial_faces[1];
+
+        // §6.6.1: the strip quad's `-1` inherit source is a flanking face (fL/fR)
+        // of the beveled edge. Capture it pristine before the surgery.
+        let representative_material = self.face_material_index(face_left);
 
         // §7.5 foundational pin: only the valence-3 terminal endpoint close is
         // documented (the surviving third face absorbs the corner). A valence ≥ 4
@@ -402,6 +438,7 @@ impl LoopMesh {
         // verts, wound opposite to how fL traverses its new `aL–bL` long edge so
         // the quad and fL share that edge with consistent (radial-2) traversal.
         let strip = self.build_strip_quad(strip_a_left, strip_b_left, strip_b_right, strip_a_right);
+        self.assign_bevel_face_material(strip.face, material, representative_material);
         result.faces.push(strip.face);
         result.edges.extend(strip.edges);
 
@@ -439,6 +476,7 @@ impl LoopMesh {
         beveled: &[EdgeKey],
         junctions: &[VertexKey],
         offset: f32,
+        material: i32,
         result: &mut BevelResult,
     ) {
         // Drop any non-manifold beveled edge (§2.1): a junction strip needs each
@@ -452,6 +490,34 @@ impl LoopMesh {
         if beveled_manifold.is_empty() {
             return;
         }
+
+        // §6.6.1: capture the `-1` inherit source for each new face against the
+        // pristine mesh, before re-stitch kills the adjacent originals. A strip's
+        // representative is one of its beveled edge's two flanking faces; a
+        // junction patch's representative is a face incident to that junction
+        // vertex. Captured now, applied to the new faces built in phases 3/4.
+        let strip_material: Vec<(EdgeKey, i32)> = beveled_manifold
+            .iter()
+            .map(|&edge| {
+                let representative = self
+                    .edge_loop_keys(edge)
+                    .first()
+                    .map(|&l| self.face_material_index(self.loop_face(l)))
+                    .unwrap_or(0);
+                (edge, representative)
+            })
+            .collect();
+        let junction_material: Vec<(VertexKey, i32)> = junctions
+            .iter()
+            .map(|&vertex| {
+                let representative = self
+                    .vert_face_keys(vertex)
+                    .first()
+                    .map(|&face| self.face_material_index(face))
+                    .unwrap_or(0);
+                (vertex, representative)
+            })
+            .collect();
 
         let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
 
@@ -516,16 +582,25 @@ impl LoopMesh {
         }
 
         // Phase 3: one strip quad per beveled edge over its four near/far corner
-        // verts (§7.1 item 2).
+        // verts (§7.1 item 2). §6.6: stamp / inherit each new strip's material.
         for &edge in &beveled_manifold {
-            self.build_junction_strip(edge, &corner_vert, result);
+            let representative = strip_material
+                .iter()
+                .find_map(|&(e, m)| (e == edge).then_some(m))
+                .unwrap_or(0);
+            self.build_junction_strip(edge, &corner_vert, material, representative, result);
         }
 
         // Phase 4: cap each `s ≥ 3` junction with one flat patch face over its
-        // boundvert ring (§7.6.3). `s == 2` adds no patch.
+        // boundvert ring (§7.6.3). `s == 2` adds no patch. §6.6: stamp / inherit
+        // each new patch's material from a junction-adjacent original face.
         for patch in &junction_patches {
             if patch.boundverts.len() >= 3 {
-                self.build_patch_face(&patch.boundverts, result);
+                let representative = junction_material
+                    .iter()
+                    .find_map(|&(v, m)| (v == patch.vertex).then_some(m))
+                    .unwrap_or(0);
+                self.build_patch_face(&patch.boundverts, material, representative, result);
             }
         }
 
@@ -589,7 +664,7 @@ impl LoopMesh {
             }
         }
 
-        junction_patches.push(JunctionPatch { boundverts });
+        junction_patches.push(JunctionPatch { vertex, boundverts });
     }
 
     /// Place the two strip verts of a terminal endpoint (BEVEL.md §7.3 / §7.4 /
@@ -891,6 +966,8 @@ impl LoopMesh {
         &mut self,
         edge: EdgeKey,
         corner_vert: &[CornerVert],
+        material: i32,
+        representative: i32,
         result: &mut BevelResult,
     ) {
         let [a, b] = self.edge_vert_keys(edge);
@@ -924,7 +1001,7 @@ impl LoopMesh {
         if ring_has_repeat(&ring) {
             // The strip ran into a coincident boundvert pair; emit a triangle by
             // dropping the duplicate so the strip still closes (§7.6.3 seam).
-            self.build_collapsed_strip(&ring, result);
+            self.build_collapsed_strip(&ring, material, representative, result);
             return;
         }
 
@@ -947,6 +1024,7 @@ impl LoopMesh {
         }
 
         let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
+        self.assign_bevel_face_material(face, material, representative);
         result.faces.push(face);
         for i in 0..quad.len() {
             let p = quad[i];
@@ -962,7 +1040,13 @@ impl LoopMesh {
     /// Build a degenerate strip whose ring has a repeated vert (a through-junction
     /// seam where two near corners coincide, §7.6.3): drop the duplicate and build
     /// the surviving triangle, or skip entirely if fewer than three distinct verts.
-    fn build_collapsed_strip(&mut self, ring: &[VertexKey; 4], result: &mut BevelResult) {
+    fn build_collapsed_strip(
+        &mut self,
+        ring: &[VertexKey; 4],
+        material: i32,
+        representative: i32,
+        result: &mut BevelResult,
+    ) {
         let mut distinct: Vec<VertexKey> = Vec::with_capacity(4);
         for &v in ring {
             if !distinct.contains(&v) {
@@ -973,6 +1057,7 @@ impl LoopMesh {
             return;
         }
         let face = self.face_create_verts(&distinct, FaceCreateFlags::NONE);
+        self.assign_bevel_face_material(face, material, representative);
         result.faces.push(face);
         for i in 0..distinct.len() {
             let p = distinct[i];
@@ -989,7 +1074,13 @@ impl LoopMesh {
     /// The patch adopts the strip edges already minted between consecutive
     /// boundverts (`B_(k-1)`–`B_k` is the near edge of edge `g_k`'s strip), wound
     /// opposite the arriving strips so each patch edge stays radial-2.
-    fn build_patch_face(&mut self, boundverts: &[VertexKey], result: &mut BevelResult) {
+    fn build_patch_face(
+        &mut self,
+        boundverts: &[VertexKey],
+        material: i32,
+        representative: i32,
+        result: &mut BevelResult,
+    ) {
         // The patch boundary is the boundvert ring, already in sector order. Wind
         // it opposite the strip face traversal on the first shared edge.
         let first_a = boundverts[0];
@@ -1011,6 +1102,7 @@ impl LoopMesh {
         }
 
         let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+        self.assign_bevel_face_material(face, material, representative);
         result.faces.push(face);
         for i in 0..ring.len() {
             let p = ring[i];
@@ -1274,6 +1366,14 @@ impl LoopMesh {
             let incident_faces = self.vert_face_keys(frame.vertex);
             let interior_fan = self.is_interior_fan(frame.vertex, &incident_edges, &incident_faces);
 
+            // §6.6.1: the cap's `-1` inherit source is a representative incident
+            // face of `v`. Capture its material slot now, against the pristine
+            // mesh, before the incident faces are killed / rebuilt.
+            let representative_material = incident_faces
+                .first()
+                .map(|&face| self.face_material_index(face))
+                .unwrap_or(0);
+
             let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
                 Vec::with_capacity(frame.placements.len());
             for placement in &frame.placements {
@@ -1290,6 +1390,7 @@ impl LoopMesh {
                 ring_vert_for_edge,
                 incident_faces,
                 interior_fan,
+                representative_material,
             });
         }
         corners
@@ -1583,6 +1684,25 @@ impl LoopMesh {
         }
         edges
     }
+
+    /// Assign the `material` slot of one **new** bevel face (BEVEL.md §6.6).
+    ///
+    /// - `material >= 0`: stamp that slot uniformly (§6.6 regime 1).
+    /// - `material < 0`: inherit `representative` — the material slot of a
+    ///   representative adjacent original face chosen per new face (§6.6.1: cap ←
+    ///   incident face of `v`, strip ← flanking face, patch ← junction-adjacent
+    ///   face). The representative slot is captured against the pristine mesh by
+    ///   the caller before the adjacent faces are killed / rebuilt.
+    ///
+    /// §6.6.1 specifies inheriting the whole face-attribute block; `material_index`
+    /// is the only per-face attribute the parity comparison observes, so the
+    /// inherit is realized by copying that slot (the remaining per-face CD axes are
+    /// the §5.2 follow-up). Surviving re-stitched faces are never routed here, so
+    /// they keep their own material (§6.6.2).
+    fn assign_bevel_face_material(&mut self, face: FaceKey, material: i32, representative: i32) {
+        let slot = if material >= 0 { material } else { representative };
+        self.set_face_material_index(face, slot);
+    }
 }
 
 struct CapFace {
@@ -1602,8 +1722,10 @@ struct CornerVert {
 }
 
 /// One junction vertex's ordered boundvert ring (BEVEL.md §7.6.1), capped by the
-/// patch face when `s ≥ 3` (§7.6.3).
+/// patch face when `s ≥ 3` (§7.6.3). `vertex` is the junction the patch is built
+/// around, used to look up its `-1` inherit material source (§6.6.1).
 struct JunctionPatch {
+    vertex: VertexKey,
     boundverts: Vec<VertexKey>,
 }
 
@@ -3255,6 +3377,191 @@ mod tests {
             );
         }
         mesh.validate_topology();
+    }
+
+    /// The new cap face produced by beveling cube-corner vert 0 (interior
+    /// valence-3 → one triangular cap, the single new face). Located by the
+    /// result buffer.
+    fn beveled_corner_cap(mesh: &LoopMesh, result: &BevelResult) -> FaceKey {
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "an interior valence-3 corner bevel creates exactly one cap face"
+        );
+        let _ = mesh;
+        result.faces[0]
+    }
+
+    /// BEVEL.md §6.6 regime 1: `material >= 0` stamps that slot uniformly on the
+    /// new cap, while the surviving re-stitched faces keep their own slot (§6.6.2).
+    #[test]
+    fn material_explicit_stamps_new_cap_and_leaves_survivors() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                material: 3,
+                ..Default::default()
+            },
+        );
+
+        let cap = beveled_corner_cap(&mesh, &result);
+        assert_eq!(
+            mesh.face_material_index(cap),
+            3,
+            "explicit material=3 stamps the new cap (§6.6)"
+        );
+
+        // Every surviving (non-cap) face keeps the cube's default slot 0 — never
+        // re-materialised (§6.6.2).
+        for face in mesh.face_keys() {
+            if face == cap {
+                continue;
+            }
+            assert_eq!(
+                mesh.face_material_index(face),
+                0,
+                "surviving face {face:?} keeps its own slot 0 (§6.6.2), not the stamp"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.6.2 invariant: with `material >= 0` the multiset of NEW-face
+    /// material slots is `{material}` (one per new face) regardless of segment
+    /// count — pinned here for the single-cap case at a non-zero slot distinct
+    /// from the surviving faces.
+    #[test]
+    fn material_explicit_new_face_multiset_is_the_stamp() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                material: 5,
+                ..Default::default()
+            },
+        );
+
+        let new_slots: Vec<i32> = result
+            .faces
+            .iter()
+            .map(|&f| mesh.face_material_index(f))
+            .collect();
+        assert_eq!(new_slots, vec![5], "new faces all carry the stamped slot 5");
+    }
+
+    /// BEVEL.md §6.6 regime 2 / §6.6.1: `material < 0` makes the new cap inherit a
+    /// representative *incident face of `v`*'s slot — never a global default and
+    /// never slot 0 unless an adjacent face genuinely uses slot 0. Decorating
+    /// every cube face with a distinct non-zero slot makes the inherit source
+    /// observable: the cap's slot is one of vert 0's incident faces' decorated
+    /// slots.
+    #[test]
+    fn material_inherit_takes_adjacent_face_slot() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+
+        // Decorate the six faces with distinct non-zero slots {1..=6}.
+        let faces: Vec<FaceKey> = mesh.face_keys();
+        for (index, &face) in faces.iter().enumerate() {
+            mesh.set_face_material_index(face, (index + 1) as i32);
+        }
+
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        // The slots of vert 0's incident faces, captured pristine — the §6.6.1
+        // candidate representatives the cap may inherit from.
+        let incident_slots: Vec<i32> = mesh
+            .vert_face_keys(v0)
+            .iter()
+            .map(|&f| mesh.face_material_index(f))
+            .collect();
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                material: -1,
+                ..Default::default()
+            },
+        );
+
+        let cap = beveled_corner_cap(&mesh, &result);
+        let cap_slot = mesh.face_material_index(cap);
+        assert_ne!(cap_slot, 0, "the inherited cap slot is never the default 0 (§6.6.1)");
+        assert!(
+            incident_slots.contains(&cap_slot),
+            "the cap inherits a representative incident face of v's slot ({incident_slots:?}), got {cap_slot}"
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.6: on a uniformly-materialed input the `-1` inherit yields a
+    /// uniformly-materialed result — the cap takes the one shared slot, so the
+    /// per-face tie-break (§6.6.1) is unobservable, the common case the scaffold
+    /// drives.
+    #[test]
+    fn material_inherit_uniform_input_yields_uniform_result() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        for face in mesh.face_keys() {
+            mesh.set_face_material_index(face, 4);
+        }
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                material: -1,
+                ..Default::default()
+            },
+        );
+
+        for face in mesh.face_keys() {
+            assert_eq!(
+                mesh.face_material_index(face),
+                4,
+                "uniform slot-4 input → uniform slot-4 result under -1 inherit (§6.6)"
+            );
+        }
+        let _ = result;
+        mesh.validate_topology();
+    }
+
+    /// The default `BevelOptions.material` is `-1` (inherit): a default-options
+    /// bevel of a uniformly slot-2 cube leaves the cap at slot 2, confirming the
+    /// inherit regime is the default and matches the explicit `-1` path.
+    #[test]
+    fn material_default_is_inherit() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        for face in mesh.face_keys() {
+            mesh.set_face_material_index(face, 2);
+        }
+        let v0 = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+
+        let cap = beveled_corner_cap(&mesh, &result);
+        assert_eq!(
+            mesh.face_material_index(cap),
+            2,
+            "default material is -1 (inherit), so the cap takes the adjacent slot 2"
+        );
     }
 }
 
