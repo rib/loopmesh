@@ -124,6 +124,15 @@ pub struct BevelOptions<'a> {
     /// `Cutoff` flat-cut fill is implemented for the multi-edge junction at the
     /// default profile (BEVEL.md §8.2 / §8.3).
     pub vmesh_method: BevelVmeshMethod,
+    /// Cross-section shape for the `SUPERELLIPSE` profile family (BEVEL.md §8.6),
+    /// a scalar in `0..1`. `0.5` (the default) is a circular arc, `0.25` flattens
+    /// to a straight chamfer chord, larger values bulge toward a square corner.
+    /// Only observable at `segments ≥ 2`: a single segment is a straight chamfer
+    /// regardless of `profile` (§8.6.2). The mapping to the superellipse exponent
+    /// `r` is logarithmic with `0.25 → r = 1` (line), `0.5 → r = 2` (circle),
+    /// `→ 1 → r → ∞` (square). The `CUSTOM` `profile_type` (a tabulated user curve,
+    /// §8.6.3) is not yet representable and is out of scope. Defaults to `0.5`.
+    pub profile: f32,
     /// Gate for the per-element bevel-weight prescale (BEVEL.md §8.7.2). When
     /// `false` (the default), weights are ignored entirely and every beveled
     /// element slides the full `offset` — byte-identical to the unweighted path.
@@ -163,6 +172,7 @@ impl Default for BevelOptions<'_> {
             mark_seam: false,
             mark_sharp: false,
             vmesh_method: BevelVmeshMethod::Adj,
+            profile: 0.5,
             use_weights: false,
             vert_weights: &[],
             loop_slide: false,
@@ -771,6 +781,7 @@ impl LoopMesh {
         let offset = options.offset;
         let material = options.material;
         let segments = options.segments;
+        let profile = options.profile;
 
         // §8.3: the cutoff fill needs at least one multi-beveled-edge junction —
         // an all-isolated / junction-free edge set has no corner to fold, so it is
@@ -827,6 +838,7 @@ impl LoopMesh {
                     &is_beveled,
                     offset,
                     segments,
+                    profile,
                     &mut chains,
                     &mut face_subst,
                     &mut junction_cuts,
@@ -838,6 +850,7 @@ impl LoopMesh {
                     &beveled_manifold,
                     offset,
                     segments,
+                    profile,
                     &mut chains,
                     &mut face_subst,
                     result,
@@ -884,7 +897,14 @@ impl LoopMesh {
         for cut in &junction_cuts {
             match options.vmesh_method {
                 BevelVmeshMethod::Cutoff => {
-                    self.build_cutoff_fill(cut, &chains, segments, material, result);
+                    self.build_cutoff_fill(
+                        cut,
+                        &chains,
+                        segments,
+                        options.profile,
+                        material,
+                        result,
+                    );
                 }
                 BevelVmeshMethod::Adj => {
                     self.build_adj_fill(cut, &chains, segments, material, result);
@@ -909,6 +929,7 @@ impl LoopMesh {
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         offset: f32,
         segments: u32,
+        profile: f32,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         junction_cuts: &mut Vec<JunctionCut>,
@@ -948,6 +969,7 @@ impl LoopMesh {
                 boundverts[next],
                 crossing,
                 segments,
+                profile,
                 result,
             );
             chains.push(EdgeEndChain {
@@ -978,6 +1000,7 @@ impl LoopMesh {
         beveled: &[EdgeKey],
         offset: f32,
         segments: u32,
+        profile: f32,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         result: &mut BevelResult,
@@ -1039,7 +1062,8 @@ impl LoopMesh {
         // The chain crosses E between the two strip verts (§8.3.0.1). face_left's
         // strip vert is the chain's `start`, face_right's its `end` — matching the
         // strip builder's face_left-first ordering of E's radial faces.
-        let interior = self.build_chain_between(strip_left, strip_right, edge, segments, result);
+        let interior =
+            self.build_chain_between(strip_left, strip_right, edge, segments, profile, result);
 
         // Each E-adjacent radial face collapses its corner to its one strip vert.
         for &(face, strip_vert) in &[(face_left, strip_left), (face_right, strip_right)] {
@@ -1103,6 +1127,7 @@ impl LoopMesh {
         end: VertexKey,
         edge: EdgeKey,
         segments: u32,
+        profile: f32,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
         let start_position = self.vertex_position(start);
@@ -1112,7 +1137,7 @@ impl LoopMesh {
         let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
 
         let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
-        let positions = cell.chain_positions(segments);
+        let positions = cell.chain_positions(segments, profile);
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for position in positions.iter().take(positions.len() - 1).skip(1) {
@@ -1219,6 +1244,7 @@ impl LoopMesh {
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: u32,
+        profile: f32,
         material: i32,
         result: &mut BevelResult,
     ) {
@@ -1234,9 +1260,15 @@ impl LoopMesh {
             corner_positions.push(self.corner_vert_position(cut, chains, k));
         }
 
-        // §8.3.4 apex collapse: at a 3-way junction whose corner verts coincide,
-        // weld them into one apex and omit the bottom face.
-        let collapsed = count == 3 && corner_verts_coincide(&corner_positions);
+        // §8.3.3/§8.3.4: the 3-way collapse to a single apex is a binary
+        // profile decision. It is suppressed for exactly one profile — the
+        // straight chord (`profile = 0.25`, the `r == 1` line case the
+        // superellipse sampler already special-cases) — whose corner verts stay
+        // distinct at the undisplaced boundvert ring (closed by a bottom
+        // triangle). Every curved profile (`r != 1`, including a near-chord
+        // `profile = 0.26`) collapses to a single apex.
+        let flat_chord = count == 3 && profile_to_exponent(profile) == 1.0;
+        let collapsed = count == 3 && !flat_chord && corner_verts_coincide(&corner_positions);
 
         let corner_verts: Vec<VertexKey> = if collapsed {
             let apex_position =
@@ -1245,9 +1277,16 @@ impl LoopMesh {
             result.verts.push(apex);
             vec![apex; count]
         } else {
-            corner_positions
-                .iter()
-                .map(|&position| {
+            (0..count)
+                .map(|k| {
+                    // A flat-chord 3-way takes its corners at the undisplaced
+                    // boundvert ring (the §8.3.3 down-push is ~0); a wider or bulged
+                    // ring takes the full down-pushed position.
+                    let position = if flat_chord {
+                        self.vertex_position(cut.boundverts[k])
+                    } else {
+                        corner_positions[k]
+                    };
                     let corner = self.create_vertex(position);
                     result.verts.push(corner);
                     corner
@@ -4662,6 +4701,155 @@ mod tests {
         (mesh, result)
     }
 
+    /// The same cube-corner `s = 3` cutoff junction at `segments = 2` but with an
+    /// explicit `profile` (BEVEL.md §8.6), for the profile-sampling tests. Returns
+    /// the lone Front↔Bottom interior chain vert's position across edge {0,1}.
+    fn cube_corner_cutoff_segments2_profile(profile: f32) -> Vec3 {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                profile,
+                ..Default::default()
+            },
+        );
+
+        // The Front↔Bottom interior chain vert sits on edge {0,1}'s profile cell:
+        // u = 0.75 (the boundvert plane), v sweeping the bulge toward (0.75,-0.75,
+        // -0.75). It is the one new vert at x = 0.75 with y == z below the arc
+        // center, i.e. the interior sample of that sector's chain.
+        let interior: Vec<Vec3> = result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|p| {
+                (p.x - 0.75).abs() < 1.0e-4
+                    && (p.y - p.z).abs() < 1.0e-4
+                    && p.y < -0.8
+                    && p.y > -1.0
+            })
+            .collect();
+        assert_eq!(
+            interior.len(),
+            1,
+            "exactly one Front-Bottom interior chain vert for profile {profile}",
+        );
+        interior[0]
+    }
+
+    /// BEVEL.md §8.6.4 / §8.3.6: the circle shortcut (`profile = 0.5`, `r = 2`) is
+    /// pure angle spacing `(sin θ_k, cos θ_k)`, reproducing the §8.3.6 default
+    /// bit-for-bit. The pure sampler is checked directly so the reduction is pinned
+    /// independently of the cell mapping.
+    #[test]
+    fn superellipse_chain_circle_is_angle_spacing() {
+        let chain = superellipse_chain(0.5, 2);
+        assert_eq!(chain[0], (0.0, 1.0));
+        assert_eq!(chain[2], (1.0, 0.0));
+        let theta = std::f32::consts::FRAC_PI_2 / 2.0;
+        assert_eq!(chain[1], (theta.sin(), theta.cos()));
+
+        let chain4 = superellipse_chain(0.5, 4);
+        for k in 1..4 {
+            let theta = k as f32 * std::f32::consts::FRAC_PI_2 / 4.0;
+            assert_eq!(chain4[k], (theta.sin(), theta.cos()));
+        }
+    }
+
+    /// BEVEL.md §8.6.2 / §8.6.4: the flat profile (`profile = 0.25`, `r = 1`) is the
+    /// straight chord `u + v = 1`, so even spacing is even linear interpolation. At
+    /// `segments = 2` the lone interior sample is the chord midpoint `(0.5, 0.5)`.
+    #[test]
+    fn superellipse_chain_line_is_chord_midpoint() {
+        let chain = superellipse_chain(0.25, 2);
+        assert_eq!(chain[1], (0.5, 0.5));
+
+        let chain4 = superellipse_chain(0.25, 4);
+        for k in 0..=4 {
+            let t = k as f32 / 4.0;
+            assert!((chain4[k].0 - t).abs() < 1.0e-6 && (chain4[k].1 - (1.0 - t)).abs() < 1.0e-6);
+        }
+    }
+
+    /// BEVEL.md §8.6.1 / §8.6.4: a general exponent (`profile = 0.7`, `r ≈ 3.89`)
+    /// runs the chord-equalisation solver. At `segments = 2` the single interior
+    /// sample sits on the `u = v` diagonal at `m = (1/2)^(1/r)`, which lies on the
+    /// superellipse `u^r + v^r = 1` and bulges past both the circle (0.5) and the
+    /// flat chord (0.25) samples.
+    #[test]
+    fn superellipse_chain_general_lands_on_superellipse() {
+        let chain = superellipse_chain(0.7, 2);
+        let (u, v) = chain[1];
+        // On the u = v diagonal.
+        assert!((u - v).abs() < 1.0e-6);
+        // On the superellipse: u^r + v^r = 1.
+        let r = profile_to_exponent(0.7);
+        assert!((u.powf(r) + v.powf(r) - 1.0).abs() < 1.0e-4);
+        // Bulges past the circle (0.707) and the flat chord (0.5).
+        let circle_u = superellipse_chain(0.5, 2)[1].0;
+        assert!(u > circle_u);
+        assert!(u > 0.5);
+
+        // The general solver equalises chords for a larger even count too.
+        let chain4 = superellipse_chain(0.7, 4);
+        let chords: Vec<f32> = (0..4).map(|k| cell_chord(chain4[k], chain4[k + 1])).collect();
+        let max = chords.iter().cloned().fold(0.0_f32, f32::max);
+        let min = chords.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!((max - min) < 1.0e-3, "general solver equalises chords: {chords:?}");
+        // Symmetric about the diagonal: sample k mirrors sample n−k.
+        assert!((chain4[1].0 - chain4[3].1).abs() < 1.0e-5);
+    }
+
+    /// BEVEL.md §8.6: `profile = 0.5` (the default) reproduces the §8.3.6 circular
+    /// arc sample at the cutoff chain interior — no regression from routing the
+    /// chain through the general sampler.
+    #[test]
+    fn cutoff_segments2_profile_half_is_arc_sample() {
+        let interior = cube_corner_cutoff_segments2_profile(0.5);
+        let arc_point = Vec3::new(0.75, -0.926_776_7, -0.926_776_7);
+        assert!((interior - arc_point).length() < 1.0e-5);
+    }
+
+    /// BEVEL.md §8.6.2 / §8.3.6: the flat `profile = 0.25` chain interior is the
+    /// straight chord midpoint, not the circular bulge — the special case where the
+    /// cutoff fill is genuinely [P]-only.
+    #[test]
+    fn cutoff_segments2_profile_flat_is_chord_midpoint() {
+        let interior = cube_corner_cutoff_segments2_profile(0.25);
+        let chord_midpoint = Vec3::new(0.75, -0.875, -0.875);
+        assert!((interior - chord_midpoint).length() < 1.0e-5);
+    }
+
+    /// BEVEL.md §8.6.1: a non-default `profile = 0.7` bulges the chain interior past
+    /// both the circular (0.5) and flat (0.25) samples — the sampler honours the
+    /// `profile` shape control through the cell mapping, distinct in position.
+    #[test]
+    fn cutoff_segments2_profile_bulge_is_distinct() {
+        let flat = cube_corner_cutoff_segments2_profile(0.25);
+        let circle = cube_corner_cutoff_segments2_profile(0.5);
+        let bulge = cube_corner_cutoff_segments2_profile(0.7);
+
+        // All three lie on the y = z bulge diagonal at x = 0.75, ordered by bulge:
+        // flat (−0.875) is shallowest, then circle (−0.927), then 0.7 (deeper).
+        assert!(bulge.y < circle.y, "0.7 bulges past the circle sample");
+        assert!(circle.y < flat.y, "the circle bulges past the flat chord");
+        assert!((bulge - circle).length() > 1.0e-3, "0.7 is a distinct position");
+        assert!((bulge - flat).length() > 1.0e-3, "0.7 is not the chord midpoint");
+    }
+
     /// BEVEL.md §8.3.2 / §8.3.4 / §8.3.0.1: the `s = 3`, `segments = 2` cube-corner
     /// cutoff junction folds the corner flat — three cut faces collapsing to one
     /// apex (§8.3.4), no bottom face — while the three valence-3 terminals build no
@@ -4716,6 +4904,158 @@ mod tests {
         // No bottom face beyond the three cut faces: the collapse omits it (§8.3.4).
         // The new geometry is 6 strip quads + 3 cut quads = 9 faces.
         assert_eq!(result.faces.len(), 9, "6 strip quads + 3 cut quads, no bottom");
+    }
+
+    /// The same cube-corner cutoff junction at an explicit `profile`, returning the
+    /// post-bevel mesh + result for the §8.3.3/§8.3.4 collapse-gate tests.
+    fn cube_corner_cutoff_segments2_mesh(profile: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                profile,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.3.3 / §8.3.4: the 3-way collapse is suppressed for exactly the
+    /// straight-chord profile (`profile = 0.25`, the `r == 1` line case). The three
+    /// corner verts stay at their distinct boundvert-ring positions and a bottom
+    /// triangle closes the cut: two more verts, three more edges, one more face than
+    /// the curved collapse. The cut faces become pentagons (`C_k → P0 P1 P2 →
+    /// C_(k+1)`, §8.3.2) instead of the collapsed quads.
+    #[test]
+    fn cutoff_junction_segments2_flat_chord_does_not_collapse() {
+        let (mesh, result) = cube_corner_cutoff_segments2_mesh(0.25);
+        mesh.validate_topology();
+
+        // No single welded apex: the corner ring stays open.
+        let apex_position = Vec3::new(0.75, -0.75, -0.75);
+        let at_apex = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
+            .count();
+        assert_eq!(at_apex, 0, "the flat chord does not collapse to one apex");
+
+        // 6 strip quads + 3 cut pentagons + 1 bottom triangle (§8.3.2 uncollapsed).
+        assert_eq!(
+            result.faces.len(),
+            10,
+            "flat chord: 6 strip quads + 3 cut pentagons + 1 bottom triangle",
+        );
+        let (mut triangles, mut quads, mut pentagons) = (0, 0, 0);
+        for &face in &result.faces {
+            match mesh.face_vert_keys(face).len() {
+                3 => triangles += 1,
+                4 => quads += 1,
+                5 => pentagons += 1,
+                other => panic!("unexpected {other}-gon in the flat-chord cutoff fill"),
+            }
+        }
+        assert_eq!(
+            (triangles, quads, pentagons),
+            (1, 6, 3),
+            "one bottom triangle, six strip quads, three uncollapsed cut pentagons",
+        );
+
+        // The bottom triangle's three corner verts are coincident-in-position with the
+        // three boundverts (the §8.3.3 down-push is ~0) yet distinct vert keys — the
+        // +2 V / +3 E / +1 F the flat chord adds over the collapsed apex.
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let ring_radius = 0.25 * 2.0_f32.sqrt();
+        let on_ring = result
+            .verts
+            .iter()
+            .filter(|&&v| {
+                ((mesh.vertex_position(v) - corner).length() - ring_radius).abs() < 1.0e-4
+            })
+            .count();
+        assert_eq!(
+            on_ring, 6,
+            "three boundverts plus three coincident bottom corner verts on the ring",
+        );
+    }
+
+    /// BEVEL.md §8.3.3 / §8.3.4: a curved profile (`profile = 0.7`, `r != 1`) fires
+    /// the 3-way collapse exactly as the default arc does — three cut quads welded at
+    /// one apex, no bottom face. The gate is binary, suppressed only for the straight
+    /// chord, not for any curved profile.
+    #[test]
+    fn cutoff_junction_segments2_bulge_still_collapses() {
+        let (mesh, result) = cube_corner_cutoff_segments2_mesh(0.7);
+        mesh.validate_topology();
+
+        // The collapse apex is the cell-corner down-push point, profile-independent.
+        let apex_position = Vec3::new(0.75, -0.75, -0.75);
+        let at_apex = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
+            .count();
+        assert_eq!(at_apex, 1, "the curved 0.7 profile still collapses to one apex");
+
+        assert_eq!(
+            result.faces.len(),
+            9,
+            "curved collapses: 6 strip quads + 3 cut quads, no bottom face",
+        );
+        for &face in &result.faces {
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "every collapsed-junction face is a quad",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.3 / §8.3.4: the collapse gate is **binary**, not a continuous
+    /// bulge-height threshold. A near-chord curved profile (`profile = 0.26`, whose
+    /// exponent `r ≈ 1.03` is just above the line) still bulges off its chord, so it
+    /// **does** collapse to one apex — pinning the binary rule against any continuous
+    /// epsilon threshold that would have wrongly suppressed this near-straight case.
+    #[test]
+    fn cutoff_junction_segments2_near_chord_curved_collapses() {
+        let (mesh, result) = cube_corner_cutoff_segments2_mesh(0.26);
+        mesh.validate_topology();
+
+        let apex_position = Vec3::new(0.75, -0.75, -0.75);
+        let at_apex = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            at_apex, 1,
+            "the near-chord curved 0.26 profile still collapses to one apex",
+        );
+
+        assert_eq!(
+            result.faces.len(),
+            9,
+            "near-chord curved collapses: 6 strip quads + 3 cut quads, no bottom face",
+        );
+        for &face in &result.faces {
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "every collapsed-junction face is a quad",
+            );
+        }
     }
 
     /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
@@ -8116,21 +8456,24 @@ impl ProfileCell {
         intersect_line_plane(raw, self.edge_dir, self.start, self.mid_plane_normal).unwrap_or(raw)
     }
 
-    /// The chain's `segments + 1` sample positions (BEVEL.md §8.3.6). Endpoint
-    /// samples are the ring boundverts; interior samples are the circular-arc
-    /// angle-spaced cell coordinates `(sin θ_k, cos θ_k)` mapped through the cell
-    /// (the default-profile shortcut, §8.3.6). A collinear (flat) corner falls
-    /// back to the even straight subdivision of the chord (§8.2.2.1).
-    fn chain_positions(&self, segments: u32) -> Vec<Vec3> {
+    /// The chain's `segments + 1` sample positions (BEVEL.md §8.2.2.1 / §8.6).
+    /// Endpoint samples are the ring boundverts; the interior samples are the
+    /// `SUPERELLIPSE` cross-section cell coordinates `(u_k, v_k)` for the requested
+    /// `profile` (§8.6.4, reducing to the §8.3.6 circular default at `profile =
+    /// 0.5`) mapped through the cell. A collinear (flat) corner has no bulge and
+    /// falls back to the even straight subdivision of the chord (§8.2.2.1).
+    fn chain_positions(&self, segments: u32, profile: f32) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
-        for k in 1..segments {
-            if self.collinear {
+        if self.collinear {
+            for k in 1..segments {
                 let t = k as f32 / segments as f32;
                 positions.push(self.start + (self.end - self.start) * t);
-            } else {
-                let theta = k as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
-                positions.push(self.sample(theta.sin(), theta.cos()));
+            }
+        } else {
+            let cells = superellipse_chain(profile, segments);
+            for &(u, v) in cells.iter().take(segments as usize).skip(1) {
+                positions.push(self.sample(u, v));
             }
         }
         positions.push(self.end);
@@ -8143,6 +8486,178 @@ impl ProfileCell {
     fn height(&self) -> f32 {
         (2.0 * self.mid - self.start - self.end).length()
     }
+}
+
+/// A large finite stand-in for the square exponent `r → ∞` (BEVEL.md §8.6.2).
+/// True infinity is impractical, and `profile ≈ 0.95` already maps to `r ≈ 27` —
+/// square enough to snap at sampling resolution, so the family stays bounded.
+const PROFILE_SQUARE_EXPONENT: f32 = 1.0e4;
+
+/// Tolerance for snapping the computed exponent onto the special values that
+/// carry closed-form spacing shortcuts (BEVEL.md §8.6.2).
+const PROFILE_EXPONENT_SNAP: f32 = 1.0e-4;
+
+/// Map the user `profile` scalar (`0..1`) to the superellipse exponent `r`
+/// (BEVEL.md §8.6.2): `r = 2·ln(2) / ln(1/profile)`, snapped onto the special
+/// exponents whose even-arc-length spacing has a closed form (`1` line, `2`
+/// circle, the square / square-in sentinels), and clamped to a finite square
+/// sentinel at the top so the family stays bounded.
+fn profile_to_exponent(profile: f32) -> f32 {
+    if profile >= 0.95 {
+        return PROFILE_SQUARE_EXPONENT;
+    }
+    if profile <= PROFILE_EXPONENT_SNAP {
+        return 0.0;
+    }
+    let exponent = 2.0 * std::f32::consts::LN_2 / (1.0 / profile).ln();
+    if (exponent - 2.0).abs() < PROFILE_EXPONENT_SNAP {
+        2.0
+    } else if (exponent - 1.0).abs() < PROFILE_EXPONENT_SNAP {
+        1.0
+    } else if exponent < PROFILE_EXPONENT_SNAP {
+        0.0
+    } else if exponent >= PROFILE_SQUARE_EXPONENT {
+        PROFILE_SQUARE_EXPONENT
+    } else {
+        exponent
+    }
+}
+
+/// One quadrant of the superellipse `u^r + v^r = 1` solved for `v` at a given
+/// `u ∈ [0, 1]` (BEVEL.md §8.6.1). The mirror form is used for `r < 1` to keep
+/// the evaluation numerically stable near the endpoints.
+fn superellipse_v(u: f32, r: f32) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    if r >= 1.0 {
+        (1.0 - u.powf(r)).max(0.0).powf(1.0 / r)
+    } else {
+        1.0 - (1.0 - (1.0 - u).powf(r)).max(0.0).powf(1.0 / r)
+    }
+}
+
+/// The straight-chord length between two cell points.
+fn cell_chord(a: (f32, f32), b: (f32, f32)) -> f32 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+/// Place the `segments + 1` cross-section cell coordinates `(u_k, v_k)` of the
+/// `SUPERELLIPSE` profile (BEVEL.md §8.6). The ends are pinned to the cell ring
+/// corners `(0, 1)` / `(1, 0)`; the interior is spaced by even chord length along
+/// the curve (§8.6.4). The closed-form shortcuts fire at the special exponents
+/// (circle / line); any other `r` runs the symmetric chord-equalisation solver.
+/// Reduces bit-for-bit to the §8.3.6 circular default at `profile = 0.5`.
+fn superellipse_chain(profile: f32, segments: u32) -> Vec<(f32, f32)> {
+    let n = segments as usize;
+    let mut chain = vec![(0.0_f32, 0.0_f32); n + 1];
+    chain[0] = (0.0, 1.0);
+    chain[n] = (1.0, 0.0);
+    if n < 2 {
+        return chain;
+    }
+    let r = profile_to_exponent(profile);
+
+    // Circle (`r = 2`): equal arc-length is equal angle (BEVEL.md §8.6.4 / §8.3.6).
+    // Evaluated through the identical sin/cos expression as the historical default
+    // path, so the chain is bit-for-bit the §8.3.6 default at `profile = 0.5`.
+    if r == 2.0 {
+        for k in 1..n {
+            let theta = k as f32 * std::f32::consts::FRAC_PI_2 / segments as f32;
+            chain[k] = (theta.sin(), theta.cos());
+        }
+        return chain;
+    }
+    // Line (`r = 1`): the chord is the curve, so even spacing is even linear
+    // interpolation (BEVEL.md §8.6.4).
+    if r == 1.0 {
+        for k in 1..n {
+            let t = k as f32 / segments as f32;
+            chain[k] = (t, 1.0 - t);
+        }
+        return chain;
+    }
+
+    superellipse_chain_general(r, segments, &mut chain);
+    chain
+}
+
+/// The general even-chord spacing solver (BEVEL.md §8.6.4) for exponents without
+/// a closed-form shortcut. A fixed-point chord-equalisation re-walks the curve
+/// placing each next sample a target chord-distance from the previous, then snaps
+/// the result symmetric about the `u = v` diagonal (the diagonal crossing point
+/// `m = (1/2)^(1/r)` becomes the central sample at even `segments`). Writes the
+/// interior `(u_k, v_k)` into `chain[1 ..= segments-1]`.
+fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
+    let n = segments as usize;
+    let diagonal = if r > 0.0 { 0.5_f32.powf(1.0 / r) } else { 0.0 };
+
+    // Seed: linear spacing in `u` over the whole quadrant (BEVEL.md §8.6.4 step 2;
+    // a deliberately cheap start the equalisation corrects).
+    let mut samples: Vec<(f32, f32)> = (0..=n)
+        .map(|k| {
+            let u = k as f32 / segments as f32;
+            (u, superellipse_v(u, r))
+        })
+        .collect();
+    samples[0] = (0.0, 1.0);
+    samples[n] = (1.0, 0.0);
+
+    // Advance from `prev` by chord-distance `target` along the curve toward
+    // `u = 1`: a bracketed search for `u_next` with
+    // `‖(u_next, sev(u_next)) − prev‖ = target` (BEVEL.md §8.6.4 step 3). The
+    // chord grows monotonically with `u`, so a bisection on `[u_prev, 1]` is
+    // robust; if `target` can't be reached the sample clamps to the end corner.
+    let advance = |prev: (f32, f32), target: f32| -> (f32, f32) {
+        if cell_chord((1.0, 0.0), prev) <= target {
+            return (1.0, 0.0);
+        }
+        let mut lo = prev.0;
+        let mut hi = 1.0_f32;
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if cell_chord((mid, superellipse_v(mid, r)), prev) > target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let u = 0.5 * (lo + hi);
+        (u, superellipse_v(u, r))
+    };
+
+    // Fixed-point equalisation: average the current chords, re-walk at that
+    // target, repeat until the chord spread is negligible (BEVEL.md §8.6.4
+    // step 3/4).
+    for _ in 0..64 {
+        let target = (0..n).map(|k| cell_chord(samples[k], samples[k + 1])).sum::<f32>()
+            / segments as f32;
+        let mut next = samples.clone();
+        for k in 1..n {
+            next[k] = advance(next[k - 1], target);
+        }
+        next[0] = (0.0, 1.0);
+        next[n] = (1.0, 0.0);
+
+        let mut spread = 0.0_f32;
+        for k in 0..n {
+            spread = spread.max((cell_chord(next[k], next[k + 1]) - target).abs());
+        }
+        samples = next;
+        if spread < 1.0e-7 {
+            break;
+        }
+    }
+
+    // Snap exactly symmetric about `u = v` (BEVEL.md §8.6.4 step 1/5): the second
+    // half is the reflection of the first; the exact centre (even `segments`) is
+    // the diagonal crossing `(m, m)`.
+    for k in 1..n {
+        if 2 * k > n {
+            samples[k] = (samples[n - k].1, samples[n - k].0);
+        } else if 2 * k == n {
+            samples[k] = (diagonal, diagonal);
+        }
+    }
+    chain[1..n].copy_from_slice(&samples[1..n]);
 }
 
 /// The point on the first line (`p0 + t·d0`) nearest the second line
