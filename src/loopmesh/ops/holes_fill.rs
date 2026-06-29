@@ -51,9 +51,10 @@ impl LoopMesh {
     /// Algorithm in
     /// [`HOLES_FILL.md`](../../../../radial-mesh-guides/operators/HOLES_FILL.md):
     /// the §3 boundary-net tagging, the §4 two-front minimal-cycle fill (§4.1
-    /// fillable / one-shot-seed edges, §4.2 two-front breadth-first walk, §4.3
-    /// spans-distinct-faces gate, §4.4 overlap rejection, §4.5 termination, §4.6
-    /// cap build), the §5 `sides` post-fill deletion of oversized caps, and the §6
+    /// fillable edges / failed-seed net removal, §4.2 two-front breadth-first
+    /// walk, §4.3 per-front spans-distinct-faces gate, §4.4 overlap rejection,
+    /// §4.5 termination, §4.6 cap build), the §5 `sides` post-fill deletion of
+    /// oversized caps, and the §6
     /// winding coherence (§6.2) with the §6.3 free-wire geometric-normal fallback.
     ///
     /// `sides` is **not** a search constraint: the fill runs unconstrained, then
@@ -76,29 +77,41 @@ impl LoopMesh {
             return result;
         }
 
-        // §4.5 — each tagged edge is offered as a seed at most once. Iterate in a
-        // stable, deduplicated input order so the outer loop is deterministic.
-        let mut seed_order: Vec<EdgeKey> = Vec::with_capacity(tagged.len());
-        let mut seeded: HashSet<EdgeKey> = HashSet::with_capacity(tagged.len());
-        for &edge in edges {
-            if tagged.contains(&edge) && seeded.insert(edge) {
-                seed_order.push(edge);
-            }
-        }
+        // §4.3 / §4.5 — seeds are drawn in mesh/insertion order, not input order:
+        // the per-front gate's refusal of an interior-edge net depends on offering
+        // a face-bordering edge before a wire diagonal (§4.3 worked example), and
+        // `edge_keys` enumerates the slab in ascending insertion order. Only tagged
+        // edges can seed, so the candidate list is the tagged subset in that order.
+        let mut candidates: Vec<EdgeKey> = self.edge_keys();
+        candidates.retain(|edge| tagged.contains(edge));
 
         let mut new_caps: Vec<FaceKey> = Vec::new();
-        for &seed in &seed_order {
-            // §4.1 — a seed must currently be fillable: tagged and not yet
-            // manifold. A surface-hole rim edge that an earlier cap already turned
-            // manifold drops out here.
-            if !self.holes_fill_fillable(seed, &tagged) {
-                continue;
-            }
+        // The net shrinks monotonically: a seed that closes no acceptable cycle is
+        // *removed* from the tagged net (§4.1), so it can never serve as a path or
+        // connecting edge again — that is what makes a per-front refusal final
+        // (§4.3) and what terminates the free-wire case (§4.5). A successful cap's
+        // rim edges, by contrast, stay tagged and may be re-seeded; re-capping is
+        // prevented by the §4.4 overlap rejection, not by a one-shot-seed guard.
+        loop {
+            // §4.1 — the next still-fillable tagged edge in insertion order. A rim
+            // edge an earlier cap turned manifold drops out here; a failed seed has
+            // been untagged and is likewise skipped.
+            let Some(seed) = candidates
+                .iter()
+                .copied()
+                .find(|&edge| self.holes_fill_fillable(edge, &tagged))
+            else {
+                break;
+            };
             if let Some(cycle) = self.holes_fill_min_cycle(seed, &tagged) {
                 // §4.6 + §6.2 — materialise the cap, wound coherently with any
-                // surrounding surface.
+                // surrounding surface. The seed and its rim stay tagged.
                 let cap = self.holes_fill_build_cap(&cycle);
                 new_caps.push(cap);
+            } else {
+                // §4.1 — failed seed: remove it from the net so no later seeding
+                // can reconstruct a cycle across it.
+                tagged.remove(&seed);
             }
         }
 
@@ -150,20 +163,38 @@ impl LoopMesh {
     ) -> Option<Vec<VertexKey>> {
         let [root_near, root_far] = self.edge_vert_keys(seed);
 
+        // §4.3 detail 1 — the spans-distinct-faces flag is seeded from the *seed
+        // edge's* bordering face. A wire seed (no bordering face) raises both
+        // fronts' flags from the outset; otherwise both fronts start confined to
+        // the seed's single bordering face and only a step that leaves that face
+        // (or a wire step) raises the flag.
+        let seed_face: Option<FaceKey> = self.edge_face_keys(seed).first().copied();
+        let root_flag = seed_face.is_none();
+
         let mut claimed: HashMap<VertexKey, Front> = HashMap::new();
         let mut pred: HashMap<VertexKey, (VertexKey, EdgeKey)> = HashMap::new();
+        // §4.3 detail 2 — the flag is per-front and *sticky*: once raised on a
+        // path it stays raised. Carried per claimed vertex (the flag of the path
+        // root → that vertex).
+        let mut spans: HashMap<VertexKey, bool> = HashMap::new();
         let mut queue: VecDeque<VertexKey> = VecDeque::new();
 
         claimed.insert(root_near, Front::Near);
         claimed.insert(root_far, Front::Far);
-        // Both roots seeded at depth 0: a strict FIFO then expands in lockstep
+        spans.insert(root_near, root_flag);
+        spans.insert(root_far, root_flag);
+        // Both roots seeded at depth 0, then a strict FIFO expands in lockstep
         // breadth-first rings, so the first connecting edge found closes a
-        // minimal-length cycle (§4.2).
-        queue.push_back(root_near);
+        // minimal-length cycle (§4.2). The far root is enqueued first: when both
+        // fronts race for one shared vertex in the same ring, the far front claims
+        // it and the near front's step becomes the bare connecting edge — the order
+        // the §4.3 worked example relies on for the interior-net refusal.
         queue.push_back(root_far);
+        queue.push_back(root_near);
 
         while let Some(vertex) = queue.pop_front() {
             let front = claimed[&vertex];
+            let vertex_spans = spans[&vertex];
             // Collect incident edges up front so the BFS bookkeeping below does not
             // alias the disk walk.
             let incident: Vec<EdgeKey> = self.vertex_disk_iter(vertex).collect();
@@ -181,6 +212,11 @@ impl LoopMesh {
                 match claimed.get(&other) {
                     None => {
                         claimed.insert(other, front);
+                        // §4.3 detail 1+2 — propagate the flag stickily: it rises
+                        // the moment this step leaves the seed face (a wire step, or
+                        // a step onto an edge bordering a different face).
+                        let raised = vertex_spans || self.holes_fill_step_raises(edge, seed_face);
+                        spans.insert(other, raised);
                         pred.insert(other, (vertex, edge));
                         queue.push_back(other);
                     }
@@ -190,19 +226,37 @@ impl LoopMesh {
                     Some(_) => {
                         // The opposite front owns `other`: the two fronts touch
                         // across the connecting edge (vertex, other), closing a
-                        // candidate cycle.
-                        let cycle =
-                            self.holes_fill_assemble_cycle(vertex, other, front, &pred);
-                        if self.holes_fill_cycle_accepted(&cycle) {
-                            return Some(cycle);
+                        // candidate cycle. §4.3 detail 3 — the connecting edge's own
+                        // face is *not* consulted; acceptance reads only the two
+                        // meeting fronts' accumulated flags.
+                        let spans_distinct = vertex_spans || spans[&other];
+                        if spans_distinct {
+                            let cycle =
+                                self.holes_fill_assemble_cycle(vertex, other, front, &pred);
+                            if self.holes_fill_cycle_accepted(&cycle) {
+                                return Some(cycle);
+                            }
                         }
-                        // §4.4 — refused; keep searching for another connecting
-                        // edge without claiming `other`.
+                        // §4.3 / §4.4 — refused (the cycle lies within one face, or
+                        // would duplicate geometry); keep searching for another
+                        // connecting edge without claiming `other`.
                     }
                 }
             }
         }
         None
+    }
+
+    /// §4.3 detail 1 — whether stepping along `edge` lifts a front's
+    /// spans-distinct-faces flag: a wire step (no bordering face) always does, and
+    /// so does a step onto an edge whose single bordering face differs from the
+    /// seed's confining face. A fillable edge borders at most one face (§4.1), so
+    /// only its first bordering face is consulted.
+    fn holes_fill_step_raises(&self, edge: EdgeKey, seed_face: Option<FaceKey>) -> bool {
+        match self.edge_face_keys(edge).first().copied() {
+            None => true,
+            Some(face) => Some(face) != seed_face,
+        }
     }
 
     /// Retrace the two half-paths from a connecting edge back to their roots and
@@ -244,41 +298,28 @@ impl LoopMesh {
         path
     }
 
-    /// §4.3 + §4.4 — accept a candidate cycle only when it genuinely bounds a
-    /// hole. It must span distinct surrounding regions — its edges border two or
-    /// more existing faces, or include a wire edge (open space) — rather than
-    /// lying within a single existing face (§4.3); and it must not duplicate
-    /// geometry — no existing face may have all of its vertices among the cycle's
-    /// (§4.4).
+    /// §4.4 — overlap rejection (the spans-distinct-faces gate of §4.3 is decided
+    /// per-front during the walk, *before* this is called). A candidate cycle that
+    /// passed the per-front gate is still refused here if it would duplicate
+    /// geometry: no existing face may have all of its vertices among the cycle's,
+    /// which would stack a second cap over a region that face already covers.
+    /// Also rejects defensively if the assembled ring is not a closed loop of
+    /// existing edges.
     fn holes_fill_cycle_accepted(&self, cycle: &[VertexKey]) -> bool {
         let n = cycle.len();
         if n < 3 {
             return false;
         }
 
-        // §4.3 — the cycle's edges are the near half-path, the connecting edge,
-        // the far half-path, and the seed closing edge; tally the existing faces
-        // they border.
-        let mut bordering: HashSet<FaceKey> = HashSet::new();
-        let mut touches_open_space = false;
+        // Defensive: every side of the ring must be an existing tagged-net edge —
+        // the walk traces along existing edges, so a missing side means the cycle
+        // was not assembled from a real closed net loop.
         for i in 0..n {
             let from = cycle[i];
             let to = cycle[(i + 1) % n];
-            let Some(edge) = self.query_edge_exists(from, to) else {
-                // A side that is not an existing edge means the walk did not trace
-                // a closed net cycle — reject defensively.
+            if self.query_edge_exists(from, to).is_none() {
                 return false;
-            };
-            let faces = self.edge_face_keys(edge);
-            if faces.is_empty() {
-                touches_open_space = true;
             }
-            for face in faces {
-                bordering.insert(face);
-            }
-        }
-        if !touches_open_space && bordering.len() < 2 {
-            return false;
         }
 
         // §4.4 — overlap rejection: refuse a cap that would stack over a region an
@@ -675,6 +716,64 @@ mod tests {
             let got = mesh.loop_attribs().get_vec2(uv, cap_loop.as_usize()).unwrap();
             assert_eq!(got, [0.0, 0.0], "isolated cap keeps default corner UV");
         }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn interior_wire_net_in_face_creates_nothing() {
+        // §4.3 / §4.5 — an isolated quad 0-1-2-3 (the lone face) plus a wire
+        // diagonal (0,2), selecting two perimeter edges and the diagonal. The
+        // minimal cycle 0-1-2 is two quad-perimeter edges plus the wire diagonal.
+        // The per-front gate, seeding a perimeter edge first (mesh order), leaves
+        // the wire as the bare connecting edge → both fronts' flags stay low → the
+        // triangle is refused, and the failed seeds are pruned so no later seeding
+        // can reconstruct it. Nothing is created.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // Quad first → its perimeter edges precede the diagonal in insertion order.
+        mesh.face_create_verts(&[v0, v1, v2, v3], FaceCreateFlags::NO_DUPLICATE);
+        let diagonal = mesh.create_edge([v0, v2], EdgeCreateFlags::NO_DUPLICATE);
+
+        let perim_01 = mesh.query_edge_exists(v0, v1).expect("perimeter 0-1");
+        let perim_12 = mesh.query_edge_exists(v1, v2).expect("perimeter 1-2");
+
+        let result = mesh.holes_fill(
+            &[perim_01, perim_12, diagonal],
+            &HolesFillParams { sides: 0 },
+        );
+
+        assert!(result.is_empty(), "interior-edge-net triangle is refused");
+        assert_eq!(mesh.face_count(), 1, "only the original quad remains");
+        assert_eq!(mesh.vertex_count(), 4, "no vertex created");
+        assert_eq!(mesh.edge_count(), 5, "the four quad edges plus the diagonal");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn face_boundary_only_creates_nothing() {
+        // §4.3 / §7 — selecting exactly a face's own boundary is refused: both
+        // fronts stay confined to that single face (neither flag rises) and the
+        // §4.4 overlap rejection independently sees the candidate covers the face.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        mesh.face_create_verts(&[v0, v1, v2, v3], FaceCreateFlags::NO_DUPLICATE);
+        let boundary = [
+            mesh.query_edge_exists(v0, v1).unwrap(),
+            mesh.query_edge_exists(v1, v2).unwrap(),
+            mesh.query_edge_exists(v2, v3).unwrap(),
+            mesh.query_edge_exists(v3, v0).unwrap(),
+        ];
+
+        let result = mesh.holes_fill(&boundary, &HolesFillParams { sides: 0 });
+
+        assert!(result.is_empty(), "a face's own boundary is not re-capped");
+        assert_eq!(mesh.face_count(), 1, "only the original quad remains");
         mesh.validate_topology();
     }
 
