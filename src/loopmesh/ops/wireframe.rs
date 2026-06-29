@@ -37,23 +37,27 @@ fn even_offset_factor(to_prev: Vec3, to_next: Vec3) -> f32 {
     }
 }
 
-/// The per-vertex relative-offset factor (WIREFRAME.md §5.4): the median length
-/// of the tagged edges incident to a vertex, used to scale that vertex's whole
-/// cross-section so the wire thickness tracks local geometry scale. `lengths`
-/// are the tagged-edge lengths around one vertex; an even count averages the two
-/// middle values (for a two-edge fan this reduces to the mean), an odd count
-/// takes the single middle value. A vertex with no tagged edges falls back to
-/// `1.0` (absolute thickness).
-fn median_edge_length(lengths: &mut [f32]) -> f32 {
-    if lengths.is_empty() {
-        return 1.0;
-    }
-    lengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = lengths.len() / 2;
-    if lengths.len() % 2 == 0 {
-        (lengths[mid - 1] + lengths[mid]) * 0.5
+/// The per-vertex relative-offset factor (WIREFRAME.md §5.4): a
+/// **degree-normalized far-endpoint mean**, used to scale a vertex's whole
+/// cross-section so the wire thickness tracks the local geometry scale. It is
+/// emphatically *not* a statistical median — `qualifying_length_sum` is the
+/// summed lengths of just the incident edges whose far endpoint is a region
+/// vertex, and `degree` is the vertex's **full incident-edge degree** (every
+/// edge in its disk, not only the qualifying ones).
+///
+/// On a vertex whose whole disk stays in-region (every far endpoint a region
+/// vertex) this reduces to the plain mean of all incident edge lengths — the
+/// common interior case, of which a lone quad's degree-2 corner is the smallest
+/// instance. On a **border vertex** of a partial selection the out-of-region
+/// edges are dropped from the numerator but still inflate the divisor, so the
+/// factor is pulled below what a qualifying-edge-only mean would give. A vertex
+/// with no incident edges falls back to `0.0` (it can never be in-region, so the
+/// caller never reaches this branch for a tagged vertex).
+fn relative_offset_factor(qualifying_length_sum: f32, degree: usize) -> f32 {
+    if degree == 0 {
+        0.0
     } else {
-        lengths[mid]
+        qualifying_length_sum / degree as f32
     }
 }
 
@@ -228,17 +232,19 @@ impl LoopMesh {
     /// per-vertex edge-length scale of WIREFRAME.md §5.4: when
     /// `use_relative_offset` is set, every per-vertex magnitude (the in-plane
     /// inset half-width and all three shell distances) is multiplied by that
-    /// vertex's **relative factor** — the median length of the tagged edges
-    /// incident to it. The wire thickness then tracks the local geometry scale:
-    /// a vertex surrounded by long edges gets a thicker wire than one in a
-    /// finely subdivided region. For a vertex whose tagged fan is two edges the
-    /// median reduces to their mean. When `use_relative_offset` is clear the
-    /// factor is `1.0` everywhere and the result is bit-identical to
+    /// vertex's **relative factor** — a *degree-normalized far-endpoint mean*,
+    /// **not** a statistical median. The factor sums the lengths of the incident
+    /// edges whose far endpoint is a region vertex and divides by the vertex's
+    /// **full incident-edge degree** (every edge in its disk, not just the
+    /// qualifying ones). The wire thickness then tracks the local geometry scale:
+    /// a vertex surrounded by long region edges gets a thicker wire than one in a
+    /// finely subdivided region. For a vertex whose whole disk stays in-region
+    /// this is the plain mean of its incident edge lengths (the lone-quad corner
+    /// is the degree-2 instance); a **border vertex** of a partial selection
+    /// divides a smaller numerator by its full degree, so its wire is pulled
+    /// thinner. When `use_relative_offset` is clear the factor is `1.0`
+    /// everywhere and the result is bit-identical to
     /// [`Self::wireframe_with_offset`] (absolute thickness).
-    ///
-    /// This implements only the all-tagged-edge fan case (the median is taken
-    /// over the tagged edges of the region); the mixed tagged/untagged edge-fan
-    /// behaviour of §14 is out of scope.
     pub fn wireframe_with_relative_offset(
         &mut self,
         faces: &[FaceKey],
@@ -368,47 +374,53 @@ impl LoopMesh {
             self.face_op_flag_set(face_tag, face, 0);
         }
 
-        // §3: tag every vertex of a tagged face (a tagged vertex gets a shell
-        // pair) and every edge of a tagged face (the tagged edges whose median
-        // length drives the §5.4 relative scale). The shell-pair lookup is keyed
-        // by original vertex slot. Snapshot the original element watermarks so
-        // the §7 replace pass can tell originals (slot < watermark) from freshly
-        // built wire geometry.
+        // §3: tag every vertex of a tagged face — a tagged vertex is a region
+        // vertex (`in_region`), the predicate the §5.4 relative factor keys its
+        // far-endpoint test on, and the vertex that gets a shell pair (§4.1). The
+        // shell-pair lookup is keyed by original vertex slot. Snapshot the
+        // original vertex watermark so the §7 replace pass can tell originals
+        // (slot < watermark) from freshly built wire geometry.
         let vert_watermark = self.vertices.key_watermark();
-        let edge_watermark = self.edges.key_watermark();
         let mut vert_tagged: Vec<bool> = vec![false; vert_watermark];
-        let mut edge_tagged: Vec<bool> = vec![false; edge_watermark];
         for &face in faces {
             let mut loops = self.face_loops(face);
             while let Some(l) = loops.next(self) {
                 vert_tagged[self.loop_vertex(l).as_usize()] = true;
-                edge_tagged[self.loop_edge(l).as_usize()] = true;
             }
         }
 
-        // §5.4: the per-vertex relative factor — the median length of the tagged
-        // edges incident to each tagged vertex — scaling that vertex's whole
-        // cross-section. With `use_relative_offset` clear the factor is `1.0`
-        // everywhere, so the cross-section keeps its absolute size and the path
-        // is bit-identical to the flat behaviour.
+        // §5.4: the per-vertex relative factor — a degree-normalized
+        // far-endpoint mean — scaling that vertex's whole cross-section. For each
+        // region vertex, walk its *full* edge disk: every incident edge counts
+        // toward the divisor (`degree`), but only those whose far endpoint is
+        // itself a region vertex add their length to the numerator. The far
+        // endpoint test (not edge-in-region membership) is what makes this a
+        // vertex rule, so an edge joining two region vertices that no tagged face
+        // uses still contributes on a non-convex selection. A border vertex thus
+        // divides a smaller numerator by its full degree and gets a smaller
+        // factor than an interior vertex with the same in-region edges would. The
+        // tagged vertex set is fixed before any factor is computed, so the factor
+        // never depends on visit order. With `use_relative_offset` clear the
+        // factor is `1.0` everywhere, bit-identical to the flat path.
         let mut relative_scale: Vec<f32> = vec![1.0; vert_watermark];
         if use_relative_offset {
-            let mut lengths: Vec<f32> = Vec::new();
             for slot in 0..vert_watermark {
                 if !vert_tagged[slot] {
                     continue;
                 }
                 let v = VertexKey::from_usize(slot);
-                lengths.clear();
+                let mut qualifying_length_sum = 0.0_f32;
+                let mut degree = 0usize;
                 for edge in self.vertex_disk_iter(v) {
-                    if !edge_tagged[edge.as_usize()] {
-                        continue;
-                    }
+                    degree += 1;
                     let [a, b] = self.edge_vertices(edge);
-                    let length = (self.vertex_position(a) - self.vertex_position(b)).length();
-                    lengths.push(length);
+                    let far = if a == v { b } else { a };
+                    if vert_tagged[far.as_usize()] {
+                        qualifying_length_sum +=
+                            (self.vertex_position(a) - self.vertex_position(b)).length();
+                    }
                 }
-                relative_scale[slot] = median_edge_length(&mut lengths);
+                relative_scale[slot] = relative_offset_factor(qualifying_length_sum, degree);
             }
         }
 
@@ -1358,8 +1370,13 @@ mod tests {
     #[test]
     fn relative_offset_scales_shell_per_vertex() {
         // WIREFRAME.md §5.4: each corner's whole cross-section scales by the
-        // median length of its tagged edges. Build a quad whose four edges have
-        // distinct lengths so each corner has a *different* median:
+        // degree-normalized far-endpoint mean of its incident edge lengths. On a
+        // lone quad every corner is degree 2 with both neighbours in-region, so
+        // the factor is the mean of its two incident edges (mean and median
+        // coincide here — the lone-quad pitfall; the degree-≥3 + border-vertex
+        // case is pinned by `relative_offset_partial_grid_mean_and_border_divisor`).
+        // Build a quad whose four edges have distinct lengths so each corner has
+        // a *different* factor:
         //   c0 = (0,0)  c1 = (5,0)  c2 = (5,2)  c3 = (0,2)
         //   |c0c1| = 5  |c1c2| = 2  |c2c3| = 5  |c3c0| = 2
         // Each corner has two tagged edges → factor = their mean:
@@ -1420,7 +1437,7 @@ mod tests {
         // The quad is planar (z = 0, +Z normal) so every shell vert is offset
         // purely along ±Z, landing at z = ±half·factor[c]. Group the 8 shell
         // verts (the new verts with non-zero z) by nearest corner and assert
-        // their |z| equals half × that corner's median factor. The inset-frame
+        // their |z| equals half × that corner's relative factor. The inset-frame
         // verts stay in the plane (z = 0); the four originals are at z = 0 too.
         let mut shell_hits = 0;
         for slot in 4..16 {
@@ -1454,29 +1471,168 @@ mod tests {
         // vacuous on a rectangle (uniform factor).
         assert!(
             factor[0] != factor[1] && factor[1] != factor[2] && factor[2] != factor[3],
-            "fixture must give a non-uniform per-corner median",
+            "fixture must give a non-uniform per-corner factor",
         );
         mesh.validate_topology();
     }
 
     #[test]
-    fn relative_offset_two_edge_fan_is_mean() {
-        // WIREFRAME.md §5.4: for a vertex whose tagged fan is exactly two edges
-        // the median reduces to their mean. On a lone tagged quad every corner
-        // has a two-edge fan, so the relative factor at a corner is the mean of
-        // its two incident edge lengths. Pin that directly via `median_edge_length`
-        // and via the resulting shell offset on an isosceles right-corner quad.
-        let mut two = [3.0_f32, 7.0];
-        assert_eq!(super::median_edge_length(&mut two), 5.0, "two-edge fan → mean");
+    fn relative_offset_factor_is_degree_normalized_mean_not_median() {
+        // WIREFRAME.md §5.4: the relative factor is a degree-normalized
+        // far-endpoint *mean*, not a median, and the divisor is the full degree.
+        //
+        // Two-edge fan, both neighbours in-region (the lone-quad corner): the
+        // numerator is both edge lengths and the divisor is 2, so the factor is
+        // their mean — here mean and median coincide, the pitfall a lone quad
+        // hides.
+        assert_eq!(super::relative_offset_factor(3.0 + 7.0, 2), 5.0, "two-edge fan → mean");
 
-        let mut three = [2.0_f32, 10.0, 6.0];
-        assert_eq!(super::median_edge_length(&mut three), 6.0, "odd count → middle value");
+        // Degree-4 interior vertex with unequal edges {1, 2, 4, 8}: the mean is
+        // 15/4 = 3.75, whereas a statistical median would be (2 + 4)/2 = 3.0.
+        // The factor must be the mean.
+        assert_eq!(
+            super::relative_offset_factor(1.0 + 2.0 + 4.0 + 8.0, 4),
+            3.75,
+            "degree-4 fan → mean 3.75, not median 3.0",
+        );
 
-        let mut four = [1.0_f32, 2.0, 8.0, 9.0];
-        assert_eq!(super::median_edge_length(&mut four), 5.0, "even count → mean of middles");
+        // Border vertex: in-region edges {2, 1.5} plus one out-of-region edge
+        // dropped from the sum but still counted in the degree. The factor is the
+        // §5.4 worked example (2 + 1.5)/3 ≈ 1.167 — NOT (2 + 1.5)/2 = 1.75.
+        let border = super::relative_offset_factor(2.0 + 1.5, 3);
+        assert!(
+            (border - 3.5 / 3.0).abs() < 1.0e-6,
+            "border vertex divides by full degree 3, not qualifying count 2: {border}",
+        );
 
-        let mut empty: [f32; 0] = [];
-        assert_eq!(super::median_edge_length(&mut empty), 1.0, "no tagged edges → 1.0 fallback");
+        // A vertex with no incident edges (never reached for a region vertex)
+        // falls back to 0.0.
+        assert_eq!(super::relative_offset_factor(0.0, 0), 0.0, "empty disk → 0.0 fallback");
+    }
+
+    #[test]
+    fn relative_offset_partial_grid_mean_and_border_divisor() {
+        // WIREFRAME.md §5.4: the case a lone quad cannot expose. Wire a 2×2
+        // sub-block of a graded 3×3-face grid (4×4 verts), so the block centre is
+        // a **degree-4 interior vertex** with unequal edge lengths (mean ≠ median)
+        // and the block rim carries **border vertices** whose disk has an edge
+        // leaving the region (full-degree divisor ≠ qualifying-edge count).
+        //
+        // Graded coordinates give four distinct edge lengths around the centre:
+        //   xs = [0, 1, 5, 8]   ys = [0, 2, 10, 11]
+        // Vertex grid v[iy][ix] at (xs[ix], ys[iy], 0); tag quads with ix,iy < 2.
+        let xs = [0.0_f32, 1.0, 5.0, 8.0];
+        let ys = [0.0_f32, 2.0, 10.0, 11.0];
+        let pos = |ix: usize, iy: usize| Vec3::new(xs[ix], ys[iy], 0.0);
+
+        let mut mesh = LoopMesh::new();
+        let mut verts = [[VertexKey::from_usize(0); 4]; 4];
+        for iy in 0..4 {
+            for ix in 0..4 {
+                verts[iy][ix] = mesh.create_vertex(pos(ix, iy));
+            }
+        }
+        let mut tagged = Vec::new();
+        for y in 0..3 {
+            for x in 0..3 {
+                let ring = [
+                    verts[y][x],
+                    verts[y][x + 1],
+                    verts[y + 1][x + 1],
+                    verts[y + 1][x],
+                ];
+                let edges = [
+                    mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                    mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                    mesh.create_edge([ring[2], ring[3]], EdgeCreateFlags::NO_DUPLICATE),
+                    mesh.create_edge([ring[3], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+                ];
+                let face = mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+                // The bottom-left 2×2 block of quads is the wired sub-selection.
+                if x < 2 && y < 2 {
+                    tagged.push(face);
+                }
+            }
+        }
+        assert_eq!(tagged.len(), 4, "a 2×2 block of quads");
+
+        let len = |a: (usize, usize), b: (usize, usize)| (pos(a.0, a.1) - pos(b.0, b.1)).length();
+
+        // Interior vertex v[1][1] = (1, 2): all four disk edges stay in-region,
+        // so the factor is their mean. Lengths {1, 4, 2, 8} → 15/4 = 3.75; a
+        // median would give (2 + 4)/2 = 3.0.
+        let interior_factor = (len((1, 1), (0, 1))
+            + len((1, 1), (2, 1))
+            + len((1, 1), (1, 0))
+            + len((1, 1), (1, 2)))
+            / 4.0;
+        assert!((interior_factor - 3.75).abs() < 1.0e-6);
+        let interior_median = 3.0_f32; // (2 + 4)/2 over sorted {1,2,4,8}
+        assert!(
+            (interior_factor - interior_median).abs() > 0.5,
+            "fixture must make mean ≠ median at the degree-4 interior vertex",
+        );
+
+        // Border vertex v[1][2] = (5, 2): its disk has four edges, but the edge
+        // to v[1][3] leaves the region (v[1][3] belongs to no tagged face). That
+        // length is dropped from the sum yet still counts toward the degree, so
+        // the factor is (4 + 2 + 8)/4 = 3.5 — NOT (4 + 2 + 8)/3 ≈ 4.667 (the
+        // qualifying-count divisor) and NOT a median over {2,4,8} = 4.
+        let border_factor =
+            (len((2, 1), (1, 1)) + len((2, 1), (2, 0)) + len((2, 1), (2, 2))) / 4.0;
+        assert!((border_factor - 3.5).abs() < 1.0e-6);
+        let border_qualifying_divisor =
+            (len((2, 1), (1, 1)) + len((2, 1), (2, 0)) + len((2, 1), (2, 2))) / 3.0;
+        assert!(
+            (border_factor - border_qualifying_divisor).abs() > 0.5,
+            "fixture must make full-degree divisor differ from qualifying-count divisor",
+        );
+
+        let thickness = 0.2_f32;
+        let half = thickness * 0.5;
+        mesh.wireframe_with_relative_offset(&tagged, thickness, 0.0, false, true);
+
+        // The grid is planar (+Z normal everywhere, including the interior verts
+        // shared with untagged faces), so each shell vert is offset purely along
+        // ±Z by `half · factor`. The shell pair at a corner sits at exactly its
+        // (x, y); inset-frame verts are displaced in-plane (so off the corner xy)
+        // and the originals stay at z = 0 — leaving exactly the two shell verts
+        // at each corner's xy with non-zero z.
+        let shell_abs_z = |mesh: &LoopMesh, target: Vec3| -> Vec<f32> {
+            let mut zs = Vec::new();
+            for v in mesh.vert_keys() {
+                let p = mesh.vertex_position(v);
+                if p.z.abs() < 1.0e-6 {
+                    continue;
+                }
+                if (p.x - target.x).abs() < 1.0e-6 && (p.y - target.y).abs() < 1.0e-6 {
+                    zs.push(p.z.abs());
+                }
+            }
+            zs
+        };
+
+        let interior_zs = shell_abs_z(&mesh, pos(1, 1));
+        assert_eq!(interior_zs.len(), 2, "one +/- shell pair at the interior vertex");
+        for z in interior_zs {
+            assert!(
+                (z - half * interior_factor).abs() < 1.0e-5,
+                "interior shell |z| {z} should be half·3.75 = {}",
+                half * interior_factor,
+            );
+        }
+
+        let border_zs = shell_abs_z(&mesh, pos(2, 1));
+        assert_eq!(border_zs.len(), 2, "one +/- shell pair at the border vertex");
+        for z in border_zs {
+            assert!(
+                (z - half * border_factor).abs() < 1.0e-5,
+                "border shell |z| {z} should be half·3.5 = {} (full-degree divisor)",
+                half * border_factor,
+            );
+        }
+
+        mesh.validate_topology();
     }
 
     /// A radial-3 T-junction fan (WIREFRAME.md §11.4): three quads share one
