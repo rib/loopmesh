@@ -8,6 +8,7 @@
 //! [`mid`](super::mid), which in turn are implemented in terms of the low-level
 //! Euler operators in [`euler`](super::euler).
 
+mod beautify_fill;
 mod bevel;
 mod bisect_edges;
 mod bisect_plane;
@@ -71,6 +72,7 @@ mod unsubdivide;
 mod weld_verts;
 mod wireframe;
 
+pub use beautify_fill::{BeautifyFillOptions, BeautifyFillResult, BeautifyMethod};
 pub use bevel::{BevelAffect, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod};
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};

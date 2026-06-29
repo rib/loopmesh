@@ -81,7 +81,7 @@ pub use geom::{convex_hull, ConvexHullProvider, HullFace, HullTopology, Quickhul
 pub use iter::*;
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    Axis, BevelAffect, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
+    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
     BisectParams,
     BisectResult, BridgeLoopsParams, BridgeLoopsResult, CenterMode, ConnectVertsNonplanarOut,
     ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
