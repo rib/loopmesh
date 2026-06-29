@@ -341,53 +341,44 @@ impl LoopMesh {
             return;
         }
 
-        let position = |g: &Lattice, x: usize, y: usize, mesh: &LoopMesh| -> Vec3 {
+        let at = |g: &Lattice, x: usize, y: usize, mesh: &LoopMesh| -> Vec3 {
             mesh.vertex_position(g.get(x, y))
         };
+
+        // The four boundary profiles. The two rails feed the §5 row frames; the
+        // two sides supply the column profiles carried inward (§5.3) and the
+        // §6 convex blend.
+        let left_rail: Vec<Vec3> = (0..rows).map(|y| at(grid, 0, y, self)).collect();
+        let right_rail: Vec<Vec3> = (0..rows).map(|y| at(grid, cols - 1, y, self)).collect();
+        let bottom_side: Vec<Vec3> = (0..cols).map(|x| at(grid, x, 0, self)).collect();
+        let top_side: Vec<Vec3> = (0..cols).map(|x| at(grid, x, rows - 1, self)).collect();
+
+        // §5.1 — the bottom and top row frames are fixed for the whole fill.
+        let frame_bottom = grid_row_frame(&left_rail, &right_rail, 0);
+        let frame_top = grid_row_frame(&left_rail, &right_rail, rows - 1);
 
         for x in 1..cols - 1 {
             for y in 1..rows - 1 {
                 let u = x as f32 / (cols - 1) as f32;
                 let v = y as f32 / (rows - 1) as f32;
 
-                let bottom = position(grid, x, 0, self);
-                let top = position(grid, x, rows - 1, self);
-                let left = position(grid, 0, y, self);
-                let right = position(grid, cols - 1, y, self);
-                let p00 = position(grid, 0, 0, self);
-                let p10 = position(grid, cols - 1, 0, self);
-                let p01 = position(grid, 0, rows - 1, self);
-                let p11 = position(grid, cols - 1, rows - 1, self);
-
-                let pos = if use_interp_simple {
-                    // §6 — Coons bilinear blend of the four boundary sides.
-                    grid_coons(u, v, bottom, top, left, right, p00, p10, p01, p11)
+                let position = if use_interp_simple {
+                    // §6.1 — reciprocal-distance convex partition of unity over
+                    // the four boundary verts sharing this cell's column/row.
+                    grid_simple_blend(u, v, bottom_side[x], left_rail[y], top_side[x], right_rail[y])
                 } else {
-                    // §5 — carry the bottom and top side profiles inward along
-                    // the rails. Each side has a local frame (its run direction
-                    // and the across-to-next-row direction); the profile point
-                    // is re-expressed in the current row's frame, then the two
-                    // mapped positions are blended by the row height. The frame
-                    // rotation is what makes a curved boundary yield a curved
-                    // interior rather than the flat bilinear sheet of §6.
-                    let row_origin = position(grid, 0, y, self);
-                    let row_run = position(grid, cols - 1, y, self) - row_origin;
-                    let row_across = position(grid, 0, y + 1, self) - row_origin;
-
-                    let bottom_across = position(grid, 0, 1, self) - p00;
-                    let carried_bottom = grid_frame_transfer(
-                        bottom, p00, p10 - p00, bottom_across, row_origin, row_run, row_across,
-                    );
-
-                    let top_across = p01 - position(grid, 0, rows - 2, self);
-                    let carried_top = grid_frame_transfer(
-                        top, p01, p11 - p01, top_across, row_origin, row_run, row_across,
-                    );
-
-                    carried_bottom.lerp(carried_top, v)
+                    // §5.3 — carry this column's bottom and top profile verts
+                    // through their own row frame into the current row's frame,
+                    // then blend by the row's fractional height. The per-row
+                    // frame rotation is what makes a curved boundary yield a
+                    // curved interior rather than the flat blend of §6.
+                    let frame_row = grid_row_frame(&left_rail, &right_rail, y);
+                    let co_a = grid_frame_transform(bottom_side[x], frame_bottom, frame_row);
+                    let co_b = grid_frame_transform(top_side[x], frame_top, frame_row);
+                    co_a.lerp(co_b, v)
                 };
 
-                let vertex = self.create_vertex(pos);
+                let vertex = self.create_vertex(position);
 
                 // Interior vertex attributes blend the four boundary verts in
                 // the cell's row and column (§5).
@@ -459,77 +450,105 @@ fn grid_rails_overlap(rail_left: &[VertexKey], rail_right: &[VertexKey]) -> bool
     rail_right.iter().any(|v| left.contains(v))
 }
 
-/// §6 — the Coons bilinear blend: the four boundary sides summed, minus the
-/// corner bilinear term, so a flat regular frame reproduces the regular lattice.
-#[allow(clippy::too_many_arguments)]
-fn grid_coons(
-    u: f32,
-    v: f32,
-    bottom: Vec3,
-    top: Vec3,
-    left: Vec3,
-    right: Vec3,
-    p00: Vec3,
-    p10: Vec3,
-    p01: Vec3,
-    p11: Vec3,
-) -> Vec3 {
-    let sides = (1.0 - v) * bottom + v * top + (1.0 - u) * left + u * right;
-    let corners = (1.0 - u) * (1.0 - v) * p00
-        + u * (1.0 - v) * p10
-        + (1.0 - u) * v * p01
-        + u * v * p11;
-    sides - corners
+/// §6.1 — the reciprocal-distance convex blend. Each of the four boundary
+/// sides gets an unnormalised weight equal to the reciprocal of the lattice
+/// distance to it; normalising by their sum yields a partition of unity, so the
+/// interior vertex is a true convex combination of the four boundary points.
+fn grid_simple_blend(u: f32, v: f32, bottom: Vec3, left: Vec3, top: Vec3, right: Vec3) -> Vec3 {
+    let w_bottom = 1.0 / v;
+    let w_left = 1.0 / u;
+    let w_top = 1.0 / (1.0 - v);
+    let w_right = 1.0 / (1.0 - u);
+    let sum = w_bottom + w_left + w_top + w_right;
+    (w_bottom * bottom + w_left * left + w_top * top + w_right * right) / sum
 }
 
-/// §5 — re-express `point` from a source corner frame into a destination corner
-/// frame. Each frame is the orthonormalised `(run, across)` pair plus their
-/// cross product; the source-relative coordinates are rebuilt in the destination
-/// basis, scaled by the run-length ratio. A rotation between the frames carries
-/// a curved profile through the row's orientation instead of merely translating
-/// it (which is what distinguishes §5 from the §6 bilinear sheet on a warped
-/// frame).
-fn grid_frame_transfer(
-    point: Vec3,
-    src_origin: Vec3,
-    src_run: Vec3,
-    src_across: Vec3,
-    dst_origin: Vec3,
-    dst_run: Vec3,
-    dst_across: Vec3,
-) -> Vec3 {
-    let (se1, se2, se3, src_len) = grid_ortho_frame(src_run, src_across);
-    let (de1, de2, de3, dst_len) = grid_ortho_frame(dst_run, dst_across);
-    let relative = point - src_origin;
-    if src_len < 1.0e-12 {
-        return dst_origin + relative;
-    }
-    let a = relative.dot(se1);
-    let b = relative.dot(se2);
-    let c = relative.dot(se3);
-    let scale = dst_len / src_len;
-    dst_origin + (a * de1 + b * de2 + c * de3) * scale
+/// §5.1 — the row frame: a triangle `[L, R, apex]` whose base is the row's
+/// left-rail to right-rail segment and whose apex sits a base-length away along
+/// the averaged direction in which the two rails advance from this row toward
+/// its neighbour(s). The apex direction is what makes the interior follow the
+/// boundary's bow rather than lie flat.
+fn grid_row_frame(left: &[Vec3], right: &[Vec3], y: usize) -> [Vec3; 3] {
+    let l = left[y];
+    let r = right[y];
+    let progression = grid_progression(left, right, y);
+    let apex = (l + r) * 0.5 + progression * (r - l).length();
+    [l, r, apex]
 }
 
-/// Orthonormal frame `(e1, e2, e3)` from a run direction and an across
-/// direction, returning the run length so the caller can scale. `e1` follows
-/// the run; `e2` is the across component orthogonal to `e1`; `e3` completes the
-/// right-handed basis.
-fn grid_ortho_frame(run: Vec3, across: Vec3) -> (Vec3, Vec3, Vec3, f32) {
-    let run_len = run.length();
-    let e1 = if run_len > 1.0e-12 {
-        run / run_len
+/// §5.1 — the unit progression direction for row `y`: the averaged rail step
+/// toward the neighbouring row(s). The bottom row steps forward, the top row
+/// steps backward and negates (so its apex points the same way as the bottom's),
+/// and an interior row averages a forward and a backward estimate.
+fn grid_progression(left: &[Vec3], right: &[Vec3], y: usize) -> Vec3 {
+    let rows = left.len();
+    let unit = |v: Vec3| v.normalize_or_zero();
+    // Averaged unit step of the two rails from row `a` to row `b`.
+    let step = |a: usize, b: usize| unit(unit(left[b] - left[a]) + unit(right[b] - right[a]));
+    if y == 0 {
+        step(0, 1)
+    } else if y == rows - 1 {
+        -step(rows - 1, rows - 2)
     } else {
-        Vec3::X
+        unit(step(y, y + 1) + step(y - 1, y))
+    }
+}
+
+/// §5.2 — carry a point from a source row frame into a target row frame. The
+/// in-plane part is handled by (un-clamped) triangle barycentric coordinates;
+/// the signed height above the source plane is carried across and rescaled by
+/// the linear size ratio of the two triangles.
+fn grid_frame_transform(point: Vec3, src: [Vec3; 3], tar: [Vec3; 3]) -> Vec3 {
+    let n_src = grid_tri_normal(src);
+    let n_tar = grid_tri_normal(tar);
+
+    // Orthonormal frame whose z axis is the source normal; (x, y) lie in the
+    // source plane, z is signed height.
+    let (e1, e2) = n_src.any_orthonormal_pair();
+    let project = |q: Vec3| Vec3::new(q.dot(e1), q.dot(e2), q.dot(n_src));
+    let p = project(point);
+    let s = [project(src[0]), project(src[1]), project(src[2])];
+
+    // Affine (un-clamped) barycentric weights in the source plane.
+    let w = grid_barycentric_2d(p.truncate(), s[0].truncate(), s[1].truncate(), s[2].truncate());
+    let in_plane = w[0] * tar[0] + w[1] * tar[1] + w[2] * tar[2];
+
+    // Out-of-plane height, scaled by the linear size ratio of the triangles.
+    let height = p.z - s[0].z;
+    let area_tar = grid_tri_area_3d(tar);
+    let area_src = grid_tri_area_2d(s[0].truncate(), s[1].truncate(), s[2].truncate());
+    let scale = if area_src > 1.0e-20 {
+        area_tar.sqrt() / area_src.sqrt()
+    } else {
+        1.0
     };
-    let mut e2 = across - across.dot(e1) * e1;
-    if e2.length_squared() < 1.0e-20 {
-        e2 = e1.any_orthonormal_vector();
-    } else {
-        e2 = e2.normalize();
-    }
-    let e3 = e1.cross(e2);
-    (e1, e2, e3, run_len)
+    in_plane + n_tar * (height * scale)
+}
+
+/// Unit normal of a triangle, from its fixed `[a, b, c]` vertex order. The §5.2
+/// result is invariant to the sign convention as long as it is consistent.
+fn grid_tri_normal(t: [Vec3; 3]) -> Vec3 {
+    (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero()
+}
+
+fn grid_tri_area_3d(t: [Vec3; 3]) -> f32 {
+    0.5 * (t[1] - t[0]).cross(t[2] - t[0]).length()
+}
+
+fn grid_tri_area_2d(a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> f32 {
+    0.5 * (b - a).perp_dot(c - a).abs()
+}
+
+/// Affine barycentric weights of `p` within triangle `(a, b, c)` in 2D. The
+/// three weights sum to one but may fall outside `[0, 1]` (extrapolation).
+fn grid_barycentric_2d(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> [f32; 3] {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = p - a;
+    let den = v0.perp_dot(v1);
+    let w1 = v2.perp_dot(v1) / den;
+    let w2 = v0.perp_dot(v2) / den;
+    [1.0 - w1 - w2, w1, w2]
 }
 
 #[cfg(test)]
@@ -545,14 +564,21 @@ mod tests {
     /// `warp` lifts the boundary into a saddle so the two interpolation modes
     /// diverge.
     fn rect_wire_ring(mesh: &mut LoopMesh, cols: usize, rows: usize, warp: f32) -> Vec<EdgeKey> {
+        let on_perimeter = |x: usize, y: usize| x == 0 || x == cols - 1 || y == 0 || y == rows - 1;
+        let is_corner =
+            |x: usize, y: usize| (x == 0 || x == cols - 1) && (y == 0 || y == rows - 1);
         let z = |x: usize, y: usize| -> f32 {
-            // Saddle: positive along one diagonal, negative along the other.
-            let u = x as f32 / (cols - 1) as f32 - 0.5;
-            let v = y as f32 / (rows - 1) as f32 - 0.5;
-            warp * (u * u - v * v)
+            // Bow the boundary: every non-corner boundary vertex is lifted to
+            // `warp`, the four corners stay at z = 0. This is the GRID_FILL.md
+            // §5/§6 worked-check frame (a flat warp = 0 frame is the regular
+            // lattice; a non-zero warp makes the two interp modes diverge).
+            if on_perimeter(x, y) && !is_corner(x, y) {
+                warp
+            } else {
+                0.0
+            }
         };
         let mut vert = vec![vec![VertexKey(u32::MAX); rows]; cols];
-        let on_perimeter = |x: usize, y: usize| x == 0 || x == cols - 1 || y == 0 || y == rows - 1;
         for x in 0..cols {
             for y in 0..rows {
                 if on_perimeter(x, y) {
@@ -671,6 +697,92 @@ mod tests {
             "the two interpolation modes must place the interior vert differently \
              (simple={simple:?} transform={transform:?})",
         );
+    }
+
+    /// The position of the (unique) vertex whose `xy` lands near `(x, y)`.
+    fn vert_near(mesh: &LoopMesh, x: f32, y: f32) -> Vec3 {
+        let mut found = None;
+        let mut it = mesh.mesh_verts();
+        while let Some(v) = it.next(mesh) {
+            let p = mesh.vertex_position(v);
+            if (p.x - x).abs() < 1.0e-3 && (p.y - y).abs() < 1.0e-3 {
+                assert!(found.is_none(), "more than one vertex near ({x}, {y})");
+                found = Some(p);
+            }
+        }
+        found.unwrap_or_else(|| panic!("no vertex near ({x}, {y})"))
+    }
+
+    #[test]
+    fn simple_interp_centered_saddle_3x3() {
+        // §6.1 worked check: u = v = 0.5 ⇒ all four reciprocal weights are 2,
+        // normalise to 0.25; the four boundary midpoints all sit at z = 0.6, so
+        // the lone interior vert lands at (1, 1, 0.6) — a convex blend (a
+        // partition-of-unity bug would double the height to 1.2).
+        let mut mesh = LoopMesh::new();
+        let side_edges = rect_wire_ring(&mut mesh, 3, 3, 0.6);
+        mesh.grid_fill(
+            &side_edges,
+            &GridFillParams {
+                use_interp_simple: true,
+                ..Default::default()
+            },
+        );
+        let p = vert_near(&mesh, 1.0, 1.0);
+        assert!(
+            (p - Vec3::new(1.0, 1.0, 0.6)).length() < 1.0e-4,
+            "simple-mode interior vert at (1,1,0.6), got {p:?}",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn simple_interp_offcenter_4x3() {
+        // §6.1 off-center worked check: grid[1][1] sits at u = 1/3, v = 1/2 with
+        // asymmetric weights (2, 3, 2, 1.5)/8.5, landing it at (1, 1, 0.6) —
+        // above its own column, not drifted to x = 1.25 as a uniform 0.25-each
+        // (symmetric) weighting would. Its mirror grid[2][1] lands at (2,1,0.6).
+        let mut mesh = LoopMesh::new();
+        let side_edges = rect_wire_ring(&mut mesh, 4, 3, 0.6);
+        mesh.grid_fill(
+            &side_edges,
+            &GridFillParams {
+                use_interp_simple: true,
+                ..Default::default()
+            },
+        );
+        let p1 = vert_near(&mesh, 1.0, 1.0);
+        let p2 = vert_near(&mesh, 2.0, 1.0);
+        assert!(
+            (p1 - Vec3::new(1.0, 1.0, 0.6)).length() < 1.0e-4,
+            "grid[1][1] at (1,1,0.6), got {p1:?}",
+        );
+        assert!(
+            (p2 - Vec3::new(2.0, 1.0, 0.6)).length() < 1.0e-4,
+            "grid[2][1] at (2,1,0.6), got {p2:?}",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn default_interp_saddle_3x3_lifts_above_simple() {
+        // §5.3 worked check: the per-row frame apexes bow the interior well
+        // above the z = 0.6 plane of the four side midpoints — BMesh lands the
+        // lone interior vert at z ≈ 1.115, distinct from the simple mode's 0.6.
+        let mut mesh = LoopMesh::new();
+        let side_edges = rect_wire_ring(&mut mesh, 3, 3, 0.6);
+        mesh.grid_fill(&side_edges, &GridFillParams::default());
+        let p = vert_near(&mesh, 1.0, 1.0);
+        assert!(
+            (p.x - 1.0).abs() < 1.0e-4 && (p.y - 1.0).abs() < 1.0e-4,
+            "default interior vert centred over its column, got {p:?}",
+        );
+        assert!(
+            (p.z - 1.115).abs() < 2.0e-2,
+            "default-mode interior vert lifted to z ≈ 1.115, got z = {}",
+            p.z,
+        );
+        mesh.validate_topology();
     }
 
     #[test]
