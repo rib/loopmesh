@@ -89,6 +89,7 @@ pub use ops::{
     DissolveVertsParams,
     DuplicateResult, EdgeloopFillParams, EdgeloopFillResult, ExtrudeVertIndivResult, GeomKey,
     GridFillParams, GridFillResult,
+    HolesFillParams, HolesFillResult,
     InsetIndividualParams, InsetIndividualResult,
     InsetRegionParams, InsetRegionResult, JoinTrianglesParams, JoinTrianglesResult, MirrorParams,
     MirrorResult, MixedSeed, NgonMethod, OffsetEdgeLoopsResult, ProfileShape, QuadCornerType,
