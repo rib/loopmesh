@@ -87,8 +87,9 @@ impl LoopMesh {
     /// `mat_nr` / `use_smooth` stamping into `faces.out`.
     ///
     /// All-or-nothing (§3): any failed gate fills nothing and returns an empty
-    /// result. Span equalisation (§3.4, mismatched side counts) is not yet
-    /// implemented — sides or rails of unequal length are rejected.
+    /// result. Span equalisation (§3.4) fills mismatched side or rail counts by
+    /// expanding the shorter member with scaffold vertices and collapsing them
+    /// back out after the build, yielding a fan of quads plus `|Δ|` triangles.
     pub fn grid_fill(&mut self, edges: &[EdgeKey], params: &GridFillParams) -> GridFillResult {
         let empty = GridFillResult::default();
 
@@ -99,7 +100,7 @@ impl LoopMesh {
         if loops.len() != 2 {
             return empty;
         }
-        let loop_a = loops[0].clone();
+        let mut loop_a = loops[0].clone();
         let mut loop_b = loops[1].clone();
         if loop_a.len() < 2 || loop_b.len() < 2 {
             return empty;
@@ -116,7 +117,7 @@ impl LoopMesh {
 
         // §3.3 — try the natural pairing, then the crossed pairing (which
         // reverses loop B so the rails do not twist).
-        let (rail_left, rail_right) = match (
+        let (mut rail_left, mut rail_right) = match (
             self.grid_find_rail(a_first, b_first, &side_edges),
             self.grid_find_rail(a_last, b_last, &side_edges),
         ) {
@@ -134,15 +135,51 @@ impl LoopMesh {
             },
         };
 
-        let cols = loop_a.len();
-        let rows = rail_left.len();
-
-        // The lattice must be rectangular. Span equalisation (§3.4) is out of
-        // scope, so unequal opposing sides or unequal rails are rejected here
-        // rather than expanded.
-        if loop_b.len() != cols || rail_right.len() != rows {
-            return empty;
+        // §3.4 — anchor the lattice origin deterministically. §3.3 leaves two
+        // free flips (which side is A vs B, which endpoint each loop's discovery
+        // walk labels "first"); both are arbitrary walk-order artifacts, so the
+        // span-equalisation collapse — which is keyed to the lattice origin
+        // `grid[0][0]`, not to geometry — would otherwise land its surviving
+        // corner on a hash-order-dependent physical vertex. We pin `grid[0][0]`
+        // to the corner with the lowest element index (the lattice addressed by
+        // element order, never enumeration order), choosing among the four valid
+        // non-twisted orientations. This makes the §3.4 collapse reproducible.
+        {
+            let c00 = loop_a[0];
+            let c10 = *loop_a.last().unwrap();
+            let c01 = loop_b[0];
+            let c11 = *loop_b.last().unwrap();
+            let origin = [c00, c10, c01, c11].into_iter().min_by_key(|v| v.0).unwrap();
+            if origin == c10 {
+                // Horizontal flip: the far bottom corner becomes the origin.
+                loop_a.reverse();
+                loop_b.reverse();
+                std::mem::swap(&mut rail_left, &mut rail_right);
+            } else if origin == c01 {
+                // Vertical flip: the near top corner becomes the origin.
+                std::mem::swap(&mut loop_a, &mut loop_b);
+                rail_left.reverse();
+                rail_right.reverse();
+            } else if origin == c11 {
+                // Both flips: the far top corner becomes the origin.
+                std::mem::swap(&mut loop_a, &mut loop_b);
+                loop_a.reverse();
+                loop_b.reverse();
+                rail_left.reverse();
+                rail_right.reverse();
+                std::mem::swap(&mut rail_left, &mut rail_right);
+            }
+            // else origin == c00: identity, the lattice already starts at it.
         }
+
+        // §3.4 — the lattice must be rectangular, so the two opposing sides are
+        // reconciled to a common `cols` and the two rails to a common `rows`.
+        // Equal members need no work; a shorter member is *expanded* with
+        // temporary scaffold vertices (not rejected), and the scaffold collapses
+        // back out after the quads are built — degenerating the corner-losing
+        // cells into triangles.
+        let cols = loop_a.len().max(loop_b.len());
+        let rows = rail_left.len().max(rail_right.len());
         if cols < 2 || rows < 2 {
             return empty;
         }
@@ -152,29 +189,52 @@ impl LoopMesh {
             return empty;
         }
 
+        // §3.4 Phase 1+2 — expand each boundary member to the full lattice count.
+        // `*_pos` carry the genuine (scaffold-subdivided) boundary positions that
+        // feed the §5/§6 interior interpolation; `*_key` carry the per-slot
+        // vertex, with every scaffold slot already mapped to the perimeter vertex
+        // it collapses into, so no scaffold vertex survives in the result.
+        let (bottom_pos, bottom_key) = self.grid_expand_member(&loop_a, cols);
+        let (top_pos, top_key) = self.grid_expand_member(&loop_b, cols);
+        let (left_pos, left_key) = self.grid_expand_member(&rail_left, rows);
+        let (right_pos, right_key) = self.grid_expand_member(&rail_right, rows);
+
         // §4.1 — write the perimeter into the lattice. The four corners are
-        // written by more than one side; §3.3 pinned them to the same vertices.
+        // written by more than one side; §3.3 pinned them to the same vertices,
+        // and slot 0 / slot max are always real (never scaffold), so the corners
+        // stay coherent under expansion.
         let mut grid = Lattice::new(cols, rows);
         for x in 0..cols {
-            grid.set(x, 0, loop_a[x]);
-            grid.set(x, rows - 1, loop_b[x]);
+            grid.set(x, 0, bottom_key[x]);
+            grid.set(x, rows - 1, top_key[x]);
         }
         for y in 0..rows {
-            grid.set(0, y, rail_left[y]);
-            grid.set(cols - 1, y, rail_right[y]);
+            grid.set(0, y, left_key[y]);
+            grid.set(cols - 1, y, right_key[y]);
         }
 
-        // §5/§6 — create the interior vertices by interpolation.
-        self.grid_build_interior(&mut grid, params.use_interp_simple);
+        // §5/§6 — create the genuine interior vertices by interpolation over the
+        // expanded boundary profiles.
+        self.grid_build_interior(
+            &mut grid,
+            &bottom_pos,
+            &top_pos,
+            &left_pos,
+            &right_pos,
+            params.use_interp_simple,
+        );
 
         // §4.2 — settle the build winding against any bordering surface.
         let flip = self.grid_winding_flip(&grid);
 
-        // §7 — one quad per cell, stamped and recorded.
+        // §7 / §3.4 Phase 3 — one face per lattice cell. A cell with four distinct
+        // corners is a quad; a cell that lost a corner to a scaffold collapse has
+        // a consecutive duplicate, which drops out to leave a triangle. A fully
+        // degenerate cell produces no face.
         let mut result = GridFillResult::default();
         for x in 0..cols - 1 {
             for y in 0..rows - 1 {
-                let corners: [VertexKey; 4] = if flip {
+                let raw: [VertexKey; 4] = if flip {
                     [
                         grid.get(x, y),
                         grid.get(x + 1, y),
@@ -189,6 +249,18 @@ impl LoopMesh {
                         grid.get(x + 1, y),
                     ]
                 };
+                let mut corners: SmallVec<[VertexKey; 4]> = SmallVec::new();
+                for &vertex in &raw {
+                    if corners.last() != Some(&vertex) {
+                        corners.push(vertex);
+                    }
+                }
+                if corners.len() > 1 && corners.first() == corners.last() {
+                    corners.pop();
+                }
+                if corners.len() < 3 {
+                    continue;
+                }
                 let face = self.face_create_verts(&corners, FaceCreateFlags::NO_DUPLICATE);
                 if params.mat_nr != 0 {
                     self.set_face_material_index(face, params.mat_nr);
@@ -333,29 +405,86 @@ impl LoopMesh {
         Some(path)
     }
 
-    /// §5/§6 — fill every interior lattice cell with a freshly created vertex.
-    fn grid_build_interior(&mut self, grid: &mut Lattice, use_interp_simple: bool) {
+    /// §3.4 Phase 1+2 — reconcile a boundary member of `members` real vertices to
+    /// the lattice's full `target` slot count. Every original member vertex is
+    /// preserved as a lattice slot; the `target - count` extra slots are
+    /// *scaffold* vertices inserted into the member's segments by a count-driven
+    /// even-distribution schedule walked **from the origin end** (the member is
+    /// pre-oriented origin-first, so segment `s` is `[members[s], members[s+1]]`).
+    /// The schedule — segment `s` receives
+    /// `floor((s+1)·extra / segments) − floor(s·extra / segments)` scaffolds — is
+    /// a function of the counts alone, never of input ordering or geometry.
+    ///
+    /// Returns the per-slot positions (genuine scaffold points, on the member's
+    /// polyline, that feed the §5/§6 interior interpolation) and the per-slot
+    /// vertex keys, with each scaffold slot **collapsed (Phase 2) into its
+    /// segment's origin-ward — lower-index — endpoint**, the deterministic
+    /// collapse survivor of §3.4 (the endpoint reached first walking from
+    /// `grid[0][0]`). The two member endpoints are always slot 0 and slot
+    /// `target-1`, so the four lattice corners stay real. An already-full member
+    /// is the identity.
+    fn grid_expand_member(
+        &self,
+        members: &[VertexKey],
+        target: usize,
+    ) -> (Vec<Vec3>, Vec<VertexKey>) {
+        let real_positions: Vec<Vec3> =
+            members.iter().map(|&v| self.vertex_position(v)).collect();
+        let count = members.len();
+        if count == target {
+            return (real_positions, members.to_vec());
+        }
+
+        let extra = target - count;
+        let segments = count - 1;
+        let mut positions = Vec::with_capacity(target);
+        let mut keys = Vec::with_capacity(target);
+        let mut inserted = 0usize;
+        for s in 0..segments {
+            // The segment's origin-ward endpoint — a real member vertex, and the
+            // collapse survivor for every scaffold this segment carries.
+            positions.push(real_positions[s]);
+            keys.push(members[s]);
+
+            // Even-distribution schedule (Bresenham-style spread from the origin
+            // end): the running count up to and including this segment, minus what
+            // earlier segments already took.
+            let upto = (s + 1) * extra / segments;
+            let here = upto - inserted;
+            inserted = upto;
+            for k in 0..here {
+                let frac = (k + 1) as f32 / (here + 1) as f32;
+                positions.push(real_positions[s].lerp(real_positions[s + 1], frac));
+                // §3.4 — origin-ward (lower-index) endpoint survives the collapse.
+                keys.push(members[s]);
+            }
+        }
+        // The final real member vertex closes the walk at slot `target-1`.
+        positions.push(real_positions[count - 1]);
+        keys.push(members[count - 1]);
+        (positions, keys)
+    }
+
+    /// §5/§6 — fill every interior lattice cell with a freshly created vertex,
+    /// interpolated from the four expanded boundary profiles (§3.4 Phase 1).
+    fn grid_build_interior(
+        &mut self,
+        grid: &mut Lattice,
+        bottom_side: &[Vec3],
+        top_side: &[Vec3],
+        left_rail: &[Vec3],
+        right_rail: &[Vec3],
+        use_interp_simple: bool,
+    ) {
         let cols = grid.cols;
         let rows = grid.rows;
         if cols < 3 || rows < 3 {
             return;
         }
 
-        let at = |g: &Lattice, x: usize, y: usize, mesh: &LoopMesh| -> Vec3 {
-            mesh.vertex_position(g.get(x, y))
-        };
-
-        // The four boundary profiles. The two rails feed the §5 row frames; the
-        // two sides supply the column profiles carried inward (§5.3) and the
-        // §6 convex blend.
-        let left_rail: Vec<Vec3> = (0..rows).map(|y| at(grid, 0, y, self)).collect();
-        let right_rail: Vec<Vec3> = (0..rows).map(|y| at(grid, cols - 1, y, self)).collect();
-        let bottom_side: Vec<Vec3> = (0..cols).map(|x| at(grid, x, 0, self)).collect();
-        let top_side: Vec<Vec3> = (0..cols).map(|x| at(grid, x, rows - 1, self)).collect();
-
         // §5.1 — the bottom and top row frames are fixed for the whole fill.
-        let frame_bottom = grid_row_frame(&left_rail, &right_rail, 0);
-        let frame_top = grid_row_frame(&left_rail, &right_rail, rows - 1);
+        let frame_bottom = grid_row_frame(left_rail, right_rail, 0);
+        let frame_top = grid_row_frame(left_rail, right_rail, rows - 1);
 
         for x in 1..cols - 1 {
             for y in 1..rows - 1 {
@@ -372,7 +501,7 @@ impl LoopMesh {
                     // then blend by the row's fractional height. The per-row
                     // frame rotation is what makes a curved boundary yield a
                     // curved interior rather than the flat blend of §6.
-                    let frame_row = grid_row_frame(&left_rail, &right_rail, y);
+                    let frame_row = grid_row_frame(left_rail, right_rail, y);
                     let co_a = grid_frame_transform(bottom_side[x], frame_bottom, frame_row);
                     let co_b = grid_frame_transform(top_side[x], frame_top, frame_row);
                     co_a.lerp(co_b, v)
@@ -871,6 +1000,202 @@ mod tests {
             (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (v0, e0, f0),
         );
+        mesh.validate_topology();
+    }
+
+    /// §3.4 mismatched-sides fixture: a bottom side of `bottom_cols` vertices
+    /// opposing a top side of `top_cols`, joined by single-edge rails. Returns the
+    /// side edges (the grid-fill input); the two rails are left for discovery.
+    fn unequal_sided_wire_ring(
+        mesh: &mut LoopMesh,
+        bottom_cols: usize,
+        top_cols: usize,
+    ) -> Vec<EdgeKey> {
+        let width = bottom_cols.max(top_cols) - 1;
+        let bottom: Vec<VertexKey> = (0..bottom_cols)
+            .map(|x| {
+                let fx = x as f32 * width as f32 / (bottom_cols - 1) as f32;
+                mesh.create_vertex(Vec3::new(fx, 0.0, 0.0))
+            })
+            .collect();
+        let top: Vec<VertexKey> = (0..top_cols)
+            .map(|x| {
+                let fx = x as f32 * width as f32 / (top_cols - 1) as f32;
+                mesh.create_vertex(Vec3::new(fx, 2.0, 0.0))
+            })
+            .collect();
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE)
+        };
+        let mut side_edges = Vec::new();
+        for x in 0..bottom_cols - 1 {
+            side_edges.push(edge(mesh, bottom[x], bottom[x + 1]));
+        }
+        for x in 0..top_cols - 1 {
+            side_edges.push(edge(mesh, top[x], top[x + 1]));
+        }
+        // Single-edge rails connecting the matching corners — discovered, not input.
+        edge(mesh, bottom[0], top[0]);
+        edge(mesh, bottom[bottom_cols - 1], top[top_cols - 1]);
+        side_edges
+    }
+
+    /// §3.4 mismatched-rails fixture: single-edge opposing sides joined by a left
+    /// rail of `left_rows` vertices opposing a right rail of `right_rows`. Returns
+    /// the side edges (the input); the rails are left for discovery.
+    fn unequal_railed_wire_ring(
+        mesh: &mut LoopMesh,
+        left_rows: usize,
+        right_rows: usize,
+    ) -> Vec<EdgeKey> {
+        let height = left_rows.max(right_rows) - 1;
+        let left: Vec<VertexKey> = (0..left_rows)
+            .map(|y| {
+                let fy = y as f32 * height as f32 / (left_rows - 1) as f32;
+                mesh.create_vertex(Vec3::new(0.0, fy, 0.0))
+            })
+            .collect();
+        let right: Vec<VertexKey> = (0..right_rows)
+            .map(|y| {
+                let fy = y as f32 * height as f32 / (right_rows - 1) as f32;
+                mesh.create_vertex(Vec3::new(2.0, fy, 0.0))
+            })
+            .collect();
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE)
+        };
+        // Single-edge bottom + top sides — the input loops.
+        let side_edges = vec![
+            edge(mesh, left[0], right[0]),
+            edge(mesh, left[left_rows - 1], right[right_rows - 1]),
+        ];
+        // The two rails — discovered, not input.
+        for y in 0..left_rows - 1 {
+            edge(mesh, left[y], left[y + 1]);
+        }
+        for y in 0..right_rows - 1 {
+            edge(mesh, right[y], right[y + 1]);
+        }
+        side_edges
+    }
+
+    /// Partition a fill result into (quad count, triangle count).
+    fn quad_tri_split(mesh: &LoopMesh, result: &super::GridFillResult) -> (usize, usize) {
+        let mut quads = 0;
+        let mut tris = 0;
+        for &face in result.faces() {
+            match mesh.face_len(face) {
+                4 => quads += 1,
+                3 => tris += 1,
+                n => panic!("unexpected face of {n} verts in span-equalised fill"),
+            }
+        }
+        (quads, tris)
+    }
+
+    #[test]
+    fn unequal_sided_ring_fills_to_quad_tri_fan() {
+        // §3.4 worked check: a bottom side of 4 opposing a top side of 3 (single
+        // edge rails) → 2 quads + 1 triangle; the lone scaffold that expanded the
+        // top to 4 collapses back into the top-middle vertex, so the vertex set is
+        // unchanged and the fan apex is shared by all three cells.
+        let mut mesh = LoopMesh::new();
+        let side_edges = unequal_sided_wire_ring(&mut mesh, 4, 3);
+        let v0 = mesh.vertex_count();
+        let e0 = mesh.edge_count();
+        let f0 = mesh.face_count();
+        let perimeter: std::collections::HashSet<VertexKey> = {
+            let mut set = std::collections::HashSet::new();
+            let mut it = mesh.mesh_verts();
+            while let Some(v) = it.next(&mesh) {
+                set.insert(v);
+            }
+            set
+        };
+
+        let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
+
+        assert_eq!(result.faces().len(), 3, "fan of 3 faces");
+        assert_eq!(quad_tri_split(&mesh, &result), (2, 1), "2 quads + 1 triangle");
+        assert_eq!(mesh.vertex_count(), v0, "no scaffold vertex survives (V unchanged)");
+        assert_eq!(mesh.face_count() - f0, 3, "F 0 -> 3");
+        assert_eq!(mesh.edge_count() - e0, 2, "two interior fan edges created (E 7 -> 9)");
+
+        // The perimeter vertex set is exactly the input's — every scaffold collapsed.
+        let mut after = std::collections::HashSet::new();
+        let mut it = mesh.mesh_verts();
+        while let Some(v) = it.next(&mesh) {
+            after.insert(v);
+        }
+        assert_eq!(after, perimeter, "perimeter vertex set unchanged");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn unequal_railed_ring_fills_to_quad_tri_fan() {
+        // §3.4 worked check: single-edge opposing sides with a left rail of 2
+        // opposing a right rail of 3 → 1 quad + 1 triangle. The right rail's
+        // genuine middle vertex is an input perimeter vertex and is retained; the
+        // left-rail scaffold collapses into the lattice origin corner, so the
+        // vertex set is unchanged.
+        let mut mesh = LoopMesh::new();
+        let side_edges = unequal_railed_wire_ring(&mut mesh, 2, 3);
+        let v0 = mesh.vertex_count();
+        let f0 = mesh.face_count();
+
+        let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
+
+        assert_eq!(result.faces().len(), 2, "fan of 2 faces");
+        assert_eq!(quad_tri_split(&mesh, &result), (1, 1), "1 quad + 1 triangle");
+        assert_eq!(mesh.vertex_count(), v0, "no scaffold vertex survives (V unchanged)");
+        assert_eq!(mesh.face_count() - f0, 2, "F 0 -> 2");
+
+        // §3.4 determinate collapse: the scaffold survives into the origin-ward
+        // (bottom, low-y) corner, so the **bottom** cell degenerates to the
+        // triangle — never the top. The fixture's bottom side is at y = 0, the
+        // top side at y = 2; the triangle must therefore carry no top-side
+        // vertex (max y < 2), and the quad must carry both top-side vertices.
+        let max_y = |face: FaceKey| -> f32 {
+            mesh.face_vert_keys(face)
+                .iter()
+                .map(|&v| mesh.vertex_position(v).y)
+                .fold(f32::MIN, f32::max)
+        };
+        let triangle = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 3)
+            .unwrap();
+        let quad = result
+            .faces()
+            .iter()
+            .copied()
+            .find(|&f| mesh.face_len(f) == 4)
+            .unwrap();
+        assert!(
+            max_y(triangle) < 1.5,
+            "triangle degenerates the bottom (origin) cell, not the top",
+        );
+        assert!(
+            max_y(quad) > 1.5,
+            "the quad spans up to the top side",
+        );
+
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn equal_sides_unaffected_by_equalisation_path() {
+        // §3.4 is a no-op for equal members: the regular 3x3 grid still fills to 4
+        // quads with one new interior vertex (guards against the expand-collapse
+        // path regressing the equal-sided case).
+        let mut mesh = LoopMesh::new();
+        let side_edges = rect_wire_ring(&mut mesh, 3, 3, 0.0);
+        let v0 = mesh.vertex_count();
+        let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
+        assert_eq!(quad_tri_split(&mesh, &result), (4, 0), "4 quads, no triangles");
+        assert_eq!(mesh.vertex_count() - v0, 1, "one interior vertex created");
         mesh.validate_topology();
     }
 
