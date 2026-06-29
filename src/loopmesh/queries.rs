@@ -219,6 +219,18 @@ impl LoopMesh {
         self.vertices.get(v).eflags.contains(ElementFlags::HIDDEN)
     }
 
+    /// Read a vertex's persistent header flags (select / hide / tag) as the
+    /// typed [`ElementFlags`] view. A freshly `create_vert`'d vertex carries no
+    /// header flags — the value is [`ElementFlags::empty`] (CREATE_VERT.md
+    /// §2.3); the persistent select bit is a post-execution concern of the
+    /// caller, never set by the bare create path. Only the all-clear
+    /// (`== empty`) case is a layout-independent contract: loopmesh's bit
+    /// layout is not asserted to match any other backend's, so individual set
+    /// bits are not portable comparands.
+    pub fn vert_flags(&self, v: VertexKey) -> ElementFlags {
+        self.vertices.get(v).eflags
+    }
+
     /// Set or clear the edge's persistent HIDDEN header bit.
     pub fn set_edge_hidden(&mut self, e: EdgeKey, hidden: bool) {
         self.edges.get_mut(e).eflags.set(ElementFlags::HIDDEN, hidden);

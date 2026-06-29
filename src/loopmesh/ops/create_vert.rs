@@ -117,6 +117,24 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// §2.3 / §5.1: at the BMOP boundary a freshly-created vertex carries no
+    /// persistent header flags — the flags are empty. The bare create path never
+    /// sets select; that is the caller's (editor wrapper's) post-execution
+    /// concern.
+    #[test]
+    fn new_vertex_has_clear_header_flags() {
+        let mut mesh = LoopMesh::new();
+
+        let v = mesh.create_vert(Vec3::new(1.0, 2.0, 3.0));
+
+        assert_eq!(
+            mesh.vert_flags(v),
+            ElementFlags::empty(),
+            "new vertex must carry no persistent header flags"
+        );
+        mesh.validate_topology();
+    }
+
     /// §2.2 / §5.1: with a per-vertex float CD layer registered, the new vertex
     /// reads the layer **default** (zero fill), never a copied or interpolated
     /// value — the operator takes no example vertex.
