@@ -1399,11 +1399,21 @@ impl LoopMesh {
         result: &mut BevelResult,
     ) {
         let count = cut.boundverts.len();
-        // §8.5: the forced tri-corner case is exactly three sectors at one segment
-        // of fill (`segments = 2`). Higher valence / larger segments are the §8.5.5
-        // general-grid stub.
-        if count != 3 || segments != 2 {
+        // §8.5 forces the tri-corner only for `s = 3`; higher valence is the
+        // §8.5.5.5 stub.
+        if count != 3 {
             return;
+        }
+        // The forced `segments = 2` pinwheel (§8.5.1–§8.5.4) keeps its dedicated
+        // closed-form path below; `segments ≥ 3` takes the general subdivided
+        // grid (§8.5.5). `segments < 2` has no interior to fill.
+        match segments {
+            0 | 1 => return,
+            2 => {}
+            _ => {
+                self.build_adj_fill_general(cut, chains, segments, material, result);
+                return;
+            }
         }
 
         // Sector i's interior chain vert (i,0,1): the lone interior sample of the
@@ -1495,6 +1505,302 @@ impl LoopMesh {
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
+    }
+
+    /// Build the rounded adjacency-grid fill for the symmetric equal-offset 3-way
+    /// cube corner at `segments ≥ 3` (BEVEL.md §8.5.5). The `segments = 2` pinwheel
+    /// (§8.5.1–§8.5.4) is the coarse control net; this tiles the larger grid as
+    /// `s = 3` quad **sub-patches** — one per boundvert `B_i`, spanning from `B_i`
+    /// inward to the corner centre — each interior grid vert snapped onto the corner
+    /// superellipsoid (the sphere, for the default circular profile, §8.5.5.3).
+    ///
+    /// The centre resolves by parity (§8.5.5.4): even `segments` welds the three
+    /// sub-patches at one apex vertex `c + R·normalize(v − c)`; odd `segments` leaves
+    /// the sub-patches separated by a ring of seam quads closed by a central
+    /// `s`-gon face, with no apex vertex on the body diagonal.
+    ///
+    /// The boundary (the three profile chains and the boundvert ring) is *reused*
+    /// from [P]/[S], not re-minted, so the patch shares its rim with the arriving
+    /// strips. Interior positions are an admissible implementation choice (Tier-2,
+    /// `bevel_vmesh.md`); only their superellipsoid membership and the grid
+    /// counts / parity are pinned.
+    ///
+    /// Scope (§8.5.5.5): the symmetric equal-offset cube corner, default circular
+    /// profile only. Higher valence, unequal offsets, and the pipe / square grids
+    /// are left unfilled.
+    fn build_adj_fill_general(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        material: i32,
+        result: &mut BevelResult,
+    ) {
+        let sectors = cut.boundverts.len(); // 3 (guarded by the caller)
+        let seg = segments as usize;
+        let half = seg / 2;
+
+        // Each sector's profile chain, oriented from its opening boundvert `B_i`
+        // (`seg + 1` samples; the two ends are the ring boundverts).
+        let mut chain_of: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            match self.oriented_chain(cut, chains, i) {
+                Some(chain) if chain.len() == seg + 1 => chain_of.push(chain),
+                // A sector that did not sample to `seg + 1` verts (a collinear /
+                // degenerate chain) is outside the forced cube-corner regime; skip
+                // the whole fill rather than emit a torn patch.
+                _ => return,
+            }
+        }
+
+        // The corner sphere the whole patch lies on (§8.5.5.3): fit it from the
+        // three ring boundverts and one on-arc chain sample, all at distance `R`
+        // from the centre `c`. For the default circular profile the superellipsoid
+        // is exactly this sphere, so every grid vert snaps onto it by the radial
+        // projection `c + R·normalize(p − c)`.
+        let on_surface = [
+            self.vertex_position(cut.boundverts[0]),
+            self.vertex_position(cut.boundverts[1]),
+            self.vertex_position(cut.boundverts[2]),
+            self.vertex_position(chain_of[0][1]),
+        ];
+        let (center, radius) = match circumsphere(on_surface) {
+            Some(sphere) => sphere,
+            None => return,
+        };
+
+        let vertex_position = self.vertex_position(cut.vertex);
+        let even = seg % 2 == 0;
+
+        // Per sub-patch, its four corner positions: `B_i`, the chain-`i` inner end
+        // (`P0t`), the chain-`(i−1)` inner end (`Pt0`), and the inner corner (`Ptt`)
+        // — the welded apex for even `segments`, a distinct central-ring vert `G_i`
+        // for odd. Interior grid verts are the bilinear blend of these four, snapped
+        // to the sphere (§8.5.5.3).
+        let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            let p00 = self.vertex_position(chain_of[i][0]);
+            let p0t = self.vertex_position(chain_of[i][half]);
+            let prev = (i + sectors - 1) % sectors;
+            let pt0 = self.vertex_position(chain_of[prev][seg - half]);
+            let ptt = if even {
+                center + radius * (vertex_position - center).normalize_or_zero()
+            } else {
+                // Odd centre ring: tilt the body-diagonal direction toward `B_i` so
+                // the three `G_i` form a small central `s`-gon around the diagonal,
+                // each on the sphere. The exact tilt is a free interior choice.
+                let diagonal = (vertex_position - center).normalize_or_zero();
+                let toward_boundvert = (p00 - center).normalize_or_zero();
+                let gamma = 1.0 / (half as f32 + 1.0);
+                center + radius * (diagonal + gamma * toward_boundvert).normalize_or_zero()
+            };
+            corners.push([p00, p0t, pt0, ptt]);
+        }
+
+        let representative = cut.representative_material(self);
+        let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
+            std::collections::HashMap::new();
+
+        // Sub-patch interior cells (`half × half` quads each), shared between
+        // sectors at the seams (even) or independent (odd, the seam strips bridge
+        // them). Walk every cell of every sub-patch.
+        for i in 0..sectors {
+            for cell_j in 0..half {
+                for cell_k in 0..half {
+                    let a = self.adj_grid_vert(
+                        i, cell_j, cell_k, half, seg, sectors, even, &chain_of, &corners,
+                        center, radius, &mut grid, result,
+                    );
+                    let b = self.adj_grid_vert(
+                        i, cell_j, cell_k + 1, half, seg, sectors, even, &chain_of, &corners,
+                        center, radius, &mut grid, result,
+                    );
+                    let c = self.adj_grid_vert(
+                        i, cell_j + 1, cell_k + 1, half, seg, sectors, even, &chain_of, &corners,
+                        center, radius, &mut grid, result,
+                    );
+                    let d = self.adj_grid_vert(
+                        i, cell_j + 1, cell_k, half, seg, sectors, even, &chain_of, &corners,
+                        center, radius, &mut grid, result,
+                    );
+                    self.emit_patch_face(&[a, b, c, d], center, material, representative, result);
+                }
+            }
+        }
+
+        if even {
+            // The even centre is already welded: every sub-patch's innermost cell
+            // meets the shared apex vertex, so no further faces are needed.
+            return;
+        }
+
+        // Odd centre (§8.5.5.4): bridge each pair of adjacent sub-patches with a
+        // strip of `half` quads — sub-patch `i`'s inner column (`k = half`) against
+        // sub-patch `(i+1)`'s inner row (`j = half`) — covering the chains' central
+        // segments, then close the `G_i` ring with one central `s`-gon face.
+        for i in 0..sectors {
+            let next = (i + 1) % sectors;
+            let mut column: Vec<VertexKey> = Vec::with_capacity(half + 1);
+            let mut row: Vec<VertexKey> = Vec::with_capacity(half + 1);
+            for r in 0..=half {
+                column.push(self.adj_grid_vert(
+                    i, r, half, half, seg, sectors, even, &chain_of, &corners, center, radius,
+                    &mut grid, result,
+                ));
+                row.push(self.adj_grid_vert(
+                    next, half, r, half, seg, sectors, even, &chain_of, &corners, center, radius,
+                    &mut grid, result,
+                ));
+            }
+            for r in 0..half {
+                self.emit_patch_face(
+                    &[column[r], row[r], row[r + 1], column[r + 1]],
+                    center,
+                    material,
+                    representative,
+                    result,
+                );
+            }
+        }
+
+        let mut central: Vec<VertexKey> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            central.push(self.adj_grid_vert(
+                i, half, half, half, seg, sectors, even, &chain_of, &corners, center, radius,
+                &mut grid, result,
+            ));
+        }
+        self.emit_patch_face(&central, center, material, representative, result);
+    }
+
+    /// Resolve the adjacency-grid vert at sub-patch index `(i, j, k)` (BEVEL.md
+    /// §8.5.5). Boundary rows (`j == 0` / `k == 0`) reuse the existing chain /
+    /// boundvert keys so the patch shares its rim with the strips; interior verts
+    /// are created once at the bilinear blend of the sub-patch corners, snapped to
+    /// the corner sphere, and cached. For even `segments` the inner column (`k ==
+    /// half`), inner row (`j == half`), and centre alias onto the neighbouring
+    /// sub-patch (the welded seams / apex); odd `segments` keeps each sub-patch
+    /// independent.
+    #[allow(clippy::too_many_arguments)]
+    fn adj_grid_vert(
+        &mut self,
+        i: usize,
+        j: usize,
+        k: usize,
+        half: usize,
+        seg: usize,
+        sectors: usize,
+        even: bool,
+        chain_of: &[Vec<VertexKey>],
+        corners: &[[Vec3; 4]],
+        center: Vec3,
+        radius: f32,
+        grid: &mut std::collections::HashMap<(usize, usize, usize), VertexKey>,
+        result: &mut BevelResult,
+    ) -> VertexKey {
+        // `j = 0` is the chain `i` boundary (from `B_i`); `k = 0` is the chain
+        // `(i−1)` boundary (toward `B_i`, hence reversed). Their shared corner
+        // `(0, 0)` is `B_i` from either chain.
+        if j == 0 {
+            return chain_of[i][k];
+        }
+        if k == 0 {
+            return chain_of[(i + sectors - 1) % sectors][seg - j];
+        }
+
+        // Interior. Even `segments` welds the seams / apex by aliasing the inner
+        // column / row / corner onto one canonical sub-patch; odd keeps `(i, j, k)`.
+        let canon = if even {
+            if j == half && k == half {
+                (0, half, half) // the single welded apex
+            } else if k == half {
+                (i, j, half) // inner column = seam, owned by sub-patch i
+            } else if j == half {
+                ((i + sectors - 1) % sectors, k, half) // inner row aliases prev sub-patch's seam
+            } else {
+                (i, j, k)
+            }
+        } else {
+            (i, j, k)
+        };
+        if let Some(&existing) = grid.get(&canon) {
+            return existing;
+        }
+
+        let [p00, p0t, pt0, ptt] = corners[canon.0];
+        let s = canon.2 as f32 / half as f32;
+        let u = canon.1 as f32 / half as f32;
+        let blended = p00 * ((1.0 - s) * (1.0 - u))
+            + p0t * (s * (1.0 - u))
+            + pt0 * ((1.0 - s) * u)
+            + ptt * (s * u);
+        let position = center + radius * (blended - center).normalize_or_zero();
+        let vertex = self.create_vertex(position);
+        result.verts.push(vertex);
+        grid.insert(canon, vertex);
+        vertex
+    }
+
+    /// Emit one adjacency-grid patch face (BEVEL.md §8.5.5), wound outward so it is
+    /// radial-2 against the arriving strips and its neighbours: the face normal is
+    /// flipped to agree with the outward sphere normal `centroid − c`. Consecutive
+    /// duplicate corners (none expected, a guard) are dropped.
+    fn emit_patch_face(
+        &mut self,
+        verts: &[VertexKey],
+        center: Vec3,
+        material: i32,
+        representative: i32,
+        result: &mut BevelResult,
+    ) {
+        let mut ring: Vec<VertexKey> = Vec::with_capacity(verts.len());
+        for &vertex in verts {
+            if ring.last() != Some(&vertex) {
+                ring.push(vertex);
+            }
+        }
+        if ring.len() >= 2 && ring.first() == ring.last() {
+            ring.pop();
+        }
+        if ring.len() < 3 {
+            return;
+        }
+
+        let positions: Vec<Vec3> = ring.iter().map(|&v| self.vertex_position(v)).collect();
+        let centroid = positions.iter().sum::<Vec3>() / positions.len() as f32;
+        let mut normal = Vec3::ZERO;
+        for index in 0..positions.len() {
+            let edge_a = positions[index] - centroid;
+            let edge_b = positions[(index + 1) % positions.len()] - centroid;
+            normal += edge_a.cross(edge_b);
+        }
+        if normal.dot(centroid - center) < 0.0 {
+            ring.reverse();
+        }
+
+        let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+        self.assign_bevel_face_material(face, material, representative);
+        result.faces.push(face);
+        self.collect_face_edges(face, result);
+    }
+
+    /// The profile chain of sector `i` at this junction, oriented from its opening
+    /// boundvert `B_i` (BEVEL.md §8.2.2). `None` when no chain spans the sector's
+    /// boundvert pair.
+    fn oriented_chain(
+        &self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        i: usize,
+    ) -> Option<Vec<VertexKey>> {
+        let count = cut.boundverts.len();
+        let start = cut.boundverts[i];
+        let end = cut.boundverts[(i + 1) % count];
+        let chain = chains.iter().find(|c| {
+            c.endpoint == cut.vertex
+                && ((c.start == start && c.end == end) || (c.start == end && c.end == start))
+        })?;
+        Some(chain.oriented_from(start))
     }
 
     /// One boundvert's down-pushed corner-vert position (BEVEL.md §8.3.3): `B_k`
@@ -5322,10 +5628,202 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.5.5: ADJ outside the forced `segments = 2` 3-way cube-corner is
-    /// still a stub. A two-edge (`s = 2`) junction takes no pinwheel fill (the
-    /// through-strips still build, exactly as cutoff), and there is no central apex.
-    /// Multi-segment vertex bevel also remains a no-op.
+    /// Bevel the same symmetric equal-offset cube corner with `segments` segments,
+    /// default circular profile, `vmesh_method = ADJ` (BEVEL.md §8.5.5).
+    fn cube_corner_adj(segments: u32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// The corner sphere (centre `c`, radius `R = offset`) the cube-corner patch
+    /// lies on (§8.5.5.3), and a "within a few `offset` of `c`" membership test that
+    /// isolates the corner-grid verts/faces from the per-edge strips (§8.5.5.6).
+    fn adj_sphere_center() -> Vec3 {
+        Vec3::new(0.75, -0.75, -0.75)
+    }
+    const ADJ_SPHERE_RADIUS: f32 = 0.25;
+
+    fn adj_in_corner_ball(mesh: &LoopMesh, vertex: VertexKey) -> bool {
+        (mesh.vertex_position(vertex) - adj_sphere_center()).length() <= ADJ_SPHERE_RADIUS * 1.2
+    }
+
+    fn adj_patch_faces(mesh: &LoopMesh, result: &BevelResult) -> Vec<FaceKey> {
+        result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&f| mesh.face_vert_keys(f).iter().all(|&v| adj_in_corner_ball(mesh, v)))
+            .collect()
+    }
+
+    fn adj_apex_position() -> Vec3 {
+        adj_sphere_center() + ADJ_SPHERE_RADIUS * Vec3::new(1.0, -1.0, -1.0) / 3.0_f32.sqrt()
+    }
+
+    fn adj_assert_invariants(mesh: &LoopMesh, result: &BevelResult) {
+        mesh.validate_topology();
+
+        // Invariant 1 (§8.5.5.6): the three [P] boundverts, segment-count-independent
+        // (offset·√2 from the corner).
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let ring_radius = ADJ_SPHERE_RADIUS * 2.0_f32.sqrt();
+        let ring = result
+            .verts
+            .iter()
+            .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - ring_radius).abs() < 1.0e-4)
+            .count();
+        assert_eq!(ring, 3, "three §7.6.2 boundverts (invariant 1)");
+
+        // Invariant 2 (§8.5.5.6): every corner-region grid vert lies on the corner
+        // sphere; the strip verts sit several offset away and are excluded.
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            if (p - adj_sphere_center()).length() <= ADJ_SPHERE_RADIUS * 1.2 {
+                assert!(
+                    ((p - adj_sphere_center()).length() - ADJ_SPHERE_RADIUS).abs() < 1.0e-4,
+                    "corner-grid vert lies on the superellipsoid (invariant 2)",
+                );
+            }
+        }
+
+        // Closed manifold: every face edge is shared with exactly one other face.
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                assert_eq!(
+                    mesh.edge_radial_iter(mesh.loop_edge(loop_key)).count(),
+                    2,
+                    "every edge is radial-2",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.5.5.4 (even parity): `segments = 4` at the cube corner welds the
+    /// three sub-patches to one apex vertex on the body diagonal, with no central
+    /// face — the corner grid is 3·(segments/2)² = 12 quads.
+    #[test]
+    fn adj_cube_corner_segments_4_welded_apex() {
+        let (mesh, result) = cube_corner_adj(4);
+        adj_assert_invariants(&mesh, &result);
+
+        // Invariant 4 (§8.5.5.4): the single welded apex on the body diagonal.
+        let apex: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - adj_apex_position()).length() < 1.0e-4)
+            .collect();
+        assert_eq!(apex.len(), 1, "even segments weld to one apex vertex");
+        let apex = apex[0];
+        let apex_faces: Vec<FaceKey> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&f| mesh.face_vert_keys(f).contains(&apex))
+            .collect();
+        assert_eq!(
+            apex_faces.len(),
+            3,
+            "the three innermost cells meet the apex directly (no central face)",
+        );
+
+        // Invariant 3 (§8.5.5.6): 12 all-quad sub-patch faces.
+        let patch_faces = adj_patch_faces(&mesh, &result);
+        assert_eq!(patch_faces.len(), 12, "3·(segments/2)² = 12 sub-patch quads");
+        for &f in &patch_faces {
+            assert_eq!(
+                mesh.face_vert_keys(f).len(),
+                4,
+                "every corner-grid face is a quad at even parity",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.4 (odd parity): `segments = 3` at the cube corner places no
+    /// vertex on the body diagonal; the three sub-patches are bridged by seam quads
+    /// and closed by exactly one central `s`-gon (s = 3) triangle — 6 quads + 1
+    /// triangle.
+    #[test]
+    fn adj_cube_corner_segments_3_central_ngon() {
+        let (mesh, result) = cube_corner_adj(3);
+        adj_assert_invariants(&mesh, &result);
+
+        // Invariant 4 (§8.5.5.4): no apex vertex on the body diagonal.
+        assert_eq!(
+            result
+                .verts
+                .iter()
+                .filter(|&&v| (mesh.vertex_position(v) - adj_apex_position()).length() < 1.0e-4)
+                .count(),
+            0,
+            "odd segments place no vertex on the body diagonal",
+        );
+
+        // Invariant 3/4: quad-dominant with exactly one central triangle.
+        let patch_faces = adj_patch_faces(&mesh, &result);
+        let triangles = patch_faces
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 3)
+            .count();
+        let quads = patch_faces
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
+            .count();
+        assert_eq!(triangles, 1, "exactly one central s-gon (triangle) at odd parity");
+        assert_eq!(quads, 6, "3 corner sub-patch quads + 3 seam quads");
+        assert_eq!(patch_faces.len(), 7);
+    }
+
+    /// BEVEL.md §8.5.5.4: the load-bearing parity contrast — an even target closes
+    /// the corner on a welded apex vertex and no central face, an odd target on a
+    /// central `s`-gon face and no apex vertex.
+    #[test]
+    fn adj_cube_corner_odd_even_central_parity_differs() {
+        let (odd_mesh, odd) = cube_corner_adj(3);
+        let (even_mesh, even) = cube_corner_adj(4);
+        let apex_pos = adj_apex_position();
+
+        let apex_count = |mesh: &LoopMesh, result: &BevelResult| {
+            result
+                .verts
+                .iter()
+                .filter(|&&v| (mesh.vertex_position(v) - apex_pos).length() < 1.0e-4)
+                .count()
+        };
+        assert_eq!(apex_count(&even_mesh, &even), 1, "even → welded apex vertex");
+        assert_eq!(apex_count(&odd_mesh, &odd), 0, "odd → no apex vertex");
+
+        let central_triangles = |mesh: &LoopMesh, result: &BevelResult| {
+            adj_patch_faces(mesh, result)
+                .into_iter()
+                .filter(|&f| mesh.face_vert_keys(f).len() == 3)
+                .count()
+        };
+        assert_eq!(central_triangles(&odd_mesh, &odd), 1, "odd → one central triangle");
+        assert_eq!(central_triangles(&even_mesh, &even), 0, "even → no central face");
+    }
+
+    /// BEVEL.md §8.5.5.5: ADJ outside the symmetric cube corner stays a stub. A
+    /// two-edge (`s = 2`) junction takes no pinwheel fill (the through-strips still
+    /// build, exactly as cutoff), and there is no central apex. Multi-segment vertex
+    /// bevel also remains a no-op.
     #[test]
     fn adj_non_forced_and_vertex_are_stubbed() {
         let mut mesh = LoopMesh::new();
