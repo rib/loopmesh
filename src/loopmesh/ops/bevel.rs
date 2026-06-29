@@ -907,7 +907,14 @@ impl LoopMesh {
                     );
                 }
                 BevelVmeshMethod::Adj => {
-                    self.build_adj_fill(cut, &chains, segments, material, result);
+                    self.build_adj_fill(
+                        cut,
+                        &chains,
+                        segments,
+                        options.profile,
+                        material,
+                        result,
+                    );
                 }
             }
         }
@@ -1375,6 +1382,62 @@ impl LoopMesh {
         }
     }
 
+    /// The §8.5.1 forced-tri-corner trigger: whether this 3-way junction is the
+    /// symmetric equal-offset orthonormal cube corner at the default circular
+    /// profile that the ADJ tri-corner fill (§8.5.1–§8.5.5) is distilled for.
+    ///
+    /// The two geometric conditions (§8.5.5.3) are read off the boundvert ring,
+    /// which is pairing-robust at a triangle (every pair of boundverts shares one
+    /// beveled edge). Writing each ring vert as the §7.6.2 meet-point
+    /// `B_i = v + offset·(d_a + d_b)` over the two orthonormal inward edge
+    /// directions it bridges:
+    /// - **equal offset** ⇒ the three `w_i = B_i − v` have equal length
+    ///   (`|w_i| = offset·√2`); an unequal-offset corner breaks this;
+    /// - **right-angle convex octant** ⇒ every pair `w_i, w_j` meets at 60°
+    ///   (`cos = ½`, the signature of mutually perpendicular `d_*`); a non-octant
+    ///   corner moves the cosine off ½.
+    ///
+    /// The default-profile condition is the circular superellipse (`r = 2`); a
+    /// curved / square / custom profile snaps onto a superellipsoid the closed-form
+    /// sphere fit does not solve (§8.5.5.5), so it declines here.
+    fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32) -> bool {
+        if cut.boundverts.len() != 3 {
+            return false;
+        }
+        if profile_to_exponent(profile) != 2.0 {
+            return false;
+        }
+        let vertex = self.vertex_position(cut.vertex);
+        let spokes = [
+            self.vertex_position(cut.boundverts[0]) - vertex,
+            self.vertex_position(cut.boundverts[1]) - vertex,
+            self.vertex_position(cut.boundverts[2]) - vertex,
+        ];
+        let lengths = [spokes[0].length(), spokes[1].length(), spokes[2].length()];
+        let longest = lengths.iter().copied().fold(0.0_f32, f32::max);
+        if longest <= 1.0e-6 {
+            return false;
+        }
+        // Equal offset within tolerance: the three meet-point spokes are equal length.
+        let length_tol = longest * 1.0e-3;
+        if (lengths[0] - lengths[1]).abs() > length_tol
+            || (lengths[1] - lengths[2]).abs() > length_tol
+            || (lengths[2] - lengths[0]).abs() > length_tol
+        {
+            return false;
+        }
+        // Right-angle convex octant: each spoke pair meets at 60° (cos = ½).
+        let directions = [
+            spokes[0] / lengths[0],
+            spokes[1] / lengths[1],
+            spokes[2] / lengths[2],
+        ];
+        let cos_tol = 1.0e-3;
+        (directions[0].dot(directions[1]) - 0.5).abs() <= cos_tol
+            && (directions[1].dot(directions[2]) - 0.5).abs() <= cos_tol
+            && (directions[2].dot(directions[0]) - 0.5).abs() <= cos_tol
+    }
+
     /// Build the rounded adjacency-grid fill at one junction (BEVEL.md §8.5),
     /// distilled for the forced `segments = 2` 3-way (cube-corner) case: a
     /// three-quad pinwheel meeting at one welded central apex.
@@ -1395,6 +1458,7 @@ impl LoopMesh {
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: u32,
+        profile: f32,
         material: i32,
         result: &mut BevelResult,
     ) {
@@ -1402,6 +1466,17 @@ impl LoopMesh {
         // §8.5 forces the tri-corner only for `s = 3`; higher valence is the
         // §8.5.5.5 stub.
         if count != 3 {
+            return;
+        }
+        // §8.5.1 forced-tri-corner trigger. The whole ADJ tri-corner construction
+        // (both the closed-form `segments = 2` pinwheel and the larger-`segments`
+        // grid) is distilled *only* for the symmetric equal-offset orthonormal cube
+        // corner at the default circular profile. Outside that the unit-frame map is
+        // no longer a similarity and the snap target is a genuine ellipsoid the guide
+        // defers (§8.5.5.5); the closed-form sphere snap below would otherwise pin the
+        // fill onto the wrong surface. When the trigger does not hold we decline (the
+        // same no-op as the `count != 3` case) rather than emit unpinned geometry.
+        if !self.adj_tri_corner_trigger(cut, profile) {
             return;
         }
         // The forced `segments = 2` pinwheel (§8.5.1–§8.5.4) keeps its dedicated
@@ -5818,6 +5893,147 @@ mod tests {
         };
         assert_eq!(central_triangles(&odd_mesh, &odd), 1, "odd → one central triangle");
         assert_eq!(central_triangles(&even_mesh, &even), 0, "even → no central face");
+    }
+
+    /// BEVEL.md §8.5.1: the forced-tri-corner trigger predicate read off the
+    /// boundvert ring. The symmetric equal-offset orthonormal cube corner at the
+    /// default circular profile fires it; an unequal-offset corner, a non-right-angle
+    /// corner, or a non-default profile all decline (the §8.5.5.5 deferred cases).
+    #[test]
+    fn adj_tri_corner_trigger_predicate() {
+        let mut mesh = LoopMesh::new();
+        let junction = mesh.create_vertex(Vec3::ZERO);
+        let make_cut = |mesh: &mut LoopMesh, spokes: [Vec3; 3]| JunctionCut {
+            vertex: junction,
+            boundverts: spokes.iter().map(|&s| mesh.create_vertex(s)).collect(),
+            opening_edges: Vec::new(),
+            outward: Vec3::ZERO,
+        };
+
+        // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
+        // three axis directions — equal length (√2) and pairwise 60° (cos ½).
+        let cube = make_cut(
+            &mut mesh,
+            [
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+            ],
+        );
+        assert!(
+            mesh.adj_tri_corner_trigger(&cube, 0.5),
+            "default-profile cube corner fires the §8.5.1 trigger",
+        );
+        assert!(
+            !mesh.adj_tri_corner_trigger(&cube, 0.7),
+            "a curved profile declines (§8.5.5.5)",
+        );
+
+        // Unequal offset: one spoke is twice as long, so the lengths differ.
+        let unequal = make_cut(
+            &mut mesh,
+            [
+                Vec3::new(2.0, 2.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+            ],
+        );
+        assert!(
+            !mesh.adj_tri_corner_trigger(&unequal, 0.5),
+            "unequal offsets decline the §8.5.1 trigger",
+        );
+
+        // Non-right-angle corner: equal-length spokes 120° apart (cos −½, not ½).
+        let flat = make_cut(
+            &mut mesh,
+            [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(-0.5, 0.866_025_4, 0.0),
+                Vec3::new(-0.5, -0.866_025_4, 0.0),
+            ],
+        );
+        assert!(
+            !mesh.adj_tri_corner_trigger(&flat, 0.5),
+            "non-right-angle corner declines the §8.5.1 trigger",
+        );
+    }
+
+    /// BEVEL.md §8.5.1 / §8.5.5.5: a non-default (curved) profile at the symmetric
+    /// cube corner fails the trigger's default-profile condition, so the
+    /// `segments ≥ 3` general fill (`build_adj_fill_general`) is declined rather than
+    /// snapping the interior onto a sphere it does not lie on. The through-strips
+    /// still build; the corner is simply left unfilled.
+    #[test]
+    fn adj_tri_corner_guard_declines_curved_profile_segments3() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                profile: 0.7,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert_eq!(
+            adj_patch_faces(&mesh, &result).len(),
+            0,
+            "curved-profile cube corner declines the §8.5.5 general fill",
+        );
+        assert_eq!(
+            result
+                .verts
+                .iter()
+                .filter(|&&v| (mesh.vertex_position(v) - adj_apex_position()).length() < 1.0e-4)
+                .count(),
+            0,
+            "no central body-diagonal vertex emitted when the trigger declines",
+        );
+    }
+
+    /// BEVEL.md §8.5.1 / §8.5.5.5: the same default-profile guard covers the
+    /// closed-form `segments = 2` pinwheel path. A curved profile declines the
+    /// pinwheel, leaving only the 6 through-strip quads (vs the 9 = 6 strip + 3
+    /// pinwheel of the supported default-profile cube corner).
+    #[test]
+    fn adj_tri_corner_guard_declines_curved_profile_segments2() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                profile: 0.7,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert_eq!(
+            result.faces.len(),
+            6,
+            "curved-profile seg=2 corner declines the pinwheel: 6 strip quads only",
+        );
     }
 
     /// BEVEL.md §8.5.5.5: ADJ outside the symmetric cube corner stays a stub. A
