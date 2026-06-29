@@ -36,6 +36,10 @@ bitflags! {
         /// Element has been marked as "hidden" - e.g. to simplify view while editing
         const HIDDEN    = 1<<1;
 
+        /// Face is smooth-shaded (per-face shading attribute). A face carrying
+        /// this bit is rendered smooth; cleared, it is flat.
+        const SMOOTH    = 1<<5;
+
         const TAG0      = 1<<2;
         const TAG1      = 1<<3;
         const TAG2      = 1<<4;

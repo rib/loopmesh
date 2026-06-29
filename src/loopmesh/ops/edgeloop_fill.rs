@@ -170,8 +170,10 @@ impl LoopMesh {
         if params.mat_nr != 0 {
             self.set_face_material_index(face, params.mat_nr);
         }
-        // `use_smooth` has no per-face representation in loopmesh yet; the
-        // matrix tracks it as a separate row.
+        // §5 — stamp the per-face smooth flag when requested; flat otherwise.
+        if params.use_smooth {
+            self.set_face_smooth(face, true);
+        }
 
         result.faces.push(face);
     }
@@ -341,6 +343,39 @@ mod tests {
 
         assert!(result.is_empty(), "branched net fills nothing");
         assert_eq!(mesh.face_count(), 0, "no face created");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_smooth_stamps_smooth_flag_on_cap() {
+        let mut mesh = LoopMesh::new();
+        let edges = convex_wire_ring(&mut mesh, 6, 1.0, Vec3::ZERO);
+        let params = EdgeloopFillParams { use_smooth: true, ..Default::default() };
+        let result = mesh.edgeloop_fill(&edges, &params);
+
+        assert_eq!(result.faces().len(), 1, "one n-gon capped");
+        let face = result.faces()[0];
+        assert!(mesh.is_face_smooth(face), "use_smooth flags the cap smooth");
+        assert!(
+            mesh.face_flags(face).contains(ElementFlags::SMOOTH),
+            "face_flags reports the SMOOTH bit",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn default_use_smooth_leaves_cap_flat() {
+        let mut mesh = LoopMesh::new();
+        let edges = convex_wire_ring(&mut mesh, 6, 1.0, Vec3::ZERO);
+        let result = mesh.edgeloop_fill(&edges, &EdgeloopFillParams::default());
+
+        assert_eq!(result.faces().len(), 1, "one n-gon capped");
+        let face = result.faces()[0];
+        assert!(!mesh.is_face_smooth(face), "default cap is flat");
+        assert!(
+            !mesh.face_flags(face).contains(ElementFlags::SMOOTH),
+            "face_flags reports no SMOOTH bit by default",
+        );
         mesh.validate_topology();
     }
 

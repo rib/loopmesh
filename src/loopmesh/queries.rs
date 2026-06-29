@@ -249,6 +249,28 @@ impl LoopMesh {
         self.faces.get(f).eflags.contains(ElementFlags::HIDDEN)
     }
 
+    /// Set or clear the face's persistent SMOOTH header bit. A face carrying the
+    /// bit is smooth-shaded; cleared, it is flat (EDGELOOP_FILL.md §1/§5).
+    pub fn set_face_smooth(&mut self, f: FaceKey, smooth: bool) {
+        self.faces.get_mut(f).eflags.set(ElementFlags::SMOOTH, smooth);
+    }
+
+    pub fn is_face_smooth(&self, f: FaceKey) -> bool {
+        self.faces.get(f).eflags.contains(ElementFlags::SMOOTH)
+    }
+
+    /// Read a face's persistent header flags (select / hide / smooth / tag) as
+    /// the typed [`ElementFlags`] view, mirroring [`LoopMesh::vert_flags`]. A
+    /// freshly created face carries no header flags — the value is
+    /// [`ElementFlags::empty`]. Only the all-clear (`== empty`) case is a
+    /// layout-independent contract: loopmesh's bit layout is not asserted to
+    /// match any other backend's, so individual set bits are not portable
+    /// comparands — read them through the typed predicates
+    /// ([`LoopMesh::is_face_smooth`], …) instead.
+    pub fn face_flags(&self, f: FaceKey) -> ElementFlags {
+        self.faces.get(f).eflags
+    }
+
     pub fn edge_vertices(&self, e: EdgeKey) -> [VertexKey; 2] {
         self.edges.get(e).vertices
     }
