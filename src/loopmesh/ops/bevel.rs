@@ -1778,13 +1778,21 @@ impl LoopMesh {
         let mut arc_start: Vec<VertexKey> = Vec::with_capacity(count);
         let mut arc_mid: Vec<VertexKey> = Vec::with_capacity(count);
         let mut arc_end: Vec<VertexKey> = Vec::with_capacity(count);
+        let sqrt2 = std::f32::consts::SQRT_2;
         for plan in &plans {
             // §8.9.3 / §8.9.4: B1 and B3 are pushed `spread` out along their own
-            // beveled edge from the stored arc midpoint; the midpoint stays at the
-            // meet-point so the arc still bulges through the original corner.
-            let b1 = self.create_vertex(plan.midpoint + plan.dir_open * spread);
-            let b3 = self.create_vertex(plan.midpoint + plan.dir_close * spread);
-            let mid = self.create_vertex(plan.midpoint);
+            // beveled edge from the stored meet-point.
+            let b1_position = plan.midpoint + plan.dir_open * spread;
+            let b3_position = plan.midpoint + plan.dir_close * spread;
+            // §8.9.5: the stored meet-point is the outer corner of the square that
+            // circumscribes the arc, not a point on the arc. The single `segments = 2`
+            // interior sample is the inscribed circle's 45° point — pulled in a
+            // fraction `√2 − 1` of the way from the chord midpoint toward that corner.
+            let chord_mid = 0.5 * (b1_position + b3_position);
+            let bulge_mid = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * plan.midpoint;
+            let b1 = self.create_vertex(b1_position);
+            let b3 = self.create_vertex(b3_position);
+            let mid = self.create_vertex(bulge_mid);
             result.verts.push(b1);
             result.verts.push(b3);
             result.verts.push(mid);
@@ -1852,8 +1860,8 @@ impl LoopMesh {
     /// boundverts become extra columns of the same adjacency grid).
     ///
     /// The apex stays on the corner dome the no-miter case uses (§8.5.2): the sphere
-    /// through the three stored arc midpoints (the unmoved meet-points) and a cross
-    /// sample, snapped along the body diagonal toward the junction.
+    /// through the three arc bulge midpoints (the §8.9.5 inscribed-arc samples) and a
+    /// cross sample, snapped along the body diagonal toward the junction.
     fn build_adj_fill_inner_miter(
         &mut self,
         mj: &MiterJunction,
@@ -6322,7 +6330,7 @@ mod tests {
     /// places the spread-pushed arc-start boundverts the sharp fill never mints.
     #[test]
     fn inner_miter_arc_reshapes_cube_corner() {
-        let spread = 0.1;
+        let spread = 0.3;
         let (mesh, result) = cube_corner_adj_segments2_inner_miter(BevelMiter::Arc, spread);
         let (sharp_mesh, _sharp) = cube_corner_adj_segments2();
 
@@ -6368,7 +6376,7 @@ mod tests {
         // the beveled edges from each stored meet-point. The bottom-face (z = -1)
         // sector's §7.6.2 meet sits at offset·√2 from the corner along that face's
         // diagonal — (0.75, -0.75, -1); its arc start pushed `spread` along the -x
-        // beveled edge lands at (0.65, -0.75, -1), a vertex the sharp fill never mints
+        // beveled edge lands at (0.45, -0.75, -1), a vertex the sharp fill never mints
         // (it keeps the single boundvert at the meet-point itself).
         let bottom_meet = Vec3::new(0.75, -0.75, -1.0);
         let arc_end_x = bottom_meet + spread * Vec3::new(-1.0, 0.0, 0.0);
@@ -6384,11 +6392,34 @@ mod tests {
                 .any(|v| (sharp_mesh.vertex_position(v) - arc_end_x).length() < 1.0e-4),
             "the sharp corner mints no vertex at the spread-pushed arc boundvert",
         );
-        // The stored arc midpoint stays at the meet-point (§8.9.3), shared with sharp.
+        // §8.9.5: the arc bulge midpoint is the inscribed-circle 45° sample, pulled in
+        // a fraction `√2 − 1` from the chord midpoint toward the stored meet corner —
+        // NOT left at the raw meet-point. For the bottom sector's spread = 0.3 ends
+        // B1 = (0.45, -0.75, -1) and B3 = (0.75, -0.45, -1), the guide's worked check
+        // lands the bulge at (0.66213, -0.66213, -1) (the y = -1 sibling sector gives
+        // (0.66213, -1, -0.66213)).
+        let bulge_mid = Vec3::new(0.662_132, -0.662_132, -1.0);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, bulge_mid),
+            1,
+            "the arc bulge midpoint sits at the §8.9.5 inscribed-arc sample",
+        );
         assert_eq!(
             result_has_vert_near(&mesh, &result, bottom_meet),
-            1,
-            "the stored arc midpoint stays at the §7.6.2 meet-point",
+            0,
+            "the bulge midpoint is pulled in — no vertex stays at the raw meet corner",
+        );
+        // The welded apex stays on the corner body diagonal by the 3-fold symmetry of
+        // the tri-corner (a, -a, -a). NOTE: its exact magnitude is an open guide gap —
+        // §8.9.5 claims the §8.5 centre fit yields per-axis 0.85982 from the corrected
+        // bulge, but the documented circumsphere fit does not reproduce that (see the
+        // bevel.md miter row / report). We pin only the symmetry here, not the
+        // contested magnitude.
+        let apex_position = mesh.vertex_position(apex[0]);
+        let apex_axis = apex_position.x.abs();
+        assert!(
+            (apex_position - Vec3::new(apex_axis, -apex_axis, -apex_axis)).length() < 1.0e-4,
+            "the welded apex stays on the body diagonal",
         );
     }
 
