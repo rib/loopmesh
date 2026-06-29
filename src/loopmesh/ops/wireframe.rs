@@ -11,6 +11,14 @@ const BISECTOR_EPS_SQ: f32 = 1.0e-12;
 /// dividing by a value that has drifted just past `1`.
 const EVEN_FACTOR_EPS: f32 = 1.0e-6;
 
+/// The named per-edge float layer carrying the subdivision-surface crease weight
+/// (WIREFRAME.md §8). Wireframe writes `crease_weight` here on the hub edges when
+/// `use_crease` is set; it is a genuine per-edge float attribute (unlike the
+/// header-style seam/sharp bits), lazily registered on first write so the
+/// crease-clear path never materialises it. The name is load-bearing for the
+/// canonical parity gate, which keys the crease axis on this exact layer name.
+pub const CREASE_EDGE_ATTRIBUTE: &str = "crease_edge";
+
 /// The §4.3 shell-angle factor for the inset distance at a corner whose two
 /// incident edge directions (leaving the corner, unit length) are `to_prev` and
 /// `to_next`. The interior corner angle `α` satisfies `cos α = to_prev · to_next`,
@@ -112,8 +120,19 @@ impl LoopMesh {
     ) -> WireframeResult {
         // The off-centre bias defaults to a symmetric straddle (§5.1, `b = 0`),
         // the originals are kept (`use_replace = false`), and the inset uses the
-        // plain flat distance (`use_even_offset = false`).
-        self.wireframe_core(faces, thickness, 0.0, use_boundary, false, false, false)
+        // plain flat distance (`use_even_offset = false`). No crease is written
+        // (§8): the crease-clear path never touches the crease layer.
+        self.wireframe_core(
+            faces,
+            thickness,
+            0.0,
+            use_boundary,
+            false,
+            false,
+            false,
+            false,
+            0.0,
+        )
     }
 
     /// As [`Self::wireframe`], but with the `[-1, 1]` off-centre bias `offset`
@@ -131,7 +150,17 @@ impl LoopMesh {
         offset: f32,
         use_boundary: bool,
     ) -> WireframeResult {
-        self.wireframe_core(faces, thickness, offset, use_boundary, false, false, false)
+        self.wireframe_core(
+            faces,
+            thickness,
+            offset,
+            use_boundary,
+            false,
+            false,
+            false,
+            false,
+            0.0,
+        )
     }
 
     /// As [`Self::wireframe_with_offset`], but with the `use_even_offset`
@@ -161,6 +190,8 @@ impl LoopMesh {
             false,
             use_even_offset,
             false,
+            false,
+            0.0,
         )
     }
 
@@ -180,7 +211,17 @@ impl LoopMesh {
         use_boundary: bool,
         use_replace: bool,
     ) -> WireframeResult {
-        self.wireframe_core(faces, thickness, offset, use_boundary, use_replace, false, false)
+        self.wireframe_core(
+            faces,
+            thickness,
+            offset,
+            use_boundary,
+            use_replace,
+            false,
+            false,
+            false,
+            0.0,
+        )
     }
 
     /// As [`Self::wireframe_with_offset`], but with the `use_relative_offset`
@@ -214,15 +255,84 @@ impl LoopMesh {
             false,
             false,
             use_relative_offset,
+            false,
+            0.0,
         )
+    }
+
+    /// As [`Self::wireframe`], but with the `use_crease` hub-edge crease of
+    /// WIREFRAME.md §8: when `use_crease` is set, `crease_weight` is written onto
+    /// the **hub edges** — the radial edges joining each inset-frame vert to its
+    /// corresponding shell vert (`inset → pos` and `inset → neg`; and, under
+    /// `use_boundary`, `boundary → pos` / `boundary → neg`). These are the edges
+    /// running *across* the wire from the surface frame out to each shell side;
+    /// creasing them keeps the wire's longitudinal corners sharp under a later
+    /// subdivision-surface pass. No other edges are creased — the struts' long
+    /// edges and the window (inset-frame) edges are left untouched.
+    ///
+    /// The crease lives in the named per-edge float layer
+    /// [`CREASE_EDGE_ATTRIBUTE`] (`"crease_edge"`), lazily registered on first
+    /// write. When `use_crease` is clear the crease layer is never touched and
+    /// the result is bit-identical to [`Self::wireframe`] /
+    /// [`Self::wireframe_with_offset`] (the same lazy-omission convention the
+    /// seam/sharp paths use).
+    pub fn wireframe_with_crease(
+        &mut self,
+        faces: &[FaceKey],
+        thickness: f32,
+        offset: f32,
+        use_boundary: bool,
+        use_crease: bool,
+        crease_weight: f32,
+    ) -> WireframeResult {
+        self.wireframe_core(
+            faces,
+            thickness,
+            offset,
+            use_boundary,
+            false,
+            false,
+            false,
+            use_crease,
+            crease_weight,
+        )
+    }
+
+    /// The crease weight stored on `edge` under the [`CREASE_EDGE_ATTRIBUTE`]
+    /// convention, or the default `0.0` when no per-edge crease layer exists or
+    /// the edge has no stored value.
+    pub fn edge_crease(&self, edge: EdgeKey) -> f32 {
+        let attribs = self.edge_attribs();
+        match attribs.find(&AttributeKey::custom(CREASE_EDGE_ATTRIBUTE)) {
+            Some(layer) => attribs.get_f32(layer, edge.as_usize()).unwrap_or(0.0),
+            None => 0.0,
+        }
+    }
+
+    /// Set `edge`'s crease weight under the [`CREASE_EDGE_ATTRIBUTE`] convention
+    /// (WIREFRAME.md §8), registering the per-edge `F32` layer on first use.
+    ///
+    /// Idempotent in the layer: repeated calls reuse the single registered layer.
+    /// Edges never assigned a value keep the default `0.0`.
+    pub fn set_edge_crease(&mut self, edge: EdgeKey, crease: f32) {
+        let key = AttributeKey::custom(CREASE_EDGE_ATTRIBUTE);
+        let layer = match self.edge_attribs().find(&key) {
+            Some(layer) => layer,
+            None => self
+                .register_edge_attribute(ElementAttributeDesc::numeric(key, AttrType::F32))
+                .expect("F32x1 is a supported edge attribute format"),
+        };
+        self.edge_attribs_mut()
+            .set_f32(layer, edge.as_usize(), crease);
     }
 
     /// The shared wireframe core driving every public entry point: per-face
     /// inset-frame + two-sided strut bridge, with the `offset` bias (§5.1/§5.3),
     /// the `use_boundary` rim cap (§6), the `use_replace` removal (§7), the
-    /// `use_even_offset` shell-angle correction (§4.3), and the
-    /// `use_relative_offset` per-vertex edge-length scale (§5.4) all selected by
-    /// argument.
+    /// `use_even_offset` shell-angle correction (§4.3), the
+    /// `use_relative_offset` per-vertex edge-length scale (§5.4), and the
+    /// `use_crease` hub-edge crease (§8) all selected by argument.
+    #[allow(clippy::too_many_arguments)]
     fn wireframe_core(
         &mut self,
         faces: &[FaceKey],
@@ -232,6 +342,8 @@ impl LoopMesh {
         use_replace: bool,
         use_even_offset: bool,
         use_relative_offset: bool,
+        use_crease: bool,
+        crease_weight: f32,
     ) -> WireframeResult {
         if faces.is_empty() {
             return WireframeResult::default();
@@ -400,6 +512,18 @@ impl LoopMesh {
                 result.strut_faces.push(neg_quad);
                 result.strut_faces.push(pos_quad);
 
+                // §8: crease the four hub edges of this corner's strut pair —
+                // the radial edges from each end's inset-frame vert to that
+                // end's shell vert (`inset → neg` and `inset → pos` at corners
+                // a and b). The window edges (`inset_a → inset_b`) and the long
+                // shell edges (`shell_a → shell_b`) are left uncreased.
+                if use_crease {
+                    self.wireframe_crease_hub_edge(inset_a, shell_a.neg, crease_weight);
+                    self.wireframe_crease_hub_edge(inset_b, shell_b.neg, crease_weight);
+                    self.wireframe_crease_hub_edge(inset_a, shell_a.pos, crease_weight);
+                    self.wireframe_crease_hub_edge(inset_b, shell_b.pos, crease_weight);
+                }
+
                 // §6: a region-boundary edge (no other tagged face uses it)
                 // gets, under `use_boundary`, an outer rim cap that closes its
                 // tube.
@@ -451,6 +575,15 @@ impl LoopMesh {
                     );
                     result.strut_faces.push(cap_neg);
                     result.strut_faces.push(cap_pos);
+
+                    // §8: the rim cap adds its own hub edges from the boundary
+                    // inset-frame vert out to each shell side; crease them too.
+                    if use_crease {
+                        self.wireframe_crease_hub_edge(boundary_a, shell_a.neg, crease_weight);
+                        self.wireframe_crease_hub_edge(boundary_b, shell_b.neg, crease_weight);
+                        self.wireframe_crease_hub_edge(boundary_a, shell_a.pos, crease_weight);
+                        self.wireframe_crease_hub_edge(boundary_b, shell_b.pos, crease_weight);
+                    }
                 }
 
                 l = next_l;
@@ -687,6 +820,17 @@ impl LoopMesh {
         let frame = self.create_vertex(here + outward * inset_dist);
         self.vertex_attribs.copy_into(frame.as_usize(), v.as_usize());
         frame
+    }
+
+    /// §8 — write `crease_weight` onto the hub edge between an inset/boundary
+    /// frame vert and a shell vert, located by its two endpoints. The edge was
+    /// already created by the strut/cap quad (deduplicated under
+    /// `NO_DUPLICATE`), so this looks it up rather than creating it; a hub edge
+    /// shared by two adjacent struts is creased idempotently.
+    fn wireframe_crease_hub_edge(&mut self, frame: VertexKey, shell: VertexKey, crease_weight: f32) {
+        if let Some(edge) = self.query_edge_exists(frame, shell) {
+            self.set_edge_crease(edge, crease_weight);
+        }
     }
 
     /// Build one strut quad from four corner verts, copying the source face's
@@ -1547,6 +1691,171 @@ mod tests {
             8,
             "one boundary vert per boundary vertex (V_b = 2k+2 = 8), not per boundary edge",
         );
+    }
+
+    /// Classify every edge of the wired mesh as a hub edge (one endpoint a
+    /// frame/window/shell vert below the original watermark vs above) for the
+    /// crease tests. An edge is a **hub** edge iff it joins an inset/boundary
+    /// frame vert to a shell vert. We identify the two families geometrically on
+    /// the flat +Z quad: shell verts have non-zero z (offset along the normal),
+    /// frame verts sit in z = 0 (offset=0). A hub edge spans z=0 → z≠0 between
+    /// two *new* verts (slot ≥ original count); a window edge joins two z=0 new
+    /// verts; a strut long edge joins two z≠0 new verts.
+    fn classify_quad_edges(mesh: &LoopMesh, orig_verts: usize) -> (Vec<EdgeKey>, Vec<EdgeKey>) {
+        let mut hub = Vec::new();
+        let mut other = Vec::new();
+        let mut edge_iter = MeshEdges::default();
+        while let Some(e) = edge_iter.next(mesh) {
+            let [a, b] = mesh.edge_vertices(e);
+            // Skip any edge touching an original vert (the source face's own
+            // edges, which are not hub edges).
+            if a.as_usize() < orig_verts || b.as_usize() < orig_verts {
+                other.push(e);
+                continue;
+            }
+            let za = mesh.vertex_position(a).z.abs() > 1.0e-6;
+            let zb = mesh.vertex_position(b).z.abs() > 1.0e-6;
+            // Hub edge: exactly one endpoint is a shell vert (off-plane).
+            if za != zb {
+                hub.push(e);
+            } else {
+                other.push(e);
+            }
+        }
+        (hub, other)
+    }
+
+    #[test]
+    fn use_crease_writes_hub_edges_only() {
+        // WIREFRAME.md §8: with `use_crease` set, `crease_weight` is written onto
+        // the hub edges (inset-frame vert → shell vert) and nowhere else. On a
+        // lone flat quad (offset = 0): 4 inset-frame verts in z = 0, 8 shell
+        // verts at z = ±t/2. Each of the 8 strut quads contributes two hub edges;
+        // adjacent struts share the frame→shell edge at the shared corner, so the
+        // distinct hub-edge count is one per (corner, side) = 4 corners × 2 sides
+        // = 8 hub edges. Window edges (frame→frame) and strut long edges
+        // (shell→shell) stay uncreased.
+        let mut mesh = LoopMesh::new();
+        let face = flat_quad(&mut mesh);
+        let orig = mesh.vertex_count();
+
+        let weight = 0.4_f32;
+        mesh.wireframe_with_crease(&[face], 0.2, 0.0, false, true, weight);
+
+        let (hub, other) = classify_quad_edges(&mesh, orig);
+        assert_eq!(hub.len(), 8, "one hub edge per (corner, side): 4 × 2");
+        for &e in &hub {
+            assert!(
+                (mesh.edge_crease(e) - weight).abs() < 1.0e-6,
+                "hub edge {e:?} must carry crease_weight",
+            );
+        }
+        for &e in &other {
+            assert_eq!(
+                mesh.edge_crease(e),
+                0.0,
+                "non-hub edge {e:?} (window / strut long / source) must stay uncreased",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_crease_clear_registers_no_crease_layer() {
+        // WIREFRAME.md §8 lazy-omission: with `use_crease` clear the crease layer
+        // is never touched, so it must not be registered at all — the
+        // crease-clear path is bit-identical to the plain wireframe. Pin both the
+        // absence of the layer and that every edge reads the default 0.0.
+        let mut clear = LoopMesh::new();
+        let fc = flat_quad(&mut clear);
+        clear.wireframe_with_crease(&[fc], 0.2, 0.0, false, false, 0.5);
+
+        assert!(
+            clear
+                .edge_attribs()
+                .find(&AttributeKey::custom(super::CREASE_EDGE_ATTRIBUTE))
+                .is_none(),
+            "no crease layer may be registered when use_crease is clear",
+        );
+
+        // The clear path must build the same topology/positions as the plain
+        // 3-arg wireframe (bit-identical).
+        let mut plain = LoopMesh::new();
+        let fp = flat_quad(&mut plain);
+        plain.wireframe(&[fp], 0.2, false);
+        assert_eq!(clear.vertex_count(), plain.vertex_count());
+        assert_eq!(clear.face_count(), plain.face_count());
+        for slot in 0..clear.vertex_count() {
+            assert_eq!(
+                clear.vertex_position(VertexKey::from_usize(slot)),
+                plain.vertex_position(VertexKey::from_usize(slot)),
+                "vert {slot}: use_crease=false must equal the plain wireframe path",
+            );
+        }
+        clear.validate_topology();
+    }
+
+    #[test]
+    fn use_crease_boundary_creases_rim_hub_edges() {
+        // WIREFRAME.md §8 + §6: under `use_boundary` the rim cap adds hub edges
+        // from each boundary inset-frame vert out to the shell verts; these are
+        // creased too. The lone quad capped gives 20 verts (4 original + 4 inset
+        // + 8 shell + 4 boundary). Hub edges = inner (8) + rim-cap (one per
+        // (corner, side) = 4 × 2 = 8) = 16. All carry the weight; no other edge
+        // does.
+        let mut mesh = LoopMesh::new();
+        let face = flat_quad(&mut mesh);
+        let orig = mesh.vertex_count();
+
+        let weight = 0.6_f32;
+        mesh.wireframe_with_crease(&[face], 0.2, 0.0, true, true, weight);
+
+        let (hub, other) = classify_quad_edges(&mesh, orig);
+        assert_eq!(hub.len(), 16, "8 inner hub edges + 8 rim-cap hub edges");
+        for &e in &hub {
+            assert!(
+                (mesh.edge_crease(e) - weight).abs() < 1.0e-6,
+                "rim/inner hub edge {e:?} must carry crease_weight",
+            );
+        }
+        for &e in &other {
+            assert_eq!(mesh.edge_crease(e), 0.0, "non-hub edge {e:?} stays uncreased");
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn use_crease_boundary_clear_creases_only_inner_hub_edges() {
+        // Contrast pin for the boundary arm: with `use_boundary` clear there are
+        // no rim caps, so only the 8 inner hub edges are creased (no rim-cap hub
+        // edges exist). This distinguishes the boundary crease path (16 hub
+        // edges) from the no-boundary one (8).
+        let mut mesh = LoopMesh::new();
+        let face = flat_quad(&mut mesh);
+        let orig = mesh.vertex_count();
+
+        mesh.wireframe_with_crease(&[face], 0.2, 0.0, false, true, 0.4);
+
+        let (hub, _other) = classify_quad_edges(&mesh, orig);
+        let creased = hub.iter().filter(|&&e| mesh.edge_crease(e) > 0.0).count();
+        assert_eq!(creased, 8, "no rim caps → only the 8 inner hub edges creased");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn edge_crease_accessor_round_trips_with_default_zero() {
+        // The §8 accessor pair: an edge with no crease layer reads the default
+        // 0.0; setting registers the layer lazily and the value round-trips.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let e = mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE);
+
+        assert_eq!(mesh.edge_crease(e), 0.0, "default crease is 0.0 (no layer)");
+        mesh.set_edge_crease(e, 0.75);
+        assert!((mesh.edge_crease(e) - 0.75).abs() < 1.0e-6, "value round-trips");
+        mesh.set_edge_crease(e, 0.25);
+        assert!((mesh.edge_crease(e) - 0.25).abs() < 1.0e-6, "layer reused on update");
     }
 
     #[test]
