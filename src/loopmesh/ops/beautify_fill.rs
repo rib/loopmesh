@@ -25,8 +25,54 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use glam::Vec3;
+
 use crate::loopmesh::*;
 use crate::triangulate::beautify_quad_cost;
+
+/// The "never rotate" cost sentinel shared by both metrics (BEAUTIFY_FILL.md §4):
+/// a degenerate / flip-producing candidate scores this so the descent never
+/// enqueues it. Matches the AREA kernel's `f32::MAX` (`beautify_quad_cost`).
+const NEVER_ROTATE: f32 = f32::MAX;
+
+/// The §4.1 ANGLE cost of rotating the cyclic quad `(v0, v1, v2, v3)` from its
+/// current diagonal `v0-v2` to the candidate diagonal `v1-v3`. The metric
+/// measures the dihedral angle between the two flanking triangles' normals and
+/// prefers the diagonal that folds the pair *flatter*; the cost is therefore
+/// `angle_after − angle_before`, negative when the candidate is the flatter,
+/// more Delaunay-like choice. Computed on the true 3D triangle normals — there
+/// is no axis-dominant 2D projection here (unlike the AREA kernel). A candidate
+/// triangle with a zero-length (degenerate, zero-area) normal scores
+/// [`NEVER_ROTATE`] so a rotation *into* a fold is never enqueued (§3 gate 5,
+/// §4.1 candidate zero-normal sentinel); the current state's degeneracy is left
+/// to the §3 eligibility guard.
+fn beautify_quad_cost_angle(v0: Vec3, v1: Vec3, v2: Vec3, v3: Vec3) -> f32 {
+    // Current diagonal v0-v2: flanking triangles (v0,v3,v2) and (v0,v2,v1).
+    let current_normal_a = (v3 - v0).cross(v2 - v0);
+    let current_normal_b = (v2 - v0).cross(v1 - v0);
+    let angle_before = dihedral_between(current_normal_a, current_normal_b);
+
+    // Candidate diagonal v1-v3: flanking triangles (v1,v0,v3) and (v1,v3,v2).
+    let candidate_normal_c = (v0 - v1).cross(v3 - v1);
+    let candidate_normal_d = (v3 - v1).cross(v2 - v1);
+    if candidate_normal_c.length_squared() == 0.0 || candidate_normal_d.length_squared() == 0.0 {
+        return NEVER_ROTATE;
+    }
+    let angle_after = dihedral_between(candidate_normal_c, candidate_normal_d);
+
+    angle_after - angle_before
+}
+
+/// The dihedral angle (radians, in `[0, π]`) between two triangle normals,
+/// each normalised first. A zero-length input normalises to zero, yielding a
+/// `π/2` reading — the ANGLE metric only treats a zero-length *candidate*
+/// normal as degenerate (handled by the caller before this is reached for the
+/// candidate pair).
+fn dihedral_between(normal_a: Vec3, normal_b: Vec3) -> f32 {
+    let unit_a = normal_a.normalize_or_zero();
+    let unit_b = normal_b.normalize_or_zero();
+    unit_a.dot(unit_b).clamp(-1.0, 1.0).acos()
+}
 
 /// Which beauty metric decides a rotation (BEAUTIFY_FILL.md §4). `Area` is the
 /// zero-init default (an unset `method` runs the area-over-perimeter test);
@@ -151,9 +197,6 @@ impl LoopMesh {
         edges: &[EdgeKey],
         options: BeautifyFillOptions,
     ) -> BeautifyFillResult {
-        if let BeautifyMethod::Angle = options.method {
-            unimplemented!("beautify_fill: ANGLE metric not yet implemented (BEAUTIFY_FILL.md §4.1)");
-        }
         if options.use_restrict_tag {
             unimplemented!(
                 "beautify_fill: use_restrict_tag not yet implemented (BEAUTIFY_FILL.md §6.2)"
@@ -190,7 +233,7 @@ impl LoopMesh {
             if active.contains_key(&edge) {
                 continue;
             }
-            if let Some(cost) = self.beautify_edge_cost(edge, &patch) {
+            if let Some(cost) = self.beautify_edge_cost(edge, &patch, options.method) {
                 if cost < 0.0 {
                     active.insert(edge, cost);
                     heap.push(HeapEntry {
@@ -280,7 +323,9 @@ impl LoopMesh {
                 if !rotatable.contains(&neighbour) {
                     continue;
                 }
-                let admit = self.beautify_edge_cost(neighbour, &patch).and_then(|cost| {
+                let admit = self
+                    .beautify_edge_cost(neighbour, &patch, options.method)
+                    .and_then(|cost| {
                     if cost >= 0.0 {
                         return None;
                     }
@@ -313,13 +358,19 @@ impl LoopMesh {
         result
     }
 
-    /// The §4.2 AREA cost of rotating `edge`, or `None` if `edge` fails a §3
-    /// eligibility gate (non-manifold, a flanking face outside the triangle
-    /// patch, or the no-double guard). A negative cost means rotating improves
-    /// the patch; the always-on degenerate lock (§3 gate 5) is passed to the
-    /// kernel, which returns its `f32::MAX` "never rotate" sentinel for a
-    /// degenerate candidate.
-    fn beautify_edge_cost(&self, edge: EdgeKey, patch: &HashSet<FaceKey>) -> Option<f32> {
+    /// The §4 beauty cost of rotating `edge` under `method`, or `None` if `edge`
+    /// fails a §3 eligibility gate (non-manifold, a flanking face outside the
+    /// triangle patch, or the no-double guard). A negative cost means rotating
+    /// improves the patch. The always-on degenerate lock (§3 gate 5) is honoured
+    /// by both metrics: the AREA kernel takes it as a flag and the ANGLE kernel
+    /// bakes it in via its candidate zero-normal check — either way a degenerate
+    /// candidate scores the [`NEVER_ROTATE`] sentinel and is never enqueued.
+    fn beautify_edge_cost(
+        &self,
+        edge: EdgeKey,
+        patch: &HashSet<FaceKey>,
+        method: BeautifyMethod,
+    ) -> Option<f32> {
         // §3 gate 2 — manifold, with a well-defined opposite diagonal.
         let (apex_a, apex_c) = self.edge_rotate_diagonal(edge, true)?;
         // §3 gate 3 — both flanking faces are members of the triangle patch.
@@ -333,16 +384,25 @@ impl LoopMesh {
             return None;
         }
 
-        // §4.2 — score the cyclic quad (e0, apex_a, e1, apex_c): existing
-        // diagonal e0-e1, candidate diagonal apex_a-apex_c.
+        // §4 — score the cyclic quad (e0, apex_a, e1, apex_c): existing diagonal
+        // e0-e1, candidate diagonal apex_a-apex_c. The metric selector picks the
+        // ordering (§4.1 ANGLE: angle_after − angle_before; §4.2 AREA:
+        // fac_before − fac_after).
         let [e0, e1] = self.edges.get(edge).vertices;
-        let cost = beautify_quad_cost(
+        let (pos_e0, pos_apex_a, pos_e1, pos_apex_c) = (
             self.vertex_position(e0),
             self.vertex_position(apex_a),
             self.vertex_position(e1),
             self.vertex_position(apex_c),
-            true,
         );
+        let cost = match method {
+            BeautifyMethod::Area => {
+                beautify_quad_cost(pos_e0, pos_apex_a, pos_e1, pos_apex_c, true)
+            }
+            BeautifyMethod::Angle => {
+                beautify_quad_cost_angle(pos_e0, pos_apex_a, pos_e1, pos_apex_c)
+            }
+        };
         Some(cost)
     }
 
@@ -687,5 +747,178 @@ mod tests {
             counts
         );
         let _ = diag;
+    }
+
+    /// A **folded** two-triangle tent: both near corners `v1/v3` lifted out of
+    /// the `v0..v2` line so the current `{v0,v2}` diagonal is a sharp ridge,
+    /// while the candidate `{v1,v3}` diagonal lies flat. The §4.1 ANGLE metric
+    /// prefers the flatter candidate, so it rotates. Returns `[v0,v1,v2,v3]`
+    /// (the strip shares the `{v0,v2}` diagonal).
+    fn folded_tent_strip(mesh: &mut LoopMesh) -> ([VertexKey; 4], [FaceKey; 2]) {
+        let v0 = mesh.create_vertex(Vec3::new(-3.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, -0.6, 1.5));
+        let v2 = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 0.6, 1.5));
+        let f0 = tri(mesh, [v0, v1, v2]);
+        let f1 = tri(mesh, [v0, v2, v3]);
+        ([v0, v1, v2, v3], [f0, f1])
+    }
+
+    /// A **non-planar saddle** two-triangle strip split on `{v0,v2}`, engineered
+    /// so the two §4 metrics *disagree*: the AREA metric rotates `{v0,v2}` →
+    /// `{v1,v3}` (the projected quad's `{v0,v2}` split gives the worse
+    /// area-over-perimeter ratio, cost ≈ −0.05) while the ANGLE metric **keeps**
+    /// `{v0,v2}` (its flanking-triangle dihedral fold is flatter than
+    /// `{v1,v3}`'s, cost ≈ +4.4°). This is the discriminating case: a
+    /// metric-blind ANGLE path that fell through to AREA would rotate.
+    fn saddle_discriminating_strip(mesh: &mut LoopMesh) -> ([VertexKey; 4], [FaceKey; 2]) {
+        let v0 = mesh.create_vertex(Vec3::new(-2.5, -0.5, 1.5));
+        let v1 = mesh.create_vertex(Vec3::new(-1.5, -2.5, 1.5));
+        let v2 = mesh.create_vertex(Vec3::new(2.5, -0.5, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(-1.5, 1.0, 2.0));
+        let f0 = tri(mesh, [v0, v1, v2]);
+        let f1 = tri(mesh, [v0, v2, v3]);
+        ([v0, v1, v2, v3], [f0, f1])
+    }
+
+    /// A strip split on `{v0,v2}` whose **candidate** diagonal `{v1,v3}` would
+    /// produce a degenerate (zero-area) triangle: the diagonal endpoint `v0` is
+    /// collinear with both apexes `v1`/`v3`, so the candidate triangle
+    /// `(v1,v0,v3)` has a zero-length normal. The §4.1 ANGLE metric must score
+    /// the never-rotate sentinel and keep the edge out of the worklist.
+    fn degenerate_candidate_strip(mesh: &mut LoopMesh) -> ([VertexKey; 4], [FaceKey; 2]) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, -3.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let f0 = tri(mesh, [v0, v1, v2]);
+        let f1 = tri(mesh, [v0, v2, v3]);
+        ([v0, v1, v2, v3], [f0, f1])
+    }
+
+    /// §4.1 — the ANGLE metric rotates a folded patch toward the flatter
+    /// (smaller-dihedral) diagonal. The ridge `{v0,v2}` is replaced by the flat
+    /// `{v1,v3}`; `geom.out` carries the one rotated edge and its two faces.
+    #[test]
+    fn angle_metric_rotates_folded_tent() {
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = folded_tent_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: false,
+                method: BeautifyMethod::Angle,
+            },
+        );
+
+        assert_eq!(out.edges().count(), 1, "one edge rotated under ANGLE");
+        assert_eq!(out.faces().count(), 2, "two flanking faces reported");
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_some(),
+            "the flatter diagonal {{1,3}} now exists"
+        );
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_none(),
+            "the folded ridge diagonal {{0,2}} is gone"
+        );
+    }
+
+    /// §4.1 / §8 (`method` disagreement) — on the saddle the ANGLE metric is a
+    /// **no-op** (the current `{0,2}` fold is already the flatter one) even
+    /// though the AREA metric would rotate the same patch. The two runs of the
+    /// same fixture must diverge; this pins that the operator honours the metric
+    /// selector rather than always falling through to AREA.
+    #[test]
+    fn angle_metric_keeps_saddle_where_area_rotates() {
+        // ANGLE arm: keep {0,2}.
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = saddle_discriminating_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: false,
+                method: BeautifyMethod::Angle,
+            },
+        );
+
+        assert!(out.is_empty(), "ANGLE: saddle is already the flatter split");
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_some(),
+            "ANGLE keeps the {{0,2}} diagonal"
+        );
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_none(),
+            "ANGLE never creates the {{1,3}} diagonal"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts,
+            "ANGLE arm: mesh untouched"
+        );
+
+        // AREA arm: same fixture rotates — proving the metrics genuinely diverge.
+        let mut mesh_area = LoopMesh::new();
+        let ([a0, a1, a2, a3], [g0, g1]) = saddle_discriminating_strip(&mut mesh_area);
+        let area_diag = edge_between(&mesh_area, a0, a2);
+        let area_out = mesh_area.beautify_fill(
+            &[g0, g1],
+            &[area_diag],
+            BeautifyFillOptions {
+                use_restrict_tag: false,
+                method: BeautifyMethod::Area,
+            },
+        );
+        assert!(!area_out.is_empty(), "AREA rotates the same saddle");
+        assert!(
+            mesh_area.query_edge_exists(a1, a3).is_some(),
+            "AREA rotates to {{1,3}}"
+        );
+        assert!(
+            mesh_area.query_edge_exists(a0, a2).is_none(),
+            "AREA drops {{0,2}}"
+        );
+    }
+
+    /// §4.1 (candidate zero-normal sentinel) / §3 gate 5 — a candidate diagonal
+    /// whose flanking triangle is degenerate (collinear) scores the never-rotate
+    /// sentinel under ANGLE, so the edge never enters the worklist: the patch is
+    /// returned unchanged and `geom.out` is empty.
+    #[test]
+    fn angle_metric_degenerate_candidate_stays_out_of_worklist() {
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = degenerate_candidate_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: false,
+                method: BeautifyMethod::Angle,
+            },
+        );
+
+        assert!(out.is_empty(), "degenerate candidate ⇒ never-rotate sentinel");
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_some(),
+            "the current diagonal {{0,2}} survives"
+        );
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_none(),
+            "the degenerate candidate {{1,3}} is never created"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts,
+            "mesh untouched"
+        );
     }
 }
