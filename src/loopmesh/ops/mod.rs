@@ -26,6 +26,7 @@ mod dissolve_faces;
 mod dissolve_limit;
 mod dissolve_verts;
 mod duplicate;
+mod edgeloop_fill;
 mod extrude_discrete;
 mod extrude_edge_only;
 mod extrude_mixed;
@@ -84,6 +85,7 @@ pub use dissolve_limit::{
 };
 pub use dissolve_verts::DissolveVertsParams;
 pub use duplicate::{DuplicateResult, GeomKey};
+pub use edgeloop_fill::{EdgeloopFillParams, EdgeloopFillResult};
 pub use extrude_mixed::ExtrudeMixedResult;
 pub use extrude_vert_indiv::ExtrudeVertIndivResult;
 pub use face_poke::{CenterMode, PokeResult};
