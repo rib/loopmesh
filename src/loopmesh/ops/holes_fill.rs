@@ -123,6 +123,10 @@ impl LoopMesh {
             });
         }
 
+        // §6.1 — flood the surrounding surface's attributes into the surviving
+        // caps. A free-wire cap the flood never reaches keeps its defaults (§6.3).
+        self.holes_fill_inherit_attributes(&new_caps);
+
         result.faces = new_caps;
         result
     }
@@ -337,6 +341,130 @@ impl LoopMesh {
         }
         tally > 0
     }
+
+    /// §6.1 — inherit the surrounding surface's attributes into the surviving
+    /// caps. Face-domain attributes (material index, smooth flag, face-domain
+    /// custom-data) flood outward across shared edges: every cap touching an
+    /// existing face inherits directly, then caps reachable only through other
+    /// caps inherit transitively from the first cap that touched the surface.
+    /// Per-corner loop attributes (UVs / colours) are pulled across each cap
+    /// corner's shared edge from the existing face at the same vertex. A cap the
+    /// flood never reaches — a free wire loop with no adjacent existing face —
+    /// keeps its defaults (§6.3).
+    fn holes_fill_inherit_attributes(&mut self, caps: &[FaceKey]) {
+        if caps.is_empty() {
+            return;
+        }
+        let cap_set: HashSet<FaceKey> = caps.iter().copied().collect();
+
+        // Face-domain flood. Seed from every cap adjacent to an existing (non-cap)
+        // face, then propagate to caps reachable only through already-resolved
+        // caps. Reuses the same radial adjacency walk as the §6.2 winding vote.
+        let mut resolved: HashSet<FaceKey> = HashSet::with_capacity(caps.len());
+        let mut queue: VecDeque<FaceKey> = VecDeque::new();
+        for &cap in caps {
+            if let Some(donor) = self.holes_fill_surface_neighbor(cap, &cap_set) {
+                self.holes_fill_copy_face_attribs(donor, cap);
+                resolved.insert(cap);
+                queue.push_back(cap);
+            }
+        }
+        while let Some(donor_cap) = queue.pop_front() {
+            for shared in self.face_edge_keys(donor_cap) {
+                for radial in self.edge_loop_keys(shared) {
+                    let neighbor = self.loop_face(radial);
+                    if cap_set.contains(&neighbor) && resolved.insert(neighbor) {
+                        self.holes_fill_copy_face_attribs(donor_cap, neighbor);
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        // Per-corner loop inheritance across the shared boundary.
+        if !self.loop_attribs.is_empty() {
+            for &cap in caps {
+                self.holes_fill_copy_loop_data(cap, &cap_set);
+            }
+        }
+    }
+
+    /// Find an existing (non-cap) face adjacent to `cap` across any of its rim
+    /// edges — the donor the cap inherits face attributes from. Returns `None`
+    /// for a free wire cap with no surrounding surface.
+    fn holes_fill_surface_neighbor(
+        &self,
+        cap: FaceKey,
+        cap_set: &HashSet<FaceKey>,
+    ) -> Option<FaceKey> {
+        for shared in self.face_edge_keys(cap) {
+            for radial in self.edge_loop_keys(shared) {
+                let neighbor = self.loop_face(radial);
+                if neighbor != cap && !cap_set.contains(&neighbor) {
+                    return Some(neighbor);
+                }
+            }
+        }
+        None
+    }
+
+    /// Copy `donor`'s face-domain attributes into `cap`: the material index and
+    /// any face-domain custom-data (both live in the face attribute table, so a
+    /// single copy carries them together) plus the persistent smooth header bit.
+    fn holes_fill_copy_face_attribs(&mut self, donor: FaceKey, cap: FaceKey) {
+        self.face_attribs.copy_into(cap.as_usize(), donor.as_usize());
+        let smooth = self.is_face_smooth(donor);
+        self.set_face_smooth(cap, smooth);
+    }
+
+    /// Pull each cap corner's loop data from the existing face across its shared
+    /// edge, matched at the same vertex (§6.1). A corner whose edges all face open
+    /// space or another cap keeps its default loop data.
+    fn holes_fill_copy_loop_data(&mut self, cap: FaceKey, cap_set: &HashSet<FaceKey>) {
+        for cap_loop in self.face_loop_keys(cap) {
+            let vertex = self.loop_vertex(cap_loop);
+            let donor_face = self
+                .holes_fill_loop_donor(self.loop_edge(cap_loop), cap, cap_set)
+                .or_else(|| {
+                    self.holes_fill_loop_donor(
+                        self.loop_edge(self.loop_prev(cap_loop)),
+                        cap,
+                        cap_set,
+                    )
+                });
+            let Some(donor_face) = donor_face else {
+                continue;
+            };
+            if let Some(donor_loop) = self.holes_fill_face_loop_at(donor_face, vertex) {
+                self.loop_attribs
+                    .copy_into(cap_loop.as_usize(), donor_loop.as_usize());
+            }
+        }
+    }
+
+    /// The existing (non-cap) face bordering `edge`, if any — the donor a cap
+    /// corner on `edge` inherits its loop data from.
+    fn holes_fill_loop_donor(
+        &self,
+        edge: EdgeKey,
+        cap: FaceKey,
+        cap_set: &HashSet<FaceKey>,
+    ) -> Option<FaceKey> {
+        if edge.is_null() {
+            return None;
+        }
+        self.edge_loop_keys(edge)
+            .into_iter()
+            .map(|radial| self.loop_face(radial))
+            .find(|&face| face != cap && !cap_set.contains(&face))
+    }
+
+    /// The loop of `face` whose corner sits at `vertex`.
+    fn holes_fill_face_loop_at(&self, face: FaceKey, vertex: VertexKey) -> Option<LoopKey> {
+        self.face_loop_keys(face)
+            .into_iter()
+            .find(|&l| self.loop_vertex(l) == vertex)
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +609,72 @@ mod tests {
             mesh.face_normal(cap).length_squared() > 1e-6,
             "§6.3 fallback gives the isolated cap a well-defined normal"
         );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn surface_hole_cap_inherits_material_smooth_and_corner_uv() {
+        // §6.1 — every ring face uniformly carries material 3, the smooth flag,
+        // and a constant corner UV; the cap inherits all three across its rim.
+        let (mut mesh, rim) = grid_3x3_center_hole();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .expect("uv layer registers");
+
+        for face in mesh.face_keys() {
+            mesh.set_face_material_index(face, 3);
+            mesh.set_face_smooth(face, true);
+        }
+        for l in mesh.loop_keys() {
+            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.25, 0.75]);
+        }
+
+        let result = mesh.holes_fill(&rim, &HolesFillParams { sides: 0 });
+        assert_eq!(result.faces().len(), 1, "one cap per hole");
+        let cap = result.faces()[0];
+
+        assert_eq!(
+            mesh.face_material_index(cap),
+            3,
+            "cap inherits the surrounding material index"
+        );
+        assert!(mesh.is_face_smooth(cap), "cap inherits the smooth flag");
+        for cap_loop in mesh.face_loop_keys(cap) {
+            let got = mesh.loop_attribs().get_vec2(uv, cap_loop.as_usize()).unwrap();
+            assert_eq!(
+                got, [0.25, 0.75],
+                "every cap corner inherits the surrounding corner UV"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn free_wire_cap_keeps_default_attributes() {
+        // §6.3 — a cap the flood never reaches has no surface to inherit from, so
+        // its material / smooth / loop data stay at their defaults.
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .expect("uv layer registers");
+        let ring = convex_wire_ring(&mut mesh, 6, 1.0);
+
+        let result = mesh.holes_fill(&ring, &HolesFillParams { sides: 0 });
+        assert_eq!(result.faces().len(), 1, "free wire loop caps to one face");
+        let cap = result.faces()[0];
+
+        assert_eq!(mesh.face_material_index(cap), 0, "default material slot 0");
+        assert!(!mesh.is_face_smooth(cap), "default cap is flat");
+        for cap_loop in mesh.face_loop_keys(cap) {
+            let got = mesh.loop_attribs().get_vec2(uv, cap_loop.as_usize()).unwrap();
+            assert_eq!(got, [0.0, 0.0], "isolated cap keeps default corner UV");
+        }
         mesh.validate_topology();
     }
 
