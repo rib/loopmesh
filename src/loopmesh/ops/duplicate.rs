@@ -58,6 +58,18 @@ pub struct DuplicateResult {
     pub isovert_map: HashMap<VertexKey, VertexKey>,
 }
 
+/// The four per-domain customdata remap plans (DUPLICATE.md §8.5.2),
+/// destination-driven and matched by `(type, name)`. Built once before the
+/// cross-mesh closure walk and replayed for every cloned element of each
+/// domain. Each plan collapses to the verbatim copy of §4 when the two meshes
+/// share a layout.
+struct RemapPlans {
+    vert: RemapPlan,
+    edge: RemapPlan,
+    face: RemapPlan,
+    loops: RemapPlan,
+}
+
 impl LoopMesh {
     /// Clone a mixed selection into new, disjoint, geometrically-coincident
     /// geometry in place.
@@ -84,15 +96,14 @@ impl LoopMesh {
     ///
     /// See `radial-mesh-guides/operators/DUPLICATE.md` for the full algorithm
     /// and parity contract.
-    pub fn duplicate(
-        &mut self,
-        geom: &[GeomKey],
-        use_edge_flip_from_face: bool,
-    ) -> DuplicateResult {
-        let mut result = DuplicateResult::default();
-
-        // Selection membership, keyed by source slot, so the §6 classification
-        // can ask "is this incident element itself in the selection?".
+    /// Per-domain selection membership keyed by source slot: `(vert, edge,
+    /// face)` boolean vectors sized to each domain's key watermark, with a
+    /// `true` at every slot named in `geom`. Shared by the in-place
+    /// [`duplicate`](Self::duplicate) and the cross-mesh
+    /// [`duplicate_into`](Self::duplicate_into) so the §6 "is this incident
+    /// element itself selected?" classification cannot drift between the two
+    /// paths.
+    fn selection_flags(&self, geom: &[GeomKey]) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
         let mut vert_selected = vec![false; self.vertices.key_watermark()];
         let mut edge_selected = vec![false; self.edges.key_watermark()];
         let mut face_selected = vec![false; self.faces.key_watermark()];
@@ -103,6 +114,19 @@ impl LoopMesh {
                 GeomKey::Face(f) => face_selected[f.as_usize()] = true,
             }
         }
+        (vert_selected, edge_selected, face_selected)
+    }
+
+    pub fn duplicate(
+        &mut self,
+        geom: &[GeomKey],
+        use_edge_flip_from_face: bool,
+    ) -> DuplicateResult {
+        let mut result = DuplicateResult::default();
+
+        // Selection membership, keyed by source slot, so the §6 classification
+        // can ask "is this incident element itself in the selection?".
+        let (vert_selected, edge_selected, face_selected) = self.selection_flags(geom);
 
         // The two ledgers (DUPLICATE.md §3): source element -> clone, so an
         // element reached through several selected elements is copied once.
@@ -351,6 +375,270 @@ impl LoopMesh {
             }
         }
         count
+    }
+
+    /// Clone a mixed selection into a **separate** destination mesh
+    /// (DUPLICATE.md §8.5). The source mesh `self` is left entirely untouched;
+    /// every clone vert, edge, face, and loop is born in `dest`.
+    ///
+    /// The §3 A→B→C closure walk, the shared vert/edge ledgers, and the §6
+    /// boundary/isovert classification run exactly as the in-place
+    /// [`duplicate`](Self::duplicate) — every classification reads the
+    /// **source** mesh's incidence and selection flags, and the ledgers map each
+    /// source element to its destination clone (§8.5.1). The §4 verbatim
+    /// per-element customdata copy is replaced by the destination-driven
+    /// `(type, name)` layer-layout remap of §8.5.2: a layer present on both
+    /// meshes is copied source→clone, a destination-only layer is left at its
+    /// default on the clone, and a source-only layer is dropped. It is still a
+    /// copy, never an interpolation — one source per clone.
+    ///
+    /// Map contract cross-mesh (§8.5.1): `vert_map` / `edge_map` / `face_map`
+    /// carry `source → clone` and, together with `boundary_map` / `isovert_map`,
+    /// are the **primary** clone enumeration (their values are the destination
+    /// clones). They are **forward-only** here — unlike the in-place §5
+    /// bidirectional maps — because source and clone keys live in independent
+    /// per-mesh index spaces and a single map cannot hold both directions
+    /// without key collision (a clone in an empty `dest` reuses the source's low
+    /// indices). `geom_out` comes back **empty** cross-mesh (§8.5.1): it is the
+    /// same-mesh "new elements in this mesh" convenience, and the clones live in
+    /// `dest`; a cross-mesh caller reads the maps instead.
+    ///
+    /// See `radial-mesh-guides/operators/DUPLICATE.md` §8.5.
+    pub fn duplicate_into(
+        &self,
+        geom: &[GeomKey],
+        use_edge_flip_from_face: bool,
+        dest: &mut LoopMesh,
+    ) -> DuplicateResult {
+        let mut result = DuplicateResult::default();
+
+        // §8.5.2: one destination-driven remap plan per domain, built before the
+        // walk and replayed per cloned element.
+        let plans = RemapPlans {
+            vert: dest.vertex_attribs.build_remap_from(&self.vertex_attribs),
+            edge: dest.edge_attribs.build_remap_from(&self.edge_attribs),
+            face: dest.face_attribs.build_remap_from(&self.face_attribs),
+            loops: dest.loop_attribs.build_remap_from(&self.loop_attribs),
+        };
+
+        // Selection membership reads source-side (§8.5.1) so the §6
+        // classification can ask "is this incident element itself selected?".
+        let (vert_selected, edge_selected, face_selected) = self.selection_flags(geom);
+
+        // Ledgers keyed by source identity, value is the destination clone.
+        let mut vert_ledger: HashMap<VertexKey, VertexKey> = HashMap::new();
+        let mut edge_ledger: HashMap<EdgeKey, EdgeKey> = HashMap::new();
+
+        // ---- Pass A — selected verts, with the isolation test (§3.1) ----
+        for entry in geom {
+            let GeomKey::Vert(source) = *entry else {
+                continue;
+            };
+            if vert_ledger.contains_key(&source) {
+                continue;
+            }
+            let clone = self.clone_vertex_into(source, dest, &plans, &mut result);
+            vert_ledger.insert(source, clone);
+
+            if self.vert_isolated_in_selection(source, &edge_selected, &face_selected) {
+                result.isovert_map.insert(source, clone);
+            }
+        }
+
+        // ---- Pass B — selected edges, closing endpoints first (§3.2) ----
+        for entry in geom {
+            let GeomKey::Edge(source) = *entry else {
+                continue;
+            };
+            if edge_ledger.contains_key(&source) {
+                continue;
+            }
+            self.clone_edge_into(
+                source,
+                dest,
+                &mut vert_ledger,
+                &mut edge_ledger,
+                &face_selected,
+                use_edge_flip_from_face,
+                &plans,
+                &mut result,
+            );
+        }
+
+        // ---- Pass C — selected faces: corners, perimeter, then assemble
+        //               (§3.3) ----
+        for entry in geom {
+            let GeomKey::Face(source) = *entry else {
+                continue;
+            };
+            if result.face_map.contains_key(&source) {
+                continue;
+            }
+            self.clone_face_into(
+                source,
+                dest,
+                &mut vert_ledger,
+                &mut edge_ledger,
+                &face_selected,
+                use_edge_flip_from_face,
+                &plans,
+                &mut result,
+            );
+        }
+
+        result
+    }
+
+    /// Cross-mesh analogue of [`clone_vertex`](Self::clone_vertex): create the
+    /// clone in `dest`, remap per-vert customdata (§8.5.2), and record the
+    /// forward `source → clone` correspondence. No `geom_out` push — cross-mesh
+    /// `geom.out` is empty (§8.5.1).
+    fn clone_vertex_into(
+        &self,
+        source: VertexKey,
+        dest: &mut LoopMesh,
+        plans: &RemapPlans,
+        result: &mut DuplicateResult,
+    ) -> VertexKey {
+        let clone = dest.create_vertex(self.vertex_position(source));
+        dest.vertex_attribs.apply_remap_from(
+            &plans.vert,
+            clone.as_usize(),
+            &self.vertex_attribs,
+            source.as_usize(),
+        );
+        result.vert_map.insert(source, clone);
+        clone
+    }
+
+    /// Cross-mesh analogue of [`clone_edge`](Self::clone_edge): close endpoints
+    /// into `dest` via the ledger, create the clone edge in `dest`, remap
+    /// per-edge customdata (§8.5.2), record the forward correspondence, and
+    /// classify for `boundary_map` source-side (§6.1).
+    #[allow(clippy::too_many_arguments)]
+    fn clone_edge_into(
+        &self,
+        source: EdgeKey,
+        dest: &mut LoopMesh,
+        vert_ledger: &mut HashMap<VertexKey, VertexKey>,
+        edge_ledger: &mut HashMap<EdgeKey, EdgeKey>,
+        face_selected: &[bool],
+        use_edge_flip_from_face: bool,
+        plans: &RemapPlans,
+        result: &mut DuplicateResult,
+    ) -> EdgeKey {
+        let [v0, v1] = self.edge_vertices(source);
+        let c0 = self.closure_vertex_into(v0, dest, vert_ledger, plans, result);
+        let c1 = self.closure_vertex_into(v1, dest, vert_ledger, plans, result);
+
+        // §7 swap reads the source edge's boundary status and winding (§8.5.3:
+        // orthogonal to the remap — it touches endpoint order, never attributes).
+        let endpoints = if use_edge_flip_from_face && self.edge_flips_from_face(source) {
+            [c1, c0]
+        } else {
+            [c0, c1]
+        };
+
+        let clone = dest.create_edge(endpoints, EdgeCreateFlags::NONE);
+        dest.edge_attribs.apply_remap_from(
+            &plans.edge,
+            clone.as_usize(),
+            &self.edge_attribs,
+            source.as_usize(),
+        );
+        result.edge_map.insert(source, clone);
+
+        if self.edge_in_selection_radial_count(source, face_selected) < 2 {
+            result.boundary_map.insert(source, clone);
+        }
+
+        edge_ledger.insert(source, clone);
+        clone
+    }
+
+    /// Cross-mesh analogue of [`clone_face`](Self::clone_face): clone the corner
+    /// verts and perimeter edges into `dest` via the ledgers, assemble the clone
+    /// face in `dest`, then remap per-face and per-loop customdata in loop order
+    /// (§8.5.2).
+    #[allow(clippy::too_many_arguments)]
+    fn clone_face_into(
+        &self,
+        source: FaceKey,
+        dest: &mut LoopMesh,
+        vert_ledger: &mut HashMap<VertexKey, VertexKey>,
+        edge_ledger: &mut HashMap<EdgeKey, EdgeKey>,
+        face_selected: &[bool],
+        use_edge_flip_from_face: bool,
+        plans: &RemapPlans,
+        result: &mut DuplicateResult,
+    ) -> FaceKey {
+        let source_loops: Vec<LoopKey> = self.face_loop_keys(source);
+        let source_verts: Vec<VertexKey> =
+            source_loops.iter().map(|&l| self.loop_vertex(l)).collect();
+        let source_edges: Vec<EdgeKey> = source_loops.iter().map(|&l| self.loop_edge(l)).collect();
+
+        let clone_verts: Vec<VertexKey> = source_verts
+            .iter()
+            .map(|&v| self.closure_vertex_into(v, dest, vert_ledger, plans, result))
+            .collect();
+
+        let clone_edges: Vec<EdgeKey> = source_edges
+            .iter()
+            .map(|&e| match edge_ledger.get(&e) {
+                Some(&existing) => existing,
+                None => self.clone_edge_into(
+                    e,
+                    dest,
+                    vert_ledger,
+                    edge_ledger,
+                    face_selected,
+                    use_edge_flip_from_face,
+                    plans,
+                    result,
+                ),
+            })
+            .collect();
+
+        let clone = dest.face_create(&clone_verts, &clone_edges, FaceCreateFlags::NONE);
+        dest.face_attribs.apply_remap_from(
+            &plans.face,
+            clone.as_usize(),
+            &self.face_attribs,
+            source.as_usize(),
+        );
+
+        if !plans.loops.is_empty() {
+            let clone_loops: Vec<LoopKey> = dest.face_loop_keys(clone);
+            for (clone_loop, source_loop) in clone_loops.iter().zip(source_loops.iter()) {
+                dest.loop_attribs.apply_remap_from(
+                    &plans.loops,
+                    clone_loop.as_usize(),
+                    &self.loop_attribs,
+                    source_loop.as_usize(),
+                );
+            }
+        }
+
+        result.face_map.insert(source, clone);
+        clone
+    }
+
+    /// Cross-mesh closure-walk vert copy (§3.2 / §3.3): reuse the ledger clone
+    /// if present, else clone the source vert into `dest`.
+    fn closure_vertex_into(
+        &self,
+        source: VertexKey,
+        dest: &mut LoopMesh,
+        vert_ledger: &mut HashMap<VertexKey, VertexKey>,
+        plans: &RemapPlans,
+        result: &mut DuplicateResult,
+    ) -> VertexKey {
+        if let Some(&existing) = vert_ledger.get(&source) {
+            return existing;
+        }
+        let clone = self.clone_vertex_into(source, dest, plans, result);
+        vert_ledger.insert(source, clone);
+        clone
     }
 }
 
@@ -872,5 +1160,298 @@ mod tests {
         b.sort_by(|x, y| x.partial_cmp(y).unwrap());
         assert_eq!(a, b, "loop CD copied verbatim in loop order");
         mesh.validate_topology();
+    }
+
+    // ---- Cross-mesh `dest` (DUPLICATE.md §8.5) ----
+
+    #[test]
+    fn dest_single_face_into_empty_dest() {
+        // §8.5.1: naming one face clones its whole closure into `dest`; the
+        // source is untouched, `geom_out` is empty cross-mesh, and the maps
+        // (forward `source -> clone`) are the clone enumeration.
+        let mut src = LoopMesh::new();
+        let face = unit_quad(&mut src);
+        let mut dest = LoopMesh::new();
+
+        let result = src.duplicate_into(&[face.into()], false, &mut dest);
+
+        // Clones born in dest.
+        assert_eq!(dest.vertex_count(), 4);
+        assert_eq!(dest.edge_count(), 4);
+        assert_eq!(dest.face_count(), 1);
+        // Source entirely untouched.
+        assert_eq!(
+            (src.vertex_count(), src.edge_count(), src.face_count()),
+            (4, 4, 1)
+        );
+
+        // geom_out empty cross-mesh (§8.5.1); forward-only maps carry the clones.
+        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh");
+        assert_eq!(result.vert_map.len(), 4, "forward-only source -> clone");
+        assert_eq!(result.edge_map.len(), 4);
+        assert_eq!(result.face_map.len(), 1);
+        assert_eq!(result.boundary_map.len(), 4, "every perimeter edge frontier");
+        assert!(result.isovert_map.is_empty());
+
+        // Each clone vert lands in `dest` at its source's exact position (§2).
+        for sv in src.face_vert_keys(face) {
+            let cv = result.vert_map.get(&sv).copied().unwrap();
+            assert_eq!(dest.vertex_position(cv), src.vertex_position(sv));
+        }
+        dest.validate_topology();
+        src.validate_topology();
+    }
+
+    #[test]
+    fn dest_cd_layer_layout_remap_copy_default_drop() {
+        // §8.5.2: source layout {v_color, v_temp} vs dest layout {v_color,
+        // v_extra}. v_color matches both sides -> copied; v_extra is dest-only
+        // -> defaulted on the clone; v_temp is source-only -> dropped.
+        let mut src = LoopMesh::new();
+        let v_color = src
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("v_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let v_temp = src
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("v_temp"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        let face = unit_quad(&mut src);
+        for (i, v) in src.face_vert_keys(face).into_iter().enumerate() {
+            let f = i as f32;
+            src.vertex_attribs_mut()
+                .set_vec3(v_color, v.as_usize(), [f, f + 1.0, f + 2.0]);
+            src.vertex_attribs_mut().set_f32(v_temp, v.as_usize(), 9.0);
+        }
+
+        let mut dest = LoopMesh::new();
+        let d_color = dest
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("v_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let d_extra = dest
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("v_extra"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+
+        let result = src.duplicate_into(&[face.into()], false, &mut dest);
+
+        assert_eq!(result.vert_map.len(), 4);
+        // v_temp has no dest slot at all -> dropped.
+        assert!(
+            dest.vertex_attribs()
+                .find(&AttributeKey::custom("v_temp"))
+                .is_none(),
+            "source-only layer dropped"
+        );
+        for (&sv, &cv) in result.vert_map.iter() {
+            let want = src.vertex_attribs().get_vec3(v_color, sv.as_usize()).unwrap();
+            let got = dest.vertex_attribs().get_vec3(d_color, cv.as_usize()).unwrap();
+            assert_eq!(want, got, "matched layer copied source -> clone");
+            assert_eq!(
+                dest.vertex_attribs().get_vec3(d_extra, cv.as_usize()).unwrap(),
+                [0.0; 3],
+                "dest-only layer defaulted on the clone"
+            );
+        }
+        let _ = v_temp;
+        dest.validate_topology();
+    }
+
+    #[test]
+    fn dest_matching_layout_copies_all_cd_homes_including_loops() {
+        // §8.5.2 degenerate (identity) remap: matching layouts on both meshes
+        // across all four CD homes -> every clone element equals its source,
+        // exercising the per-loop remap path too.
+        fn register(m: &mut LoopMesh) -> (
+            ElementAttributeKey,
+            ElementAttributeKey,
+            ElementAttributeKey,
+            ElementAttributeKey,
+        ) {
+            let vc = m
+                .register_vertex_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("v_color"),
+                    AttrType::Vec3,
+                ))
+                .unwrap();
+            let ec = m
+                .register_edge_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("e_crease"),
+                    AttrType::F32,
+                ))
+                .unwrap();
+            let fc = m
+                .register_face_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("f_color"),
+                    AttrType::Vec3,
+                ))
+                .unwrap();
+            let uv = m
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("uv"),
+                    AttrType::Vec2,
+                ))
+                .unwrap();
+            (vc, ec, fc, uv)
+        }
+
+        let mut src = LoopMesh::new();
+        let (vc, ec, fc, uv) = register(&mut src);
+        let face = unit_quad(&mut src);
+        for v in src.face_vert_keys(face) {
+            let p = src.vertex_position(v);
+            src.vertex_attribs_mut()
+                .set_vec3(vc, v.as_usize(), [p.x, p.y, 1.0]);
+        }
+        for (i, e) in src.face_edge_keys(face).into_iter().enumerate() {
+            src.edge_attribs_mut()
+                .set_f32(ec, e.as_usize(), 0.5 * (i as f32 + 1.0));
+        }
+        src.face_attribs_mut()
+            .set_vec3(fc, face.as_usize(), [0.3, 0.4, 0.5]);
+        for (i, l) in src.face_loop_keys(face).into_iter().enumerate() {
+            src.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [i as f32, i as f32 * 3.0]);
+        }
+
+        let mut dest = LoopMesh::new();
+        let (dvc, dec, dfc, duv) = register(&mut dest);
+
+        let result = src.duplicate_into(&[face.into()], false, &mut dest);
+
+        for (&sv, &cv) in result.vert_map.iter() {
+            assert_eq!(
+                src.vertex_attribs().get_vec3(vc, sv.as_usize()),
+                dest.vertex_attribs().get_vec3(dvc, cv.as_usize()),
+                "vert CD remapped (identity)"
+            );
+        }
+        for (&se, &ce) in result.edge_map.iter() {
+            assert_eq!(
+                src.edge_attribs().get_f32(ec, se.as_usize()),
+                dest.edge_attribs().get_f32(dec, ce.as_usize()),
+                "edge CD remapped (identity)"
+            );
+        }
+        let clone_face = *result.face_map.values().next().unwrap();
+        assert_eq!(
+            src.face_attribs().get_vec3(fc, face.as_usize()),
+            dest.face_attribs().get_vec3(dfc, clone_face.as_usize()),
+            "face CD remapped (identity)"
+        );
+        let mut src_uv: Vec<[f32; 2]> = src
+            .face_loop_keys(face)
+            .iter()
+            .map(|&l| src.loop_attribs().get_vec2(uv, l.as_usize()).unwrap())
+            .collect();
+        let mut clone_uv: Vec<[f32; 2]> = dest
+            .face_loop_keys(clone_face)
+            .iter()
+            .map(|&l| dest.loop_attribs().get_vec2(duv, l.as_usize()).unwrap())
+            .collect();
+        src_uv.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        clone_uv.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(src_uv, clone_uv, "loop CD remapped in loop order");
+        dest.validate_topology();
+    }
+
+    #[test]
+    fn dest_into_populated_dest_is_additive() {
+        // §8.5.3: cloning into a dest that already holds a triangle appends the
+        // clone disjointly; the triangle and the source are left untouched and
+        // no clone aliases a pre-existing dest element.
+        let mut src = LoopMesh::new();
+        let face = unit_quad(&mut src);
+
+        let mut dest = LoopMesh::new();
+        let tri = create_face_from_verts(
+            &mut dest,
+            &[
+                Vec3::new(10.0, 0.0, 0.0),
+                Vec3::new(11.0, 0.0, 0.0),
+                Vec3::new(10.0, 1.0, 0.0),
+            ],
+        );
+        let tri_verts: HashSet<VertexKey> = dest.face_vert_keys(tri).into_iter().collect();
+
+        let result = src.duplicate_into(&[face.into()], false, &mut dest);
+
+        // Additive: triangle (3V/3E/1F) + quad clone (4V/4E/1F).
+        assert_eq!(dest.vertex_count(), 7);
+        assert_eq!(dest.edge_count(), 7);
+        assert_eq!(dest.face_count(), 2);
+
+        // No clone aliases a pre-existing dest vert.
+        for cv in result.vert_map.values() {
+            assert!(
+                !tri_verts.contains(cv),
+                "clone never aliases a pre-existing dest element"
+            );
+        }
+        // The pre-existing triangle is intact.
+        assert_eq!(dest.face_vert_keys(tri).len(), 3);
+        // Source untouched.
+        assert_eq!(
+            (src.vertex_count(), src.edge_count(), src.face_count()),
+            (4, 4, 1)
+        );
+        dest.validate_topology();
+        src.validate_topology();
+    }
+
+    #[test]
+    fn dest_only_layer_defaults_over_recycled_slot_stale_value() {
+        // §8.5.2/§8.5.3: a destination-only layer must be written to its type
+        // default on the clone, *not* left to the freshly-created slot's
+        // contents. When the clone is minted into a recycled slab slot, that
+        // slot still carries the stale value its previous occupant left (slab
+        // removal never resets the attribute buckets, and create's grow is a
+        // resize no-op for a recycled key), so the default must be stamped on.
+        let mut src = LoopMesh::new();
+        let source_vert = src.create_vertex(Vec3::new(2.0, 3.0, 4.0));
+
+        let mut dest = LoopMesh::new();
+        // A dest-only layer the source has no `(type, name)` match for.
+        let scratch = dest
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("scratch"),
+                AttrType::I32,
+            ))
+            .unwrap();
+
+        // Occupy the lowest slab slot, poison its `scratch` bucket entry, then
+        // free the slot so the next `create_vertex` recycles it (slab hands out
+        // the lowest vacant key).
+        let throwaway = dest.create_vertex(Vec3::ZERO);
+        dest.vertex_attribs_mut()
+            .set_i32(scratch, throwaway.as_usize(), 999);
+        dest.remove_vertex_slab_entry(throwaway);
+
+        let result = src.duplicate_into(&[source_vert.into()], false, &mut dest);
+
+        let clone = result.vert_map.get(&source_vert).copied().unwrap();
+        // The clone reused the recycled slot (the only freed key in `dest`).
+        assert_eq!(
+            clone.as_usize(),
+            throwaway.as_usize(),
+            "clone minted into the recycled slot",
+        );
+        // Old skip-the-layer behaviour would leak 999; the explicit default
+        // branch stamps the type default.
+        assert_eq!(
+            dest.vertex_attribs().get_i32(scratch, clone.as_usize()),
+            Some(0),
+            "dest-only layer defaulted on the clone, not left stale",
+        );
+        dest.validate_topology();
     }
 }

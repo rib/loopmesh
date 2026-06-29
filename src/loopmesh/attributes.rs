@@ -951,6 +951,73 @@ impl ElementAttributes {
         }
     }
 
+    /// Build a destination-driven `(type, name)` remap plan from `src` into
+    /// `self` (DUPLICATE.md §8.5.2). The walk is over **destination** layers;
+    /// each yields one [`RemapStep`]:
+    ///
+    /// - A destination layer with a source layer of the **same type and the
+    ///   same name** → a [`Copy`](RemapStep::Copy) step (matched layer copied
+    ///   source → clone).
+    /// - A destination-only layer with no matching source → a
+    ///   [`SetDefault`](RemapStep::SetDefault) step: the clone receives the
+    ///   layer type's default, written **explicitly**. This must not be left to
+    ///   the freshly-created element's slot already holding a default — a clone
+    ///   minted into a *recycled* slab slot inherits whatever stale value that
+    ///   slot last carried (creation's grow is a resize no-op for a recycled
+    ///   key, and removal never resets the attribute buckets), so the default
+    ///   has to be stamped on.
+    ///
+    /// A source-only layer (no matching destination layer) is never visited —
+    /// the walk is over destination layers — so it is simply dropped. Build
+    /// once per domain, replay per element with
+    /// [`apply_remap_from`](Self::apply_remap_from). The same-mesh path is the
+    /// degenerate plan where every layer matches itself — i.e. the verbatim
+    /// copy of §4.
+    pub(crate) fn build_remap_from(&self, src: &ElementAttributes) -> RemapPlan {
+        let mut plan = RemapPlan::new();
+        for (_, dst_desc) in self.iter_descriptors() {
+            let matched = src
+                .iter_descriptors()
+                .find(|(_, src_desc)| src_desc.ty == dst_desc.ty && src_desc.key == dst_desc.key);
+            match matched {
+                Some((_, src_desc)) => plan.push(RemapStep::Copy {
+                    dst: dst_desc.storage,
+                    src: src_desc.storage,
+                }),
+                None => plan.push(RemapStep::SetDefault {
+                    dst: dst_desc.storage,
+                }),
+            }
+        }
+        plan
+    }
+
+    /// Replay a [`build_remap_from`](Self::build_remap_from) plan into
+    /// `self`'s `dst_slot` (DUPLICATE.md §8.5.2):
+    ///
+    /// - [`Copy`](RemapStep::Copy) → copy the matched layer's value from `src`'s
+    ///   `src_slot`. A copy, never an interpolation — duplicate has exactly one
+    ///   source per clone, so only the *offsets* differ from §4's verbatim copy.
+    /// - [`SetDefault`](RemapStep::SetDefault) → write the destination-only
+    ///   layer's type default onto the clone, overwriting any stale value the
+    ///   recycled slot may carry.
+    pub(crate) fn apply_remap_from(
+        &mut self,
+        plan: &RemapPlan,
+        dst_slot: usize,
+        src: &ElementAttributes,
+        src_slot: usize,
+    ) {
+        for step in plan {
+            match *step {
+                RemapStep::Copy { dst, src: src_storage } => {
+                    apply_copy_cross(self, dst, dst_slot, src, src_storage, src_slot);
+                }
+                RemapStep::SetDefault { dst } => set_storage_default(self, dst, dst_slot),
+            }
+        }
+    }
+
     /// Reset every attribute's `slot` to its default-init value. Used when
     /// recycling a slab slot whose previous attribute values are no longer
     /// meaningful.
@@ -959,83 +1026,91 @@ impl ElementAttributes {
             self.attributes.iter().map(|(_, d)| d.storage).collect();
 
         for storage in plan {
-            match storage {
-                AttributeStorage::U8(b) => {
-                    if let Some(v) = self.attributes_u8.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = 0;
-                        }
-                    }
+            set_storage_default(self, storage, slot);
+        }
+    }
+}
+
+/// Stamp one layer's type default onto `slot` (zero / `false` / `None`).
+/// Shared by [`ElementAttributes::clear_slot`] and the remap plan's
+/// destination-only [`SetDefault`](RemapStep::SetDefault) branch — both need
+/// "overwrite whatever is in this slot with the layer default".
+fn set_storage_default(attrs: &mut ElementAttributes, storage: AttributeStorage, slot: usize) {
+    match storage {
+        AttributeStorage::U8(b) => {
+            if let Some(v) = attrs.attributes_u8.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = 0;
                 }
-                AttributeStorage::I32(b) => {
-                    if let Some(v) = self.attributes_i32.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = 0;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::I32(b) => {
+            if let Some(v) = attrs.attributes_i32.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = 0;
                 }
-                AttributeStorage::U32(b) => {
-                    if let Some(v) = self.attributes_u32.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = 0;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::U32(b) => {
+            if let Some(v) = attrs.attributes_u32.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = 0;
                 }
-                AttributeStorage::F32(b) => {
-                    if let Some(v) = self.attributes_f32.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = 0.0;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::F32(b) => {
+            if let Some(v) = attrs.attributes_f32.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = 0.0;
                 }
-                AttributeStorage::Vec2(b) => {
-                    if let Some(v) = self.attributes_vec2.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = [0.0; 2];
-                        }
-                    }
+            }
+        }
+        AttributeStorage::Vec2(b) => {
+            if let Some(v) = attrs.attributes_vec2.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = [0.0; 2];
                 }
-                AttributeStorage::Vec3(b) => {
-                    if let Some(v) = self.attributes_vec3.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = [0.0; 3];
-                        }
-                    }
+            }
+        }
+        AttributeStorage::Vec3(b) => {
+            if let Some(v) = attrs.attributes_vec3.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = [0.0; 3];
                 }
-                AttributeStorage::Vec4(b) => {
-                    if let Some(v) = self.attributes_vec4.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = [0.0; 4];
-                        }
-                    }
+            }
+        }
+        AttributeStorage::Vec4(b) => {
+            if let Some(v) = attrs.attributes_vec4.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = [0.0; 4];
                 }
-                AttributeStorage::Bool(b) => {
-                    if let Some(v) = self.attributes_bool.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = false;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::Bool(b) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = false;
                 }
-                AttributeStorage::F64(b) => {
-                    if let Some(v) = self.attributes_f64.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = 0.0;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::F64(b) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = 0.0;
                 }
-                AttributeStorage::Vec4U8(b) => {
-                    if let Some(v) = self.attributes_vec4u8.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = [0; 4];
-                        }
-                    }
+            }
+        }
+        AttributeStorage::Vec4U8(b) => {
+            if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = [0; 4];
                 }
-                AttributeStorage::String(b) => {
-                    if let Some(v) = self.attributes_string.get_mut(b) {
-                        if slot < v.len() {
-                            v[slot] = None;
-                        }
-                    }
+            }
+        }
+        AttributeStorage::String(b) => {
+            if let Some(v) = attrs.attributes_string.get_mut(b) {
+                if slot < v.len() {
+                    v[slot] = None;
                 }
             }
         }
@@ -1640,7 +1715,85 @@ fn apply_interp(
     }
 }
 
-/// Per-attribute dispatch for [`ElementAttributes::copy_into`].
+/// One destination layer's remap action (DUPLICATE.md §8.5.2). The
+/// destination-driven plan walks the *destination* layers; each becomes either
+/// a copy of a `(type, name)`-matched source layer or an explicit default for a
+/// destination-only layer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RemapStep {
+    /// Matched layer: copy `src` storage → `dst` storage at the per-element slots.
+    Copy {
+        dst: AttributeStorage,
+        src: AttributeStorage,
+    },
+    /// Destination-only layer: stamp the layer type's default onto `dst`.
+    SetDefault { dst: AttributeStorage },
+}
+
+/// A destination-driven customdata remap plan (DUPLICATE.md §8.5.2): one
+/// [`RemapStep`] per destination layer, built once per domain and replayed per
+/// cloned element across two meshes.
+pub(crate) type RemapPlan = Vec<RemapStep>;
+
+/// Cross-layout single-layer copy (DUPLICATE.md §8.5.2): copy the value at
+/// `src_slot` in `src`'s layer into `dst_slot` in `dst`'s layer. The two
+/// storages share an [`AttrType`] (the plan matched them by `(type, name)`), so
+/// only their bucket indices differ; a mismatched pair is a no-op.
+fn apply_copy_cross(
+    dst: &mut ElementAttributes,
+    dst_storage: AttributeStorage,
+    dst_slot: usize,
+    src: &ElementAttributes,
+    src_storage: AttributeStorage,
+    src_slot: usize,
+) {
+    macro_rules! copy {
+        ($dbucket:ident, $db:expr, $sbucket:ident, $sb:expr) => {{
+            if let (Some(dv), Some(sv)) = (dst.$dbucket.get_mut($db), src.$sbucket.get($sb)) {
+                if let (true, Some(value)) = (dst_slot < dv.len(), sv.get(src_slot)) {
+                    dv[dst_slot] = value.clone();
+                }
+            }
+        }};
+    }
+    match (dst_storage, src_storage) {
+        (AttributeStorage::Bool(db), AttributeStorage::Bool(sb)) => {
+            copy!(attributes_bool, db, attributes_bool, sb)
+        }
+        (AttributeStorage::U8(db), AttributeStorage::U8(sb)) => {
+            copy!(attributes_u8, db, attributes_u8, sb)
+        }
+        (AttributeStorage::I32(db), AttributeStorage::I32(sb)) => {
+            copy!(attributes_i32, db, attributes_i32, sb)
+        }
+        (AttributeStorage::U32(db), AttributeStorage::U32(sb)) => {
+            copy!(attributes_u32, db, attributes_u32, sb)
+        }
+        (AttributeStorage::F32(db), AttributeStorage::F32(sb)) => {
+            copy!(attributes_f32, db, attributes_f32, sb)
+        }
+        (AttributeStorage::F64(db), AttributeStorage::F64(sb)) => {
+            copy!(attributes_f64, db, attributes_f64, sb)
+        }
+        (AttributeStorage::Vec2(db), AttributeStorage::Vec2(sb)) => {
+            copy!(attributes_vec2, db, attributes_vec2, sb)
+        }
+        (AttributeStorage::Vec3(db), AttributeStorage::Vec3(sb)) => {
+            copy!(attributes_vec3, db, attributes_vec3, sb)
+        }
+        (AttributeStorage::Vec4(db), AttributeStorage::Vec4(sb)) => {
+            copy!(attributes_vec4, db, attributes_vec4, sb)
+        }
+        (AttributeStorage::Vec4U8(db), AttributeStorage::Vec4U8(sb)) => {
+            copy!(attributes_vec4u8, db, attributes_vec4u8, sb)
+        }
+        (AttributeStorage::String(db), AttributeStorage::String(sb)) => {
+            copy!(attributes_string, db, attributes_string, sb)
+        }
+        _ => {}
+    }
+}
+
 fn apply_copy(attrs: &mut ElementAttributes, dst: usize, src: usize, storage: AttributeStorage) {
     match storage {
         AttributeStorage::F32(b) => {
