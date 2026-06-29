@@ -676,10 +676,13 @@ impl LoopMesh {
     // elements as the operator runs, pop the layer when done. Bits are
     // numbered `0..32`; the operator names them.
     //
-    // For the cheap case (≤3 transient bits, no risk of conflicting with
-    // other tag users), [`ElementFlags::TAG0`]..[`ElementFlags::TAG2`] is
-    // strictly faster — no allocation, one-instruction access. The op-flag
-    // pool is for richer cases.
+    // For the cheap case (≤2 transient bits), [`ElementFlags::TAG1`]..
+    // [`ElementFlags::TAG2`] is strictly faster — no allocation,
+    // one-instruction access. `TAG0` is *not* free scratch: it is reserved as
+    // the persistent, caller-settable public element tag (exposed via
+    // [`LoopMesh::set_vert_tag`]/[`LoopMesh::vert_tag`], modeling
+    // `BM_ELEM_TAG`), so grabbing it transiently would clobber a caller's
+    // input. The op-flag pool is for richer cases.
 
     pub fn push_vert_op_flag_layer(&mut self) -> crate::op_flags::VertOpFlagLayer {
         let w = self.vertices.key_watermark();

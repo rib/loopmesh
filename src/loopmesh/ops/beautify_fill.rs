@@ -89,8 +89,10 @@ pub enum BeautifyMethod {
 /// [`LoopMesh::beautify_fill`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BeautifyFillOptions {
-    /// Confine rotation to tag-seam edges (apexes differing in tag). Out of
-    /// scope this cycle.
+    /// Confine rotation to tag-seam edges: an otherwise-eligible edge rotates
+    /// only when its two opposite-corner (apex) vertices differ in their
+    /// persistent element tag — exactly one tagged (BEAUTIFY_FILL.md §6.2, §3
+    /// gate 6). The tag is read from each apex's [`LoopMesh::vert_tag`] bit.
     pub use_restrict_tag: bool,
     /// The beauty metric. Defaults to [`BeautifyMethod::Area`].
     pub method: BeautifyMethod,
@@ -197,12 +199,6 @@ impl LoopMesh {
         edges: &[EdgeKey],
         options: BeautifyFillOptions,
     ) -> BeautifyFillResult {
-        if options.use_restrict_tag {
-            unimplemented!(
-                "beautify_fill: use_restrict_tag not yet implemented (BEAUTIFY_FILL.md §6.2)"
-            );
-        }
-
         let mut result = BeautifyFillResult::default();
 
         // §3 gate 3 — only triangle members of the patch participate. The set
@@ -233,7 +229,9 @@ impl LoopMesh {
             if active.contains_key(&edge) {
                 continue;
             }
-            if let Some(cost) = self.beautify_edge_cost(edge, &patch, options.method) {
+            if let Some(cost) =
+                self.beautify_edge_cost(edge, &patch, options.method, options.use_restrict_tag)
+            {
                 if cost < 0.0 {
                     active.insert(edge, cost);
                     heap.push(HeapEntry {
@@ -324,7 +322,7 @@ impl LoopMesh {
                     continue;
                 }
                 let admit = self
-                    .beautify_edge_cost(neighbour, &patch, options.method)
+                    .beautify_edge_cost(neighbour, &patch, options.method, options.use_restrict_tag)
                     .and_then(|cost| {
                     if cost >= 0.0 {
                         return None;
@@ -370,9 +368,18 @@ impl LoopMesh {
         edge: EdgeKey,
         patch: &HashSet<FaceKey>,
         method: BeautifyMethod,
+        use_restrict_tag: bool,
     ) -> Option<f32> {
         // §3 gate 2 — manifold, with a well-defined opposite diagonal.
         let (apex_a, apex_c) = self.edge_rotate_diagonal(edge, true)?;
+        // §3 gate 6 / §6.2 — the seam restriction. Metric-agnostic front-gate:
+        // when both opposite corners (apexes) share a tag state — both tagged or
+        // both untagged — the edge lies *within* one region and is held out of
+        // the worklist (equivalent to the never-rotate sentinel). It rotates
+        // only when exactly one apex is tagged, i.e. it straddles the seam.
+        if use_restrict_tag && self.vert_tag(apex_a) == self.vert_tag(apex_c) {
+            return None;
+        }
         // §3 gate 3 — both flanking faces are members of the triangle patch.
         let (face_a, face_b) = self.beautify_flanking_faces(edge)?;
         if !patch.contains(&face_a) || !patch.contains(&face_b) {
@@ -919,6 +926,111 @@ mod tests {
             (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             counts,
             "mesh untouched"
+        );
+    }
+
+    /// §6.2 / §3 gate 6 — under `use_restrict_tag`, an edge whose two apexes
+    /// share a tag state (here *both* tagged) is front-gated out of the
+    /// worklist: the otherwise-beneficial `{0,2} → {1,3}` rotation never fires,
+    /// `geom.out` is empty, and the patch is returned unchanged.
+    #[test]
+    fn restrict_tag_same_apex_tags_blocks_rotation() {
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = long_diagonal_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+        // Apexes are v1 / v3 (the two opposite corners of the shared {0,2}
+        // diagonal); give them the SAME tag state.
+        mesh.set_vert_tag(v1, true);
+        mesh.set_vert_tag(v3, true);
+        let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: true,
+                method: BeautifyMethod::Area,
+            },
+        );
+
+        assert!(out.is_empty(), "same-tag apexes ⇒ empty geom.out");
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_some(),
+            "the long diagonal survives (no rotation)"
+        );
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_none(),
+            "the short diagonal was never created"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            counts,
+            "mesh untouched"
+        );
+    }
+
+    /// §6.2 / §3 gate 6 — under `use_restrict_tag`, an edge whose two apexes
+    /// *differ* in tag (exactly one tagged) straddles the seam and so passes the
+    /// gate: the beneficial `{0,2} → {1,3}` rotation fires, matching the
+    /// un-restricted AREA result. Pins that the gate is a tag-*difference* test
+    /// (contrast the both-tagged blocks arm above).
+    #[test]
+    fn restrict_tag_mixed_apex_tags_rotates() {
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = long_diagonal_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+        // Only one apex tagged ⇒ the two apexes differ ⇒ the seam test admits.
+        mesh.set_vert_tag(v1, true);
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: true,
+                method: BeautifyMethod::Area,
+            },
+        );
+
+        assert_eq!(out.edges().count(), 1, "one edge rotated");
+        assert_eq!(out.faces().count(), 2, "two flanking faces reported");
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_some(),
+            "the short diagonal {{1,3}} now exists"
+        );
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_none(),
+            "the long diagonal {{0,2}} is gone"
+        );
+    }
+
+    /// Regression guard — `use_restrict_tag = false` ignores apex tags entirely.
+    /// Both apexes carry the tag (which *would* block under restriction), yet
+    /// the unrestricted run still rotates the beneficial diagonal.
+    #[test]
+    fn restrict_tag_disabled_ignores_apex_tags() {
+        let mut mesh = LoopMesh::new();
+        let ([v0, v1, v2, v3], [f0, f1]) = long_diagonal_strip(&mut mesh);
+        let diag = edge_between(&mesh, v0, v2);
+        mesh.set_vert_tag(v1, true);
+        mesh.set_vert_tag(v3, true);
+
+        let out = mesh.beautify_fill(
+            &[f0, f1],
+            &[diag],
+            BeautifyFillOptions {
+                use_restrict_tag: false,
+                method: BeautifyMethod::Area,
+            },
+        );
+
+        assert_eq!(out.edges().count(), 1, "tags ignored ⇒ rotation still fires");
+        assert!(
+            mesh.query_edge_exists(v1, v3).is_some(),
+            "the short diagonal {{1,3}} now exists"
+        );
+        assert!(
+            mesh.query_edge_exists(v0, v2).is_none(),
+            "the long diagonal {{0,2}} is gone"
         );
     }
 }

@@ -231,6 +231,24 @@ impl LoopMesh {
         self.vertices.get(v).eflags
     }
 
+    /// Set or clear a vertex's persistent **element tag** header bit — the
+    /// caller-settable tag an operator reads as input (e.g. `beautify_fill`'s
+    /// `use_restrict_tag` seam restriction, BEAUTIFY_FILL.md §6.2). It is a
+    /// persistent flag the caller sets *before* the op; the op only reads it.
+    ///
+    /// why TAG0: of the three available header tag bits
+    /// ([`ElementFlags::TAG0`]..[`TAG2`]) loopmesh fixes TAG0 as the single
+    /// public "element tag" convention, so a caller and the operators it drives
+    /// agree on one bit; TAG1/TAG2 stay free for transient operator scratch use.
+    pub fn set_vert_tag(&mut self, v: VertexKey, tagged: bool) {
+        self.vertices.get_mut(v).eflags.set(ElementFlags::TAG0, tagged);
+    }
+
+    /// Read a vertex's persistent element-tag header bit (see [`Self::set_vert_tag`]).
+    pub fn vert_tag(&self, v: VertexKey) -> bool {
+        self.vertices.get(v).eflags.contains(ElementFlags::TAG0)
+    }
+
     /// Set or clear the edge's persistent HIDDEN header bit.
     pub fn set_edge_hidden(&mut self, e: EdgeKey, hidden: bool) {
         self.edges.get_mut(e).eflags.set(ElementFlags::HIDDEN, hidden);
