@@ -73,6 +73,28 @@ impl Default for BevelVmeshMethod {
     }
 }
 
+/// How a junction's corner is reshaped when two beveled edges meet at an extreme
+/// angle (BEVEL.md §1.2 / §8.9). `Sharp` is the default V-join the foundational
+/// junction already builds; `Patch` and `Arc` replace that single point with a
+/// small fill pushed out from the junction.
+///
+/// At a **non-reflex** (inner) sector the two non-sharp modes coincide — the inner
+/// miter is always an arc start (§8.9.3), so `Patch` and `Arc` produce identical
+/// inner geometry. The flat two-boundvert `Patch` strip is an **outer**-only
+/// feature (§8.9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BevelMiter {
+    Sharp,
+    Patch,
+    Arc,
+}
+
+impl Default for BevelMiter {
+    fn default() -> Self {
+        BevelMiter::Sharp
+    }
+}
+
 /// Parameters for [`LoopMesh::bevel`]. The foundational case (BEVEL.md §3) is
 /// reachable by setting only `offset` and leaving every other field at its
 /// default: `affect = Vertices`, `segments = 1`, `offset_type = Offset`.
@@ -158,6 +180,29 @@ pub struct BevelOptions<'a> {
     /// no-op at a symmetric junction, diverging only at an irregular one
     /// (§8.8.5). Defaults to `false`.
     pub loop_slide: bool,
+    /// How a junction's corner is reshaped at a **non-reflex** (inner) sector
+    /// (BEVEL.md §8.9.3). `Sharp` (the default) keeps the foundational V-join; a
+    /// non-`Sharp` value rebuilds every convex non-reflex sector as an **arc
+    /// start** — one extra boundvert on the far flank, the original meet-point
+    /// stored as the arc midpoint, and a circular miter profile the [V-ADJ] grid
+    /// spans (§8.9.5). `Patch` and `Arc` produce identical inner geometry
+    /// (§8.9.3). Only engages on the forced tri-corner [V-ADJ] fill
+    /// (`vmesh_method = Adj`, `segments = 2`, the symmetric cube corner); other
+    /// junctions decline to `Sharp`. A junction carrying a reflex sector (the
+    /// outer-miter case, §8.9.2) also declines for now.
+    pub miter_inner: BevelMiter,
+    /// How a junction's corner is reshaped at a **reflex** (outer) sector
+    /// (BEVEL.md §8.9.2). Accepted for surface compatibility but **not yet
+    /// implemented**: any value (including non-`Sharp`) currently behaves as
+    /// `Sharp` — the reflex `s ≥ 3` junction path is a later cycle. Defaults to
+    /// `Sharp`.
+    pub miter_outer: BevelMiter,
+    /// How far an inner `Arc` miter is pushed away from the junction along each
+    /// beveled edge (BEVEL.md §8.9.4). Applies **only** to the inner miter; the
+    /// outer miter ignores it. At `spread = 0` the two arc ends stay coincident
+    /// with the meet-point and the arc collapses to a sliver, so a meaningful
+    /// inner miter wants `spread > 0`. Defaults to `0.0`.
+    pub spread: f32,
 }
 
 impl Default for BevelOptions<'_> {
@@ -176,6 +221,9 @@ impl Default for BevelOptions<'_> {
             use_weights: false,
             vert_weights: &[],
             loop_slide: false,
+            miter_inner: BevelMiter::Sharp,
+            miter_outer: BevelMiter::Sharp,
+            spread: 0.0,
         }
     }
 }
@@ -830,20 +878,42 @@ impl LoopMesh {
         let mut chains: Vec<EdgeEndChain> = Vec::new();
         let mut face_subst: Vec<FaceSubstitution> = Vec::new();
         let mut junction_cuts: Vec<JunctionCut> = Vec::new();
+        let mut miter_junctions: Vec<MiterJunction> = Vec::new();
 
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
-                self.build_junction_chains(
-                    endpoint,
-                    &is_beveled,
-                    offset,
-                    segments,
-                    profile,
-                    &mut chains,
-                    &mut face_subst,
-                    &mut junction_cuts,
-                    result,
-                );
+                // §8.9.3: the inner miter rides the forced tri-corner [V-ADJ] fill.
+                // It engages only for `vmesh_method = Adj` with a non-sharp inner
+                // miter; `build_junction_inner_miter` itself declines (without
+                // mutating) any junction outside the convex tri-corner case, falling
+                // back to the sharp boundvert ring below.
+                let inner_miter = options.miter_inner != BevelMiter::Sharp
+                    && options.vmesh_method == BevelVmeshMethod::Adj
+                    && self.build_junction_inner_miter(
+                        endpoint,
+                        &is_beveled,
+                        offset,
+                        segments,
+                        profile,
+                        options.spread,
+                        &mut chains,
+                        &mut face_subst,
+                        &mut miter_junctions,
+                        result,
+                    );
+                if !inner_miter {
+                    self.build_junction_chains(
+                        endpoint,
+                        &is_beveled,
+                        offset,
+                        segments,
+                        profile,
+                        &mut chains,
+                        &mut face_subst,
+                        &mut junction_cuts,
+                        result,
+                    );
+                }
             } else {
                 self.build_terminal_chains(
                     endpoint,
@@ -917,6 +987,12 @@ impl LoopMesh {
                     );
                 }
             }
+        }
+
+        // Phase 4b (§8.9.3 / §8.9.5): the inner-miter junctions take the enlarged
+        // tri-corner [V-ADJ] fill — the six-quad pinwheel over the arc-start ring.
+        for mj in &miter_junctions {
+            self.build_adj_fill_inner_miter(mj, material, result);
         }
 
         // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
@@ -1593,6 +1669,293 @@ impl LoopMesh {
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
+    }
+
+    /// Build a junction's **inner-miter** boundvert ring and strip cross-section
+    /// chains, riding the forced tri-corner [V-ADJ] fill (BEVEL.md §8.9.3 / §8.9.5).
+    ///
+    /// Each convex non-reflex sector is rebuilt as an **arc start** (§8.9.3): the
+    /// `§7.6.2` meet-point becomes the stored **arc midpoint**, and the sector gains
+    /// two ring boundverts — `B1` keeping the opening edge's side and a new `B3`
+    /// taking over the closing edge's side. Both are pushed `spread` away from the
+    /// junction along their respective beveled edges from the stored midpoint
+    /// (§8.9.4). The strip across each beveled edge now spans `B3` of one sector and
+    /// `B1` of the next, and each sector face re-stitches its corner onto the arc run
+    /// `B1 → midpoint → B3`.
+    ///
+    /// This is scoped to the **inner** miter only (§8.9.3): the forced tri-corner —
+    /// three sectors, all non-reflex (the convex cube corner), circular profile,
+    /// `segments = 2`. The method performs all classification read-only first and
+    /// returns `false` **without mutating** for any junction outside that case (a
+    /// reflex sector — the deferred outer miter §8.9.2 — a non-tri-corner, or a
+    /// non-circular profile), so the caller falls back to the sharp ring.
+    #[allow(clippy::too_many_arguments)]
+    fn build_junction_inner_miter(
+        &mut self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+        segments: u32,
+        profile: f32,
+        spread: f32,
+        chains: &mut Vec<EdgeEndChain>,
+        face_subst: &mut Vec<FaceSubstitution>,
+        miter_junctions: &mut Vec<MiterJunction>,
+        result: &mut BevelResult,
+    ) -> bool {
+        // §8.9.5: the inner miter only rides the forced `segments = 2` circular
+        // tri-corner grid.
+        if segments != 2 || profile_to_exponent(profile) != 2.0 {
+            return false;
+        }
+        let corners = self.vertex_corner_ring(vertex);
+        let sectors = sector_split(&corners, is_beveled);
+        if sectors.len() != 3 {
+            return false;
+        }
+        let vertex_position = self.vertex_position(vertex);
+
+        // Read-only classification pass (§8.9.1): solve each sector's meet-point and
+        // its two flanking edge directions, and run the winding-invariant signed
+        // reflex test. Decline the whole junction the moment any sector is reflex —
+        // that is outer-miter territory (§8.9.2), out of scope this cycle.
+        struct SectorPlan {
+            face: FaceKey,
+            opening: EdgeKey,
+            closing: EdgeKey,
+            midpoint: Vec3,
+            dir_open: Vec3,
+            dir_close: Vec3,
+        }
+        let mut plans: Vec<SectorPlan> = Vec::with_capacity(3);
+        let mut meet_points: Vec<Vec3> = Vec::with_capacity(3);
+        for sector in &sectors {
+            if sector.bounding_edges.len() < 2 {
+                return false;
+            }
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = match sector.corners.first() {
+                Some(&(_, face)) => face,
+                None => return false,
+            };
+            let dir_open = match self.edge_direction_from(opening, vertex, vertex_position) {
+                Some(direction) => direction,
+                None => return false,
+            };
+            let dir_close = match self.edge_direction_from(closing, vertex, vertex_position) {
+                Some(direction) => direction,
+                None => return false,
+            };
+            // §8.9.1: the two unit directions *toward* `v`, their cross product, and a
+            // genuine incident-face normal reference. `cross · n_ref < 0` ⇒ reflex.
+            let cross = (-dir_open).cross(-dir_close);
+            let reference = self.face_plane_normal(face);
+            if cross.dot(reference) < 0.0 {
+                return false;
+            }
+            let midpoint = self.solve_meet_point(vertex, vertex_position, sector, offset);
+            meet_points.push(midpoint);
+            plans.push(SectorPlan {
+                face,
+                opening,
+                closing,
+                midpoint,
+                dir_open,
+                dir_close,
+            });
+        }
+
+        // §8.5.1 / §8.9.5: the forced tri-corner geometry — equal-length spokes and
+        // a mutually-60° convex octant. A non-tri-corner ring has no closed-form grid
+        // here, so decline to the sharp fill.
+        if !tri_corner_meet_geometry(vertex_position, &meet_points) {
+            return false;
+        }
+
+        // Mutation pass: every check has passed. Build the enlarged arc-start ring.
+        let count = plans.len();
+        let mut arc_start: Vec<VertexKey> = Vec::with_capacity(count);
+        let mut arc_mid: Vec<VertexKey> = Vec::with_capacity(count);
+        let mut arc_end: Vec<VertexKey> = Vec::with_capacity(count);
+        for plan in &plans {
+            // §8.9.3 / §8.9.4: B1 and B3 are pushed `spread` out along their own
+            // beveled edge from the stored arc midpoint; the midpoint stays at the
+            // meet-point so the arc still bulges through the original corner.
+            let b1 = self.create_vertex(plan.midpoint + plan.dir_open * spread);
+            let b3 = self.create_vertex(plan.midpoint + plan.dir_close * spread);
+            let mid = self.create_vertex(plan.midpoint);
+            result.verts.push(b1);
+            result.verts.push(b3);
+            result.verts.push(mid);
+            arc_start.push(b1);
+            arc_mid.push(mid);
+            arc_end.push(b3);
+        }
+
+        // Re-stitch each sector face onto its arc run `B1 → midpoint → B3`, ordered to
+        // match the face loop's traversal through `v` (the boundvert near the loop's
+        // incoming edge comes first).
+        for (k, plan) in plans.iter().enumerate() {
+            let run = match self.face_corner_edges(plan.face, vertex) {
+                Some((incoming, _)) if incoming == plan.opening => {
+                    vec![arc_start[k], arc_mid[k], arc_end[k]]
+                }
+                _ => vec![arc_end[k], arc_mid[k], arc_start[k]],
+            };
+            set_face_substitution(face_subst, vertex, plan.face, run);
+        }
+
+        // §8.9.5: the strip across each beveled edge spans `B3` of one sector and
+        // `B1` of the next; build that cross-section chain (one interior arc sample at
+        // `segments = 2`). The miter arc rim itself (B1 → midpoint → B3) is internal
+        // to the patch and consumed only by the fill — not a strip.
+        let mut cross: Vec<VertexKey> = Vec::with_capacity(count);
+        for k in 0..count {
+            let next = (k + 1) % count;
+            let crossing = plans[k].closing; // == plans[next].opening
+            let start = arc_end[k];
+            let end = arc_start[next];
+            let interior = self.build_chain_between(start, end, crossing, segments, profile, result);
+            cross.push(
+                *interior
+                    .first()
+                    .expect("a circular segments=2 cross-section has one interior sample"),
+            );
+            chains.push(EdgeEndChain {
+                edge: crossing,
+                endpoint: vertex,
+                start,
+                interior,
+                end,
+            });
+        }
+
+        miter_junctions.push(MiterJunction {
+            vertex,
+            arc_start,
+            arc_mid,
+            arc_end,
+            cross,
+        });
+        true
+    }
+
+    /// Build the inner-miter tri-corner [V-ADJ] fill (BEVEL.md §8.9.5): a six-quad
+    /// pinwheel over the enlarged arc-start ring, meeting at one welded central apex.
+    ///
+    /// The enlarged rim alternates the six ring boundverts with their six interior
+    /// samples — per sector `k` the arc midpoint `arc_mid[k]` (between `B1` and `B3`)
+    /// and the strip cross-section sample `cross[k]` (between this sector's `B3` and
+    /// the next sector's `B1`). Each boundvert anchors one pinwheel quad spanning it,
+    /// its two flanking interior samples, and the apex (§8.9.5: the miter's extra
+    /// boundverts become extra columns of the same adjacency grid).
+    ///
+    /// The apex stays on the corner dome the no-miter case uses (§8.5.2): the sphere
+    /// through the three stored arc midpoints (the unmoved meet-points) and a cross
+    /// sample, snapped along the body diagonal toward the junction.
+    fn build_adj_fill_inner_miter(
+        &mut self,
+        mj: &MiterJunction,
+        material: i32,
+        result: &mut BevelResult,
+    ) {
+        let count = mj.arc_start.len();
+        if count != 3 || mj.cross.len() != count {
+            return;
+        }
+
+        let vertex_position = self.vertex_position(mj.vertex);
+        let on_surface = [
+            self.vertex_position(mj.arc_mid[0]),
+            self.vertex_position(mj.arc_mid[1]),
+            self.vertex_position(mj.arc_mid[2]),
+            self.vertex_position(mj.cross[0]),
+        ];
+        let apex_position = match circumsphere(on_surface) {
+            Some((center, radius)) => {
+                let body_diagonal = (vertex_position - center).normalize_or_zero();
+                center + body_diagonal * radius
+            }
+            None => {
+                let sum: Vec3 = mj
+                    .arc_mid
+                    .iter()
+                    .fold(Vec3::ZERO, |acc, &m| acc + self.vertex_position(m));
+                sum / count as f32
+            }
+        };
+        let apex = self.create_vertex(apex_position);
+        result.verts.push(apex);
+
+        let representative = self
+            .vert_face_keys(mj.vertex)
+            .first()
+            .map(|&face| self.face_material_index(face))
+            .unwrap_or(0);
+
+        for k in 0..count {
+            let before = (k + count - 1) % count;
+            // The arc start `B1_k`: flanked by its arc midpoint and the strip sample
+            // across its opening edge (the previous sector's cross sample).
+            self.emit_pinwheel_quad(
+                vec![mj.arc_start[k], mj.arc_mid[k], apex, mj.cross[before]],
+                material,
+                representative,
+                result,
+            );
+            // The arc end `B3_k`: flanked by the strip sample across its closing edge
+            // and its arc midpoint.
+            self.emit_pinwheel_quad(
+                vec![mj.arc_end[k], mj.cross[k], apex, mj.arc_mid[k]],
+                material,
+                representative,
+                result,
+            );
+        }
+    }
+
+    /// Create one fill quad, wound opposite the existing loop on its first edge so
+    /// that shared edge stays radial-2 against the neighbour (re-stitched face or
+    /// strip) that already created it (BEVEL.md §5.1, the share-don't-flip rule).
+    fn emit_pinwheel_quad(
+        &mut self,
+        mut quad: Vec<VertexKey>,
+        material: i32,
+        representative: i32,
+        result: &mut BevelResult,
+    ) {
+        if let Some(edge) = self.query_edge_exists(quad[0], quad[1]) {
+            let runs_forward = self
+                .edge_loop_keys(edge)
+                .first()
+                .map(|&l| {
+                    let start = self.loop_vertex(l);
+                    let next = self.loop_vertex(self.loop_next(l));
+                    start == quad[0] && next == quad[1]
+                })
+                .unwrap_or(false);
+            if runs_forward {
+                quad.reverse();
+            }
+        }
+        let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
+        self.assign_bevel_face_material(face, material, representative);
+        result.faces.push(face);
+        self.collect_face_edges(face, result);
+    }
+
+    /// The (incoming, outgoing) edges of `face` meeting at `vertex` in the face's
+    /// loop traversal order: the edge arriving at `vertex` and the edge leaving it.
+    fn face_corner_edges(&self, face: FaceKey, vertex: VertexKey) -> Option<(EdgeKey, EdgeKey)> {
+        for loop_key in self.face_loop_keys(face) {
+            if self.loop_vertex(loop_key) == vertex {
+                let incoming = self.loop_edge(self.loop_prev(loop_key));
+                let outgoing = self.loop_edge(loop_key);
+                return Some((incoming, outgoing));
+            }
+        }
+        None
     }
 
     /// Build the rounded adjacency-grid fill for the symmetric equal-offset 3-way
@@ -4146,6 +4509,20 @@ impl JunctionCut {
     }
 }
 
+/// One junction's **inner-miter** ring data (BEVEL.md §8.9.3 / §8.9.5), consumed by
+/// the six-quad pinwheel fill. Per convex non-reflex sector `k` (disk order): the
+/// arc-start boundvert `arc_start[k]` (`B1`, near the opening edge), the stored arc
+/// midpoint `arc_mid[k]` (the unmoved §7.6.2 meet-point), the arc-end boundvert
+/// `arc_end[k]` (`B3`, near the closing edge), and the strip cross-section sample
+/// `cross[k]` between this sector's `B3` and the next sector's `B1`.
+struct MiterJunction {
+    vertex: VertexKey,
+    arc_start: Vec<VertexKey>,
+    arc_mid: Vec<VertexKey>,
+    arc_end: Vec<VertexKey>,
+    cross: Vec<VertexKey>,
+}
+
 /// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
 /// §7.6.1): the ordered near-corner vert(s) the re-stitch substitutes for the
 /// single corner vertex `vertex` on `face`. One vert for a 1-for-1 swap (a strip's
@@ -4232,6 +4609,42 @@ fn corner_verts_coincide(positions: &[Vec3]) -> bool {
     positions
         .iter()
         .all(|&position| (position - first).length() <= 1.0e-4)
+}
+
+/// The §8.5.1 forced-tri-corner geometry test on three meet-point positions: equal
+/// spoke length and a mutually-60° convex octant (`cos = ½`), the same conditions
+/// `adj_tri_corner_trigger` reads off the boundvert ring (BEVEL.md §8.5.5.3), but on
+/// raw positions so the inner-miter classifier can run it before minting any vert.
+fn tri_corner_meet_geometry(vertex_position: Vec3, meet_points: &[Vec3]) -> bool {
+    if meet_points.len() != 3 {
+        return false;
+    }
+    let spokes = [
+        meet_points[0] - vertex_position,
+        meet_points[1] - vertex_position,
+        meet_points[2] - vertex_position,
+    ];
+    let lengths = [spokes[0].length(), spokes[1].length(), spokes[2].length()];
+    let longest = lengths.iter().copied().fold(0.0_f32, f32::max);
+    if longest <= 1.0e-6 {
+        return false;
+    }
+    let length_tol = longest * 1.0e-3;
+    if (lengths[0] - lengths[1]).abs() > length_tol
+        || (lengths[1] - lengths[2]).abs() > length_tol
+        || (lengths[2] - lengths[0]).abs() > length_tol
+    {
+        return false;
+    }
+    let directions = [
+        spokes[0] / lengths[0],
+        spokes[1] / lengths[1],
+        spokes[2] / lengths[2],
+    ];
+    let cos_tol = 1.0e-3;
+    (directions[0].dot(directions[1]) - 0.5).abs() <= cos_tol
+        && (directions[1].dot(directions[2]) - 0.5).abs() <= cos_tol
+        && (directions[2].dot(directions[0]) - 0.5).abs() <= cos_tol
 }
 
 /// True if `ring` contains the same vertex twice (a collapsed strip side, §7.6.3).
@@ -5871,6 +6284,150 @@ mod tests {
             result_has_vert_near(&mesh, &result, chord_midpoint),
             0,
             "no interior chain vert at the straight chord midpoint",
+        );
+    }
+
+    /// Bevel the cube corner of `cube_corner_adj_segments2` with an inner miter
+    /// (BEVEL.md §8.9.3), `miter_inner = kind`, pushed out by `spread`.
+    fn cube_corner_adj_segments2_inner_miter(kind: BevelMiter, spread: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: kind,
+                spread,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.9.3 / §8.9.5: the inner miter rebuilds every convex non-reflex
+    /// sector of the cube corner as an arc start, enlarging the tri-corner ring from
+    /// three boundverts to six and filling it with a six-quad pinwheel — three more
+    /// faces than the sharp pinwheel (§8.9.6). The result stays a closed manifold and
+    /// places the spread-pushed arc-start boundverts the sharp fill never mints.
+    #[test]
+    fn inner_miter_arc_reshapes_cube_corner() {
+        let spread = 0.1;
+        let (mesh, result) = cube_corner_adj_segments2_inner_miter(BevelMiter::Arc, spread);
+        let (sharp_mesh, _sharp) = cube_corner_adj_segments2();
+
+        mesh.validate_topology();
+
+        // §8.9.6: the inner miter adds one boundvert per non-reflex sector (three of
+        // them) and so three more pinwheel quads than the sharp corner.
+        let (sharp_v, sharp_e, sharp_f) = counts(&sharp_mesh);
+        let (miter_v, miter_e, miter_f) = counts(&mesh);
+        assert_eq!(
+            (sharp_v, sharp_e, sharp_f),
+            (20, 33, 15),
+            "the sharp cube-corner ADJ seg=2 baseline is unchanged",
+        );
+        assert_eq!(
+            (miter_v, miter_e, miter_f),
+            (26, 42, 18),
+            "inner miter grows the corner by +6 V / +9 E / +3 F over the sharp pinwheel",
+        );
+
+        // The pinwheel grows from three quads to six, all sharing one welded apex —
+        // the lone new vertex incident to six fill quads (vs three when sharp).
+        let apex: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| {
+                mesh.face_keys()
+                    .into_iter()
+                    .filter(|&f| mesh.face_vert_keys(f).contains(&v))
+                    .count()
+                    == 6
+            })
+            .collect();
+        assert_eq!(apex.len(), 1, "exactly one apex is shared by six pinwheel quads");
+        for &f in &mesh.face_keys() {
+            if mesh.face_vert_keys(f).contains(&apex[0]) {
+                assert_eq!(mesh.face_vert_keys(f).len(), 4, "each pinwheel cell is a quad");
+            }
+        }
+
+        // Non-vacuous reshape: the arc-start boundverts are pushed `spread` out along
+        // the beveled edges from each stored meet-point. The bottom-face (z = -1)
+        // sector's §7.6.2 meet sits at offset·√2 from the corner along that face's
+        // diagonal — (0.75, -0.75, -1); its arc start pushed `spread` along the -x
+        // beveled edge lands at (0.65, -0.75, -1), a vertex the sharp fill never mints
+        // (it keeps the single boundvert at the meet-point itself).
+        let bottom_meet = Vec3::new(0.75, -0.75, -1.0);
+        let arc_end_x = bottom_meet + spread * Vec3::new(-1.0, 0.0, 0.0);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, arc_end_x),
+            1,
+            "an arc boundvert sits `spread` out along the -x beveled edge",
+        );
+        assert!(
+            !sharp_mesh
+                .vert_keys()
+                .into_iter()
+                .any(|v| (sharp_mesh.vertex_position(v) - arc_end_x).length() < 1.0e-4),
+            "the sharp corner mints no vertex at the spread-pushed arc boundvert",
+        );
+        // The stored arc midpoint stays at the meet-point (§8.9.3), shared with sharp.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, bottom_meet),
+            1,
+            "the stored arc midpoint stays at the §7.6.2 meet-point",
+        );
+    }
+
+    /// BEVEL.md §8.9.3: `miter_inner` distinguishes only sharp from non-sharp — the
+    /// `Patch` value yields the identical arc-start construction as `Arc` at an inner
+    /// (non-reflex) sector, so the two reshape the cube corner the same way.
+    #[test]
+    fn inner_miter_patch_equals_arc() {
+        let spread = 0.1;
+        let (arc_mesh, _arc) = cube_corner_adj_segments2_inner_miter(BevelMiter::Arc, spread);
+        let (patch_mesh, _patch) = cube_corner_adj_segments2_inner_miter(BevelMiter::Patch, spread);
+        patch_mesh.validate_topology();
+        assert_eq!(
+            counts(&arc_mesh),
+            counts(&patch_mesh),
+            "inner Patch and Arc produce the same element counts (§8.9.3)",
+        );
+    }
+
+    /// BEVEL.md §8.9.3: `miter_inner = Sharp` (the default) leaves the cube corner
+    /// bit-identical to the no-miter ADJ fill, and a non-sharp inner miter genuinely
+    /// diverges from it — the miter is never a silent no-op when engaged.
+    #[test]
+    fn inner_miter_sharp_is_the_unmitered_corner() {
+        let (default_mesh, _default) = cube_corner_adj_segments2();
+        let (sharp_mesh, _sharp) = cube_corner_adj_segments2_inner_miter(BevelMiter::Sharp, 0.1);
+        let (arc_mesh, _arc) = cube_corner_adj_segments2_inner_miter(BevelMiter::Arc, 0.1);
+
+        // Explicit Sharp == the default (no-miter) corner, regardless of `spread`.
+        assert_eq!(
+            counts(&default_mesh),
+            counts(&sharp_mesh),
+            "explicit Sharp inner miter matches the default no-miter corner",
+        );
+        // A non-sharp inner miter diverges (more geometry).
+        assert_ne!(
+            counts(&sharp_mesh),
+            counts(&arc_mesh),
+            "an Arc inner miter is not a silent no-op",
         );
     }
 
