@@ -36,6 +36,7 @@ mod face_poke;
 mod face_triangulate;
 mod find_doubles;
 mod fractal_noise;
+mod grid_fill;
 mod inset_individual;
 mod inset_region;
 mod join_triangles;
@@ -86,6 +87,7 @@ pub use dissolve_limit::{
 pub use dissolve_verts::DissolveVertsParams;
 pub use duplicate::{DuplicateResult, GeomKey};
 pub use edgeloop_fill::{EdgeloopFillParams, EdgeloopFillResult};
+pub use grid_fill::{GridFillParams, GridFillResult};
 pub use extrude_mixed::ExtrudeMixedResult;
 pub use extrude_vert_indiv::ExtrudeVertIndivResult;
 pub use face_poke::{CenterMode, PokeResult};
