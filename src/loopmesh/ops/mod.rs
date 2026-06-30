@@ -23,6 +23,7 @@ mod create_circle;
 mod create_cone;
 mod create_cube;
 mod create_grid;
+mod create_icosphere;
 mod create_uvsphere;
 mod create_vert;
 mod delete;
