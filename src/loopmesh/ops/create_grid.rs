@@ -32,11 +32,13 @@ impl LoopMesh {
     /// face counts and connectivity — with every vertex collapsed onto the single
     /// point `matrix·(0,0,0)`; the coincident verts are not de-duplicated (§7).
     ///
-    /// `calc_uvs` is accepted for call-shape compatibility but is presently a
-    /// deferral: loopmesh writes no default UV unwrap (the §4 UV row is tracked
-    /// separately and stays unimplemented this cycle). With no UV layer populated
-    /// the topology is identical with the flag set or clear, matching §7's
-    /// "`calc_uvs` set but no UV layer present" no-op.
+    /// When `calc_uvs` is set **and** the mesh carries an active per-loop
+    /// 2-component-float (UV) layer, a default unit-square unwrap is painted
+    /// across the grid: `du = 1/nx`, `dv = 1/ny`, each cell occupying a
+    /// `du × dv` tile that mirrors its spatial position one-to-one, with UV
+    /// `(0,0)` at the bottom-left corner of the patch and `(1,1)` at the
+    /// top-right (§4). With `calc_uvs` clear, or when no UV layer exists, the
+    /// flag is a silent no-op — it never creates a layer (§7).
     ///
     /// See `radial-mesh-guides/operators/CREATE_GRID.md` for the full contract.
     pub fn create_grid(
@@ -47,8 +49,6 @@ impl LoopMesh {
         matrix: Mat4,
         calc_uvs: bool,
     ) -> Vec<VertexKey> {
-        let _ = calc_uvs;
-
         // §7 — clamp each segment count up to a minimum of 1.
         let nx = x_segments.max(1) as usize;
         let ny = y_segments.max(1) as usize;
@@ -96,8 +96,79 @@ impl LoopMesh {
             self.vert_normal_update(vert);
         }
 
+        // §4 — optional default unit-square UV unwrap, painted only when the
+        // flag is set and an active per-loop UV layer already exists (the flag
+        // alone never mints a layer).
+        if calc_uvs {
+            if let Some(uv_layer) = self.active_uv_layer_for_grid() {
+                self.paint_grid_uvs(&new_faces, nx, ny, uv_layer);
+            }
+        }
+
         // §2.2 — report the created verts in row-major order (the verts.out slot).
         lattice
+    }
+
+    /// §4 — paint the seamless `[0,1]²` planar unwrap across the freshly built
+    /// grid faces. `new_faces` is in row-major cell build order (§3), so the
+    /// face at position `face_index` sits at 0-based cell column
+    /// `ix = face_index mod nx` and row `iy = face_index div nx`. Each cell
+    /// occupies a `du × dv` tile, and the four loop corners — in the
+    /// `bottom-left → bottom-right → top-right → top-left` visit order the
+    /// faces were created with — receive the tile's corners so the unwrap
+    /// matches the spatial layout one-to-one.
+    fn paint_grid_uvs(
+        &mut self,
+        new_faces: &[FaceKey],
+        nx: usize,
+        ny: usize,
+        uv_layer: ElementAttributeKey,
+    ) {
+        let du = 1.0 / nx as f32;
+        let dv = 1.0 / ny as f32;
+
+        let mut loop_keys: smallvec::SmallVec<[LoopKey; 4]> = smallvec::SmallVec::new();
+        for (face_index, &face) in new_faces.iter().enumerate() {
+            let cell_ix = (face_index % nx) as f32;
+            let cell_iy = (face_index / nx) as f32;
+            let u_lo = cell_ix * du;
+            let u_hi = (cell_ix + 1.0) * du;
+            let v_lo = cell_iy * dv;
+            let v_hi = (cell_iy + 1.0) * dv;
+            let corner_uvs = [
+                [u_lo, v_lo], // corner 0: bottom-left
+                [u_hi, v_lo], // corner 1: bottom-right
+                [u_hi, v_hi], // corner 2: top-right
+                [u_lo, v_hi], // corner 3: top-left
+            ];
+
+            loop_keys.clear();
+            for loop_key in self.iter_face_loops(face) {
+                loop_keys.push(loop_key);
+            }
+            for (corner, &loop_key) in loop_keys.iter().enumerate() {
+                self.loop_attribs_mut()
+                    .set_vec2(uv_layer, loop_key.as_usize(), corner_uvs[corner]);
+            }
+        }
+    }
+
+    /// Resolve the active UV layer: the loop-domain layer create-grid paints
+    /// when `calc_uvs` is set. Prefer 2-component loop layers tagged with the
+    /// Uv role; otherwise fall back to the first registered Vec2 loop layer
+    /// (the "a vec2 loop layer is a UV layer" convention). `None` when the mesh
+    /// carries no UV layer at all (§4 / §7 — the no-op case).
+    fn active_uv_layer_for_grid(&self) -> Option<ElementAttributeKey> {
+        let attribs = self.loop_attribs();
+        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
+        let any_tagged = attribs
+            .iter_descriptors()
+            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
+        attribs
+            .iter_descriptors()
+            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
+            .map(|(key, _)| key)
+            .next()
     }
 }
 
@@ -327,5 +398,123 @@ mod tests {
                 "verts.out[{ix}+{iy}·{vert_columns}] at {got:?}, expected ({ix},{iy}) = {want:?}"
             );
         }
+    }
+
+    fn register_uv(mesh: &mut LoopMesh) -> ElementAttributeKey {
+        mesh.register_loop_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("uv"),
+            AttrType::Vec2,
+        ))
+        .expect("uv layer registers")
+    }
+
+    /// Read the per-corner UVs of a face in loop-cycle order.
+    fn read_corner_uvs(mesh: &LoopMesh, face: FaceKey, uv: ElementAttributeKey) -> Vec<[f32; 2]> {
+        mesh.face_loop_keys(face)
+            .into_iter()
+            .map(|l| mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap())
+            .collect()
+    }
+
+    fn uv_near(got: [f32; 2], want: [f32; 2]) -> bool {
+        (got[0] - want[0]).abs() < EPS && (got[1] - want[1]).abs() < EPS
+    }
+
+    /// §4: a `1 × 1` grid with `calc_uvs` and an active UV layer maps its single
+    /// quad onto the whole unit square — `(0,0)` bottom-left through `(1,1)`
+    /// top-right, in the `BL → BR → TR → TL` corner order the face was built.
+    #[test]
+    fn create_grid_calc_uvs_1x1_unit_square() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+
+        mesh.create_grid(1, 1, 1.0, Mat4::IDENTITY, true);
+
+        let face = mesh.face_keys()[0];
+        let corners = read_corner_uvs(&mesh, face, uv);
+        let expected = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        for (i, want) in expected.iter().enumerate() {
+            assert!(
+                uv_near(corners[i], *want),
+                "corner {i} UV {:?}, expected {want:?}",
+                corners[i]
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// §4: a `2 × 2` grid tiles UV space into four `0.5 × 0.5` cells matching
+    /// the spatial layout one-to-one. Cell `(ix, iy)` (row-major face order)
+    /// occupies `[ix·du, (ix+1)·du] × [iy·dv, (iy+1)·dv]`; the shared spatial
+    /// vertex carries the same UV from each incident face (the unwrap is
+    /// continuous), and `(0,0)`/`(1,1)` land on the patch corners.
+    #[test]
+    fn create_grid_calc_uvs_2x2_tiles() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+
+        let faces_before = mesh.face_count();
+        mesh.create_grid(2, 2, 1.0, Mat4::IDENTITY, true);
+        assert_eq!(mesh.face_count() - faces_before, 4);
+
+        let du = 0.5;
+        let dv = 0.5;
+        // Faces are emitted in row-major cell order (§3): index k → cell
+        // (k mod 2, k div 2).
+        for (face_index, face) in mesh.face_keys().into_iter().enumerate() {
+            let cell_ix = (face_index % 2) as f32;
+            let cell_iy = (face_index / 2) as f32;
+            let u_lo = cell_ix * du;
+            let u_hi = (cell_ix + 1.0) * du;
+            let v_lo = cell_iy * dv;
+            let v_hi = (cell_iy + 1.0) * dv;
+            let expected = [
+                [u_lo, v_lo],
+                [u_hi, v_lo],
+                [u_hi, v_hi],
+                [u_lo, v_hi],
+            ];
+            let corners = read_corner_uvs(&mesh, face, uv);
+            for (i, want) in expected.iter().enumerate() {
+                assert!(
+                    uv_near(corners[i], *want),
+                    "face {face_index} corner {i} UV {:?}, expected {want:?}",
+                    corners[i]
+                );
+            }
+        }
+        mesh.validate_topology();
+    }
+
+    /// §4 / §7: `calc_uvs = false` writes nothing even when a UV layer exists —
+    /// every painted-on corner keeps the layer's default (zero) value.
+    #[test]
+    fn create_grid_calc_uvs_false_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+
+        mesh.create_grid(2, 2, 1.0, Mat4::IDENTITY, false);
+
+        for face in mesh.face_keys() {
+            for corner in read_corner_uvs(&mesh, face, uv) {
+                assert!(
+                    uv_near(corner, [0.0, 0.0]),
+                    "calc_uvs=false left a non-default UV {corner:?}"
+                );
+            }
+        }
+    }
+
+    /// §4 / §7: `calc_uvs = true` with no UV layer present is a silent no-op —
+    /// it builds the topology and creates no layer.
+    #[test]
+    fn create_grid_calc_uvs_no_layer_is_noop() {
+        let mut mesh = LoopMesh::new();
+
+        mesh.create_grid(2, 2, 1.0, Mat4::IDENTITY, true);
+
+        assert_eq!(mesh.face_count(), 4);
+        assert!(mesh.loop_attribs().is_empty(), "no UV layer was created");
+        mesh.validate_topology();
     }
 }
