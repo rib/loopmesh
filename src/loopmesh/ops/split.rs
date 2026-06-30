@@ -289,16 +289,23 @@ impl LoopMesh {
     }
 
     /// `use_only_faces = true` removal (SPLIT.md §4): widen the kill set over the
-    /// **whole mesh** — which, after the clone has run, also contains the freshly
-    /// made clone loose parts — then tear out the whole widened set.
+    /// **whole mesh in which this delete runs** — i.e. `self` — then tear out the
+    /// whole widened set. Which loose parts that reaches depends on the caller:
     ///
-    /// The §4 widening is two solely-owned passes over every element, not just
-    /// the source originals: an edge whose every face is flagged (or a wire edge,
-    /// with no face, vacuously) and then a vert whose every edge is flagged (or a
-    /// loose vert, vacuously). A clone wire edge / clone loose vert has no face /
-    /// no edge holding it, so it passes vacuously and is swept exactly as BMesh
-    /// sweeps it — the selection's loose parts vanish entirely (original *and*
-    /// clone), leaving only the face-bounded clone.
+    /// - **Same-mesh** ([`split`](Self::split)): the clone was made in `self`
+    ///   *before* this runs, so the passes range over a mesh that holds the
+    ///   source originals *and* the freshly-made clone loose parts. Both vanish
+    ///   (original *and* clone), leaving only the face-bounded clone (§4).
+    /// - **Cross-mesh** ([`split_into`](Self::split_into)): the clone lives in
+    ///   `dest`, never in `self`, so these passes never visit it. Only the
+    ///   **source** selection's loose extremities are swept; the clone keeps its
+    ///   full closure in `dest`, loose wire edges / loose verts included (§8.3 —
+    ///   the one place the cross-mesh result diverges from the same-mesh result).
+    ///
+    /// The §4 widening itself is the same two solely-owned passes over every
+    /// element either way, not just the source originals: an edge whose every face
+    /// is flagged (or a wire edge, with no face, vacuously) and then a vert whose
+    /// every edge is flagged (or a loose vert, vacuously).
     fn split_delete_widened(&mut self, selected_face: &HashSet<FaceKey>) {
         // (a) Every edge all of whose faces are flagged — wire edges (no face)
         //     pass vacuously. An edge a non-flagged face still holds is spared
@@ -734,6 +741,85 @@ mod tests {
             assert!(
                 dest.edges.try_get(clone_edge).is_some(),
                 "frontier clone lives in dest"
+            );
+        }
+
+        src.validate_topology();
+        dest.validate_topology();
+    }
+
+    #[test]
+    fn split_into_use_only_faces_sweeps_source_loose_keeps_dest_loose() {
+        // §8.3 — the one place the cross-mesh result genuinely diverges from the
+        // same-mesh result. A face + a disjoint wire edge + a loose vert torn into
+        // an empty dest under `use_only_faces = true`. The widening sweep runs over
+        // the SOURCE only, so:
+        //   - source loses its orphaned extremities (the torn wire's endpoints and
+        //     the loose vert are swept vacuously) — same as same-mesh; here the
+        //     isolated quad closure is solely-owned too, so the source empties.
+        //   - dest keeps the FULL clone closure (duplicate is purely additive
+        //     there): the clone wire edge and clone loose vert stand, unlike the
+        //     same-mesh case where the whole-mesh widening would sweep them.
+        let mut src = LoopMesh::new();
+        let (face, wire, loose) = face_with_loose_edge_and_vert(&mut src);
+        let [wa, wb] = src.edge_vertices(wire);
+        let mut dest = LoopMesh::new();
+
+        let result = src.split_into(&[face.into(), wire.into(), loose.into()], true, &mut dest);
+
+        // Source side: the widened sweep reaches the orphaned wire endpoints and
+        // the loose vert (the §8.3 source-side divergence) — the whole isolated
+        // selection is solely-owned, so the source empties entirely.
+        assert!(src.edges.try_get(wire).is_none(), "source wire swept (§8.3)");
+        assert!(
+            src.vertices.try_get(wa).is_none(),
+            "orphaned source wire endpoint swept (§8.3)"
+        );
+        assert!(
+            src.vertices.try_get(wb).is_none(),
+            "orphaned source wire endpoint swept (§8.3)"
+        );
+        assert!(
+            src.vertices.try_get(loose).is_none(),
+            "source loose vert swept (§8.3)"
+        );
+        assert!(src.faces.try_get(face).is_none(), "source face torn out");
+        assert_eq!(
+            (src.vertex_count(), src.edge_count(), src.face_count()),
+            (0, 0, 0),
+            "isolated source emptied — widening reached every extremity (§8.3)"
+        );
+
+        // Dest side: the clone keeps its full closure. The widening never crosses
+        // into dest, so the clone wire (2V/1E) and clone loose vert (1V) survive
+        // alongside the face-bounded quad clone (4V/4E/1F): 7V / 5E / 1F.
+        assert_eq!(
+            (dest.vertex_count(), dest.edge_count(), dest.face_count()),
+            (7, 5, 1),
+            "dest retains the full clone closure incl. clone wire/loose vert (§8.3)"
+        );
+        // Pin the divergence concretely: dest still holds exactly one wire edge
+        // (no face) and exactly one fully-loose vert — the parts the same-mesh
+        // widening would have swept.
+        let dest_wire_edges = dest
+            .edge_keys()
+            .into_iter()
+            .filter(|&e| dest.iter_radial_loops(e).next().is_none())
+            .count();
+        let dest_loose_verts = dest
+            .vert_keys()
+            .into_iter()
+            .filter(|&v| dest.iter_disk_edges(v).next().is_none())
+            .count();
+        assert_eq!(dest_wire_edges, 1, "clone wire edge stands in dest (§8.3)");
+        assert_eq!(dest_loose_verts, 1, "clone loose vert stands in dest (§8.3)");
+
+        // §8.2: geom_out empty cross-mesh; forward-only maps reach dest clones.
+        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        for &clone_vert in result.isovert_map.values() {
+            assert!(
+                dest.vertices.try_get(clone_vert).is_some(),
+                "isovert clone value is a live dest vert (§8.2)"
             );
         }
 
