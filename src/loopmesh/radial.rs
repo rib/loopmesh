@@ -817,6 +817,63 @@ impl LoopMesh {
 
         self.remove_face_slab_entry(face);
     }
+
+    /// Graft `donor`'s entire loop cycle onto `dst`, discarding `dst`'s
+    /// previous loops and freeing the now-emptied `donor` face slab entry.
+    ///
+    /// `dst` keeps its own key, its slab identity, and its per-face
+    /// attributes — only the loops it owns change. `donor`'s loops (and the
+    /// edges they sit on) are preserved and re-parented to `dst`; `donor`'s
+    /// per-face attributes are dropped along with its face slab entry. Loop-
+    /// level customdata rides along on the donor loops untouched, and the
+    /// cached face normal of the grafted topology is adopted too.
+    ///
+    /// This is the handle-preserving rebuild primitive: build a replacement
+    /// topology on a throwaway `donor` face, then graft it onto a long-lived
+    /// `dst` handle so callers holding `dst` keep a live key naming the new
+    /// topology. `dst`'s old loops must be safe to free (their radial / disk
+    /// neighbours already account for the impending removal, exactly as
+    /// [`Self::face_kill`] assumes).
+    ///
+    /// Both faces must be live and distinct.
+    pub(crate) fn face_adopt_loop_cycle(&mut self, dst: FaceKey, donor: FaceKey) {
+        assert_ne!(dst, donor, "face_adopt_loop_cycle: dst and donor must differ");
+
+        // Free dst's current loop cycle, leaving its face slab entry in place.
+        let dst_first = self.faces.get(dst).first_edge_loop;
+        let mut cur = dst_first;
+        loop {
+            let links = self.loops.get(cur).face_loop_links;
+            self.face_loop_disconnect_edge(cur);
+            self.face_loop_data_remove(cur);
+            cur = links.next;
+            if cur == dst_first {
+                break;
+            }
+        }
+
+        // Re-parent the donor's loops onto dst (their radial / edge links are
+        // untouched — only the owning face changes).
+        let donor_first = self.faces.get(donor).first_edge_loop;
+        let mut cur = donor_first;
+        loop {
+            self.loops.get_mut(cur).face = dst;
+            cur = self.loops.get(cur).face_loop_links.next;
+            if cur == donor_first {
+                break;
+            }
+        }
+
+        let donor_len = self.faces.get(donor).len;
+        let donor_normal = self.faces.get(donor).normal;
+        let dst_face = self.faces.get_mut(dst);
+        dst_face.first_edge_loop = donor_first;
+        dst_face.len = donor_len;
+        dst_face.normal = donor_normal;
+        self.flags |= LoopMeshFlags::LOOPS_INDEX_DIRTY;
+
+        self.remove_face_slab_entry(donor);
+    }
 }
 
 #[cfg(test)]

@@ -45,10 +45,12 @@ impl LoopMesh {
     /// triangles sharing the same verts. Returns immediately for triangles
     /// (already-triangulated).
     ///
-    /// The source `face` is consumed: it is replaced by `n - 2` fresh
-    /// triangle faces. Use [`Self::face_triangulate_collect_doubles`] when you
-    /// need the duplicate-triangle report (§9.4); this entry point discards
-    /// it.
+    /// The source `face` is replaced by `n - 2` triangle faces sharing the
+    /// same verts. The source face *handle survives* (§9.5): after the call
+    /// it is still valid and names one of the output triangles, carrying the
+    /// source's per-face attributes. Use
+    /// [`Self::face_triangulate_collect_doubles`] when you need the
+    /// duplicate-triangle report (§9.4); this entry point discards it.
     ///
     /// Face customdata: every new triangle inherits the source face's CD.
     ///
@@ -167,27 +169,42 @@ impl LoopMesh {
 
     /// Build the triangulation's faces with the §9.4 edge-reuse surgery and
     /// run the radial-walk duplicate check on each. `triples` indexes into
-    /// `verts` (the source face's perimeter ring). The source face is killed
-    /// once every triangle has been created and has inherited its CD.
+    /// `verts` (the source face's perimeter ring).
+    ///
+    /// §9.5 handle survival: rather than killing the source face and minting
+    /// all `n - 2` triangles fresh, the last triangle's topology is grafted
+    /// onto the source face, so a caller holding the source key keeps a live
+    /// handle naming one output triangle (carrying the source's per-face
+    /// attributes). The canonical/topological result is identical either way.
+    ///
+    /// §9.5 positional loop-CD mapping: the source corners are captured once
+    /// in face-cycle order into `source_loops`, indexed by the same `0..n`
+    /// vertex labels the triples use. Each new corner at source-vertex index
+    /// `k` inherits its loop customdata from `source_loops[k]` by O(1) index,
+    /// O(n) total across all triangles.
     fn construct_triangulation(
         &mut self,
         source_face: FaceKey,
         verts: &[VertexKey],
         triples: &[[u32; 3]],
     ) -> Vec<FaceKey> {
-        // Capture the source loop at each perimeter vertex for loop-CD
-        // inheritance: every new corner copies from the same-vertex source
-        // corner (§9.4). The source loops stay live until the kill below.
+        // §9.5: capture the source corner at each perimeter vertex index. Both
+        // `face_loops` and `face_vert_keys` walk from `first_edge_loop`, so
+        // `source_loops[k].vertex == verts[k]`. The source loops stay live
+        // through the whole build phase below (the source face's loops are not
+        // freed until the graft at the end), so every triangle — including the
+        // one grafted onto the source handle — reads valid source CD.
         let do_loop_cd = !self.loop_attribs.is_empty();
-        let mut vert_src_loop: Vec<(VertexKey, LoopKey)> = Vec::new();
+        let mut source_loops: Vec<LoopKey> = Vec::new();
         if do_loop_cd {
-            vert_src_loop.reserve(verts.len());
+            source_loops.reserve(verts.len());
             let mut it = self.face_loops(source_face);
             while let Some(l) = it.next(self) {
-                vert_src_loop.push((self.loop_vertex(l), l));
+                source_loops.push(l);
             }
         }
 
+        let mut new_faces: Vec<FaceKey> = Vec::with_capacity(triples.len());
         let mut doubles: Vec<FaceKey> = Vec::new();
         for triple in triples {
             let tri_verts = [
@@ -205,14 +222,18 @@ impl LoopMesh {
                 .copy_into(new_face.as_usize(), source_face.as_usize());
 
             if do_loop_cd {
+                // The new triangle's corners are built in `tri_verts` order, so
+                // the corner at position `corner_slot` sits on source-vertex
+                // index `triple[corner_slot]` (§9.5 positional mapping).
                 let first = self.face_first_loop(new_face);
                 let mut corner = first;
+                let mut corner_slot = 0usize;
                 loop {
-                    let v = self.loop_vertex(corner);
-                    if let Some(&(_, src)) = vert_src_loop.iter().find(|(vv, _)| *vv == v) {
-                        self.loop_attribs.copy_into(corner.as_usize(), src.as_usize());
-                    }
+                    let source_index = triple[corner_slot] as usize;
+                    self.loop_attribs
+                        .copy_into(corner.as_usize(), source_loops[source_index].as_usize());
                     corner = self.loop_next(corner);
+                    corner_slot += 1;
                     if corner == first {
                         break;
                     }
@@ -222,9 +243,25 @@ impl LoopMesh {
             if self.triangle_coincides_on_radial(new_face) {
                 doubles.push(new_face);
             }
+            new_faces.push(new_face);
         }
 
-        self.face_kill(source_face);
+        // §9.5: graft the final triangle onto the source face handle (freeing
+        // the throwaway donor and the source's old n-gon loops). `triples` is
+        // non-empty for n >= 4, so `new_faces` always has a last element.
+        let donor = *new_faces
+            .last()
+            .expect("triangulation produced at least one triangle for n >= 4");
+        self.face_adopt_loop_cycle(source_face, donor);
+        // §9.4 duplicate-list naming follows the handle swap: if the grafted
+        // (last) triangle was flagged a duplicate, report it under the
+        // surviving source handle rather than the freed donor key.
+        for double in doubles.iter_mut() {
+            if *double == donor {
+                *double = source_face;
+            }
+        }
+
         doubles
     }
 
@@ -401,5 +438,106 @@ mod tests {
         let mut expected: Vec<usize> = [v[0], v[1], v[2]].iter().map(|k| k.as_usize()).collect();
         expected.sort_unstable();
         assert_eq!(triple, expected);
+    }
+
+    /// §9.5 handle survival: a caller holding the source `FaceKey` across the
+    /// call must still find it valid afterward, naming one of the output
+    /// triangles and carrying the source face's per-face attributes. This is
+    /// gate-blind (a topology-only canonical comparison cannot see handle
+    /// identity), so it is pinned here directly.
+    #[test]
+    fn source_face_handle_survives_and_keeps_face_cd() {
+        let mut mesh = LoopMesh::new();
+        let material = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("material"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        let verts = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let face = create_face_from_verts(&mut mesh, &verts);
+        mesh.face_attribs_mut().set_f32(material, face.as_usize(), 7.0);
+
+        mesh.face_triangulate(face, QuadMethod::Fixed, NgonMethod::EarClip);
+
+        // The source key is still live.
+        assert!(
+            mesh.face_keys().contains(&face),
+            "source face handle must survive triangulation"
+        );
+        // ...and names a triangle carrying the source's per-face CD.
+        assert_eq!(mesh.face_len(face), 3, "surviving handle names a triangle");
+        assert_eq!(
+            mesh.face_attribs().get_f32(material, face.as_usize()),
+            Some(7.0),
+            "surviving handle keeps the source face's per-face attribute"
+        );
+        // Every output triangle inherits the face CD (the survivor included).
+        for output in mesh.face_keys() {
+            assert_eq!(
+                mesh.face_attribs().get_f32(material, output.as_usize()),
+                Some(7.0)
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// §9.5 positional loop-CD mapping: each new corner inherits its loop
+    /// customdata from the source corner at the *same vertex*. Distinct
+    /// per-corner UVs make this a precise positional check — every output
+    /// corner must read back exactly the source UV of the vertex it sits on.
+    #[test]
+    fn new_corner_inherits_same_vertex_source_loop_cd() {
+        use std::collections::HashMap;
+
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+        // A pentagon so the n-gon ear-clip path (not just the quad path) is
+        // exercised, and several corners come from the same source loops.
+        let verts: Vec<Vec3> = (0..5)
+            .map(|i| {
+                let theta = (i as f32) * std::f32::consts::TAU / 5.0;
+                Vec3::new(theta.cos(), theta.sin(), 0.0)
+            })
+            .collect();
+        let face = create_face_from_verts(&mut mesh, &verts);
+
+        // Give each source corner a distinct UV keyed by its vertex, and
+        // remember the mapping so we can check inheritance per vertex.
+        let mut expected_uv: HashMap<VertexKey, [f32; 2]> = HashMap::new();
+        for (corner_index, source_loop) in mesh.face_loop_keys(face).into_iter().enumerate() {
+            let source_vertex = mesh.loop_vertex(source_loop);
+            let value = [corner_index as f32 + 1.0, (corner_index as f32 + 1.0) * 10.0];
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, source_loop.as_usize(), value);
+            expected_uv.insert(source_vertex, value);
+        }
+
+        mesh.face_triangulate(face, QuadMethod::Fixed, NgonMethod::EarClip);
+
+        // Every output corner reads back the source UV of the vertex it sits
+        // on — the positional same-vertex inheritance contract.
+        for output_face in mesh.face_keys() {
+            for output_loop in mesh.face_loop_keys(output_face) {
+                let output_vertex = mesh.loop_vertex(output_loop);
+                let got = mesh.loop_attribs().get_vec2(uv, output_loop.as_usize());
+                assert_eq!(
+                    got,
+                    Some(expected_uv[&output_vertex]),
+                    "corner on vertex {output_vertex:?} must inherit that vertex's source loop CD"
+                );
+            }
+        }
+        mesh.validate_topology();
     }
 }
