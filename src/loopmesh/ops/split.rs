@@ -156,6 +156,94 @@ impl LoopMesh {
         }
     }
 
+    /// Tear a mixed selection loose **into a separate destination mesh**: the
+    /// cross-mesh sibling of [`split`](Self::split) (SPLIT.md §8).
+    ///
+    /// The `split` operation declares a `dest` slot but never reads it, so a
+    /// genuine cross-mesh tear is a **consumer-built composition** rather than a
+    /// `dest`-carrying `split` call (SPLIT.md §8 intro). This method builds that
+    /// composition from two already-parity-correct primitives:
+    ///
+    /// 1. **Step 1 (§8.1 step 1)** — [`duplicate_into`](Self::duplicate_into)
+    ///    clones the selection's closure into `dest`. The clone is born in
+    ///    `dest`; `self` is left untouched, so the source mesh holds *no*
+    ///    coincident clone — the headline cross-mesh simplification (§8).
+    /// 2. **Step 2 (§8.1 step 2)** — the same-mesh active-face re-point does not
+    ///    apply cross-mesh (a mesh's active face must be one of its own faces, and
+    ///    the clone now lives in `dest`), so it is skipped.
+    /// 3. **Step 3 (§8.1 step 3)** — the originals are removed from `self` under
+    ///    the **faces** context, exactly as the in-place [`split`](Self::split)
+    ///    runs its source removal. Because the source holds only originals (no
+    ///    clone to spare), this is plain faces-context delete; the same
+    ///    `use_only_faces` widening (§4) and named-loose sweep (§3.3) apply, and
+    ///    cross-mesh the §8.3 widening sweeps the **source** only — the clone's
+    ///    loose parts stay standing in `dest`, since the source-side passes never
+    ///    reach them.
+    ///
+    /// **Output slots cross-mesh (SPLIT.md §8.2).** `geom_out` comes back
+    /// **empty** — the clone lives in `dest`, not in `self`, so the source-side
+    /// new-element scan finds nothing (mirroring [`duplicate_into`](Self::duplicate_into)).
+    /// A cross-mesh consumer reads the clone through `dest` or the correspondence
+    /// maps. The `boundary_map` / `isovert_map` slots are forwarded **forward-only**
+    /// (`source → clone`, key in `self`, value in `dest`) exactly as
+    /// `duplicate_into` produces them: the §5 boundary-map key fix-up (rewriting a
+    /// deleted-source frontier edge to a `clone → clone` self-map) is **deferred**
+    /// for this landing. Per the §8.2 handle-uniqueness caveat an index-keyed
+    /// backend cannot safely hold the self-map branch (a `clone → clone` couple
+    /// living entirely in `dest` collides with a surviving-source `source → clone`
+    /// couple at equal indices), so the cross-mesh maps stay forward-only here. A
+    /// solely-owned frontier edge's source key therefore dangles after the tear,
+    /// just as the isovert map's deleted-source key does (§5); the consumer
+    /// reaches the surviving clone through the couple **value**.
+    ///
+    /// See `radial-mesh-guides/operators/SPLIT.md` §8 for the cross-mesh
+    /// composition and its per-mesh element-count deltas (§8.4).
+    pub fn split_into(
+        &mut self,
+        geom: &[GeomKey],
+        use_only_faces: bool,
+        dest: &mut LoopMesh,
+    ) -> SplitResult {
+        // The named face / loose parts of the input `geom`, in `self`. A face's
+        // closure adds only edges and verts, never another face, so the named
+        // faces *are* the selected-face set the faces-context delete cascades
+        // from (SPLIT.md §3.3, applied source-side per §8.1 step 3).
+        let mut named_faces: Vec<FaceKey> = Vec::new();
+        let mut named_edges: Vec<EdgeKey> = Vec::new();
+        let mut named_verts: Vec<VertexKey> = Vec::new();
+        for g in geom {
+            match *g {
+                GeomKey::Face(f) => named_faces.push(f),
+                GeomKey::Edge(e) => named_edges.push(e),
+                GeomKey::Vert(v) => named_verts.push(v),
+            }
+        }
+
+        // Step 1 (§8.1 step 1) — clone the closure into `dest`. `self` is left
+        // untouched; nothing of the clone enters the source mesh.
+        let dupe = self.duplicate_into(geom, false, dest);
+
+        // Step 2 (§8.1 step 2) — active-face re-point does not apply cross-mesh.
+
+        // Step 3 (§8.1 step 3) — remove the originals from `self` with the faces
+        // context. The source holds only originals, so this is the in-place
+        // split's source removal verbatim; the §8.3 widening sweeps `self` only.
+        if use_only_faces {
+            let selected_face: HashSet<FaceKey> = named_faces.iter().copied().collect();
+            self.split_delete_widened(&selected_face);
+        } else {
+            self.split_delete_faces_and_named_loose(&named_faces, &named_edges, &named_verts);
+        }
+
+        SplitResult {
+            // §8.2: empty cross-mesh — the clone lives in `dest`.
+            geom_out: dupe.geom_out,
+            // §8.2: forward-only `source → clone`, no §5 cross-mesh fix-up (deferred).
+            boundary_map: dupe.boundary_map,
+            isovert_map: dupe.isovert_map,
+        }
+    }
+
     /// Default-path removal (`use_only_faces = false`, SPLIT.md §3.3): tear out
     /// the face closure with the faces context, then sweep the input `geom`'s
     /// directly-named loose parts.
@@ -558,5 +646,98 @@ mod tests {
             "both original and clone loose verts swept"
         );
         mesh.validate_topology();
+    }
+
+    // ---- Cross-mesh tear (`split_into`, SPLIT.md §8) ----
+
+    #[test]
+    fn split_into_isolated_quad_moves_to_dest() {
+        // §8.4 clean move: an isolated quad (the whole source) torn into an empty
+        // dest. The clone is born in dest (+4/+4/+1); the source-side faces delete
+        // removes the whole isolated original (every edge/vert solely owned), so
+        // the source empties (−4/−4/−1). Cross-mesh this is not the same-mesh
+        // no-op but a relocation (§8.4).
+        let mut src = LoopMesh::new();
+        let face = unit_quad(&mut src);
+        let mut dest = LoopMesh::new();
+
+        let result = src.split_into(&[face.into()], false, &mut dest);
+
+        // Source emptied — nothing of the isolated selection survives.
+        assert_eq!(
+            (src.vertex_count(), src.edge_count(), src.face_count()),
+            (0, 0, 0),
+            "isolated source torn out entirely (§8.4 move)"
+        );
+        // Dest holds the full clone quad.
+        assert_eq!(
+            (dest.vertex_count(), dest.edge_count(), dest.face_count()),
+            (4, 4, 1),
+            "dest gains the whole clone (+Fc/+Ec/+Vc, §8.4)"
+        );
+
+        // §8.2: geom_out empty cross-mesh (the clone lives in dest).
+        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        // Forward-only boundary map: every perimeter edge is a frontier, keyed by
+        // the (now-deleted) source edge, valued at the live dest clone.
+        assert_eq!(result.boundary_map.len(), 4, "four frontier edges (§8.2)");
+        for &clone_edge in result.boundary_map.values() {
+            assert!(
+                dest.edges.try_get(clone_edge).is_some(),
+                "boundary_map value is a live dest clone edge"
+            );
+        }
+
+        src.validate_topology();
+        dest.validate_topology();
+    }
+
+    #[test]
+    fn split_into_interior_quad_keeps_seam_clones_to_dest() {
+        // §8.4 interior tear: the centre face of a 3×3 grid torn into an empty
+        // dest. The four perimeter edges are shared with surrounding faces, so the
+        // source-side faces delete keeps them (the §3.3 keep-alive) and only the
+        // centre face is removed: source delta −0/−0/−1. The clone lands whole in
+        // dest: +4/+4/+1.
+        let mut src = LoopMesh::new();
+        let faces = build_quad_grid(&mut src, 3);
+        let (v0, e0, f0) = (src.vertex_count(), src.edge_count(), src.face_count());
+        let centre = faces[1 * 3 + 1];
+        let mut dest = LoopMesh::new();
+
+        let result = src.split_into(&[centre.into()], false, &mut dest);
+
+        // Source keeps the shared seam — only the face count drops.
+        assert_eq!(src.vertex_count(), v0, "shared seam verts kept (−0 V, §8.4)");
+        assert_eq!(src.edge_count(), e0, "shared seam edges kept (−0 E, §8.4)");
+        assert_eq!(src.face_count(), f0 - 1, "only the centre face removed (−1 F, §8.4)");
+        assert!(
+            src.faces.try_get(centre).is_none(),
+            "centre original torn out of the source"
+        );
+        // Dest gains the full clone quad.
+        assert_eq!(
+            (dest.vertex_count(), dest.edge_count(), dest.face_count()),
+            (4, 4, 1),
+            "dest gains the whole clone (+4/+4/+1, §8.4)"
+        );
+
+        // §8.2: geom_out empty; forward-only frontier map spans the two meshes
+        // (source key survives the keep-alive, dest value is the clone).
+        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        assert_eq!(result.boundary_map.len(), 4, "four shared frontier edges");
+        for (&source_edge, &clone_edge) in result.boundary_map.iter() {
+            assert!(
+                src.edges.try_get(source_edge).is_some(),
+                "shared source key survives the keep-alive in src"
+            );
+            assert!(
+                dest.edges.try_get(clone_edge).is_some(),
+                "frontier clone lives in dest"
+            );
+        }
+
+        src.validate_topology();
+        dest.validate_topology();
     }
 }
