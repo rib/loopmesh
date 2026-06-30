@@ -139,7 +139,7 @@ impl LoopMesh {
         // layer). `new_faces` holds exactly the cap faces, so the uncapped path
         // has nothing to paint.
         if calc_uvs && cap_ends {
-            if let Some(uv_layer) = self.active_uv_layer_for_circle() {
+            if let Some(uv_layer) = self.active_uv_loop_layer() {
                 self.paint_circle_uvs(&new_faces, matrix, radius, uv_layer);
             }
         }
@@ -185,24 +185,6 @@ impl LoopMesh {
                     .set_vec2(uv_layer, loop_key.as_usize(), uv);
             }
         }
-    }
-
-    /// Resolve the active UV layer: the loop-domain layer create-circle paints
-    /// when `calc_uvs` is set. Prefer 2-component loop layers tagged with the
-    /// Uv role; otherwise fall back to the first registered Vec2 loop layer
-    /// (the "a vec2 loop layer is a UV layer" convention). `None` when the mesh
-    /// carries no UV layer at all (§4 / §7 — the no-op case).
-    fn active_uv_layer_for_circle(&self) -> Option<ElementAttributeKey> {
-        let attribs = self.loop_attribs();
-        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
-        let any_tagged = attribs
-            .iter_descriptors()
-            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
-        attribs
-            .iter_descriptors()
-            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
-            .map(|(key, _)| key)
-            .next()
     }
 }
 

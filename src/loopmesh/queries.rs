@@ -616,6 +616,28 @@ impl LoopMesh {
 
         None
     }
+
+    /// Resolve the active UV layer: the loop-domain layer UV-aware operators
+    /// target by default. Prefer the canonical primary-UV semantic — a
+    /// 2-component loop layer tagged with the [`AttrRole::Uv`] role; otherwise
+    /// fall back to the first registered 2-component loop layer (the
+    /// established "a vec2 loop layer is a UV layer" convention). `None` when
+    /// the mesh carries no UV layer at all.
+    pub(crate) fn active_uv_loop_layer(&self) -> Option<ElementAttributeKey> {
+        let attribs = self.loop_attribs();
+        // Among 2-component loop layers, prefer those tagged with the Uv role;
+        // fall back to the layout convention (first Vec2 loop layer) when none
+        // is tagged.
+        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
+        let any_tagged = attribs
+            .iter_descriptors()
+            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
+        attribs
+            .iter_descriptors()
+            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
+            .map(|(key, _)| key)
+            .next()
+    }
 }
 
 #[cfg(test)]

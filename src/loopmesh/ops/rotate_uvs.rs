@@ -25,7 +25,7 @@ impl LoopMesh {
     /// not create a layer. Each face is rotated independently, so the result is
     /// order-independent.
     pub fn rotate_uvs(&mut self, faces: &[FaceKey], use_ccw: bool) {
-        let uv_layer = match self.active_uv_layer_for_rotate() {
+        let uv_layer = match self.active_uv_loop_layer() {
             Some(layer) => layer,
             None => return,
         };
@@ -67,27 +67,6 @@ impl LoopMesh {
                     .set_vec2(uv_layer, loop_keys[i].as_usize(), saved[source]);
             }
         }
-    }
-
-    /// Resolve the active UV layer: the loop-domain layer the operator targets
-    /// by default. Prefer the canonical primary-UV semantic; otherwise fall
-    /// back to the first registered 2-component loop layer (the established
-    /// "a vec2 loop layer is a UV layer" convention). `None` when the mesh
-    /// carries no UV layer at all.
-    fn active_uv_layer_for_rotate(&self) -> Option<ElementAttributeKey> {
-        let attribs = self.loop_attribs();
-        // Among 2-component loop layers, prefer those tagged with the Uv role;
-        // fall back to the layout convention (first Vec2 loop layer) when none
-        // is tagged.
-        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
-        let any_tagged = attribs
-            .iter_descriptors()
-            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
-        attribs
-            .iter_descriptors()
-            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
-            .map(|(key, _)| key)
-            .next()
     }
 }
 
