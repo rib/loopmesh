@@ -70,6 +70,7 @@ mod euler;
 mod geom;
 mod index;
 mod iter;
+mod math;
 mod mid;
 mod normals;
 mod ops;
@@ -78,6 +79,7 @@ mod radial;
 
 pub use attributes::*;
 pub use geom::{convex_hull, ConvexHullProvider, HullFace, HullTopology, Quickhull};
+pub use math::{SparseCholesky, SparseSolveError};
 pub use iter::*;
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
