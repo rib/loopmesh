@@ -43,6 +43,7 @@ mod face_attribute_fill;
 mod face_poke;
 mod face_triangulate;
 mod find_doubles;
+mod flip_quad_tessellation;
 mod fractal_noise;
 mod grid_fill;
 mod holes_fill;
