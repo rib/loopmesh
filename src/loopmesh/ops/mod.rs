@@ -39,6 +39,7 @@ mod extrude_edge_only;
 mod extrude_mixed;
 mod extrude_region;
 mod extrude_vert_indiv;
+mod face_attribute_fill;
 mod face_poke;
 mod face_triangulate;
 mod find_doubles;
@@ -96,6 +97,7 @@ pub use dissolve_limit::{
 pub use dissolve_verts::DissolveVertsParams;
 pub use duplicate::{DuplicateResult, GeomKey};
 pub use edgeloop_fill::{EdgeloopFillParams, EdgeloopFillResult};
+pub use face_attribute_fill::FaceAttributeFillResult;
 pub use grid_fill::{GridFillParams, GridFillResult};
 pub use holes_fill::{HolesFillParams, HolesFillResult};
 pub use extrude_mixed::ExtrudeMixedResult;

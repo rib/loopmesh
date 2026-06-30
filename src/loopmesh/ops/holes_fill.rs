@@ -452,7 +452,10 @@ impl LoopMesh {
     /// Copy `donor`'s face-domain attributes into `cap`: the material index and
     /// any face-domain custom-data (both live in the face attribute table, so a
     /// single copy carries them together) plus the persistent smooth header bit.
-    fn holes_fill_copy_face_attribs(&mut self, donor: FaceKey, cap: FaceKey) {
+    ///
+    /// Shared with [`LoopMesh::face_attribute_fill`], which is the same bare
+    /// face-domain inheritance pass exposed on its own.
+    pub(crate) fn holes_fill_copy_face_attribs(&mut self, donor: FaceKey, cap: FaceKey) {
         self.face_attribs.copy_into(cap.as_usize(), donor.as_usize());
         let smooth = self.is_face_smooth(donor);
         self.set_face_smooth(cap, smooth);
@@ -461,7 +464,11 @@ impl LoopMesh {
     /// Pull each cap corner's loop data from the existing face across its shared
     /// edge, matched at the same vertex (§6.1). A corner whose edges all face open
     /// space or another cap keeps its default loop data.
-    fn holes_fill_copy_loop_data(&mut self, cap: FaceKey, cap_set: &HashSet<FaceKey>) {
+    ///
+    /// Shared with [`LoopMesh::face_attribute_fill`]: passing the live set of
+    /// still-unresolved destinations as `cap_set` gives the per-corner,
+    /// non-transitive loop-data inheritance both operators share.
+    pub(crate) fn holes_fill_copy_loop_data(&mut self, cap: FaceKey, cap_set: &HashSet<FaceKey>) {
         for cap_loop in self.face_loop_keys(cap) {
             let vertex = self.loop_vertex(cap_loop);
             let donor_face = self
