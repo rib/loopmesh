@@ -15,6 +15,9 @@ impl LoopMesh {
     ///
     /// Vertices are minted in **row-major** order — the bottom row left to right,
     /// then upward — with linear index `index(ix, iy) = ix + iy·(nx+1)` (§2.2).
+    /// They are **returned** in that same row-major order (the `verts.out` slot
+    /// contract, §2.2): the returned buffer has `(nx+1)·(ny+1)` elements and
+    /// `result[ix + iy·(nx+1)]` is the vertex at lattice coordinate `(ix, iy)`.
     /// One counter-clockwise quad is built per 2×2 cell through the edge-reusing
     /// face-create primitive (§3), so interior edges between adjacent cells are
     /// minted once and shared; only the rim edges stay boundary, making the
@@ -43,7 +46,7 @@ impl LoopMesh {
         size: f32,
         matrix: Mat4,
         calc_uvs: bool,
-    ) {
+    ) -> Vec<VertexKey> {
         let _ = calc_uvs;
 
         // §7 — clamp each segment count up to a minimum of 1.
@@ -92,6 +95,9 @@ impl LoopMesh {
         for &vert in &lattice {
             self.vert_normal_update(vert);
         }
+
+        // §2.2 — report the created verts in row-major order (the verts.out slot).
+        lattice
     }
 }
 
@@ -285,5 +291,41 @@ mod tests {
             assert_eq!(mesh.face_vert_keys(face).len(), 4);
         }
         mesh.validate_topology();
+    }
+
+    /// §2.2: the returned `verts.out` buffer has `(nx+1)·(ny+1)` elements in
+    /// row-major order — `result[ix + iy·(nx+1)]` is the vertex at lattice
+    /// coordinate `(ix, iy)`. Probed on a rectangular `nx ≠ ny` grid so a
+    /// transposed / column-major bug fails (the strides differ: 4 vs 3).
+    #[test]
+    fn create_grid_returns_row_major_verts_out() {
+        let mut mesh = LoopMesh::new();
+        let (nx, ny, size) = (3usize, 2usize, 1.0f32);
+
+        let verts = mesh.create_grid(nx as i32, ny as i32, size, Mat4::IDENTITY, false);
+
+        let vert_columns = nx + 1;
+        assert_eq!(verts.len(), vert_columns * (ny + 1));
+
+        // Expected local lattice position for coordinate (ix, iy).
+        let expected = |ix: usize, iy: usize| {
+            Vec3::new(
+                ((ix as f32 * 2.0 / nx as f32) - 1.0) * size,
+                ((iy as f32 * 2.0 / ny as f32) - 1.0) * size,
+                0.0,
+            )
+        };
+
+        // Probe several cells, including asymmetric ones (ix != iy) and the far
+        // corners, so a column-major layout would land on the wrong vertex.
+        for (ix, iy) in [(0, 0), (3, 0), (0, 2), (3, 2), (1, 0), (0, 1), (2, 1)] {
+            let key = verts[ix + iy * vert_columns];
+            let got = mesh.vertex_position(key);
+            let want = expected(ix, iy);
+            assert!(
+                (got - want).length() < EPS,
+                "verts.out[{ix}+{iy}·{vert_columns}] at {got:?}, expected ({ix},{iy}) = {want:?}"
+            );
+        }
     }
 }
