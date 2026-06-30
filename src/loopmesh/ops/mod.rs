@@ -34,6 +34,7 @@ mod dissolve_limit;
 mod dissolve_verts;
 mod duplicate;
 mod edgeloop_fill;
+mod edgenet_fill;
 mod extrude_discrete;
 mod extrude_edge_only;
 mod extrude_mixed;
@@ -99,6 +100,7 @@ pub use dissolve_limit::{
 pub use dissolve_verts::DissolveVertsParams;
 pub use duplicate::{DuplicateResult, GeomKey};
 pub use edgeloop_fill::{EdgeloopFillParams, EdgeloopFillResult};
+pub use edgenet_fill::{EdgenetFillParams, EdgenetFillResult};
 pub use face_attribute_fill::FaceAttributeFillResult;
 pub use grid_fill::{GridFillParams, GridFillResult};
 pub use holes_fill::{HolesFillParams, HolesFillResult};

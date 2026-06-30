@@ -63,8 +63,45 @@ impl LoopMesh {
     pub fn holes_fill(&mut self, edges: &[EdgeKey], params: &HolesFillParams) -> HolesFillResult {
         let mut result = HolesFillResult::default();
 
-        // §3 — tag the boundary net: only these edges are ever stepped along or
-        // seeded from. A degenerate self-edge can bound no hole and is dropped.
+        // §3 + §4 — the shared minimal-cycle core: tag the net, cap every enclosed
+        // cell with one n-gon, and refresh each cap's normal (NORMALS_CALC).
+        let mut new_caps = self.edgenet_minimal_cycle_fill(edges);
+
+        // §5 — the `sides` perimeter cap is a post-fill deletion, not a search
+        // constraint: every hole was filled above, and only now is each oversized
+        // cap killed. `sides == 0` skips the deletion entirely.
+        if params.sides != 0 {
+            new_caps.retain(|&cap| {
+                if self.face_len(cap) > params.sides {
+                    self.face_kill(cap);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // §6.1 — flood the surrounding surface's attributes into the surviving
+        // caps. A free-wire cap the flood never reaches keeps its defaults (§6.3).
+        self.holes_fill_inherit_attributes(&new_caps);
+
+        result.faces = new_caps;
+        result
+    }
+
+    /// §3 + §4 — the shared **edgenet minimal-cycle fill** core, reused verbatim
+    /// by [`LoopMesh::holes_fill`] and [`LoopMesh::edgenet_fill`]. Tags the
+    /// working net (§3), then repeatedly finds the smallest fillable cycle in the
+    /// tagged subset and caps it with a single n-gon (§4.1–§4.6) until no fillable
+    /// tagged edge remains, returning every new cap with a refreshed geometric
+    /// normal (NORMALS_CALC / §6.3).
+    ///
+    /// Neither the `sides` post-fill deletion (holes-fill §5) nor the §6 attribute
+    /// flood is part of the core — those are the per-operator wrappers that the
+    /// two fill operators apply around this identical engine.
+    pub(crate) fn edgenet_minimal_cycle_fill(&mut self, edges: &[EdgeKey]) -> Vec<FaceKey> {
+        // §3 — tag the working net: only these edges are ever stepped along or
+        // seeded from. A degenerate self-edge can bound no cell and is dropped.
         let mut tagged: HashSet<EdgeKey> = HashSet::with_capacity(edges.len());
         for &edge in edges {
             let [a, b] = self.edge_vert_keys(edge);
@@ -74,7 +111,7 @@ impl LoopMesh {
         }
         // §7 — fewer than three fillable edges can close no cycle.
         if tagged.len() < 3 {
-            return result;
+            return Vec::new();
         }
 
         // §4.3 / §4.5 — seeds are drawn in mesh/insertion order, not input order:
@@ -122,26 +159,7 @@ impl LoopMesh {
             self.face_normal_update(cap);
         }
 
-        // §5 — the `sides` perimeter cap is a post-fill deletion, not a search
-        // constraint: every hole was filled above, and only now is each oversized
-        // cap killed. `sides == 0` skips the deletion entirely.
-        if params.sides != 0 {
-            new_caps.retain(|&cap| {
-                if self.face_len(cap) > params.sides {
-                    self.face_kill(cap);
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        // §6.1 — flood the surrounding surface's attributes into the surviving
-        // caps. A free-wire cap the flood never reaches keeps its defaults (§6.3).
-        self.holes_fill_inherit_attributes(&new_caps);
-
-        result.faces = new_caps;
-        result
+        new_caps
     }
 
     /// §4.1 — an edge is fillable (step-ok / seed-ok) when it carries the working
@@ -392,7 +410,7 @@ impl LoopMesh {
     /// corner's shared edge from the existing face at the same vertex. A cap the
     /// flood never reaches — a free wire loop with no adjacent existing face —
     /// keeps its defaults (§6.3).
-    fn holes_fill_inherit_attributes(&mut self, caps: &[FaceKey]) {
+    pub(crate) fn holes_fill_inherit_attributes(&mut self, caps: &[FaceKey]) {
         if caps.is_empty() {
             return;
         }
