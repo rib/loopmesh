@@ -20,6 +20,7 @@ mod connect_verts_concave;
 mod connect_verts_nonplanar;
 mod convex_hull;
 mod create_circle;
+mod create_cone;
 mod create_cube;
 mod create_grid;
 mod create_vert;
