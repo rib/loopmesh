@@ -50,6 +50,11 @@ impl LoopMesh {
     /// geometry, never clears the mesh, and never merges into prior verts even
     /// where the new box is geometrically coincident with them (§ intro, §7).
     ///
+    /// The eight corners are **returned** in §2.1 sign-bit order (the `verts.out`
+    /// slot contract): `result[i]` is the corner whose `(x, y, z)` signs are the
+    /// binary expansion of `i` (`i = (x_bit << 2) | (y_bit << 1) | z_bit`, a set
+    /// bit meaning `+half`), so the buffer always has exactly 8 elements.
+    ///
     /// `calc_uvs` is accepted for call-shape compatibility but is presently a
     /// deferral: loopmesh writes no default cube-cross UV net (the §4 UV row is
     /// tracked separately and stays unimplemented this cycle). With no UV layer
@@ -57,7 +62,7 @@ impl LoopMesh {
     /// §7's "`calc_uvs` set but no UV layer present" no-op.
     ///
     /// See `radial-mesh-guides/operators/CREATE_CUBE.md` for the full contract.
-    pub fn create_cube(&mut self, size: f32, matrix: Mat4, calc_uvs: bool) {
+    pub fn create_cube(&mut self, size: f32, matrix: Mat4, calc_uvs: bool) -> Vec<VertexKey> {
         let _ = calc_uvs;
 
         // §7 — exactly `0` maps to the unit cube; every other size, positive or
@@ -118,6 +123,9 @@ impl LoopMesh {
         for &vert in &corners {
             self.vert_normal_update(vert);
         }
+
+        // §2.1 — report the eight corners in sign-bit index order (verts.out).
+        corners.to_vec()
     }
 }
 
@@ -287,6 +295,42 @@ mod tests {
             }
         }
         mesh.validate_topology();
+    }
+
+    /// §2.1 / §8: the returned `verts.out` buffer has exactly 8 elements in
+    /// sign-bit corner order — `result[i]` is the corner whose `(x, y, z)` signs
+    /// are the binary expansion of `i` (`bit 2 → x, bit 1 → y, bit 0 → z`, a set
+    /// bit meaning `+off`). Probed under a non-identity matrix so a transposed or
+    /// reordered bug lands on the wrong corner. This slot order is *not* captured
+    /// by an order-free isomorphism check, so it needs an explicit index check.
+    #[test]
+    fn create_cube_returns_sign_bit_corner_order() {
+        let mut mesh = LoopMesh::new();
+        let size = 2.0;
+        let off = size / 2.0;
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_4),
+            Vec3::new(5.0, -2.0, 1.0),
+        );
+
+        let verts = mesh.create_cube(size, matrix, false);
+
+        assert_eq!(verts.len(), 8);
+        for index in 0..8usize {
+            let signed = |bit_set: bool| if bit_set { off } else { -off };
+            let local = Vec3::new(
+                signed(index & 0b100 != 0),
+                signed(index & 0b010 != 0),
+                signed(index & 0b001 != 0),
+            );
+            let expected = matrix.transform_point3(local);
+            let got = mesh.vertex_position(verts[index]);
+            assert!(
+                (got - expected).length() < EPS,
+                "verts.out[{index}] at {got:?}, expected sign pattern {local:?} -> {expected:?}"
+            );
+        }
     }
 
     /// §7 / intro: create-cube appends to a populated mesh without clearing it.
