@@ -44,11 +44,20 @@ impl LoopMesh {
     /// route never mints one, §2.2), so it returns just the ring. A `segments = 0`
     /// no-op returns an empty buffer.
     ///
-    /// `calc_uvs` is accepted for call-shape compatibility but is presently a
-    /// deferral: loopmesh writes no default radial UV unwrap (the §4 UV row is
-    /// tracked separately and stays unimplemented this cycle). With no UV layer
-    /// populated the topology is identical with the flag set or clear, matching
-    /// §7's "`calc_uvs` set but no UV layer present" no-op.
+    /// When `calc_uvs` is set, the ring is capped (`cap_ends`), **and** the mesh
+    /// carries an active per-loop 2-component-float (UV) layer, a default radial
+    /// unwrap is painted across the cap loops (§4): each loop's vertex world
+    /// position is mapped **back** through `inverse(matrix)` into the local
+    /// `z = 0` plane, then `u = 0.5 + (0.5/radius)·local.x`,
+    /// `v = 0.5 + (0.5/radius)·local.y`, so the centre lands at `(0.5, 0.5)` and
+    /// the rim traces the inscribed `r = 0.5` circle. The unwrap is purely
+    /// position-keyed: each loop's UV is a pure function of its own vertex, so
+    /// shared corners (the fan apex, ring verts across triangles) agree
+    /// automatically — no reconciliation step is needed. With `calc_uvs` clear,
+    /// no UV layer present, or an uncapped ring, the flag is a silent no-op — it
+    /// never mints a layer (§4 / §7). At `radius = 0` the `0.5/radius` scale is
+    /// `+∞` and the formula yields `NaN` on the collapsed local `(0, 0)`; this is
+    /// the don't-care degenerate output and is left unguarded (§4).
     ///
     /// See `radial-mesh-guides/operators/CREATE_CIRCLE.md` for the full contract.
     pub fn create_circle(
@@ -60,8 +69,6 @@ impl LoopMesh {
         matrix: Mat4,
         calc_uvs: bool,
     ) -> Vec<VertexKey> {
-        let _ = calc_uvs;
-
         // §7 — `segments = 0` (or any non-positive value) builds nothing.
         if segments <= 0 {
             return Vec::new();
@@ -126,6 +133,17 @@ impl LoopMesh {
             self.vert_normal_update(vert);
         }
 
+        // §4 — optional default radial UV unwrap, painted only when the flag is
+        // set, the ring is capped (so there are cap loops to carry UVs), and an
+        // active per-loop UV layer already exists (the flag alone never mints a
+        // layer). `new_faces` holds exactly the cap faces, so the uncapped path
+        // has nothing to paint.
+        if calc_uvs && cap_ends {
+            if let Some(uv_layer) = self.active_uv_layer_for_circle() {
+                self.paint_circle_uvs(&new_faces, matrix, radius, uv_layer);
+            }
+        }
+
         // §1 / §2.1 / §8 — report the created verts in verts.out order: the fan
         // apex (created first, before the ring) leads when it survives, then the
         // ring in angular order. The n-gon and uncapped paths have no centre.
@@ -133,6 +151,58 @@ impl LoopMesh {
             Some(apex) => std::iter::once(apex).chain(ring).collect(),
             None => ring,
         }
+    }
+
+    /// §4 — paint the radial unwrap across the cap loops. Each loop's UV is a
+    /// pure function of its own vertex position: map the world position back
+    /// through `inverse(matrix)` into the local `z = 0` plane, then
+    /// `u = 0.5 + (0.5/radius)·local.x`, `v = 0.5 + (0.5/radius)·local.y`. The
+    /// formula is position-keyed, so loops sharing a vertex (the fan apex, ring
+    /// verts across triangles) land on identical UVs with no reconciliation. At
+    /// `radius = 0` the scale is `+∞` and the result is `NaN` on the collapsed
+    /// `(0, 0)` — the §4 don't-care degenerate, left unguarded.
+    fn paint_circle_uvs(
+        &mut self,
+        cap_faces: &[FaceKey],
+        matrix: Mat4,
+        radius: f32,
+        uv_layer: ElementAttributeKey,
+    ) {
+        let inverse = matrix.inverse();
+        let scale = 0.5 / radius;
+
+        let mut loop_keys: smallvec::SmallVec<[LoopKey; 4]> = smallvec::SmallVec::new();
+        for &face in cap_faces {
+            loop_keys.clear();
+            for loop_key in self.iter_face_loops(face) {
+                loop_keys.push(loop_key);
+            }
+            for &loop_key in &loop_keys {
+                let vertex = self.loop_vertex(loop_key);
+                let local = inverse.transform_point3(self.vertex_position(vertex));
+                let uv = [0.5 + scale * local.x, 0.5 + scale * local.y];
+                self.loop_attribs_mut()
+                    .set_vec2(uv_layer, loop_key.as_usize(), uv);
+            }
+        }
+    }
+
+    /// Resolve the active UV layer: the loop-domain layer create-circle paints
+    /// when `calc_uvs` is set. Prefer 2-component loop layers tagged with the
+    /// Uv role; otherwise fall back to the first registered Vec2 loop layer
+    /// (the "a vec2 loop layer is a UV layer" convention). `None` when the mesh
+    /// carries no UV layer at all (§4 / §7 — the no-op case).
+    fn active_uv_layer_for_circle(&self) -> Option<ElementAttributeKey> {
+        let attribs = self.loop_attribs();
+        let is_vec2 = |key| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_)));
+        let any_tagged = attribs
+            .iter_descriptors()
+            .any(|(key, d)| d.role == AttrRole::Uv && is_vec2(key));
+        attribs
+            .iter_descriptors()
+            .filter(|(key, d)| is_vec2(*key) && (!any_tagged || d.role == AttrRole::Uv))
+            .map(|(key, _)| key)
+            .next()
     }
 }
 
@@ -435,5 +505,133 @@ mod tests {
                 "uncapped verts.out[{a}] at {got:?}, expected ring vertex {a} at {expected:?}"
             );
         }
+    }
+
+    fn register_uv(mesh: &mut LoopMesh) -> ElementAttributeKey {
+        mesh.register_loop_attribute(ElementAttributeDesc::numeric(
+            AttributeKey::custom("uv"),
+            AttrType::Vec2,
+        ))
+        .expect("uv layer registers")
+    }
+
+    fn uv_near(got: [f32; 2], want: [f32; 2]) -> bool {
+        (got[0] - want[0]).abs() < EPS && (got[1] - want[1]).abs() < EPS
+    }
+
+    /// §4: an n-gon-cap circle with `calc_uvs` and an active UV layer paints the
+    /// radial unwrap on the single face's loops — each loop's UV a pure function
+    /// of its vertex's local position (`u = 0.5 + 0.5·x/r`, `v = 0.5 + 0.5·y/r`
+    /// under the identity matrix), so the rim verts trace the inscribed `r = 0.5`
+    /// circle centred on `(0.5, 0.5)`. Vertex 0 at local `(0, +r)` lands at UV
+    /// `(0.5, 1.0)`; the n-gon has no centre, so no `(0.5, 0.5)` corner.
+    #[test]
+    fn create_circle_calc_uvs_ngon_cap_radial_unwrap() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let n = 8;
+        let r = 2.0;
+
+        mesh.create_circle(true, false, n, r, Mat4::IDENTITY, true);
+
+        let face = mesh.face_keys()[0];
+        let mut saw_top = false;
+        for loop_key in mesh.face_loop_keys(face) {
+            let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+            let want = [0.5 + 0.5 * position.x / r, 0.5 + 0.5 * position.y / r];
+            let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+            assert!(uv_near(got, want), "loop UV {got:?}, expected {want:?}");
+            // Every rim corner sits on the inscribed r = 0.5 circle.
+            let radial = ((got[0] - 0.5).powi(2) + (got[1] - 0.5).powi(2)).sqrt();
+            assert!((radial - 0.5).abs() < EPS, "rim UV off the r=0.5 circle: {got:?}");
+            if uv_near(got, [0.5, 1.0]) {
+                saw_top = true;
+            }
+        }
+        assert!(saw_top, "vertex 0 at local (0,+r) should land at UV (0.5, 1.0)");
+        mesh.validate_topology();
+    }
+
+    /// §4: a fan-cap circle paints the unwrap on every triangle's loops. The
+    /// shared apex corners all land at the centre UV `(0.5, 0.5)` (position-keyed,
+    /// no reconciliation), and the rim corners trace the inscribed `r = 0.5`
+    /// circle. Probed under a non-identity transform so the inverse-matrix
+    /// remapping is exercised (a dropped inverse would skew the unwrap).
+    #[test]
+    fn create_circle_calc_uvs_fan_cap_centre_and_rim() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+        let n = 6;
+        let r = 1.5;
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(1.0, 2.0, 1.0),
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_3),
+            Vec3::new(4.0, -1.0, 2.0),
+        );
+        let inverse = matrix.inverse();
+
+        mesh.create_circle(true, true, n, r, matrix, true);
+
+        let mut apex_corners = 0;
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let local = inverse.transform_point3(mesh.vertex_position(mesh.loop_vertex(loop_key)));
+                let want = [0.5 + 0.5 * local.x / r, 0.5 + 0.5 * local.y / r];
+                let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+                assert!(uv_near(got, want), "fan loop UV {got:?}, expected {want:?}");
+                if uv_near(got, [0.5, 0.5]) {
+                    apex_corners += 1;
+                }
+            }
+        }
+        // Each of the n triangles contributes one apex corner, all at (0.5, 0.5).
+        assert_eq!(apex_corners, n as usize, "every fan apex corner at the centre UV");
+        mesh.validate_topology();
+    }
+
+    /// §4 / §7: an uncapped ring has no cap loops, so `calc_uvs` is a no-op even
+    /// with an active UV layer — the topology matches the `calc_uvs = false`
+    /// build and no loops exist to carry UVs.
+    #[test]
+    fn create_circle_calc_uvs_uncapped_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let _uv = register_uv(&mut mesh);
+
+        mesh.create_circle(false, false, 8, 1.0, Mat4::IDENTITY, true);
+
+        assert_eq!(mesh.loop_count(), 0, "uncapped ring has no loops to paint");
+        assert_eq!(mesh.face_count(), 0);
+        mesh.validate_topology();
+    }
+
+    /// §4 / §7: `calc_uvs = true` with no UV layer present is a silent no-op — it
+    /// builds the cap topology and creates no layer.
+    #[test]
+    fn create_circle_calc_uvs_no_layer_is_noop() {
+        let mut mesh = LoopMesh::new();
+
+        mesh.create_circle(true, false, 6, 1.0, Mat4::IDENTITY, true);
+
+        assert_eq!(mesh.face_count(), 1);
+        assert!(mesh.loop_attribs().is_empty(), "no UV layer was created");
+        mesh.validate_topology();
+    }
+
+    /// §4 / §7: `calc_uvs = false` writes nothing even when a UV layer exists —
+    /// every cap corner keeps the layer's default (zero) value.
+    #[test]
+    fn create_circle_calc_uvs_false_is_noop() {
+        let mut mesh = LoopMesh::new();
+        let uv = register_uv(&mut mesh);
+
+        mesh.create_circle(true, true, 6, 1.0, Mat4::IDENTITY, false);
+
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+                assert!(uv_near(got, [0.0, 0.0]), "calc_uvs=false left a non-default UV {got:?}");
+            }
+        }
+        mesh.validate_topology();
     }
 }
