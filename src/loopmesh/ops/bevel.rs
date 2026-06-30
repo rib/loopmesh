@@ -142,9 +142,11 @@ pub struct BevelOptions<'a> {
     pub mark_sharp: bool,
     /// How a multi-edge junction's corner patch is filled at `segments ≥ 2`
     /// (BEVEL.md §1.2 / §8.3). Only consulted for `affect = Edges`,
-    /// `segments ≥ 2`. Defaults to `Adj` (the rounded grid; still a stub). The
-    /// `Cutoff` flat-cut fill is implemented for the multi-edge junction at the
-    /// default profile (BEVEL.md §8.2 / §8.3).
+    /// `segments ≥ 2`. Defaults to `Adj` (the rounded grid), implemented at the
+    /// default circular profile for the cube corner (any `segments`) and the
+    /// general valence-`s` corner (BEVEL.md §8.5 / §8.5.5.5). The `Cutoff`
+    /// flat-cut fill is implemented for the multi-edge junction at the default
+    /// profile (BEVEL.md §8.2 / §8.3).
     pub vmesh_method: BevelVmeshMethod,
     /// Cross-section shape for the `SUPERELLIPSE` profile family (BEVEL.md §8.6),
     /// a scalar in `0..1`. `0.5` (the default) is a circular arc, `0.25` flattens
@@ -961,9 +963,10 @@ impl LoopMesh {
         }
 
         // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
-        // adjacency grid (§8.5), per `vmesh_method`. ADJ is implemented only for
-        // the forced `segments = 2` 3-way cube-corner (§8.5); a junction outside
-        // that forced case takes no ADJ fill (the general grid is a stub, §8.5.5).
+        // adjacency grid (§8.5), per `vmesh_method`. ADJ fills the cube corner (any
+        // `segments`) and the general valence-`s` corner at the default circular
+        // profile (§8.5.5.5); only the deferred profile / pipe variants of
+        // §8.5.5.5(f) take no ADJ fill yet.
         for cut in &junction_cuts {
             match options.vmesh_method {
                 BevelVmeshMethod::Cutoff => {
@@ -1514,21 +1517,26 @@ impl LoopMesh {
             && (directions[2].dot(directions[0]) - 0.5).abs() <= cos_tol
     }
 
-    /// Build the rounded adjacency-grid fill at one junction (BEVEL.md §8.5),
-    /// distilled for the forced `segments = 2` 3-way (cube-corner) case: a
-    /// three-quad pinwheel meeting at one welded central apex.
+    /// Dispatch the rounded adjacency-grid fill at one junction (BEVEL.md §8.5).
     ///
-    /// Per §8.5.3 each sector `i` contributes one quad whose corners are
-    /// `B_i` (`(i,0,0)`), sector `i`'s interior chain vert (`(i,0,1)`), the central
-    /// apex (`(i,1,1)`), and sector `i−1`'s interior chain vert (`(i,1,0)`, the
-    /// shared seam vert with the previous sector). The three apex corners weld to
-    /// one vertex, placed closed-form (§8.5.2): the `unit_to_corner` body-diagonal
-    /// direction snapped onto the rounded surface the ring + chain verts lie on, so
-    /// the apex sits *on* the dome rather than pushed down into the solid (§8.5.3).
+    /// Three paths share the valence-`s` grid machinery, picked by the corner's
+    /// geometry:
     ///
-    /// Only the forced case is handled: exactly three sectors, each with a single
-    /// lone interior chain vert (`segments = 2`). Any other shape is left unfilled
-    /// (the general adjacency grid is a stub, §8.5.5).
+    /// - **Forced `segments = 2` 3-way cube corner (§8.5.1–§8.5.4):** a three-quad
+    ///   pinwheel meeting at one closed-form welded central apex, snapped onto the
+    ///   corner sphere (§8.5.2). Combinatorially forced ⇒ the only strict-isomorphism
+    ///   path; handled inline below.
+    /// - **Larger-`segments` 3-way cube corner (§8.5.5.1–§8.5.5.4):** the subdivided
+    ///   sphere grid (`build_adj_fill_general`), still snapped onto the corner sphere.
+    /// - **General valence-`s` corner (§8.5.5.5):** any junction without the
+    ///   valence-3 orthonormal sphere — `s ≠ 3`, oblique, or irregular-ring — takes
+    ///   the centre-fullness cap (`build_adj_fill_general_nonsymmetric`), which is
+    ///   valence-generic. The even/odd centre parity (§8.5.5.5(e)) decides between a
+    ///   welded centre vertex and a central `s`-gon for every `s`.
+    ///
+    /// Scope this cycle: default circular profile, equal offsets. Curved / square /
+    /// square-in / custom profiles and the seg ≤ 2 oblique coarse net stay unfilled
+    /// (§8.5.5.5(f)).
     fn build_adj_fill(
         &mut self,
         cut: &JunctionCut,
@@ -1539,9 +1547,12 @@ impl LoopMesh {
         result: &mut BevelResult,
     ) {
         let count = cut.boundverts.len();
-        // §8.5 forces the tri-corner only for `s = 3`; higher valence is the
-        // §8.5.5.5 stub (no scaffold this cycle).
-        if count != 3 {
+        // The cube-corner closed-form sphere snap (§8.5.5.3) exists only at a
+        // valence-3 orthonormal equal-offset corner; a valence-`s` (`s ≠ 3`)
+        // junction has no such sphere and takes the general fullness cap below
+        // (§8.5.5.5(e)/(f)), routed once the tri-corner trigger declines. Fewer than
+        // three boundverts is not a fillable corner.
+        if count < 3 {
             return;
         }
         // Curved / square / square-in / custom profiles take a dedicated non-smooth
@@ -1554,10 +1565,11 @@ impl LoopMesh {
         // §8.5.1 forced-tri-corner trigger. The symmetric equal-offset *orthonormal*
         // cube corner has the closed-form sphere of radius `offset` to snap onto, so
         // it keeps the dedicated cube-corner path (the `segments = 2` pinwheel below
-        // and the larger-`segments` sphere grid). An oblique / irregular corner has
-        // no such sphere; at the same circular profile and equal offsets it now
-        // routes into the general non-symmetric fullness-relaxation grid (§8.5.5.5)
-        // instead of declining — only `segments ≥ 3` (the coarse net is itself the
+        // and the larger-`segments` sphere grid). Every other junction — a valence-`s`
+        // (`s ≠ 3`) corner, or an oblique / irregular-ring valence-3 corner — has no
+        // such sphere; at the same circular profile and equal offsets it routes into
+        // the general valence-`s` fullness-relaxation grid (§8.5.5.5) instead of
+        // declining — only `segments ≥ 3` (the coarse net is itself the
         // `segments = 2` resolution, out of scope this cycle).
         if !self.adj_tri_corner_trigger(cut, profile) {
             match segments {
@@ -6872,6 +6884,366 @@ mod tests {
             oblique_cap_incidence(&odd_mesh, &odd_patch).len(),
             oblique_cap_incidence(&even_mesh, &even_patch).len(),
             "odd (central n-gon) and even (welded vertex) caps differ in vert count",
+        );
+    }
+
+    /// A closed square pyramid: a four-way apex over a square base, four outward-wound
+    /// side triangles and one base quad. The apex is a **symmetric valence-4 junction**
+    /// — beveling its four slant edges drives the general valence-`s` (`s = 4`)
+    /// adjacency-grid cap (BEVEL.md §8.5.5.5). Returns `[apex, b0, b1, b2, b3]`.
+    fn square_pyramid(mesh: &mut LoopMesh) -> [VertexKey; 5] {
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.4));
+        let b0 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let b1 = mesh.create_vertex(Vec3::new(-1.0, 1.0, 0.0));
+        let b2 = mesh.create_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        let b3 = mesh.create_vertex(Vec3::new(1.0, -1.0, 0.0));
+        let triangles = [
+            [apex, b0, b1],
+            [apex, b1, b2],
+            [apex, b2, b3],
+            [apex, b3, b0],
+        ];
+        for ring in triangles {
+            let edges = [
+                mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[2], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        // Base quad, wound downward (outward), reusing the four base edges.
+        let base = [b0, b3, b2, b1];
+        let base_edges = [
+            mesh.create_edge([base[0], base[1]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base[1], base[2]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base[2], base[3]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base[3], base[0]], EdgeCreateFlags::NO_DUPLICATE),
+        ];
+        mesh.face_create(&base, &base_edges, FaceCreateFlags::NONE);
+        [apex, b0, b1, b2, b3]
+    }
+
+    /// Bevel the four slant edges of the square pyramid's apex with `segments`,
+    /// default circular profile, `vmesh_method = ADJ` (BEVEL.md §8.5.5.5(f), the
+    /// general-valence `s = 4` cap). Returns the mesh, result, and the apex corner.
+    fn pyramid_corner_adj(segments: u32) -> (LoopMesh, BevelResult, Vec3) {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let corner = mesh.vertex_position(apex);
+        let slants = [
+            mesh.query_edge_exists(apex, b0).expect("slant {apex,0}"),
+            mesh.query_edge_exists(apex, b1).expect("slant {apex,1}"),
+            mesh.query_edge_exists(apex, b2).expect("slant {apex,2}"),
+            mesh.query_edge_exists(apex, b3).expect("slant {apex,3}"),
+        ];
+        let result = mesh.bevel(
+            &slants.map(Into::into),
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result, corner)
+    }
+
+    /// The cap's symmetry axis (BEVEL.md §8.5.5.7): the line through the original
+    /// corner `v` and the centroid of the cap verts. At a symmetric valence-4 corner
+    /// the welded apex (even parity) lies on it, while the central `s`-gon (odd
+    /// parity) straddles it with no vert on the axis.
+    fn cap_symmetry_axis(mesh: &LoopMesh, patch: &[FaceKey], corner: Vec3) -> (Vec3, Vec3) {
+        let incidence = oblique_cap_incidence(mesh, patch);
+        let centroid = incidence
+            .keys()
+            .fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v))
+            / incidence.len().max(1) as f32;
+        (corner, (centroid - corner).normalize_or_zero())
+    }
+
+    /// Perpendicular distance of `point` from the line `base + t·direction`.
+    fn distance_to_axis(point: Vec3, base: Vec3, direction: Vec3) -> f32 {
+        let offset = point - base;
+        (offset - direction * offset.dot(direction)).length()
+    }
+
+    /// Count cap verts lying on the symmetry axis (BEVEL.md §8.5.5.7): one for the
+    /// even-parity welded apex, zero for odd parity (where the centre is a face). At
+    /// `s = 4` the central `s`-gon is itself a quad, so parity is read here off the
+    /// axis rather than from the face-side histogram.
+    fn cap_on_axis_vert_count(mesh: &LoopMesh, patch: &[FaceKey], corner: Vec3) -> usize {
+        let (base, direction) = cap_symmetry_axis(mesh, patch, corner);
+        oblique_cap_incidence(mesh, patch)
+            .keys()
+            .filter(|&&v| distance_to_axis(mesh.vertex_position(v), base, direction) < 0.02)
+            .count()
+    }
+
+    /// Count cap faces centred on the symmetry axis (BEVEL.md §8.5.5.7): one central
+    /// `s`-gon for odd parity, zero for even parity (where the centre is a vertex).
+    fn cap_on_axis_face_count(mesh: &LoopMesh, patch: &[FaceKey], corner: Vec3) -> usize {
+        let (base, direction) = cap_symmetry_axis(mesh, patch, corner);
+        patch
+            .iter()
+            .filter(|&&f| {
+                let verts = mesh.face_vert_keys(f);
+                let centroid = verts
+                    .iter()
+                    .fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v))
+                    / verts.len() as f32;
+                distance_to_axis(centroid, base, direction) < 0.02
+            })
+            .count()
+    }
+
+    /// BEVEL.md §8.5.5.5(f) / §8.5.5.7 (odd parity, valence 4): the general fill at
+    /// `segments = 3` over the symmetric valence-4 apex is a topologically regular
+    /// 4×4 quad grid — 16 cap verts, 9 quad faces — whose centre is a central quad
+    /// straddling the symmetry axis with **no** welded vertex on the axis.
+    #[test]
+    fn adj_general_valence4_corner_segments_3_central_ngon() {
+        let (mesh, result, corner) = pyramid_corner_adj(3);
+        oblique_assert_manifold(&mesh);
+
+        let patch = oblique_patch_faces(&mesh, &result, corner);
+        assert_eq!(patch.len(), 9, "(segments+1)² regular grid → 4×4 = 9 cap quads");
+        for &f in &patch {
+            assert_eq!(
+                mesh.face_vert_keys(f).len(),
+                4,
+                "every valence-4 cap face is a quad (the central s-gon is itself a quad)",
+            );
+        }
+        assert_eq!(oblique_cap_incidence(&mesh, &patch).len(), 16, "4×4 grid → 16 cap verts");
+
+        assert_eq!(
+            cap_on_axis_vert_count(&mesh, &patch, corner),
+            0,
+            "odd parity → no welded vertex on the symmetry axis",
+        );
+        assert_eq!(
+            cap_on_axis_face_count(&mesh, &patch, corner),
+            1,
+            "odd parity → one central quad centred on the symmetry axis",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f) / §8.5.5.7 (even parity, valence 4): the general fill at
+    /// `segments = 4` over the symmetric valence-4 apex is a topologically regular
+    /// 5×5 quad grid — 25 cap verts, 16 quad faces — that welds **one** shared apex
+    /// vertex on the symmetry axis with no central face.
+    #[test]
+    fn adj_general_valence4_corner_segments_4_welded_apex() {
+        let (mesh, result, corner) = pyramid_corner_adj(4);
+        oblique_assert_manifold(&mesh);
+
+        let patch = oblique_patch_faces(&mesh, &result, corner);
+        assert_eq!(patch.len(), 16, "(segments+1)² regular grid → 5×5 = 16 cap quads");
+        for &f in &patch {
+            assert_eq!(mesh.face_vert_keys(f).len(), 4, "every cap face is a quad at even parity");
+        }
+        assert_eq!(oblique_cap_incidence(&mesh, &patch).len(), 25, "5×5 grid → 25 cap verts");
+
+        assert_eq!(
+            cap_on_axis_vert_count(&mesh, &patch, corner),
+            1,
+            "even parity → one welded apex vertex on the symmetry axis",
+        );
+        assert_eq!(
+            cap_on_axis_face_count(&mesh, &patch, corner),
+            0,
+            "even parity → no cap face centred on the symmetry axis",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e), valence 4: the load-bearing parity contrast read off the
+    /// symmetry axis (the §8.5.5.7 valence-4 reading, since the central `s`-gon is a
+    /// quad invisible to the face-side histogram). Odd straddles the axis with a
+    /// central quad and no on-axis vertex; even welds one on-axis apex vertex and no
+    /// central face. The two caps differ in vert count (16 vs 25).
+    #[test]
+    fn adj_general_valence4_corner_odd_even_central_parity_differs() {
+        let (odd_mesh, odd, odd_corner) = pyramid_corner_adj(3);
+        let (even_mesh, even, even_corner) = pyramid_corner_adj(4);
+        let odd_patch = oblique_patch_faces(&odd_mesh, &odd, odd_corner);
+        let even_patch = oblique_patch_faces(&even_mesh, &even, even_corner);
+
+        assert_eq!(cap_on_axis_vert_count(&odd_mesh, &odd_patch, odd_corner), 0, "odd → no on-axis vertex");
+        assert_eq!(cap_on_axis_vert_count(&even_mesh, &even_patch, even_corner), 1, "even → one on-axis vertex");
+        assert_eq!(cap_on_axis_face_count(&odd_mesh, &odd_patch, odd_corner), 1, "odd → one on-axis face");
+        assert_eq!(cap_on_axis_face_count(&even_mesh, &even_patch, even_corner), 0, "even → no on-axis face");
+
+        assert_ne!(
+            oblique_cap_incidence(&odd_mesh, &odd_patch).len(),
+            oblique_cap_incidence(&even_mesh, &even_patch).len(),
+            "odd (16) and even (25) valence-4 caps differ in vert count",
+        );
+    }
+
+    /// A closed pentagonal pyramid: a five-way apex over a regular pentagon base,
+    /// five outward-wound side triangles and one base pentagon. The apex is a
+    /// **symmetric valence-5 junction** — beveling its five slant edges drives the
+    /// general valence-`s` (`s = 5`) adjacency-grid cap (BEVEL.md §8.5.5.5), whose
+    /// odd central `s`-gon is a **pentagon** directly visible in the face histogram
+    /// (§8.5.5.7) — the sharpest pin on the now-live higher-valence path, needing no
+    /// symmetry-axis reading. Returns `[apex, b0, b1, b2, b3, b4]`.
+    fn pentagonal_pyramid(mesh: &mut LoopMesh) -> [VertexKey; 6] {
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.4));
+        let radius = 1.4_f32;
+        let mut base = [apex; 5];
+        for k in 0..5 {
+            let angle =
+                std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 5.0;
+            base[k] =
+                mesh.create_vertex(Vec3::new(radius * angle.cos(), radius * angle.sin(), 0.0));
+        }
+        for k in 0..5 {
+            let ring = [apex, base[k], base[(k + 1) % 5]];
+            let edges = [
+                mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[2], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        // Base pentagon, wound opposite the apex fan (downward / outward).
+        let base_ring = [base[0], base[4], base[3], base[2], base[1]];
+        let base_edges = [
+            mesh.create_edge([base_ring[0], base_ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base_ring[1], base_ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base_ring[2], base_ring[3]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base_ring[3], base_ring[4]], EdgeCreateFlags::NO_DUPLICATE),
+            mesh.create_edge([base_ring[4], base_ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+        ];
+        mesh.face_create(&base_ring, &base_edges, FaceCreateFlags::NONE);
+        [apex, base[0], base[1], base[2], base[3], base[4]]
+    }
+
+    /// Bevel the five slant edges of the pentagonal pyramid's apex with `segments`,
+    /// default circular profile, `vmesh_method = ADJ` (BEVEL.md §8.5.5.5(f), the
+    /// general-valence `s = 5` cap). Returns the mesh, result, and the apex corner.
+    fn pentagon_corner_adj(segments: u32) -> (LoopMesh, BevelResult, Vec3) {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3, b4] = pentagonal_pyramid(&mut mesh);
+        let corner = mesh.vertex_position(apex);
+        let slants = [
+            mesh.query_edge_exists(apex, b0).expect("slant {apex,0}"),
+            mesh.query_edge_exists(apex, b1).expect("slant {apex,1}"),
+            mesh.query_edge_exists(apex, b2).expect("slant {apex,2}"),
+            mesh.query_edge_exists(apex, b3).expect("slant {apex,3}"),
+            mesh.query_edge_exists(apex, b4).expect("slant {apex,4}"),
+        ];
+        let result = mesh.bevel(
+            &slants.map(Into::into),
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result, corner)
+    }
+
+    /// The number of welded centre vertices in a valence-`sectors` cap: cap verts
+    /// touching exactly `sectors` faces — the §8.5.5.5(e) even-parity signature
+    /// (one), absent at odd parity (zero). Clean for `s = 3` and `s ≥ 5`, where the
+    /// welded centre's incidence `s` is distinct from the regular interior incidence
+    /// 4; at `s = 4` the two collide, which is why valence-4 parity is read off the
+    /// symmetry axis instead (§8.5.5.7).
+    fn cap_welded_centre_count(mesh: &LoopMesh, patch: &[FaceKey], sectors: usize) -> usize {
+        oblique_cap_incidence(mesh, patch)
+            .values()
+            .filter(|&&c| c == sectors)
+            .count()
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.5.5.7 (odd parity, valence 5): the general fill at
+    /// `segments = 3` over the symmetric valence-5 apex closes the centre with one
+    /// central `s`-gon — a **pentagon**, directly visible in the face histogram (the
+    /// reason `s = 5` pins the now-live higher-valence path more sharply than the
+    /// `s = 4` quad-grid case). 10 quads + 1 pentagon, and no welded centre vertex.
+    #[test]
+    fn adj_general_valence5_corner_segments_3_central_ngon() {
+        let (mesh, result, corner) = pentagon_corner_adj(3);
+        oblique_assert_manifold(&mesh);
+
+        let patch = oblique_patch_faces(&mesh, &result, corner);
+        let pentagons = patch
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 5)
+            .count();
+        let quads = patch
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
+            .count();
+        assert_eq!(pentagons, 1, "odd parity → exactly one central s-gon (pentagon)");
+        assert_eq!(quads, 10, "5 corner sub-patch quads + 5 seam quads");
+        assert_eq!(patch.len(), 11);
+
+        assert_eq!(
+            cap_welded_centre_count(&mesh, &patch, 5),
+            0,
+            "odd parity → no welded centre vertex (the centre is a pentagon face)",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.5.5.7 (even parity, valence 5): the general fill at
+    /// `segments = 4` over the same valence-5 apex welds one shared centre vertex
+    /// (incidence 5, distinct from the regular interior 4) with **no** central face
+    /// — 20 all-quad sub-patch cells, the even-parity histogram at `s = 5`.
+    #[test]
+    fn adj_general_valence5_corner_segments_4_welded_apex() {
+        let (mesh, result, corner) = pentagon_corner_adj(4);
+        oblique_assert_manifold(&mesh);
+
+        let patch = oblique_patch_faces(&mesh, &result, corner);
+        assert_eq!(patch.len(), 20, "s·(segments/2)² = 5·4 = 20 sub-patch quads");
+        for &f in &patch {
+            assert_eq!(
+                mesh.face_vert_keys(f).len(),
+                4,
+                "every cap face is a quad at even parity (no central s-gon)",
+            );
+        }
+
+        assert_eq!(
+            cap_welded_centre_count(&mesh, &patch, 5),
+            1,
+            "even parity → exactly one welded centre vertex shared by the 5 sectors",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e), valence 5: the load-bearing parity contrast read
+    /// straight off the face histogram (the central `s`-gon is a pentagon, not a
+    /// quad, so no symmetry-axis trick is needed). Odd closes on a central pentagon
+    /// and no welded vertex; even welds one centre vertex and emits no central face.
+    #[test]
+    fn adj_general_valence5_corner_odd_even_central_parity_differs() {
+        let (odd_mesh, odd, odd_corner) = pentagon_corner_adj(3);
+        let (even_mesh, even, even_corner) = pentagon_corner_adj(4);
+        let odd_patch = oblique_patch_faces(&odd_mesh, &odd, odd_corner);
+        let even_patch = oblique_patch_faces(&even_mesh, &even, even_corner);
+
+        let pentagons = |mesh: &LoopMesh, patch: &[FaceKey]| {
+            patch
+                .iter()
+                .filter(|&&f| mesh.face_vert_keys(f).len() == 5)
+                .count()
+        };
+        assert_eq!(pentagons(&odd_mesh, &odd_patch), 1, "segments = 3 → central pentagon");
+        assert_eq!(pentagons(&even_mesh, &even_patch), 0, "segments = 4 → no central face");
+
+        assert_eq!(cap_welded_centre_count(&odd_mesh, &odd_patch, 5), 0, "odd → no welded vertex");
+        assert_eq!(cap_welded_centre_count(&even_mesh, &even_patch, 5), 1, "even → welded vertex");
+
+        // The two parities are observably distinct caps (different vert counts).
+        assert_ne!(
+            oblique_cap_incidence(&odd_mesh, &odd_patch).len(),
+            oblique_cap_incidence(&even_mesh, &even_patch).len(),
+            "odd (central pentagon) and even (welded vertex) caps differ in vert count",
         );
     }
 
