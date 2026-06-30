@@ -96,7 +96,7 @@ pub use ops::{
     InsetRegionParams, InsetRegionResult, JoinTrianglesParams, JoinTrianglesResult, MirrorParams,
     MirrorResult, MixedSeed, NgonMethod, OffsetEdgeLoopsResult, ProfileShape, QuadCornerType,
     QuadMethod, RegionExtendOptions, RingInterp,
-    RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothVertParams,
+    RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothLaplacianParams, SmoothVertParams,
     SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
     SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult, TransformParams,
     TranslateParams, TriangleFillParams, TriangleFillResult, WireframeResult, DELIMIT_MATERIAL,

@@ -188,3 +188,35 @@ fn rhs_length_mismatch_is_rejected() {
         })
     ));
 }
+
+#[test]
+fn out_of_range_index_is_assembly_error() {
+    // A triplet references row 5 in a 2×2 system: the matrix cannot be assembled.
+    let result = SparseCholesky::factor(2, &[(0, 0, 1.0), (5, 5, 1.0)]);
+    assert!(matches!(result, Err(super::SparseSolveError::Assembly(_))));
+}
+
+#[test]
+fn solve_columns_empty_is_empty() {
+    // No right-hand sides: a well-formed factor yields an empty result, no panic.
+    let factor = SparseCholesky::factor(2, &[(0, 0, 1.0), (1, 1, 1.0)]).unwrap();
+    let solutions = factor.solve_columns(&[]).unwrap();
+    assert!(solutions.is_empty());
+}
+
+#[test]
+fn solve_columns_non_first_mismatch_is_rejected() {
+    // The dimension check must catch a bad length on a *later* column, not only
+    // the first one.
+    let factor = SparseCholesky::factor(2, &[(0, 0, 1.0), (1, 1, 1.0)]).unwrap();
+    let good: &[f64] = &[1.0, 2.0];
+    let bad: &[f64] = &[1.0, 2.0, 3.0];
+    let result = factor.solve_columns(&[good, bad]);
+    assert!(matches!(
+        result,
+        Err(super::SparseSolveError::DimensionMismatch {
+            expected: 2,
+            found: 3
+        })
+    ));
+}

@@ -138,7 +138,7 @@ impl LoopMesh {
     /// vertex normals on every vert of those faces (SMOOTH_VERT.md §1, the same
     /// scoped refresh `transform` uses). Scoped to the affected geometry so the
     /// cost tracks the selection.
-    fn refresh_normals_around_verts(&mut self, verts: &[VertexKey]) {
+    pub(crate) fn refresh_normals_around_verts(&mut self, verts: &[VertexKey]) {
         let mut affected_faces: smallvec::SmallVec<[FaceKey; 16]> = smallvec::SmallVec::new();
         for &vert in verts {
             let mut disk = self.disk_edges(vert);

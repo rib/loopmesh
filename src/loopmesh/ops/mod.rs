@@ -65,6 +65,7 @@ mod rotate_colors;
 mod rotate_edges;
 mod rotate_uvs;
 mod scale;
+mod smooth_laplacian;
 mod smooth_vert;
 mod solidify;
 mod spin;
@@ -113,6 +114,7 @@ pub use region_extend::RegionExtendOptions;
 pub use rotate::RotateParams;
 pub use rotate_edges::RotateEdgesResult;
 pub use scale::ScaleParams;
+pub use smooth_laplacian::SmoothLaplacianParams;
 pub use smooth_vert::SmoothVertParams;
 pub use split::SplitResult;
 pub use subdivide_edgering::{
