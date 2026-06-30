@@ -36,6 +36,14 @@ impl LoopMesh {
     /// topology is still built with every ring vertex collapsed onto the
     /// transformed origin, undeduplicated (§7).
     ///
+    /// The created vertices are **returned** in the `verts.out` slot order
+    /// (§1 / §2.1 / §8): the surviving centre apex first when (and only when) the
+    /// fan cap is built — it is created before the ring — then the `segments` ring
+    /// vertices in angular order (vertex `a` at angle `2π·a/segments`, CCW from
+    /// `+z`). An uncapped or n-gon-cap circle has no surviving centre (the n-gon
+    /// route never mints one, §2.2), so it returns just the ring. A `segments = 0`
+    /// no-op returns an empty buffer.
+    ///
     /// `calc_uvs` is accepted for call-shape compatibility but is presently a
     /// deferral: loopmesh writes no default radial UV unwrap (the §4 UV row is
     /// tracked separately and stays unimplemented this cycle). With no UV layer
@@ -51,12 +59,12 @@ impl LoopMesh {
         radius: f32,
         matrix: Mat4,
         calc_uvs: bool,
-    ) {
+    ) -> Vec<VertexKey> {
         let _ = calc_uvs;
 
         // §7 — `segments = 0` (or any non-positive value) builds nothing.
         if segments <= 0 {
-            return;
+            return Vec::new();
         }
         let segment_count = segments as usize;
 
@@ -116,6 +124,14 @@ impl LoopMesh {
         }
         for &vert in &ring {
             self.vert_normal_update(vert);
+        }
+
+        // §1 / §2.1 / §8 — report the created verts in verts.out order: the fan
+        // apex (created first, before the ring) leads when it survives, then the
+        // ring in angular order. The n-gon and uncapped paths have no centre.
+        match centre {
+            Some(apex) => std::iter::once(apex).chain(ring).collect(),
+            None => ring,
         }
     }
 }
@@ -342,11 +358,82 @@ mod tests {
     #[test]
     fn create_circle_zero_segments_is_noop() {
         let mut mesh = LoopMesh::new();
-        mesh.create_circle(true, true, 0, 1.0, Mat4::IDENTITY, false);
+        let verts = mesh.create_circle(true, true, 0, 1.0, Mat4::IDENTITY, false);
+        assert!(verts.is_empty(), "no-op returns an empty verts.out buffer");
         assert_eq!(
             (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
             (0, 0, 0)
         );
         mesh.validate_topology();
+    }
+
+    /// §1 / §2.1 / §8: the returned `verts.out` buffer is in slot order — the fan
+    /// apex first (created before the ring, present only for the fan cap), then the
+    /// `n` ring verts in angular order (vertex `a` at angle `2π·a/n`, CCW from
+    /// `+z`). An uncapped / n-gon-cap circle has no surviving centre, so it returns
+    /// just the ring. Probed under a non-identity matrix so a reordered or
+    /// transform-dropping bug lands on the wrong position — this slot order is *not*
+    /// captured by an order-free isomorphism check, so it needs an explicit index
+    /// check.
+    #[test]
+    fn create_circle_returns_centre_then_ring_order() {
+        let n = 8usize;
+        let r = 1.5_f32;
+        let matrix = Mat4::from_scale_rotation_translation(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_4),
+            Vec3::new(5.0, -2.0, 1.0),
+        );
+
+        let ring_position = |a: usize| {
+            let theta = std::f32::consts::TAU * (a as f32) / (n as f32);
+            let local = Vec3::new(-r * theta.sin(), r * theta.cos(), 0.0);
+            matrix.transform_point3(local)
+        };
+
+        // Fan cap — centre apex leads, then the ring in angular order.
+        let mut fan = LoopMesh::new();
+        let fan_verts = fan.create_circle(true, true, n as i32, r, matrix, false);
+        assert_eq!(fan_verts.len(), n + 1, "fan reports n ring + 1 centre");
+        assert!(
+            (fan.vertex_position(fan_verts[0]) - matrix.transform_point3(Vec3::ZERO)).length()
+                < EPS,
+            "verts.out[0] is the transformed centre apex"
+        );
+        for a in 0..n {
+            let got = fan.vertex_position(fan_verts[a + 1]);
+            let expected = ring_position(a);
+            assert!(
+                (got - expected).length() < EPS,
+                "fan verts.out[{}] at {got:?}, expected ring vertex {a} at {expected:?}",
+                a + 1
+            );
+        }
+
+        // n-gon cap — no surviving centre, the ring alone in angular order.
+        let mut ngon = LoopMesh::new();
+        let ngon_verts = ngon.create_circle(true, false, n as i32, r, matrix, false);
+        assert_eq!(ngon_verts.len(), n, "n-gon reports just the ring (no centre)");
+        for a in 0..n {
+            let got = ngon.vertex_position(ngon_verts[a]);
+            let expected = ring_position(a);
+            assert!(
+                (got - expected).length() < EPS,
+                "n-gon verts.out[{a}] at {got:?}, expected ring vertex {a} at {expected:?}"
+            );
+        }
+
+        // Uncapped — no centre either, the ring alone in angular order.
+        let mut wire = LoopMesh::new();
+        let wire_verts = wire.create_circle(false, false, n as i32, r, matrix, false);
+        assert_eq!(wire_verts.len(), n, "uncapped reports just the ring");
+        for a in 0..n {
+            let got = wire.vertex_position(wire_verts[a]);
+            let expected = ring_position(a);
+            assert!(
+                (got - expected).length() < EPS,
+                "uncapped verts.out[{a}] at {got:?}, expected ring vertex {a} at {expected:?}"
+            );
+        }
     }
 }
