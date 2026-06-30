@@ -20,14 +20,14 @@ const LENGTH_EPSILON: f64 = 1e-9;
 /// cotangent degrades to `0` instead of blowing up (§4.1).
 const COT_EPSILON: f64 = 1e-12;
 
-// GUIDE GAP (§7.1): the edge-length sanity gate's exact ratio thresholds are
-// not stated by the guide ("a fixed maximum/minimum percentage"). These wide
-// placeholders keep the gate from firing on well-conditioned input — they catch
-// only gross blow-ups — pending bmesh-insider pinning the real ratios. No
-// in-scope scaffold exercises the gate's threshold, so this gap does not affect
-// the rows landed this cycle.
-const EDGE_LEN_MAX_RATIO: f64 = 1.0e6;
-const EDGE_LEN_MIN_RATIO: f64 = 1.0e-6;
+/// The §7.1 edge-length sanity gate's fixed ratio thresholds. After the solve
+/// every mesh edge is checked: an edge whose solved length exceeds its original
+/// length by more than `EDGE_LEN_MAX_RATIO ×` (too stretched) or falls below
+/// `EDGE_LEN_MIN_RATIO ×` it (too collapsed) reverts **both** of its endpoints to
+/// their input positions. They are fixed constants — not parameters, not derived
+/// from `lambda_*`.
+const EDGE_LEN_MAX_RATIO: f64 = 1.8;
+const EDGE_LEN_MIN_RATIO: f64 = 0.15;
 
 /// Parameters for [`LoopMesh::smooth_laplacian`] (SMOOTH_LAPLACIAN_VERT.md §1).
 ///
@@ -59,10 +59,14 @@ impl LoopMesh {
     /// `region_faces` region (SMOOTH_LAPLACIAN_VERT.md §3 / §4).
     ///
     /// Two independent selections drive the operator (§5): `verts` are the
-    /// **free** variables (every other vert is pinned as a fixed boundary
-    /// condition), and `region_faces` are the **smoothing region** whose corner
-    /// triangles supply the cotangent weights and ring areas. Interior free
-    /// verts relax with the area-normalised cotangent Laplacian at
+    /// **free** variables, and `region_faces` are the **smoothing region** whose
+    /// corner triangles supply the cotangent weights and ring areas. Every other
+    /// vert is **locked**, but a locked vert is *not* a Dirichlet condition pinned
+    /// at its own position — the solve sees it at the **origin** (§3.2), so a free
+    /// row's spoke to a locked neighbour is **dropped** (origin-pull, §4.7), never
+    /// folded onto the RHS at the neighbour's position. To hold a rim at its true
+    /// position, free it too with `lambda_border = 0` (§5), don't lock it.
+    /// Interior free verts relax with the area-normalised cotangent Laplacian at
     /// `lambda_factor`; boundary free verts — those on a topological rim (a
     /// one-face edge) or bordering an out-of-region face (§6.1) — relax with a
     /// uniform edge-length weighting at `lambda_border`.
@@ -226,7 +230,8 @@ impl LoopMesh {
             }
         }
 
-        // Rows over the free verts; the locked verts move to the right-hand side.
+        // Rows over the free verts. A locked vert is seen at the origin, so its
+        // coupling is dropped entirely (§3.2) — never moved to the right-hand side.
         let mut matrix_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); free_count];
         let mut rhs = [
             vec![0.0f64; free_count],
@@ -283,10 +288,8 @@ impl LoopMesh {
                     let coefficient = (1.0 / length) * length_scale;
                     lay_off_diagonal(
                         &mut matrix_rows,
-                        &mut rhs,
                         &is_free,
                         &free_index,
-                        &position,
                         row,
                         other,
                         coefficient,
@@ -300,15 +303,19 @@ impl LoopMesh {
         }
 
         // §4.3 / §6.3 — interior cotangent off-diagonals: a second sweep over the
-        // region corners. The entry is gated on the **row/pivot** vert's
+        // region corners. The matrix-add is gated on the **row/pivot** vert's
         // interior-eligibility alone (non-boundary, non-zero-area, with ring
-        // area); the column vert's status never suppresses it. An interior row
-        // couples to *all* its corner-triangle neighbours — boundary and
-        // zero-area ones included — so each rim-adjacent interior vert solves a
-        // complete Laplacian row. A locked (boundary) neighbour's contribution is
-        // routed to the RHS by `lay_off_diagonal` as a Dirichlet coupling, not
-        // dropped. Boundary verts never own a cotangent row (the row gate), so
-        // they only ever appear here as columns.
+        // area); the column vert's status never suppresses the add. An interior
+        // row lays an off-diagonal toward *all* its corner-triangle neighbours —
+        // boundary and zero-area ones included. What the column's status changes
+        // is what the term does at solve time (§3.2 / §4.3): a **free** column
+        // stays a live coupling and feeds its solved position back into row `i`; a
+        // **locked** column is seen at the origin, so its spoke folds to zero and
+        // is dropped — it reaches neither the matrix nor the RHS. A free interior
+        // vert with a locked neighbour therefore keeps its full diagonal but loses
+        // that spoke's off-diagonal, biasing the solve toward the origin (§4.7).
+        // Boundary verts never own a cotangent row (the row gate), so they only
+        // ever appear here as columns.
         {
             let eligible = |slot: usize| {
                 !boundary[slot] && !zero_area[slot] && ring_area[slot] > 0.0
@@ -322,10 +329,8 @@ impl LoopMesh {
                     let coefficient = cotangent * scale[si];
                     lay_off_diagonal(
                         &mut matrix_rows,
-                        &mut rhs,
                         &is_free,
                         &free_index,
-                        &position,
                         free_index[si],
                         j,
                         coefficient,
@@ -409,25 +414,36 @@ impl LoopMesh {
             .map(|row| DVec3::new(solution[0][row], solution[1][row], solution[2][row]))
             .collect();
 
-        // §7.1 — edge-length sanity gate: revert verts whose solved edges blew
-        // up or collapsed. Marks both endpoints zero-area → excluded from
-        // write-back. (Threshold magnitudes are a documented guide gap, above.)
+        // §7.1 — edge-length sanity gate: sweep **every** mesh edge (not gated on
+        // region/selection) and revert verts whose solved edges blew up or
+        // collapsed. Marks both endpoints zero-area → excluded from write-back, so
+        // they keep their full input coordinate on every axis (the §7.2 axis gate
+        // does not re-enter for a reverted vert). The revert is symmetric: a single
+        // blown edge reverts the verts at *both* ends.
+        // §7.1 / §3.2 — the gate reads the *solver's* variable values, not the
+        // mesh positions: a free vert at its computed position, a **locked** vert
+        // at the solver's default, the **origin**. So an edge from a free vert far
+        // from the origin to a locked vert measures a large solved length and the
+        // free vert is reverted to its input.
         let solved_position = |vert: VertexKey| -> DVec3 {
             let slot = vert.as_usize();
             if is_free[slot] {
                 solved[free_index[slot]]
             } else {
-                position[slot]
+                DVec3::ZERO
             }
         };
         for edge in self.edge_keys() {
             let [a, b] = self.edge_vertices(edge);
+            // §7.1 — original = endpoints' input positions; solved = solver
+            // variable values (locked endpoint at the origin via `solved_position`).
             let original = (position[a.as_usize()] - position[b.as_usize()]).length();
-            if original < LENGTH_EPSILON {
-                continue;
-            }
-            let ratio = (solved_position(a) - solved_position(b)).length() / original;
-            if ratio > EDGE_LEN_MAX_RATIO || ratio < EDGE_LEN_MIN_RATIO {
+            let solved_length = (solved_position(a) - solved_position(b)).length();
+            // Multiplication form (§7.1): never forms the ratio, so a zero
+            // original_length never divides. Trip if too stretched or too collapsed.
+            if solved_length > original * EDGE_LEN_MAX_RATIO
+                || solved_length < original * EDGE_LEN_MIN_RATIO
+            {
                 zero_area[a.as_usize()] = true;
                 zero_area[b.as_usize()] = true;
             }
@@ -529,16 +545,18 @@ fn triangle_area(a: DVec3, b: DVec3, c: DVec3) -> f64 {
     0.5 * (b - a).cross(c - a).length()
 }
 
-/// Lay one directed off-diagonal `matrix[row][col(j)] += coefficient`. When `j`
-/// is free it becomes a matrix entry; when `j` is locked the term moves to the
-/// right-hand side with the opposite sign (SMOOTH_LAPLACIAN_VERT.md §3.2).
-#[allow(clippy::too_many_arguments)]
+/// Lay one directed off-diagonal `matrix[row][col(j)] += coefficient` for a
+/// **free** column. A **locked** column is seen by the solve at the **origin**
+/// (SMOOTH_LAPLACIAN_VERT.md §3.2), so `coefficient · origin = 0`: the spoke
+/// contributes nothing to the matrix **and** nothing to the right-hand side and
+/// is simply dropped — it is *not* folded onto the RHS at the locked vert's
+/// position. Dropping the spoke leaves the row's diagonal carrying its full
+/// Laplacian magnitude (§4.4) but only its free off-diagonals, so the row
+/// over-balances and biases the solve toward the origin (the §4.7 origin-pull).
 fn lay_off_diagonal(
     matrix_rows: &mut [Vec<(usize, f64)>],
-    rhs: &mut [Vec<f64>; 3],
     is_free: &[bool],
     free_index: &[usize],
-    position: &[DVec3],
     row: usize,
     j: VertexKey,
     coefficient: f64,
@@ -546,11 +564,6 @@ fn lay_off_diagonal(
     let slot = j.as_usize();
     if is_free[slot] {
         matrix_rows[row].push((free_index[slot], coefficient));
-    } else {
-        let locked = position[slot];
-        rhs[0][row] -= coefficient * locked.x;
-        rhs[1][row] -= coefficient * locked.y;
-        rhs[2][row] -= coefficient * locked.z;
     }
 }
 
@@ -612,16 +625,17 @@ mod tests {
         area
     }
 
-    /// §3 / §4: the headline interior relaxation. The lone free interior vert,
-    /// lifted above the rim, is pulled toward the plane. The six rim neighbours
-    /// are boundary and locked, so per §4.3 their cotangent off-diagonals are
-    /// still laid (gated on the interior *row* vert, not the boundary column) but
-    /// flow to the RHS as Dirichlet couplings. With the rim pinned at `z = 0` that
-    /// coupling contributes `0` to every channel's RHS, so the effective row is
-    /// `(1 + λ/(4·A))·x = x_old` and the vert lands at `x_old / (1 + λ/(4·A))` —
-    /// flat directions fixed, the `z` bump shrunk. (The
-    /// `interior_vert_couples_to_boundary_neighbour` test lifts the rim off the
-    /// plane to make that RHS coupling non-zero and observable.)
+    /// §3.2 / §4.7: the headline interior relaxation under a locked surround. The
+    /// lone free interior vert, lifted above the rim, has its six rim neighbours
+    /// **locked**, so each is seen by the solve at the **origin** and its cotangent
+    /// spoke is **dropped** (§3.2 / §4.3) — not folded onto the RHS at the rim's
+    /// position. Row `centre` collapses to its diagonal alone,
+    /// `(1 + λ/(4·A))·x = x_old`, so the centre is pulled straight toward the
+    /// origin by `1 / (1 + λ/(4·A))`. Here `x_old = (0, 0, height)` already sits on
+    /// the z-axis, so the flat axes stay `0` and only the `z` bump shrinks — the
+    /// observable headline relaxation. (The
+    /// `free_rim_feeds_held_position_to_interior` test frees the rim instead — the
+    /// §5 idiom — so the rim's true height feeds in.)
     ///
     /// `A` is the **all-three-corners** ring area (§4 callout / §4.6): each of the
     /// six fan faces is a triangle whose three corner iterations all deposit the
@@ -653,19 +667,21 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §4.3 / §6.3 / §4.6: an interior free vert with **boundary** neighbours
-    /// solves a *complete* cotangent row — the held rim couples into the RHS as a
-    /// Dirichlet term, it is not dropped. Same hex fan, but the rim is lifted to a
-    /// non-zero plane `z = h_rim`, so the rim's height flows through the
-    /// off-diagonal sum into the centre's solved `z`. By the row-sum-zero property
-    /// `Σ_j off[c][j] = −λ/(4·A)`, and with every locked neighbour at the same
-    /// height the RHS coupling is `−h_rim · Σ off = h_rim · λ/(4·A)`, giving
-    /// `z_c = (h_c + h_rim·m) / (1 + m)` with `m = λ/(4·A)`. The over-strict
-    /// "both endpoints eligible" column gate this rework removed would instead
-    /// drop the rim coupling and land the centre at `h_c/(1 + m)`, ignoring the
-    /// rim height — a regression this pins.
+    /// §5 / §6.3: the parity-correct held-boundary idiom. To relax the interior
+    /// toward a genuinely held rim, the rim verts must be **free** (in the `verts`
+    /// slot) with `lambda_border = 0` — *not* locked. A free rim vert with
+    /// `lambda_border = 0` gets an identity row, so it stays at its **true**
+    /// position, and being free it feeds that true position into the centre's
+    /// interior cotangent row as a live column. Same hex fan with the rim lifted
+    /// to `z = h_rim`: with the whole fan free the centre keeps all six spokes, so
+    /// `Σ_j off[c][j] = −λ/(4·A)` and the held rim height flows in, giving
+    /// `z_c = (h_c + h_rim·m) / (1 + m)` with `m = λ/(4·A)`. Locking the rim
+    /// instead would drop every spoke (rim seen at the origin) and land the centre
+    /// at the pure origin-pull `h_c/(1 + m)` (§4.7) — a *different*, smaller value
+    /// this fixture distinguishes. This is the contrast the corrected model turns
+    /// on: held-boundary needs a **free** rim, never a locked one.
     #[test]
-    fn interior_vert_couples_to_boundary_neighbour() {
+    fn free_rim_feeds_held_position_to_interior() {
         let h_c = 1.5f32;
         let h_rim = 0.5f32;
         let lambda = 2.0f64;
@@ -685,12 +701,16 @@ mod tests {
         }
         let faces = mesh.face_keys();
 
-        mesh.smooth_laplacian(&[centre], &faces, all_axes(lambda as f32, 0.0));
+        // Free the whole fan (centre + rim); lambda_border = 0 holds the rim at
+        // its true height via identity boundary rows.
+        let mut free = vec![centre];
+        free.extend(ring);
+        mesh.smooth_laplacian(&free, &faces, all_axes(lambda as f32, 0.0));
 
         let area = 3.0 * fan_ring_area(Vec3::new(0.0, 0.0, h_c), h_rim);
         let m = lambda / (4.0 * area);
         let expected_z = (h_c as f64 + h_rim as f64 * m) / (1.0 + m);
-        let dropped_z = h_c as f64 / (1.0 + m); // what the removed column gate produced
+        let origin_pull_z = h_c as f64 / (1.0 + m); // what locking the rim would give
 
         let result = mesh.vertex_position(centre);
         assert!(
@@ -699,14 +719,101 @@ mod tests {
         );
         assert!(
             (result.z as f64 - expected_z).abs() < 1e-4,
-            "z = {} expected complete-row {expected_z} (dropped-row would be {dropped_z})",
+            "z = {} expected held-rim {expected_z} (locked-rim origin-pull would be {origin_pull_z})",
             result.z
         );
-        // The boundary coupling must be observable: the complete row differs
-        // measurably from the (buggy) dropped row.
+        // The held-rim coupling must be observable: it differs measurably from the
+        // origin-pull a locked rim would produce.
         assert!(
-            (expected_z - dropped_z).abs() > 1e-3,
-            "fixture must distinguish complete from dropped row"
+            (expected_z - origin_pull_z).abs() > 1e-3,
+            "fixture must distinguish held-rim from origin-pull"
+        );
+        // The free rim stays at its true height (identity rows at lambda_border = 0).
+        for &v in &ring {
+            assert!(
+                (mesh.vertex_position(v).z - h_rim).abs() < 1e-5,
+                "free rim with lambda_border = 0 must stay at its true height"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// §4.7: a free interior vert all of whose ring neighbours are **locked**
+    /// collapses to a pure origin-pull — `x_C = x_old_C / (1 + λ/(4·ring_area))` —
+    /// because every locked spoke is dropped (the locked vert is seen at the
+    /// origin, not at its own position, §3.2 / §4.3), so no neighbour term
+    /// survives. The centre is pulled straight toward the origin by a **uniform
+    /// scalar shrink on every axis**, *not* toward the rim. (Guide's worked
+    /// instance: `ring_area = 9`, `λ = 1` → factor `36/37`; here `ring_area` is
+    /// read from the actual fan geometry.)
+    #[test]
+    fn locked_rim_pulls_interior_toward_origin() {
+        let mut mesh = LoopMesh::new();
+        let start = Vec3::new(0.3, 0.2, 0.5);
+        let (centre, _) = hex_fan(&mut mesh, start);
+        let faces = mesh.face_keys();
+        let lambda = 1.0f64;
+
+        // Only the centre is free; the six rim verts are locked → seen at origin.
+        mesh.smooth_laplacian(&[centre], &faces, all_axes(lambda as f32, 0.0));
+
+        let area = 3.0 * fan_ring_area(start, 0.0);
+        let factor = 1.0 / (1.0 + lambda / (4.0 * area));
+        let expected = start.as_dvec3() * factor;
+        let result = mesh.vertex_position(centre).as_dvec3();
+        assert!(
+            (result - expected).length() < 1e-5,
+            "origin-pull closed form: {result:?} expected {expected:?}"
+        );
+        // Pure origin-pull: a uniform shrink along the origin→input ray — the same
+        // scalar on every axis — *not* a displacement toward the rim centroid
+        // (which sits in the z = 0 plane, a different direction).
+        let ratio_x = result.x / start.x as f64;
+        let ratio_z = result.z / start.z as f64;
+        assert!(
+            (ratio_x - ratio_z).abs() < 1e-6,
+            "uniform scalar shrink across axes: x×{ratio_x} vs z×{ratio_z}"
+        );
+        assert!(factor < 1.0, "must shrink toward the origin");
+        mesh.validate_topology();
+    }
+
+    /// §7.1: the edge-length sanity gate reverts a free vert whose solved edge to
+    /// a **locked** neighbour blows past the `1.8×` upper ratio. A hex fan offset
+    /// far from the origin: the centre is free, the rim **locked** (seen at the
+    /// origin, §3.2). The centre's solved origin-seen edge length is its whole
+    /// distance to the origin (~the offset), while the original centre–rim edge is
+    /// ~unit — a ratio of ~10, far above `1.8`. The gate trips and the centre is
+    /// reverted to its **input** position, keeping the full input coordinate on
+    /// every axis (the §7.2 axis gate does not re-enter). Contrast
+    /// `locked_rim_pulls_interior_toward_origin`, whose origin-seen ratio ≈0.68
+    /// sits inside `[0.15, 1.8]`, so the gate does *not* fire and the centre moves.
+    #[test]
+    fn gate_reverts_free_vert_with_blown_up_locked_edge() {
+        let mut mesh = LoopMesh::new();
+        let offset = Vec3::new(10.0, 0.0, 0.0);
+        let centre = mesh.create_vertex(offset);
+        let mut ring = [centre; 6];
+        for k in 0..6 {
+            let angle = k as f32 * PI / 3.0;
+            ring[k] = mesh.create_vertex(offset + Vec3::new(angle.cos(), angle.sin(), 0.0));
+        }
+        for k in 0..6 {
+            mesh.face_create_verts(
+                &[centre, ring[k], ring[(k + 1) % 6]],
+                FaceCreateFlags::NO_DUPLICATE,
+            );
+        }
+        let faces = mesh.face_keys();
+
+        // Only the centre is free; the locked rim is seen at the origin, so the
+        // centre's origin-seen edge length ~10 >> 1.8 × (~1) original → gate trips.
+        mesh.smooth_laplacian(&[centre], &faces, all_axes(2.0, 0.0));
+
+        let result = mesh.vertex_position(centre);
+        assert!(
+            (result - offset).length() < 1e-6,
+            "gate must revert the centre to its input position: {result:?}"
         );
         mesh.validate_topology();
     }
@@ -794,34 +901,27 @@ mod tests {
         smoothed.validate_topology();
     }
 
-    /// §4.3 / §4.4: a flat interior region is a fixed point. A regular planar
-    /// grid is discretely harmonic — each interior vert sits at the
-    /// cotangent-weighted average of its four axis neighbours by symmetry — so
-    /// one implicit step must leave it exactly put. This pins the row-sum-zero
-    /// property of the off-diagonal sweep: under the accumulate-to-all-three
-    /// model each directed off-diagonal is deliberately laid once per corner
-    /// iteration that touches both endpoints (so an interior spoke is
-    /// multi-counted), and the multi-count cancels because `vweight_raw[i]` in the
-    /// per-spoke scale's denominator is multi-counted in lockstep — `Σ_j off[i][j]`
-    /// still collapses to `−λ/(4·ring_area[i])` and exactly balances the diagonal,
-    /// so the centroid is preserved. A regression that broke that lockstep (laying
-    /// the off-diagonals without the matching `vweight_raw` multi-count, or vice
-    /// versa) would leave the row sum non-zero and drift the verts toward the
-    /// origin.
+    /// §4.3 / §4.4 / §5: a flat, **all-free** region is a fixed point. A regular
+    /// planar grid is discretely harmonic — each interior vert sits at the
+    /// cotangent-weighted average of its four axis neighbours by symmetry — so one
+    /// implicit step leaves it exactly put. With **every** vert free (the §5
+    /// idiom) each interior row keeps all its spokes, so `Σ_j off[i][j]` collapses
+    /// to `−λ/(4·ring_area[i])` and exactly cancels the diagonal's Laplacian term;
+    /// the row sums to one and the planar coordinates are preserved. The rim verts
+    /// are boundary and, with `lambda_border = 0`, take identity rows: they stay
+    /// put *and*, being free, feed their true positions into the interior rows.
     ///
-    /// Per §6.3 the interior cotangent off-diagonal is gated on the **row/pivot**
-    /// vert alone: an interior-eligible row couples to *all* its corner-triangle
-    /// neighbours, and a locked/boundary column flows to the RHS as a Dirichlet
-    /// term rather than being dropped (the earlier "both endpoints
-    /// non-boundary" gate has been removed). The fixed point therefore does not
-    /// require free verts to have non-boundary neighbours: a flat region is
-    /// preserved regardless, because the cotangent Laplacian of a planar mesh is
-    /// identically zero and the relocated RHS terms reconstruct the same
-    /// equation. Freeing the central 2×2 block (`(2,2),(2,3),(3,2),(3,3)`) of the
-    /// 6×6 grid is about exercising **live free–free matrix couplings** — four
-    /// mutually-adjacent free verts whose entries land in the matrix, not the RHS
-    /// — since that is where the accumulate-to-all-three multi-count actually
-    /// manifests and where a broken lockstep would surface.
+    /// This pins the row-sum-zero property of the off-diagonal sweep under the
+    /// accumulate-to-all-three model: each directed off-diagonal is laid once per
+    /// corner iteration touching both endpoints (so an interior spoke is
+    /// multi-counted), and the multi-count cancels because `vweight_raw[i]` in the
+    /// per-spoke scale's denominator is multi-counted in lockstep. A regression
+    /// breaking that lockstep would leave the row sum non-zero and drift the verts.
+    /// The whole grid is free so the interior verts couple to one another as live
+    /// **free–free** matrix entries — exactly where the multi-count manifests —
+    /// while the held rim is the parity-correct boundary, **not** a locked surround
+    /// (a locked surround would drop the interior→rim spokes and pull the interior
+    /// toward the origin, §3.2 / §4.7).
     #[test]
     fn flat_interior_grid_is_fixed_point() {
         let mut mesh = LoopMesh::new();
@@ -841,10 +941,10 @@ mod tests {
             }
         }
         let faces = mesh.face_keys();
-        // The central 2×2 block: mutually adjacent free verts, so their couplings
-        // land in the matrix as live free–free entries (locked/boundary columns
-        // would route to the RHS as Dirichlet terms, not be dropped).
-        let free = [grid[2][2], grid[2][3], grid[3][2], grid[3][3]];
+        // The whole grid is free (§5): the rim holds at its true position with
+        // lambda_border = 0 while the interior verts couple as live free–free
+        // matrix entries.
+        let free: Vec<VertexKey> = grid.iter().flatten().copied().collect();
         let before: Vec<Vec3> = free.iter().map(|&v| mesh.vertex_position(v)).collect();
 
         mesh.smooth_laplacian(&free, &faces, all_axes(2.0, 0.0));
@@ -853,7 +953,7 @@ mod tests {
             let moved = (mesh.vertex_position(v) - p).length();
             assert!(
                 moved < 1e-6,
-                "flat interior region must be a fixed point: vert moved {moved}"
+                "flat all-free region must be a fixed point: vert moved {moved}"
             );
         }
         mesh.validate_topology();
