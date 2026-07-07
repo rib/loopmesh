@@ -1439,21 +1439,21 @@ impl LoopMesh {
         }
         let representative = cut.representative_material(self);
 
-        // Per boundvert, its down-pushed corner-vert position (§8.3.3).
+        // Per boundvert, its down-pushed corner-vert position (§8.3.3). The push
+        // is binary in the profile: full cell diagonal for a curved profile, zero
+        // for the straight chord (which leaves the corner on the undisplaced ring).
         let mut corner_positions: Vec<Vec3> = Vec::with_capacity(count);
         for k in 0..count {
-            corner_positions.push(self.corner_vert_position(cut, chains, k));
+            corner_positions.push(self.corner_vert_position(cut, chains, k, profile));
         }
 
-        // §8.3.3/§8.3.4: the 3-way collapse to a single apex is a binary
-        // profile decision. It is suppressed for exactly one profile — the
-        // straight chord (`profile = 0.25`, the `r == 1` line case the
-        // superellipse sampler already special-cases) — whose corner verts stay
-        // distinct at the undisplaced boundvert ring (closed by a bottom
-        // triangle). Every curved profile (`r != 1`, including a near-chord
-        // `profile = 0.26`) collapses to a single apex.
-        let flat_chord = count == 3 && profile_to_exponent(profile) == 1.0;
-        let collapsed = count == 3 && !flat_chord && corner_verts_coincide(&corner_positions);
+        // §8.3.4: the 3-way collapse to a single apex reads off the plain geometric
+        // coincidence of the (already profile-aware) corner positions. A curved
+        // profile pushes all three onto one point → collapse; the straight chord
+        // leaves them at their distinct ring positions → suppressed and the bottom
+        // triangle is built. For `s >= 4` the corners generally do not coincide, so
+        // the bottom n-gon is built regardless.
+        let collapsed = count == 3 && corner_verts_coincide(&corner_positions);
 
         let corner_verts: Vec<VertexKey> = if collapsed {
             let apex_position =
@@ -1464,15 +1464,7 @@ impl LoopMesh {
         } else {
             (0..count)
                 .map(|k| {
-                    // A flat-chord 3-way takes its corners at the undisplaced
-                    // boundvert ring (the §8.3.3 down-push is ~0); a wider or bulged
-                    // ring takes the full down-pushed position.
-                    let position = if flat_chord {
-                        self.vertex_position(cut.boundverts[k])
-                    } else {
-                        corner_positions[k]
-                    };
-                    let corner = self.create_vertex(position);
+                    let corner = self.create_vertex(corner_positions[k]);
                     result.verts.push(corner);
                     corner
                 })
@@ -2535,16 +2527,34 @@ impl LoopMesh {
     /// plus the cross of the two adjacent sectors' mid-plane normals (the fold
     /// crease), scaled by the average of the two profiles' `height/√2`, oriented
     /// into the corner.
-    fn corner_vert_position(&self, cut: &JunctionCut, chains: &[EdgeEndChain], k: usize) -> Vec3 {
+    fn corner_vert_position(
+        &self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        k: usize,
+        profile: f32,
+    ) -> Vec3 {
         let count = cut.boundverts.len();
         let boundvert = cut.boundverts[k];
+        let boundvert_position = self.vertex_position(boundvert);
+
+        // §8.3.3: the down-push height is binary and set by the sector's profile
+        // shape alone, not its valence. At the straight chord (`r == 1`) the cell
+        // map is bypassed and the push is exactly zero for every junction valence
+        // `s`, so the corner vert stays coincident-in-position with its boundvert
+        // `B_k` at the undisplaced ring. Only curved profiles push the full cell
+        // diagonal. Gating here (not per-`count`) is what suppresses the §8.3.4
+        // collapse at `s == 3` and keeps `s >= 4` corners on the ring.
+        if profile_to_exponent(profile) == 1.0 {
+            return boundvert_position;
+        }
+
         let before = (k + count - 1) % count; // sector ending at B_k
         let after = k; // sector starting at B_k
 
         let cell_before = self.sector_cell(cut, chains, before);
         let cell_after = self.sector_cell(cut, chains, after);
 
-        let boundvert_position = self.vertex_position(boundvert);
         let (normal_before, height_before) = cell_before
             .map(|c| (c.mid_plane_normal, c.height()))
             .unwrap_or((Vec3::ZERO, 0.0));
@@ -6451,6 +6461,93 @@ mod tests {
                 "every collapsed-junction face is a quad",
             );
         }
+    }
+
+    /// Bevel the four slant edges of the square pyramid's apex with `segments = 2`,
+    /// `vmesh_method = Cutoff`, at an explicit `profile` (BEVEL.md §8.3, the general
+    /// valence-`s = 4` cutoff junction). Returns the mesh, result, and apex corner.
+    fn pyramid_corner_cutoff_segments2(profile: f32) -> (LoopMesh, BevelResult, Vec3) {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let corner = mesh.vertex_position(apex);
+        let slants = [
+            mesh.query_edge_exists(apex, b0).expect("slant {apex,0}"),
+            mesh.query_edge_exists(apex, b1).expect("slant {apex,1}"),
+            mesh.query_edge_exists(apex, b2).expect("slant {apex,2}"),
+            mesh.query_edge_exists(apex, b3).expect("slant {apex,3}"),
+        ];
+        let result = mesh.bevel(
+            &slants.map(Into::into),
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                profile,
+                ..Default::default()
+            },
+        );
+        (mesh, result, corner)
+    }
+
+    /// BEVEL.md §8.3.3 / §8.3.4: the binary down-push is set by the profile alone,
+    /// not the junction valence `s`. At an `s = 4` apex the straight chord
+    /// (`profile = 0.25`, `r == 1`) leaves every corner vert coincident-in-position
+    /// with its own boundvert on the undisplaced ring (four coincident pairs in the
+    /// apex region), while the curved profile (`profile = 0.5`) pushes each corner
+    /// the full cell diagonal into the solid, off the ring (no coincidences). The
+    /// `s >= 4` bottom face is built either way — the collapse is `s == 3`-only.
+    #[test]
+    fn cutoff_junction_valence4_straight_chord_leaves_corners_on_ring() {
+        // The apex boundvert ring sits high on the tall pyramid; the base-corner
+        // terminal caps sit near z = 0. This threshold isolates the apex junction.
+        let apex_region = |mesh: &LoopMesh, result: &BevelResult| -> Vec<Vec3> {
+            result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .filter(|p| p.z > 0.6)
+                .collect()
+        };
+        let coincident_pairs = |points: &[Vec3]| -> usize {
+            let mut pairs = 0;
+            for i in 0..points.len() {
+                for j in (i + 1)..points.len() {
+                    if (points[i] - points[j]).length() < 1.0e-4 {
+                        pairs += 1;
+                    }
+                }
+            }
+            pairs
+        };
+
+        let (mesh_chord, result_chord, _) = pyramid_corner_cutoff_segments2(0.25);
+        mesh_chord.validate_topology();
+        let chord_points = apex_region(&mesh_chord, &result_chord);
+        assert_eq!(
+            coincident_pairs(&chord_points),
+            4,
+            "s = 4 straight chord: four corner verts stay coincident with their boundverts",
+        );
+
+        let (mesh_curved, result_curved, _) = pyramid_corner_cutoff_segments2(0.5);
+        mesh_curved.validate_topology();
+        let curved_points = apex_region(&mesh_curved, &result_curved);
+        assert_eq!(
+            coincident_pairs(&curved_points),
+            0,
+            "s = 4 curved: every corner is pushed off the ring into the solid",
+        );
+
+        // Both valences build the bottom face (the collapse is 3-way-only): each cut
+        // is closed, so the apex region carries a distinct pushed/undisplaced ring.
+        // The curved corners must land strictly below (into the solid) the chord ring.
+        let chord_min_z = chord_points.iter().map(|p| p.z).fold(f32::MAX, f32::min);
+        let curved_min_z = curved_points.iter().map(|p| p.z).fold(f32::MAX, f32::min);
+        assert!(
+            curved_min_z < chord_min_z - 1.0e-4,
+            "the curved down-push drives corners below the undisplaced chord ring",
+        );
     }
 
     /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
