@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use glam::Vec3;
 
 use super::duplicate::GeomKey;
@@ -93,6 +95,50 @@ impl Default for BevelMiter {
     fn default() -> Self {
         BevelMiter::Sharp
     }
+}
+
+/// Which face kinds the weighted-normal strength post-pass stamps (BEVEL.md
+/// §8.10.1). The four modes form a nested inclusion — each stamps a superset of
+/// the previous — so they compare as an ordered scale
+/// `None < New < Affected < All` (the declaration order below).
+///
+/// - [`None`](Self::None) — the pass does not run; no layer is created.
+/// - [`New`](Self::New) — stamp only the newly-created bevel faces (corner-cap →
+///   weak, chamfer-strip → medium). Reconstructed / untouched originals stay at
+///   the layer default (`0`).
+/// - [`Affected`](Self::Affected) — additionally stamp reconstructed originals
+///   (the faces the bevel re-stitched but did not create) strong.
+/// - [`All`](Self::All) — additionally stamp untouched originals strong too, so
+///   every face carries an explicit strength.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum BevelFaceStrengthMode {
+    #[default]
+    None,
+    New,
+    Affected,
+    All,
+}
+
+/// Name of the face-domain 32-bit-integer customdata layer the strength
+/// post-pass writes, shared by convention with the downstream weighted-normal
+/// consumer so producer and consumer agree (BEVEL.md §8.10.1).
+const FACE_STRENGTH_LAYER: &str = "__mod_weightednormals_faceweight";
+/// The three strength sentinels stamped by mode (BEVEL.md §8.10.1). These exact
+/// integers are part of the observable layer, not merely their ordering.
+const FACE_STRENGTH_WEAK: i32 = -16384;
+const FACE_STRENGTH_MEDIUM: i32 = 0;
+const FACE_STRENGTH_STRONG: i32 = 16384;
+
+/// Provenance kind recorded for a **new** bevel face at creation time so the
+/// §8.10.1 post-pass can key its strength on it. The junction vmesh patch and the
+/// vertex-bevel cap fold into [`Cap`](Self::Cap) (weak); the profile / chamfer
+/// strips fold into [`Strip`](Self::Strip) (medium). Reconstructed and untouched
+/// originals are recovered by the post-pass from the pre-bevel face/vertex
+/// snapshots, not tagged here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BevelNewFaceKind {
+    Cap,
+    Strip,
 }
 
 /// Parameters for [`LoopMesh::bevel`]. The foundational case (BEVEL.md §3) is
@@ -205,6 +251,15 @@ pub struct BevelOptions<'a> {
     /// with the meet-point and the arc collapses to a sliver, so a meaningful
     /// inner miter wants `spread > 0`. Defaults to `0.0`.
     pub spread: f32,
+    /// Weighted-normal face-strength post-pass (BEVEL.md §8.10.1). A pure
+    /// attribute pass that runs after the whole bevel is built: it stamps a
+    /// per-face-kind strength sentinel (corner-cap → weak `-16384`, chamfer-strip
+    /// → medium `0`, reconstructed / untouched original → strong `+16384`) into a
+    /// named face-`Int32` layer (`__mod_weightednormals_faceweight`), gated by the
+    /// nested [`BevelFaceStrengthMode`] scale. Creates and moves no geometry.
+    /// Defaults to [`BevelFaceStrengthMode::None`] — the layer is not written at
+    /// all, so existing callers are unaffected.
+    pub face_strength_mode: BevelFaceStrengthMode,
 }
 
 impl Default for BevelOptions<'_> {
@@ -226,6 +281,7 @@ impl Default for BevelOptions<'_> {
             miter_inner: BevelMiter::Sharp,
             miter_outer: BevelMiter::Sharp,
             spread: 0.0,
+            face_strength_mode: BevelFaceStrengthMode::None,
         }
     }
 }
@@ -299,8 +355,45 @@ impl LoopMesh {
     /// A non-positive `offset`, or a beveled vertex with fewer than two incident
     /// edges, is a no-op for that vertex (BEVEL.md §2.1).
     ///
+    /// After the topological build, the `face_strength_mode` shading post-pass
+    /// (BEVEL.md §8.10.1) runs when the mode is not
+    /// [`BevelFaceStrengthMode::None`]: a pure attribute pass stamping the named
+    /// weighted-normal strength layer per face kind. It touches no geometry.
+    ///
     /// See `radial-mesh-guides/operators/BEVEL.md`.
     pub fn bevel(&mut self, geom: &[GeomKey], options: BevelOptions) -> BevelResult {
+        let mode = options.face_strength_mode;
+        if mode == BevelFaceStrengthMode::None {
+            return self.bevel_dispatch(geom, &options);
+        }
+
+        // §8.10.1 recovers reconstructed vs untouched originals from the *pristine*
+        // face / vertex sets: a surviving original that gained a ring / strip vert
+        // (or that was killed and rebuilt into a fresh key) is reconstructed;
+        // everything still keyed and all-original-verts is untouched. New bevel
+        // faces are recorded live (cap vs strip) into `bevel_cap_faces`.
+        let original_faces: HashSet<FaceKey> = self.face_keys().into_iter().collect();
+        let original_verts: HashSet<VertexKey> = self.vert_keys().into_iter().collect();
+
+        self.bevel_cap_faces = Some(Vec::new());
+        let result = self.bevel_dispatch(geom, &options);
+        let cap_faces: HashSet<FaceKey> = self
+            .bevel_cap_faces
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let new_faces: HashSet<FaceKey> = result.faces.iter().copied().collect();
+
+        self.stamp_face_strengths(mode, &original_faces, &original_verts, &new_faces, &cap_faces);
+
+        result
+    }
+
+    /// The topological bevel build (BEVEL.md §3–§8), independent of the shading
+    /// post-passes. Returns the created geometry; the public [`bevel`](Self::bevel)
+    /// wraps this with the `face_strength_mode` post-pass (§8.10.1).
+    fn bevel_dispatch(&mut self, geom: &[GeomKey], options: &BevelOptions) -> BevelResult {
         let mut result = BevelResult::default();
 
         if options.offset <= 0.0 {
@@ -315,7 +408,7 @@ impl LoopMesh {
         // 3-way cube-corner case (§8.5); other ADJ cases still no-op below.
         if options.segments >= 2 {
             if options.affect == BevelAffect::Edges {
-                return self.bevel_edges(geom, &options);
+                return self.bevel_edges(geom, options);
             }
             return result;
         }
@@ -325,7 +418,7 @@ impl LoopMesh {
         }
 
         if options.affect == BevelAffect::Edges {
-            return self.bevel_edges(geom, &options);
+            return self.bevel_edges(geom, options);
         }
 
         if options.affect != BevelAffect::Vertices {
@@ -386,6 +479,7 @@ impl LoopMesh {
                         cap.face,
                         options.material,
                         corner.representative_material,
+                        BevelNewFaceKind::Cap,
                     );
                     result.faces.push(cap.face);
                     result.edges.extend(cap.chamfer_edges);
@@ -590,7 +684,12 @@ impl LoopMesh {
         // verts, wound opposite to how fL traverses its new `aL–bL` long edge so
         // the quad and fL share that edge with consistent (radial-2) traversal.
         let strip = self.build_strip_quad(strip_a_left, strip_b_left, strip_b_right, strip_a_right);
-        self.assign_bevel_face_material(strip.face, material, representative_material);
+        self.assign_bevel_face_material(
+            strip.face,
+            material,
+            representative_material,
+            BevelNewFaceKind::Strip,
+        );
         result.faces.push(strip.face);
         result.edges.extend(strip.edges);
 
@@ -1315,7 +1414,7 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-            self.assign_bevel_face_material(face, material, representative);
+            self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Strip);
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -1432,7 +1531,7 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&face_verts, FaceCreateFlags::NONE);
-            self.assign_bevel_face_material(face, material, representative);
+            self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -1455,7 +1554,7 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
-            self.assign_bevel_face_material(face, material, representative);
+            self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -1677,7 +1776,7 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-            self.assign_bevel_face_material(face, material, representative);
+            self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -1960,7 +2059,7 @@ impl LoopMesh {
             }
         }
         let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative);
+        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
         result.faces.push(face);
         self.collect_face_edges(face, result);
     }
@@ -2408,7 +2507,7 @@ impl LoopMesh {
         }
 
         let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative);
+        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
         result.faces.push(face);
         self.collect_face_edges(face, result);
     }
@@ -3519,7 +3618,7 @@ impl LoopMesh {
         }
 
         let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative);
+        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Strip);
         result.faces.push(face);
         for i in 0..quad.len() {
             let p = quad[i];
@@ -3552,7 +3651,7 @@ impl LoopMesh {
             return;
         }
         let face = self.face_create_verts(&distinct, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative);
+        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Strip);
         result.faces.push(face);
         for i in 0..distinct.len() {
             let p = distinct[i];
@@ -3597,7 +3696,7 @@ impl LoopMesh {
         }
 
         let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative);
+        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
         result.faces.push(face);
         for i in 0..ring.len() {
             let p = ring[i];
@@ -4375,9 +4474,110 @@ impl LoopMesh {
     /// inherit is realized by copying that slot (the remaining per-face CD axes are
     /// the §5.2 follow-up). Surviving re-stitched faces are never routed here, so
     /// they keep their own material (§6.6.2).
-    fn assign_bevel_face_material(&mut self, face: FaceKey, material: i32, representative: i32) {
+    ///
+    /// This is also the single chokepoint every **new** bevel face flows through,
+    /// so it doubles as the §8.10.1 provenance recorder: while a face-strength pass
+    /// is active (`bevel_cap_faces` is `Some`), each [`BevelNewFaceKind::Cap`] face
+    /// is recorded so the post-pass can stamp it weak. Strips need no recording —
+    /// their medium sentinel equals the layer default.
+    fn assign_bevel_face_material(
+        &mut self,
+        face: FaceKey,
+        material: i32,
+        representative: i32,
+        kind: BevelNewFaceKind,
+    ) {
         let slot = if material >= 0 { material } else { representative };
         self.set_face_material_index(face, slot);
+
+        if kind == BevelNewFaceKind::Cap {
+            if let Some(cap_faces) = self.bevel_cap_faces.as_mut() {
+                cap_faces.push(face);
+            }
+        }
+    }
+
+    /// §8.10.1 shading post-pass: stamp the named weighted-normal face-strength
+    /// layer per face kind, gated by `mode`. A pure attribute pass — no geometry
+    /// changes. Reconstructed vs untouched originals are recovered from the
+    /// pre-bevel `original_faces` / `original_verts` snapshots; new bevel faces are
+    /// `new_faces` (caps split out by `cap_faces`, everything else a strip).
+    fn stamp_face_strengths(
+        &mut self,
+        mode: BevelFaceStrengthMode,
+        original_faces: &HashSet<FaceKey>,
+        original_verts: &HashSet<VertexKey>,
+        new_faces: &HashSet<FaceKey>,
+        cap_faces: &HashSet<FaceKey>,
+    ) {
+        if mode == BevelFaceStrengthMode::None {
+            return;
+        }
+
+        // Add the layer if absent, initialised to the medium sentinel (`0`) on
+        // every face; an already-present layer is reused and only stamped faces
+        // are overwritten (§8.10.1).
+        let key = AttributeKey::custom(FACE_STRENGTH_LAYER);
+        let layer = match self.face_attribs().find(&key) {
+            Some(existing) => existing,
+            None => self
+                .register_face_attribute(ElementAttributeDesc::numeric(key, AttrType::I32))
+                .expect("face i32 strength layer registers"),
+        };
+
+        // Classify against immutable snapshots first, then write — the classify
+        // walk borrows `self` (face cycles), the write borrows it mutably.
+        let mut writes: Vec<(FaceKey, i32)> = Vec::new();
+        for face in self.face_keys() {
+            if let Some(value) =
+                self.face_strength_value(face, mode, original_faces, original_verts, new_faces, cap_faces)
+            {
+                writes.push((face, value));
+            }
+        }
+        for (face, value) in writes {
+            self.face_attribs_mut().set_i32(layer, face.as_usize(), value);
+        }
+    }
+
+    /// The strength to write for `face` under `mode`, or `None` when the face's
+    /// kind is below the mode's threshold (left at the layer default). BEVEL.md
+    /// §8.10.1's kind → strength map, gated by the nested mode scale.
+    fn face_strength_value(
+        &self,
+        face: FaceKey,
+        mode: BevelFaceStrengthMode,
+        original_faces: &HashSet<FaceKey>,
+        original_verts: &HashSet<VertexKey>,
+        new_faces: &HashSet<FaceKey>,
+        cap_faces: &HashSet<FaceKey>,
+    ) -> Option<i32> {
+        if new_faces.contains(&face) {
+            // A newly-created bevel face: corner-cap → weak, chamfer-strip →
+            // medium; both stamped from `New` upward.
+            if mode < BevelFaceStrengthMode::New {
+                return None;
+            }
+            if cap_faces.contains(&face) {
+                Some(FACE_STRENGTH_WEAK)
+            } else {
+                Some(FACE_STRENGTH_MEDIUM)
+            }
+        } else {
+            let untouched = original_faces.contains(&face)
+                && self
+                    .face_vert_keys(face)
+                    .iter()
+                    .all(|vertex| original_verts.contains(vertex));
+            if untouched {
+                // Untouched original → strong, only at `All`.
+                (mode >= BevelFaceStrengthMode::All).then_some(FACE_STRENGTH_STRONG)
+            } else {
+                // Reconstructed original (re-stitched / rebuilt) → strong, from
+                // `Affected` upward.
+                (mode >= BevelFaceStrengthMode::Affected).then_some(FACE_STRENGTH_STRONG)
+            }
+        }
     }
 }
 
@@ -5102,6 +5302,137 @@ mod tests {
         );
 
         mesh.validate_topology();
+    }
+
+    // ---- §8.10.1 face_strength_mode shading post-pass ----
+
+    /// Bevel the interior valence-3 cube corner `(1,-1,-1)` at `offset = 0.25`
+    /// with the given strength mode, returning the mesh, the result, and the cap
+    /// face (`result.faces[0]`, the single triangular corner-cap).
+    fn beveled_cube_corner_strength(mode: BevelFaceStrengthMode) -> (LoopMesh, BevelResult, FaceKey) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                face_strength_mode: mode,
+                ..Default::default()
+            },
+        );
+        let cap = result.faces[0];
+        (mesh, result, cap)
+    }
+
+    /// Histogram of the strength layer over every live face, or `None` when the
+    /// named layer was never created (the `None` mode).
+    fn strength_histogram(mesh: &LoopMesh) -> Option<std::collections::BTreeMap<i32, usize>> {
+        let layer = mesh
+            .face_attribs()
+            .find(&AttributeKey::custom(FACE_STRENGTH_LAYER))?;
+        let mut histogram = std::collections::BTreeMap::new();
+        for face in mesh.face_keys() {
+            let value = mesh
+                .face_attribs()
+                .get_i32(layer, face.as_usize())
+                .expect("every face has a slot in the strength layer");
+            *histogram.entry(value).or_insert(0) += 1;
+        }
+        Some(histogram)
+    }
+
+    fn strength_of(mesh: &LoopMesh, face: FaceKey) -> i32 {
+        let layer = mesh
+            .face_attribs()
+            .find(&AttributeKey::custom(FACE_STRENGTH_LAYER))
+            .expect("strength layer present");
+        mesh.face_attribs()
+            .get_i32(layer, face.as_usize())
+            .expect("face has a strength slot")
+    }
+
+    /// BEVEL.md §8.10.1 `ALL`: every face is stamped — the corner-cap weak, and
+    /// all six originals (three reconstructed + three untouched) strong.
+    #[test]
+    fn face_strength_all_stamps_every_face_cube_corner() {
+        let (mesh, _result, cap) = beveled_cube_corner_strength(BevelFaceStrengthMode::All);
+
+        assert_eq!(strength_of(&mesh, cap), FACE_STRENGTH_WEAK, "cap is weak");
+        let histogram = strength_histogram(&mesh).expect("layer created");
+        assert_eq!(
+            histogram,
+            std::collections::BTreeMap::from([(FACE_STRENGTH_WEAK, 1), (FACE_STRENGTH_STRONG, 6)]),
+            "ALL: one weak cap + six strong originals, every face stamped",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.1 `NEW`: only the newly-created cap is stamped (weak); the
+    /// reconstructed and untouched originals stay at the medium default (`0`).
+    #[test]
+    fn face_strength_new_stamps_only_new_faces_cube_corner() {
+        let (mesh, _result, cap) = beveled_cube_corner_strength(BevelFaceStrengthMode::New);
+
+        assert_eq!(strength_of(&mesh, cap), FACE_STRENGTH_WEAK, "cap is weak");
+        let histogram = strength_histogram(&mesh).expect("layer created");
+        assert_eq!(
+            histogram,
+            std::collections::BTreeMap::from([(FACE_STRENGTH_WEAK, 1), (FACE_STRENGTH_MEDIUM, 6)]),
+            "NEW: only the cap stamped weak; six originals left at the medium default",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.1 `AFFECTED`: the cap (weak) plus the three reconstructed
+    /// originals (strong) are stamped; the three untouched originals stay at
+    /// default. Distinct from both `NEW` and `ALL`.
+    #[test]
+    fn face_strength_affected_stamps_reconstructed_not_untouched_cube_corner() {
+        let (mesh, _result, cap) = beveled_cube_corner_strength(BevelFaceStrengthMode::Affected);
+
+        assert_eq!(strength_of(&mesh, cap), FACE_STRENGTH_WEAK, "cap is weak");
+        let histogram = strength_histogram(&mesh).expect("layer created");
+        assert_eq!(
+            histogram,
+            std::collections::BTreeMap::from([
+                (FACE_STRENGTH_WEAK, 1),
+                (FACE_STRENGTH_MEDIUM, 3),
+                (FACE_STRENGTH_STRONG, 3),
+            ]),
+            "AFFECTED: cap weak, three reconstructed strong, three untouched at default",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.1 `None`: the pass does not run — the named layer is never
+    /// created, so existing callers see no change.
+    #[test]
+    fn face_strength_none_writes_no_layer_cube_corner() {
+        let (mesh, result, _cap) = beveled_cube_corner_strength(BevelFaceStrengthMode::None);
+
+        assert_eq!(result.faces.len(), 1, "still a single cap built");
+        assert!(
+            strength_histogram(&mesh).is_none(),
+            "None mode creates no strength layer at all",
+        );
+        mesh.validate_topology();
+    }
+
+    /// The three modes the A/B scaffolds cross-pin (`ALL` / `NEW` / `None`) each
+    /// produce a distinct captured layer — the axis is non-vacuous.
+    #[test]
+    fn face_strength_all_new_none_are_distinct_cube_corner() {
+        let (all_mesh, ..) = beveled_cube_corner_strength(BevelFaceStrengthMode::All);
+        let (new_mesh, ..) = beveled_cube_corner_strength(BevelFaceStrengthMode::New);
+        let (none_mesh, ..) = beveled_cube_corner_strength(BevelFaceStrengthMode::None);
+
+        let all = strength_histogram(&all_mesh);
+        let new = strength_histogram(&new_mesh);
+        let none = strength_histogram(&none_mesh);
+
+        assert!(all.is_some() && new.is_some() && none.is_none());
+        assert_ne!(all, new, "ALL and NEW stamp different layers");
     }
 
     /// BEVEL.md §4: ring verts slide `offset` along each incident edge toward the

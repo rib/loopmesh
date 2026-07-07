@@ -85,7 +85,12 @@ mod weld_verts;
 mod wireframe;
 
 pub use beautify_fill::{BeautifyFillOptions, BeautifyFillResult, BeautifyMethod};
-pub use bevel::{BevelAffect, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod};
+pub use bevel::{
+    BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,
+    BevelVmeshMethod,
+};
+/// Convention-neutral alias for [`BevelFaceStrengthMode`] (BEVEL.md §8.10.1).
+pub use bevel::BevelFaceStrengthMode as FaceStrengthMode;
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
 pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};

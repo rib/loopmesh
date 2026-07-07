@@ -83,7 +83,7 @@ pub use math::{SparseCholesky, SparseSolveError};
 pub use iter::*;
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
+    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
     BisectParams,
     BisectResult, BridgeLoopsParams, BridgeLoopsResult, CenterMode, ConnectVertsNonplanarOut,
     ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
@@ -91,7 +91,7 @@ pub use ops::{
     DissolveVertsParams,
     DuplicateResult, EdgeloopFillParams, EdgeloopFillResult, EdgenetFillParams, EdgenetFillResult,
     EdgenetPrepareResult,
-    ExtrudeVertIndivResult, GeomKey,
+    ExtrudeVertIndivResult, FaceStrengthMode, GeomKey,
     GridFillParams, GridFillResult,
     HolesFillParams, HolesFillResult,
     InsetIndividualParams, InsetIndividualResult,
@@ -606,6 +606,12 @@ pub struct LoopMesh {
 
     // Transient per-element bit fields for operators. See [`op_flags`].
     pub(crate) op_flags: crate::op_flags::OpFlagPool,
+
+    // Transient bevel scratch: while a `face_strength_mode` post-pass is active
+    // (BEVEL.md §8.10.1), the new corner-cap faces are collected here as they are
+    // minted, so the post-pass can stamp them weak. `None` outside a
+    // strength-tracking bevel; the op sets it before the build and takes it after.
+    pub(crate) bevel_cap_faces: Option<Vec<FaceKey>>,
 }
 
 impl Default for LoopMesh {
@@ -640,6 +646,8 @@ impl LoopMesh {
             face_attribs: ElementAttributes::default(),
 
             op_flags: crate::op_flags::OpFlagPool::default(),
+
+            bevel_cap_faces: None,
         }
     }
 
