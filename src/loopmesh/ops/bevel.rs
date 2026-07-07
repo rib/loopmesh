@@ -5798,6 +5798,85 @@ mod tests {
         assert!((chain4[1].0 - chain4[3].1).abs() < 1.0e-5);
     }
 
+    /// BEVEL.md §8.6.1 / §8.6.4: the square (`profile = 1.0`, `r = ∞` sentinel)
+    /// and square-in (`profile = 0`, `r = 0` sentinel) cross-sections are two
+    /// straight legs meeting at a corner on the `u = v` diagonal. Even chord
+    /// spacing lands each interior sample on a leg (never off the two edges), the
+    /// diagonal corner is a sample at even `segments`, and every chord is equal
+    /// length — the closed-form leg-linear shortcut, not the iterative solver.
+    #[test]
+    fn superellipse_chain_square_is_leg_linear_even() {
+        // Square: legs (0,1)→(1,1)→(1,0), corner on the diagonal at (1,1).
+        let chain = superellipse_chain(1.0, 4);
+        assert_eq!(chain[0], (0.0, 1.0));
+        assert_eq!(chain[4], (1.0, 0.0));
+        // Even segments → the central sample is the diagonal corner.
+        assert!((chain[2].0 - 1.0).abs() < 1.0e-6 && (chain[2].1 - 1.0).abs() < 1.0e-6);
+        // Interior samples lie on the legs: the first-leg point has v == 1 (top
+        // edge), the mirrored second-leg point has u == 1 (right edge).
+        assert!((chain[1].1 - 1.0).abs() < 1.0e-6, "chain[1] on top leg (v=1)");
+        assert!((chain[3].0 - 1.0).abs() < 1.0e-6, "chain[3] on right leg (u=1)");
+        // Equal chords: each of the 4 chords is 2/segments = 0.5 long.
+        for k in 0..4 {
+            assert!((cell_chord(chain[k], chain[k + 1]) - 0.5).abs() < 1.0e-6);
+        }
+
+        // Square-in: legs (0,1)→(0,0)→(1,0), corner on the diagonal at (0,0).
+        let chain_in = superellipse_chain(0.0, 4);
+        assert!((chain_in[2].0).abs() < 1.0e-6 && (chain_in[2].1).abs() < 1.0e-6);
+        assert!((chain_in[1].0).abs() < 1.0e-6, "chain[1] on left leg (u=0)");
+        assert!((chain_in[3].1).abs() < 1.0e-6, "chain[3] on bottom leg (v=0)");
+        for k in 0..4 {
+            assert!((cell_chord(chain_in[k], chain_in[k + 1]) - 0.5).abs() < 1.0e-6);
+        }
+    }
+
+    /// BEVEL.md §8.6.4: at **odd** `segments` no sample sits on the diagonal
+    /// corner; the central chord straddles it and is given a `√2/2`-weighted arc
+    /// share so the diagonal-crossing chord matches the leg chords in length. All
+    /// `segments` chords must therefore stay equal, and the two samples flanking
+    /// the corner sit a `√2/2`-scaled leg-chord away from it.
+    #[test]
+    fn superellipse_chain_square_is_leg_linear_odd() {
+        for &profile in &[1.0_f32, 0.0_f32] {
+            let chain = superellipse_chain(profile, 3);
+            assert_eq!(chain[0], (0.0, 1.0));
+            assert_eq!(chain[3], (1.0, 0.0));
+            let chords: Vec<f32> = (0..3).map(|k| cell_chord(chain[k], chain[k + 1])).collect();
+            let max = chords.iter().cloned().fold(0.0_f32, f32::max);
+            let min = chords.iter().cloned().fold(f32::INFINITY, f32::min);
+            assert!(
+                (max - min) < 1.0e-6,
+                "odd square chords equal (√2/2 straddle) for profile {profile}: {chords:?}",
+            );
+            // The interior samples flank (but never sit on) the diagonal corner.
+            assert!((chain[1].0 - chain[1].1).abs() > 1.0e-3);
+            assert!((chain[2].0 - chain[2].1).abs() > 1.0e-3);
+            // Full leg length 1 = p·L + (√2/2)·L with p = 1, so L = 1/(1+√2/2).
+            let expected = 1.0 / (1.0 + std::f32::consts::FRAC_1_SQRT_2);
+            assert!((chords[0] - expected).abs() < 1.0e-6);
+        }
+    }
+
+    /// BEVEL.md §8.6.1: the square-in sentinel `superellipse_v(u, 0)` is the
+    /// concave-notch step (`1` at `u = 0`, `0` for `u > 0`) — NOT the flat
+    /// `v ≡ 1` top the naive `r < 1` mirror form produced. The chain must ride
+    /// the two legs through the origin, never a flat top edge.
+    #[test]
+    fn superellipse_square_in_is_concave_not_flat_top() {
+        assert_eq!(superellipse_v(0.0, 0.0), 1.0);
+        assert_eq!(superellipse_v(0.25, 0.0), 0.0);
+        assert_eq!(superellipse_v(0.5, 0.0), 0.0);
+        assert_eq!(superellipse_v(1.0, 0.0), 0.0);
+
+        // No interior sample sits on a flat v = 1 top edge (that would be square,
+        // not square-in): every interior square-in sample has v < 1.
+        let chain = superellipse_chain(0.0, 4);
+        for k in 1..4 {
+            assert!(chain[k].1 < 1.0 - 1.0e-6, "square-in sample {k} off flat top");
+        }
+    }
+
     /// BEVEL.md §8.6: `profile = 0.5` (the default) reproduces the §8.3.6 circular
     /// arc sample at the cutoff chain interior — no regression from routing the
     /// chain through the general sampler.
@@ -10594,6 +10673,12 @@ fn profile_to_exponent(profile: f32) -> f32 {
 /// the evaluation numerically stable near the endpoints.
 fn superellipse_v(u: f32, r: f32) -> f32 {
     let u = u.clamp(0.0, 1.0);
+    // Square-in sentinel (`r → 0`, BEVEL.md §8.6.1): the curve collapses to the
+    // two legs `(0,1)→(0,0)→(1,0)` through the origin, so `v(u)` is the step
+    // `1` at `u = 0`, `0` for any `u > 0` — the concave notch, not a flat top.
+    if r <= 0.0 {
+        return if u <= 0.0 { 1.0 } else { 0.0 };
+    }
     if r >= 1.0 {
         (1.0 - u.powf(r)).max(0.0).powf(1.0 / r)
     } else {
@@ -10642,8 +10727,60 @@ fn superellipse_chain(profile: f32, segments: u32) -> Vec<(f32, f32)> {
         return chain;
     }
 
+    // Square (`r = ∞` sentinel) and square-in (`r = 0` sentinel): the
+    // cross-section is two straight legs meeting at a corner on the `u = v`
+    // diagonal, so even chord spacing is linear along each leg with the sample
+    // budget split at the diagonal (BEVEL.md §8.6.4). Bypasses the iterative
+    // solver — the general chord-equaliser cannot resolve the sharp corner.
+    if r == PROFILE_SQUARE_EXPONENT {
+        superellipse_chain_legs(true, segments, &mut chain);
+        return chain;
+    }
+    if r == 0.0 {
+        superellipse_chain_legs(false, segments, &mut chain);
+        return chain;
+    }
+
     superellipse_chain_general(r, segments, &mut chain);
     chain
+}
+
+/// Closed-form leg-linear spacing for the square (`r = ∞`) and square-in
+/// (`r = 0`) sentinels (BEVEL.md §8.6.4). The curve is two length-1 legs meeting
+/// at a right-angle corner on the `u = v` diagonal — square runs
+/// `(0,1)→(1,1)→(1,0)`, square-in runs `(0,1)→(0,0)→(1,0)`. Samples are placed
+/// linearly along the first leg (from the start corner toward the diagonal
+/// corner) and mirrored across `u = v` to fill the second leg.
+///
+/// For **even** `segments` a sample lands exactly on the diagonal corner and
+/// each leg carries `segments/2` chords of length `2/segments`. For **odd**
+/// `segments` no sample sits on the corner; the central chord straddles it, and
+/// to keep that diagonal-crossing chord the same length as the leg chords the
+/// straddle consumes only a `√2/2`-weighted share of arc on each leg — so with
+/// `p = (segments−1)/2` full leg chords, the leg-chord arc length solves
+/// `p·L + (√2/2)·L = 1`, i.e. `L = 1 / (p + √2/2)`.
+fn superellipse_chain_legs(square: bool, segments: u32, chain: &mut [(f32, f32)]) {
+    let n = segments as usize;
+    let (start, corner) = if square {
+        ((0.0_f32, 1.0_f32), (1.0_f32, 1.0_f32))
+    } else {
+        ((0.0_f32, 1.0_f32), (0.0_f32, 0.0_f32))
+    };
+    let leg = (corner.0 - start.0, corner.1 - start.1);
+
+    let leg_chord = if n % 2 == 0 {
+        2.0 / segments as f32
+    } else {
+        let full_chords = ((n - 1) / 2) as f32;
+        1.0 / (full_chords + std::f32::consts::FRAC_1_SQRT_2)
+    };
+
+    for i in 0..=n / 2 {
+        let t = (i as f32 * leg_chord).min(1.0);
+        let point = (start.0 + t * leg.0, start.1 + t * leg.1);
+        chain[i] = point;
+        chain[n - i] = (point.1, point.0);
+    }
 }
 
 /// The general even-chord spacing solver (BEVEL.md §8.6.4) for exponents without
