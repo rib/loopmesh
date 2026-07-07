@@ -3664,6 +3664,20 @@ impl LoopMesh {
             }
         };
 
+        // The disk-order edge directions the §7.6.2 in-wedge test bounds each
+        // forward face by: `g_k`, then each in-between leg in disk order, then
+        // `g_(k+1)`. A degenerate leg (no direction) is kept as a zero placeholder
+        // so the list stays index-aligned with `between_faces`.
+        let mut bound_dirs = Vec::with_capacity(between_edges.len() + 2);
+        bound_dirs.push(dir_first);
+        for &leg in &between_edges {
+            let leg_dir = self
+                .edge_direction_from(leg, vertex, vertex_position)
+                .unwrap_or(Vec3::ZERO);
+            bound_dirs.push(leg_dir);
+        }
+        bound_dirs.push(dir_second);
+
         Some(SectorLayout {
             dir_first,
             dir_second,
@@ -3673,6 +3687,7 @@ impl LoopMesh {
             normal_second,
             between_faces: faces,
             between_edges,
+            bound_dirs,
         })
     }
 
@@ -3759,51 +3774,44 @@ impl LoopMesh {
         // in-between leg `i` is `between_faces[i + 1]`, so the walk's forward faces
         // are exactly `between_faces` in order. The projection plane is anchored at
         // `v` (not the face's own supporting plane), oriented by the face normal; on
-        // a non-planar sector face those differ by up to the offset itself. The wedge
-        // is bounded by the walk edge and the next edge — the two edges sharing that
-        // forward face at `v`.
-        for &face in &layout.between_faces {
+        // a non-planar sector face those differ by up to the offset itself.
+        //
+        // The in-wedge bounds are the walk edge currently being tested and the next
+        // edge after it *in disk order* (`bound_dirs[i]` and `bound_dirs[i + 1]`),
+        // not an arbitrary winding-order pair off the face: the two orders can be a
+        // swap, and a swapped pair measures the *reflex* wedge, so every projection
+        // would test in-wedge and the walk would accept its first face
+        // unconditionally. For a three-petal case-3 sector that mis-accepts a face
+        // whose true wedge the drop sweeps far past (§7.6.2 worked example: the first
+        // face sweeps ~142° past its ~95° wedge and must be rejected; the second
+        // drops in-wedge at ~50° ≤ ~85°), lifting the boundvert ~offset off the base
+        // plane. Taking the disk-order pair rejects the first and accepts the second.
+        for (index, &face) in layout.between_faces.iter().enumerate() {
             let normal = self.face_plane_normal(face);
             let projected = midpoint - normal * (midpoint - vertex_position).dot(normal);
-            let bounds = self.face_edge_directions_at(face, vertex_position);
-            let (dir_one, dir_two) = match bounds {
-                Some(pair) => pair,
-                None => continue,
-            };
             let to_projected = projected - vertex_position;
             if to_projected.length() <= f32::EPSILON {
                 continue;
             }
             let dir_projected = to_projected.normalize();
+            // The in-wedge bounds are the *raw* disk-order edge directions from `v`
+            // (§7.6.2 face-drop step): the walk edge being tested and the next disk
+            // edge that shares the forward face, with no projection into the drop
+            // plane. `point_in_wedge` orients its signed sweeps by the face normal, so
+            // the small out-of-plane tilt of the bounds on a non-planar sector face is
+            // absorbed by the normal-oriented angular measure — projecting the bounds
+            // into the plane first would shift the near-boundary two-petal verdict off
+            // the wedge boundary its midpoint hugs.
+            let dir_one = layout.bound_dirs[index];
+            let dir_two = layout.bound_dirs[index + 1];
+            if dir_one == Vec3::ZERO || dir_two == Vec3::ZERO {
+                continue;
+            }
             if point_in_wedge(dir_one, dir_two, dir_projected, normal) {
                 return projected;
             }
         }
         midpoint
-    }
-
-    /// The unit directions of `face`'s two edges incident to the corner at
-    /// `vertex_position`, in the face's winding order (the edge entering the corner
-    /// then the edge leaving it). `None` if the corner or a bounding edge is
-    /// degenerate.
-    fn face_edge_directions_at(
-        &self,
-        face: FaceKey,
-        vertex_position: Vec3,
-    ) -> Option<(Vec3, Vec3)> {
-        let verts = self.face_vert_keys(face);
-        let count = verts.len();
-        let index = verts
-            .iter()
-            .position(|&v| (self.vertex_position(v) - vertex_position).length() <= f32::EPSILON)?;
-        let prev = self.vertex_position(verts[(index + count - 1) % count]);
-        let next = self.vertex_position(verts[(index + 1) % count]);
-        let to_prev = prev - vertex_position;
-        let to_next = next - vertex_position;
-        if to_prev.length() <= f32::EPSILON || to_next.length() <= f32::EPSILON {
-            return None;
-        }
-        Some((to_prev.normalize(), to_next.normalize()))
     }
 
     /// Try to place a sector's boundvert by the `loop_slide` rule (BEVEL.md §8.8):
@@ -5397,6 +5405,12 @@ struct SectorLayout {
     normal_second: Vec3,
     between_faces: Vec<FaceKey>,
     between_edges: Vec<EdgeKey>,
+    /// The sector's edge directions from `v` in disk order: `[g_k, leg_0, …,
+    /// leg_{m-1}, g_(k+1)]` (length `between_edges.len() + 2`). Aligned with
+    /// `between_faces` so the forward face `between_faces[i]` is bounded at `v` by
+    /// `bound_dirs[i]` (its walk edge) and `bound_dirs[i + 1]` (the next disk edge)
+    /// — the §7.6.2 in-wedge pair. A zero entry marks a degenerate leg direction.
+    bound_dirs: Vec<Vec3>,
 }
 
 /// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
@@ -5474,7 +5488,8 @@ fn point_in_wedge(dir_one: Vec3, dir_two: Vec3, dir_projected: Vec3, normal: Vec
     };
     let wedge = swept(dir_one, dir_two);
     let test = swept(dir_one, dir_projected);
-    test <= wedge + WEDGE_ANGLE_TOLERANCE
+    // Bounded-overshoot accept (§7.6.2): wedge − drop > −EPS_ANG.
+    test <= wedge + WEDGE_OVERSHOOT_TOLERANCE
 }
 
 /// The new strip face and its edges (BEVEL.md §7.1 item 2).
@@ -11095,16 +11110,24 @@ mod tests {
     ///
     /// BEVEL.md §8.8.2.1 (firing-frame): the firing predicate is widened to the
     /// genuine *vertex-normal* frame, so **both** qualifying single-silhouette apex
-    /// sectors slide (spoke {0,2}'s sector and spoke {0,4}'s sector), not just the
-    /// one whose flanking faces happen to align with a sector-face frame.
+    /// sectors slide onto their legs (spoke {0,2}'s sector and spoke {0,4}'s sector),
+    /// not just the one whose flanking faces happen to align with a sector-face frame.
+    /// The {0,2} slide is a large move (its §7.6.2 meet floats off z = 0); the {0,4}
+    /// sector is a *marginal two-petal* case-3 whose first in-between face `F1` drops
+    /// ~1.3° past its own wedge — an overshoot the §7.6.2 bounded-overshoot `2°` slack
+    /// **admits**, so `F1` is accepted and the meet floats *off* the leg. Its slide is
+    /// therefore a large move too. (A too-tight epsilon rejects that marginal `F1` and
+    /// advances to `F2`, pinning the meet near the leg boundary — the A/B suite proved
+    /// that `F2` placement wrong; this test now pins the widened-tolerance verdict.)
     ///
     /// BEVEL.md §8.8.5 / §8.8.4: this is an **irregular** firing junction (the two
     /// beveled edges rise out of the leg's plane at unequal angles), so the flank-sine
     /// ratio ≠ 1 redistributes the flanking edges' §7.6.4 offsets and the ripple
     /// reaches the four terminal strip verts at the edges' far ends — they are **not**
     /// static here (the case-B recipe is flag-independent, but the reconciled offset it
-    /// consumes is not). So all six new verts drift between on and off: the two firing
-    /// apex boundverts directly (case A) and the four termini by the width-pass ripple.
+    /// consumes is not). So all six new verts differ between on and off: both apex
+    /// boundverts ({0,2} and the marginal-F1 {0,4}) and the termini, by observable
+    /// amounts (case A + case-B ripple).
     #[test]
     fn edge_bevel_loop_slide_lands_on_planar_leg_line() {
         let offset = 0.2;
@@ -11136,11 +11159,22 @@ mod tests {
 
         let perp = |p: Vec3, leg: Vec3| ((p - apex_pos) - leg * (p - apex_pos).dot(leg)).length();
 
-        // §8.8.5: both firing boundverts move when the slide is enabled.
+        // §8.8.5: the {0,2} firing boundvert moves observably when the slide is
+        // enabled — its leg lies in z = 0 while the §7.6.2 meet floats off z.
         assert!(
             (b2_on - b2_off).length() > 1.0e-3,
             "loop_slide on must move the {{0,2}} boundvert, on={b2_on:?} off={b2_off:?}",
         );
+        // The {0,4} sector is a *marginal two-petal* case-3 (§7.6.2): its first
+        // in-between face `F1`'s drop overshoots that face's wedge by only ~1.3°, an
+        // overshoot the bounded-overshoot rule's `2°` slack (§7.6.2) **admits**, so
+        // `F1` is accepted and the §7.6.2 meet lands at `F1`'s face-drop — which
+        // floats *off* the leg line. So loop_slide moves the {0,4} boundvert
+        // observably (like {0,2}), sliding the floating meet onto its leg. (A
+        // too-tight epsilon — the prior `1e-4 rad` — wrongly rejects that marginal
+        // `F1`, advancing to `F2`, whose drop pins near the leg boundary; the A/B
+        // suite proved that `F2` placement wrong. This pins the widened-tolerance
+        // `F1`-accept placement.)
         assert!(
             (b4_on - b4_off).length() > 1.0e-3,
             "loop_slide on must move the {{0,4}} boundvert, on={b4_on:?} off={b4_off:?}",
@@ -11168,16 +11202,21 @@ mod tests {
             perp(b4_on, leg4_dir),
         );
 
-        // The §7.6.2 meets (loop_slide off) float off their legs — that is why the
-        // slide is observable (§8.8.5).
+        // The {0,2} §7.6.2 meet (loop_slide off) floats off its leg's z = 0 plane —
+        // that is why its slide is observable (§8.8.5).
         assert!(
             b2_off.z.abs() > 1.0e-3,
             "{{0,2}} meet-point boundvert floats off z = 0, got z={}",
             b2_off.z,
         );
+        // The {0,4} §7.6.2 meet (loop_slide off) is the marginal `F1` face-drop the
+        // `2°` bounded-overshoot slack admits (§7.6.2), so it floats *off* the leg
+        // line — that is why its slide is observable. (The too-tight prior epsilon
+        // rejected `F1` and pinned the meet near the leg boundary at `F2`; the A/B
+        // suite proved that placement wrong, so this now guards the `F1`-accept.)
         assert!(
             perp(b4_off, leg4_dir) > 1.0e-3,
-            "{{0,4}} meet-point boundvert floats off its leg, perp={}",
+            "{{0,4}} meet-point boundvert floats off its leg (marginal F1 drop), perp={}",
             perp(b4_off, leg4_dir),
         );
 
@@ -11634,14 +11673,17 @@ mod tests {
         (apex, rim)
     }
 
-    /// BEVEL.md §7.6.2 (corrected face-drop step): at a **non-planar** junction the
+    /// BEVEL.md §7.6.2 (face-drop in-wedge test): at a **non-planar** junction the
     /// two skew offset lines give a provisional midpoint that floats off the surface,
-    /// so it is dropped onto a sector face. The corrected walk **starts at the
-    /// flanking beveled edge `g_k` itself** (testing `g_k`'s forward face first) and
-    /// drops onto a **plane through the junction vertex `v`** carrying that face's
-    /// normal — not the face's own supporting plane. This pins both: each junction
-    /// boundvert lands exactly on the `v`-anchored plane of its sector's `g_k`
-    /// forward face, bounded just out from the apex.
+    /// so it is dropped onto a sector face — but only onto the **first face in the
+    /// disk-order walk whose `v`-anchored wedge actually contains the drop**. The walk
+    /// starts at `g_k`'s forward face, but for a **three-petal** sector (two
+    /// out-of-plane legs) the midpoint sits deep in the sector interior, so `g_k`'s
+    /// forward-face drop sweeps well past that face's wedge and is **rejected**; the
+    /// walk advances and the drop lands in-wedge on the **next** face. This pins the
+    /// rejection: each junction boundvert lands on its sector's *second* face plane,
+    /// decisively off `g_k`'s forward face (the accept-first bug landed it on `g_k`'s
+    /// plane, ~0.05–0.25 unit away).
     #[test]
     fn junction_face_drop_lands_on_v_anchored_g_k_plane() {
         let mut mesh = LoopMesh::new();
@@ -11689,49 +11731,120 @@ mod tests {
             "two junction sectors → two near-apex boundverts",
         );
 
-        let normal_g_k_plus = triangle_normal(0);
-        let normal_g_k_minus = triangle_normal(3);
         for point in &junction_verts {
-            let from_apex = *point - apex_pos;
             // Bounded near the apex: a small on-surface nudge, not floated off (the
             // v-anchored drop keeps it ≈ offset·few out, never the ~unit rim depth).
-            let radius = from_apex.length();
+            let radius = (*point - apex_pos).length();
             assert!(
                 radius > 1.0e-4 && radius < 4.0 * offset,
                 "junction boundvert sits just out from the apex, got {radius}",
             );
-            // It lies exactly on the v-anchored plane of *one* flanking g_k forward
-            // face — the corrected drop plane. Either sector's boundvert matches its
-            // own g_k face to f32 round-off.
-            let on_plus = from_apex.dot(normal_g_k_plus).abs();
-            let on_minus = from_apex.dot(normal_g_k_minus).abs();
-            assert!(
-                on_plus < 1.0e-5 || on_minus < 1.0e-5,
-                "boundvert on a v-anchored g_k-face plane; \
-                 +Y dist {on_plus}, -Y dist {on_minus}",
-            );
         }
 
-        // Pair each boundvert to its own sector's g_k face: the +Y boundvert
-        // (positive Y) must lie on triangle 0's plane, the −Y boundvert on
-        // triangle 3's plane — confirming the walk started at g_k, not a later leg.
-        let plus = junction_verts
+        // The +Y sector walks 0 → 3: g_k = spoke 0 (forward face triangle 0), then
+        // legs spoke 1, spoke 2 (forward faces triangle 1, triangle 2). Its midpoint
+        // sits deep enough that triangle 0's drop is out-of-wedge, so the accepted
+        // face is triangle 1. The −Y sector walks 3 → 0: g_k = spoke 3 (triangle 3),
+        // accepted face triangle 4.
+        let plus = *junction_verts
             .iter()
             .find(|p| p.y > 0.0)
             .expect("+Y junction boundvert");
-        let minus = junction_verts
+        let minus = *junction_verts
             .iter()
             .find(|p| p.y < 0.0)
             .expect("-Y junction boundvert");
+
+        // Each boundvert is decisively OFF its sector's g_k forward face (the rejected
+        // first candidate) — the accept-first bug would land it here, at f32 round-off.
         assert!(
-            (*plus - apex_pos).dot(normal_g_k_plus).abs() < 1.0e-5,
-            "+Y boundvert on spoke-0's forward-face v-plane",
+            (plus - apex_pos).dot(triangle_normal(0)).abs() > 0.02,
+            "+Y boundvert rejected spoke-0's forward face (off its v-plane)",
         );
         assert!(
-            (*minus - apex_pos).dot(normal_g_k_minus).abs() < 1.0e-5,
-            "-Y boundvert on spoke-3's forward-face v-plane",
+            (minus - apex_pos).dot(triangle_normal(3)).abs() > 0.02,
+            "-Y boundvert rejected spoke-3's forward face (off its v-plane)",
+        );
+
+        // It lands ON the accepted in-wedge face's v-plane (the second face in each
+        // walk): +Y on triangle 1, −Y on triangle 4.
+        assert!(
+            (plus - apex_pos).dot(triangle_normal(1)).abs() < 1.0e-5,
+            "+Y boundvert on the accepted second face (triangle 1) v-plane, dist {}",
+            (plus - apex_pos).dot(triangle_normal(1)).abs(),
+        );
+        assert!(
+            (minus - apex_pos).dot(triangle_normal(4)).abs() < 1.0e-5,
+            "-Y boundvert on the accepted second face (triangle 4) v-plane, dist {}",
+            (minus - apex_pos).dot(triangle_normal(4)).abs(),
         );
         mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.6.2 worked example (three-petal in-wedge rejection). At the
+    /// irregular four-spoke apex `v` the three-petal complementary sector's skew
+    /// midpoint sits deep in the interior, so its drop onto `g_k`'s forward face
+    /// `F1` sweeps ~142° — well past `F1`'s ~95° wedge — and must be **rejected**;
+    /// the walk advances and the drop lands in-wedge on the next face `F2` (~50° ≤
+    /// ~85°). Getting the rejection wrong lifts the boundvert ~offset in the
+    /// out-of-plane coordinate (`z ≈ 0.089` instead of `z ≈ 0.009`). This pins the
+    /// predicate against the guide's table and the disk-order pairing it needs: the
+    /// reversed pair measures `F1`'s *reflex* wedge and mis-accepts the drop.
+    #[test]
+    fn three_petal_in_wedge_rejection_matches_worked_example() {
+        let v = Vec3::ZERO;
+        // Spoke directions (from v) of the sector's g_k, first leg, second leg.
+        let g_k = Vec3::new(0.5, 2.0, 0.0).normalize();
+        let leg_1 = Vec3::new(-2.0, 0.3, 0.6).normalize();
+        let leg_2 = Vec3::new(-0.5, -2.0, 0.0).normalize();
+        // The two candidate forward faces' v-anchored plane normals (guide table).
+        let normal_f1 = Vec3::new(0.140, 0.140, 0.980).normalize();
+        let normal_f2 = Vec3::new(0.154, -0.154, 0.976).normalize();
+        // The skew closest-points midpoint the two case-3 offset lines produce.
+        let midpoint = Vec3::new(-0.3501, -0.2948, 0.0108);
+
+        // Drop the midpoint onto each face's v-anchored plane, then take the wedge
+        // bounds from the *raw* disk-order walk edges (F1: g_k → leg_1; F2: leg_1 →
+        // leg_2) with no in-plane projection, exactly as `drop_onto_sector_face`
+        // does — `point_in_wedge` orients its sweeps by the face normal, absorbing
+        // the bounds' small out-of-plane tilt.
+        let drop = |normal: Vec3| midpoint - normal * (midpoint - v).dot(normal);
+        let dir_to = |p: Vec3| (p - v).normalize();
+
+        let drop_f1 = drop(normal_f1);
+        let drop_f2 = drop(normal_f2);
+
+        // The rejected first face lifts the boundvert far off the base plane; the
+        // accepted second face barely lifts it — the ~0.08 out-of-plane error.
+        assert!(
+            (drop_f1.z - 0.0889).abs() < 2.0e-3,
+            "F1 (rejected) drop lifts to z≈0.089, got {}",
+            drop_f1.z,
+        );
+        assert!(
+            (drop_f2.z - 0.0088).abs() < 2.0e-3,
+            "F2 (accepted) drop stays near z≈0.009, got {}",
+            drop_f2.z,
+        );
+
+        // F1's disk-order wedge rejects the drop (sweep past the wedge)…
+        assert!(
+            !point_in_wedge(g_k, leg_1, dir_to(drop_f1), normal_f1),
+            "F1 forward face is out-of-wedge and must be rejected",
+        );
+        // …and F2's wedge accepts it (in-wedge), so F2's drop is the boundvert.
+        assert!(
+            point_in_wedge(leg_1, leg_2, dir_to(drop_f2), normal_f2),
+            "F2 forward face is in-wedge and must be accepted",
+        );
+
+        // The disk-order pairing is load-bearing: the reversed pair (what a
+        // winding-order edge lookup can yield) measures F1's *reflex* wedge and
+        // wrongly accepts the out-of-wedge drop — the accept-first bug.
+        assert!(
+            point_in_wedge(leg_1, g_k, dir_to(drop_f1), normal_f1),
+            "reversed pair measures the reflex wedge and mis-accepts F1",
+        );
     }
 }
 
@@ -11916,8 +12029,13 @@ const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
 /// so this is an angular degeneracy guard, not a length.
 const LINE_PARALLEL_TOLERANCE: f32 = 1.0e-7;
 
-/// Angular slack (radians) for the §7.6.2 in-wedge face-drop predicate.
-const WEDGE_ANGLE_TOLERANCE: f32 = 1.0e-4;
+/// Angular slack (radians) for the §7.6.2 in-wedge face-drop predicate. Per the
+/// bounded-overshoot rule (§7.6.2): accept a face-drop when its `d1→dp` sweep
+/// overshoots the `d1→d2` wedge by strictly less than `EPS_ANG = 2°`. This is a
+/// genuine geometric slack, not a round-off guard — wide enough to admit a first
+/// face whose drop overshoots its wedge by ~1.3° (the two-petal marginal accept),
+/// yet still reject one that overshoots by tens of degrees (the three-petal case).
+const WEDGE_OVERSHOOT_TOLERANCE: f32 = 0.034_906_6;
 
 /// Per-edge slide distance `d_i` for a single-segment vertex bevel (BEVEL.md
 /// §4 / §4.3). Each `offset_type` interprets `offset` as a different physical
