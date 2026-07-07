@@ -415,14 +415,17 @@ impl LoopMesh {
     /// `floor((s+1)·extra / segments) − floor(s·extra / segments)` scaffolds — is
     /// a function of the counts alone, never of input ordering or geometry.
     ///
-    /// Returns the per-slot positions (genuine scaffold points, on the member's
-    /// polyline, that feed the §5/§6 interior interpolation) and the per-slot
-    /// vertex keys, with each scaffold slot **collapsed (Phase 2) into its
-    /// segment's origin-ward — lower-index — endpoint**, the deterministic
-    /// collapse survivor of §3.4 (the endpoint reached first walking from
-    /// `grid[0][0]`). The two member endpoints are always slot 0 and slot
-    /// `target-1`, so the four lattice corners stay real. An already-full member
-    /// is the identity.
+    /// Returns the per-slot positions and the per-slot vertex keys. Each scaffold
+    /// slot is a **parameter-0 split (§3.4a-a)**: its position is placed
+    /// *coincident with* its collapse-survivor endpoint — not at the segment
+    /// midpoint — so the profile handed to the §5/§6 interior solver repeats an
+    /// endpoint coordinate at each scaffold slot rather than an even-subdivision
+    /// point. The survivor is that segment's origin-ward — lower-index — endpoint,
+    /// the deterministic collapse target of §3.4 (the endpoint reached first
+    /// walking from `grid[0][0]`), and the later Phase-2 collapse into that same
+    /// endpoint is a geometric no-op. The two member endpoints are always slot 0
+    /// and slot `target-1`, so the four lattice corners stay real. An already-full
+    /// member is the identity.
     fn grid_expand_member(
         &self,
         members: &[VertexKey],
@@ -452,10 +455,14 @@ impl LoopMesh {
             let upto = (s + 1) * extra / segments;
             let here = upto - inserted;
             inserted = upto;
-            for k in 0..here {
-                let frac = (k + 1) as f32 / (here + 1) as f32;
-                positions.push(real_positions[s].lerp(real_positions[s + 1], frac));
-                // §3.4 — origin-ward (lower-index) endpoint survives the collapse.
+            for _ in 0..here {
+                // §3.4a-a — parameter-0 split: the scaffold is placed *coincident*
+                // with its collapse-survivor (the segment's origin-ward endpoint),
+                // so the boundary profile fed to the §5/§6 interior solver carries a
+                // repeated endpoint coordinate here, not an even-subdivision
+                // midpoint. Collapsing into that same endpoint (below) moves no
+                // geometry.
+                positions.push(real_positions[s]);
                 keys.push(members[s]);
             }
         }
@@ -1170,6 +1177,128 @@ mod tests {
             edge(mesh, right[y], right[y + 1]);
         }
         side_edges
+    }
+
+    /// §3.4a non-minimal fixture: `cols`-vertex opposing sides (so a genuine
+    /// interior vertex is created) joined by a left rail of `left_rows` vertices
+    /// opposing a right rail of `right_rows`. Returns the side edges (the input);
+    /// the two rails are left for discovery.
+    fn unequal_railed_interior_wire_ring(
+        mesh: &mut LoopMesh,
+        cols: usize,
+        left_rows: usize,
+        right_rows: usize,
+    ) -> Vec<EdgeKey> {
+        let width = (cols - 1) as f32;
+        let height = (left_rows.max(right_rows) - 1) as f32;
+        let bottom: Vec<VertexKey> = (0..cols)
+            .map(|x| mesh.create_vertex(Vec3::new(x as f32, 0.0, 0.0)))
+            .collect();
+        let top: Vec<VertexKey> = (0..cols)
+            .map(|x| mesh.create_vertex(Vec3::new(x as f32, height, 0.0)))
+            .collect();
+        let left: Vec<VertexKey> = (0..left_rows)
+            .map(|y| {
+                let fy = y as f32 * height / (left_rows - 1) as f32;
+                // The two corners coincide with the side endpoints; only the
+                // genuine interior rail vertices are fresh.
+                if y == 0 {
+                    bottom[0]
+                } else if y == left_rows - 1 {
+                    top[0]
+                } else {
+                    mesh.create_vertex(Vec3::new(0.0, fy, 0.0))
+                }
+            })
+            .collect();
+        let right: Vec<VertexKey> = (0..right_rows)
+            .map(|y| {
+                let fy = y as f32 * height / (right_rows - 1) as f32;
+                if y == 0 {
+                    bottom[cols - 1]
+                } else if y == right_rows - 1 {
+                    top[cols - 1]
+                } else {
+                    mesh.create_vertex(Vec3::new(width, fy, 0.0))
+                }
+            })
+            .collect();
+        let edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NO_DUPLICATE)
+        };
+        let mut side_edges = Vec::new();
+        for x in 0..cols - 1 {
+            side_edges.push(edge(mesh, bottom[x], bottom[x + 1]));
+            side_edges.push(edge(mesh, top[x], top[x + 1]));
+        }
+        for y in 0..left_rows - 1 {
+            edge(mesh, left[y], left[y + 1]);
+        }
+        for y in 0..right_rows - 1 {
+            edge(mesh, right[y], right[y + 1]);
+        }
+        side_edges
+    }
+
+    #[test]
+    fn interior_scaffold_sits_at_coincident_endpoint() {
+        // §3.4a worked check (surviving interior, 3-vertex sides, 2-vs-3 rails).
+        // The left rail's lone scaffold `grid[0][1]` is a parameter-0 split placed
+        // *coincident with* the origin corner `(0,0,0)`, not at the rail midpoint
+        // `(0,1,0)`. The surviving interior `grid[1][1]` therefore blends its four
+        // boundary neighbours over the coincident-endpoint profile:
+        //   simple  (all §6.1 weights ¼): ¼·((1,0,0)+(0,0,0)+(1,2,0)+(2,1,0))
+        //                                  = (1.0, 0.75, 0)
+        //   default (§5.3 transform):      (1.0, 0.5, 0)
+        // A midpoint (even-subdivision) scaffold at `(0,1,0)` would instead pull
+        // the interior to `y = 1.0` in either mode — the diagnosed §3.4a divergence.
+        // Topology is identical either way (3 quads + 1 triangle, one surviving
+        // interior vertex); only this position distinguishes the two.
+        let interior_pos = |use_interp_simple: bool| -> (Vec3, usize, usize) {
+            let mut mesh = LoopMesh::new();
+            let side_edges = unequal_railed_interior_wire_ring(&mut mesh, 3, 2, 3);
+            let v0 = mesh.vertex_count();
+            let result = mesh.grid_fill(
+                &side_edges,
+                &GridFillParams {
+                    use_interp_simple,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(mesh.vertex_count() - v0, 1, "one surviving interior vertex");
+            mesh.validate_topology();
+            let (quads, tris) = quad_tri_split(&mesh, &result);
+            // The newest vertex is the surviving interior one.
+            let mut last = None;
+            let mut it = mesh.mesh_verts();
+            while let Some(v) = it.next(&mesh) {
+                last = Some(v);
+            }
+            (mesh.vertex_position(last.unwrap()), quads, tris)
+        };
+
+        let (simple, q_s, t_s) = interior_pos(true);
+        assert_eq!((q_s, t_s), (3, 1), "3 quads + 1 triangle (simple)");
+        assert!(
+            (simple - Vec3::new(1.0, 0.75, 0.0)).length() < 1.0e-4,
+            "simple-mode interior at the coincident-endpoint blend (1, 0.75, 0), got {simple:?}",
+        );
+        // Must NOT be the midpoint-subdivision result (y = 1.0).
+        assert!(
+            (simple.y - 1.0).abs() > 0.2,
+            "simple-mode interior must not sit at the midpoint-scaffold y = 1.0, got {simple:?}",
+        );
+
+        let (default, q_d, t_d) = interior_pos(false);
+        assert_eq!((q_d, t_d), (3, 1), "3 quads + 1 triangle (default)");
+        assert!(
+            (default - Vec3::new(1.0, 0.5, 0.0)).length() < 1.0e-4,
+            "default-mode interior at the coincident-endpoint blend (1, 0.5, 0), got {default:?}",
+        );
+        assert!(
+            (default.y - 1.0).abs() > 0.2,
+            "default-mode interior must not sit at the midpoint-scaffold y = 1.0, got {default:?}",
+        );
     }
 
     /// Partition a fill result into (quad count, triangle count).
