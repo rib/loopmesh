@@ -1185,6 +1185,7 @@ impl LoopMesh {
                 crossing,
                 segments,
                 profile,
+                None,
                 result,
             );
             chains.push(EdgeEndChain {
@@ -1276,9 +1277,19 @@ impl LoopMesh {
 
         // The chain crosses E between the two strip verts (§8.3.0.1). face_left's
         // strip vert is the chain's `start`, face_right's its `end` — matching the
-        // strip builder's face_left-first ordering of E's radial faces.
-        let interior =
-            self.build_chain_between(strip_left, strip_right, edge, segments, profile, result);
+        // strip builder's face_left-first ordering of E's radial faces. This is a
+        // valence-≥3 terminal (guaranteed by the disk-count guard above), so the
+        // §8.2.2.1 terminal-far-end plane override applies: pass the terminal vertex.
+        let terminal_position = self.vertex_position(vertex);
+        let interior = self.build_chain_between(
+            strip_left,
+            strip_right,
+            edge,
+            segments,
+            profile,
+            Some(terminal_position),
+            result,
+        );
 
         // Each E-adjacent radial face collapses its corner to its one strip vert.
         for &(face, strip_vert) in &[(face_left, strip_left), (face_right, strip_right)] {
@@ -1343,6 +1354,7 @@ impl LoopMesh {
         edge: EdgeKey,
         segments: u32,
         profile: f32,
+        terminal_vertex: Option<Vec3>,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
         let start_position = self.vertex_position(start);
@@ -1351,7 +1363,15 @@ impl LoopMesh {
         let edge_point = self.vertex_position(ea);
         let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
 
-        let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
+        let mut cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
+        // §8.2.2.1 terminal-far-end override: at a valence-≥3 terminal the default
+        // `start–mid–end` mid-plane is tilted up out of the rim by `mid` (the on-edge
+        // foot, which sits partway up the beveled edge), lifting the samples off the
+        // surface. Snap the profile plane to the triangle through the terminal vertex
+        // and the two chain endpoints, flattening the cross-section into the rim plane.
+        if let Some(terminal) = terminal_vertex {
+            cell.snap_terminal_plane(terminal);
+        }
         let positions = cell.chain_positions(segments, profile);
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
@@ -1938,7 +1958,8 @@ impl LoopMesh {
             let crossing = plans[k].closing; // == plans[next].opening
             let start = arc_end[k];
             let end = arc_start[next];
-            let interior = self.build_chain_between(start, end, crossing, segments, profile, result);
+            let interior =
+                self.build_chain_between(start, end, crossing, segments, profile, None, result);
             // Invariant: a circular `segments = 2` cross-section always yields exactly
             // one interior sample. Reaching here with none would mean `build_chain_between`
             // returned no interior sample despite the `segments == 2` gate above — an
@@ -2265,8 +2286,8 @@ impl LoopMesh {
             match cross_edge[i] {
                 None => mids.push(bulge),
                 Some(edge) => {
-                    let interior =
-                        self.build_chain_between(start, end, edge, segments, profile, result);
+                    let interior = self
+                        .build_chain_between(start, end, edge, segments, profile, None, result);
                     // A circular `segments = 2` cross-section always yields exactly one
                     // interior sample; none here would be an internal-invariant
                     // violation, and we are already past the read-only classification
@@ -3524,11 +3545,15 @@ impl LoopMesh {
                 dot.abs() < 1.0 - MEET_PLANAR_TOLERANCE
             });
 
-        let (normal_first, normal_second) = if has_out_of_plane {
+        // Each base-point perpendicular is in the sector plane and perpendicular to
+        // its edge, oriented so the offset pushes *into* the sector. Cases 1/2 (one
+        // shared plane) and case 3 (two local planes) build them differently.
+        let (normal_first, normal_second, perp_first, perp_second) = if has_out_of_plane {
             // Case 3: two different local planes. Each line's normal is taken from
             // the corner at its own end of the sector — the cross of that flanking
             // beveled edge's direction with the nearest in-between leg's direction,
-            // oriented by the adjacent face.
+            // oriented by the adjacent face. The perpendicular is then oriented into
+            // the sector by the face centroid.
             let first_leg = between_edges
                 .first()
                 .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
@@ -3545,29 +3570,50 @@ impl LoopMesh {
                 }
                 None => self.face_plane_normal(face_last),
             };
-            (normal_first, normal_second)
+            let perp_first =
+                self.into_face_perpendicular(dir_first, normal_first, face_first, vertex_position);
+            let perp_second =
+                self.into_face_perpendicular(dir_second, normal_second, face_last, vertex_position);
+            (normal_first, normal_second, perp_first, perp_second)
         } else {
-            // Cases 1 and 2: one shared sector plane. The first flanking face's
-            // normal serves both perpendiculars (§7.6.2 case 1/2 are identical math).
-            let normal = self.face_plane_normal(face_first);
-            (normal, normal)
+            // Cases 1 and 2: one shared sector plane. Its normal is the cross product
+            // of the two flanking beveled-edge directions at `v` (the plane those
+            // edges span), *not* the shared face's own supporting normal. When the
+            // two coincide — a planar sector, or a degenerate (anti-)parallel flank
+            // whose cross vanishes — keep the prior face-normal + centroid
+            // construction (bit-identical). When they diverge — a non-planar
+            // single-face sector, e.g. a reflex apex whose wide face wraps a far
+            // vertex that tilts its area normal off the edge-span plane — the
+            // centroid is an unreliable "into the sector" reference (a reflex face's
+            // centroid sits on the convex complement of the sector), so orient both
+            // perpendiculars directly by the sign-fixed edge-span normal via the
+            // §7.6.2 right/left convention (`g_k`'s right side, `g_(k+1)`'s left).
+            let face_normal = self.face_plane_normal(face_first);
+            let edge_span = dir_first.cross(dir_second);
+            let edge_span_unit = edge_span.normalize_or_zero();
+            let planar = edge_span_unit == Vec3::ZERO
+                || edge_span_unit.dot(face_normal).abs() >= 1.0 - MEET_PLANAR_TOLERANCE;
+            if planar {
+                let perp_first = self.into_face_perpendicular(
+                    dir_first,
+                    face_normal,
+                    face_first,
+                    vertex_position,
+                );
+                let perp_second = self.into_face_perpendicular(
+                    dir_second,
+                    face_normal,
+                    face_last,
+                    vertex_position,
+                );
+                (face_normal, face_normal, perp_first, perp_second)
+            } else {
+                let normal = orient_normal(edge_span, face_normal);
+                let perp_first = normal.cross(dir_first).normalize_or_zero();
+                let perp_second = dir_second.cross(normal).normalize_or_zero();
+                (normal, normal, perp_first, perp_second)
+            }
         };
-
-        // Each base-point perpendicular is `cross(edge, sector normal)` — in the
-        // face plane and perpendicular to the edge — oriented toward the face
-        // interior so the offset pushes *into* the sector, not out of it.
-        let perp_first = self.into_face_perpendicular(
-            dir_first,
-            normal_first,
-            face_first,
-            vertex_position,
-        );
-        let perp_second = self.into_face_perpendicular(
-            dir_second,
-            normal_second,
-            face_last,
-            vertex_position,
-        );
 
         Some(SectorLayout {
             dir_first,
@@ -7375,6 +7421,102 @@ mod tests {
             result_has_vert_near(&mesh, &result, midpoint),
             0,
             "no vertex stays at the raw meet corner (the arc ends slid off it)",
+        );
+    }
+
+    /// BEVEL.md §7.6.2 case 1: the meet-point of a **non-planar single-face reflex
+    /// sector** is built from the **edge-span normal** (the cross of the two flanking
+    /// beveled-edge directions), sign-fixed by the face normal — not the reflex
+    /// face's own tilted area normal, which its far vertex `w` drags off the
+    /// edge-span plane and which would collapse the meet toward the rim. The two
+    /// planar narrow sectors are untouched by the choice (their edges lie in the
+    /// face, so edge-span and face normal coincide).
+    #[test]
+    fn reflex_sector_meet_uses_edge_span_normal() {
+        let offset = 0.2;
+        let (mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
+        let apex_position = mesh.vertex_position(apex);
+        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
+        let corners = mesh.vertex_corner_ring(apex);
+        let sectors = sector_split(&corners, &is_beveled);
+
+        let mut reflex_meet: Option<Vec3> = None;
+        let mut narrow_meets: Vec<Vec3> = Vec::new();
+        for sector in &sectors {
+            let meet = mesh.solve_meet_point(apex, apex_position, sector, offset);
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = sector.corners[0].1;
+            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
+            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let reflex = (-d_open).cross(-d_close).dot(mesh.face_plane_normal(face)) < 0.0;
+            if reflex {
+                reflex_meet = Some(meet);
+            } else {
+                narrow_meets.push(meet);
+            }
+        }
+
+        let reflex_meet = reflex_meet.expect("the fixture has exactly one reflex sector");
+        assert!(
+            (reflex_meet - Vec3::new(0.0, -0.24495, 1.24495)).length() < 1.0e-4,
+            "reflex meet uses the edge-span normal (got {reflex_meet:?})",
+        );
+        // The face-normal (buggy) value sits ~0.3 unit short along the edge.
+        assert!(
+            (reflex_meet - Vec3::new(0.0, -0.21381, 0.94655)).length() > 0.2,
+            "reflex meet is not the collapsed face-normal placement",
+        );
+        assert_eq!(narrow_meets.len(), 2, "two planar narrow sectors");
+        for meet in narrow_meets {
+            assert!(
+                (meet.y - 0.46937).abs() < 1.0e-4 && (meet.z - 0.60908).abs() < 1.0e-4,
+                "planar narrow-sector meets are unchanged by the edge-span choice (got {meet:?})",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.9.2: with the §7.6.2 meet-point corrected, the outer-miter arc-end
+    /// boundvert lands at the live oracle position `(0.515, 0.270, 0.730)` — the
+    /// reposition slides the arc start back along its apex edge until level with the
+    /// preceding narrow-sector boundvert.
+    #[test]
+    fn reflex_outer_miter_arc_end_lands_at_oracle() {
+        let (mesh, result) = reflex_apex_outer_miter(BevelMiter::Arc);
+        mesh.validate_topology();
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.515, 0.27005, 0.72995)),
+            1,
+            "the arc-end boundvert sits at the corrected §8.9.2 oracle position",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1 / §8.3.0.1: at a valence-≥3 terminal the profile plane is
+    /// snapped to the triangle through the terminal vertex and the two chain
+    /// endpoints, flattening the far-end cross-section into the terminal's rim plane
+    /// (`z = 0` here) instead of bulging up along the tilted apex edge. The un-snapped
+    /// `start–mid–end` mid-plane lifts the interior sample `~0.035` off the rim.
+    #[test]
+    fn terminal_far_end_snaps_to_rim_plane() {
+        let (mesh, result) = reflex_apex_outer_miter(BevelMiter::Sharp);
+        mesh.validate_topology();
+
+        // The two worked-check far-end interior samples land flat on the rim (z = 0).
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.90964, 0.94068, 0.0)),
+            1,
+            "the c-terminal far-end sample is snapped flat into the rim plane",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.0, 1.35435, 0.0)),
+            1,
+            "the b-terminal far-end sample is snapped flat into the rim plane",
+        );
+        // The un-snapped mid-plane value (lifted off the rim) must not appear.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.87436, 0.90540, 0.03528)),
+            0,
+            "the tilted default mid-plane sample is not produced",
         );
     }
 
@@ -11613,6 +11755,12 @@ const MEET_ANGLE_TOLERANCE: f32 = 1.0e-4;
 /// flanking face normals differ from ±1 by more than this.
 const MEET_PLANAR_TOLERANCE: f32 = 1.0e-4;
 
+/// Degeneracy floor for the §8.2.2.1 terminal-far-end plane override: below this the
+/// `terminal–start–end` triangle is treated as collinear (no well-formed normal) or
+/// its normal as parallel to the edge (degenerate projection), so the default
+/// mid-plane is kept instead of snapping.
+const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
+
 /// Length tolerance below which the two closest points of two lines are treated as
 /// the same point (a crossing) rather than skew (§7.6.2).
 const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
@@ -11782,6 +11930,32 @@ impl ProfileCell {
             edge_dir,
             collinear,
         }
+    }
+
+    /// §8.2.2.1 terminal-far-end plane override: replace the default `start–mid–end`
+    /// mid-plane normal with the normal of the triangle through the terminal vertex
+    /// and the two chain endpoints, so the projection lands the far-end cross-section
+    /// flat in the terminal's rim plane instead of bulging up along the tilted edge.
+    /// Applied only when the triangle is well-formed (`terminal`, `start`, `end` not
+    /// collinear) and the resulting normal is not parallel to the projection edge
+    /// direction (which would make the projection degenerate); otherwise the default
+    /// mid-plane stands. The plane's sign is irrelevant — it defines a plane, not a
+    /// half-space — so no orientation is needed.
+    fn snap_terminal_plane(&mut self, terminal: Vec3) {
+        let to_start = (terminal - self.start).normalize_or_zero();
+        let to_end = (terminal - self.end).normalize_or_zero();
+        let candidate = to_start.cross(to_end);
+        let length = candidate.length();
+        if length <= TERMINAL_PLANE_TOLERANCE {
+            return;
+        }
+        let candidate = candidate / length;
+        if self.edge_dir.length_squared() > f32::EPSILON
+            && candidate.dot(self.edge_dir).abs() >= 1.0 - TERMINAL_PLANE_TOLERANCE
+        {
+            return;
+        }
+        self.mid_plane_normal = candidate;
     }
 
     /// Map a cell coordinate `(u, v)` into 3-D (BEVEL.md §8.2.2.1):
