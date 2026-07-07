@@ -1906,13 +1906,16 @@ impl LoopMesh {
             let start = arc_end[k];
             let end = arc_start[next];
             let interior = self.build_chain_between(start, end, crossing, segments, profile, result);
-            // A circular segments=2 cross-section has exactly one interior sample; a
-            // degenerate (collinear) chain that sampled none is outside the fillable
-            // regime, so decline the whole junction rather than panic (matching the
-            // sibling `build_adj_fill`'s graceful skip).
-            let Some(&sample) = interior.first() else {
-                return false;
-            };
+            // Invariant: a circular `segments = 2` cross-section always yields exactly
+            // one interior sample. Reaching here with none would mean `build_chain_between`
+            // returned no interior sample despite the `segments == 2` gate above — an
+            // internal-invariant violation, not an expected failure. We are already past
+            // the read-only classification pass (arc verts and face substitutions are
+            // minted), so a graceful decline here is impossible without orphaning geometry:
+            // the only correct return-false paths live in the classification pass above.
+            let sample = *interior
+                .first()
+                .expect("segments=2 cross-section must have exactly one interior sample");
             cross.push(sample);
             chains.push(EdgeEndChain {
                 edge: crossing,
