@@ -509,15 +509,18 @@ impl LoopMesh {
 
                 let vertex = self.create_vertex(position);
 
-                // Interior vertex attributes blend the four boundary verts in
-                // the cell's row and column (§5).
+                // Interior vertex custom-data always blends the four boundary
+                // verts by the §6.1 reciprocal-distance partition of unity —
+                // the same weights simple-mode position uses, and unconditional
+                // of `use_interp_simple` (§5.3). The linear side-weighting would
+                // only agree at a centered interior vertex.
                 if !self.vertex_attribs.is_empty() {
-                    let half = 0.5_f32;
+                    let [w_bottom, w_left, w_top, w_right] = grid_recip_weights(u, v);
                     let sources = [
-                        (half * (1.0 - v), grid.get(x, 0).as_usize()),
-                        (half * v, grid.get(x, rows - 1).as_usize()),
-                        (half * (1.0 - u), grid.get(0, y).as_usize()),
-                        (half * u, grid.get(cols - 1, y).as_usize()),
+                        (w_bottom, grid.get(x, 0).as_usize()),
+                        (w_left, grid.get(0, y).as_usize()),
+                        (w_top, grid.get(x, rows - 1).as_usize()),
+                        (w_right, grid.get(cols - 1, y).as_usize()),
                     ];
                     self.vertex_attribs
                         .interpolate_into(vertex.as_usize(), &sources);
@@ -579,17 +582,24 @@ fn grid_rails_overlap(rail_left: &[VertexKey], rail_right: &[VertexKey]) -> bool
     rail_right.iter().any(|v| left.contains(v))
 }
 
-/// §6.1 — the reciprocal-distance convex blend. Each of the four boundary
-/// sides gets an unnormalised weight equal to the reciprocal of the lattice
-/// distance to it; normalising by their sum yields a partition of unity, so the
-/// interior vertex is a true convex combination of the four boundary points.
-fn grid_simple_blend(u: f32, v: f32, bottom: Vec3, left: Vec3, top: Vec3, right: Vec3) -> Vec3 {
+/// §6.1 — the four reciprocal-distance weights `[bottom, left, top, right]`,
+/// normalised to a partition of unity. Each side's unnormalised weight is the
+/// reciprocal of the lattice distance to it, so the blend tracks the nearest
+/// boundary. Drives both the simple-mode interior position and — unconditional
+/// of `use_interp_simple` — the interior vertex-CD blend (§5.3).
+fn grid_recip_weights(u: f32, v: f32) -> [f32; 4] {
     let w_bottom = 1.0 / v;
     let w_left = 1.0 / u;
     let w_top = 1.0 / (1.0 - v);
     let w_right = 1.0 / (1.0 - u);
     let sum = w_bottom + w_left + w_top + w_right;
-    (w_bottom * bottom + w_left * left + w_top * top + w_right * right) / sum
+    [w_bottom / sum, w_left / sum, w_top / sum, w_right / sum]
+}
+
+/// §6.1 — the reciprocal-distance convex blend of the four boundary verts.
+fn grid_simple_blend(u: f32, v: f32, bottom: Vec3, left: Vec3, top: Vec3, right: Vec3) -> Vec3 {
+    let [w_bottom, w_left, w_top, w_right] = grid_recip_weights(u, v);
+    w_bottom * bottom + w_left * left + w_top * top + w_right * right
 }
 
 /// §5.1 — the row frame: a triangle `[L, R, apex]` whose base is the row's
@@ -920,6 +930,81 @@ mod tests {
             p.z,
         );
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn interior_vertex_cd_uses_reciprocal_weights_offcenter() {
+        // §5.3/§6.1: interior vertex custom-data blends the four boundary verts
+        // by the reciprocal-distance partition of unity, *unconditional* of
+        // `use_interp_simple`. On a 4x3 frame the interior vert grid[1][1] sits
+        // off-center at u = 1/3, v = 1/2, where the reciprocal bottom weight is
+        // 2/8.5 ≈ 0.2353 — distinct from the linear side-weighting's 0.25. A
+        // centered 3x3 interior vert (u = v = 1/2) cannot discriminate the two.
+        let recip_bottom = 2.0_f32 / 8.5; // ≈ 0.23529
+        let linear_bottom = 0.25_f32;
+
+        // Run in both modes: vertex-CD must not be gated by `use_interp_simple`.
+        for use_interp_simple in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let side_edges = rect_wire_ring(&mut mesh, 4, 3, 0.0);
+
+            let cd = mesh
+                .register_vertex_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("weightprobe"),
+                    AttrType::F32,
+                ))
+                .unwrap();
+            // Isolate the bottom source of grid[1][1]: only the boundary vert at
+            // (1, 0) carries 1.0; every other boundary vert carries 0.0. The
+            // interior blend then reads back exactly that vertex's normalised
+            // weight.
+            let mut it = mesh.mesh_verts();
+            while let Some(v) = it.next(&mesh) {
+                let p = mesh.vertex_position(v);
+                let value = if (p.x - 1.0).abs() < 1.0e-3 && p.y.abs() < 1.0e-3 {
+                    1.0
+                } else {
+                    0.0
+                };
+                mesh.vertex_attribs_mut().set_f32(cd, v.as_usize(), value);
+            }
+
+            mesh.grid_fill(
+                &side_edges,
+                &GridFillParams {
+                    use_interp_simple,
+                    ..Default::default()
+                },
+            );
+
+            // grid[1][1] lands over its own column at (1, 1, 0) in both modes on
+            // this flat frame.
+            let mut interior = None;
+            let mut it = mesh.mesh_verts();
+            while let Some(v) = it.next(&mesh) {
+                let p = mesh.vertex_position(v);
+                if (p.x - 1.0).abs() < 1.0e-3 && (p.y - 1.0).abs() < 1.0e-3 {
+                    assert!(interior.is_none(), "one interior vert near (1, 1)");
+                    interior = Some(v);
+                }
+            }
+            let interior = interior.expect("interior vert grid[1][1]");
+            let blended = mesh
+                .vertex_attribs()
+                .get_f32(cd, interior.as_usize())
+                .expect("probe layer present on interior vert");
+
+            assert!(
+                (blended - recip_bottom).abs() < 1.0e-4,
+                "interior vertex-CD is the reciprocal bottom weight {recip_bottom} \
+                 (simple={use_interp_simple}), got {blended}",
+            );
+            assert!(
+                (blended - linear_bottom).abs() > 1.0e-2,
+                "interior vertex-CD must NOT be the linear side-weight {linear_bottom} \
+                 (simple={use_interp_simple}), got {blended}",
+            );
+        }
     }
 
     #[test]
