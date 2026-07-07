@@ -31,8 +31,7 @@ pub struct RegionExtendOptions {
 #[derive(Default)]
 struct Marks {
     orig: HashSet<GeomKey>,
-    ring_set: HashSet<GeomKey>,
-    ring: Vec<GeomKey>,
+    ring: HashSet<GeomKey>,
 }
 
 impl Marks {
@@ -43,14 +42,14 @@ impl Marks {
         self.orig.contains(&g)
     }
     fn is_ring(&self, g: GeomKey) -> bool {
-        self.ring_set.contains(&g)
+        self.ring.contains(&g)
     }
-    /// Mark `g` RING; the harvest order tracks first-insertion so a single
-    /// element is reported once even if reached via several incidences.
+    /// Mark `g` RING. The set already dedups an element reached via several
+    /// incidences, so the harvest reports it once; the parity compare is an
+    /// order-independent position-keyed multiset (REGION_EXTEND.md §7), so no
+    /// insertion-order bookkeeping is needed.
     fn set_ring(&mut self, g: GeomKey) {
-        if self.ring_set.insert(g) {
-            self.ring.push(g);
-        }
+        self.ring.insert(g);
     }
 }
 
@@ -114,7 +113,24 @@ impl LoopMesh {
             }
         }
 
-        marks.ring
+        marks.ring.into_iter().collect()
+    }
+
+    /// Allocation-free walk of the faces incident to `v` — the disk→radial
+    /// composition of BMesh's `BM_FACES_OF_VERT`. A face touched by several of
+    /// `v`'s disk edges is yielded once per incidence (no dedup); every
+    /// region-extend caller either dedups through the RING guard or only asks
+    /// `any`, so the repeats are harmless and save a per-corner heap `Vec`.
+    fn vert_incident_faces(&self, v: VertexKey) -> impl Iterator<Item = FaceKey> + '_ {
+        self.vertex_disk_iter(v)
+            .flat_map(move |e| self.edge_radial_iter(e).map(move |l| self.loop_face(l)))
+    }
+
+    /// Allocation-free walk of the faces in `e`'s radial cycle (one per loop,
+    /// repeating a face incident twice on a non-manifold edge) — the
+    /// non-collecting form of `edge_face_keys`.
+    fn edge_incident_faces(&self, e: EdgeKey) -> impl Iterator<Item = FaceKey> + '_ {
+        self.edge_radial_iter(e).map(move |l| self.loop_face(l))
     }
 
     /// REGION_EXTEND.md §2.3 — a candidate neighbour on the **grow** path is
@@ -174,7 +190,7 @@ impl LoopMesh {
         if !on_frontier {
             return;
         }
-        for f in self.vert_face_keys(v) {
+        for f in self.vert_incident_faces(v) {
             if marks.is_ring(GeomKey::Face(f)) || self.face_hidden(f) {
                 continue;
             }
@@ -203,12 +219,12 @@ impl LoopMesh {
         for l in self.face_loop_iter(start) {
             if use_face_step {
                 let corner_vert = self.loop_vertex(l);
-                for nf in self.vert_face_keys(corner_vert) {
+                for nf in self.vert_incident_faces(corner_vert) {
                     self.try_ring_grow_face(nf, marks);
                 }
             } else {
                 let corner_edge = self.loop_edge(l);
-                for nf in self.edge_face_keys(corner_edge) {
+                for nf in self.edge_incident_faces(corner_edge) {
                     self.try_ring_grow_face(nf, marks);
                 }
             }
@@ -231,8 +247,7 @@ impl LoopMesh {
     fn shrink_vert(&self, v: VertexKey, use_face_step: bool, marks: &mut Marks) {
         let on_boundary = if use_face_step {
             let face_out = self
-                .vert_face_keys(v)
-                .into_iter()
+                .vert_incident_faces(v)
                 .any(|f| !marks.is_orig(GeomKey::Face(f)));
             let wire_out = self
                 .vertex_disk_iter(v)
@@ -261,13 +276,11 @@ impl LoopMesh {
         for l in self.face_loop_iter(start) {
             let has_outside = if use_face_step {
                 let corner_vert = self.loop_vertex(l);
-                self.vert_face_keys(corner_vert)
-                    .into_iter()
+                self.vert_incident_faces(corner_vert)
                     .any(|nf| !marks.is_orig(GeomKey::Face(nf)))
             } else {
                 let corner_edge = self.loop_edge(l);
-                self.edge_face_keys(corner_edge)
-                    .into_iter()
+                self.edge_incident_faces(corner_edge)
                     .any(|nf| !marks.is_orig(GeomKey::Face(nf)))
             };
             if has_outside {
