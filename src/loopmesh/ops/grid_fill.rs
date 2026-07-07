@@ -135,6 +135,57 @@ impl LoopMesh {
             },
         };
 
+        // §3.4 — the lattice must be rectangular, so the two opposing sides are
+        // reconciled to a common `cols` and the two rails to a common `rows`.
+        // Equal members need no work; a shorter member is *expanded* with
+        // temporary scaffold vertices (not rejected), and the scaffold collapses
+        // back out after the build — degenerating the corner-losing cells into
+        // triangles. When neither pair mismatches the expansion is the identity
+        // and no collapse occurs, so the whole equalisation apparatus (the origin
+        // anchor and the four member expansions) is inert and skipped — both
+        // exist only to make the §3.4 collapse reproducible.
+        let cols_mismatch = loop_a.len() != loop_b.len();
+        let rows_mismatch = rail_left.len() != rail_right.len();
+
+        let cols = loop_a.len().max(loop_b.len());
+        let rows = rail_left.len().max(rail_right.len());
+        if cols < 2 || rows < 2 {
+            return empty;
+        }
+
+        // §3.3 — overlapping rails cannot bound a clean rectangle. The membership
+        // test is orientation-independent, so it reads the same whether or not the
+        // origin anchor below has re-oriented the rails.
+        if grid_rails_overlap(&rail_left, &rail_right) {
+            return empty;
+        }
+
+        if !(cols_mismatch || rows_mismatch) {
+            // Equal-side path: every member already carries the full lattice
+            // count, so expansion is the identity. Read each member's positions
+            // for the §5/§6 interior solver, but hand the perimeter write the
+            // member key slices directly — no scaffold, no collapse, and no
+            // redundant per-member key clone.
+            let bottom_pos: Vec<Vec3> = loop_a.iter().map(|&v| self.vertex_position(v)).collect();
+            let top_pos: Vec<Vec3> = loop_b.iter().map(|&v| self.vertex_position(v)).collect();
+            let left_pos: Vec<Vec3> = rail_left.iter().map(|&v| self.vertex_position(v)).collect();
+            let right_pos: Vec<Vec3> =
+                rail_right.iter().map(|&v| self.vertex_position(v)).collect();
+            return self.grid_assemble(
+                cols,
+                rows,
+                &bottom_pos,
+                &top_pos,
+                &left_pos,
+                &right_pos,
+                &loop_a,
+                &loop_b,
+                &rail_left,
+                &rail_right,
+                params,
+            );
+        }
+
         // §3.4 — anchor the lattice origin deterministically. §3.3 leaves two
         // free flips (which side is A vs B, which endpoint each loop's discovery
         // walk labels "first"); both are arbitrary walk-order artifacts, so the
@@ -172,23 +223,6 @@ impl LoopMesh {
             // else origin == c00: identity, the lattice already starts at it.
         }
 
-        // §3.4 — the lattice must be rectangular, so the two opposing sides are
-        // reconciled to a common `cols` and the two rails to a common `rows`.
-        // Equal members need no work; a shorter member is *expanded* with
-        // temporary scaffold vertices (not rejected), and the scaffold collapses
-        // back out after the quads are built — degenerating the corner-losing
-        // cells into triangles.
-        let cols = loop_a.len().max(loop_b.len());
-        let rows = rail_left.len().max(rail_right.len());
-        if cols < 2 || rows < 2 {
-            return empty;
-        }
-
-        // §3.3 — overlapping rails cannot bound a clean rectangle.
-        if grid_rails_overlap(&rail_left, &rail_right) {
-            return empty;
-        }
-
         // §3.4 Phase 1+2 — expand each boundary member to the full lattice count.
         // `*_pos` carry the genuine (scaffold-subdivided) boundary positions that
         // feed the §5/§6 interior interpolation; `*_key` carry the per-slot
@@ -198,7 +232,42 @@ impl LoopMesh {
         let (top_pos, top_key) = self.grid_expand_member(&loop_b, cols);
         let (left_pos, left_key) = self.grid_expand_member(&rail_left, rows);
         let (right_pos, right_key) = self.grid_expand_member(&rail_right, rows);
+        self.grid_assemble(
+            cols,
+            rows,
+            &bottom_pos,
+            &top_pos,
+            &left_pos,
+            &right_pos,
+            &bottom_key,
+            &top_key,
+            &left_key,
+            &right_key,
+            params,
+        )
+    }
 
+    /// §4.1/§4.2/§7 — assemble a populated `cols × rows` lattice into faces,
+    /// shared by the equal-side path (identity expansion, borrowed member key
+    /// slices) and the span-equalised path (scaffold-expanded owned key vecs).
+    /// The perimeter comes from the `*_key` slots; the `*_pos` profiles drive the
+    /// §5/§6 interior interpolation. Behaviour is identical for both callers — the
+    /// only difference is whether the key slots were cloned/expanded or borrowed.
+    #[allow(clippy::too_many_arguments)]
+    fn grid_assemble(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        bottom_pos: &[Vec3],
+        top_pos: &[Vec3],
+        left_pos: &[Vec3],
+        right_pos: &[Vec3],
+        bottom_key: &[VertexKey],
+        top_key: &[VertexKey],
+        left_key: &[VertexKey],
+        right_key: &[VertexKey],
+        params: &GridFillParams,
+    ) -> GridFillResult {
         // §4.1 — write the perimeter into the lattice. The four corners are
         // written by more than one side; §3.3 pinned them to the same vertices,
         // and slot 0 / slot max are always real (never scaffold), so the corners
@@ -214,13 +283,13 @@ impl LoopMesh {
         }
 
         // §5/§6 — create the genuine interior vertices by interpolation over the
-        // expanded boundary profiles.
+        // (possibly expanded) boundary profiles.
         self.grid_build_interior(
             &mut grid,
-            &bottom_pos,
-            &top_pos,
-            &left_pos,
-            &right_pos,
+            bottom_pos,
+            top_pos,
+            left_pos,
+            right_pos,
             params.use_interp_simple,
         );
 
