@@ -1003,16 +1003,16 @@ impl LoopMesh {
                         &mut miter_junctions,
                         result,
                     );
-                // §8.9.2: the outer miter rounds the one reflex sector of an `s ≥ 3`
+                // §8.9.2: the outer miter reshapes the one reflex sector of an `s ≥ 3`
                 // junction. Like the inner miter it classifies read-only and declines
                 // (without mutating) any junction that is not a single-face reflex
                 // sector past the firing margin, falling back to the sharp ring below.
-                // Only `Arc` engages here: `Patch` is the distinct two-boundvert flat
-                // quad strip (§8.9.2) that is not yet implemented, so it declines to
-                // the sharp ring exactly as `Sharp` does rather than being mis-served
-                // as an arc.
+                // `Arc` and `Patch` engage here (`Sharp` never does): they add `+1` /
+                // `+2` reflex-ring boundverts respectively (§8.9.6). The dispatch gates
+                // strictly on the enum value so `Patch` never silently serves the arc
+                // round-over and vice versa.
                 let outer_miter = !inner_miter
-                    && options.miter_outer == BevelMiter::Arc
+                    && matches!(options.miter_outer, BevelMiter::Arc | BevelMiter::Patch)
                     && options.vmesh_method == BevelVmeshMethod::Adj
                     && self.build_junction_outer_miter(
                         endpoint,
@@ -1020,6 +1020,7 @@ impl LoopMesh {
                         offset,
                         segments,
                         profile,
+                        options.miter_outer,
                         &mut chains,
                         &mut face_subst,
                         &mut outer_miter_junctions,
@@ -2117,6 +2118,7 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        mode: BevelMiter,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         outer_miter_junctions: &mut Vec<OuterMiterJunction>,
@@ -2215,19 +2217,52 @@ impl LoopMesh {
         let b1_position = midpoint + (predecessor - midpoint).dot(dir_open) * dir_open;
         let b3_position = midpoint + (successor - midpoint).dot(dir_close) * dir_close;
 
-        // §8.9.5: the stored meet-point is the circumscribing-square corner; the single
-        // `segments = 2` interior sample is the inscribed arc's 45° point, pulled in a
-        // fraction `√2 − 1` from the chord midpoint toward that corner.
-        let sqrt2 = std::f32::consts::SQRT_2;
-        let chord_mid = 0.5 * (b1_position + b3_position);
-        let bulge_position = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
-
         let b1 = self.create_vertex(b1_position);
         let b3 = self.create_vertex(b3_position);
-        let bulge = self.create_vertex(bulge_position);
         result.verts.push(b1);
         result.verts.push(b3);
-        result.verts.push(bulge);
+
+        // The reflex sector's interior ring differs by mode (§8.9.2 / §8.9.6):
+        //   - `Arc` adds no interior ring boundvert; the single `B1 → B3` internal edge
+        //     carries a circular bulge sample pulled in `√2 − 1` from the chord midpoint
+        //     toward the stored meet corner (§8.9.5).
+        //   - `Patch` promotes the retained meet corner to the middle boundvert `B2`, so
+        //     the ring gains `B1 → B2 → B3`; the two internal edges carry flat chord
+        //     samples at their straight segment midpoints — no corner-ward bulge, so the
+        //     tent apex `B2` stays at the meet while its two ends slid back (§8.9.5).
+        // `reflex_ring` is the sector's ordered ring boundverts; `internal_mids` holds
+        // one mid sample per internal (`None` cross-edge) edge between them; `forward_run`
+        // is the reflex face's rebuilt boundary threading `B1 … B3` in sector order.
+        let (reflex_ring, internal_mids, forward_run): (
+            Vec<VertexKey>,
+            Vec<VertexKey>,
+            Vec<VertexKey>,
+        ) = match mode {
+            BevelMiter::Arc => {
+                let sqrt2 = std::f32::consts::SQRT_2;
+                let chord_mid = 0.5 * (b1_position + b3_position);
+                let bulge_position = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
+                let bulge = self.create_vertex(bulge_position);
+                result.verts.push(bulge);
+                (vec![b1, b3], vec![bulge], vec![b1, bulge, b3])
+            }
+            BevelMiter::Patch => {
+                let b2 = self.create_vertex(midpoint);
+                let mid12 = self.create_vertex(0.5 * (b1_position + midpoint));
+                let mid23 = self.create_vertex(0.5 * (midpoint + b3_position));
+                result.verts.push(b2);
+                result.verts.push(mid12);
+                result.verts.push(mid23);
+                (
+                    vec![b1, b2, b3],
+                    vec![mid12, mid23],
+                    vec![b1, mid12, b2, mid23, b3],
+                )
+            }
+            BevelMiter::Sharp => {
+                unreachable!("the outer-miter dispatch calls this only for Arc / Patch (§8.9.2)")
+            }
+        };
 
         // The non-reflex sectors keep their single sharp meet-point boundvert.
         let mut sharp: Vec<Option<VertexKey>> = vec![None; sector_count];
@@ -2253,8 +2288,12 @@ impl LoopMesh {
             }
         }
         let run = match self.face_corner_edges(reflex_face, vertex) {
-            Some((incoming, _)) if incoming == sectors[r].bounding_edges[0] => vec![b1, bulge, b3],
-            _ => vec![b3, bulge, b1],
+            Some((incoming, _)) if incoming == sectors[r].bounding_edges[0] => forward_run.clone(),
+            _ => {
+                let mut reversed = forward_run.clone();
+                reversed.reverse();
+                reversed
+            }
         };
         set_face_substitution(face_subst, vertex, reflex_face, run);
 
@@ -2266,10 +2305,14 @@ impl LoopMesh {
         for k in 0..sector_count {
             let next_opening = sectors[(k + 1) % sector_count].bounding_edges[0];
             if k == r {
-                ring.push(b1);
-                cross_edge.push(None);
-                ring.push(b3);
-                cross_edge.push(Some(next_opening));
+                for (j, &ring_vert) in reflex_ring.iter().enumerate() {
+                    ring.push(ring_vert);
+                    if j + 1 < reflex_ring.len() {
+                        cross_edge.push(None);
+                    } else {
+                        cross_edge.push(Some(next_opening));
+                    }
+                }
             } else {
                 ring.push(sharp[k].expect("non-reflex sector has a sharp boundvert"));
                 cross_edge.push(Some(next_opening));
@@ -2279,12 +2322,18 @@ impl LoopMesh {
         // The mid-chain sample on each ring edge: the strip cross-section across the
         // shared beveled edge (a `segments = 2` circular arc sample), or the arc bulge
         // between `B1` and `B3`.
+        let mut internal_mids = internal_mids.into_iter();
         let mut mids: Vec<VertexKey> = Vec::with_capacity(ring.len());
         for i in 0..ring.len() {
             let start = ring[i];
             let end = ring[(i + 1) % ring.len()];
             match cross_edge[i] {
-                None => mids.push(bulge),
+                None => {
+                    let mid = internal_mids
+                        .next()
+                        .expect("every internal reflex edge has a precreated mid sample");
+                    mids.push(mid);
+                }
                 Some(edge) => {
                     let interior = self
                         .build_chain_between(start, end, edge, segments, profile, None, result);
@@ -7290,38 +7339,135 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.9.2: outer `Patch` is the distinct two-boundvert flat quad strip, a
-    /// separate construction from the `Arc` round-over — it is deliberately deferred to a
-    /// later cycle. Until it lands, `miter_outer = Patch` must **decline to the sharp
-    /// ring** (never be silently mis-served as an arc): its mesh is identical to
-    /// `miter_outer = Sharp` and distinct from `miter_outer = Arc`.
+    /// BEVEL.md §8.9.2 / §8.9.6: outer `Patch` is the distinct **flat two-segment strip**
+    /// at the reflex sector — it promotes the meet corner to the middle boundvert `B2`,
+    /// giving the ring `B1 → B2 → B3` (`+2` boundverts vs the sharp baseline, one more
+    /// than `Arc`'s `+1`). So `Patch` is neither the sharp ring nor the arc round-over:
+    /// it carries strictly more geometry than both, stays a valid closed manifold, and
+    /// its result is distinct from each.
     #[test]
-    fn outer_miter_patch_declines_to_sharp() {
+    fn outer_miter_patch_builds_flat_strip() {
         let (patch_mesh, _patch) = reflex_apex_outer_miter(BevelMiter::Patch);
         patch_mesh.validate_topology();
         let (sharp_mesh, _sharp) = reflex_apex_outer_miter(BevelMiter::Sharp);
         let (arc_mesh, _arc) = reflex_apex_outer_miter(BevelMiter::Arc);
 
-        const TOL: f32 = 1.0e-5;
-        // §8.9.2: Patch declines — identical to Sharp up to relabelling.
-        assert!(
-            positions_multiset_eq(&patch_mesh, &sharp_mesh, TOL),
-            "outer Patch declines to the sharp ring: identical vertex positions (§8.9.2)",
-        );
-        assert!(
-            faces_match(&patch_mesh, &sharp_mesh, TOL),
-            "outer Patch declines to the sharp ring: identical face structure (§8.9.2)",
-        );
+        // The closed miter stays a manifold: χ = 2.
+        let (pv, pe, pf) = counts(&patch_mesh);
         assert_eq!(
+            pv as i64 - pe as i64 + pf as i64,
+            2,
+            "the outer Patch miter closes to a χ = 2 manifold (§8.9.2)",
+        );
+
+        // §8.9.6: Patch is a distinct construction from both the sharp ring and the arc.
+        assert_ne!(
             counts(&patch_mesh),
             counts(&sharp_mesh),
-            "outer Patch declines to the sharp ring: identical element counts (§8.9.2)",
+            "outer Patch is not the sharp ring: it adds the flat B1→B2→B3 strip (§8.9.2)",
         );
-        // And is therefore not the Arc round-over, which reshapes the junction.
         assert_ne!(
             counts(&patch_mesh),
             counts(&arc_mesh),
             "outer Patch is not mis-served as the Arc round-over (§8.9.2)",
+        );
+
+        // §8.9.6: Patch adds `+2` reflex-ring boundverts, Arc `+1`, so Patch carries the
+        // most geometry of the three at the reflex junction.
+        assert!(
+            patch_mesh.vertex_count() > arc_mesh.vertex_count()
+                && arc_mesh.vertex_count() > sharp_mesh.vertex_count(),
+            "outer Patch (+2) > Arc (+1) > Sharp (+0) in reflex-ring boundverts (§8.9.6)",
+        );
+        assert!(
+            patch_mesh.face_count() > arc_mesh.face_count()
+                && arc_mesh.face_count() > sharp_mesh.face_count(),
+            "the enlarged Patch ring tiles into more cap faces than Arc or Sharp (§8.9.6)",
+        );
+    }
+
+    /// BEVEL.md §8.9.2 / §8.9.5: the worked single-face `PATCH`. `B1` / `B3` land at the
+    /// **same** repositioned arc-ends the `Arc` path produces (the neighbour-plane
+    /// reposition is mode-independent), the middle boundvert `B2` stays at the retained
+    /// §7.6.2 meet corner (the unmoved tent apex), and the two flat chord samples sit at
+    /// the straight segment midpoints `½(B1+B2)` / `½(B2+B3)` — with **no** corner-ward
+    /// pull. In particular the arc's pulled-in bulge sample does **not** appear.
+    #[test]
+    fn outer_miter_patch_flat_chord_placement() {
+        let offset = 0.2;
+        let (mut mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
+        let apex_position = mesh.vertex_position(apex);
+        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
+
+        // Replicate the §8.9.1 classification / §8.9.2 reposition (mode-independent).
+        let corners = mesh.vertex_corner_ring(apex);
+        let sectors = sector_split(&corners, &is_beveled);
+        let sector_count = sectors.len();
+        let mut meets: Vec<Vec3> = Vec::new();
+        let mut dir_open: Vec<Vec3> = Vec::new();
+        let mut dir_close: Vec<Vec3> = Vec::new();
+        let mut reflex: Vec<bool> = Vec::new();
+        for sector in &sectors {
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = sector.corners[0].1;
+            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
+            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let cross = (-d_open).cross(-d_close);
+            reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
+            meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
+            dir_open.push(d_open);
+            dir_close.push(d_close);
+        }
+        let r = reflex.iter().position(|&x| x).unwrap();
+        let midpoint = meets[r];
+        let predecessor = meets[(r + sector_count - 1) % sector_count];
+        let successor = meets[(r + 1) % sector_count];
+        let d_open = dir_open[r];
+        let d_close = dir_close[r];
+        let b1 = midpoint + (predecessor - midpoint).dot(d_open) * d_open;
+        let b3 = midpoint + (successor - midpoint).dot(d_close) * d_close;
+        let mid12 = 0.5 * (b1 + midpoint);
+        let mid23 = 0.5 * (midpoint + b3);
+
+        // The pulled-in arc bulge sample the `Arc` path would emit — Patch must not.
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let arc_bulge = (2.0 - sqrt2) * (0.5 * (b1 + b3)) + (sqrt2 - 1.0) * midpoint;
+
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Patch,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result_has_vert_near(&mesh, &result, b1), 1, "B1 end is minted");
+        assert_eq!(result_has_vert_near(&mesh, &result, b3), 1, "B3 end is minted");
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, midpoint),
+            1,
+            "B2 stays at the retained §7.6.2 meet corner (the unmoved tent apex)",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, mid12),
+            1,
+            "the B1→B2 chord sample sits at its straight segment midpoint (§8.9.5)",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, mid23),
+            1,
+            "the B2→B3 chord sample sits at its straight segment midpoint (§8.9.5)",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, arc_bulge),
+            0,
+            "no vertex sits at the arc's pulled-in bulge — the Patch chords are flat (§8.9.5)",
         );
     }
 
