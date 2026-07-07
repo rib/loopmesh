@@ -90,6 +90,7 @@ pub use ops::{
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
     DissolveVertsParams,
     DuplicateResult, EdgeloopFillParams, EdgeloopFillResult, EdgenetFillParams, EdgenetFillResult,
+    EdgenetPrepareResult,
     ExtrudeVertIndivResult, GeomKey,
     GridFillParams, GridFillResult,
     HolesFillParams, HolesFillResult,
