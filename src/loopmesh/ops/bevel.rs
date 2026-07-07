@@ -962,6 +962,16 @@ impl LoopMesh {
             })
             .collect();
 
+        // §6.7.5: snapshot each beveled edge's seam / sharp state against the
+        // pristine mesh, keyed by edge, for the multi-segment flag propagation. The
+        // beveled edges survive (re-pointed) so their flags persist, but a pristine
+        // snapshot keeps the bridging decision independent of surgery order — the
+        // same guard the single-segment junction path (§6.7.4) uses.
+        let edge_seam_state: Vec<(EdgeKey, bool, bool)> = beveled_manifold
+            .iter()
+            .map(|&edge| (edge, self.edge_seam(edge), self.edge_sharp(edge)))
+            .collect();
+
         let mut endpoints: Vec<VertexKey> = Vec::new();
         for &edge in &beveled_manifold {
             for endpoint in self.edge_vert_keys(edge) {
@@ -1126,6 +1136,37 @@ impl LoopMesh {
         // non-reflex sharp meet-points plus the reflex sector's arc pair).
         for omj in &outer_miter_junctions {
             self.build_adj_fill_outer_miter(omj, material, result);
+        }
+
+        // Phase 4.25 (§6.7.5.2 mechanism (1), UNCONDITIONAL): each seamed / sharp
+        // beveled edge stamps the flag onto its strip's **two outer longitudinal
+        // edges** (profile index 0 and index `segments`), the strip boundaries the
+        // re-stitched adjacent faces rebuilt along the edge's two original sides. The
+        // count is two independent of `segments`; the interior longitudinal lines and
+        // every interior vmesh-ring edge descend from no original flagged edge and
+        // stay unflagged. This holds at a junction end, a terminal end, and between.
+        self.inherit_multisegment_strip_long_edge_flags(
+            &beveled_manifold,
+            &chains,
+            &edge_seam_state,
+        );
+
+        // Phase 4.5 (§6.7.5.3 mechanism (2), gated by `mark_seam` / `mark_sharp`):
+        // bridge each junction's unseamed-gap beveled edge as a **run of `segments`
+        // outermost-ring cross-section edges** — the whole profile chain spanning
+        // that gap edge, not the single patch segment of the `segments = 1` case. The
+        // gap criterion is verbatim §6.7.4; only the junction fills (`junction_cuts`)
+        // bridge — terminals and miters stay inert (§6.7.5.4).
+        if options.mark_seam || options.mark_sharp {
+            for cut in &junction_cuts {
+                self.bridge_junction_flags_multisegment(
+                    cut,
+                    &chains,
+                    &edge_seam_state,
+                    options.mark_seam,
+                    options.mark_sharp,
+                );
+            }
         }
 
         // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
@@ -4288,6 +4329,144 @@ impl LoopMesh {
         }
     }
 
+    /// Multi-segment mechanism (1): stamp each seamed / sharp beveled edge's flag
+    /// onto its strip's **two outer longitudinal edges** (BEVEL.md §6.7.5.2). The
+    /// strip is `segments` quads sharing their long edges, so it carries
+    /// `segments + 1` longitudinal edge-lines; only the two outer ones (profile
+    /// index `0` and index `segments`) lie on the boundary the re-stitched adjacent
+    /// faces rebuilt along the edge's two original sides and thus inherit the edge's
+    /// per-edge attribute block. This is UNCONDITIONAL — it runs whether or not
+    /// `mark_seam` / `mark_sharp` is set, exactly as the single-segment inheritance
+    /// (§6.7.4) does, and applies at junction, terminal, and through ends alike.
+    ///
+    /// The two outer longitudinal edges are the only edges joining a chain-end of
+    /// the edge's endpoint-`a` profile chain to a chain-end of its endpoint-`b`
+    /// chain (the interior profile samples never terminate an outer longitudinal
+    /// edge, and the two endpoints' chains face each other across the edge with no
+    /// other edge spanning between them). Iterating the four chain ends and keeping
+    /// the pairs that resolve to a real edge therefore finds exactly those two.
+    fn inherit_multisegment_strip_long_edge_flags(
+        &mut self,
+        beveled: &[EdgeKey],
+        chains: &[EdgeEndChain],
+        edge_seam_state: &[(EdgeKey, bool, bool)],
+    ) {
+        for &edge in beveled {
+            let Some(&(_, seam, sharp)) = edge_seam_state.iter().find(|&&(e, ..)| e == edge) else {
+                continue;
+            };
+            if !seam && !sharp {
+                continue;
+            }
+            let [a, b] = self.edge_vert_keys(edge);
+            let chain_a = chains.iter().find(|c| c.edge == edge && c.endpoint == a);
+            let chain_b = chains.iter().find(|c| c.edge == edge && c.endpoint == b);
+            let (chain_a, chain_b) = match (chain_a, chain_b) {
+                (Some(x), Some(y)) => (x, y),
+                _ => continue,
+            };
+            for &near_a in &[chain_a.start, chain_a.end] {
+                for &near_b in &[chain_b.start, chain_b.end] {
+                    if near_a == near_b {
+                        continue;
+                    }
+                    if let Some(long_edge) = self.query_edge_exists(near_a, near_b) {
+                        if seam {
+                            self.set_edge_seam(long_edge, true);
+                        }
+                        if sharp {
+                            self.set_edge_sharp(long_edge, true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Multi-segment mechanism (2): bridge one junction's unseamed-gap beveled edges
+    /// as **runs of `segments` outermost-ring cross-section edges** (BEVEL.md
+    /// §6.7.5.3), gated by `mark_seam` / `mark_sharp`.
+    ///
+    /// The gap criterion is verbatim §6.7.4: walk the junction's beveled edges in
+    /// disk order (`opening_edges[k] = g_k`, the edge opening sector `k`); a *gap* is
+    /// a maximal run of consecutive *unseamed* beveled edges flanked on both sides by
+    /// a seamed one. A junction with all beveled edges seamed, none seamed, or only
+    /// one seamed has no gap and bridges nothing. Where the single-segment rule
+    /// flagged the *one* direct patch segment spanning each gap edge, this flags
+    /// **every** cross-section edge of that gap edge's outermost-ring profile chain —
+    /// the whole run `(P_0,P_1) … (P_(segments−1),P_segments)` (§6.7.5.1). Only the
+    /// patch-boundary chain (ring index 0) is touched; the interior vmesh rings that
+    /// close the corner (§8.5) are never flagged, since they are not this chain.
+    ///
+    /// The chain spanning `g_m = opening_edges[m]` at this junction is the one keyed
+    /// by `(edge = g_m, endpoint = vertex)` — the §8.3.0 chain the build laid between
+    /// `g_m`'s two flanking boundverts `B_(m−1)` and `B_m`. `seam` and `sharp` run the
+    /// identical walk on independent bits.
+    fn bridge_junction_flags_multisegment(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        edge_seam_state: &[(EdgeKey, bool, bool)],
+        seam: bool,
+        sharp: bool,
+    ) {
+        let count = cut.opening_edges.len();
+        if count < 2 {
+            return;
+        }
+
+        let flag_of = |edge: EdgeKey, want_seam: bool| -> bool {
+            edge_seam_state
+                .iter()
+                .find_map(|&(e, s, h)| (e == edge).then_some(if want_seam { s } else { h }))
+                .unwrap_or(false)
+        };
+
+        let mut bridge = |want_seam: bool, this: &mut Self| {
+            let seamed = |k: usize| flag_of(cut.opening_edges[k], want_seam);
+
+            let seamed_count = (0..count).filter(|&k| seamed(k)).count();
+            // A gap needs a seamed edge on each side: at least two seamed edges and
+            // at least one unseamed edge (identical to `segments = 1`, §6.7.4).
+            if seamed_count < 2 || seamed_count == count {
+                return;
+            }
+
+            // Every maximal unseamed run on the cyclic disk is then flanked by a
+            // seamed edge on both sides, so every unseamed beveled edge is a gap edge:
+            // bridge its whole outermost-ring profile chain (`segments` edges).
+            for m in 0..count {
+                if seamed(m) {
+                    continue;
+                }
+                let gap_edge = cut.opening_edges[m];
+                let Some(chain) = chains
+                    .iter()
+                    .find(|c| c.edge == gap_edge && c.endpoint == cut.vertex)
+                else {
+                    continue;
+                };
+                let samples = chain.samples();
+                for pair in samples.windows(2) {
+                    if let Some(cross) = this.query_edge_exists(pair[0], pair[1]) {
+                        if want_seam {
+                            this.set_edge_seam(cross, true);
+                        } else {
+                            this.set_edge_sharp(cross, true);
+                        }
+                    }
+                }
+            }
+        };
+
+        if seam {
+            bridge(true, self);
+        }
+        if sharp {
+            bridge(false, self);
+        }
+    }
+
     /// Re-stitch one face incident to a beveled edge's endpoint(s) (BEVEL.md §7.4
     /// / §7.5). The two radial faces swap each beveled-edge endpoint corner for the
     /// single matching strip vert (1-for-1); every other face swaps an endpoint
@@ -5152,7 +5331,10 @@ impl EdgeEndChain {
 struct JunctionCut {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
-    #[allow(dead_code)]
+    /// Per sector `k` (disk order), the beveled edge `g_k` that opens it (BEVEL.md
+    /// §7.6.1). The outermost-ring chain crossing `g_m` spans boundverts `B_(m−1)`
+    /// and `B_m`; this maps each junction bridging chain to the beveled edge it
+    /// spans, for the §6.7.5.3 multi-segment seam / sharp bridging.
     opening_edges: Vec<EdgeKey>,
     outward: Vec3,
 }
@@ -10533,6 +10715,198 @@ mod tests {
         assert!(bridge_synthetic_junction(&[true, true, true]).is_empty());
         // No gap: none seamed bridges nothing.
         assert!(bridge_synthetic_junction(&[false, false, false]).is_empty());
+    }
+
+    // ---- mark_seam / mark_sharp, multi-segment (BEVEL.md §6.7.5) ----
+
+    /// The same three-edge cube-corner junction as `bevel_three_edge_junction_with_flag`
+    /// but at `segments ≥ 2` with the ADJ rounded fill (BEVEL.md §6.7.5): v0 = [1,-1,-1],
+    /// e01/e03/e04 beveled at offset 0.25, e01 (toward [-1,-1,-1]) and e04 (toward
+    /// [1,-1,1]) flagged, e03 (toward [1,1,-1]) the unflagged gap between them.
+    fn bevel_three_edge_junction_multisegment_with_flag(
+        set_flag: impl Fn(&mut LoopMesh, EdgeKey),
+        segments: u32,
+        mark_seam: bool,
+        mark_sharp: bool,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let e01 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, p0, Vec3::new(1.0, -1.0, 1.0));
+        set_flag(&mut mesh, e01);
+        set_flag(&mut mesh, e04);
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                mark_seam,
+                mark_sharp,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// The two outermost-ring cross-section edges bridging the unseamed e03 gap at
+    /// `segments = 2` (BEVEL.md §6.7.5.1 / §6.7.5.3): the run `(b0, M)`, `(M, b2)`
+    /// where b0 / b2 are e03's two flanking boundverts and M is the profile chain's
+    /// single interior arc sample on the corner sphere (centre (0.75,-0.75,-0.75),
+    /// radius 0.25). Both the arc midpoint and the chord midpoint fall in the same
+    /// `pos_key` (0.25-grid) bucket, so the bridge set is robust to the exact profile.
+    fn e03_gap_chain_segments2() -> EdgeKeySet {
+        let k = |x: f32, y: f32, z: f32| pos_key(Vec3::new(x, y, z));
+        let pair = |a: (i32, i32, i32), b: (i32, i32, i32)| if a <= b { (a, b) } else { (b, a) };
+        let b0 = k(0.75, -0.75, -1.0);
+        let b2 = k(1.0, -0.75, -0.75);
+        let center = Vec3::new(0.75, -0.75, -0.75);
+        let mid = center + 0.25 * Vec3::new(1.0, 0.0, -1.0).normalize();
+        let m = pos_key(mid);
+        [pair(b0, m), pair(m, b2)].into_iter().collect()
+    }
+
+    /// BEVEL.md §6.7.5.2 mechanism (1) at `segments = 2` is UNCONDITIONAL: with
+    /// `mark_seam = false` each seamed beveled edge still stamps its flag onto its
+    /// strip's **two outer longitudinal edges** (index 0 and index `segments`) — the
+    /// same four strip-boundary edges as the single-segment case, since the interior
+    /// longitudinal line (index 1) is never inherited. No cross-section chain edge is
+    /// flagged (no parameter-gated bridging).
+    #[test]
+    fn multisegment_mechanism_one_flags_two_outer_longitudinal_edges() {
+        let (mesh, result) = bevel_three_edge_junction_multisegment_with_flag(
+            |m, e| m.set_edge_seam(e, true),
+            2,
+            false,
+            false,
+        );
+        let sets = junction_expected_sets();
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+        assert_eq!(
+            seamed, sets.parallel,
+            "mechanism (1) flags exactly the two outer longitudinal edges of each \
+             seamed strip (four total across e01/e04, §6.7.5.2) — the interior \
+             longitudinal line and every cross-section chain edge stay unflagged",
+        );
+        assert!(
+            seamed.is_disjoint(&e03_gap_chain_segments2()),
+            "no cross-section bridge chain is flagged with mark_seam off",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.3 mechanism (2) at `segments = 2`: with `mark_seam = true` the
+    /// e03 gap is bridged by its whole outermost-ring profile chain — a **run of two**
+    /// cross-section edges (`segments = 2`), not the single patch segment of the
+    /// `segments = 1` case. The flagged set is exactly the four mechanism-(1)
+    /// longitudinal edges plus that two-edge chain; the seamed edges' own chains and
+    /// every interior vmesh-ring edge stay unflagged.
+    #[test]
+    fn multisegment_mechanism_two_bridges_gap_as_run_of_segments_edges() {
+        let (mesh, result) = bevel_three_edge_junction_multisegment_with_flag(
+            |m, e| m.set_edge_seam(e, true),
+            2,
+            true,
+            false,
+        );
+        let sets = junction_expected_sets();
+        let bridge = e03_gap_chain_segments2();
+        let mut expected = sets.parallel.clone();
+        expected.extend(bridge.iter().copied());
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+        assert_eq!(
+            seamed, expected,
+            "mark_seam=true seams the four mechanism-(1) longitudinal edges PLUS the \
+             two-edge outermost-ring chain spanning the e03 gap (§6.7.5.3) — a run of \
+             `segments` edges, not one",
+        );
+        assert_eq!(bridge.len(), 2, "the length-1 gap bridge is a run of segments=2 edges");
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.3: `mark_sharp` runs the identical run-bridge on the sharp bit,
+    /// independent of `mark_seam`. Off flags only the four mechanism-(1) longitudinal
+    /// edges (unconditional); on adds the two-edge e03 gap chain.
+    #[test]
+    fn multisegment_mark_sharp_bridges_gap_run_independently() {
+        let sets = junction_expected_sets();
+        let bridge = e03_gap_chain_segments2();
+
+        let (mesh_off, result_off) = bevel_three_edge_junction_multisegment_with_flag(
+            |m, e| m.set_edge_sharp(e, true),
+            2,
+            false,
+            false,
+        );
+        let sharp_off = flagged_new_edge_set(&mesh_off, &result_off, |m, e| m.edge_sharp(e));
+        assert_eq!(
+            sharp_off, sets.parallel,
+            "mark_sharp=false still sharpens the two outer longitudinal edges of each \
+             seamed strip (mechanism (1), §6.7.5.2), no chain",
+        );
+
+        let (mesh_on, result_on) = bevel_three_edge_junction_multisegment_with_flag(
+            |m, e| m.set_edge_sharp(e, true),
+            2,
+            false,
+            true,
+        );
+        let mut expected = sets.parallel.clone();
+        expected.extend(bridge.iter().copied());
+        let sharp_on = flagged_new_edge_set(&mesh_on, &result_on, |m, e| m.edge_sharp(e));
+        assert_eq!(
+            sharp_on, expected,
+            "mark_sharp=true bridges the two-edge e03 gap chain on the sharp bit (§6.7.5.3)",
+        );
+        mesh_off.validate_topology();
+        mesh_on.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4: the terminal far ends are INERT at `segments ≥ 2` — only
+    /// mechanism (1)'s two outer longitudinal edges of the through-strip carry the
+    /// flag; the mirrored far-end cross-section chain is **not** bridged, even with
+    /// `mark_seam` on. e01 / e04 run into valence-3 terminals; their far-end
+    /// cross-section chains (between the two terminal strip verts through the terminal
+    /// interior sample) must stay unflagged.
+    #[test]
+    fn multisegment_terminal_far_end_is_inert() {
+        let (mesh, result) = bevel_three_edge_junction_multisegment_with_flag(
+            |m, e| m.set_edge_seam(e, true),
+            2,
+            true,
+            false,
+        );
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+
+        // e01's terminal at [-1,-1,-1]: strip verts [-1,-0.75,-1] and [-1,-1,-0.75],
+        // with the terminal cross-section chain running between them (through a single
+        // interior sample). e04's terminal at [1,-1,1]: strip verts [0.75,-1,1] and
+        // [1,-0.75,1]. None of these far-end chain edges may be flagged.
+        let k = |x: f32, y: f32, z: f32| pos_key(Vec3::new(x, y, z));
+        let pair = |a: (i32, i32, i32), b: (i32, i32, i32)| if a <= b { (a, b) } else { (b, a) };
+        let terminal_chain = |p: Vec3, q: Vec3| -> EdgeKeySet {
+            let mid = 0.5 * (p + q);
+            let m = pos_key(mid);
+            let pk = pos_key(p);
+            let qk = pos_key(q);
+            [pair(pk, m), pair(m, qk)].into_iter().collect()
+        };
+        let e01_terminal =
+            terminal_chain(Vec3::new(-1.0, -0.75, -1.0), Vec3::new(-1.0, -1.0, -0.75));
+        let e04_terminal =
+            terminal_chain(Vec3::new(0.75, -1.0, 1.0), Vec3::new(1.0, -0.75, 1.0));
+        assert!(
+            seamed.is_disjoint(&e01_terminal),
+            "e01's far-end cross-section chain is not bridged at the terminal (§6.7.5.4)",
+        );
+        assert!(
+            seamed.is_disjoint(&e04_terminal),
+            "e04's far-end cross-section chain is not bridged at the terminal (§6.7.5.4)",
+        );
+        mesh.validate_topology();
     }
 
     /// The minimum ring slide of a corner: distance from the original corner
