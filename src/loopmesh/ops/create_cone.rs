@@ -84,7 +84,14 @@ impl LoopMesh {
         // §2.2 — fan-cap centres survive only on a non-collapsed, fan-capped end.
         // The n-gon path builds the cap straight from the ring (no centre, the
         // §3-blessed equivalent of fan-then-dissolve); a collapsed end has no cap.
-        let want_fan = cap_ends && cap_tris;
+        //
+        // §7 — over a degenerate ring (`segments < 3`) the fan-then-dissolve that
+        // would flatten a fan into an n-gon cannot operate (a 1- or 2-vertex ring
+        // has no interior to dissolve), so a degenerate n-gon cap stays a fan and
+        // its centre survives. Route those through the fan builder too, matching
+        // the ill-formed degenerate output the kernel accepts (the editor clamps
+        // to `segments >= 3`, the kernel does not).
+        let want_fan = cap_ends && (cap_tris || segment_count < 3);
         let centre_bottom = if want_fan && !bottom_apex {
             Some(self.create_vertex(matrix.transform_point3(Vec3::new(0.0, 0.0, -half_depth))))
         } else {
@@ -136,12 +143,20 @@ impl LoopMesh {
         // dedups to a triangle meeting the apex. `seg` runs 1..=n, with `seg = n`
         // the closing face that joins the last rung back to the first; its `cur`
         // rung index stays `n` (UV column 0) while the vertex wraps to slot 0.
+        //
+        // §7 — a `segments = 1` wall quad is `(b_0, t_0, t_0, b_0)`; consecutive
+        // dedup leaves `(b_0, t_0, b_0)`. Its wrap-around `b_0 == b_0` is the
+        // ring's self-loop closure: kept for an **open** (uncapped) ring, whose
+        // boundary *is* that ring edge, and stripped to a doubled-edge 2-gon for a
+        // **capped** ring, whose closure is carried by the cap. That is why the
+        // minimum wall corner count depends on `cap_ends`.
+        let wall_min_corners = if cap_ends { 2 } else { 3 };
         let mut side_faces: Vec<(FaceKey, usize, usize)> = Vec::with_capacity(segment_count);
         for seg in 1..=segment_count {
             let prev = seg - 1;
             let cur = seg;
             let corners = [bottom[prev], top[prev], top[cur % segment_count], bottom[cur % segment_count]];
-            if let Some(face) = self.cone_face_create(&corners) {
+            if let Some(face) = self.cone_face_create(&corners, wall_min_corners) {
                 side_faces.push((face, prev, cur));
             }
         }
@@ -154,16 +169,18 @@ impl LoopMesh {
             if !bottom_apex {
                 if let Some(centre) = centre_bottom {
                     // §3 bottom fan triangle: (centre, b_{a-1}, b_a) — faces -z.
+                    // §7 — over a single-vertex ring this pinches to the doubled-
+                    // spoke 2-gon (centre, b_0); `min_corners = 2` admits it.
                     for seg in 1..=segment_count {
                         let corners =
                             [centre, bottom[seg - 1], bottom[seg % segment_count]];
-                        if let Some(face) = self.cone_face_create(&corners) {
+                        if let Some(face) = self.cone_face_create(&corners, 2) {
                             bottom_cap_faces.push(face);
                         }
                     }
                 } else {
                     // §3 bottom n-gon — the ring in order faces -z.
-                    if let Some(face) = self.cone_face_create(&bottom) {
+                    if let Some(face) = self.cone_face_create(&bottom, 3) {
                         bottom_cap_faces.push(face);
                     }
                 }
@@ -171,16 +188,17 @@ impl LoopMesh {
             if !top_apex {
                 if let Some(centre) = centre_top {
                     // §3 top fan triangle: (centre, t_a, t_{a-1}) — reversed, faces +z.
+                    // §7 — pinches to the doubled-spoke 2-gon over a 1-vertex ring.
                     for seg in 1..=segment_count {
                         let corners = [centre, top[seg % segment_count], top[seg - 1]];
-                        if let Some(face) = self.cone_face_create(&corners) {
+                        if let Some(face) = self.cone_face_create(&corners, 2) {
                             top_cap_faces.push(face);
                         }
                     }
                 } else {
                     // §3 top n-gon — the ring reversed faces +z.
                     let reversed: Vec<VertexKey> = top.iter().rev().copied().collect();
-                    if let Some(face) = self.cone_face_create(&reversed) {
+                    if let Some(face) = self.cone_face_create(&reversed, 3) {
                         top_cap_faces.push(face);
                     }
                 }
@@ -254,22 +272,29 @@ impl LoopMesh {
         out
     }
 
-    /// Build a face from `corners`, collapsing consecutive (and wrap-around)
-    /// duplicate vertices first — a collapsed-ring side quad dedups to a triangle
-    /// (§2.3). Returns `None` (building nothing) when fewer than three distinct
-    /// corners remain, which keeps the doubly-degenerate spindle (both radii `0`)
-    /// and the degenerate low-`segments` inputs from erroring (§7 don't-care).
-    fn cone_face_create(&mut self, corners: &[VertexKey]) -> Option<FaceKey> {
+    /// Build a face from `corners`, collapsing consecutive duplicate vertices
+    /// first, then stripping wrap-around duplicates down to `min_corners`.
+    ///
+    /// A collapsed-ring side quad (`radius = 0`, §2.3) dedups to a triangle: its
+    /// `(apex, t_{a-1}, t_a, apex)` corners strip the wrap `apex == apex` down to
+    /// the three distinct corners. A degenerate low-`segments` face (§7) keeps
+    /// more: `min_corners = 3` retains a single-vertex ring's self-loop closure
+    /// (the `segments = 1` self-edge on an **open** wall), while `min_corners = 2`
+    /// lets a capped wall or a pinched cap fan collapse to a doubled-edge 2-gon.
+    ///
+    /// Returns `None` (building nothing) only when fewer than two distinct corners
+    /// survive — the doubly-degenerate spindle (both radii `0`, §7 don't-care).
+    fn cone_face_create(&mut self, corners: &[VertexKey], min_corners: usize) -> Option<FaceKey> {
         let mut deduped: Vec<VertexKey> = Vec::with_capacity(corners.len());
         for &v in corners {
             if deduped.last() != Some(&v) {
                 deduped.push(v);
             }
         }
-        while deduped.len() >= 2 && deduped.first() == deduped.last() {
+        while deduped.len() > min_corners && deduped.first() == deduped.last() {
             deduped.pop();
         }
-        if deduped.len() < 3 {
+        if deduped.len() < 2 {
             return None;
         }
         Some(self.face_create_verts(&deduped, FaceCreateFlags::NONE))
@@ -605,6 +630,83 @@ mod tests {
         }
         assert_eq!(ngon_caps, 1, "a cone caps only its open end");
         cone.validate_topology();
+    }
+
+    /// §7 degenerate `segments = 1`, uncapped: the bare kernel does not clamp to
+    /// `segments >= 3`. A single-vertex ring closes on itself, so the wall quad
+    /// `(b_0, t_0, t_0, b_0)` collapses to `(b_0, t_0, b_0)` — one rung edge plus
+    /// the bottom ring's **self-loop** closure. Raw `(V, E, F) = (2, 2, 1)`; the
+    /// self-edge is the load-bearing degeneracy (CanonicalMesh dedups edges and is
+    /// blind to it, so the raw counts are the pin).
+    #[test]
+    fn create_cone_segments_one_uncapped_self_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh.create_cone(false, false, 1, 1.0, 1.0, 2.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (2, 2, 1),
+            "segments = 1 uncapped: rung + one self-loop ring edge, one degenerate side quad"
+        );
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 1.0, -1.0)));
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 1.0, 1.0)));
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `segments = 1`, n-gon capped: the fan-then-dissolve that would
+    /// flatten a cap fan into an n-gon cannot operate over a single-vertex ring, so
+    /// each cap stays a pinched fan and its centre survives. The wall's ring
+    /// closure is carried by the caps, so the wall degenerates to a doubled-edge
+    /// 2-gon (no self-loop). Raw `(V, E, F) = (4, 3, 3)`: two ring verts + two
+    /// surviving cap centres; the rung + the two doubled cap spokes; the wall +
+    /// two pinched cap 2-gons.
+    #[test]
+    fn create_cone_segments_one_ngon_capped_degenerate() {
+        let mut mesh = LoopMesh::new();
+        mesh.create_cone(true, false, 1, 1.0, 1.0, 2.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 3, 3),
+            "segments = 1 n-gon capped: ring verts + surviving cap centres, doubled spokes"
+        );
+        // Both cap centres survive on the degenerate ring.
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, -1.0)));
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, 1.0)));
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `segments = 2`, uncapped: doubled ring edges merge into a
+    /// 4-cycle and the two side quads coincide (oppositely wound, zero-area). Raw
+    /// `(V, E, F) = (4, 4, 2)`: four ring verts, two rungs + one merged top + one
+    /// merged bottom ring edge, two coincident side quads.
+    #[test]
+    fn create_cone_segments_two_uncapped_doubled_edges() {
+        let mut mesh = LoopMesh::new();
+        mesh.create_cone(false, false, 2, 1.0, 1.0, 2.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 4, 2),
+            "segments = 2 uncapped: 4-cycle of doubled ring edges, two coincident side quads"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `segments = 2`, n-gon capped: the caps stay fans (dissolve
+    /// cannot flatten a 2-vertex ring) with surviving centres. Raw
+    /// `(V, E, F) = (6, 8, 6)`: four ring verts + two centres; two rungs + two
+    /// merged ring edges + two bottom spokes + two top spokes; two side quads +
+    /// two bottom cap tris + two top cap tris.
+    #[test]
+    fn create_cone_segments_two_ngon_capped_degenerate() {
+        let mut mesh = LoopMesh::new();
+        mesh.create_cone(true, false, 2, 1.0, 1.0, 2.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 8, 6),
+            "segments = 2 n-gon capped: fan caps with surviving centres over the doubled ring"
+        );
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, -1.0)));
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, 1.0)));
+        mesh.validate_topology();
     }
 
     /// §1 / §2.1 / §8.1 depth separation: the rings sit at `z = ±depth/2`, so two
