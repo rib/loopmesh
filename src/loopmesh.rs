@@ -86,6 +86,7 @@ pub use ops::{
     Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
     BisectParams,
     BisectResult, BridgeLoopsParams, BridgeLoopsResult, CenterMode, ConnectVertsNonplanarOut,
+    ContextualCreateParams, ContextualCreateResult,
     ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
     DissolveVertsParams,
