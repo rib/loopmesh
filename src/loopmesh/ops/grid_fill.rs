@@ -675,6 +675,14 @@ fn grid_barycentric_2d(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec
     let v1 = c - a;
     let v2 = p - a;
     let den = v0.perp_dot(v1);
+    // A collinear/degenerate source frame (den ≈ 0) has no well-defined
+    // barycentric coordinates; dividing would emit inf/NaN into the interior
+    // vertex position. Collapse to the first source vertex — a finite,
+    // deterministic fallback. Guarded at the same magnitude as `area_src` in
+    // `grid_frame_transform`; unreachable on non-degenerate frames.
+    if den.abs() <= 1.0e-20 {
+        return [1.0, 0.0, 0.0];
+    }
     let w1 = v2.perp_dot(v1) / den;
     let w2 = v0.perp_dot(v2) / den;
     [1.0 - w1 - w2, w1, w2]
@@ -1210,5 +1218,35 @@ mod tests {
         let unique: std::collections::HashSet<FaceKey> = result.faces().iter().copied().collect();
         assert_eq!(unique.len(), 9, "faces.out lists each new quad once");
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn degenerate_source_frame_stays_finite() {
+        // A collinear source triple gives a zero barycentric denominator; the
+        // guard must yield finite weights (and a finite transformed position)
+        // rather than dividing by ~zero into inf/NaN.
+        let a = glam::Vec2::new(0.0, 0.0);
+        let b = glam::Vec2::new(1.0, 0.0);
+        let c = glam::Vec2::new(2.0, 0.0); // collinear with a, b ⇒ den == 0
+        let w = super::grid_barycentric_2d(glam::Vec2::new(0.5, 0.3), a, b, c);
+        assert!(w.iter().all(|v| v.is_finite()), "weights finite, got {w:?}");
+
+        // End-to-end through the frame transform with a collinear source
+        // triangle: every component of the carried point must be finite.
+        let src = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ];
+        let tar = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(2.0, 0.0, 1.0),
+        ];
+        let out = super::grid_frame_transform(Vec3::new(0.5, 0.5, 0.5), src, tar);
+        assert!(
+            out.x.is_finite() && out.y.is_finite() && out.z.is_finite(),
+            "transformed position finite on a degenerate source frame, got {out:?}",
+        );
     }
 }
