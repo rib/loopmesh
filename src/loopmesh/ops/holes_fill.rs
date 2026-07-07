@@ -54,8 +54,8 @@ impl LoopMesh {
     /// fillable edges / failed-seed net removal, §4.2 two-front breadth-first
     /// walk, §4.3 per-front spans-distinct-faces gate, §4.4 overlap rejection,
     /// §4.5 termination, §4.6 cap build), the §5 `sides` post-fill deletion of
-    /// oversized caps, and the §6
-    /// winding coherence (§6.2) with the §6.3 free-wire geometric-normal fallback.
+    /// oversized caps, and the §6 winding coherence (§6.2) with the §6.3
+    /// free-wire geometric-normal fallback.
     ///
     /// `sides` is **not** a search constraint: the fill runs unconstrained, then
     /// any cap with more than `sides` corners is deleted (`sides == 0` keeps all,
@@ -117,10 +117,12 @@ impl LoopMesh {
         // §4.3 / §4.5 — seeds are drawn in mesh/insertion order, not input order:
         // the per-front gate's refusal of an interior-edge net depends on offering
         // a face-bordering edge before a wire diagonal (§4.3 worked example), and
-        // `edge_keys` enumerates the slab in ascending insertion order. Only tagged
-        // edges can seed, so the candidate list is the tagged subset in that order.
-        let mut candidates: Vec<EdgeKey> = self.edge_keys();
-        candidates.retain(|edge| tagged.contains(edge));
+        // that mesh order is ascending edge-index order. Only tagged edges can
+        // seed, so the candidate list is the tagged subset sorted into that order —
+        // equivalent to enumerating the whole edge slab and keeping the tagged ones,
+        // but O(k log k) in the tagged count instead of O(total_edges).
+        let mut candidates: Vec<EdgeKey> = tagged.iter().copied().collect();
+        candidates.sort_by_key(|edge| edge.as_usize());
 
         let mut new_caps: Vec<FaceKey> = Vec::new();
         // The net shrinks monotonically: a seed that closes no acceptable cycle is
@@ -129,25 +131,36 @@ impl LoopMesh {
         // (§4.3) and what terminates the free-wire case (§4.5). A successful cap's
         // rim edges, by contrast, stay tagged and may be re-seeded; re-capping is
         // prevented by the §4.4 overlap rejection, not by a one-shot-seed guard.
+        //
+        // Fillability is monotone within this loop (faces are only added, tags only
+        // removed), so a candidate proven non-fillable stays non-fillable. A cursor
+        // therefore advances past exhausted candidates once and never rescans them,
+        // while a still-fillable successful seed keeps its cursor slot and is
+        // re-offered on the next pass (where §4.4 refuses the duplicate and prunes
+        // it) — reproducing the old "find first fillable from 0" draw order without
+        // the O(n²) rescan.
+        let mut cursor = 0;
         loop {
-            // §4.1 — the next still-fillable tagged edge in insertion order. A rim
-            // edge an earlier cap turned manifold drops out here; a failed seed has
-            // been untagged and is likewise skipped.
-            let Some(seed) = candidates
-                .iter()
-                .copied()
-                .find(|&edge| self.holes_fill_fillable(edge, &tagged))
-            else {
+            // §4.1 — skip past candidates no longer fillable: a rim edge an earlier
+            // cap turned manifold, or a failed seed that was untagged.
+            while cursor < candidates.len()
+                && !self.holes_fill_fillable(candidates[cursor], &tagged)
+            {
+                cursor += 1;
+            }
+            let Some(&seed) = candidates.get(cursor) else {
                 break;
             };
             if let Some(cycle) = self.holes_fill_min_cycle(seed, &tagged) {
                 // §4.6 + §6.2 — materialise the cap, wound coherently with any
-                // surrounding surface. The seed and its rim stay tagged.
+                // surrounding surface. The seed and its rim stay tagged, so the
+                // cursor is left in place to re-offer the seed next pass.
                 let cap = self.holes_fill_build_cap(&cycle);
                 new_caps.push(cap);
             } else {
                 // §4.1 — failed seed: remove it from the net so no later seeding
-                // can reconstruct a cycle across it.
+                // can reconstruct a cycle across it. It is now non-fillable, so the
+                // cursor advances past it on the next pass.
                 tagged.remove(&seed);
             }
         }
@@ -166,7 +179,7 @@ impl LoopMesh {
     /// tag *and* borders zero or one face (wire or boundary). An edge already
     /// bordering two faces is full; capping it again would make it non-manifold.
     fn holes_fill_fillable(&self, edge: EdgeKey, tagged: &HashSet<EdgeKey>) -> bool {
-        tagged.contains(&edge) && self.edge_loop_keys(edge).len() <= 1
+        tagged.contains(&edge) && self.edge_radial_iter(edge).count() <= 1
     }
 
     /// §4.2 — the two-front breadth-first walk. Plant the seed edge's two
@@ -213,10 +226,7 @@ impl LoopMesh {
         while let Some(vertex) = queue.pop_front() {
             let front = claimed[&vertex];
             let vertex_spans = spans[&vertex];
-            // Collect incident edges up front so the BFS bookkeeping below does not
-            // alias the disk walk.
-            let incident: Vec<EdgeKey> = self.vertex_disk_iter(vertex).collect();
-            for edge in incident {
+            for edge in self.vertex_disk_iter(vertex) {
                 // Never step along the seed itself — it is the implied closing
                 // edge that joins the two roots, not an outward step.
                 if edge == seed {
@@ -385,14 +395,20 @@ impl LoopMesh {
             let Some(edge) = self.query_edge_exists(from, to) else {
                 continue;
             };
-            let radial = self.edge_loop_keys(edge);
-            if radial.len() != 1 {
+            // Only an edge bordering exactly one existing face casts a coherence
+            // vote; walk the radial fan without collecting it (len == 1 iff a first
+            // loop exists and there is no second).
+            let mut radial = self.edge_radial_iter(edge);
+            let Some(neighbor_loop) = radial.next() else {
+                continue;
+            };
+            if radial.next().is_some() {
                 continue;
             }
             // The neighbour traverses the shared edge starting at this loop's
             // vertex; if it traverses from→to the same way our walk does, our
             // walk is incoherent → vote to flip.
-            if self.loop_vertex(radial[0]) == from {
+            if self.loop_vertex(neighbor_loop) == from {
                 tally += 1;
             } else {
                 tally -= 1;
@@ -535,6 +551,7 @@ impl LoopMesh {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::f32::consts::TAU;
 
     use glam::Vec3;
@@ -799,6 +816,36 @@ mod tests {
 
         assert!(result.is_empty(), "a face's own boundary is not re-capped");
         assert_eq!(mesh.face_count(), 1, "only the original quad remains");
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn two_free_rings_cap_in_ascending_seed_edge_order() {
+        // Draw-order pin: two vertex-disjoint wire rings are seeded from the
+        // tagged net in ascending edge-index order, so the ring whose edges were
+        // created first is capped first. `faces.out` records caps in creation
+        // (drain) order, so faces()[0] must span the first ring's verts.
+        let mut mesh = LoopMesh::new();
+        let first_ring = convex_wire_ring(&mut mesh, 5, 1.0);
+        let first_verts: HashSet<VertexKey> = first_ring
+            .iter()
+            .flat_map(|&e| mesh.edge_vert_keys(e))
+            .collect();
+        let second_ring = convex_wire_ring(&mut mesh, 4, 1.0);
+        let mut all: Vec<EdgeKey> = first_ring;
+        all.extend(second_ring);
+
+        let result = mesh.holes_fill(&all, &HolesFillParams { sides: 0 });
+
+        assert_eq!(result.faces().len(), 2, "each ring caps independently");
+        let cap0 = result.faces()[0];
+        assert_eq!(mesh.face_len(cap0), 5, "first cap spans the first ring");
+        for corner in mesh.face_vert_keys(cap0) {
+            assert!(
+                first_verts.contains(&corner),
+                "the first-drained cap covers exactly the first ring's verts"
+            );
+        }
         mesh.validate_topology();
     }
 
