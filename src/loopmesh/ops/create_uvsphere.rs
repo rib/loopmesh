@@ -19,9 +19,13 @@ impl LoopMesh {
     /// Both `u_segments` and `v_segments` are **clamped up to a minimum of `1`**
     /// (§1 / §7): a count of `0` builds a degenerate shell, **not** nothing — a
     /// deliberate divergence from `create_cone`'s `segments = 0` no-op, matching
-    /// `create_grid`'s clamp. At the clamped degenerate floor (`u = 1` or `v = 1`)
-    /// the bands collapse to two-vertex slivers that build no face; the well-formed
-    /// regime is `u ≥ 3`, `v ≥ 2`.
+    /// `create_grid`'s clamp. The well-formed regime is `u ≥ 3`, `v ≥ 2`; below it
+    /// the bare kernel emits ill-formed collapsed geometry (§7), reproduced here by
+    /// three floors: `v = 1` folds to two poles joined by one meridian edge (the
+    /// bigon sphere); `u = 1` leaves two coincident meridian arcs sharing the poles
+    /// (the doubled, multi-edge collapsed meridian); `u = 2` welds the coincident
+    /// opposite-longitude band quads down to `F = v` (the flat lens). Each floor is
+    /// guarded so the well-formed path is untouched.
     ///
     /// Each latitude band between rings `a` and `a + 1` contributes one quad per
     /// longitude `(P(a+1,j), P(a,j), P(a,j+1), P(a+1,j+1))`, wound outward (§3).
@@ -63,6 +67,17 @@ impl LoopMesh {
         let u = u_segments.max(1) as usize;
         let v = v_segments.max(1) as usize;
 
+        // §7 — degenerate floors below the well-formed regime (`u ≥ 3`, `v ≥ 2`).
+        // The bare kernel accepts these and emits ill-formed collapsed geometry the
+        // editor layer would clamp away; each floor is its own collapse, handled
+        // before the well-formed path so that path stays byte-identical.
+        if v == 1 {
+            return self.create_uvsphere_bigon(radius, matrix);
+        }
+        if u == 1 {
+            return self.create_uvsphere_collapsed_meridian(v, radius, matrix);
+        }
+
         // §2.3 — build at local positions; `matrix` is applied in a final pass.
         let north = self.create_vertex(Vec3::new(0.0, 0.0, radius));
         let south = self.create_vertex(Vec3::new(0.0, 0.0, -radius));
@@ -73,7 +88,7 @@ impl LoopMesh {
         // round-half tie at cos φ = ½ rings where an f32 intermediate would round
         // the opposite way from the higher-precision reference.
         let radius = radius as f64;
-        let mut interior: Vec<Vec<VertexKey>> = Vec::with_capacity(v.saturating_sub(1));
+        let mut interior: Vec<Vec<VertexKey>> = Vec::with_capacity(v - 1);
         for a in 1..v {
             let phi = PI * (a as f64) / (v as f64);
             let (sin_phi, cos_phi) = (phi.sin(), phi.cos());
@@ -102,8 +117,16 @@ impl LoopMesh {
         };
 
         // §3 — one band per latitude, one quad per longitude. The north (`a = 0`)
-        // and south (`a = v − 1`) bands degenerate to the pole-fan triangles when
-        // the duplicate pole corners are collapsed by `sphere_face_create`.
+        // and south (`a = v − 1`) bands dedup to the pole-fan triangles.
+        //
+        // §7 — at the `u = 2` flat-lens floor the two opposite-longitude faces of
+        // every band land coincident (same corner *set*, opposite winding); the
+        // reference operator's internal merge folds each such pair to one, so a
+        // coincident-face weld keeps only the first of each pair (`F = v`). Guarded
+        // to `u = 2`, where such pairs actually arise, so the well-formed path
+        // builds every face.
+        let weld_coincident = u == 2;
+        let mut welded_sets: Vec<smallvec::SmallVec<[VertexKey; 4]>> = Vec::new();
         let mut faces: Vec<FaceKey> = Vec::with_capacity(u * v);
         for a in 0..v {
             for j in 0..u {
@@ -114,9 +137,19 @@ impl LoopMesh {
                     lattice(a, jn),
                     lattice(a + 1, jn),
                 ];
-                if let Some(face) = self.sphere_face_create(&corners) {
-                    faces.push(face);
+                let deduped = dedup_face_corners(&corners);
+                if deduped.len() < 3 {
+                    continue;
                 }
+                if weld_coincident {
+                    let mut key = deduped.clone();
+                    key.sort_unstable_by_key(|vertex| vertex.as_usize());
+                    if welded_sets.contains(&key) {
+                        continue;
+                    }
+                    welded_sets.push(key);
+                }
+                faces.push(self.face_create_verts(&deduped, FaceCreateFlags::NONE));
             }
         }
 
@@ -146,7 +179,7 @@ impl LoopMesh {
 
         // §8.2 — verts.out: slot order is a don't-care, emit a clean
         // pole-then-rings order.
-        let mut out: Vec<VertexKey> = Vec::with_capacity(u * v.saturating_sub(1) + 2);
+        let mut out: Vec<VertexKey> = Vec::with_capacity(u * (v - 1) + 2);
         out.push(north);
         out.push(south);
         for ring in &interior {
@@ -155,25 +188,116 @@ impl LoopMesh {
         out
     }
 
-    /// Build a face from `corners`, collapsing consecutive (and wrap-around)
-    /// duplicate vertices first — a pole band's quad dedups to a triangle fan
-    /// face (§3). Returns `None` (building nothing) when fewer than three distinct
-    /// corners remain, which keeps the degenerate floor (`u = 1` / `v = 1`, where
-    /// every band collapses to a two-vertex sliver) from erroring (§7 don't-care).
-    fn sphere_face_create(&mut self, corners: &[VertexKey]) -> Option<FaceKey> {
-        let mut deduped: smallvec::SmallVec<[VertexKey; 4]> = smallvec::SmallVec::new();
-        for &v in corners {
-            if deduped.last() != Some(&v) {
-                deduped.push(v);
+    /// §7 `v = 1` — the **bigon sphere**. The meridian arc is just the two poles;
+    /// sweeping it produces two-sided (bigon) faces that the internal merge folds
+    /// entirely against the polar axis, leaving the two poles joined by a single
+    /// meridian edge and no faces — raw `(V, E, F) = (2, 1, 0)`. (The low-`u`
+    /// partial-survival counts the reference emits for `u = 3/4` are a fragile
+    /// merge-threshold artifact and a don't-care; the robust `u ≥ 5` full collapse
+    /// is the pinned form, reproduced here for every `u`.)
+    fn create_uvsphere_bigon(&mut self, radius: f32, matrix: Mat4) -> Vec<VertexKey> {
+        let north = self.create_vertex(Vec3::new(0.0, 0.0, radius));
+        let south = self.create_vertex(Vec3::new(0.0, 0.0, -radius));
+        self.create_edge([north, south], EdgeCreateFlags::NO_DUPLICATE);
+
+        if matrix != Mat4::IDENTITY {
+            for vert in [north, south] {
+                let local = self.vertex_position(vert);
+                self.set_vertex_position(vert, matrix.transform_point3(local));
             }
         }
-        while deduped.len() >= 2 && deduped.first() == deduped.last() {
-            deduped.pop();
+        self.vert_normal_update(north);
+        self.vert_normal_update(south);
+
+        vec![north, south]
+    }
+
+    /// §7 `u = 1` — the **collapsed meridian**. A single-longitude sweep rotates a
+    /// full −2π in one step, landing the extruded copy back on the original
+    /// meridian; the internal merge fuses the two poles but leaves the interior
+    /// ring vertices doubled (a fragile merge artifact). The result is two
+    /// coincident meridian arcs sharing the two poles — a collapsed, multi-edge
+    /// shell of `(2v, 3v − 1, v)` elements: the two poles, two coincident verts per
+    /// interior ring, a fan triangle at each pole, and `v − 2` collapsed quad
+    /// bands. Genuinely ill-formed (§7); positions and counts are the pinned
+    /// contract, the collapsed faces' winding a don't-care.
+    fn create_uvsphere_collapsed_meridian(
+        &mut self,
+        v: usize,
+        radius: f32,
+        matrix: Mat4,
+    ) -> Vec<VertexKey> {
+        use std::f64::consts::PI;
+
+        let radius_f64 = radius as f64;
+        let north = self.create_vertex(Vec3::new(0.0, 0.0, radius));
+        let south = self.create_vertex(Vec3::new(0.0, 0.0, -radius));
+
+        // Two coincident interior verts per ring, both at longitude 0 (+y): the two
+        // meridian arcs the full-turn sweep leaves superimposed.
+        let mut arc_a: Vec<VertexKey> = Vec::with_capacity(v - 1);
+        let mut arc_b: Vec<VertexKey> = Vec::with_capacity(v - 1);
+        for a in 1..v {
+            let phi = PI * (a as f64) / (v as f64);
+            let position = Vec3::new(
+                0.0,
+                (radius_f64 * phi.sin()) as f32,
+                (radius_f64 * phi.cos()) as f32,
+            );
+            arc_a.push(self.create_vertex(position));
+            arc_b.push(self.create_vertex(position));
         }
-        if deduped.len() < 3 {
-            return None;
+
+        // Latitude `0` is the (shared) north pole, `v` the south pole, everything
+        // between is that arc's interior ring vertex.
+        let arc_vertex = |arc: &[VertexKey], a: usize| -> VertexKey {
+            if a == 0 {
+                north
+            } else if a == v {
+                south
+            } else {
+                arc[a - 1]
+            }
+        };
+
+        // §3 — one collapsed band per meridian segment: the quad joining arc A's
+        // edge `(a, a+1)` to arc B's, the pole segments deduping to fan triangles.
+        let mut faces: Vec<FaceKey> = Vec::with_capacity(v);
+        for a in 0..v {
+            let corners = [
+                arc_vertex(&arc_a, a),
+                arc_vertex(&arc_a, a + 1),
+                arc_vertex(&arc_b, a + 1),
+                arc_vertex(&arc_b, a),
+            ];
+            let deduped = dedup_face_corners(&corners);
+            if deduped.len() >= 3 {
+                faces.push(self.face_create_verts(&deduped, FaceCreateFlags::NONE));
+            }
         }
-        Some(self.face_create_verts(&deduped, FaceCreateFlags::NONE))
+
+        if matrix != Mat4::IDENTITY {
+            for &vert in [north, south].iter().chain(arc_a.iter()).chain(arc_b.iter()) {
+                let local = self.vertex_position(vert);
+                self.set_vertex_position(vert, matrix.transform_point3(local));
+            }
+        }
+
+        for &face in &faces {
+            self.face_calc_normal(face);
+        }
+        for &vert in [north, south].iter().chain(arc_a.iter()).chain(arc_b.iter()) {
+            self.vert_normal_update(vert);
+        }
+
+        let mut out: Vec<VertexKey> = Vec::with_capacity(2 * v);
+        out.push(north);
+        out.push(south);
+        for a in 0..(v - 1) {
+            out.push(arc_a[a]);
+            out.push(arc_b[a]);
+        }
+        out
     }
 
     /// §4 — paint the default equirectangular unwrap over the sphere's faces from
@@ -276,6 +400,23 @@ impl LoopMesh {
                 .set_vec2(uv_layer, loop_key.as_usize(), [uv[0] - shift, uv[1]]);
         }
     }
+}
+
+/// Collapse consecutive (and wrap-around) duplicate vertices in a band's corner
+/// list, so a pole band's quad dedups to a fan triangle (§3). The returned list
+/// may still be shorter than three corners (a fully collapsed degenerate band),
+/// which the caller drops.
+fn dedup_face_corners(corners: &[VertexKey]) -> smallvec::SmallVec<[VertexKey; 4]> {
+    let mut deduped: smallvec::SmallVec<[VertexKey; 4]> = smallvec::SmallVec::new();
+    for &vertex in corners {
+        if deduped.last() != Some(&vertex) {
+            deduped.push(vertex);
+        }
+    }
+    while deduped.len() >= 2 && deduped.first() == deduped.last() {
+        deduped.pop();
+    }
+    deduped
 }
 
 #[cfg(test)]
@@ -591,6 +732,109 @@ mod tests {
         let mut mesh = LoopMesh::new();
         mesh.create_uvsphere(8, 6, 1.0, Mat4::IDENTITY, true);
         assert!(mesh.loop_attribs().is_empty(), "no UV layer was created");
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `u_segments = 1` — the **collapsed meridian**. A single
+    /// longitude leaves two coincident meridian arcs sharing the two poles: a
+    /// doubled, multi-edge shell of `(V, E, F) = (2v, 3v − 1, v)`; at `v = 6` that
+    /// is `(12, 17, 6)`. The doubled interior verts and merged bands are the
+    /// load-bearing degeneracy (raw counts are the pin; the collapsed faces' loop
+    /// structure is a don't-care). The clamp routes `u = 0` here too.
+    #[test]
+    fn create_uvsphere_u_segments_one_collapsed_meridian() {
+        let mut mesh = LoopMesh::new();
+        let v = 6usize;
+        mesh.create_uvsphere(1, v as i32, 1.0, Mat4::IDENTITY, false);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (2 * v, 3 * v - 1, v),
+            "u=1 collapsed meridian: doubled interior verts, merged multi-edge meridian"
+        );
+
+        // Each interior ring carries two coincident verts at longitude 0 (+y).
+        for a in 1..v {
+            let phi = std::f64::consts::PI * (a as f64) / (v as f64);
+            let target = Vec3::new(0.0, phi.sin() as f32, phi.cos() as f32);
+            let coincident = mesh
+                .vert_keys()
+                .into_iter()
+                .filter(|&vert| (mesh.vertex_position(vert) - target).length() < EPS)
+                .count();
+            assert_eq!(coincident, 2, "ring a={a} carries two coincident verts");
+        }
+
+        // The clamp routes `u = 0` to the same degenerate build.
+        let mut clamped = LoopMesh::new();
+        clamped.create_uvsphere(0, v as i32, 1.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (clamped.vertex_count(), clamped.edge_count(), clamped.face_count()),
+            (2 * v, 3 * v - 1, v)
+        );
+
+        // A well-formed `u = 8` build differs.
+        let mut wellformed = LoopMesh::new();
+        wellformed.create_uvsphere(8, v as i32, 1.0, Mat4::IDENTITY, false);
+        assert_ne!(mesh.vertex_count(), wellformed.vertex_count());
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `u_segments = 2` — the **flat lens**. Two longitudes at
+    /// `θ = 0` and `θ = π` form a planar lens; the coincident opposite-longitude
+    /// band quads merge to `F = v`. `(V, E, F) = (2v, 3v − 1, v) = (12, 17, 6)` at
+    /// `v = 6` — the same count triple as `u = 1`, but a distinct (two-column)
+    /// mesh: two real longitude columns at `+y` and `−y`.
+    #[test]
+    fn create_uvsphere_u_segments_two_flat_lens() {
+        let mut mesh = LoopMesh::new();
+        let v = 6usize;
+        mesh.create_uvsphere(2, v as i32, 1.0, Mat4::IDENTITY, false);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (2 * v, 3 * v - 1, v),
+            "u=2 flat lens: coincident opposite-longitude band quads merge to F=v"
+        );
+
+        // Two real longitude columns (unlike u=1's single collapsed column): the
+        // first interior ring places one vertex at +y and one at −y.
+        let phi = std::f64::consts::PI / (v as f64);
+        let (s, c) = (phi.sin() as f32, phi.cos() as f32);
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, s, c)), "j=0 column at +y");
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, -s, c)), "j=1 column at -y");
+
+        // The lens keeps half the well-formed `u·v` faces (the coincident pairs
+        // welded), so it differs from an unwelded double count.
+        assert_eq!(mesh.face_count(), v);
+        mesh.validate_topology();
+    }
+
+    /// §7 degenerate `v_segments = 1` — the **bigon sphere**. One latitude segment
+    /// leaves the two poles joined by a single meridian edge; the sweep's bigon
+    /// faces fold entirely against the polar axis under the merge. The robust
+    /// full collapse (`u ≥ 5`) is `(V, E, F) = (2, 1, 0)`. The clamp routes
+    /// `v = 0` here too.
+    #[test]
+    fn create_uvsphere_v_segments_one_bigon_sphere() {
+        let mut mesh = LoopMesh::new();
+        mesh.create_uvsphere(6, 1, 1.0, Mat4::IDENTITY, false);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (2, 1, 0),
+            "v=1 bigon sphere: two poles joined by a single meridian edge, no faces"
+        );
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, 1.0)));
+        assert!(has_vertex_near(&mesh, Vec3::new(0.0, 0.0, -1.0)));
+
+        // The clamp routes `v = 0` to the same collapse.
+        let mut clamped = LoopMesh::new();
+        clamped.create_uvsphere(6, 0, 1.0, Mat4::IDENTITY, false);
+        assert_eq!(
+            (clamped.vertex_count(), clamped.edge_count(), clamped.face_count()),
+            (2, 1, 0)
+        );
         mesh.validate_topology();
     }
 }
