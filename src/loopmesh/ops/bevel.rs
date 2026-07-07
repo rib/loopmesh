@@ -1578,34 +1578,12 @@ impl LoopMesh {
             return false;
         }
         let vertex = self.vertex_position(cut.vertex);
-        let spokes = [
-            self.vertex_position(cut.boundverts[0]) - vertex,
-            self.vertex_position(cut.boundverts[1]) - vertex,
-            self.vertex_position(cut.boundverts[2]) - vertex,
+        let meet_points = [
+            self.vertex_position(cut.boundverts[0]),
+            self.vertex_position(cut.boundverts[1]),
+            self.vertex_position(cut.boundverts[2]),
         ];
-        let lengths = [spokes[0].length(), spokes[1].length(), spokes[2].length()];
-        let longest = lengths.iter().copied().fold(0.0_f32, f32::max);
-        if longest <= 1.0e-6 {
-            return false;
-        }
-        // Equal offset within tolerance: the three meet-point spokes are equal length.
-        let length_tol = longest * 1.0e-3;
-        if (lengths[0] - lengths[1]).abs() > length_tol
-            || (lengths[1] - lengths[2]).abs() > length_tol
-            || (lengths[2] - lengths[0]).abs() > length_tol
-        {
-            return false;
-        }
-        // Right-angle convex octant: each spoke pair meets at 60° (cos = ½).
-        let directions = [
-            spokes[0] / lengths[0],
-            spokes[1] / lengths[1],
-            spokes[2] / lengths[2],
-        ];
-        let cos_tol = 1.0e-3;
-        (directions[0].dot(directions[1]) - 0.5).abs() <= cos_tol
-            && (directions[1].dot(directions[2]) - 0.5).abs() <= cos_tol
-            && (directions[2].dot(directions[0]) - 0.5).abs() <= cos_tol
+        tri_corner_meet_geometry(vertex, &meet_points)
     }
 
     /// Dispatch the rounded adjacency-grid fill at one junction (BEVEL.md §8.5).
@@ -1928,11 +1906,14 @@ impl LoopMesh {
             let start = arc_end[k];
             let end = arc_start[next];
             let interior = self.build_chain_between(start, end, crossing, segments, profile, result);
-            cross.push(
-                *interior
-                    .first()
-                    .expect("a circular segments=2 cross-section has one interior sample"),
-            );
+            // A circular segments=2 cross-section has exactly one interior sample; a
+            // degenerate (collinear) chain that sampled none is outside the fillable
+            // regime, so decline the whole junction rather than panic (matching the
+            // sibling `build_adj_fill`'s graceful skip).
+            let Some(&sample) = interior.first() else {
+                return false;
+            };
+            cross.push(sample);
             chains.push(EdgeEndChain {
                 edge: crossing,
                 endpoint: vertex,
@@ -1952,19 +1933,24 @@ impl LoopMesh {
         true
     }
 
-    /// Build the inner-miter tri-corner [V-ADJ] fill (BEVEL.md §8.9.5): a six-quad
-    /// pinwheel over the enlarged arc-start ring, meeting at one welded central apex.
+    /// Build the inner-miter [V-ADJ] fill (BEVEL.md §8.9.5): the inner miter turns
+    /// each non-reflex sector into a two-boundvert arc, so the junction presents a
+    /// **six-boundvert** ring and is filled by the general non-symmetric adjacency
+    /// grid at valence `s = 6` (§8.5.5.5) — *not* the three-boundvert tri-corner
+    /// sphere snap (§8.5.2), which fires only for exactly three boundverts.
     ///
-    /// The enlarged rim alternates the six ring boundverts with their six interior
-    /// samples — per sector `k` the arc midpoint `arc_mid[k]` (between `B1` and `B3`)
-    /// and the strip cross-section sample `cross[k]` (between this sector's `B3` and
-    /// the next sector's `B1`). Each boundvert anchors one pinwheel quad spanning it,
-    /// its two flanking interior samples, and the apex (§8.9.5: the miter's extra
-    /// boundverts become extra columns of the same adjacency grid).
+    /// The enlarged rim alternates the six ring boundverts `B_i` with their six
+    /// mid-chain samples `m_i`: per sector `k` the arc bulge `arc_mid[k]` (between
+    /// `B1` and `B3`) and the strip cross-section `cross[k]` (between this sector's
+    /// `B3` and the next sector's `B1`). At `segments = 2` (`half = 1`, even) the grid
+    /// tiles as one six-quad pinwheel meeting a single welded apex, so this routes the
+    /// ring straight through the shared [`emit_adj_grid`](Self::emit_adj_grid) tiler.
     ///
-    /// The apex stays on the corner dome the no-miter case uses (§8.5.2): the sphere
-    /// through the three arc bulge midpoints (the §8.9.5 inscribed-arc samples) and a
-    /// cross sample, snapped along the body diagonal toward the junction.
+    /// The apex is the fullness-seeded, once-subdivided extraordinary centre of the
+    /// six-boundvert ring (§8.5.5.5(b)–(d)), carried in closed form for the even
+    /// `segments = 2` base (`adj_even_extraordinary_centre`): there is no sphere or
+    /// body-diagonal fit — the seed `centre_0 = centroid + fullness·(v − centroid)` is
+    /// pulled in by one valence-6 subdivision round.
     fn build_adj_fill_inner_miter(
         &mut self,
         mj: &MiterJunction,
@@ -1972,32 +1958,60 @@ impl LoopMesh {
         result: &mut BevelResult,
     ) {
         let count = mj.arc_start.len();
-        if count != 3 || mj.cross.len() != count {
+        if count != 3
+            || mj.arc_mid.len() != count
+            || mj.arc_end.len() != count
+            || mj.cross.len() != count
+        {
             return;
         }
 
+        // The six-boundvert ring in ring order: each sector contributes its arc start
+        // then its arc end, and the six mid-chain samples alternate the arc bulge
+        // (between a sector's own two boundverts) with the strip cross-section (between
+        // one sector's arc end and the next sector's arc start).
+        let sectors = 2 * count; // 6
+        let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors);
+        let mut mids: Vec<VertexKey> = Vec::with_capacity(sectors);
+        for k in 0..count {
+            boundverts.push(mj.arc_start[k]);
+            boundverts.push(mj.arc_end[k]);
+            mids.push(mj.arc_mid[k]);
+            mids.push(mj.cross[k]);
+        }
+        let boundvert_pos: Vec<Vec3> =
+            boundverts.iter().map(|&b| self.vertex_position(b)).collect();
+        let mid_pos: Vec<Vec3> = mids.iter().map(|&m| self.vertex_position(m)).collect();
+
         let vertex_position = self.vertex_position(mj.vertex);
-        let on_surface = [
-            self.vertex_position(mj.arc_mid[0]),
-            self.vertex_position(mj.arc_mid[1]),
-            self.vertex_position(mj.arc_mid[2]),
-            self.vertex_position(mj.cross[0]),
-        ];
-        let apex_position = match circumsphere(on_surface) {
-            Some((center, radius)) => {
-                let body_diagonal = (vertex_position - center).normalize_or_zero();
-                center + body_diagonal * radius
-            }
-            None => {
-                let sum: Vec3 = mj
-                    .arc_mid
-                    .iter()
-                    .fold(Vec3::ZERO, |acc, &m| acc + self.vertex_position(m));
-                sum / count as f32
-            }
-        };
-        let apex = self.create_vertex(apex_position);
-        result.verts.push(apex);
+        let apex_position = adj_even_extraordinary_centre(
+            vertex_position,
+            &boundvert_pos,
+            &mid_pos,
+            SABIN_GAMMA_6,
+        );
+
+        // Route the valence-6 grid topology through the shared adjacency-grid tiler.
+        // At `segments = 2` each sector is one cell whose inner corner is the welded
+        // apex; the tiler reuses the existing rim keys and mints only that apex.
+        let seg = 2usize;
+        let half = 1usize;
+        let mut chain_of: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
+        let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            let next = (i + 1) % sectors;
+            let prev = (i + sectors - 1) % sectors;
+            chain_of.push(vec![boundverts[i], mids[i], boundverts[next]]);
+            corners.push([boundvert_pos[i], mid_pos[i], mid_pos[prev], apex_position]);
+        }
+
+        // §8.5.5.5(b): the outward-winding anchor is an interior point below the cap on
+        // the solid side away from `v` (the fullness centre reflected through the rim
+        // centroid), so every cap face winds outward against it.
+        let centroid =
+            boundvert_pos.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
+        let fullness = adj_fullness(seg as u32);
+        let anchor = centroid - fullness * (vertex_position - centroid);
 
         let representative = self
             .vert_face_keys(mj.vertex)
@@ -2005,55 +2019,18 @@ impl LoopMesh {
             .map(|&face| self.face_material_index(face))
             .unwrap_or(0);
 
-        for k in 0..count {
-            let before = (k + count - 1) % count;
-            // The arc start `B1_k`: flanked by its arc midpoint and the strip sample
-            // across its opening edge (the previous sector's cross sample).
-            self.emit_pinwheel_quad(
-                vec![mj.arc_start[k], mj.arc_mid[k], apex, mj.cross[before]],
-                material,
-                representative,
-                result,
-            );
-            // The arc end `B3_k`: flanked by the strip sample across its closing edge
-            // and its arc midpoint.
-            self.emit_pinwheel_quad(
-                vec![mj.arc_end[k], mj.cross[k], apex, mj.arc_mid[k]],
-                material,
-                representative,
-                result,
-            );
-        }
-    }
-
-    /// Create one fill quad, wound opposite the existing loop on its first edge so
-    /// that shared edge stays radial-2 against the neighbour (re-stitched face or
-    /// strip) that already created it (BEVEL.md §5.1, the share-don't-flip rule).
-    fn emit_pinwheel_quad(
-        &mut self,
-        mut quad: Vec<VertexKey>,
-        material: i32,
-        representative: i32,
-        result: &mut BevelResult,
-    ) {
-        if let Some(edge) = self.query_edge_exists(quad[0], quad[1]) {
-            let runs_forward = self
-                .edge_loop_keys(edge)
-                .first()
-                .map(|&l| {
-                    let start = self.loop_vertex(l);
-                    let next = self.loop_vertex(self.loop_next(l));
-                    start == quad[0] && next == quad[1]
-                })
-                .unwrap_or(false);
-            if runs_forward {
-                quad.reverse();
-            }
-        }
-        let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-        self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Cap);
-        result.faces.push(face);
-        self.collect_face_edges(face, result);
+        self.emit_adj_grid(
+            sectors,
+            seg,
+            half,
+            true,
+            &chain_of,
+            &corners,
+            AdjPlacement::Fullness { anchor },
+            material,
+            representative,
+            result,
+        );
     }
 
     /// The (incoming, outgoing) edges of `face` meeting at `vertex` in the face's
@@ -4841,10 +4818,11 @@ fn corner_verts_coincide(positions: &[Vec3]) -> bool {
         .all(|&position| (position - first).length() <= 1.0e-4)
 }
 
-/// The §8.5.1 forced-tri-corner geometry test on three meet-point positions: equal
-/// spoke length and a mutually-60° convex octant (`cos = ½`), the same conditions
-/// `adj_tri_corner_trigger` reads off the boundvert ring (BEVEL.md §8.5.5.3), but on
-/// raw positions so the inner-miter classifier can run it before minting any vert.
+/// The §8.5.1 forced-tri-corner geometry test on three meet-point positions
+/// (BEVEL.md §8.5.5.3): equal spoke length and a mutually-60° convex octant
+/// (`cos = ½`). This is the single position-based predicate — `adj_tri_corner_trigger`
+/// feeds it the boundvert-ring positions, and the inner-miter classifier feeds it the
+/// raw meet-points before any vert is minted.
 fn tri_corner_meet_geometry(vertex_position: Vec3, meet_points: &[Vec3]) -> bool {
     if meet_points.len() != 3 {
         return false;
@@ -6928,17 +6906,17 @@ mod tests {
             0,
             "the bulge midpoint is pulled in — no vertex stays at the raw meet corner",
         );
-        // The welded apex stays on the corner body diagonal by the 3-fold symmetry of
-        // the tri-corner (a, -a, -a). NOTE: its exact magnitude is an open guide gap —
-        // §8.9.5 claims the §8.5 centre fit yields per-axis 0.85982 from the corrected
-        // bulge, but the documented circumsphere fit does not reproduce that (see the
-        // bevel.md miter row / report). We pin only the symmetry here, not the
-        // contested magnitude.
+        // §8.9.5: the welded apex is the fullness-seeded, once-subdivided
+        // extraordinary centre of the six-boundvert ring at valence `s = 6` — NOT a
+        // circumsphere / body-diagonal fit. Seed `centre_0 = centroid + 0.559·(v −
+        // centroid)` at 0.88240 per axis, pulled in to 0.859816 by one valence-6
+        // subdivision round (γ_6 = 0.523423277, sharpening mask (−1/6, +4/3, −1/6)).
         let apex_position = mesh.vertex_position(apex[0]);
-        let apex_axis = apex_position.x.abs();
+        let expected_apex = Vec3::new(0.859_816, -0.859_816, -0.859_816);
         assert!(
-            (apex_position - Vec3::new(apex_axis, -apex_axis, -apex_axis)).length() < 1.0e-4,
-            "the welded apex stays on the body diagonal",
+            (apex_position - expected_apex).length() < 1.0e-5,
+            "the welded apex sits at the §8.5.5.5 valence-6 extraordinary centre \
+             (0.859816, -0.859816, -0.859816), got {apex_position:?}",
         );
     }
 
@@ -11342,15 +11320,64 @@ impl AdjPlacement {
     }
 }
 
+/// The exact valence-6 Sabin extraordinary-point smoothing weight `γ_6` (BEVEL.md
+/// §8.5.5.5(c)): the real root `x` of `x³ + (4k² − 3)·x − 2k = 0` at `k = cos(π/6)`,
+/// fed through `γ_s = (k·x + 2k² − 1)/(x²·(k·x + 1))`. It is load-bearing to `1e-5`
+/// for the inner-miter apex (§8.9.5); the rounded `0.523` overshoots the position
+/// bucket by `≈4e-5`.
+const SABIN_GAMMA_6: f32 = 0.523_423_277;
+
 /// The §8.5.5.5(b) centre-fullness fit scalar for the **default circular** profile:
-/// a single constant in roughly `[0.55, 0.65]` rising with `segments`, with a small
-/// even/odd offset. It is a tabulated fit, not a per-vertex solve, and the centre it
-/// places is Tier-2 (non-unique, §8.5.5.7) — any in-band value is admissible; the
-/// offline per-offset refit for genuinely unequal offsets is deferred (§8.5.5.5(f)).
+/// an exact tabulated constant depending only on `segments` (separately for even and
+/// odd), not a per-vertex solve. The table does **not** rise monotonically — even
+/// counts sit lower than the odd counts that bracket them (§8.5.5.5(b)) — so it is
+/// pinned directly, not interpolated. The centre it seeds is Tier-2 (non-unique,
+/// §8.5.5.7); the offline per-offset refit for genuinely unequal offsets is deferred
+/// (§8.5.5.5(f)). `segments = 2 → 0.559` is the value the inner-miter apex of §8.9.5
+/// consumes.
 fn adj_fullness(segments: u32) -> f32 {
-    let rising = (0.55 + 0.012 * segments as f32).clamp(0.55, 0.65);
-    let parity_offset = if segments % 2 == 0 { 0.01 } else { -0.01 };
-    (rising + parity_offset).clamp(0.5, 0.7)
+    match segments {
+        0 | 1 | 2 => 0.559,
+        3 => 0.642,
+        4 => 0.551,
+        5 => 0.646,
+        6 => 0.624,
+        // Larger odd counts settle toward ≈0.647; even counts stay a touch lower.
+        _ if segments % 2 == 0 => 0.63,
+        _ => 0.647,
+    }
+}
+
+/// The even-`segments = 2` extraordinary-centre apex of a valence-`s` adjacency grid
+/// (BEVEL.md §8.5.5.5(b)–(d)), in closed form. `boundverts` are the `s` ring
+/// meet-points in ring order and `mids[i]` is the single mid-chain sample of the
+/// sector between `boundverts[i]` and `boundverts[(i+1) % s]`; `gamma_s` is the Sabin
+/// weight for valence `s`. Seeds the fullness centre, runs one subdivision round
+/// (boundary sharpening `(−1/6, +4/3, −1/6)`, per-sector face/edge points), and pulls
+/// the seed in through the valence-`s` extraordinary-centre stencil `apex = E −
+/// γ_s·F + γ_s·centre_0`. The even resample keeps this subdivided centre verbatim.
+fn adj_even_extraordinary_centre(vertex: Vec3, boundverts: &[Vec3], mids: &[Vec3], gamma_s: f32) -> Vec3 {
+    let s = boundverts.len();
+    let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / s as f32;
+    let centre_0 = centroid + adj_fullness(2) * (vertex - centroid);
+
+    // The curvature-*sharpening* three-tap `(−1/6, +4/3, −1/6)`: negative neighbour
+    // weights pull each sample a sixth *away* from the mean of its chain neighbours.
+    let sharpened: Vec<Vec3> = (0..s)
+        .map(|i| {
+            let sample = mids[i];
+            sample - (1.0 / 6.0) * (boundverts[i] + boundverts[(i + 1) % s] - 2.0 * sample)
+        })
+        .collect();
+    let face: Vec<Vec3> = (0..s)
+        .map(|i| 0.25 * (boundverts[i] + sharpened[i] + sharpened[(i + s - 1) % s] + centre_0))
+        .collect();
+    let edge: Vec<Vec3> = (0..s)
+        .map(|i| 0.25 * (sharpened[i] + centre_0 + face[i] + face[(i + 1) % s]))
+        .collect();
+    let mean_edge = edge.iter().fold(Vec3::ZERO, |acc, &e| acc + e) / s as f32;
+    let mean_face = face.iter().fold(Vec3::ZERO, |acc, &f| acc + f) / s as f32;
+    mean_edge - gamma_s * mean_face + gamma_s * centre_0
 }
 
 /// The sphere (center, radius) through four points (BEVEL.md §8.5.2: the rounded
