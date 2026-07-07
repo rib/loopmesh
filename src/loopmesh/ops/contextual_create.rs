@@ -99,7 +99,11 @@ impl LoopMesh {
             }
         }
         let totv = verts.len();
-        let tote = edges.len();
+        // §3 — the count of *selected* edges. `edges` is later reassigned to the
+        // prepared/working fill net (§6), which can be larger than the selection,
+        // so §8's `tote > 2` guard must key off this dedicated counter, not
+        // `edges.len()`. Its only sanctioned increment is §5's `+2` chain closure.
+        let mut tote = edges.len();
         let totf = faces.len();
 
         // §4 — two verts make an edge. Terminal: report the (no-duplicate) edge
@@ -121,6 +125,9 @@ impl LoopMesh {
             {
                 edges.push(self.create_edge([free, endpoint_a], EdgeCreateFlags::NO_DUPLICATE));
                 edges.push(self.create_edge([free, endpoint_b], EdgeCreateFlags::NO_DUPLICATE));
+                // §5 — the two chain-closure edges are the only sanctioned bump
+                // to the selected-edge count the §8 guard reads.
+                tote += 2;
             }
         }
 
@@ -167,7 +174,9 @@ impl LoopMesh {
         // §8 — edgeloop-fill fallback for a closed loop around existing geometry
         // that edge-net fill's minimal-cycle walk could not close. Inherits /
         // leaves default material (the caller's knobs are *not* stamped here, §1).
-        if edges.len() > 2 {
+        // §8 guards on `tote` (the §3 selected-edge count, +2 if §5 fired), not
+        // the working net `edges`, which §6's prepare may have grown past `tote`.
+        if tote > 2 {
             let filled = self.edgeloop_fill(&edges, &EdgeloopFillParams::default());
             if !filled.is_empty() {
                 result.faces = filled.faces().to_vec();
@@ -464,6 +473,69 @@ mod tests {
         assert_eq!(mesh.edge_count(), 4, "one bridge edge added by prepare");
         assert!(mesh.query_edge_exists(v0, v3).is_some(), "the chain ends are bridged");
         assert_eq!(mesh.face_len(out.faces()[0]), 4, "a quad cap");
+        mesh.validate_topology();
+    }
+
+    fn build_two_quads(mesh: &mut LoopMesh) -> Vec<EdgeKey> {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        mesh.face_create_verts(&[v0, v1, v4, v3], FaceCreateFlags::NO_DUPLICATE);
+        mesh.face_create_verts(&[v1, v2, v5, v4], FaceCreateFlags::NO_DUPLICATE);
+        [(v0, v1), (v1, v2), (v2, v5), (v5, v4), (v4, v3), (v3, v0)]
+            .iter()
+            .map(|&(a, b)| mesh.query_edge_exists(a, b).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn edgenet_declines_on_overlap_so_edgeloop_fill_is_reached() {
+        // The load-bearing routing pin for §8: the enclosing hexagon of the
+        // two-quad region overlaps the already-faced surface, so §6 edge-net fill
+        // must **decline** (its minimal-cycle walk is blocked by the faced edges)
+        // and §8 edgeloop fill must succeed — proven here on independent meshes so
+        // the two sub-op calls don't share state.
+        let mut net_mesh = LoopMesh::new();
+        let net_ring = build_two_quads(&mut net_mesh);
+        let net = net_mesh.edgenet_fill(
+            &net_ring,
+            &EdgenetFillParams { mat_nr: 0, use_smooth: false, sides: usize::MAX },
+        );
+        assert!(net.is_empty(), "§6 edge-net fill declines on the overlapping ring");
+
+        let mut loop_mesh = LoopMesh::new();
+        let loop_ring = build_two_quads(&mut loop_mesh);
+        let filled = loop_mesh.edgeloop_fill(&loop_ring, &EdgeloopFillParams::default());
+        assert_eq!(filled.faces().len(), 1, "§8 edgeloop fill caps the ring");
+    }
+
+    #[test]
+    fn edge_loop_around_surface_edgeloop_fills_shadow_ngon() {
+        // §6 declines / §8 fills — two adjacent coplanar quads share the interior
+        // edge v1-v4; the six *outer* boundary edges form an enclosing hexagon
+        // that overlaps the already-faced two-quad region. Edge-net fill (§6)
+        // declines on that overlap, the cascade falls through §7, and edgeloop
+        // fill (§8) caps the ring with one shadow n-gon. No vert / edge created;
+        // +1 face.
+        let mut mesh = LoopMesh::new();
+        let outer_edges = build_two_quads(&mut mesh);
+        assert_eq!(mesh.edge_count(), 7, "two quads share one interior edge");
+        assert_eq!(mesh.face_count(), 2);
+
+        // The six outer boundary edges (the hexagon); the interior v1-v4 is left
+        // unselected.
+        let geom: Vec<GeomKey> = outer_edges.iter().map(|&e| e.into()).collect();
+
+        let out = mesh.contextual_create(&geom, ContextualCreateParams::default());
+
+        assert_eq!(out.faces().len(), 1, "§8 edgeloop fill caps the ring with one n-gon");
+        assert_eq!(mesh.face_len(out.faces()[0]), 6, "the shadow cap spans the hexagon");
+        assert_eq!(mesh.vertex_count(), 6, "no vertex created");
+        assert_eq!(mesh.edge_count(), 7, "no edge created (the ring is reused)");
+        assert_eq!(mesh.face_count(), 3, "the shadow n-gon is added over the two quads");
         mesh.validate_topology();
     }
 
