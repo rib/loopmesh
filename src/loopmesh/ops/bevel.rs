@@ -1665,14 +1665,17 @@ impl LoopMesh {
         // cube corner has the closed-form sphere of radius `offset` to snap onto, so
         // it keeps the dedicated cube-corner path (the `segments = 2` pinwheel below
         // and the larger-`segments` sphere grid). Every other junction — a valence-`s`
-        // (`s ≠ 3`) corner, or an oblique / irregular-ring valence-3 corner — has no
+        // (`s ≠ 3`) corner, or an oblique / irregular-ring valence-3 corner (§7.6.6,
+        // e.g. a reflex sector whose dihedral fold fails the tri-corner test) — has no
         // such sphere; at the same circular profile and equal offsets it routes into
         // the general valence-`s` fullness-relaxation grid (§8.5.5.5) instead of
-        // declining — only `segments ≥ 3` (the coarse net is itself the
-        // `segments = 2` resolution, out of scope this cycle).
+        // declining. The general fill runs even at `segments = 2`: it subdivides its
+        // coarse net once before resampling (§8.5.5.5(d)), so a declined-tri-corner
+        // `segments = 2` ring gets the centre-vertex pinwheel cap here rather than an
+        // unfilled hole. Only `segments < 2` has no interior grid to fill.
         if !self.adj_tri_corner_trigger(cut, profile) {
             match segments {
-                0 | 1 | 2 => return,
+                0 | 1 => return,
                 _ => {
                     self.build_adj_fill_general_nonsymmetric(cut, chains, segments, material, result);
                     return;
@@ -2537,14 +2540,35 @@ impl LoopMesh {
         let vertex_position = self.vertex_position(cut.vertex);
 
         // §8.5.5.5(b): the centre-fullness blend. `centroid` is the mean of the `s`
-        // boundverts (the `(i, 0, 0)` ring corners); `centre` is pulled a `fullness`
-        // fraction back toward the original corner `v`.
+        // boundverts (the `(i, 0, 0)` ring corners); the fullness seed is pulled a
+        // `fullness` fraction back toward the original corner `v`.
         let centroid = chain_of
             .iter()
             .fold(Vec3::ZERO, |acc, chain| acc + self.vertex_position(chain[0]))
             / sectors as f32;
         let fullness = adj_fullness(segments);
-        let centre = centroid + fullness * (vertex_position - centroid);
+        let fullness_seed = centroid + fullness * (vertex_position - centroid);
+
+        // §8.5.5.5(d): the general fill subdivides its coarse net once even at
+        // `segments = 2`, and the even resample keeps that once-subdivided centre
+        // verbatim — the extra round pulls the fullness seed in toward the
+        // subdivision-limit position (the §8.9.5 apex pull-in mechanism). So the
+        // even `segments = 2` welded centre is the extraordinary-point stencil applied
+        // to the seed, not the raw seed itself. Larger even counts keep the raw seed
+        // (their multi-round relaxation is the deferred §8.5.5.5(f) refit).
+        let centre = if even && seg == 2 {
+            let boundverts: Vec<Vec3> = chain_of
+                .iter()
+                .map(|chain| self.vertex_position(chain[0]))
+                .collect();
+            let mids: Vec<Vec3> = chain_of
+                .iter()
+                .map(|chain| self.vertex_position(chain[half]))
+                .collect();
+            adj_even_extraordinary_centre(vertex_position, &boundverts, &mids, sabin_gamma(sectors))
+        } else {
+            fullness_seed
+        };
 
         // The face-winding anchor (§8.5.5): an interior point *below* the cap, on
         // the solid side away from `v`. The corner sphere centre played this role at
@@ -7113,6 +7137,84 @@ mod tests {
             },
         );
         (mesh, result)
+    }
+
+    /// BEVEL.md §7.6.6: the base **sharp** bevel (no miter engaged) of a reflex
+    /// valence-3 junction still closes. The far-side reflex boundvert makes the
+    /// boundvert ring oblique, so the closed-form tri-corner snap declines and the
+    /// cap routes to the general §8.5.5.5 adjacency grid, which fills the junction
+    /// with a centre vertex + one quad per sector even at `segments = 2` rather than
+    /// leaving the reflex gap an open hole. The load-bearing signal is the Euler
+    /// characteristic: a dropped reflex cap reads as χ = 1 (one boundary loop); the
+    /// closed junction is χ = 2.
+    #[test]
+    fn base_sharp_reflex_junction_closes_at_segments2() {
+        let (mesh, result) = reflex_apex_outer_miter(BevelMiter::Sharp);
+        mesh.validate_topology();
+
+        // §7.6.6 oracle: 17 V / 28 E / 13 F, a closed manifold.
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!(
+            (vertices, edges, faces),
+            (17, 28, 13),
+            "sharp reflex junction total element counts (§7.6.6)",
+        );
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "the closed sharp reflex bevel is χ = 2, not the χ = 1 open hole (§7.6.6)",
+        );
+
+        // The apex cap carries one welded centre vertex at the once-subdivided
+        // fullness position (§8.5.5.5(d); the raw seed sits nearer ≈(0, 0.102,
+        // 0.921)). Its exact position is Tier-2, so pin it loosely.
+        // The apex cap is the §8.5.5.5(a) three-quad pinwheel: one welded centre
+        // vertex where exactly three cap faces meet, every one a quad. The centre is
+        // the sole new (result) vertex with exactly three incident faces that are all
+        // quads — the terminal-endpoint verts also carry three faces but include the
+        // absorbing triangles, and the chain / boundvert samples carry four. Its exact
+        // position is a Tier-2 interior (§8.5.5.7) that still trails the deferred
+        // reflex-boundvert positioning residual, so it is not pinned here.
+        let centre_hubs: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                let incident: Vec<FaceKey> = mesh
+                    .face_keys()
+                    .into_iter()
+                    .filter(|&face| mesh.face_vert_keys(face).contains(&candidate))
+                    .collect();
+                incident.len() == 3
+                    && incident
+                        .iter()
+                        .all(|&face| mesh.face_vert_keys(face).len() == 4)
+            })
+            .collect();
+        assert_eq!(
+            centre_hubs.len(),
+            1,
+            "the reflex junction closes on exactly one welded centre vertex (§8.5.5.5(a))",
+        );
+        let centre = centre_hubs[0];
+
+        let cap_faces: Vec<FaceKey> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&face| mesh.face_vert_keys(face).contains(&centre))
+            .collect();
+        assert_eq!(
+            cap_faces.len(),
+            3,
+            "three cap quads meet at the welded centre (§8.5.5.5(a))",
+        );
+        for face in cap_faces {
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "each reflex-junction cap face is a quad",
+            );
+        }
     }
 
     /// BEVEL.md §8.9.2 / §8.9.5: `miter_outer = Arc` at a reflex `s = 3` junction rounds
