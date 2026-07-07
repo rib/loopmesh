@@ -5076,6 +5076,78 @@ mod tests {
             .count()
     }
 
+    /// True when two meshes carry the same set of vertex positions (as a
+    /// multiset), matched greedily within `tol`. Position-keyed rather than
+    /// key-keyed because two independent builds may assign different internal
+    /// element keys while producing identical geometry.
+    fn positions_multiset_eq(a: &LoopMesh, b: &LoopMesh, tol: f32) -> bool {
+        let positions_a: Vec<Vec3> = a.vert_keys().iter().map(|&v| a.vertex_position(v)).collect();
+        let mut positions_b: Vec<Vec3> =
+            b.vert_keys().iter().map(|&v| b.vertex_position(v)).collect();
+        if positions_a.len() != positions_b.len() {
+            return false;
+        }
+        for target in &positions_a {
+            match positions_b.iter().position(|q| (*q - *target).length() < tol) {
+                Some(i) => {
+                    positions_b.swap_remove(i);
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Two position cycles are equal up to rotation and reflection (a face is a
+    /// cycle, so both are free), matched pointwise within `tol`.
+    fn cycle_matches(a: &[Vec3], b: &[Vec3], tol: f32) -> bool {
+        let n = a.len();
+        if b.len() != n || n == 0 {
+            return b.len() == n;
+        }
+        for &reversed in &[false, true] {
+            let candidate: Vec<Vec3> = if reversed {
+                b.iter().rev().copied().collect()
+            } else {
+                b.to_vec()
+            };
+            for start in 0..n {
+                if (0..n).all(|i| (a[i] - candidate[(start + i) % n]).length() < tol) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// True when two meshes carry the same set of faces (as a multiset), each
+    /// face compared as its position cycle up to rotation/reflection within
+    /// `tol`. Discriminates real geometry, not just per-face vertex counts.
+    fn faces_match(a: &LoopMesh, b: &LoopMesh, tol: f32) -> bool {
+        let face_cycle = |mesh: &LoopMesh, f: FaceKey| -> Vec<Vec3> {
+            mesh.face_vert_keys(f)
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect()
+        };
+        let faces_a: Vec<Vec<Vec3>> =
+            a.face_keys().iter().map(|&f| face_cycle(a, f)).collect();
+        let mut faces_b: Vec<Vec<Vec3>> =
+            b.face_keys().iter().map(|&f| face_cycle(b, f)).collect();
+        if faces_a.len() != faces_b.len() {
+            return false;
+        }
+        for face in &faces_a {
+            match faces_b.iter().position(|other| cycle_matches(face, other, tol)) {
+                Some(i) => {
+                    faces_b.swap_remove(i);
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// BEVEL.md §4.4.3: beveling the two shared-edge endpoints of the cube with
     /// `clamp_overlap = true` at `offset = 1.5` reduces the effective offset to
     /// `1.0` (clamp factor `1.0 / 1.5`), so every ring vert slides exactly `1.0`
@@ -6931,7 +7003,25 @@ mod tests {
         let spread = 0.1;
         let (arc_mesh, _arc) = cube_corner_adj_segments2_inner_miter(BevelMiter::Arc, spread);
         let (patch_mesh, _patch) = cube_corner_adj_segments2_inner_miter(BevelMiter::Patch, spread);
+        arc_mesh.validate_topology();
         patch_mesh.validate_topology();
+
+        // §8.9.3: at an inner (non-reflex) sector `Patch` runs the identical
+        // arc-start construction as `Arc`, so the two meshes are the same up to
+        // element relabelling — equal vertex-position multiset AND equal face
+        // structure, not merely equal element counts.
+        const TOL: f32 = 1.0e-5;
+        assert!(
+            positions_multiset_eq(&arc_mesh, &patch_mesh, TOL),
+            "inner Patch and Arc yield identical vertex-position multisets (§8.9.3)",
+        );
+        assert!(
+            faces_match(&arc_mesh, &patch_mesh, TOL),
+            "inner Patch and Arc yield identical face structure up to relabelling (§8.9.3)",
+        );
+        // Complements the geometric compares: element counts also observe wire /
+        // stray edges (belonging to no face) that the position/face-multiset
+        // checks would miss.
         assert_eq!(
             counts(&arc_mesh),
             counts(&patch_mesh),
