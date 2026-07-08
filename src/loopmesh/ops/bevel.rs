@@ -1906,11 +1906,16 @@ impl LoopMesh {
         if count < 3 {
             return;
         }
-        // Curved / square / square-in / custom profiles take a dedicated non-smooth
-        // grid the rounded subdivision path does not cover (§8.5.5.5(f)); only the
-        // default circular profile (`r = 2`) fills here. Both the cube-corner sphere
-        // snap and the general fullness cap are distilled for the circular default.
-        if profile_to_exponent(profile) != 2.0 {
+        // Square / square-in / general-curved profiles take a dedicated non-smooth
+        // grid the rounded subdivision path does not cover (§8.5.5.5(f)). Two profile
+        // exponents fill here: the circular default (`r = 2`, for which both the
+        // cube-corner sphere snap and the general fullness cap are distilled) and the
+        // flat/straight-chord (`r = 1`, §8.3.0.2.1). The flat case fills only through
+        // the general fullness cap below at its `fullness = 0` planar specialisation —
+        // the tri-corner sphere trigger declines any non-circular profile, so a flat
+        // corner always routes to the general cap rather than the sphere snap.
+        let exponent = profile_to_exponent(profile);
+        if exponent != 2.0 && exponent != 1.0 {
             return;
         }
         // §8.5.1 forced-tri-corner trigger. The symmetric equal-offset *orthonormal*
@@ -1929,7 +1934,7 @@ impl LoopMesh {
             match segments {
                 0 | 1 => return,
                 _ => {
-                    self.build_adj_fill_general_nonsymmetric(cut, chains, segments, material, result);
+                    self.build_adj_fill_general_nonsymmetric(cut, chains, segments, profile, material, result);
                     return;
                 }
             }
@@ -2816,6 +2821,7 @@ impl LoopMesh {
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: u32,
+        profile: f32,
         material: i32,
         result: &mut BevelResult,
     ) {
@@ -2847,7 +2853,14 @@ impl LoopMesh {
             .iter()
             .fold(Vec3::ZERO, |acc, chain| acc + self.vertex_position(chain[0]))
             / sectors as f32;
-        let fullness = adj_fullness(segments);
+        // §8.5.5.5(b) / §8.3.0.2.1: the flat straight-chord profile (`r = 1`) is the
+        // `fullness = 0` planar specialisation. The cap lies in the boundvert ring
+        // plane, so the centre pins to the boundvert centroid with no bulge toward
+        // the corner `v` and no extraordinary-centre relaxation — the round path's
+        // fullness bulge is *retained but zeroed* here, not suppressed. Every other
+        // filled profile (the circular default) keeps the tabulated fullness seed.
+        let flat = profile_to_exponent(profile) == 1.0;
+        let fullness = if flat { 0.0 } else { adj_fullness(segments) };
         let fullness_seed = centroid + fullness * (vertex_position - centroid);
 
         // §8.5.5.5(d): the general fill subdivides its coarse net once even at
@@ -2856,8 +2869,12 @@ impl LoopMesh {
         // subdivision-limit position (the §8.9.5 apex pull-in mechanism). So the
         // even `segments = 2` welded centre is the extraordinary-point stencil applied
         // to the seed, not the raw seed itself. Larger even counts keep the raw seed
-        // (their multi-round relaxation is the deferred §8.5.5.5(f) refit).
-        let centre = if even && seg == 2 {
+        // (their multi-round relaxation is the deferred §8.5.5.5(f) refit). The flat
+        // cap skips the stencil entirely: its planar relaxation keeps the centre on the
+        // ring-plane centroid (§8.3.0.2.1).
+        let centre = if flat {
+            fullness_seed
+        } else if even && seg == 2 {
             let boundverts: Vec<Vec3> = chain_of
                 .iter()
                 .map(|chain| self.vertex_position(chain[0]))
@@ -2872,10 +2889,18 @@ impl LoopMesh {
         };
 
         // The face-winding anchor (§8.5.5): an interior point *below* the cap, on
-        // the solid side away from `v`. The corner sphere centre played this role at
-        // the cube corner; here we reflect the fullness centre through the rim
-        // centroid so `centroid_face − anchor` points outward for every cap face.
-        let anchor = centroid - fullness * (vertex_position - centroid);
+        // the solid side away from `v`, so `centroid_face − anchor` points outward for
+        // every cap face. The corner sphere centre played this role at the cube corner;
+        // the round path reflects the fullness centre through the rim centroid. The
+        // flat cap's `fullness = 0` would collapse that anchor onto the in-plane
+        // centroid — an undefined winding reference for a planar cap — so it reflects
+        // the original corner `v` through the centroid instead, a point clearly on the
+        // solid side of the ring plane.
+        let anchor = if flat {
+            centroid - (vertex_position - centroid)
+        } else {
+            centroid - fullness * (vertex_position - centroid)
+        };
 
         // A small in-cap length used to spread the odd central `s`-gon verts.
         let cap_scale = chain_of
@@ -7553,6 +7578,114 @@ mod tests {
             })
             .collect();
         assert_eq!(ring.len(), 6, "six corner verts form the corrected apex ring");
+    }
+
+    /// BEVEL.md §8.3.0.2.1 / §8.5.5.5(b): the fully-surrounded valence-6 apex under
+    /// the **flat straight-chord** profile (`profile = 0.25`, `r = 1`) takes the
+    /// general ADJ fullness cap at its `fullness = 0` planar specialisation. Beveling
+    /// the six top spokes of a regular hexagonal bipyramid at `offset = 0.25`,
+    /// `segments = 2`, ADJ closes the apex with a planar hexagonal cap: one centre
+    /// vert pinned to the boundvert ring plane at the ring centroid `(0, 0, 0.465478)`
+    /// (no fullness bulge) and six vmesh quads fanning around it — not an open
+    /// hexagonal hole. This pins the fix for the previously-dropped flat ADJ centre.
+    #[test]
+    fn adj_flat_profile_valence6_apex_centre_and_cap() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, _bottom) = hexagonal_bipyramid(&mut mesh);
+        let spokes: [EdgeKey; 6] =
+            std::array::from_fn(|k| mesh.query_edge_exists(top, rim[k]).expect("top spoke"));
+        let result = mesh.bevel(
+            &spokes.map(Into::into),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                profile: 0.25,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The ring-plane centroid, retained flat (§8.3.0.2.1) — not the round profile's
+        // bulged-up centre.
+        let flat_centre = Vec3::new(0.0, 0.0, 0.465_478);
+        let round_centre = Vec3::new(0.0, 0.0, 0.703_618);
+
+        let centre_verts: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - flat_centre).length() < 1.0e-4)
+            .collect();
+        assert_eq!(
+            centre_verts.len(),
+            1,
+            "the flat ADJ apex centre lands at the ring-plane centroid (0, 0, 0.465478)",
+        );
+        let centre = centre_verts[0];
+
+        let bulged = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - round_centre).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            bulged, 0,
+            "the flat centre is not bulged to the round profile's fullness position",
+        );
+
+        // Six vmesh quads fan around the centre, closing the cap (no open hole).
+        let cap_faces: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&f| mesh.face_vert_keys(f).contains(&centre))
+            .collect();
+        assert_eq!(cap_faces.len(), 6, "six vmesh quads fan around the flat apex centre");
+        for &f in &cap_faces {
+            assert_eq!(mesh.face_vert_keys(f).len(), 4, "each apex cap face is a quad");
+        }
+    }
+
+    /// BEVEL.md §8.3.0.2.1 regression guard: the **round** profile (`profile = 0.5`,
+    /// the default) apex centre stays **bulged** up off the boundvert ring plane at
+    /// `(0, 0, 0.703618)` (its fullness>0 extraordinary-centre position), unperturbed
+    /// by the flat-profile fix. The flat ring-plane centroid must *not* appear.
+    #[test]
+    fn adj_round_profile_valence6_apex_centre_unperturbed() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, _bottom) = hexagonal_bipyramid(&mut mesh);
+        let spokes: [EdgeKey; 6] =
+            std::array::from_fn(|k| mesh.query_edge_exists(top, rim[k]).expect("top spoke"));
+        let result = mesh.bevel(
+            &spokes.map(Into::into),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let round_centre = Vec3::new(0.0, 0.0, 0.703_618);
+        let flat_centre = Vec3::new(0.0, 0.0, 0.465_478);
+
+        let bulged = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - round_centre).length() < 1.0e-4)
+            .count();
+        assert_eq!(bulged, 1, "the round ADJ apex centre stays bulged at (0, 0, 0.703618)");
+
+        let flattened = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - flat_centre).length() < 1.0e-4)
+            .count();
+        assert_eq!(flattened, 0, "the round centre is not pinned to the flat ring plane");
     }
 
     /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
