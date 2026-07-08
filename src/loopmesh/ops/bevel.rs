@@ -3152,9 +3152,11 @@ impl LoopMesh {
     }
 
     /// One boundvert's down-pushed corner-vert position (BEVEL.md §8.3.3): `B_k`
-    /// plus the cross of the two adjacent sectors' mid-plane normals (the fold
-    /// crease), scaled by the average of the two profiles' `height/√2`, oriented
-    /// into the corner.
+    /// plus the **raw** cross of the two adjacent sectors' mid-plane normals (the
+    /// fold crease, whose own length is `sin θ`), scaled by the average of the two
+    /// profiles' `height/√2`, oriented into the corner. The true displacement
+    /// distance is therefore `sin θ · (height/√2)` — the `sin θ` from the
+    /// un-normalised crease is load-bearing (§8.3.3.1).
     fn corner_vert_position(
         &self,
         cut: &JunctionCut,
@@ -3190,11 +3192,16 @@ impl LoopMesh {
             .map(|c| (c.mid_plane_normal, c.height()))
             .unwrap_or((Vec3::ZERO, 0.0));
 
+        // §8.3.3: the fold-crease direction is the RAW cross product of the two
+        // adjacent unit mid-plane normals. Its magnitude is `sin θ` (θ = dihedral
+        // between those mid-planes), and that `sin θ` is *part of the push distance*
+        // — the height scalar below is scaled by it. Re-normalising to unit length
+        // silently drops the factor and over-pushes every corner by `1 / sin θ`
+        // (§8.3.3.1). Keep it raw; only flip its sign to point into the corner.
         let mut down = normal_before.cross(normal_after);
         if down.length_squared() <= 1.0e-12 {
             return boundvert_position;
         }
-        down = down.normalize();
         if down.dot(cut.outward) > 0.0 {
             down = -down;
         }
@@ -7454,6 +7461,98 @@ mod tests {
             curved_min_z < chord_min_z - 1.0e-4,
             "the curved down-push drives corners below the undisplaced chord ring",
         );
+    }
+
+    /// A closed regular hexagonal bipyramid (BEVEL.md §8.3.3.1 worked example): a
+    /// top apex at `(0, 0, 1)`, a bottom apex at `(0, 0, -1)`, and six rim verts at
+    /// radius 1 in the `z = 0` plane at `0°, 60°, … , 300°`. Twelve triangular
+    /// faces close the solid. Returns `(top, [r0..r5], bottom)`.
+    fn hexagonal_bipyramid(mesh: &mut LoopMesh) -> (VertexKey, [VertexKey; 6], VertexKey) {
+        fn add_tri(mesh: &mut LoopMesh, tri: [VertexKey; 3]) {
+            let edges = [
+                mesh.create_edge([tri[0], tri[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([tri[1], tri[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([tri[2], tri[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&tri, &edges, FaceCreateFlags::NONE);
+        }
+
+        let top = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let bottom = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
+        let rim = std::array::from_fn(|k| {
+            let angle = k as f32 * std::f32::consts::TAU / 6.0;
+            mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+        });
+        for k in 0..6 {
+            let a = rim[k];
+            let b = rim[(k + 1) % 6];
+            add_tri(mesh, [top, a, b]);
+            add_tri(mesh, [bottom, b, a]);
+        }
+        (top, rim, bottom)
+    }
+
+    /// BEVEL.md §8.3.3.1: the valence-6 closed-apex ring is the fixture that pins
+    /// the un-normalised `sin θ` fold-crease push. Beveling all six top spokes of a
+    /// regular hexagonal bipyramid at `offset = 0.25`, `segments = 2`, default round
+    /// profile produces a six-sector cutoff patch whose interior corner ring must
+    /// land at radius `0.396095`, height `0.407614` — the `+30°` boundvert's corner
+    /// vert at `(0.343028, 0.198047, 0.407614)`. Normalising the down direction
+    /// (dropping `sin θ = 0.661438`) over-pushes by `1 / sin θ ≈ 1.512×`, landing
+    /// the ring at `(0.313410, 0.180948, 0.377997)` instead — this test fails under
+    /// that bug and passes only with the raw crease.
+    #[test]
+    fn cutoff_valence6_apex_ring_carries_sin_theta_push() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, _bottom) = hexagonal_bipyramid(&mut mesh);
+        let spokes: [EdgeKey; 6] =
+            std::array::from_fn(|k| mesh.query_edge_exists(top, rim[k]).expect("top spoke"));
+        let result = mesh.bevel(
+            &spokes.map(Into::into),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let expected = Vec3::new(0.343_028, 0.198_047, 0.407_614);
+        let over_pushed = Vec3::new(0.313_410, 0.180_948, 0.377_997);
+
+        let at_expected = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - expected).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            at_expected, 1,
+            "the +30° corner vert lands at the sin θ-scaled ring position",
+        );
+
+        let at_over_pushed = result
+            .verts
+            .iter()
+            .filter(|&&v| (mesh.vertex_position(v) - over_pushed).length() < 1.0e-4)
+            .count();
+        assert_eq!(
+            at_over_pushed, 0,
+            "no corner vert sits at the normalised (1/sin θ over-pushed) position",
+        );
+
+        // The whole interior ring shares the corrected radius/height, six-fold.
+        let ring: Vec<Vec3> = result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|p| {
+                let radius = (p.x * p.x + p.y * p.y).sqrt();
+                (radius - 0.396_095).abs() < 1.0e-4 && (p.z - 0.407_614).abs() < 1.0e-4
+            })
+            .collect();
+        assert_eq!(ring.len(), 6, "six corner verts form the corrected apex ring");
     }
 
     /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
