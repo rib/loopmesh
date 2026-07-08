@@ -716,6 +716,18 @@ impl LoopMesh {
         self.vertex_kill(vertex);
     }
 
+    /// Whether a beveled endpoint is **loose** (BEVEL.md §5.1.1): every edge on
+    /// its disk is radial-empty, so no live face still references it. §5.1.1's
+    /// free step assumes every incident face was re-stitched off the endpoint,
+    /// which holds at a terminal whose whole fan was beveled but *not* on a
+    /// closed solid, where a terminal endpoint can stay incident to unbeveled
+    /// faces after the strip build. Those endpoints are kept, not freed — the
+    /// condition `free_loose_vertex` asserts, read here as a gate instead.
+    fn vertex_is_loose(&self, vertex: VertexKey) -> bool {
+        self.iter_disk_edges(vertex)
+            .all(|edge| self.edge_radial_iter(edge).next().is_none())
+    }
+
     /// Edge bevel where two or more beveled edges meet at one or more **junction**
     /// vertices (BEVEL.md §7.6). Places every near-corner vert (boundverts at
     /// junctions, strip verts at terminal endpoints) and far-corner strip vert
@@ -1169,9 +1181,14 @@ impl LoopMesh {
             }
         }
 
-        // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
+        // Phase 5: free each consumed endpoint that the strip build actually left
+        // loose (§5.1.1). On a closed solid a terminal endpoint can remain incident
+        // to unbeveled faces (its disk still carries live radial faces) — that vert
+        // is kept, matching the reference operator, rather than force-freed.
         for &endpoint in &endpoints {
-            self.free_loose_vertex(endpoint);
+            if self.vertex_is_loose(endpoint) {
+                self.free_loose_vertex(endpoint);
+            }
         }
     }
 
@@ -8706,6 +8723,122 @@ mod tests {
             },
         );
         (mesh, result, corner)
+    }
+
+    /// A closed square bipyramid (octahedron): two apexes over a square rim, all
+    /// eight triangular faces present. Beveling one apex's four spokes leaves the
+    /// rim verts as valence-4 **terminals** still incident to the opposite apex's
+    /// (unbeveled) faces — the closed-solid case §5.1.1's loose-free premise does
+    /// not cover. Returns `(top_apex, [r0, r1, r2, r3], bottom_apex)`.
+    fn square_bipyramid(mesh: &mut LoopMesh) -> (VertexKey, [VertexKey; 4], VertexKey) {
+        fn add_tri(mesh: &mut LoopMesh, tri: [VertexKey; 3]) {
+            let edges = [
+                mesh.create_edge([tri[0], tri[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([tri[1], tri[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([tri[2], tri[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&tri, &edges, FaceCreateFlags::NONE);
+        }
+
+        let top = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let bottom = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
+        let rim = [
+            mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0)),
+            mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0)),
+            mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0)),
+            mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0)),
+        ];
+        for k in 0..4 {
+            let a = rim[k];
+            let b = rim[(k + 1) % 4];
+            add_tri(mesh, [top, a, b]);
+            add_tri(mesh, [bottom, b, a]);
+        }
+        (top, rim, bottom)
+    }
+
+    /// BEVEL.md §5.1.1 / §8.3.0.1: beveling one apex's spokes on a **closed solid**
+    /// leaves the rim verts as valence-4 terminals still incident to the opposite
+    /// apex's faces. The multisegment strip build's valence-≥4 terminal close is a
+    /// stub (it declines rather than absorbs), so those terminals stay attached —
+    /// Phase 5 must **keep** them (they are not loose) rather than force-free them
+    /// and panic. This is the regression guard for the closed-solid apex bevel.
+    #[test]
+    fn multisegment_closed_bipyramid_apex_keeps_attached_terminals() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, bottom) = square_bipyramid(&mut mesh);
+        assert_eq!(counts(&mesh), (6, 12, 8), "octahedron 6 V / 12 E / 8 F");
+
+        let spokes: Vec<GeomKey> = rim
+            .iter()
+            .map(|&r| mesh.query_edge_exists(top, r).expect("top spoke").into())
+            .collect();
+
+        // `segments >= 2` routes through `bevel_edges_cutoff_multisegment`; the apex
+        // is a junction (4 beveled edges), each rim vert a valence-4 terminal. Before
+        // the loose-gate this panicked in Phase 5 freeing a still-attached rim vert.
+        let _ = mesh.bevel(
+            &spokes,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            !mesh.vert_keys().contains(&top),
+            "the beveled junction apex is consumed (its disk was fully re-stitched)",
+        );
+        assert!(
+            mesh.vert_keys().contains(&bottom),
+            "the unbeveled opposite apex survives untouched",
+        );
+        for (k, &r) in rim.iter().enumerate() {
+            assert!(mesh.vert_keys().contains(&r), "rim terminal {k} kept, not freed");
+            assert!(
+                !mesh.vert_face_keys(r).is_empty(),
+                "rim terminal {k} still incident to unbeveled faces",
+            );
+            assert!(
+                mesh.query_edge_exists(bottom, r).is_some(),
+                "rim terminal {k} keeps its unbeveled bottom spoke",
+            );
+        }
+    }
+
+    /// The `segments = 2` ADJ variant of the same closed-solid apex bevel routes
+    /// through the same Phase 5 free — it, too, must keep the attached terminals.
+    #[test]
+    fn multisegment_adj_closed_bipyramid_apex_keeps_attached_terminals() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, _bottom) = square_bipyramid(&mut mesh);
+
+        let spokes: Vec<GeomKey> = rim
+            .iter()
+            .map(|&r| mesh.query_edge_exists(top, r).expect("top spoke").into())
+            .collect();
+
+        let _ = mesh.bevel(
+            &spokes,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+
+        for (k, &r) in rim.iter().enumerate() {
+            assert!(mesh.vert_keys().contains(&r), "rim terminal {k} kept, not freed");
+            assert!(
+                !mesh.vert_face_keys(r).is_empty(),
+                "rim terminal {k} still incident to unbeveled faces",
+            );
+        }
     }
 
     /// The cap's symmetry axis (BEVEL.md §8.5.5.7): the line through the original
