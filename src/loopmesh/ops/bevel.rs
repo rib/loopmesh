@@ -1353,7 +1353,7 @@ impl LoopMesh {
         // The chain crosses E between the two strip verts (§8.3.0.1). face_left's
         // strip vert is the chain's `start`, face_right's its `end` — matching the
         // strip builder's face_left-first ordering of E's radial faces. This is a
-        // valence-≥3 terminal (guaranteed by the disk-count guard above), so the
+        // valence-≥3 terminal (any terminal endpoint reaching this point), so the
         // §8.2.2.1 terminal-far-end plane override applies: pass the terminal vertex.
         let terminal_position = self.vertex_position(vertex);
         let interior = self.build_chain_between(
@@ -4065,8 +4065,17 @@ impl LoopMesh {
             // absorbed by the normal-oriented angular measure — projecting the bounds
             // into the plane first would shift the near-boundary two-petal verdict off
             // the wedge boundary its midpoint hugs.
-            let dir_one = layout.bound_dirs[index];
-            let dir_two = layout.bound_dirs[index + 1];
+            //
+            // The positional `[index]`/`[index + 1]` reads are in range for a manifold
+            // fan (the dedup rules keep `between_faces.len() <= between_edges.len() + 1`
+            // while `bound_dirs.len() == between_edges.len() + 2`); a non-manifold disk
+            // with a non-consecutively-recurring leg edge could over-run, so guard the
+            // pair and `continue`, mirroring the degenerate-leg continue just below.
+            let (Some(&dir_one), Some(&dir_two)) =
+                (layout.bound_dirs.get(index), layout.bound_dirs.get(index + 1))
+            else {
+                continue;
+            };
             if dir_one == Vec3::ZERO || dir_two == Vec3::ZERO {
                 continue;
             }
@@ -7891,9 +7900,6 @@ mod tests {
             "the closed sharp reflex bevel is χ = 2, not the χ = 1 open hole (§7.6.6)",
         );
 
-        // The apex cap carries one welded centre vertex at the once-subdivided
-        // fullness position (§8.5.5.5(d); the raw seed sits nearer ≈(0, 0.102,
-        // 0.921)). Its exact position is Tier-2, so pin it loosely.
         // The apex cap is the §8.5.5.5(a) three-quad pinwheel: one welded centre
         // vertex where exactly three cap faces meet, every one a quad. The centre is
         // the sole new (result) vertex with exactly three incident faces that are all
