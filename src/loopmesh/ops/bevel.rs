@@ -1003,6 +1003,7 @@ impl LoopMesh {
         let mut junction_cuts: Vec<JunctionCut> = Vec::new();
         let mut miter_junctions: Vec<MiterJunction> = Vec::new();
         let mut outer_miter_junctions: Vec<OuterMiterJunction> = Vec::new();
+        let mut terminal_fans: Vec<TerminalFan> = Vec::new();
 
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
@@ -1070,6 +1071,7 @@ impl LoopMesh {
                     profile,
                     &mut chains,
                     &mut face_subst,
+                    &mut terminal_fans,
                     result,
                 );
             }
@@ -1135,6 +1137,16 @@ impl LoopMesh {
                     );
                 }
             }
+        }
+
+        // Phase 4d (§8.3.0.2): each valence-≥4 terminal takes its poly-fan — the
+        // through-chain plus the leg verts, triangulated from a leg vert. The fan is
+        // vmesh-independent (identical under Cutoff and Adj), so it is built for
+        // every terminal regardless of `vmesh_method`, after the strip (phase 3) and
+        // re-stitched leg faces (phase 2) exist so each triangle can wind against a
+        // built neighbour.
+        for fan in &terminal_fans {
+            self.build_terminal_fan(fan, material, result);
         }
 
         // Phase 4b (§8.9.3 / §8.9.5): the inner-miter junctions take the enlarged
@@ -1264,10 +1276,19 @@ impl LoopMesh {
         });
     }
 
-    /// Place a valence-3 terminal's two boundverts and build its single edge's
-    /// chain (BEVEL.md §8.3.0.1). No fill face: the two boundverts are E's two
-    /// perpendicular strip verts (the §7.5 planar offset), the chain runs between
-    /// them, and the surviving third face(s) absorb the whole `segments + 1` run.
+    /// Place a terminal's boundverts and build its single edge's chain (BEVEL.md
+    /// §8.3.0.1 / §8.3.0.2). The two E-flanking boundverts (`start`/`end`) are E's
+    /// two perpendicular strip verts (the §7.5.1 leg-meet) and the chain runs
+    /// between them across E. The close then splits on terminal valence:
+    ///
+    /// - **valence 3** (§8.3.0.1): no fill face — the surviving third face(s) absorb
+    ///   the whole `segments + 1` run through the terminal.
+    /// - **valence ≥ 4** (§8.3.0.2): one poly-fan — one vert slid the plain offset
+    ///   along each unbeveled leg not adjacent to E, one fan face over the
+    ///   through-chain and the leg verts, and the original terminal vertex consumed
+    ///   (every incident face re-stitches off it). The fan is identical under both
+    ///   fill methods; it is gated on "terminal", not `vmesh_method`, and is built
+    ///   later (`build_terminal_fan`) once the strip and re-stitched leg faces exist.
     #[allow(clippy::too_many_arguments)]
     fn build_terminal_chains(
         &mut self,
@@ -1278,6 +1299,7 @@ impl LoopMesh {
         profile: f32,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
+        terminal_fans: &mut Vec<TerminalFan>,
         result: &mut BevelResult,
     ) {
         let edge = self
@@ -1307,17 +1329,11 @@ impl LoopMesh {
             segment / length
         };
 
-        // Only the valence-3 terminal close is implemented (§8.3.0.1): the
-        // surviving third face absorbs the run. Valence ≥ 4 (the fan/poly fill)
-        // remains a stub.
-        if self.iter_disk_edges(vertex).count() != 3 {
-            return;
-        }
-
         // The two flanking unbeveled legs share E's two radial faces (§7.5.1); each
         // strip vert is the leg meet of E against its own flanking leg. `direction`
         // is the chain axis, not the strip placement.
         let _ = direction;
+        let valence = self.iter_disk_edges(vertex).count();
         let left_other = self.face_other_edge_at(face_left, vertex, edge);
         let right_other = self.face_other_edge_at(face_right, vertex, edge);
         let surface_normal = self.surface_normal_at(vertex);
@@ -1355,43 +1371,131 @@ impl LoopMesh {
             set_face_substitution(face_subst, vertex, face, vec![strip_vert]);
         }
 
-        // The third face(s) absorb the full chain run, ordered so the strip vert
-        // sharing the incoming leg sits next to `prev` (§8.3.0.1 / §7.4).
-        let mut forward_run = Vec::with_capacity(segments as usize + 1);
-        forward_run.push(strip_left);
-        forward_run.extend_from_slice(&interior);
-        forward_run.push(strip_right);
-        let mut reverse_run = forward_run.clone();
-        reverse_run.reverse();
+        if valence >= 4 {
+            // §8.3.0.2 poly-fan: one vert slid the plain offset along each unbeveled
+            // leg NOT adjacent to E, and one fan face over the through-chain plus the
+            // leg verts. The original terminal vertex is consumed — every incident
+            // face re-stitches off it.
 
-        for face in self.vert_face_keys(vertex) {
-            if face == face_left || face == face_right {
-                continue;
+            // A face incident to the (about-to-be-consumed) terminal supplies the
+            // §6.6.1 inherit source for the fan's new faces; captured now, before the
+            // re-stitch strips the terminal of its faces.
+            let representative = self
+                .vert_face_keys(vertex)
+                .first()
+                .map(|&face| self.face_material_index(face))
+                .unwrap_or(0);
+
+            // Near-corner vert per unbeveled leg: the two E-adjacent legs collapse to
+            // the two flanking boundverts; each non-adjacent leg gets its own vert
+            // slid the plain offset from the terminal along that leg (§7.5).
+            let mut leg_near: Vec<(EdgeKey, VertexKey)> =
+                vec![(left_other, strip_left), (right_other, strip_right)];
+            let mut leg_verts: Vec<VertexKey> = Vec::new();
+            for leg in self.iter_disk_edges(vertex).collect::<Vec<_>>() {
+                if leg == edge || leg == left_other || leg == right_other {
+                    continue;
+                }
+                let leg_direction =
+                    match self.edge_direction_from(leg, vertex, terminal_position) {
+                        Some(direction) => direction,
+                        None => continue,
+                    };
+                let leg_vert = self.create_vertex(terminal_position + leg_direction * offset);
+                result.verts.push(leg_vert);
+                leg_verts.push(leg_vert);
+                leg_near.push((leg, leg_vert));
             }
-            let cycle_verts = self.face_vert_keys(face);
-            let cycle_length = cycle_verts.len();
-            // A malformed third face (wire-edge sharing, non-manifold) may not
-            // carry the endpoint as a clean corner, or its incoming corner edge
-            // may not resolve. Skip such a face rather than panic — the gate does
-            // not enforce these as preconditions (rubric-5: panics are for
-            // internal invariants only).
-            let index = match cycle_verts.iter().position(|&w| w == vertex) {
-                Some(index) => index,
-                None => continue,
+
+            // Every incident face other than E's two radial faces (already collapsed
+            // to their flanking boundvert) re-stitches its corner onto the near verts
+            // of its two flanking legs, ordered so the leg shared with `prev` comes
+            // first (§8.3.0.2 re-stitch; the §7.4 absorb widened to the fan boundary).
+            let near_of = |leg: EdgeKey| -> Option<VertexKey> {
+                leg_near.iter().find(|&&(l, _)| l == leg).map(|&(_, v)| v)
             };
-            let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
-            let incoming_edge = match self.query_edge_exists(prev_vertex, vertex) {
-                Some(edge) => edge,
-                None => continue,
-            };
-            let ordered = if incoming_edge == right_other {
-                reverse_run.clone()
-            } else if incoming_edge == left_other {
-                forward_run.clone()
-            } else {
-                forward_run.clone()
-            };
-            set_face_substitution(face_subst, vertex, face, ordered);
+            for face in self.vert_face_keys(vertex) {
+                if face == face_left || face == face_right {
+                    continue;
+                }
+                let cycle_verts = self.face_vert_keys(face);
+                let cycle_length = cycle_verts.len();
+                // A malformed face (wire-edge sharing, non-manifold) may not carry
+                // the endpoint as a clean corner; skip rather than panic (rubric-5).
+                let index = match cycle_verts.iter().position(|&w| w == vertex) {
+                    Some(index) => index,
+                    None => continue,
+                };
+                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
+                let next_vertex = cycle_verts[(index + 1) % cycle_length];
+                let incoming = match self.query_edge_exists(prev_vertex, vertex) {
+                    Some(leg) => leg,
+                    None => continue,
+                };
+                let outgoing = match self.query_edge_exists(vertex, next_vertex) {
+                    Some(leg) => leg,
+                    None => continue,
+                };
+                let (near_in, near_out) = match (near_of(incoming), near_of(outgoing)) {
+                    (Some(near_in), Some(near_out)) => (near_in, near_out),
+                    _ => continue,
+                };
+                let mut run = vec![near_in];
+                if near_out != near_in {
+                    run.push(near_out);
+                }
+                set_face_substitution(face_subst, vertex, face, run);
+            }
+
+            let mut boundary = Vec::with_capacity(interior.len() + 2);
+            boundary.push(strip_left);
+            boundary.extend_from_slice(&interior);
+            boundary.push(strip_right);
+            terminal_fans.push(TerminalFan {
+                boundary,
+                leg_verts,
+                representative,
+            });
+        } else {
+            // §8.3.0.1 valence-3 through-strip: no fill face — the surviving third
+            // face(s) absorb the full chain run, ordered so the strip vert sharing
+            // the incoming leg sits next to `prev` (§7.4).
+            let mut forward_run = Vec::with_capacity(segments as usize + 1);
+            forward_run.push(strip_left);
+            forward_run.extend_from_slice(&interior);
+            forward_run.push(strip_right);
+            let mut reverse_run = forward_run.clone();
+            reverse_run.reverse();
+
+            for face in self.vert_face_keys(vertex) {
+                if face == face_left || face == face_right {
+                    continue;
+                }
+                let cycle_verts = self.face_vert_keys(face);
+                let cycle_length = cycle_verts.len();
+                // A malformed third face (wire-edge sharing, non-manifold) may not
+                // carry the endpoint as a clean corner, or its incoming corner edge
+                // may not resolve. Skip such a face rather than panic — the gate does
+                // not enforce these as preconditions (rubric-5: panics are for
+                // internal invariants only).
+                let index = match cycle_verts.iter().position(|&w| w == vertex) {
+                    Some(index) => index,
+                    None => continue,
+                };
+                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
+                let incoming_edge = match self.query_edge_exists(prev_vertex, vertex) {
+                    Some(edge) => edge,
+                    None => continue,
+                };
+                let ordered = if incoming_edge == right_other {
+                    reverse_run.clone()
+                } else if incoming_edge == left_other {
+                    forward_run.clone()
+                } else {
+                    forward_run.clone()
+                };
+                set_face_substitution(face_subst, vertex, face, ordered);
+            }
         }
 
         chains.push(EdgeEndChain {
@@ -1401,6 +1505,75 @@ impl LoopMesh {
             interior,
             end: strip_right,
         });
+    }
+
+    /// Build one valence-≥4 terminal's poly-fan face(s) (BEVEL.md §8.3.0.2). The fan
+    /// polygon is `[boundary…, leg_verts…]`, triangulated as a fan from the first leg
+    /// vert. Each triangle winds opposite an already-built neighbour on a shared edge
+    /// so it stays radial-2 against the strip and the re-stitched leg faces. A
+    /// `segments = 2` valence-4 terminal yields the two triangles
+    /// `(leg, start, peak)` and `(leg, peak, end)`; the general form is
+    /// `segments + n − 4` triangles over a `(segments + 1) + (n − 3)`-gon.
+    fn build_terminal_fan(&mut self, fan: &TerminalFan, material: i32, result: &mut BevelResult) {
+        if fan.leg_verts.is_empty() {
+            return;
+        }
+        let mut ring: Vec<VertexKey> =
+            Vec::with_capacity(fan.boundary.len() + fan.leg_verts.len());
+        ring.extend_from_slice(&fan.boundary);
+        ring.extend_from_slice(&fan.leg_verts);
+        let count = ring.len();
+        if count < 3 {
+            return;
+        }
+        // Fan centre: the first leg vert (§8.3.0.2 fans from a leg vert). For the
+        // valence-4 / `segments = 2` ring `[start, peak, end, leg]` this is `leg` and
+        // the walk yields `(leg, start, peak)` then `(leg, peak, end)`.
+        let center = fan.boundary.len();
+        for step in 1..count - 1 {
+            let a = ring[center];
+            let b = ring[(center + step) % count];
+            let c = ring[(center + step + 1) % count];
+            if a == b || b == c || a == c {
+                continue;
+            }
+            let mut triangle = vec![a, b, c];
+            self.wind_fan_triangle_opposite_neighbor(&mut triangle);
+            let face = self.face_create_verts(&triangle, FaceCreateFlags::NONE);
+            self.assign_bevel_face_material(
+                face,
+                material,
+                fan.representative,
+                BevelNewFaceKind::Cap,
+            );
+            result.faces.push(face);
+            self.collect_face_edges(face, result);
+        }
+    }
+
+    /// Reverse `triangle` if it runs the same way as an already-built neighbour on a
+    /// shared edge, so the fan face stays radial-2 against the strip / re-stitched leg
+    /// faces (BEVEL.md §8.3.0.2 re-stitch, the share-don't-duplicate discipline of
+    /// §7.6.3). Uses the first shared edge that already carries a face loop.
+    fn wind_fan_triangle_opposite_neighbor(&self, triangle: &mut [VertexKey]) {
+        for i in 0..triangle.len() {
+            let p = triangle[i];
+            let q = triangle[(i + 1) % triangle.len()];
+            let edge = match self.query_edge_exists(p, q) {
+                Some(edge) => edge,
+                None => continue,
+            };
+            let first_loop = match self.edge_loop_keys(edge).first().copied() {
+                Some(loop_key) => loop_key,
+                None => continue,
+            };
+            let start = self.loop_vertex(first_loop);
+            let next = self.loop_vertex(self.loop_next(first_loop));
+            if start == p && next == q {
+                triangle.reverse();
+            }
+            return;
+        }
     }
 
     /// Build a profile chain's `segments − 1` interior verts between two ring
@@ -5368,6 +5541,18 @@ impl JunctionCut {
     }
 }
 
+/// One valence-≥4 terminal's poly-fan (BEVEL.md §8.3.0.2). The fan polygon walks
+/// the beveled edge's through-chain `boundary` (`start` → interior peaks → `end`)
+/// then one `leg_vert` per unbeveled leg not adjacent to E, and is triangulated as
+/// a fan from the first leg vert. Built for both fill methods — the terminal fan is
+/// vmesh-independent (gated on "terminal", not `vmesh_method`). `representative` is
+/// the §6.6.1 material inherit source captured from a terminal-incident face.
+struct TerminalFan {
+    boundary: Vec<VertexKey>,
+    leg_verts: Vec<VertexKey>,
+    representative: i32,
+}
+
 /// One junction's **inner-miter** ring data (BEVEL.md §8.9.3 / §8.9.5), consumed by
 /// the six-quad pinwheel fill. Per convex non-reflex sector `k` (disk order): the
 /// arc-start boundvert `arc_start[k]` (`B1`, near the opening edge), the stored arc
@@ -8757,17 +8942,18 @@ mod tests {
         (top, rim, bottom)
     }
 
-    /// BEVEL.md §5.1.1 / §8.3.0.1: beveling one apex's spokes on a **closed solid**
-    /// leaves the rim verts as valence-4 terminals still incident to the opposite
-    /// apex's faces. The multisegment strip build's valence-≥4 terminal close is a
-    /// stub (it declines rather than absorbs), so those terminals stay attached —
-    /// Phase 5 must **keep** them (they are not loose) rather than force-free them
-    /// and panic. This is the regression guard for the closed-solid apex bevel.
+    /// BEVEL.md §8.3.0.2: beveling one apex's spokes on a **closed solid** makes each
+    /// rim vert a valence-4 terminal whose one beveled edge (the top spoke) gets the
+    /// poly-fan close — two E-flanking boundverts, one interior peak, one leg vert on
+    /// the non-adjacent (bottom) spoke — and the **original rim vertex is consumed**.
+    /// The beveled junction apex is likewise consumed; the unbeveled opposite apex
+    /// survives. This is the closed-solid regression guard for the fan close.
     #[test]
-    fn multisegment_closed_bipyramid_apex_keeps_attached_terminals() {
+    fn multisegment_closed_bipyramid_apex_fan_consumes_terminals() {
         let mut mesh = LoopMesh::new();
         let (top, rim, bottom) = square_bipyramid(&mut mesh);
         assert_eq!(counts(&mesh), (6, 12, 8), "octahedron 6 V / 12 E / 8 F");
+        let rim_positions: Vec<Vec3> = rim.iter().map(|&r| mesh.vertex_position(r)).collect();
 
         let spokes: Vec<GeomKey> = rim
             .iter()
@@ -8775,8 +8961,7 @@ mod tests {
             .collect();
 
         // `segments >= 2` routes through `bevel_edges_cutoff_multisegment`; the apex
-        // is a junction (4 beveled edges), each rim vert a valence-4 terminal. Before
-        // the loose-gate this panicked in Phase 5 freeing a still-attached rim vert.
+        // is a junction (4 beveled edges), each rim vert a valence-4 terminal.
         let _ = mesh.bevel(
             &spokes,
             BevelOptions {
@@ -8797,22 +8982,29 @@ mod tests {
             "the unbeveled opposite apex survives untouched",
         );
         for (k, &r) in rim.iter().enumerate() {
-            assert!(mesh.vert_keys().contains(&r), "rim terminal {k} kept, not freed");
             assert!(
-                !mesh.vert_face_keys(r).is_empty(),
-                "rim terminal {k} still incident to unbeveled faces",
+                !mesh.vert_keys().contains(&r),
+                "rim terminal {k} is consumed by the valence-4 fan close",
             );
+            // The leg vert sits the plain offset along the bottom spoke from the old
+            // rim position (§8.3.0.2).
+            let bottom_dir =
+                (mesh.vertex_position(bottom) - rim_positions[k]).normalize();
+            let leg = rim_positions[k] + bottom_dir * 0.25;
             assert!(
-                mesh.query_edge_exists(bottom, r).is_some(),
-                "rim terminal {k} keeps its unbeveled bottom spoke",
+                mesh.vert_keys()
+                    .into_iter()
+                    .any(|v| (mesh.vertex_position(v) - leg).length() < 2.0e-3),
+                "rim terminal {k}'s leg vert at {leg:?} is minted on the bottom spoke",
             );
         }
     }
 
-    /// The `segments = 2` ADJ variant of the same closed-solid apex bevel routes
-    /// through the same Phase 5 free — it, too, must keep the attached terminals.
+    /// The `segments = 2` ADJ variant of the same closed-solid apex bevel: the
+    /// terminal fan is vmesh-independent (§8.3.0.2), so ADJ consumes the rim
+    /// terminals with the same fan close as Cutoff.
     #[test]
-    fn multisegment_adj_closed_bipyramid_apex_keeps_attached_terminals() {
+    fn multisegment_adj_closed_bipyramid_apex_fan_consumes_terminals() {
         let mut mesh = LoopMesh::new();
         let (top, rim, _bottom) = square_bipyramid(&mut mesh);
 
@@ -8833,10 +9025,9 @@ mod tests {
         );
 
         for (k, &r) in rim.iter().enumerate() {
-            assert!(mesh.vert_keys().contains(&r), "rim terminal {k} kept, not freed");
             assert!(
-                !mesh.vert_face_keys(r).is_empty(),
-                "rim terminal {k} still incident to unbeveled faces",
+                !mesh.vert_keys().contains(&r),
+                "rim terminal {k} is consumed by the valence-4 fan close (ADJ)",
             );
         }
     }
@@ -12352,6 +12543,219 @@ mod tests {
             point_in_wedge(leg_1, g_k, dir_to(drop_f1), normal_f1),
             "reversed pair measures the reflex wedge and mis-accepts F1",
         );
+    }
+
+    /// A hexagonal bipyramid: 6 rim verts on the unit circle at `z = 0`, a top apex
+    /// `(0,0,1)` and a bottom apex `(0,0,-1)`, closed by 12 triangles. Each rim vert
+    /// is a valence-4 terminal (one top spoke, two rim edges, one bottom spoke).
+    fn hex_bipyramid() -> (LoopMesh, VertexKey, Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let top = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let bottom = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
+        let mut rim = Vec::with_capacity(6);
+        for i in 0..6 {
+            let angle = (i as f32) * std::f32::consts::PI / 3.0;
+            rim.push(mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0)));
+        }
+        for i in 0..6 {
+            let j = (i + 1) % 6;
+            mesh.face_create_verts(&[top, rim[i], rim[j]], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[bottom, rim[j], rim[i]], FaceCreateFlags::NONE);
+        }
+        (mesh, top, rim)
+    }
+
+    /// Bevel every top-apex spoke of the hexagonal bipyramid at `segments = 2` under
+    /// `vmesh_method`, returning the beveled mesh.
+    fn bevel_bipyramid_top_spokes(vmesh_method: BevelVmeshMethod) -> LoopMesh {
+        let (mut mesh, top, rim) = hex_bipyramid();
+        let spokes: Vec<GeomKey> = rim
+            .iter()
+            .map(|&r| mesh.query_edge_exists(top, r).expect("top spoke").into())
+            .collect();
+        mesh.bevel(
+            &spokes,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method,
+                ..Default::default()
+            },
+        );
+        mesh
+    }
+
+    fn vert_near(mesh: &LoopMesh, position: Vec3, tol: f32) -> Option<VertexKey> {
+        mesh.vert_keys()
+            .into_iter()
+            .find(|&v| (mesh.vertex_position(v) - position).length() < tol)
+    }
+
+    /// BEVEL.md §8.3.0.2 worked oracle: beveling the six top-apex spokes of the
+    /// hexagonal bipyramid at `offset = 0.25`, `segments = 2` mints the four fan
+    /// verts (`start`, `peak`, `end`, `leg`) at the `P = (1,0,0)` terminal and
+    /// consumes `P`. The plain-offset (no `√2`) leg slide is pinned explicitly.
+    #[test]
+    fn bevel_terminal_fan_valence4_positions() {
+        let mesh = bevel_bipyramid_top_spokes(BevelVmeshMethod::Cutoff);
+        let tol = 2.0e-3;
+
+        // The original rim vertex is consumed.
+        assert!(
+            vert_near(&mesh, Vec3::new(1.0, 0.0, 0.0), 1.0e-4).is_none(),
+            "the P=(1,0,0) terminal vertex is consumed by the fan close",
+        );
+
+        // The four §8.3.0.2 fan verts land at their oracle positions.
+        for (label, position) in [
+            ("start", Vec3::new(0.8664, 0.2315, 0.0)),
+            ("peak", Vec3::new(0.9217, 0.0, 0.0)),
+            ("end", Vec3::new(0.8664, -0.2315, 0.0)),
+            ("leg", Vec3::new(0.8232, 0.0, -0.1768)),
+        ] {
+            assert!(
+                vert_near(&mesh, position, tol).is_some(),
+                "fan vert `{label}` at {position:?} is minted",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.2: the leg vert is slid the PLAIN offset (no `√2`) along the
+    /// non-adjacent (bottom-apex) spoke for the default round profile. `P=(1,0,0)`,
+    /// bottom apex `(0,0,-1)` ⇒ direction `(-1,0,-1)/√2`, so
+    /// `leg = P + 0.25·dir = (0.8232, 0, -0.1768)` — a `0.25` slide, not `0.25·√2`.
+    #[test]
+    fn bevel_terminal_fan_leg_is_plain_offset() {
+        let mesh = bevel_bipyramid_top_spokes(BevelVmeshMethod::Cutoff);
+        let plain = vert_near(&mesh, Vec3::new(0.8232, 0.0, -0.1768), 2.0e-3);
+        assert!(plain.is_some(), "leg vert slid the plain offset exists");
+
+        // The √2-slid position must NOT be present (the flat-profile trap).
+        let over = Vec3::new(0.0, 0.0, -1.0) - Vec3::new(1.0, 0.0, 0.0);
+        let over_dir = over / over.length();
+        let sqrt2_position =
+            Vec3::new(1.0, 0.0, 0.0) + over_dir * (0.25 * std::f32::consts::SQRT_2);
+        assert!(
+            vert_near(&mesh, sqrt2_position, 1.0e-3).is_none(),
+            "no leg vert at the √2-slid (flat-profile) position {sqrt2_position:?}",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.2: the valence-4 / `segments = 2` fan is the two triangles
+    /// `(start, peak, leg)` and `(peak, end, leg)` — a fan from the leg vert. So the
+    /// leg vert carries exactly two triangular incident faces (the fan), and the
+    /// through-chain rungs `start`/`end` are shared with the strip.
+    #[test]
+    fn bevel_terminal_fan_is_two_triangles() {
+        let mesh = bevel_bipyramid_top_spokes(BevelVmeshMethod::Cutoff);
+        let tol = 2.0e-3;
+        let leg = vert_near(&mesh, Vec3::new(0.8232, 0.0, -0.1768), tol).expect("leg vert");
+        let start = vert_near(&mesh, Vec3::new(0.8664, 0.2315, 0.0), tol).expect("start");
+        let peak = vert_near(&mesh, Vec3::new(0.9217, 0.0, 0.0), tol).expect("peak");
+        let end = vert_near(&mesh, Vec3::new(0.8664, -0.2315, 0.0), tol).expect("end");
+
+        let triangles: Vec<Vec<VertexKey>> = mesh
+            .vert_face_keys(leg)
+            .into_iter()
+            .map(|f| mesh.face_vert_keys(f))
+            .filter(|verts| verts.len() == 3)
+            .collect();
+        assert_eq!(
+            triangles.len(),
+            2,
+            "the leg vert fans exactly two triangles",
+        );
+
+        let has = |set: &[Vec<VertexKey>], a, b, c| {
+            set.iter().any(|verts| {
+                verts.contains(&a) && verts.contains(&b) && verts.contains(&c)
+            })
+        };
+        assert!(
+            has(&triangles, leg, start, peak),
+            "fan triangle (leg, start, peak) present",
+        );
+        assert!(
+            has(&triangles, leg, peak, end),
+            "fan triangle (leg, peak, end) present",
+        );
+
+        // The fan close leaves a manifold solid: no edge carries more than two
+        // radial faces (a mis-wound fan triangle would duplicate an edge's use).
+        for edge in mesh.edge_keys() {
+            assert!(
+                mesh.edge_radial_iter(edge).count() <= 2,
+                "edge {edge:?} stays manifold (≤ 2 radial faces) after the fan close",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.2 net budget: each valence-4 terminal contributes `+3` verts
+    /// (`start`, `peak`, `end`, `leg`, minus the consumed rim vertex). Across the six
+    /// rim terminals that is the `+18`-vert budget beyond the apex junction, and the
+    /// six original rim verts are all consumed.
+    #[test]
+    fn bevel_terminal_fan_consumes_rim_and_mints_budget() {
+        let mesh = bevel_bipyramid_top_spokes(BevelVmeshMethod::Cutoff);
+
+        for i in 0..6 {
+            let angle = (i as f32) * std::f32::consts::PI / 3.0;
+            let rim = Vec3::new(angle.cos(), angle.sin(), 0.0);
+            assert!(
+                vert_near(&mesh, rim, 1.0e-4).is_none(),
+                "rim terminal {i} at {rim:?} is consumed",
+            );
+        }
+
+        // Per rim terminal: exactly 4 fan verts within a 0.4 radius of the old rim
+        // position (two flank boundverts, one peak, one leg), for `6 × 4 = 24` fan
+        // verts total. (The apex-junction verts sit well inside this radius of the
+        // origin, not the rim.)
+        let mut fan_total = 0;
+        for i in 0..6 {
+            let angle = (i as f32) * std::f32::consts::PI / 3.0;
+            let rim = Vec3::new(angle.cos(), angle.sin(), 0.0);
+            let near = mesh
+                .vert_keys()
+                .into_iter()
+                .filter(|&v| (mesh.vertex_position(v) - rim).length() < 0.4)
+                .count();
+            assert_eq!(near, 4, "rim terminal {i} mints its 4 fan verts");
+            fan_total += near;
+        }
+        assert_eq!(fan_total, 24, "6 terminals × 4 fan verts");
+    }
+
+    /// BEVEL.md §8.3.0.2: the terminal fan is byte-identical under `Cutoff` and
+    /// `Adj` — it gates on "terminal", not `vmesh_method`. The rim-region geometry
+    /// (all verts / faces within `0.4` of each rim terminal) must match between the
+    /// two whole-mesh bevels; only the apex-junction fill differs.
+    #[test]
+    fn bevel_terminal_fan_vmesh_independent() {
+        let cutoff = bevel_bipyramid_top_spokes(BevelVmeshMethod::Cutoff);
+        let adj = bevel_bipyramid_top_spokes(BevelVmeshMethod::Adj);
+
+        for i in 0..6 {
+            let angle = (i as f32) * std::f32::consts::PI / 3.0;
+            let rim = Vec3::new(angle.cos(), angle.sin(), 0.0);
+            let rim_verts = |mesh: &LoopMesh| -> Vec<Vec3> {
+                mesh.vert_keys()
+                    .into_iter()
+                    .map(|v| mesh.vertex_position(v))
+                    .filter(|&p| (p - rim).length() < 0.4)
+                    .collect()
+            };
+            let a = rim_verts(&cutoff);
+            let b = rim_verts(&adj);
+            assert_eq!(a.len(), b.len(), "rim {i} same fan vert count under both fills");
+            for target in &a {
+                assert!(
+                    b.iter().any(|q| (*q - *target).length() < 1.0e-4),
+                    "rim {i} fan vert {target:?} identical under Cutoff and Adj",
+                );
+            }
+        }
     }
 }
 
