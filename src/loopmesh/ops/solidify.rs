@@ -109,6 +109,15 @@ impl LoopMesh {
         // from the marked region.
         let vert_watermark = self.vertices.key_watermark();
         let edge_watermark = self.edges.key_watermark();
+        let face_watermark = self.faces.key_watermark();
+
+        // O(1) region-face membership keyed by face watermark, built once, so
+        // the radial walks below stay O(Σ degree) rather than
+        // O(degree × region-size) linear scans of `duplicate_faces` (§9).
+        let mut face_in_region: Vec<bool> = vec![false; face_watermark];
+        for &face in duplicate_faces {
+            face_in_region[face.as_usize()] = true;
+        }
 
         let mut vert_in_region: Vec<bool> = vec![false; vert_watermark];
         // Per-region-edge incident-face count: 2 ⇒ manifold interior, 1 ⇒
@@ -147,11 +156,14 @@ impl LoopMesh {
 
         // §4.2 / §4.3: accumulate per-edge angle-weighted edge normals into
         // both endpoints. `accumulator` holds the running direction sum;
-        // `had_contribution` records whether any edge contributed, so a vertex
-        // whose estimate cancels can be told apart from one that never got a
-        // contribution.
+        // `vert_on_coplanar_edge` is set on both endpoints of every
+        // exactly-coplanar, co-oriented interior region edge (§4.2). That flag —
+        // *not* a "did the vertex receive a contribution?" tally — is the single
+        // discriminator that gates fallback-2 (§4.3, §4.4, and the
+        // `!had_contribution` trap note there): a zero-accumulator vertex falls
+        // back to a face normal only when it is coplanar-flagged.
         let mut accumulator: Vec<Vec3> = vec![Vec3::ZERO; vert_watermark];
-        let mut had_contribution: Vec<bool> = vec![false; vert_watermark];
+        let mut vert_on_coplanar_edge: Vec<bool> = vec![false; vert_watermark];
 
         for slot in 0..edge_watermark {
             let region_face_count = edge_region_face_count[slot];
@@ -168,8 +180,7 @@ impl LoopMesh {
                 while let Some(l) = radial.next(self) {
                     let face = self.loops.get(l).face;
                     if vert_in_region[self.loops.get(l).vertex.as_usize()]
-                        && self.faces.try_get(face).is_some()
-                        && duplicate_faces.contains(&face)
+                        && face_in_region[face.as_usize()]
                     {
                         region_face_normals.push(self.faces.get(face).normal);
                     }
@@ -182,7 +193,13 @@ impl LoopMesh {
                 let theta = LoopMesh::acos_approx(n0.dot(n1).clamp(-1.0, 1.0));
                 if theta == 0.0 {
                     // §4.2: exactly coplanar, co-oriented faces contribute
-                    // nothing; their endpoints may fall back to a face normal.
+                    // nothing (their bisector is undefined) — but flag both
+                    // endpoints as coplanar-edge endpoints so a resulting zero
+                    // accumulator resolves to fallback-2 (§4.3), not to a
+                    // zero-normal no-offset.
+                    for v in self.edge_vertices(edge) {
+                        vert_on_coplanar_edge[v.as_usize()] = true;
+                    }
                     continue;
                 }
                 LoopMesh::normalize_or_zero(n0 + n1) * theta
@@ -193,7 +210,7 @@ impl LoopMesh {
                 let mut radial = self.radial_loops(edge);
                 while let Some(l) = radial.next(self) {
                     let face = self.loops.get(l).face;
-                    if duplicate_faces.contains(&face) {
+                    if face_in_region[face.as_usize()] {
                         region_face_normal = self.faces.get(face).normal;
                         break;
                     }
@@ -203,7 +220,6 @@ impl LoopMesh {
 
             for v in self.edge_vertices(edge) {
                 accumulator[v.as_usize()] += edge_normal;
-                had_contribution[v.as_usize()] = true;
             }
         }
 
@@ -231,13 +247,16 @@ impl LoopMesh {
             let unit = LoopMesh::normalize_or_zero(accumulator[slot]);
             if unit != Vec3::ZERO {
                 smoothed_normal[slot] = unit;
-            } else {
-                // §4.4 fallback 2: the estimate cancelled to zero (a flat-but-
-                // marked vertex) — take an arbitrary incident region face's
-                // normal.
-                let _ = had_contribution[slot];
-                smoothed_normal[slot] = self.solidify_any_region_face_normal(v, duplicate_faces);
+            } else if vert_on_coplanar_edge[slot] {
+                // §4.4 fallback 2 (narrowly gated, §4.3): the accumulator
+                // cancelled to zero AND the vertex is a coplanar-edge endpoint —
+                // the ordinary totally-flat interior patch, where every incident
+                // region face shares one normal, so any one of them serves.
+                smoothed_normal[slot] = self.solidify_any_region_face_normal(v, &face_in_region);
             }
+            // else: §4.3 — a zero accumulator with no coplanar-edge flag keeps
+            // the zero normal and receives no offset (§5.3's `thickness · 0`).
+            // Applying fallback-2 here would be wider than the gate.
         }
 
         // §5: displace each region vertex along its smoothed normal by
@@ -249,7 +268,7 @@ impl LoopMesh {
             let v = VertexKey::from_usize(slot);
             let n_v = smoothed_normal[slot];
             let offset_distance =
-                self.solidify_vertex_offset_distance(v, n_v, duplicate_faces, thickness);
+                self.solidify_vertex_offset_distance(v, n_v, &face_in_region, thickness);
             if offset_distance != 0.0 {
                 let new_position = self.vertex_position(v) + n_v * offset_distance;
                 self.set_vertex_position(v, new_position);
@@ -264,7 +283,7 @@ impl LoopMesh {
         &self,
         v: VertexKey,
         n_v: Vec3,
-        region_faces: &[FaceKey],
+        face_in_region: &[bool],
         thickness: f32,
     ) -> f32 {
         let apex = self.vertex_position(v);
@@ -279,7 +298,7 @@ impl LoopMesh {
                     continue;
                 }
                 let face = loop_data.face;
-                if !region_faces.contains(&face) {
+                if !face_in_region[face.as_usize()] {
                     continue;
                 }
                 let prev_vertex = self.loops.get(self.loop_prev(l)).vertex;
@@ -396,13 +415,13 @@ impl LoopMesh {
     }
 
     /// §4.4 fallback 2: the normal of any one region face incident to `v`.
-    fn solidify_any_region_face_normal(&self, v: VertexKey, region_faces: &[FaceKey]) -> Vec3 {
+    fn solidify_any_region_face_normal(&self, v: VertexKey, face_in_region: &[bool]) -> Vec3 {
         let mut disk = self.disk_edges(v);
         while let Some(e) = disk.next(self) {
             let mut radial = self.radial_loops(e);
             while let Some(l) = radial.next(self) {
                 let loop_data = self.loops.get(l);
-                if loop_data.vertex == v && region_faces.contains(&loop_data.face) {
+                if loop_data.vertex == v && face_in_region[loop_data.face.as_usize()] {
                     return self.faces.get(loop_data.face).normal;
                 }
             }
@@ -520,6 +539,72 @@ mod tests {
             assert!(
                 (p.z - 0.5).abs() < 1e-4,
                 "negative thickness pushes duplicate to z = +0.5, got z = {}",
+                p.z
+            );
+        }
+    }
+
+    #[test]
+    fn flat_grid_full_region_interior_vertex_fires_fallback2() {
+        // SOLIDIFY.md §4.2 / §4.3 / §4.4 (narrow gate): solidify the *whole*
+        // flat 3×3 grid. An interior vertex is surrounded by four mutually
+        // coplanar region faces, so every one of its incident interior edges is
+        // exactly-coplanar and contributes nothing — its §4.3 accumulator
+        // cancels to zero. But those coplanar edges *flag* it (§4.2), so the
+        // narrow gate resolves it via fallback-2 (an arbitrary incident
+        // region-face normal) and it offsets like the rest of the flat sheet.
+        // A vertex that reached zero *without* being coplanar-flagged would keep
+        // a zero normal and not move — the interior vertex must NOT do that.
+        let mut mesh = LoopMesh::new();
+        let (faces, interior) = flat_grid_3x3(&mut mesh);
+
+        let result = mesh.solidify(&faces, 0.5);
+        mesh.validate_topology();
+
+        // Flat region ⇒ every duplicate vert (including the fallback-2 interior
+        // vertex) offsets straight to z = -0.5 (duplicate normals point -Z after
+        // the phase-1 flip; shell factor 1).
+        let mut interior_seen = false;
+        for &(original, dup) in &result.vert_map {
+            let p = mesh.vertex_position(dup);
+            assert!(
+                (p.z + 0.5).abs() < 1e-4,
+                "flat-grid duplicate should offset to z = -0.5, got z = {}",
+                p.z
+            );
+            if original == interior {
+                interior_seen = true;
+            }
+        }
+        assert!(
+            interior_seen,
+            "the coplanar-flagged interior vertex must appear in the duplicate map"
+        );
+    }
+
+    #[test]
+    fn grid_centre_face_region_offsets_without_fallback2() {
+        // SOLIDIFY.md §7.2: solidifying a *single* interior face of the 3×3 grid
+        // keeps the original, duplicates it, and walls its four boundary edges.
+        // Only the centre face is marked, so each of its four edges is a
+        // region-boundary edge (one region face) — the accumulator is non-zero
+        // and no fallback-2 path is taken. The flat single face still offsets to
+        // z = -0.5. This confirms the narrow gate leaves the foundational
+        // interior-region case bit-unchanged.
+        let mut mesh = LoopMesh::new();
+        let (faces, _interior) = flat_grid_3x3(&mut mesh);
+        let centre = faces[4];
+
+        let result = mesh.solidify(&[centre], 0.5);
+        mesh.validate_topology();
+
+        assert_eq!(result.cap_faces.len(), 1, "one duplicate centre face");
+        assert_eq!(result.wall_faces.len(), 4, "four rim walls");
+        for &(_original, dup) in &result.vert_map {
+            let p = mesh.vertex_position(dup);
+            assert!(
+                (p.z + 0.5).abs() < 1e-4,
+                "duplicate centre-face vert should offset to z = -0.5, got z = {}",
                 p.z
             );
         }
@@ -653,6 +738,39 @@ mod tests {
             }
         }
         assert_eq!(spine_pairs, 2, "both spine verts present in the vert map");
+    }
+
+    /// A flat 3×3 grid of quad faces (4×4 verts) in the z = 0 plane, wound so
+    /// every face normal points +Z. Returns the nine faces and one
+    /// fully-interior vertex — surrounded by four coplanar region faces, so its
+    /// §4.3 accumulator cancels to zero and it is coplanar-flagged (§4.2),
+    /// exercising the narrow fallback-2 gate.
+    fn flat_grid_3x3(mesh: &mut LoopMesh) -> (Vec<FaceKey>, VertexKey) {
+        let mut verts = [[VertexKey::from_usize(0); 4]; 4];
+        for gi in 0..4 {
+            for gj in 0..4 {
+                verts[gi][gj] = mesh.create_vertex(Vec3::new(gi as f32, gj as f32, 0.0));
+            }
+        }
+        let mut faces = Vec::new();
+        for gi in 0..3 {
+            for gj in 0..3 {
+                let ring = [
+                    verts[gi][gj],
+                    verts[gi + 1][gj],
+                    verts[gi + 1][gj + 1],
+                    verts[gi][gj + 1],
+                ];
+                let mut edges = [EdgeKey::from_usize(0); 4];
+                for i in 0..4 {
+                    edges[i] = mesh
+                        .create_edge([ring[i], ring[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE);
+                }
+                faces.push(mesh.face_create(&ring, &edges, FaceCreateFlags::NONE));
+            }
+        }
+        // verts[1][1] is a fully-interior vertex shared by four region faces.
+        (faces, verts[1][1])
     }
 
     /// An asymmetric region-non-manifold fan: three quad wings off a shared
