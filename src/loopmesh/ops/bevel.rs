@@ -489,9 +489,12 @@ impl LoopMesh {
             }
         }
 
-        // §5.1.1 / §6.3: every beveled vertex is now loose. Free each.
+        // §5.1.1 / §6.3: every beveled vertex is now loose. Free each through
+        // the same guarded path the edge bevel uses, so a re-point/re-stitch
+        // that left a corner attached to live geometry panics rather than
+        // silently killing it.
         for corner in &corners {
-            self.vertex_kill(corner.vertex);
+            self.free_loose_vertex(corner.vertex);
         }
 
         result
@@ -5111,7 +5114,6 @@ impl LoopMesh {
         // corner-adjacent edge connects its ring vert(s); the face rebuild below
         // reuses each one (the face builder's NO_DUPLICATE reuse) rather than
         // minting it fresh, leaving only the chamfer edges newly minted.
-        let _ = beveled;
         self.repoint_incident_edges(corners);
 
         for (face, new_cycle) in rebuilds {
