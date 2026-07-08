@@ -764,9 +764,11 @@ fn grid_barycentric_2d(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec
     // A collinear/degenerate source frame (den ≈ 0) has no well-defined
     // barycentric coordinates; dividing would emit inf/NaN into the interior
     // vertex position. Collapse to the first source vertex — a finite,
-    // deterministic fallback. Guarded at the same magnitude as `area_src` in
-    // `grid_frame_transform`; unreachable on non-degenerate frames.
-    if den.abs() <= 1.0e-20 {
+    // deterministic fallback. `den` is twice `area_src` (the latter is
+    // ½·|perp_dot|), so guarding `|den| <= 2.0e-20` fires at the same frame
+    // magnitude the sibling `area_src > 1.0e-20` check in `grid_frame_transform`
+    // rejects; unreachable on non-degenerate frames.
+    if den.abs() <= 2.0e-20 {
         return [1.0, 0.0, 0.0];
     }
     let w1 = v2.perp_dot(v1) / den;
