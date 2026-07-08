@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use glam::Vec3;
@@ -263,12 +262,19 @@ impl LoopMesh {
         let axis_w = normal.cross(axis_u);
 
         let mut ring: Vec<VertexKey> = verts.to_vec();
-        ring.sort_by(|&a, &b| {
-            let angle = |v: VertexKey| {
-                let offset = self.vertex_position(v) - centroid;
-                offset.dot(axis_w).atan2(offset.dot(axis_u))
-            };
-            angle(a).partial_cmp(&angle(b)).unwrap_or(Ordering::Equal)
+        // Compute each vert's plane-relative angle once (O(n) atan2), keyed on a
+        // monotonic total-order transform of the f32 so the stable sort keeps
+        // input order on ties. Adding 0.0 folds −0.0 onto +0.0, so equal-angle
+        // ties compare equal exactly as the prior `partial_cmp` did.
+        ring.sort_by_cached_key(|&v| {
+            let offset = self.vertex_position(v) - centroid;
+            let angle = offset.dot(axis_w).atan2(offset.dot(axis_u)) + 0.0;
+            let bits = angle.to_bits();
+            if bits >> 31 == 1 {
+                !bits
+            } else {
+                bits | 0x8000_0000
+            }
         });
 
         let face = self.face_create_verts(&ring, FaceCreateFlags::NO_DUPLICATE);
