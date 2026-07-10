@@ -2397,13 +2397,14 @@ impl LoopMesh {
     ///
     /// Scoped to a circular profile, `segments = 2`, `s ≥ 3`. `ARC` and `PATCH` both
     /// engage at a **single-face** reflex sector (no absorbed unbeveled legs); a
-    /// **multi-face** reflex sector (absorbed legs) is supported for `PATCH` only
-    /// (§8.9.2.1, `restitch_multiface_patch_reflex`) — `ARC`'s multi-face
-    /// interior-sample walk is not yet pinned. All classification runs read-only first;
-    /// the method returns `false` **without mutating** for any junction outside those
-    /// cases (no reflex sector — the miter is inert — a multi-face `ARC` sector, a
-    /// non-circular profile, `s < 3`, or `segments != 2`), so the caller falls back to
-    /// the sharp ring.
+    /// **multi-face** reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to
+    /// the hub `B2` (§8.9.2.1, `restitch_multiface_patch_reflex`) and for `ARC` by
+    /// tiling the arc's profile-sample run (§8.9.2.2, `restitch_multiface_arc_reflex`,
+    /// **even `segments` only** — odd `segments` stays on the sharp-ring decline). All
+    /// classification runs read-only first; the method returns `false` **without
+    /// mutating** for any junction outside those cases (no reflex sector — the miter is
+    /// inert — a multi-face `ARC` sector at odd `segments`, a non-circular profile,
+    /// `s < 3`, or `segments != 2`), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_outer_miter(
         &mut self,
@@ -2483,18 +2484,23 @@ impl LoopMesh {
 
         // A **single-face** reflex sector (no absorbed unbeveled legs) re-stitches its
         // one face onto the whole run like a non-miter sector (§7.6.3). A **multi-face**
-        // reflex sector absorbs one or more unbeveled legs; `Patch` distributes them onto
-        // the `B1 → B2 → B3` run and rebuilds each face (§8.9.2.1). `Arc`'s multi-face
-        // interior-sample walk is not yet pinned, so decline it (and Sharp) to the sharp
-        // ring rather than tear the disk.
+        // reflex sector absorbs one or more unbeveled legs: `Patch` fans them to the hub
+        // `B2` (§8.9.2.1); `Arc` tiles them along the arc's profile-sample run (§8.9.2.2),
+        // which is pinned for **even `segments` only** — decline a multi-face `Arc` sector
+        // at odd `segments` (the arc has no exact midpoint sample there, still-open B3) to
+        // the sharp ring rather than tile an un-pinned run.
         let mut reflex_faces: Vec<FaceKey> = Vec::new();
         for &(_, face) in &sectors[r].corners {
             if !reflex_faces.contains(&face) {
                 reflex_faces.push(face);
             }
         }
-        if reflex_faces.len() != 1 && mode != BevelMiter::Patch {
-            return false;
+        if reflex_faces.len() != 1 {
+            match mode {
+                BevelMiter::Patch => {}
+                BevelMiter::Arc if segments % 2 == 0 => {}
+                _ => return false,
+            }
         }
 
         // Every check has passed — mutate.
@@ -2598,12 +2604,37 @@ impl LoopMesh {
             };
             set_face_substitution(face_subst, vertex, reflex_face, run);
         } else {
-            // Multi-face reflex sector (§8.9.2.1): `Patch` only (Arc/Sharp declined
-            // above). Fan every reflex face to the hub `B2` (identical to the SHARP
-            // outer join), opening only the two flank faces into pentagons along their
-            // patch legs. `forward_run` is the patch chain `[B1, SH_lead, B2, SH_trail,
-            // B3]`, so `B2` is its middle slot.
-            self.restitch_multiface_patch_reflex(vertex, &sectors[r], &forward_run, face_subst);
+            // Multi-face reflex sector: rebuild each absorbed-leg face by mode.
+            match mode {
+                // §8.9.2.1: `Patch` fans every reflex face to the hub `B2` (identical to
+                // the SHARP outer join), opening only the two flank faces into pentagons
+                // along their patch legs. `forward_run` is the patch chain `[B1, SH_lead,
+                // B2, SH_trail, B3]`, so `B2` is its middle slot.
+                BevelMiter::Patch => {
+                    self.restitch_multiface_patch_reflex(
+                        vertex,
+                        &sectors[r],
+                        &forward_run,
+                        face_subst,
+                    );
+                }
+                // §8.9.2.2: `Arc` tiles the reflex faces along the arc sample run — no
+                // hub. `forward_run` is the sample chain `[s_0 = B1, s_1 = bulge, …,
+                // s_segments = B3]`, so each face threads the inclusive run between its two
+                // legs' assigned sample indices.
+                BevelMiter::Arc => {
+                    self.restitch_multiface_arc_reflex(
+                        vertex,
+                        &sectors[r],
+                        &forward_run,
+                        segments,
+                        face_subst,
+                    );
+                }
+                BevelMiter::Sharp => {
+                    unreachable!("the outer-miter dispatch calls this only for Arc / Patch")
+                }
+            }
         }
 
         // Build the enlarged ring in disk order together with the crossing beveled edge
@@ -2732,6 +2763,85 @@ impl LoopMesh {
             };
             // Orient the run to the face's own winding: forward when the face enters the
             // apex from its disk-leading leg, reversed otherwise (§7.6.3 convention).
+            let run = match self.face_corner_edges(face, vertex) {
+                Some((incoming, _)) if incoming == legs[face_slot] => forward,
+                _ => {
+                    let mut reversed = forward;
+                    reversed.reverse();
+                    reversed
+                }
+            };
+            set_face_substitution(face_subst, vertex, face, run);
+        }
+    }
+
+    /// Re-stitch a **multi-face** reflex sector for the outer `ARC` miter
+    /// (BEVEL.md §8.9.2.2, **even `segments`**). Unlike `PATCH`, `ARC` has **no** `B2`
+    /// ring hub: the arc between `B1` and `B3` is realised as its full profile — the
+    /// sample chain `[s_0 = B1, s_1, …, s_segments = B3]` (`sample_chain`, all interior
+    /// samples materialised whether or not a leg lands on one) — and the reflex faces
+    /// **tile contiguous runs** of that chain rather than fanning to a point.
+    ///
+    /// Each absorbed leg gets a profile-sample index by the §8.9.2 assignment (walking
+    /// the absorbed legs in disk order: first half → `0`, second half → `segments`, and
+    /// — for an odd absorbed-leg count — the single middle leg → `segments / 2`); the two
+    /// flanking beveled edges take the arc ends (`0` for the leading flank, `segments` for
+    /// the trailing). The indices are non-decreasing in disk order. Each reflex face,
+    /// bounded by two legs with indices `i ≤ j`, then rebuilds by substituting its apex
+    /// corner with the inclusive sample run `s_i … s_j` — a single sample (triangle) when
+    /// `i = j`, one extra vertex per interior sample the run crosses (a face straddling an
+    /// un-pinned interior sample threads it rather than skipping it). A flank face's rim
+    /// vertex on the beveled side is replaced by that edge's terminal boundvert through the
+    /// ordinary beveled-edge restitch — not here — exactly as for `PATCH`.
+    fn restitch_multiface_arc_reflex(
+        &self,
+        vertex: VertexKey,
+        reflex_sector: &Sector,
+        sample_chain: &[VertexKey],
+        segments: u32,
+        face_subst: &mut Vec<FaceSubstitution>,
+    ) {
+        // The sector's legs in disk order (leading flank, absorbed legs, trailing flank)
+        // and the face bounded by each consecutive leg pair, `corners[i].1` between
+        // `legs[i]` and `legs[i + 1]` — the same layout `restitch_multiface_patch_reflex`
+        // consumes.
+        let legs: Vec<EdgeKey> = reflex_sector.corners.iter().map(|&(edge, _)| edge).collect();
+        let leg_count = legs.len();
+        let seg = segments as usize;
+        // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed leg;
+        // anything shorter is single-face and never reaches here. The sample chain is the
+        // arc's `segments + 1` profile vertices `s_0 … s_segments`.
+        if leg_count < 3 || sample_chain.len() != seg + 1 {
+            return;
+        }
+
+        // §8.9.2 profile-sample index per leg. Flanks anchor the two arc ends; absorbed
+        // legs split first-half → 0 / (odd) middle → segments/2 / second-half → segments.
+        let absorbed_count = leg_count - 2;
+        let first_half = absorbed_count / 2;
+        let has_middle = absorbed_count % 2 == 1;
+        let mut leg_sample: Vec<usize> = vec![0; leg_count];
+        leg_sample[leg_count - 1] = seg; // trailing flank → B3 end
+        for absorbed in 0..absorbed_count {
+            let leg = absorbed + 1; // absorbed legs occupy legs[1 ..= leg_count - 2]
+            leg_sample[leg] = if absorbed < first_half {
+                0
+            } else if has_middle && absorbed == first_half {
+                seg / 2
+            } else {
+                seg
+            };
+        }
+
+        for face_slot in 0..leg_count - 1 {
+            let face = reflex_sector.corners[face_slot].1;
+            // The face's earlier (disk-leading) leg carries the lower index `i`, the later
+            // leg the higher `j`; the run replacing the apex is the inclusive `s_i … s_j`.
+            let i = leg_sample[face_slot];
+            let j = leg_sample[face_slot + 1];
+            // Ascending run `[s_i … s_j]`, the order used when the face enters the apex
+            // from its disk-leading leg (so `s_i` lands next to that leg's rim vertex).
+            let forward: Vec<VertexKey> = sample_chain[i..=j].to_vec();
             let run = match self.face_corner_edges(face, vertex) {
                 Some((incoming, _)) if incoming == legs[face_slot] => forward,
                 _ => {
@@ -3936,7 +4046,21 @@ impl LoopMesh {
             direction: dir_second,
         };
 
+        // The §7.6.2 face-drop runs for **case-3 (non-planar) sectors only**. Whether
+        // the two case-3 offset lines happen to come out skew or exactly crossing is a
+        // floating-point knife-edge — either way the provisional meet floats above the
+        // surface and must be projected onto the first in-wedge sector face. Gating the
+        // drop on the skew/crossing classification (rather than on planarity) leaves a
+        // clean crossing lifted above an in-wedge face: correct where no face is in-wedge
+        // (the crossing stands, e.g. a reflex meet whose bisector lands on a rim vertex),
+        // wrong where one is (e.g. an even-absorbed-leg reflex sector whose bisector falls
+        // inside a straddle face — the crossing must drop onto it, §8.9.2 / §8.9.2.2).
+        // Case 1/2 planar sectors never reach `non_planar`, so their in-plane crossing is
+        // returned untouched.
         match intersect_lines(&line_first, &line_second) {
+            LineMeet::Crossing(point) if layout.non_planar => {
+                self.drop_onto_sector_face(vertex_position, &layout, point, offset)
+            }
             LineMeet::Crossing(point) => point,
             LineMeet::Collinear => line_first.point,
             LineMeet::Skew(midpoint) => {
@@ -4094,6 +4218,7 @@ impl LoopMesh {
             between_faces: faces,
             between_edges,
             bound_dirs,
+            non_planar: has_out_of_plane,
         })
     }
 
@@ -6232,6 +6357,10 @@ struct SectorLayout {
     /// `bound_dirs[i]` (its walk edge) and `bound_dirs[i + 1]` (the next disk edge)
     /// — the §7.6.2 in-wedge pair. A zero entry marks a degenerate leg direction.
     bound_dirs: Vec<Vec3>,
+    /// Whether this is a §7.6.2 **case 3** (non-planar) sector: at least one
+    /// in-between leg is out-of-plane, so each offset line carries its own local
+    /// normal. The face-drop step runs only for these sectors.
+    non_planar: bool,
 }
 
 /// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
@@ -8490,6 +8619,14 @@ mod tests {
     /// unbeveled legs `A–R4 … A–R8`. Returns `(mesh, apex A, rim [R1 … R8],
     /// [A-R1, A-R2, A-R3])`.
     fn octagonal_bipyramid() -> (LoopMesh, VertexKey, [VertexKey; 8], [EdgeKey; 3]) {
+        let (mesh, apex, rim, apex_leg) = octagonal_bipyramid_all_legs();
+        (mesh, apex, rim, [apex_leg[0], apex_leg[1], apex_leg[2]])
+    }
+
+    /// The same octagonal bipyramid, exposing **all eight** apex legs so a caller can
+    /// bevel any prefix (e.g. four legs for the even-absorbed-leg `ARC` cross-check of
+    /// §8.9.2.2). Returns `(mesh, apex A, rim [R1 … R8], apex legs [A-R1 … A-R8])`.
+    fn octagonal_bipyramid_all_legs() -> (LoopMesh, VertexKey, [VertexKey; 8], [EdgeKey; 8]) {
         let mut mesh = LoopMesh::new();
         let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
         let base = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
@@ -8525,7 +8662,55 @@ mod tests {
         }
 
         let rim_array: [VertexKey; 8] = rim.try_into().expect("eight rim verts");
-        (mesh, apex, rim_array, [apex_leg[0], apex_leg[1], apex_leg[2]])
+        let leg_array: [EdgeKey; 8] = apex_leg.try_into().expect("eight apex legs");
+        (mesh, apex, rim_array, leg_array)
+    }
+
+    /// Re-derive a reflex sector's three `segments = 2` `ARC` sample positions on the
+    /// pristine octagonal bipyramid, independently of the operator: the two arc ends
+    /// `s_0 = B1` / `s_2 = B3` (the §8.9.2 neighbour-plane reposition of the sector's
+    /// meet-point along its two flanking edges) and the interior bulge `s_1` (pulled in
+    /// `√2 − 1` from the chord midpoint toward the stored meet corner, §8.9.5). `beveled`
+    /// names which apex-leg indices are beveled. Returns `(s_0, s_1, s_2)`.
+    fn octagonal_arc_samples(beveled: &[usize]) -> (Vec3, Vec3, Vec3) {
+        let offset = 0.2;
+        let (mesh, apex, _rim, apex_leg) = octagonal_bipyramid_all_legs();
+        let beveled_edges: Vec<EdgeKey> = beveled.iter().map(|&k| apex_leg[k]).collect();
+        let is_beveled = |edge: EdgeKey| beveled_edges.contains(&edge);
+        let apex_position = mesh.vertex_position(apex);
+        let corners = mesh.vertex_corner_ring(apex);
+        let sectors = sector_split(&corners, &is_beveled);
+        let sector_count = sectors.len();
+        let mut meets: Vec<Vec3> = Vec::new();
+        let mut dir_open: Vec<Vec3> = Vec::new();
+        let mut dir_close: Vec<Vec3> = Vec::new();
+        let mut reflex: Vec<bool> = Vec::new();
+        for sector in &sectors {
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = sector.corners[0].1;
+            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
+            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let cross = (-d_open).cross(-d_close);
+            reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
+            meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
+            dir_open.push(d_open);
+            dir_close.push(d_close);
+        }
+        assert_eq!(
+            reflex.iter().filter(|&&x| x).count(),
+            1,
+            "the bunched octagonal bevel presents exactly one reflex sector",
+        );
+        let r = reflex.iter().position(|&x| x).unwrap();
+        let midpoint = meets[r];
+        let predecessor = meets[(r + sector_count - 1) % sector_count];
+        let successor = meets[(r + 1) % sector_count];
+        let b1 = midpoint + (predecessor - midpoint).dot(dir_open[r]) * dir_open[r];
+        let b3 = midpoint + (successor - midpoint).dot(dir_close[r]) * dir_close[r];
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let bulge = (2.0 - sqrt2) * (0.5 * (b1 + b3)) + (sqrt2 - 1.0) * midpoint;
+        (b1, bulge, b3)
     }
 
     fn single_face_reflex_junction() -> (LoopMesh, VertexKey, [EdgeKey; 3]) {
@@ -8986,36 +9171,210 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.9.2.1: the multi-face reflex sector is supported for `PATCH` only —
-    /// `ARC`'s interior-sample walk is not yet pinned, so `miter_outer = Arc` on the same
-    /// octagonal-bipyramid driver declines the outer miter and falls back to the sharp
-    /// ring (identical to `Sharp`), while `PATCH` genuinely reshapes it.
+    /// BEVEL.md §8.9.2.2 worked trace: the multi-face reflex outer-`ARC` re-stitch at
+    /// `segments = 2`. Beveling the three bunched apex legs `A–R1 … A–R3` of the octagonal
+    /// bipyramid leaves the `270°` reflex sector absorbing the five unbeveled legs
+    /// `A–R4 … A–R8` (an **odd** count). `ARC` materialises the three arc samples
+    /// `s_0 = B1`, `s_1 = bulge`, `s_2 = B3` — with **no** `B2` hub — and **tiles** the six
+    /// reflex faces along that sample run: the odd middle leg `A–R6` pins the interior
+    /// sample `s_1`, so the two faces on either side of it (`[A,R5,R6]`, `[A,R6,R7]`) grow
+    /// to quads that straddle `s_1`, while the two ends and the two flanks stay triangles.
+    /// No reflex face fans to a single hub, and no vertex remains at the raw meet corner.
     #[test]
-    fn multiface_arc_declines_while_patch_reshapes() {
-        let bevel = |kind: BevelMiter| {
-            let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
-            let _ = mesh.bevel(
-                &[va.into(), vb.into(), vc.into()],
-                BevelOptions {
-                    offset: 0.2,
-                    affect: BevelAffect::Edges,
-                    segments: 2,
-                    vmesh_method: BevelVmeshMethod::Adj,
-                    miter_outer: kind,
-                    ..Default::default()
-                },
-            );
-            mesh.validate_topology();
-            counts(&mesh)
-        };
-        let sharp = bevel(BevelMiter::Sharp);
-        let arc = bevel(BevelMiter::Arc);
-        let patch = bevel(BevelMiter::Patch);
-        assert_eq!(
-            arc, sharp,
-            "multi-face ARC declines to the sharp ring (interior-sample walk unpinned, §8.9.2.1)",
+    fn multiface_arc_tiles_reflex_hole_run() {
+        let (s0, s1, s2) = octagonal_arc_samples(&[0, 1, 2]);
+        // The raw §7.6.2 meet corner PATCH would promote to the hub B2 — ARC keeps it only
+        // as a control point and mints no vertex there.
+        let (_, meet, _) = octagonal_patch_boundvert_positions();
+
+        let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
         );
-        assert_ne!(patch, sharp, "multi-face PATCH reshapes the reflex sector (§8.9.2.1)");
+        mesh.validate_topology();
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+
+        let find = |p: Vec3| {
+            result
+                .verts
+                .iter()
+                .copied()
+                .find(|&x| (mesh.vertex_position(x) - p).length() < 1.0e-4)
+        };
+        let sample = [
+            find(s0).expect("s_0 = B1 minted"),
+            find(s1).expect("s_1 interior bulge minted (always materialised, §8.9.2.2)"),
+            find(s2).expect("s_2 = B3 minted"),
+        ];
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, meet),
+            0,
+            "ARC keeps the meet corner only as a control point — no ring hub B2 (§8.9.2.2)",
+        );
+
+        // Classify every reflex face (one touching an absorbed rim vert R4 … R8) by the
+        // arc samples it threads and its size. §8.9.2.2 pins the exact multiset: two
+        // `{s_0}` triangles, one `{s_0,s_1}` quad, one `{s_1,s_2}` quad, two `{s_2}`
+        // triangles — the run-tiling signature (no hub, the odd middle leg splits the run
+        // at s_1).
+        let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
+        let mut observed: Vec<(Vec<usize>, usize)> = Vec::new();
+        for face in mesh.face_keys() {
+            let face_verts = mesh.face_vert_keys(face);
+            if !face_verts.iter().any(|x| absorbed.contains(x)) {
+                continue;
+            }
+            let threaded: Vec<usize> = sample
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| face_verts.contains(&s))
+                .map(|(i, _)| i)
+                .collect();
+            // Base-side pyramid faces touch the absorbed rims too but thread no arc
+            // sample and are not re-stitched; only reflex miter faces reach the samples.
+            if threaded.is_empty() {
+                continue;
+            }
+            observed.push((threaded, face_verts.len()));
+        }
+        observed.sort();
+        let mut expected = vec![
+            (vec![0], 3),
+            (vec![0], 3),
+            (vec![0, 1], 4),
+            (vec![1, 2], 4),
+            (vec![2], 3),
+            (vec![2], 3),
+        ];
+        expected.sort();
+        assert_eq!(
+            observed, expected,
+            "six reflex faces tile the arc run: 4 triangles + 2 straddle quads (§8.9.2.2)",
+        );
+
+        // The interior sample s_1 is threaded by exactly the two straddle quads — one per
+        // side of the odd middle leg — never fanned to a hub.
+        let s1_faces = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&face| mesh.face_vert_keys(face).contains(&sample[1]))
+            .count();
+        assert!(
+            s1_faces >= 2,
+            "the interior bulge s_1 is a real arc vertex the straddle quads thread",
+        );
+    }
+
+    /// BEVEL.md §8.9.2.2 even-leg cross-check: beveling **four** apex legs `A–R1 … A–R4`
+    /// of the octagonal bipyramid leaves the `225°` reflex sector absorbing **four**
+    /// unbeveled legs `A–R5 … A–R8` (an **even** count), assigned `A–R5→0, A–R6→0,
+    /// A–R7→2, A–R8→2` — no leg on the interior sample `s_1`. This is the case the
+    /// withdrawn "arc-end-only" reading claimed adds no interior vertex; the pinned rule
+    /// **does** materialise `s_1` and threads the single wide face `[A,R6,R7]` through it
+    /// as a **pentagon** `[B_3, s_1, B_1, R6, R7]`, while the other reflex faces stay
+    /// triangles. So the even-leg closure is one pentagon plus four triangles — not
+    /// arc-end-only.
+    #[test]
+    fn multiface_arc_even_legs_thread_pentagon() {
+        let (s0, s1, s2) = octagonal_arc_samples(&[0, 1, 2, 3]);
+
+        // §8.9.2 / §8.9.2.2: the arc ends inherit the reflex sector's meet-point, which
+        // for this **even**-absorbed-leg sector is the two flanking edges' offset-line
+        // crossing **dropped onto the straddle face** `[A,R6,R7]` (the §7.6.2 face-drop
+        // fires on the case-3 crossing, not just a skew midpoint). The neighbour-plane
+        // reposition then lands `B1` / `B3` here, and the §8.9.5 bulge pulls `s_1` in —
+        // matching the cross-backend oracle. (The odd-leg sector's crossing bisector
+        // lands on a rim vertex, so its drop rejects every face and the meet stays
+        // lifted; only the even sector drops. These pins are the discriminator.)
+        let oracle = [
+            Vec3::new(-0.36871, 0.24371, 0.42679),
+            Vec3::new(0.00368, 0.00888, 0.62133),
+            Vec3::new(0.43305, -0.08839, 0.42679),
+        ];
+        for (got, want) in [s0, s1, s2].iter().zip(oracle.iter()) {
+            assert!(
+                (*got - *want).length() < 1.0e-4,
+                "even-leg arc sample {got:?} matches oracle {want:?} (§8.9.2.2 reflex drop)",
+            );
+        }
+
+        let (mut mesh, _apex, rim, apex_leg) = octagonal_bipyramid_all_legs();
+        let beveled: Vec<GeomKey> = (0..4).map(|k| apex_leg[k].into()).collect();
+        let result = mesh.bevel(
+            &beveled,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+
+        let find = |p: Vec3| {
+            result
+                .verts
+                .iter()
+                .copied()
+                .find(|&x| (mesh.vertex_position(x) - p).length() < 1.0e-4)
+        };
+        let sample = [
+            find(s0).expect("s_0 = B1 minted"),
+            find(s1).expect("s_1 interior bulge minted even with no leg on it (§8.9.2.2)"),
+            find(s2).expect("s_2 = B3 minted"),
+        ];
+
+        // The absorbed rims are R5 … R8; classify reflex faces by threaded samples + size.
+        let absorbed = [rim[4], rim[5], rim[6], rim[7]];
+        let mut observed: Vec<(Vec<usize>, usize)> = Vec::new();
+        for face in mesh.face_keys() {
+            let face_verts = mesh.face_vert_keys(face);
+            if !face_verts.iter().any(|x| absorbed.contains(x)) {
+                continue;
+            }
+            let threaded: Vec<usize> = sample
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| face_verts.contains(&s))
+                .map(|(i, _)| i)
+                .collect();
+            // Base-side pyramid faces touch the absorbed rims too but thread no arc
+            // sample and are not re-stitched; only reflex miter faces reach the samples.
+            if threaded.is_empty() {
+                continue;
+            }
+            observed.push((threaded, face_verts.len()));
+        }
+        observed.sort();
+        // Faces: [A,R5,R6]→{s_0} tri, [A,R6,R7]→{s_0,s_1,s_2} pent (threads un-pinned s_1),
+        // [A,R7,R8]→{s_2} tri, plus the two flank triangles [A,R4,R5]→{s_0}, [A,R8,R1]→{s_2}.
+        let mut expected = vec![
+            (vec![0], 3),
+            (vec![0], 3),
+            (vec![0, 1, 2], 5),
+            (vec![2], 3),
+            (vec![2], 3),
+        ];
+        expected.sort();
+        assert_eq!(
+            observed, expected,
+            "even-leg ARC: one wide pentagon threads s_1 + four triangles (§8.9.2.2)",
+        );
     }
 
     /// BEVEL.md §8.9.2 / §8.9.5: pin the outer-miter construction against a faithful
