@@ -1659,7 +1659,15 @@ impl LoopMesh {
         if let Some(terminal) = terminal_vertex {
             cell.snap_terminal_plane(terminal);
         }
-        let positions = cell.chain_positions(segments, profile);
+        // §8.2.2.1.1 applies the seg=2 boundary resample to every cross-section that
+        // bounds a [V-ADJ] adjacency fill. A terminal far end has no junction fill
+        // face (§6.7.5.4) — its through-strip is capped by the naive profile chain,
+        // not a doubled-then-down-resampled vmesh boundary — so the resample is
+        // inert there. Everywhere else (junction and miter-patch cross-sections) it
+        // is applied unconditionally: the identity on symmetric cells leaves every
+        // equal-offset strip untouched, correcting only the skewed arc-flanking ones.
+        let resample_seg2 = terminal_vertex.is_none();
+        let positions = cell.chain_positions(segments, profile, resample_seg2);
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for position in positions.iter().take(positions.len() - 1).skip(1) {
@@ -2250,8 +2258,8 @@ impl LoopMesh {
             let crossing = plans[k].closing; // == plans[next].opening
             let start = arc_end[k];
             let end = arc_start[next];
-            let interior =
-                self.build_chain_between(start, end, crossing, segments, profile, None, result);
+            let interior = self
+                .build_chain_between(start, end, crossing, segments, profile, None, result);
             // Invariant: a circular `segments = 2` cross-section always yields exactly
             // one interior sample. Reaching here with none would mean `build_chain_between`
             // returned no interior sample despite the `segments == 2` gate above — an
@@ -2675,8 +2683,14 @@ impl LoopMesh {
                     mids.push(mid);
                 }
                 Some(edge) => {
-                    let interior = self
-                        .build_chain_between(start, end, edge, segments, profile, None, result);
+                    // §8.2.2.1.1: the reflex sector's flanking beveled-edge cross-sections
+                    // run to an inward-repositioned arc-start boundvert, making the profile
+                    // cell skewed; at `segments = 2` the single interior sample is the
+                    // chord-fraction resample of the doubled profile, not the naive 45°
+                    // point. Identity on the symmetric interior sector strips.
+                    let interior = self.build_chain_between(
+                        start, end, edge, segments, profile, None, result,
+                    );
                     // A circular `segments = 2` cross-section always yields exactly one
                     // interior sample; none here would be an internal-invariant
                     // violation, and we are already past the read-only classification
@@ -9377,6 +9391,121 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.2.2.1.1: on the skewed arc-flanking cross-section cell (the reflex
+    /// sector's leading beveled edge `A–R4` of the octagonal-bipyramid ARC fixture,
+    /// `offset = 0.2`, `segments = 2`), the single interior sample is the chord-fraction
+    /// resample of the doubled (4-segment) profile, not the naive 45° cell point. Pins
+    /// the guide's oracle-verified worked trace.
+    #[test]
+    fn segment2_flanking_resample_matches_worked_trace() {
+        // Leading flanking beveled edge `A–R4`: apex `A`, rim `R4` (BEVEL.md §8.2.2.1.1).
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let rim = Vec3::new(-0.70711, 0.70711, 0.0);
+        let edge_dir = (rim - apex).normalize();
+
+        let start = Vec3::new(-0.19194, 0.46338, 0.45712); // shoulder meet of A–R3 / A–R4
+        let end = Vec3::new(-0.36871, 0.24371, 0.42679); // inward-repositioned B_1
+
+        let cell = ProfileCell::new(start, end, apex, edge_dir);
+
+        // The on-edge foot: unequal legs (0.200 vs 0.133) — a genuinely skewed cell.
+        assert!(
+            (cell.mid - Vec3::new(-0.35577, 0.35577, 0.49687)).length() < 1.0e-4,
+            "on-edge foot mid = {:?}",
+            cell.mid,
+        );
+        let leg_start = (cell.mid - start).length();
+        let leg_end = (cell.mid - end).length();
+        assert!(
+            (leg_start - 0.200).abs() < 2.0e-3 && (leg_end - 0.133).abs() < 2.0e-3,
+            "unequal-offset legs {leg_start} / {leg_end}",
+        );
+
+        // The naive 45° sample (the wrong, symmetric-cell value the resample corrects).
+        let naive = cell.sample(
+            std::f32::consts::FRAC_PI_4.sin(),
+            std::f32::consts::FRAC_PI_4.cos(),
+        );
+        assert!(
+            (naive - Vec3::new(-0.31157, 0.35446, 0.46470)).length() < 1.0e-4,
+            "naive 45° sample = {naive:?}",
+        );
+
+        // The §8.2.2.1.1 chord-fraction resample lands on BMesh's flanking vertex.
+        let resampled = cell.segment2_boundary_resample(0.5);
+        assert!(
+            (resampled - Vec3::new(-0.31188, 0.35399, 0.46459)).length() < 1.0e-4,
+            "resampled flanking sample = {resampled:?}",
+        );
+        // It genuinely moves off the naive point (~0.0005 world-units, ~50 quanta).
+        let shift = (resampled - naive).length();
+        assert!(
+            shift > 3.0e-4 && shift < 1.0e-3,
+            "resample shifts the sample ~0.0005 wu off the naive point (got {shift})",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1.1: the resample is the **identity** on a symmetric
+    /// (equal-offset) cell — `f = 0.5` lands exactly on `Q_2 = P_1` — so applying it
+    /// unconditionally at `segments = 2` cannot regress the equal-offset strips.
+    #[test]
+    fn segment2_resample_is_identity_on_symmetric_cell() {
+        // A symmetric cell: `start` / `end` mirror across the z-axis edge, so both cell
+        // legs equal `1.0` and the foot lands at `(0, 0, 1)`.
+        let start = Vec3::new(1.0, 0.0, 1.0);
+        let end = Vec3::new(0.0, 1.0, 1.0);
+        let cell = ProfileCell::new(start, end, Vec3::ZERO, Vec3::Z);
+
+        assert!(
+            ((cell.mid - start).length() - (cell.mid - end).length()).abs() < 1.0e-6,
+            "constructed cell is symmetric",
+        );
+
+        let naive = cell.sample(
+            std::f32::consts::FRAC_PI_4.sin(),
+            std::f32::consts::FRAC_PI_4.cos(),
+        );
+        let resampled = cell.segment2_boundary_resample(0.5);
+        assert!(
+            (resampled - naive).length() < 1.0e-6,
+            "symmetric-cell resample is the identity ({resampled:?} vs {naive:?})",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1.1 / §6.7.5.4: the seg=2 resample fires for every cross-section
+    /// that bounds a [V-ADJ] adjacency fill (`resample_seg2 = true`) but is inert at a
+    /// terminal far end (`false`), which has no fill and keeps the naive profile chain.
+    /// On the skewed arc-flanking cell the two paths must disagree by the resample shift.
+    #[test]
+    fn chain_positions_resamples_skewed_cell_only_off_terminal() {
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let rim = Vec3::new(-0.70711, 0.70711, 0.0);
+        let edge_dir = (rim - apex).normalize();
+        let start = Vec3::new(-0.19194, 0.46338, 0.45712);
+        let end = Vec3::new(-0.36871, 0.24371, 0.42679);
+        let cell = ProfileCell::new(start, end, apex, edge_dir);
+
+        let filled = cell.chain_positions(2, 0.5, true);
+        let terminal = cell.chain_positions(2, 0.5, false);
+
+        // Endpoints are identical; only the single interior sample can differ.
+        assert_eq!(filled.len(), 3);
+        assert_eq!(terminal.len(), 3);
+        assert!((filled[0] - terminal[0]).length() < 1.0e-6);
+        assert!((filled[2] - terminal[2]).length() < 1.0e-6);
+
+        // The fill path lands on the resampled sample; the terminal path stays naive.
+        let coarse = superellipse_chain(0.5, 2);
+        let naive = cell.sample(coarse[1].0, coarse[1].1);
+        assert!((filled[1] - cell.segment2_boundary_resample(0.5)).length() < 1.0e-6);
+        assert!(
+            (terminal[1] - naive).length() < 1.0e-6,
+            "terminal far-end interior stays the naive profile-chain sample",
+        );
+        // On this skewed cell the two paths genuinely disagree (past the quantum).
+        assert!((filled[1] - terminal[1]).length() > 3.0e-4);
+    }
+
     /// BEVEL.md §8.9.2 / §8.9.5: pin the outer-miter construction against a faithful
     /// re-derivation from the pristine mesh. Replicating the §8.9.1 classification and
     /// §8.9.2 reposition here, the arc-end boundverts `B1` / `B3` each land level
@@ -14658,7 +14787,7 @@ impl ProfileCell {
     /// `profile` (§8.6.4, reducing to the §8.3.6 circular default at `profile =
     /// 0.5`) mapped through the cell. A collinear (flat) corner has no bulge and
     /// falls back to the even straight subdivision of the chord (§8.2.2.1).
-    fn chain_positions(&self, segments: u32, profile: f32) -> Vec<Vec3> {
+    fn chain_positions(&self, segments: u32, profile: f32, resample_seg2: bool) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
         if self.collinear {
@@ -14673,7 +14802,74 @@ impl ProfileCell {
             }
         }
         positions.push(self.end);
+        // §8.2.2.1.1 [V-ADJ] boundary resample: at `segments == 2` the round-over
+        // fill reaches its width by doubling a 2-segment control cage to 4 and
+        // resampling back down *by chord fraction*, not cell angle. On a symmetric
+        // (equal-offset) cell that is the identity, but on the skewed arc-flanking
+        // cross-section (a repositioned arc-start boundvert shortens one leg) it
+        // shifts the single interior sample off the naive 45° point. `resample_seg2`
+        // is set for every vmesh-fill-bounding cross-section (the caller clears it
+        // only for a terminal far end, which has no adjacency fill — §6.7.5.4); the
+        // identity on symmetric cells then leaves every equal-offset strip untouched,
+        // correcting only the skewed arc-flanking cross-sections.
+        if resample_seg2 && segments == 2 && !self.collinear {
+            positions[1] = self.segment2_boundary_resample(profile);
+        }
         positions
+    }
+
+    /// §8.2.2.1.1 `segments = 2` chord-fraction resample of the single interior
+    /// sample. Materialise the cross-section at the doubled (4-segment) resolution
+    /// (`Q_0 = start`, `Q_m = S(22.5°·m)`, `Q_4 = end`), take the chord fraction `f`
+    /// of the naive 45° sample along the 2-segment chord `[start, P_1, end]`, and
+    /// read the 4-segment polyline back at chord fraction `f`. Identity on symmetric
+    /// cells (`f = 0.5` lands exactly on `Q_2 = P_1`); the skew pushes `f` toward the
+    /// shorter leg.
+    fn segment2_boundary_resample(&self, profile: f32) -> Vec3 {
+        let coarse = superellipse_chain(profile, 2);
+        let naive = self.sample(coarse[1].0, coarse[1].1);
+
+        let fine = superellipse_chain(profile, 4);
+        let q = [
+            self.start,
+            self.sample(fine[1].0, fine[1].1),
+            self.sample(fine[2].0, fine[2].1),
+            self.sample(fine[3].0, fine[3].1),
+            self.end,
+        ];
+
+        let to_start = (naive - self.start).length();
+        let to_end = (self.end - naive).length();
+        let chord = to_start + to_end;
+        if chord <= f32::EPSILON {
+            return naive;
+        }
+        let f = to_start / chord;
+
+        let mut g = [0.0f32; 5];
+        for m in 1..5 {
+            g[m] = g[m - 1] + (q[m] - q[m - 1]).length();
+        }
+        let total = g[4];
+        if total <= f32::EPSILON {
+            return naive;
+        }
+        for value in g.iter_mut() {
+            *value /= total;
+        }
+
+        for j in 0..4 {
+            if f <= g[j + 1] || j == 3 {
+                let span = g[j + 1] - g[j];
+                let t = if span <= f32::EPSILON {
+                    0.0
+                } else {
+                    (f - g[j]) / span
+                };
+                return q[j] + (q[j + 1] - q[j]) * t;
+            }
+        }
+        naive
     }
 
     /// The profile's "height" (BEVEL.md §8.3.3): the span between the cell's
