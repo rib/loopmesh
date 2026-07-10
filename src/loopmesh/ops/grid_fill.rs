@@ -445,27 +445,29 @@ impl LoopMesh {
         Some(path)
     }
 
-    /// §3.4 Phase 1+2 — reconcile a boundary member of `members` real vertices to
-    /// the lattice's full `target` slot count. Every original member vertex is
-    /// preserved as a lattice slot; the `target - count` extra slots are
-    /// *scaffold* vertices inserted into the member's segments by a count-driven
-    /// even-distribution schedule walked **from the origin end** (the member is
-    /// pre-oriented origin-first, so segment `s` is `[members[s], members[s+1]]`).
-    /// The schedule — segment `s` receives
-    /// `floor((s+1)·extra / segments) − floor(s·extra / segments)` scaffolds — is
-    /// a function of the counts alone, never of input ordering or geometry.
+    /// §3.4 Phase 1+2 / §3.4a(b) — reconcile a boundary member of `members` real
+    /// vertices to the lattice's full `target` slot count. Every original member
+    /// vertex is preserved as a lattice slot; the `target − count` extra slots are
+    /// *scaffold* vertices whose placement, and whose collapse survivor, follow
+    /// the **doubling-then-spread expand schedule** of §3.4a(b). That schedule is
+    /// a pure function of `count` and `target` — never of input ordering or
+    /// geometry — and is what lands the parity-correct outer-cell fan (`4→6 →
+    /// [m0, m0, m1, m2, m3, m3]`) rather than an inner-cell one.
     ///
-    /// Returns the per-slot positions and the per-slot vertex keys. Each scaffold
-    /// slot is a **parameter-0 split (§3.4a-a)**: its position is placed
-    /// *coincident with* its collapse-survivor endpoint — not at the segment
-    /// midpoint — so the profile handed to the §5/§6 interior solver repeats an
-    /// endpoint coordinate at each scaffold slot rather than an even-subdivision
-    /// point. The survivor is that segment's origin-ward — lower-index — endpoint,
-    /// the deterministic collapse target of §3.4 (the endpoint reached first
-    /// walking from `grid[0][0]`), and the later Phase-2 collapse into that same
-    /// endpoint is a geometric no-op. The two member endpoints are always slot 0
-    /// and slot `target-1`, so the four lattice corners stay real. An already-full
-    /// member is the identity.
+    /// Each slot is resolved to the member index it carries: a real slot to its
+    /// own vertex, a scaffold slot to the collapse **survivor** it is coincident
+    /// with. Because a scaffold is a **parameter-0 split (§3.4a(a))** placed on
+    /// top of its survivor, both its position and its key are the survivor's, so
+    /// the profile handed to the §5/§6 interior solver repeats an endpoint
+    /// coordinate at each scaffold slot (not an even-subdivision midpoint) and the
+    /// later Phase-2 collapse into that survivor moves no geometry.
+    ///
+    /// A running **swap flag** (§3.4a(b)) picks each split's survivor: **set** →
+    /// the slot being processed, **clear** → the neighbour slot sharing the split
+    /// segment. It starts set, toggles after every scaffold, and toggles once more
+    /// at the end of each doubling pass, carrying unbroken into the spread pass.
+    /// The two member endpoints are always slot 0 and slot `target−1`, so the four
+    /// lattice corners stay real. An already-full member is the identity.
     fn grid_expand_member(
         &self,
         members: &[VertexKey],
@@ -478,37 +480,70 @@ impl LoopMesh {
             return (real_positions, members.to_vec());
         }
 
-        let extra = target - count;
-        let segments = count - 1;
-        let mut positions = Vec::with_capacity(target);
-        let mut keys = Vec::with_capacity(target);
-        let mut inserted = 0usize;
-        for s in 0..segments {
-            // The segment's origin-ward endpoint — a real member vertex, and the
-            // collapse survivor for every scaffold this segment carries.
-            positions.push(real_positions[s]);
-            keys.push(members[s]);
+        // Each slot resolves to the member index it carries; scaffolds resolve to
+        // their collapse survivor. Start as the identity over the real vertices.
+        let mut slots: Vec<usize> = (0..count).collect();
+        let mut survive_processed = true;
 
-            // Even-distribution schedule (Bresenham-style spread from the origin
-            // end): the running count up to and including this segment, minus what
-            // earlier segments already took.
-            let upto = (s + 1) * extra / segments;
-            let here = upto - inserted;
-            inserted = upto;
-            for _ in 0..here {
-                // §3.4a-a — parameter-0 split: the scaffold is placed *coincident*
-                // with its collapse-survivor (the segment's origin-ward endpoint),
-                // so the boundary profile fed to the §5/§6 interior solver carries a
-                // repeated endpoint coordinate here, not an even-subdivision
-                // midpoint. Collapsing into that same endpoint (below) moves no
-                // geometry.
-                positions.push(real_positions[s]);
-                keys.push(members[s]);
+        // Doubling pass — while the member is under half the target, insert one
+        // scaffold per current slot, taking `current → 2·current`.
+        while 2 * slots.len() < target {
+            let base = std::mem::take(&mut slots);
+            let mut next = Vec::with_capacity(base.len() * 2);
+            for j in 0..base.len() {
+                if j + 1 < base.len() {
+                    // Forward split of the segment ahead: the processed slot is
+                    // the origin-ward endpoint, the neighbour is its follower.
+                    let survivor = if survive_processed { base[j] } else { base[j + 1] };
+                    next.push(base[j]);
+                    next.push(survivor);
+                } else {
+                    // The final slot has no segment ahead, so it splits the
+                    // segment behind it; the neighbour is its predecessor (the
+                    // scaffold just emitted for the previous slot).
+                    let predecessor = *next.last().unwrap();
+                    let survivor = if survive_processed { base[j] } else { predecessor };
+                    next.push(survivor);
+                    next.push(base[j]);
+                }
+                survive_processed = !survive_processed;
             }
+            // One extra toggle closes the doubling pass, carrying into the next.
+            survive_processed = !survive_processed;
+            slots = next;
         }
-        // The final real member vertex closes the walk at slot `target-1`.
-        positions.push(real_positions[count - 1]);
-        keys.push(members[count - 1]);
+
+        // Spread pass — scatter the remaining scaffolds one per even-width bucket
+        // over the current slots (§3.4a(b) `spread_indices`). Indices refer to the
+        // pre-spread sequence; inserting in ascending order keeps a running offset.
+        let current = slots.len();
+        let indices = spread_indices(current, target - current);
+        let mut offset = 0usize;
+        for index in indices {
+            let position = index + offset;
+            let survivor = if index + 1 < current {
+                // Forward split: this slot (set) or its follower (clear).
+                if survive_processed {
+                    slots[position]
+                } else {
+                    slots[position + 1]
+                }
+            } else {
+                // Final slot: backward split against its predecessor.
+                if survive_processed {
+                    slots[position]
+                } else {
+                    slots[position - 1]
+                }
+            };
+            let insert_at = if index + 1 < current { position + 1 } else { position };
+            slots.insert(insert_at, survivor);
+            survive_processed = !survive_processed;
+            offset += 1;
+        }
+
+        let positions: Vec<Vec3> = slots.iter().map(|&m| real_positions[m]).collect();
+        let keys: Vec<VertexKey> = slots.iter().map(|&m| members[m]).collect();
         (positions, keys)
     }
 
@@ -666,6 +701,20 @@ fn grid_walk_arm(
 fn grid_rails_overlap(rail_left: &[VertexKey], rail_right: &[VertexKey]) -> bool {
     let left: HashSet<VertexKey> = rail_left.iter().copied().collect();
     rail_right.iter().any(|v| left.contains(v))
+}
+
+/// §3.4a(b) — the spread pass's scaffold slots: one mark per equal-width bucket
+/// over `0..count`, dropped at the integer slot **just below** the bucket centre
+/// `c_k = (2k+1)·count / (2·extra)` (the largest integer strictly less than
+/// `c_k`). Equal buckets keep the marks as evenly spaced as an integer grid
+/// allows; the low-biased "just below" tie rule fixes the placement when a centre
+/// lands exactly on an integer slot. Both operands are non-negative, so this is
+/// ordinary truncating integer division. `spread_indices(4, 2) == [0, 2]`,
+/// `spread_indices(6, 1) == [2]`.
+fn spread_indices(count: usize, extra: usize) -> Vec<usize> {
+    (0..extra)
+        .map(|k| ((2 * k + 1) * count - 1) / (2 * extra))
+        .collect()
 }
 
 /// §6.1 — the four reciprocal-distance weights `[bottom, left, top, right]`,
@@ -1615,5 +1664,109 @@ mod tests {
             out.x.is_finite() && out.y.is_finite() && out.z.is_finite(),
             "transformed position finite on a degenerate source frame, got {out:?}",
         );
+    }
+
+    #[test]
+    fn spread_indices_matches_guide_traces() {
+        // §3.4a(b) worked traces: two even-width buckets over 0..4 pick slots 0
+        // and 2; a single bucket over 0..6 picks the slot just below centre 3.0.
+        assert_eq!(super::spread_indices(4, 2), vec![0, 2]);
+        assert_eq!(super::spread_indices(6, 1), vec![2]);
+    }
+
+    /// The §3.4a(b) collapsed slot profile of `grid_expand_member`, expressed as
+    /// the member index each slot resolves to (a scaffold resolves to its collapse
+    /// survivor). `[0, 0, 1, 2, 3, 3]` is the outer-cell fan of a `4→6` expand.
+    fn expand_profile(mesh: &LoopMesh, members: &[VertexKey], target: usize) -> Vec<usize> {
+        let (positions, keys) = mesh.grid_expand_member(members, target);
+        assert_eq!(positions.len(), target, "one position per lattice slot");
+        assert_eq!(keys.len(), target, "one key per lattice slot");
+        keys.iter()
+            .map(|k| {
+                members
+                    .iter()
+                    .position(|m| m == k)
+                    .expect("every slot resolves to a real member vertex")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn expand_schedule_matches_worked_traces() {
+        // §3.4a(b) — the doubling-then-spread expand schedule, pinned against the
+        // guide's two fully-worked traces and the minimal-axis regressions.
+        let mut mesh = LoopMesh::new();
+        let make = |mesh: &mut LoopMesh, n: usize| -> Vec<VertexKey> {
+            (0..n)
+                .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
+                .collect()
+        };
+
+        // 4→6: doubling does not run (2·4 = 8 is not < 6); the flag is still set,
+        // spread [0, 2] collapses segment 0 origin-ward (m0) and segment 2
+        // destination-ward (m3) → the outer-cell fan.
+        let m4 = make(&mut mesh, 4);
+        assert_eq!(expand_profile(&mesh, &m4, 6), vec![0, 0, 1, 2, 3, 3]);
+        // Identity when already full.
+        assert_eq!(expand_profile(&mesh, &m4, 4), vec![0, 1, 2, 3]);
+
+        // 3→7: one doubling pass (2·3 = 6 < 7) then a single spread; the flag's
+        // set → clear → set cadence plus the end-of-pass toggle lands the spread
+        // scaffold origin-ward on m1.
+        let m3 = make(&mut mesh, 3);
+        assert_eq!(expand_profile(&mesh, &m3, 7), vec![0, 0, 1, 1, 2, 2, 2]);
+
+        // Minimal single-scaffold axes are unchanged from the earlier ✅ rows.
+        let m2 = make(&mut mesh, 2);
+        assert_eq!(expand_profile(&mesh, &m2, 3), vec![0, 0, 1]); // 2→3 origin-ward
+        let m3b = make(&mut mesh, 3);
+        assert_eq!(expand_profile(&mesh, &m3b, 4), vec![0, 1, 1, 2]); // 3→4 middle segment
+
+        // Single-segment multi-scaffold chains every scaffold onto the first
+        // corner — the toggle is a no-op once the segment degenerates.
+        let m2b = make(&mut mesh, 2);
+        assert_eq!(expand_profile(&mesh, &m2b, 5), vec![0, 0, 0, 0, 1]); // 2→5
+        assert_eq!(expand_profile(&mesh, &m2b, 4), vec![0, 0, 0, 1]); // 2→4
+    }
+
+    #[test]
+    fn multisegment_expand_lands_outer_cell_fan() {
+        // §3.4a(b) parity target: a 6-vertex side opposing a 4-vertex side (single
+        // edge rails) expands the short side 4→6 with the outer-cell fan profile
+        // [m0, m0, m1, m2, m3, m3], so the two **outer** lattice cells degenerate
+        // to triangles and the three interior cells stay quads. The bottom corners
+        // at (0,0,0) and (5,0,0) each belong to a triangle — the observable that
+        // distinguishes this from the inner-cell fan an even-per-segment schedule
+        // would produce (where those corners land in quads).
+        let mut mesh = LoopMesh::new();
+        let side_edges = unequal_sided_wire_ring(&mut mesh, 6, 4);
+        let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
+
+        assert_eq!(result.faces().len(), 5, "fan of 5 faces");
+        assert_eq!(quad_tri_split(&mesh, &result), (3, 2), "3 quads + 2 triangles");
+
+        // The face carrying a given position, and whether it is a triangle.
+        let face_at = |x: f32, y: f32| -> FaceKey {
+            let target = result.faces().iter().copied().find(|&f| {
+                mesh.face_vert_keys(f).iter().any(|&v| {
+                    let p = mesh.vertex_position(v);
+                    (p.x - x).abs() < 1.0e-3 && (p.y - y).abs() < 1.0e-3
+                })
+            });
+            target.unwrap_or_else(|| panic!("no fill face carries ({x}, {y})"))
+        };
+
+        // Both bottom corners degenerate → the outer cells are the triangles.
+        assert_eq!(
+            mesh.face_len(face_at(0.0, 0.0)),
+            3,
+            "the origin-corner (outer) cell degenerates to a triangle",
+        );
+        assert_eq!(
+            mesh.face_len(face_at(5.0, 0.0)),
+            3,
+            "the far-corner (outer) cell degenerates to a triangle",
+        );
+        mesh.validate_topology();
     }
 }
