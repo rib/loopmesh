@@ -129,6 +129,13 @@ const FACE_STRENGTH_WEAK: i32 = -16384;
 const FACE_STRENGTH_MEDIUM: i32 = 0;
 const FACE_STRENGTH_STRONG: i32 = 16384;
 
+/// Name of the per-loop `Vec3` customdata layer the §8.10.2 hardening post-pass
+/// writes: the target **world-space** custom split normal for each loop of a new
+/// bevel face. This is the decoded world vector (step 1 of §8.10.2); the
+/// loop-normal-*space* encode/store is a later cycle, so loopmesh pins the
+/// firewall-safe decoded value directly.
+const HARDEN_LOOP_NORMAL_LAYER: &str = "__bevel_harden_loop_normal";
+
 /// Provenance kind recorded for a **new** bevel face at creation time so the
 /// §8.10.1 post-pass can key its strength on it. The junction vmesh patch and the
 /// vertex-bevel cap fold into [`Cap`](Self::Cap) (weak); the profile / chamfer
@@ -260,6 +267,17 @@ pub struct BevelOptions<'a> {
     /// Defaults to [`BevelFaceStrengthMode::None`] — the layer is not written at
     /// all, so existing callers are unaffected.
     pub face_strength_mode: BevelFaceStrengthMode,
+    /// Hard-normal shading post-pass (BEVEL.md §8.10.2). A pure attribute pass
+    /// that runs after the whole bevel is built: it marks the reconstructed↔new
+    /// seam edges sharp, refreshes the face / vertex normals, then writes a
+    /// per-loop **custom split normal** onto every loop of a *new* bevel face
+    /// (corner-cap and chamfer-strip kinds) so the flat bevel reads as a crisp
+    /// transition while the surrounding original surface keeps its smooth
+    /// shading. Creates and moves no geometry. Gated on a nonzero offset; a leaf
+    /// independent of `face_strength_mode` (either / both / neither may run).
+    /// Defaults to `false` — the per-loop normal layer is not written at all, so
+    /// existing callers are unaffected.
+    pub harden_normals: bool,
 }
 
 impl Default for BevelOptions<'_> {
@@ -282,6 +300,7 @@ impl Default for BevelOptions<'_> {
             miter_outer: BevelMiter::Sharp,
             spread: 0.0,
             face_strength_mode: BevelFaceStrengthMode::None,
+            harden_normals: false,
         }
     }
 }
@@ -363,19 +382,26 @@ impl LoopMesh {
     /// See `radial-mesh-guides/operators/BEVEL.md`.
     pub fn bevel(&mut self, geom: &[GeomKey], options: BevelOptions) -> BevelResult {
         let mode = options.face_strength_mode;
-        if mode == BevelFaceStrengthMode::None {
+        let harden = options.harden_normals;
+
+        // Neither shading post-pass wants provenance tracking — take the bare
+        // topological path with no snapshot / recording overhead.
+        if mode == BevelFaceStrengthMode::None && !harden {
             return self.bevel_dispatch(geom, &options);
         }
 
-        // §8.10.1 recovers reconstructed vs untouched originals from the *pristine*
-        // face / vertex sets: a surviving original that gained a ring / strip vert
-        // (or that was killed and rebuilt into a fresh key) is reconstructed;
-        // everything still keyed and all-original-verts is untouched. New bevel
-        // faces are recorded live (cap vs strip) into `bevel_cap_faces`.
+        // §8.10.1 / §8.10.2 recover reconstructed vs untouched originals from the
+        // *pristine* face / vertex sets: a surviving original that gained a ring /
+        // strip vert (or that was killed and rebuilt into a fresh key) is
+        // reconstructed; everything still keyed and all-original-verts is
+        // untouched. New bevel faces are recorded live (cap vs strip) into
+        // `bevel_cap_faces`, and the chamfer strips' long edges (needed by the
+        // §8.10.2 fan step) into `bevel_strip_long_edges`.
         let original_faces: HashSet<FaceKey> = self.face_keys().into_iter().collect();
         let original_verts: HashSet<VertexKey> = self.vert_keys().into_iter().collect();
 
         self.bevel_cap_faces = Some(Vec::new());
+        self.bevel_strip_long_edges = Some(Vec::new());
         let result = self.bevel_dispatch(geom, &options);
         let cap_faces: HashSet<FaceKey> = self
             .bevel_cap_faces
@@ -383,9 +409,28 @@ impl LoopMesh {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let long_edges: HashSet<EdgeKey> = self
+            .bevel_strip_long_edges
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let new_faces: HashSet<FaceKey> = result.faces.iter().copied().collect();
 
-        self.stamp_face_strengths(mode, &original_faces, &original_verts, &new_faces, &cap_faces);
+        if mode != BevelFaceStrengthMode::None {
+            self.stamp_face_strengths(mode, &original_faces, &original_verts, &new_faces, &cap_faces);
+        }
+        // §8.10.2 is a leaf independent of §8.10.1: it runs whenever the caller
+        // requested it and the bevel actually built new geometry (nonzero offset).
+        if harden && !new_faces.is_empty() {
+            self.harden_normals_pass(
+                &original_faces,
+                &original_verts,
+                &new_faces,
+                &cap_faces,
+                &long_edges,
+            );
+        }
 
         result
     }
@@ -693,6 +738,13 @@ impl LoopMesh {
             representative_material,
             BevelNewFaceKind::Strip,
         );
+        // §8.10.2 long-edge tagging: the strip quad's two *lengthwise* edges run
+        // endpoint-to-endpoint along the beveled edge (aL–bL flanking fL, aR–bR
+        // flanking fR); the a-end / b-end chords run *across* it. Only the long
+        // edges separate a chamfer face from its lengthwise shading neighbour, so
+        // the harden post-pass keys its average-vs-copy choice on them.
+        self.record_strip_long_edge(strip_a_left, strip_b_left);
+        self.record_strip_long_edge(strip_a_right, strip_b_right);
         result.faces.push(strip.face);
         result.edges.extend(strip.edges);
 
@@ -5431,6 +5483,260 @@ impl LoopMesh {
             }
         }
     }
+
+    /// Record one chamfer strip's *lengthwise* edge (BEVEL.md §8.10.2) while a
+    /// hardening bevel is active, so its post-pass can recover which fan step is
+    /// the shading boundary. A no-op outside a hardening bevel.
+    fn record_strip_long_edge(&mut self, p: VertexKey, q: VertexKey) {
+        if self.bevel_strip_long_edges.is_none() {
+            return;
+        }
+        if let Some(edge) = self.query_edge_exists(p, q) {
+            if let Some(edges) = self.bevel_strip_long_edges.as_mut() {
+                edges.push(edge);
+            }
+        }
+    }
+
+    /// The `harden_normals` shading post-pass (BEVEL.md §8.10.2). Marks the
+    /// reconstructed↔new seam edges sharp, refreshes the face / vertex normals,
+    /// then writes the target **world-space** custom split normal onto every loop
+    /// of a *new* bevel face (corner-cap and chamfer-strip kinds). A pure
+    /// attribute pass: no geometry created, nothing moved.
+    fn harden_normals_pass(
+        &mut self,
+        original_faces: &HashSet<FaceKey>,
+        original_verts: &HashSet<VertexKey>,
+        new_faces: &HashSet<FaceKey>,
+        cap_faces: &HashSet<FaceKey>,
+        long_edges: &HashSet<EdgeKey>,
+    ) {
+        // Refresh flat face normals and smoothed vertex normals so the reconstructed
+        // faces' normals and the vertices' normals are current for the writeback.
+        self.mesh_normals_update();
+
+        // Pre-pass: mark every reconstructed-original ↔ new-bevel-face seam edge
+        // sharp (the §6.7 seam edges), so a downstream loop-normal-space build keeps
+        // the two sides independent. Collect first (the walk borrows `self`), set
+        // after.
+        let mut seam_edges: Vec<EdgeKey> = Vec::new();
+        for &face in new_faces {
+            for loop_key in self.face_loop_keys(face) {
+                let edge = self.loop_edge(loop_key);
+                if let Some(neighbour) = self.radial_other_face(edge, face) {
+                    if self.harden_face_kind(neighbour, original_faces, original_verts, new_faces, cap_faces)
+                        == HardenFaceKind::Reconstructed
+                    {
+                        seam_edges.push(edge);
+                    }
+                }
+            }
+        }
+        for edge in seam_edges {
+            self.set_edge_sharp(edge, true);
+        }
+
+        // Writeback: the target world normal per new-face loop. Classify first
+        // (borrows `self`), then store into the per-loop layer.
+        let key = AttributeKey::custom(HARDEN_LOOP_NORMAL_LAYER);
+        let layer = match self.loop_attribs().find(&key) {
+            Some(existing) => existing,
+            None => self
+                .register_loop_attribute(ElementAttributeDesc::numeric(key, AttrType::Vec3))
+                .expect("per-loop Vec3 harden-normal layer registers"),
+        };
+        let mut writes: Vec<(LoopKey, Vec3)> = Vec::new();
+        for &face in new_faces {
+            for loop_key in self.face_loop_keys(face) {
+                let normal = self.harden_loop_world_normal(
+                    loop_key,
+                    face,
+                    original_faces,
+                    original_verts,
+                    new_faces,
+                    cap_faces,
+                    long_edges,
+                );
+                writes.push((loop_key, normal));
+            }
+        }
+        for (loop_key, normal) in writes {
+            self.loop_attribs_mut()
+                .set_vec3(layer, loop_key.as_usize(), normal.into());
+        }
+    }
+
+    /// The `HardenFaceKind` of `face` for the §8.10.2 fan classification, recovered
+    /// from the pristine snapshots (mirrors the §8.10.1 face-strength recovery).
+    fn harden_face_kind(
+        &self,
+        face: FaceKey,
+        original_faces: &HashSet<FaceKey>,
+        original_verts: &HashSet<VertexKey>,
+        new_faces: &HashSet<FaceKey>,
+        cap_faces: &HashSet<FaceKey>,
+    ) -> HardenFaceKind {
+        if new_faces.contains(&face) {
+            if cap_faces.contains(&face) {
+                HardenFaceKind::Cap
+            } else {
+                HardenFaceKind::Strip
+            }
+        } else if original_faces.contains(&face)
+            && self
+                .face_vert_keys(face)
+                .iter()
+                .all(|vertex| original_verts.contains(vertex))
+        {
+            HardenFaceKind::Untouched
+        } else {
+            // A surviving re-stitched original, or a killed-and-rebuilt original
+            // (fresh key not in the snapshot): both are reconstructed originals.
+            HardenFaceKind::Reconstructed
+        }
+    }
+
+    /// The radial face of `edge` other than `face`, or `None` at a boundary edge.
+    fn radial_other_face(&self, edge: EdgeKey, face: FaceKey) -> Option<FaceKey> {
+        self.edge_face_keys(edge)
+            .into_iter()
+            .find(|&f| f != face)
+    }
+
+    /// The target **world-space** custom split normal for one loop of a new bevel
+    /// face (BEVEL.md §8.10.2, step 1 of the two-step encode). The choice keys on
+    /// the two fan-neighbour faces reached across the loop's two incident edges,
+    /// classified by kind — matching the adjacent original surface where one
+    /// exists, blending flanking chamfer strips where none does, and reading the
+    /// vertex's own smoothed normal where a corner is enclosed by caps.
+    #[allow(clippy::too_many_arguments)]
+    fn harden_loop_world_normal(
+        &self,
+        loop_key: LoopKey,
+        face: FaceKey,
+        original_faces: &HashSet<FaceKey>,
+        original_verts: &HashSet<VertexKey>,
+        new_faces: &HashSet<FaceKey>,
+        cap_faces: &HashSet<FaceKey>,
+        long_edges: &HashSet<EdgeKey>,
+    ) -> Vec3 {
+        let vertex = self.loop_vertex(loop_key);
+        // The loop sits on two edges at `vertex`: its own outgoing edge and the
+        // previous loop's edge. Each faces one neighbour in the vertex fan.
+        let edge_own = self.loop_edge(loop_key);
+        let edge_prev = self.loop_edge(self.loop_prev(loop_key));
+        let neighbour_own = self.radial_other_face(edge_own, face);
+        let neighbour_prev = self.radial_other_face(edge_prev, face);
+
+        let kind_of = |f: Option<FaceKey>| {
+            f.map(|f| self.harden_face_kind(f, original_faces, original_verts, new_faces, cap_faces))
+        };
+
+        let own_flat = self.face_normal(face);
+
+        match self.harden_face_kind(face, original_faces, original_verts, new_faces, cap_faces) {
+            HardenFaceKind::Strip => {
+                // Only the lengthwise ("long") edge is a shading boundary; pick the
+                // fan neighbour across whichever incident edge was tagged long.
+                let across = if long_edges.contains(&edge_own) {
+                    neighbour_own
+                } else if long_edges.contains(&edge_prev) {
+                    neighbour_prev
+                } else {
+                    // No tagged long edge at this loop's vertex (unexpected for a
+                    // well-formed strip): keep the strip's own flat normal.
+                    return own_flat;
+                };
+                match across {
+                    Some(nf) => match self.harden_face_kind(
+                        nf,
+                        original_faces,
+                        original_verts,
+                        new_faces,
+                        cap_faces,
+                    ) {
+                        HardenFaceKind::Reconstructed | HardenFaceKind::Untouched => {
+                            // The chamfer's long edge meets the original surface at
+                            // the seam: match that reconstructed face exactly.
+                            self.face_normal(nf)
+                        }
+                        HardenFaceKind::Strip | HardenFaceKind::Cap => {
+                            // Two chamfer strips flanking the long edge: blend them
+                            // smoothly along the bevel while each cross-section stays
+                            // flat.
+                            LoopMesh::normalize_or_zero(own_flat + self.face_normal(nf))
+                        }
+                    },
+                    // A long edge with no fan neighbour (open boundary): the strip's
+                    // own flat normal is the only defined target.
+                    None => own_flat,
+                }
+            }
+            HardenFaceKind::Cap => {
+                let k_own = kind_of(neighbour_own);
+                let k_prev = kind_of(neighbour_prev);
+                let both_caps = k_own == Some(HardenFaceKind::Cap)
+                    && k_prev == Some(HardenFaceKind::Cap);
+                if both_caps {
+                    // Enclosed entirely by cap faces: the corner reads as a smooth
+                    // rounded point at the vertex's own smoothed normal.
+                    return self.vertex_normal(vertex);
+                }
+                // A reconstructed / untouched original neighbour matches the original
+                // surface at the corner seam. Prefer the own-edge side when both
+                // sides are reconstructed (see the §8.10.2 tie-break note).
+                let reconstructed = |k: Option<HardenFaceKind>| {
+                    matches!(
+                        k,
+                        Some(HardenFaceKind::Reconstructed) | Some(HardenFaceKind::Untouched)
+                    )
+                };
+                if reconstructed(k_own) {
+                    return self.face_normal(neighbour_own.unwrap());
+                }
+                if reconstructed(k_prev) {
+                    return self.face_normal(neighbour_prev.unwrap());
+                }
+                // Otherwise (a mixed cap/strip neighbourhood with no reconstructed
+                // face directly adjacent): the §8.10.2 "one fan-step further" case.
+                // The junction-patch corner it targets is not exercised on the
+                // reachable drivers this cycle; fall back to the vertex's own
+                // smoothed normal, which keeps the corner rounded.
+                self.vertex_normal(vertex)
+            }
+            // A hardened loop only ever belongs to a new bevel face; other kinds are
+            // never enqueued by the writeback.
+            HardenFaceKind::Reconstructed | HardenFaceKind::Untouched => own_flat,
+        }
+    }
+
+    /// The stored §8.10.2 target world custom split normal for `loop_key`, or
+    /// `None` when the hardening pass did not write it (not a new bevel face's
+    /// loop, or `harden_normals` was off). The value is the decoded world vector.
+    ///
+    /// A written normal is always unit length, so the layer's all-zero default —
+    /// the value read at a loop the pass never touched, once the layer exists —
+    /// reads back as `None` (unwritten), distinct from any hardened value.
+    pub fn loop_hardened_normal(&self, loop_key: LoopKey) -> Option<Vec3> {
+        let layer = self
+            .loop_attribs()
+            .find(&AttributeKey::custom(HARDEN_LOOP_NORMAL_LAYER))?;
+        self.loop_attribs()
+            .get_vec3(layer, loop_key.as_usize())
+            .map(Vec3::from)
+            .filter(|normal| *normal != Vec3::ZERO)
+    }
+}
+
+/// Face-provenance kind for the §8.10.2 fan classification, re-grouped from the
+/// bevel's `Cap` / `Strip` recording plus the reconstructed / untouched original
+/// recovery (a compatible re-grouping of §6.6.1, per §8.10).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HardenFaceKind {
+    Cap,
+    Strip,
+    Reconstructed,
+    Untouched,
 }
 
 struct CapFace {
@@ -6392,6 +6698,263 @@ mod tests {
 
         assert!(all.is_some() && new.is_some() && none.is_none());
         assert_ne!(all, new, "ALL and NEW stamp different layers");
+    }
+
+    // ---- §8.10.2 harden_normals shading post-pass ----
+
+    // The three cube-face normals incident to the corner `(1,-1,-1)`: front
+    // `z=-1 → -Z`, bottom `y=-1 → -Y`, right `x=1 → +X`.
+    #[allow(non_snake_case)]
+    fn CORNER_FRONT_N() -> Vec3 {
+        Vec3::new(0.0, 0.0, -1.0)
+    }
+    #[allow(non_snake_case)]
+    fn CORNER_BOTTOM_N() -> Vec3 {
+        Vec3::new(0.0, -1.0, 0.0)
+    }
+    #[allow(non_snake_case)]
+    fn CORNER_RIGHT_N() -> Vec3 {
+        Vec3::new(1.0, 0.0, 0.0)
+    }
+
+    fn approx_eq(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1.0e-5
+    }
+
+    fn count_matching(normals: &[Vec3], target: Vec3) -> usize {
+        normals.iter().filter(|n| approx_eq(**n, target)).count()
+    }
+
+    fn hardened_loop_normals(mesh: &LoopMesh, face: FaceKey) -> Vec<Vec3> {
+        mesh.face_loop_keys(face)
+            .into_iter()
+            .map(|l| {
+                mesh.loop_hardened_normal(l)
+                    .expect("every loop of a new bevel face is hardened")
+            })
+            .collect()
+    }
+
+    /// BEVEL.md §8.10.2 chamfer-strip → reconstructed-original branch. Beveling the
+    /// isolated cube edge `{0,1}` (crease between front `-Z` and bottom `-Y`) writes
+    /// each strip loop the flat normal of the reconstructed flanking face across its
+    /// *long* edge — so the four strip loops carry two `-Z` and two `-Y`, matching
+    /// the original surface at each seam. This is emphatically **not** the strip's
+    /// own flat normal (`≈ (0,-1,-1)/√2`), which a naive flat-everywhere writeback
+    /// would stamp on all four.
+    #[test]
+    fn harden_edge_strip_matches_reconstructed_flanks() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let edge = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                harden_normals: true,
+                ..Default::default()
+            },
+        );
+
+        let strip = result.faces[0];
+        let strip_flat = mesh.face_normal(strip);
+        let normals = hardened_loop_normals(&mesh, strip);
+
+        assert_eq!(normals.len(), 4, "strip quad has four loops");
+        assert_eq!(
+            count_matching(&normals, CORNER_FRONT_N()),
+            2,
+            "two strip loops match the reconstructed front face (-Z)",
+        );
+        assert_eq!(
+            count_matching(&normals, CORNER_BOTTOM_N()),
+            2,
+            "two strip loops match the reconstructed bottom face (-Y)",
+        );
+        // The rule genuinely differs from a flat-everywhere writeback: no loop
+        // carries the strip's own diagonal facing normal.
+        for n in &normals {
+            assert!(
+                (*n - strip_flat).length() > 0.1,
+                "hardened loop normal {n:?} must not be the strip's own flat normal {strip_flat:?}",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.2 corner-cap → reconstructed-original branch. Beveling the
+    /// valence-3 cube corner `(1,-1,-1)` writes each of the triangular cap's three
+    /// loops the flat normal of the reconstructed cube face it seams against, so the
+    /// three loops carry exactly the three incident axis normals `{-Z, -Y, +X}` —
+    /// one per fan sector — never the cap's own diagonal flat normal `(1,-1,-1)/√3`.
+    #[test]
+    fn harden_corner_cap_matches_reconstructed_faces() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                harden_normals: true,
+                ..Default::default()
+            },
+        );
+
+        let cap = result.faces[0];
+        let cap_flat = mesh.face_normal(cap);
+        let normals = hardened_loop_normals(&mesh, cap);
+
+        assert_eq!(normals.len(), 3, "triangular cap has three loops");
+        // The three loops seam against the three distinct incident cube faces, so
+        // their hardened normals are the three axis normals as a set — a bijection
+        // onto the fan sectors, independent of the two-reconstructed tie-break.
+        assert_eq!(count_matching(&normals, CORNER_FRONT_N()), 1, "one loop -Z");
+        assert_eq!(count_matching(&normals, CORNER_BOTTOM_N()), 1, "one loop -Y");
+        assert_eq!(count_matching(&normals, CORNER_RIGHT_N()), 1, "one loop +X");
+        // None is the cap's own diagonal flat normal (the naive writeback).
+        for n in &normals {
+            assert!(
+                (*n - cap_flat).length() > 0.1,
+                "hardened cap loop {n:?} must not be the cap's own flat normal {cap_flat:?}",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.2 pre-pass: the reconstructed-original ↔ new-bevel seam edges
+    /// (here the cap's three chamfer edges) are marked **sharp** before the
+    /// writeback. A cube edge untouched by the bevel stays smooth.
+    #[test]
+    fn harden_marks_reconstructed_seam_edges_sharp() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                harden_normals: true,
+                ..Default::default()
+            },
+        );
+
+        let cap = result.faces[0];
+        for loop_key in mesh.face_loop_keys(cap) {
+            let edge = mesh.loop_edge(loop_key);
+            assert!(
+                mesh.edge_sharp(edge),
+                "cap chamfer edge {edge:?} is a reconstructed↔new seam and must be sharp",
+            );
+        }
+
+        // An untouched cube edge (the far top crease) stays smooth.
+        let untouched = cube_edge(
+            &mesh,
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        assert!(
+            !mesh.edge_sharp(untouched),
+            "an edge the bevel never touched must not be marked sharp",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §8.10.2 gate + scope: `harden_normals = false` writes no per-loop
+    /// layer at all, and with it on only the *new* bevel faces' loops are written —
+    /// an untouched original face's loops stay unwritten.
+    #[test]
+    fn harden_gate_and_scope() {
+        // Gate off: no layer, no writeback.
+        let mut off = LoopMesh::new();
+        mesh_add_cube(&mut off);
+        let corner_off = vert_at(&off, Vec3::new(1.0, -1.0, -1.0));
+        let result_off = off.bevel(
+            &[corner_off.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+        let cap_off = result_off.faces[0];
+        for loop_key in off.face_loop_keys(cap_off) {
+            assert!(
+                off.loop_hardened_normal(loop_key).is_none(),
+                "harden_normals off writes no per-loop normal",
+            );
+        }
+
+        // Gate on: new-face loops written, untouched-original loops untouched.
+        let mut on = LoopMesh::new();
+        mesh_add_cube(&mut on);
+        on.calc_face_normals();
+        let top_face_before = on
+            .face_keys()
+            .into_iter()
+            .find(|&f| approx_eq(on.face_normal(f), Vec3::new(0.0, 0.0, 1.0)))
+            .expect("cube top face +Z");
+        let corner_on = vert_at(&on, Vec3::new(1.0, -1.0, -1.0));
+        let result_on = on.bevel(
+            &[corner_on.into()],
+            BevelOptions {
+                offset: 0.25,
+                harden_normals: true,
+                ..Default::default()
+            },
+        );
+        let cap_on = result_on.faces[0];
+        for loop_key in on.face_loop_keys(cap_on) {
+            assert!(
+                on.loop_hardened_normal(loop_key).is_some(),
+                "a new bevel face's loop is hardened",
+            );
+        }
+        // The +Z top face is untouched by a bevel of the -Z/-Y/+X corner.
+        for loop_key in on.face_loop_keys(top_face_before) {
+            assert!(
+                on.loop_hardened_normal(loop_key).is_none(),
+                "an untouched original face's loop is never hardened",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.10.2 leaf independence: `harden_normals` and `face_strength_mode`
+    /// touch disjoint customdata (per-loop normals vs a per-face integer) and both
+    /// take effect when requested together.
+    #[test]
+    fn harden_independent_of_face_strength_mode() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                harden_normals: true,
+                face_strength_mode: BevelFaceStrengthMode::New,
+                ..Default::default()
+            },
+        );
+
+        let cap = result.faces[0];
+        // The face-strength pass ran: the cap is weak.
+        assert_eq!(strength_of(&mesh, cap), FACE_STRENGTH_WEAK);
+        // The harden pass ran: the cap's loops carry the incident cube-face normals.
+        let normals = hardened_loop_normals(&mesh, cap);
+        assert_eq!(count_matching(&normals, CORNER_FRONT_N()), 1);
+        assert_eq!(count_matching(&normals, CORNER_BOTTOM_N()), 1);
+        assert_eq!(count_matching(&normals, CORNER_RIGHT_N()), 1);
+        mesh.validate_topology();
     }
 
     /// BEVEL.md §4: ring verts slide `offset` along each incident edge toward the

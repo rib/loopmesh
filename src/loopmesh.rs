@@ -613,6 +613,13 @@ pub struct LoopMesh {
     // minted, so the post-pass can stamp them weak. `None` outside a
     // strength-tracking bevel; the op sets it before the build and takes it after.
     pub(crate) bevel_cap_faces: Option<Vec<FaceKey>>,
+
+    // Transient bevel scratch: while a `harden_normals` post-pass is active
+    // (BEVEL.md §8.10.2), the chamfer strips' *lengthwise* ("long") edges are
+    // collected here at strip-build time, so the post-pass can recover which fan
+    // step separates a chamfer face from its lengthwise shading neighbour. `None`
+    // outside a hardening bevel; the op sets it before the build and takes it after.
+    pub(crate) bevel_strip_long_edges: Option<Vec<EdgeKey>>,
 }
 
 impl Default for LoopMesh {
@@ -649,6 +656,7 @@ impl LoopMesh {
             op_flags: crate::op_flags::OpFlagPool::default(),
 
             bevel_cap_faces: None,
+            bevel_strip_long_edges: None,
         }
     }
 
