@@ -2599,9 +2599,10 @@ impl LoopMesh {
             set_face_substitution(face_subst, vertex, reflex_face, run);
         } else {
             // Multi-face reflex sector (§8.9.2.1): `Patch` only (Arc/Sharp declined
-            // above). Distribute the absorbed legs onto the patch run and rebuild each
-            // reflex face over the run between its two bounding legs. `forward_run` is
-            // the patch chain `[B1, mid12, B2, mid23, B3]`.
+            // above). Fan every reflex face to the hub `B2` (identical to the SHARP
+            // outer join), opening only the two flank faces into pentagons along their
+            // patch legs. `forward_run` is the patch chain `[B1, SH_lead, B2, SH_trail,
+            // B3]`, so `B2` is its middle slot.
             self.restitch_multiface_patch_reflex(vertex, &sectors[r], &forward_run, face_subst);
         }
 
@@ -2676,18 +2677,18 @@ impl LoopMesh {
     /// Re-stitch a **multi-face** reflex sector for the outer `PATCH` miter
     /// (BEVEL.md §8.9.2.1). The sector's `> 180°` gap absorbs one or more unbeveled
     /// legs; `patch_chain` is the three ring boundverts with their two flat chord
-    /// mid-samples interleaved — `[B1, mid12, B2, mid23, B3]`, so patch boundvert
-    /// index `i ∈ {0, 1, 2}` sits at chain slot `2·i`.
+    /// mid-samples (the grid **shoulders**) interleaved — `[B1, SH_lead, B2, SH_trail,
+    /// B3]`, so the hub `B2` is the middle slot (index 2).
     ///
-    /// The absorbed legs distribute by disk position onto the three boundverts (first
-    /// half → `B1`, second half → `B3`, an odd middle leg → `B2`; the two flanking
-    /// beveled edges anchor `B1` / `B3`). Each reflex face — bounded by two
-    /// consecutive legs — then opens its apex corner onto the run of the chain between
-    /// those two legs' assigned indices: a same-index pair leaves a triangle (one
-    /// boundvert), an adjacent-index pair grows a quad (two boundverts, threading the
-    /// intervening chord mid so the reflex face stays flush with the reused
-    /// enlarged-ring cap grid, §8.9.5). Because the indices are monotonic along the
-    /// gap the per-face runs tile `B1 → B2 → B3` gap-free, with no overlap.
+    /// `PATCH` closes the reflex hole by a **fan to the single hub `B2`**, not by tiling
+    /// the ring run. `B2` is the retained §7.6.2 meet-point (the lifted `SHARP` V-join
+    /// crossing), and **every** reflex face closes at it — the interior fan is identical
+    /// to the default `SHARP` outer join. `PATCH`'s sole departure is at the sector's two
+    /// **flank faces** (the ones bounded by a flanking *beveled* edge): there the sharp
+    /// apex corner opens along that flank's subdivided patch leg (hub → shoulder →
+    /// flank boundvert), growing the triangle to an `(s + 3)`-gon (a pentagon at
+    /// `segments = 2`). The interior faces stay bare hub triangles `[B2, R_k, R_{k+1}]`.
+    /// There is no per-leg index assignment and no quad-growth.
     fn restitch_multiface_patch_reflex(
         &self,
         vertex: VertexKey,
@@ -2703,39 +2704,34 @@ impl LoopMesh {
         let legs: Vec<EdgeKey> = reflex_sector.corners.iter().map(|&(edge, _)| edge).collect();
         let leg_count = legs.len();
         // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed
-        // leg; anything shorter is single-face and never reaches here.
-        if leg_count < 3 {
+        // leg; anything shorter is single-face and never reaches here. `patch_chain` is
+        // always the five-slot `[B1, SH_lead, B2, SH_trail, B3]` at `segments = 2`.
+        if leg_count < 3 || patch_chain.len() != 5 {
             return;
         }
-        let absorbed = leg_count - 2;
-
-        // §8.9.2.1 assignment (indices 0 = B1, 1 = B2, 2 = B3 at `segments = 2`): the
-        // flanks anchor B1 / B3; the absorbed run splits by disk position, and an odd
-        // middle leg lands on B2.
-        let mut leg_index = vec![0usize; leg_count];
-        leg_index[leg_count - 1] = 2;
-        let half = absorbed / 2;
-        for position in 0..absorbed {
-            leg_index[1 + position] = if absorbed % 2 == 1 {
-                match position.cmp(&half) {
-                    std::cmp::Ordering::Less => 0,
-                    std::cmp::Ordering::Equal => 1,
-                    std::cmp::Ordering::Greater => 2,
-                }
-            } else if position < half {
-                0
-            } else {
-                2
-            };
-        }
+        let hub = patch_chain[2]; // B2
+        let leading_flank = 0;
+        let trailing_flank = leg_count - 2;
 
         for face_slot in 0..leg_count - 1 {
             let face = reflex_sector.corners[face_slot].1;
-            let low = leg_index[face_slot].min(leg_index[face_slot + 1]);
-            let high = leg_index[face_slot].max(leg_index[face_slot + 1]);
-            let forward: Vec<VertexKey> = patch_chain[2 * low..=2 * high].to_vec();
+            // The apex-corner run, ordered from the face's disk-*leading* leg side to its
+            // trailing side. Interior faces collapse the apex to the lone hub; the two
+            // flank faces splice that flank's patch leg (`B_flank → shoulder → hub`)
+            // between the hub and the flank's reflex boundvert (§8.9.2.1).
+            let forward: Vec<VertexKey> = if face_slot == leading_flank {
+                // Leading flank (disk-leading leg is the flank beveled edge): the flank
+                // boundvert B1 sits on the leading side, the hub on the trailing side.
+                patch_chain[0..=2].to_vec() // [B1, SH_lead, B2]
+            } else if face_slot == trailing_flank {
+                // Trailing flank (disk-trailing leg is the flank beveled edge): the hub
+                // sits on the leading side, the flank boundvert B3 on the trailing side.
+                patch_chain[2..=4].to_vec() // [B2, SH_trail, B3]
+            } else {
+                vec![hub]
+            };
             // Orient the run to the face's own winding: forward when the face enters the
-            // apex from its disk-leading leg, reversed otherwise.
+            // apex from its disk-leading leg, reversed otherwise (§7.6.3 convention).
             let run = match self.face_corner_edges(face, vertex) {
                 Some((incoming, _)) if incoming == legs[face_slot] => forward,
                 _ => {
@@ -8855,16 +8851,16 @@ mod tests {
     /// BEVEL.md §8.9.2.1: the multi-face reflex outer-`PATCH` re-stitch. Beveling the
     /// three bunched apex legs of an octagonal bipyramid leaves a `270°` reflex sector
     /// that absorbs the five unbeveled legs `A–R4 … A–R8`. `PATCH` materialises the
-    /// three ring boundverts `B1 → B2 → B3` (`B2` the retained meet-point), distributes
-    /// the absorbed legs by disk position, and rebuilds the six reflex faces so their
-    /// apex corners tile the run **monotonically**: four stay tri-corners (one
-    /// boundvert), two become quad-corners across the `B1→B2` and `B2→B3` index steps.
-    /// The mesh stays a closed `χ = 2` manifold. Because the reused enlarged-ring grid
-    /// (§8.9.5) subdivides every ring edge, a quad-corner face threads the intervening
-    /// chord mid-sample, landing as a pentagon flush with the cap — the same
-    /// mid-threading the single-face path uses (`outer_miter_patch_flat_chord_placement`).
+    /// three ring boundverts `B1 → B2 → B3` (`B2` the retained lifted meet-point) and
+    /// closes the reflex hole by a **fan to the single hub `B2`** — every one of the six
+    /// reflex faces carries `B2`, exactly as the default `SHARP` outer join does. Its
+    /// sole departure from `SHARP` is at the two **flank faces**, which open into
+    /// pentagons along their subdivided patch legs (`B2 → shoulder → B_flank`); the four
+    /// interior faces stay bare hub triangles `[B2, R_k, R_{k+1}]`. The mesh stays a
+    /// closed `χ = 2` manifold. (This replaces a withdrawn run-tiling reading — see the
+    /// contrast note in §8.9.2.1.)
     #[test]
-    fn multiface_patch_restitch_tiles_run_monotonically() {
+    fn multiface_patch_fans_reflex_hole_to_hub() {
         let (b1_pos, b2_pos, b3_pos) = octagonal_patch_boundvert_positions();
 
         let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
@@ -8903,11 +8899,13 @@ mod tests {
 
         // The reflex faces are exactly those touching an absorbed leg's rim vert
         // (`R4 … R8`) and a patch boundvert. Classify each by which of `{B1, B2, B3}` it
-        // threads: a tri-corner threads one boundvert (stays a triangle); a quad-corner
-        // threads two across an index step (a pentagon, carrying the chord mid).
+        // threads: an interior fan face threads only the hub `B2` (stays a triangle); a
+        // flank face threads the hub plus its flank boundvert (a pentagon carrying the
+        // grid shoulder).
         let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
-        let mut tri_corners: Vec<usize> = Vec::new();
-        let mut quad_corners: Vec<Vec<usize>> = Vec::new();
+        let mut interior_hub_tris = 0usize;
+        let mut flank_pentagons: Vec<Vec<usize>> = Vec::new();
+        let mut reflex_face_count = 0usize;
         for face in mesh.face_keys() {
             let face_verts = mesh.face_vert_keys(face);
             if !face_verts.iter().any(|x| absorbed.contains(x)) {
@@ -8919,49 +8917,53 @@ mod tests {
                 .filter(|(_, &b)| face_verts.contains(&b))
                 .map(|(i, _)| i)
                 .collect();
+            if threaded.is_empty() {
+                continue;
+            }
+            reflex_face_count += 1;
+            // §8.9.2.1: every reflex face closes at the hub `B2` (index 1).
+            assert!(
+                threaded.contains(&1),
+                "every reflex face carries the hub B2 (§8.9.2.1)",
+            );
             match threaded.len() {
-                0 => continue,
                 1 => {
                     assert_eq!(
                         face_verts.len(),
                         3,
-                        "a tri-corner reflex face stays a triangle (same-index run)",
+                        "an interior fan face is a bare hub triangle [B2, R_k, R_k+1]",
                     );
-                    tri_corners.push(threaded[0]);
+                    interior_hub_tris += 1;
                 }
                 2 => {
                     assert_eq!(
                         face_verts.len(),
                         5,
-                        "a quad-corner reflex face threads the chord mid, a pentagon flush with the cap",
+                        "a flank face opens into a pentagon threading its patch leg shoulder",
                     );
-                    quad_corners.push(threaded);
+                    flank_pentagons.push(threaded);
                 }
-                n => panic!("a reflex face threads {n} boundverts; the run is at most a pair"),
+                n => panic!("a reflex face threads {n} boundverts; only the hub + one flank"),
             }
         }
 
-        // §8.9.2.1 worked trace: four tri-corners + two quad-corners.
-        assert_eq!(tri_corners.len(), 4, "four reflex faces stay tri-corners");
-        assert_eq!(quad_corners.len(), 2, "two reflex faces grow to quad-corners at the steps");
+        // §8.9.2.1 worked trace: six reflex faces = four interior hub triangles + two
+        // flank pentagons. All carry the hub `B2`; only the flanks reach `B1` / `B3`.
+        assert_eq!(reflex_face_count, 6, "six reflex faces wrap the 270° gap");
+        assert_eq!(interior_hub_tris, 4, "four interior faces fan to the hub as triangles");
+        assert_eq!(flank_pentagons.len(), 2, "two flank faces open into pentagons");
 
-        // The tri-corners split evenly onto the two flanks `B1` / `B3`; `B2` is reached
-        // only across a step, so it carries no tri-corner.
-        assert_eq!(tri_corners.iter().filter(|&&i| i == 0).count(), 2, "two tri-corners on B1");
-        assert_eq!(tri_corners.iter().filter(|&&i| i == 2).count(), 2, "two tri-corners on B3");
-        assert_eq!(tri_corners.iter().filter(|&&i| i == 1).count(), 0, "B2 is a pure step vertex");
-
-        // The two steps are `B1→B2` and `B2→B3` — monotonic and gap-free through `B2`,
-        // never a `B1→B3` jump that would skip the retained meet-point.
-        let mut steps = quad_corners.clone();
-        for step in steps.iter_mut() {
-            step.sort_unstable();
+        // One flank pentagon threads {B1, B2}, the other {B2, B3}; `B1` and `B3` each
+        // appear in exactly that one reflex face (their own flank), never in the fan.
+        let mut flanks = flank_pentagons.clone();
+        for flank in flanks.iter_mut() {
+            flank.sort_unstable();
         }
-        steps.sort();
+        flanks.sort();
         assert_eq!(
-            steps,
+            flanks,
             vec![vec![0, 1], vec![1, 2]],
-            "the runs tile B1→B2→B3 gap-free, no overlap (§8.9.2.1)",
+            "the two flank pentagons are the leading B1-B2 and trailing B2-B3 legs (§8.9.2.1)",
         );
 
         // The miter is not inert: it differs from the sharp baseline.
