@@ -2395,12 +2395,15 @@ impl LoopMesh {
     /// single sharp meet-point, so the junction presents an `(s + 1)`-boundvert ring
     /// the general grid tiles.
     ///
-    /// Scoped this cycle to `ARC` at a reflex sector that is a **single face** (no
-    /// absorbed unbeveled legs), circular profile, `segments = 2`. All classification
-    /// runs read-only first; the method returns `false` **without mutating** for any
-    /// junction outside that case (no reflex sector — the miter is inert — a multi-face
-    /// reflex sector, a non-circular profile, `s < 3`, or `segments != 2`), so the
-    /// caller falls back to the sharp ring.
+    /// Scoped to a circular profile, `segments = 2`, `s ≥ 3`. `ARC` and `PATCH` both
+    /// engage at a **single-face** reflex sector (no absorbed unbeveled legs); a
+    /// **multi-face** reflex sector (absorbed legs) is supported for `PATCH` only
+    /// (§8.9.2.1, `restitch_multiface_patch_reflex`) — `ARC`'s multi-face
+    /// interior-sample walk is not yet pinned. All classification runs read-only first;
+    /// the method returns `false` **without mutating** for any junction outside those
+    /// cases (no reflex sector — the miter is inert — a multi-face `ARC` sector, a
+    /// non-circular profile, `s < 3`, or `segments != 2`), so the caller falls back to
+    /// the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_outer_miter(
         &mut self,
@@ -2478,9 +2481,11 @@ impl LoopMesh {
         }
         let r = reflex_indices[0];
 
-        // Scoped to a single-face reflex sector (no absorbed unbeveled legs). A
-        // multi-face reflex sector splits an interior leg between `B1` and `B3` and so
-        // needs corner-opening surgery §8.9.2 does not yet pin; decline it to the sharp
+        // A **single-face** reflex sector (no absorbed unbeveled legs) re-stitches its
+        // one face onto the whole run like a non-miter sector (§7.6.3). A **multi-face**
+        // reflex sector absorbs one or more unbeveled legs; `Patch` distributes them onto
+        // the `B1 → B2 → B3` run and rebuilds each face (§8.9.2.1). `Arc`'s multi-face
+        // interior-sample walk is not yet pinned, so decline it (and Sharp) to the sharp
         // ring rather than tear the disk.
         let mut reflex_faces: Vec<FaceKey> = Vec::new();
         for &(_, face) in &sectors[r].corners {
@@ -2488,10 +2493,9 @@ impl LoopMesh {
                 reflex_faces.push(face);
             }
         }
-        if reflex_faces.len() != 1 {
+        if reflex_faces.len() != 1 && mode != BevelMiter::Patch {
             return false;
         }
-        let reflex_face = reflex_faces[0];
 
         // Every check has passed — mutate.
         let midpoint = plans[r].meet;
@@ -2578,15 +2582,28 @@ impl LoopMesh {
                 set_face_substitution(face_subst, vertex, face, vec![boundvert]);
             }
         }
-        let run = match self.face_corner_edges(reflex_face, vertex) {
-            Some((incoming, _)) if incoming == sectors[r].bounding_edges[0] => forward_run.clone(),
-            _ => {
-                let mut reversed = forward_run.clone();
-                reversed.reverse();
-                reversed
-            }
-        };
-        set_face_substitution(face_subst, vertex, reflex_face, run);
+        if reflex_faces.len() == 1 {
+            // Single-face reflex sector: the one face threads the whole run in its own
+            // winding (forward when it enters the apex from the sector's opening edge).
+            let reflex_face = reflex_faces[0];
+            let run = match self.face_corner_edges(reflex_face, vertex) {
+                Some((incoming, _)) if incoming == sectors[r].bounding_edges[0] => {
+                    forward_run.clone()
+                }
+                _ => {
+                    let mut reversed = forward_run.clone();
+                    reversed.reverse();
+                    reversed
+                }
+            };
+            set_face_substitution(face_subst, vertex, reflex_face, run);
+        } else {
+            // Multi-face reflex sector (§8.9.2.1): `Patch` only (Arc/Sharp declined
+            // above). Distribute the absorbed legs onto the patch run and rebuild each
+            // reflex face over the run between its two bounding legs. `forward_run` is
+            // the patch chain `[B1, mid12, B2, mid23, B3]`.
+            self.restitch_multiface_patch_reflex(vertex, &sectors[r], &forward_run, face_subst);
+        }
 
         // Build the enlarged ring in disk order together with the crossing beveled edge
         // (or the arc) on each ring edge. `cross_edge[i]` is `Some` for a strip
@@ -2654,6 +2671,81 @@ impl LoopMesh {
             mids,
         });
         true
+    }
+
+    /// Re-stitch a **multi-face** reflex sector for the outer `PATCH` miter
+    /// (BEVEL.md §8.9.2.1). The sector's `> 180°` gap absorbs one or more unbeveled
+    /// legs; `patch_chain` is the three ring boundverts with their two flat chord
+    /// mid-samples interleaved — `[B1, mid12, B2, mid23, B3]`, so patch boundvert
+    /// index `i ∈ {0, 1, 2}` sits at chain slot `2·i`.
+    ///
+    /// The absorbed legs distribute by disk position onto the three boundverts (first
+    /// half → `B1`, second half → `B3`, an odd middle leg → `B2`; the two flanking
+    /// beveled edges anchor `B1` / `B3`). Each reflex face — bounded by two
+    /// consecutive legs — then opens its apex corner onto the run of the chain between
+    /// those two legs' assigned indices: a same-index pair leaves a triangle (one
+    /// boundvert), an adjacent-index pair grows a quad (two boundverts, threading the
+    /// intervening chord mid so the reflex face stays flush with the reused
+    /// enlarged-ring cap grid, §8.9.5). Because the indices are monotonic along the
+    /// gap the per-face runs tile `B1 → B2 → B3` gap-free, with no overlap.
+    fn restitch_multiface_patch_reflex(
+        &self,
+        vertex: VertexKey,
+        reflex_sector: &Sector,
+        patch_chain: &[VertexKey],
+        face_subst: &mut Vec<FaceSubstitution>,
+    ) {
+        // The sector's legs in disk order (leading flank, absorbed legs, trailing
+        // flank) and the face bounded by each consecutive leg pair. `corners` lists
+        // one `(incoming_leg, face)` per face in order, plus one trailing duplicate for
+        // the closing beveled edge — so the legs are every corner's edge and the face
+        // between `legs[i]` and `legs[i + 1]` is `corners[i].1`.
+        let legs: Vec<EdgeKey> = reflex_sector.corners.iter().map(|&(edge, _)| edge).collect();
+        let leg_count = legs.len();
+        // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed
+        // leg; anything shorter is single-face and never reaches here.
+        if leg_count < 3 {
+            return;
+        }
+        let absorbed = leg_count - 2;
+
+        // §8.9.2.1 assignment (indices 0 = B1, 1 = B2, 2 = B3 at `segments = 2`): the
+        // flanks anchor B1 / B3; the absorbed run splits by disk position, and an odd
+        // middle leg lands on B2.
+        let mut leg_index = vec![0usize; leg_count];
+        leg_index[leg_count - 1] = 2;
+        let half = absorbed / 2;
+        for position in 0..absorbed {
+            leg_index[1 + position] = if absorbed % 2 == 1 {
+                match position.cmp(&half) {
+                    std::cmp::Ordering::Less => 0,
+                    std::cmp::Ordering::Equal => 1,
+                    std::cmp::Ordering::Greater => 2,
+                }
+            } else if position < half {
+                0
+            } else {
+                2
+            };
+        }
+
+        for face_slot in 0..leg_count - 1 {
+            let face = reflex_sector.corners[face_slot].1;
+            let low = leg_index[face_slot].min(leg_index[face_slot + 1]);
+            let high = leg_index[face_slot].max(leg_index[face_slot + 1]);
+            let forward: Vec<VertexKey> = patch_chain[2 * low..=2 * high].to_vec();
+            // Orient the run to the face's own winding: forward when the face enters the
+            // apex from its disk-leading leg, reversed otherwise.
+            let run = match self.face_corner_edges(face, vertex) {
+                Some((incoming, _)) if incoming == legs[face_slot] => forward,
+                _ => {
+                    let mut reversed = forward;
+                    reversed.reverse();
+                    reversed
+                }
+            };
+            set_face_substitution(face_subst, vertex, face, run);
+        }
     }
 
     /// Build the outer-miter [V-ADJ] fill (BEVEL.md §8.9.2 / §8.9.5): the enlarged
@@ -8394,6 +8486,52 @@ mod tests {
     /// folds in 3-D (the signed reflex test needs a real vertex-normal frame, §8.9.1),
     /// and the two narrow top sectors (`(v, A, B)`, `(v, B, C)`) stay non-reflex.
     /// Returns `(mesh, apex, [v-A, v-B, v-C])`.
+    /// A closed octagonal bipyramid (BEVEL.md §8.9.2.1 worked driver): top apex `A`
+    /// at `(0, 0, 1)`, bottom apex `B` at `(0, 0, -1)`, rim octagon `R1 … R8` at
+    /// radius 1 in `z = 0` (`R_k` at `45·(k−1)°`). Beveling the three apex legs
+    /// `A–R1`, `A–R2`, `A–R3` bunches the junction to one side, so the `270°` reflex
+    /// gap `R3 → R4 → … → R8 → R1` is a **multi-face** sector absorbing the five
+    /// unbeveled legs `A–R4 … A–R8`. Returns `(mesh, apex A, rim [R1 … R8],
+    /// [A-R1, A-R2, A-R3])`.
+    fn octagonal_bipyramid() -> (LoopMesh, VertexKey, [VertexKey; 8], [EdgeKey; 3]) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let base = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
+        let rim: Vec<VertexKey> = (0..8)
+            .map(|k| {
+                let angle = std::f32::consts::FRAC_PI_4 * k as f32;
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+
+        let apex_leg: Vec<EdgeKey> = (0..8)
+            .map(|k| mesh.create_edge([apex, rim[k]], EdgeCreateFlags::NONE))
+            .collect();
+        let base_leg: Vec<EdgeKey> = (0..8)
+            .map(|k| mesh.create_edge([base, rim[k]], EdgeCreateFlags::NONE))
+            .collect();
+        let rim_edge: Vec<EdgeKey> = (0..8)
+            .map(|k| mesh.create_edge([rim[k], rim[(k + 1) % 8]], EdgeCreateFlags::NONE))
+            .collect();
+
+        for k in 0..8 {
+            let next = (k + 1) % 8;
+            mesh.face_create(
+                &[apex, rim[k], rim[next]],
+                &[apex_leg[k], rim_edge[k], apex_leg[next]],
+                FaceCreateFlags::NONE,
+            );
+            mesh.face_create(
+                &[base, rim[next], rim[k]],
+                &[base_leg[next], rim_edge[k], base_leg[k]],
+                FaceCreateFlags::NONE,
+            );
+        }
+
+        let rim_array: [VertexKey; 8] = rim.try_into().expect("eight rim verts");
+        (mesh, apex, rim_array, [apex_leg[0], apex_leg[1], apex_leg[2]])
+    }
+
     fn single_face_reflex_junction() -> (LoopMesh, VertexKey, [EdgeKey; 3]) {
         let mut mesh = LoopMesh::new();
         let v = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
@@ -8671,6 +8809,211 @@ mod tests {
             0,
             "no vertex sits at the arc's pulled-in bulge — the Patch chords are flat (§8.9.5)",
         );
+    }
+
+    // Replicate the §8.9.1 classification / §8.9.2 reposition on a pristine octagonal
+    // bipyramid to recover the reflex sector's three patch boundvert positions
+    // `(B1, B2, B3)` independently of the operator.
+    fn octagonal_patch_boundvert_positions() -> (Vec3, Vec3, Vec3) {
+        let offset = 0.2;
+        let (mesh, apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+        let apex_position = mesh.vertex_position(apex);
+        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
+        let corners = mesh.vertex_corner_ring(apex);
+        let sectors = sector_split(&corners, &is_beveled);
+        let sector_count = sectors.len();
+        let mut meets: Vec<Vec3> = Vec::new();
+        let mut dir_open: Vec<Vec3> = Vec::new();
+        let mut dir_close: Vec<Vec3> = Vec::new();
+        let mut reflex: Vec<bool> = Vec::new();
+        for sector in &sectors {
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = sector.corners[0].1;
+            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
+            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let cross = (-d_open).cross(-d_close);
+            reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
+            meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
+            dir_open.push(d_open);
+            dir_close.push(d_close);
+        }
+        assert_eq!(
+            reflex.iter().filter(|&&x| x).count(),
+            1,
+            "the octagonal bipyramid presents exactly one reflex sector",
+        );
+        let r = reflex.iter().position(|&x| x).unwrap();
+        let midpoint = meets[r];
+        let predecessor = meets[(r + sector_count - 1) % sector_count];
+        let successor = meets[(r + 1) % sector_count];
+        let b1 = midpoint + (predecessor - midpoint).dot(dir_open[r]) * dir_open[r];
+        let b3 = midpoint + (successor - midpoint).dot(dir_close[r]) * dir_close[r];
+        (b1, midpoint, b3)
+    }
+
+    /// BEVEL.md §8.9.2.1: the multi-face reflex outer-`PATCH` re-stitch. Beveling the
+    /// three bunched apex legs of an octagonal bipyramid leaves a `270°` reflex sector
+    /// that absorbs the five unbeveled legs `A–R4 … A–R8`. `PATCH` materialises the
+    /// three ring boundverts `B1 → B2 → B3` (`B2` the retained meet-point), distributes
+    /// the absorbed legs by disk position, and rebuilds the six reflex faces so their
+    /// apex corners tile the run **monotonically**: four stay tri-corners (one
+    /// boundvert), two become quad-corners across the `B1→B2` and `B2→B3` index steps.
+    /// The mesh stays a closed `χ = 2` manifold. Because the reused enlarged-ring grid
+    /// (§8.9.5) subdivides every ring edge, a quad-corner face threads the intervening
+    /// chord mid-sample, landing as a pentagon flush with the cap — the same
+    /// mid-threading the single-face path uses (`outer_miter_patch_flat_chord_placement`).
+    #[test]
+    fn multiface_patch_restitch_tiles_run_monotonically() {
+        let (b1_pos, b2_pos, b3_pos) = octagonal_patch_boundvert_positions();
+
+        let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Patch,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "the multi-face PATCH miter closes to a χ = 2 manifold (§8.9.2.1)",
+        );
+
+        // All three patch boundverts are minted; `B2` stays at the retained meet-point.
+        let find = |p: Vec3| {
+            result
+                .verts
+                .iter()
+                .copied()
+                .find(|&x| (mesh.vertex_position(x) - p).length() < 1.0e-4)
+        };
+        let b1 = find(b1_pos).expect("B1 minted");
+        let b2 = find(b2_pos).expect("B2 minted at the retained meet-point");
+        let b3 = find(b3_pos).expect("B3 minted");
+        let boundverts = [b1, b2, b3];
+
+        // The reflex faces are exactly those touching an absorbed leg's rim vert
+        // (`R4 … R8`) and a patch boundvert. Classify each by which of `{B1, B2, B3}` it
+        // threads: a tri-corner threads one boundvert (stays a triangle); a quad-corner
+        // threads two across an index step (a pentagon, carrying the chord mid).
+        let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
+        let mut tri_corners: Vec<usize> = Vec::new();
+        let mut quad_corners: Vec<Vec<usize>> = Vec::new();
+        for face in mesh.face_keys() {
+            let face_verts = mesh.face_vert_keys(face);
+            if !face_verts.iter().any(|x| absorbed.contains(x)) {
+                continue;
+            }
+            let threaded: Vec<usize> = boundverts
+                .iter()
+                .enumerate()
+                .filter(|(_, &b)| face_verts.contains(&b))
+                .map(|(i, _)| i)
+                .collect();
+            match threaded.len() {
+                0 => continue,
+                1 => {
+                    assert_eq!(
+                        face_verts.len(),
+                        3,
+                        "a tri-corner reflex face stays a triangle (same-index run)",
+                    );
+                    tri_corners.push(threaded[0]);
+                }
+                2 => {
+                    assert_eq!(
+                        face_verts.len(),
+                        5,
+                        "a quad-corner reflex face threads the chord mid, a pentagon flush with the cap",
+                    );
+                    quad_corners.push(threaded);
+                }
+                n => panic!("a reflex face threads {n} boundverts; the run is at most a pair"),
+            }
+        }
+
+        // §8.9.2.1 worked trace: four tri-corners + two quad-corners.
+        assert_eq!(tri_corners.len(), 4, "four reflex faces stay tri-corners");
+        assert_eq!(quad_corners.len(), 2, "two reflex faces grow to quad-corners at the steps");
+
+        // The tri-corners split evenly onto the two flanks `B1` / `B3`; `B2` is reached
+        // only across a step, so it carries no tri-corner.
+        assert_eq!(tri_corners.iter().filter(|&&i| i == 0).count(), 2, "two tri-corners on B1");
+        assert_eq!(tri_corners.iter().filter(|&&i| i == 2).count(), 2, "two tri-corners on B3");
+        assert_eq!(tri_corners.iter().filter(|&&i| i == 1).count(), 0, "B2 is a pure step vertex");
+
+        // The two steps are `B1→B2` and `B2→B3` — monotonic and gap-free through `B2`,
+        // never a `B1→B3` jump that would skip the retained meet-point.
+        let mut steps = quad_corners.clone();
+        for step in steps.iter_mut() {
+            step.sort_unstable();
+        }
+        steps.sort();
+        assert_eq!(
+            steps,
+            vec![vec![0, 1], vec![1, 2]],
+            "the runs tile B1→B2→B3 gap-free, no overlap (§8.9.2.1)",
+        );
+
+        // The miter is not inert: it differs from the sharp baseline.
+        let (mut sharp_mesh, _apex, _rim, [sa, sb, sc]) = octagonal_bipyramid();
+        let _ = sharp_mesh.bevel(
+            &[sa.into(), sb.into(), sc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Sharp,
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            counts(&mesh),
+            counts(&sharp_mesh),
+            "multi-face PATCH carries more geometry than the sharp ring",
+        );
+    }
+
+    /// BEVEL.md §8.9.2.1: the multi-face reflex sector is supported for `PATCH` only —
+    /// `ARC`'s interior-sample walk is not yet pinned, so `miter_outer = Arc` on the same
+    /// octagonal-bipyramid driver declines the outer miter and falls back to the sharp
+    /// ring (identical to `Sharp`), while `PATCH` genuinely reshapes it.
+    #[test]
+    fn multiface_arc_declines_while_patch_reshapes() {
+        let bevel = |kind: BevelMiter| {
+            let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+            let _ = mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments: 2,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: kind,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            counts(&mesh)
+        };
+        let sharp = bevel(BevelMiter::Sharp);
+        let arc = bevel(BevelMiter::Arc);
+        let patch = bevel(BevelMiter::Patch);
+        assert_eq!(
+            arc, sharp,
+            "multi-face ARC declines to the sharp ring (interior-sample walk unpinned, §8.9.2.1)",
+        );
+        assert_ne!(patch, sharp, "multi-face PATCH reshapes the reflex sector (§8.9.2.1)");
     }
 
     /// BEVEL.md §8.9.2 / §8.9.5: pin the outer-miter construction against a faithful
