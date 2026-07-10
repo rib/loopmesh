@@ -100,7 +100,7 @@ impl LoopMesh {
         if loops.len() != 2 {
             return empty;
         }
-        let mut loop_a = loops[0].clone();
+        let loop_a = loops[0].clone();
         let mut loop_b = loops[1].clone();
         if loop_a.len() < 2 || loop_b.len() < 2 {
             return empty;
@@ -117,7 +117,7 @@ impl LoopMesh {
 
         // §3.3 — try the natural pairing, then the crossed pairing (which
         // reverses loop B so the rails do not twist).
-        let (mut rail_left, mut rail_right) = match (
+        let (rail_left, rail_right) = match (
             self.grid_find_rail(a_first, b_first, &side_edges),
             self.grid_find_rail(a_last, b_last, &side_edges),
         ) {
@@ -141,9 +141,11 @@ impl LoopMesh {
         // temporary scaffold vertices (not rejected), and the scaffold collapses
         // back out after the build — degenerating the corner-losing cells into
         // triangles. When neither pair mismatches the expansion is the identity
-        // and no collapse occurs, so the whole equalisation apparatus (the origin
-        // anchor and the four member expansions) is inert and skipped — both
-        // exist only to make the §3.4 collapse reproducible.
+        // and no collapse occurs, so the member expansions are inert and skipped;
+        // they exist only to make the §3.4 collapse reproducible. The lattice
+        // origin `grid[0][0]` is already pinned by the §3.4a discovery labeling
+        // (loop A's seed-oriented far terminus, `a_first`) — no separate anchor
+        // pass is needed here.
         let cols_mismatch = loop_a.len() != loop_b.len();
         let rows_mismatch = rail_left.len() != rail_right.len();
 
@@ -154,8 +156,8 @@ impl LoopMesh {
         }
 
         // §3.3 — overlapping rails cannot bound a clean rectangle. The membership
-        // test is orientation-independent, so it reads the same whether or not the
-        // origin anchor below has re-oriented the rails.
+        // test is orientation-independent, so the rails' §3.3 pairing orientation
+        // does not affect it.
         if grid_rails_overlap(&rail_left, &rail_right) {
             return empty;
         }
@@ -186,42 +188,11 @@ impl LoopMesh {
             );
         }
 
-        // §3.4 — anchor the lattice origin deterministically. §3.3 leaves two
-        // free flips (which side is A vs B, which endpoint each loop's discovery
-        // walk labels "first"); both are arbitrary walk-order artifacts, so the
-        // span-equalisation collapse — which is keyed to the lattice origin
-        // `grid[0][0]`, not to geometry — would otherwise land its surviving
-        // corner on a hash-order-dependent physical vertex. We pin `grid[0][0]`
-        // to the corner with the lowest element index (the lattice addressed by
-        // element order, never enumeration order), choosing among the four valid
-        // non-twisted orientations. This makes the §3.4 collapse reproducible.
-        {
-            let c00 = loop_a[0];
-            let c10 = *loop_a.last().unwrap();
-            let c01 = loop_b[0];
-            let c11 = *loop_b.last().unwrap();
-            let origin = [c00, c10, c01, c11].into_iter().min_by_key(|v| v.0).unwrap();
-            if origin == c10 {
-                // Horizontal flip: the far bottom corner becomes the origin.
-                loop_a.reverse();
-                loop_b.reverse();
-                std::mem::swap(&mut rail_left, &mut rail_right);
-            } else if origin == c01 {
-                // Vertical flip: the near top corner becomes the origin.
-                std::mem::swap(&mut loop_a, &mut loop_b);
-                rail_left.reverse();
-                rail_right.reverse();
-            } else if origin == c11 {
-                // Both flips: the far top corner becomes the origin.
-                std::mem::swap(&mut loop_a, &mut loop_b);
-                loop_a.reverse();
-                loop_b.reverse();
-                rail_left.reverse();
-                rail_right.reverse();
-                std::mem::swap(&mut rail_left, &mut rail_right);
-            }
-            // else origin == c00: identity, the lattice already starts at it.
-        }
+        // §3.4a — the lattice origin `grid[0][0]` is `a_first` (loop A's
+        // seed-oriented far terminus, `loop_a[0]`), fixed upstream by discovery.
+        // The §3.3 pairing already ran loop B and the rails the same way around
+        // the lattice, so no re-orientation is needed before expansion; the
+        // collapse survivor keyed to `grid[0][0]` is therefore reproducible.
 
         // §3.4 Phase 1+2 — expand each boundary member to the full lattice count.
         // `*_pos` carry the genuine (scaffold-subdivided) boundary positions that
@@ -347,8 +318,15 @@ impl LoopMesh {
     /// §3.1 — discover the open edge loops in the marked input. Returns `None`
     /// when the input is malformed for a grid fill: a self-loop edge, a branch
     /// vertex (valence > 2 over the input set), or a leftover closed loop (a
-    /// cycle with no endpoints — the single-closed-loop case of §1.2/§8). Each
-    /// returned loop is an ordered open vertex chain.
+    /// cycle with no endpoints — the single-closed-loop case of §1.2/§8).
+    ///
+    /// The returned loops are ordered and oriented by the §3.4a discovery
+    /// labeling — the one upstream quantity the fill's orientation is a locked
+    /// function of, and which must never depend on hash iteration order. Loops
+    /// come back in ascending order of their **lowest-indexed member edge** (loop
+    /// A first, owning the global-lowest marked edge), and each chain is oriented
+    /// so its slot 0 is `a_first`: the far terminus reached by crossing that
+    /// loop's seed edge in its stored `first → second` order and continuing.
     fn grid_discover_open_loops(&self, edges: &[EdgeKey]) -> Option<Vec<Vec<VertexKey>>> {
         if edges.is_empty() {
             return None;
@@ -378,46 +356,39 @@ impl LoopMesh {
                 return None;
             }
         }
-        let endpoints: Vec<VertexKey> = adjacency
-            .iter()
-            .filter(|(_, incident)| incident.len() == 1)
-            .map(|(&v, _)| v)
-            .collect();
+        // §3.4a(ii) — seed each loop from the lowest-indexed marked edge it
+        // contains, scanning the marked set in ascending edge-index order. The
+        // global-lowest edge seeds loop A; building A consumes its edges, so the
+        // lowest remaining edge seeds loop B. This makes both the loop ordering
+        // and (via the seed's stored endpoint order) each loop's orientation a
+        // pure function of element indices, never of hash iteration order.
+        let mut seed_order = edge_list.clone();
+        seed_order.sort_unstable_by_key(|edge| edge.0);
 
         let mut visited_edges: HashSet<EdgeKey> = HashSet::new();
         let mut loops: Vec<Vec<VertexKey>> = Vec::new();
-        for &start in &endpoints {
-            let start_edge = adjacency[&start][0].1;
-            if visited_edges.contains(&start_edge) {
+        for &seed in &seed_order {
+            if !visited_edges.insert(seed) {
                 continue;
             }
-            let mut path = vec![start];
-            let mut current = start;
-            let mut arrived: Option<EdgeKey> = None;
-            loop {
-                let mut advanced = false;
-                for &(next_vertex, next_edge) in &adjacency[&current] {
-                    if Some(next_edge) == arrived {
-                        continue;
-                    }
-                    visited_edges.insert(next_edge);
-                    path.push(next_vertex);
-                    current = next_vertex;
-                    arrived = Some(next_edge);
-                    advanced = true;
-                    break;
-                }
-                if !advanced {
-                    break;
-                }
-            }
-            loops.push(path);
-        }
+            let [first, second] = self.edge_vert_keys(seed);
 
-        // Any edge not reached from an endpoint belongs to a closed loop, which
-        // has no endpoints to attach rails to (§3.1).
-        if visited_edges.len() != edge_list.len() {
-            return None;
+            // Walk the two arms away from the seed edge. Every internal vertex of
+            // a grid side has exactly one continuing edge (valence ≤ 2, checked
+            // above), so each arm ends at a valence-one terminus. An arm that
+            // returns to the opposite seed endpoint means the component is a
+            // closed loop — no endpoints for rails → reject (§3.1).
+            let forward = grid_walk_arm(&adjacency, seed, first, second, &mut visited_edges)?;
+            let backward = grid_walk_arm(&adjacency, seed, second, first, &mut visited_edges)?;
+
+            // §3.4a(iii) — orient the chain so slot 0 is `a_first`: the far
+            // terminus reached by crossing the seed `first → second` and
+            // continuing, i.e. the end of the `forward` arm. The chain therefore
+            // runs `forward` reversed then `backward`.
+            let mut chain = Vec::with_capacity(forward.len() + backward.len());
+            chain.extend(forward.iter().rev().copied());
+            chain.extend(backward.iter().copied());
+            loops.push(chain);
         }
 
         Some(loops)
@@ -649,6 +620,45 @@ impl LoopMesh {
 
         tally > 0
     }
+}
+
+/// §3.1/§3.4a — walk one arm of a side loop away from its seed edge. Starting at
+/// `start` (a seed endpoint) having arrived via `seed`, step to the single
+/// continuing edge at each vertex until a valence-one terminus, collecting the
+/// vertices (including `start`). Returns `None` when the arm reaches
+/// `far_endpoint` (the seed's opposite endpoint), which means the component is a
+/// closed loop and cannot be a grid side.
+fn grid_walk_arm(
+    adjacency: &HashMap<VertexKey, SmallVec<[(VertexKey, EdgeKey); 2]>>,
+    seed: EdgeKey,
+    far_endpoint: VertexKey,
+    start: VertexKey,
+    visited_edges: &mut HashSet<EdgeKey>,
+) -> Option<Vec<VertexKey>> {
+    let mut arm = vec![start];
+    let mut current = start;
+    let mut arrived = seed;
+    loop {
+        let mut next = None;
+        for &(next_vertex, next_edge) in &adjacency[&current] {
+            if next_edge == arrived {
+                continue;
+            }
+            next = Some((next_vertex, next_edge));
+            break;
+        }
+        let Some((next_vertex, next_edge)) = next else {
+            break;
+        };
+        if next_vertex == far_endpoint {
+            return None;
+        }
+        visited_edges.insert(next_edge);
+        arm.push(next_vertex);
+        current = next_vertex;
+        arrived = next_edge;
+    }
+    Some(arm)
 }
 
 /// §3.3 — the two rails overlap when they share any vertex (a clean rectangle's
@@ -1476,6 +1486,78 @@ mod tests {
         );
 
         mesh.validate_topology();
+    }
+
+    #[test]
+    fn side_edge_input_order_is_inert_on_asymmetric_frame() {
+        // §3.4a(i): the input edge array's order is *inert*. The operator stamps
+        // a mark on each input edge as a membership set, discards the incoming
+        // order, and rediscovers the two loops by scanning the marked set in
+        // ascending edge-index order (§3.4a(ii)) — seeding loop A from the
+        // lowest-indexed marked edge and walking it from that seed's stored
+        // `first -> second` endpoints (§3.4a(iii)). Permuting `side_edges` must
+        // therefore leave the fill *identical*, not merely isomorphic.
+        //
+        // This is exercised on `unequal_railed_interior_wire_ring(3, 2, 3)`
+        // precisely because it *would* discriminate a reintroduced order
+        // dependence: loop A (the 3-vertex bottom side) owns **two** marked
+        // edges, so seeding from the passed order rather than the lowest index
+        // could pick a different seed and mirror the grid; and the frame is
+        // rail-asymmetric (short 2-vertex left rail vs 3-vertex right rail), so a
+        // mirror moves the surviving interior vertex and the triangle's cell —
+        // observably, not just up to isomorphism. (Contrast a single-edge loop A
+        // or a symmetric frame, where the property holds vacuously.)
+        //
+        // Same fixture built in one creation order (⇒ identical element indices),
+        // filled three times with `side_edges` forward, reversed, and rotated.
+        // All three must agree on the face split, the surviving interior vertex
+        // key, and its position exactly.
+        let fill = |permute: &dyn Fn(&mut Vec<EdgeKey>)| -> (usize, usize, VertexKey, Vec3) {
+            let mut mesh = LoopMesh::new();
+            let mut side_edges = unequal_railed_interior_wire_ring(&mut mesh, 3, 2, 3);
+            permute(&mut side_edges);
+            let v0 = mesh.vertex_count();
+            let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
+            let (quads, tris) = quad_tri_split(&mesh, &result);
+            assert_eq!(mesh.vertex_count() - v0, 1, "one surviving interior vertex");
+            // The lone surviving interior vertex is the newest one.
+            let mut interior = None;
+            let mut it = mesh.mesh_verts();
+            while let Some(v) = it.next(&mesh) {
+                interior = Some(v);
+            }
+            let interior = interior.unwrap();
+            mesh.validate_topology();
+            (quads, tris, interior, mesh.vertex_position(interior))
+        };
+
+        let forward = fill(&|_edges| {});
+        let reversed = fill(&|edges| edges.reverse());
+        let rotated = fill(&|edges| edges.rotate_left(1));
+
+        assert_eq!(
+            forward, reversed,
+            "reversing side_edges must leave the fill identical (interior key, position, split)",
+        );
+        assert_eq!(
+            forward, rotated,
+            "rotating side_edges must leave the fill identical (interior key, position, split)",
+        );
+
+        // Pin the orientation concretely (the §3.4a worked check): the fill lands
+        // 3 quads + 1 triangle and the surviving interior vertex sits at the
+        // coincident-endpoint blend (1, 0.5, 0) — never the y = 1.0 an
+        // even-subdivision (or mirror-opposite) placement would give.
+        let (quads, tris, _interior, interior_pos) = forward;
+        assert_eq!((quads, tris), (3, 1), "2-vs-3 rail fill: 3 quads + 1 triangle");
+        assert!(
+            (interior_pos - Vec3::new(1.0, 0.5, 0.0)).length() < 1.0e-4,
+            "interior vertex at the coincident-endpoint blend (1, 0.5, 0), got {interior_pos:?}",
+        );
+        assert!(
+            (interior_pos.y - 1.0).abs() > 0.2,
+            "interior vertex must not sit at the mirror/midpoint y = 1.0, got {interior_pos:?}",
+        );
     }
 
     #[test]
