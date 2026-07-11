@@ -1821,13 +1821,33 @@ impl LoopMesh {
     /// identity there); on the skewed arc-flanking cell it is the un-skewed point the
     /// extraordinary-centre stencil must see instead of the resampled rim value.
     fn coarse_flank_mid(&self, start: VertexKey, end: VertexKey, edge: EdgeKey, profile: f32) -> Vec3 {
-        let start_position = self.vertex_position(start);
-        let end_position = self.vertex_position(end);
+        self.ring_flank_profile(start, end, edge, profile)
+            .raw_positions(2)[1]
+    }
+
+    /// The profile **generator** of a ring edge that crosses a beveled edge (BEVEL.md
+    /// §8.2.2.1 / §8.5.5.5(a)): that edge's cross-section cell between the two ring
+    /// boundverts. Rebuilt from the same three inputs `build_chain_between` used, so the
+    /// generator re-samples to exactly the polyline the emitted chain was read off.
+    fn ring_flank_profile(
+        &self,
+        start: VertexKey,
+        end: VertexKey,
+        edge: EdgeKey,
+        profile: f32,
+    ) -> RingChainProfile {
         let [ea, eb] = self.edge_vert_keys(edge);
         let edge_point = self.vertex_position(ea);
         let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
-        let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
-        cell.chain_positions(2, profile, ChainEmission::Raw)[1]
+        RingChainProfile::Cell {
+            cell: ProfileCell::new(
+                self.vertex_position(start),
+                self.vertex_position(end),
+                edge_point,
+                edge_dir,
+            ),
+            profile,
+        }
     }
 
     /// Build one beveled edge's `segments`-wide strip (BEVEL.md §8.3.0): `segments`
@@ -2385,6 +2405,8 @@ impl LoopMesh {
         // raw bulge is also the emitted rim sample (§8.9.5).
         let mut sector_ring: Vec<Vec<VertexKey>> = Vec::with_capacity(sector_count);
         let mut sector_arc: Vec<Option<Vec<VertexKey>>> = Vec::with_capacity(sector_count);
+        let mut sector_arc_profile: Vec<Option<RingChainProfile>> =
+            Vec::with_capacity(sector_count);
         let mut sector_bulge: Vec<Option<Vec3>> = Vec::with_capacity(sector_count);
         for plan in &plans {
             if plan.reflex {
@@ -2392,6 +2414,7 @@ impl LoopMesh {
                 result.verts.push(boundvert);
                 sector_ring.push(vec![boundvert]);
                 sector_arc.push(None);
+                sector_arc_profile.push(None);
                 sector_bulge.push(None);
                 continue;
             }
@@ -2405,6 +2428,11 @@ impl LoopMesh {
             // `√2 − 1` of the way from the chord midpoint toward that corner.
             let chord_mid = 0.5 * (b1_position + b3_position);
             let bulge_position = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * plan.meet;
+            sector_arc_profile.push(Some(RingChainProfile::Arc {
+                b1: b1_position,
+                b3: b3_position,
+                midpoint: plan.meet,
+            }));
             let b1 = self.create_vertex(b1_position);
             let bulge = self.create_vertex(bulge_position);
             let b3 = self.create_vertex(b3_position);
@@ -2486,7 +2514,9 @@ impl LoopMesh {
         // registered as the beveled edge's chain so the strip build joins onto it.
         let ring_count = ring.len();
         let mut arc_chains = sector_arc.iter().flatten();
+        let mut arc_profiles = sector_arc_profile.iter().flatten();
         let mut ring_chains: Vec<Vec<VertexKey>> = Vec::with_capacity(ring_count);
+        let mut ring_profiles: Vec<RingChainProfile> = Vec::with_capacity(ring_count);
         for i in 0..ring_count {
             let start = ring[i];
             let end = ring[(i + 1) % ring_count];
@@ -2496,8 +2526,14 @@ impl LoopMesh {
                         .next()
                         .expect("every internal ring edge has a pre-minted arc chain");
                     ring_chains.push(chain.clone());
+                    ring_profiles.push(
+                        *arc_profiles
+                            .next()
+                            .expect("every internal ring edge has a pre-minted arc profile"),
+                    );
                 }
                 Some(edge) => {
+                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile));
                     let interior = self.build_chain_between(
                         start,
                         end,
@@ -2553,6 +2589,7 @@ impl LoopMesh {
             boundverts: ring,
             chains: ring_chains,
             raw_coarse_mids,
+            profiles: ring_profiles,
             cross_edges: cross_edge,
             segments,
         });
@@ -2572,16 +2609,17 @@ impl LoopMesh {
     /// single sharp meet-point, so the junction presents an `(s + 1)`-boundvert ring
     /// the general grid tiles.
     ///
-    /// Scoped to a circular profile, `segments = 2`, `s ≥ 3`. `ARC` and `PATCH` both
-    /// engage at a **single-face** reflex sector (no absorbed unbeveled legs); a
-    /// **multi-face** reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to
-    /// the hub `B2` (§8.9.2.1, `restitch_multiface_patch_reflex`) and for `ARC` by
-    /// tiling the arc's profile-sample run (§8.9.2.2, `restitch_multiface_arc_sector`,
-    /// **even `segments` only** — odd `segments` stays on the sharp-ring decline). All
-    /// classification runs read-only first; the method returns `false` **without
-    /// mutating** for any junction outside those cases (no reflex sector — the miter is
-    /// inert — a multi-face `ARC` sector at odd `segments`, a non-circular profile,
-    /// `s < 3`, or `segments != 2`), so the caller falls back to the sharp ring.
+    /// Scoped to a circular profile and `s ≥ 3`: `ARC` is segments-general
+    /// (§8.9.5.1–§8.9.5.3), `PATCH` is still `segments = 2`-only. Both engage at a
+    /// **single-face** reflex sector (no absorbed unbeveled legs); a **multi-face**
+    /// reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to the hub `B2`
+    /// (§8.9.2.1, `restitch_multiface_patch_reflex`) and for `ARC` by tiling the arc's
+    /// profile-sample run at either parity (§8.9.2.2 / §8.9.2.3,
+    /// `restitch_multiface_arc_sector`). All classification runs read-only first; the
+    /// method returns `false` **without mutating** for any junction outside those cases
+    /// (no reflex sector — the miter is inert — more than one reflex sector, a
+    /// non-circular profile, `s < 3`, `segments < 2`, or a `PATCH` at `segments != 2`),
+    /// so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_outer_miter(
         &mut self,
@@ -2716,45 +2754,22 @@ impl LoopMesh {
         // stencil consumes (§8.5.5.5(d) / §8.9.5.3), which is **not** the emitted rim
         // sample; `forward_run` is the reflex face's rebuilt boundary threading `B1 … B3`
         // in sector order.
-        let (reflex_ring, internal_chains, raw_internal_mids, forward_run): (
+        let (reflex_ring, internal_chains, raw_internal_mids, internal_profiles, forward_run): (
             Vec<VertexKey>,
             Vec<Vec<VertexKey>>,
             Vec<Vec3>,
+            Vec<RingChainProfile>,
             Vec<VertexKey>,
         ) = match mode {
             BevelMiter::Arc => {
-                // §8.9.5.1 segments-general arc sampling in the (non-orthonormal) unit-
-                // square frame: `a_axis = midpoint − B1`, `b_axis = midpoint − B3`, inner
-                // corner `B1 + B3 − midpoint`, sample `k` at `P(cos θ_k, sin θ_k)` with
-                // `θ` *descending* from 90° at `B1` to 0° at `B3`. The seg = 2 raw sample
-                // keeps the closed-form `(2−√2)·chord_mid + (√2−1)·midpoint` bulge, which
-                // is that same 45° point.
-                let a_axis = midpoint - b1_position;
-                let b_axis = midpoint - b3_position;
-                let inner_corner = b1_position + b3_position - midpoint;
-                let arc_sample = |theta: f32| {
-                    a_axis * theta.cos() + b_axis * theta.sin() + inner_corner
+                // §8.9.5.1: the reflex chain is the inscribed circular arc sampled in the
+                // (non-orthonormal) unit-square frame of `B1` / `B3` / the stored midpoint.
+                let arc = RingChainProfile::Arc {
+                    b1: b1_position,
+                    b3: b3_position,
+                    midpoint,
                 };
-                let sqrt2 = std::f32::consts::SQRT_2;
-                let chord_mid = 0.5 * (b1_position + b3_position);
-                let raw_bulge = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
-                let arc_polyline = |count: u32| -> Vec<Vec3> {
-                    (0..=count)
-                        .map(|k| {
-                            if k == 0 {
-                                b1_position
-                            } else if k == count {
-                                b3_position
-                            } else if count == 2 {
-                                raw_bulge
-                            } else {
-                                let theta = std::f32::consts::FRAC_PI_2
-                                    * (1.0 - k as f32 / count as f32);
-                                arc_sample(theta)
-                            }
-                        })
-                        .collect()
-                };
+                let raw_bulge = arc.raw_positions(2)[1];
 
                 // §8.2.2.1.1 / §8.9.5.2: the arc is a ring-edge chain of the [V-ADJ] cap
                 // like any other, so its *emitted* rim samples are the chord-fraction
@@ -2762,12 +2777,12 @@ impl LoopMesh {
                 // resolution. On an asymmetric (absorbed-leg) reflex fan the arc cell is
                 // the most skewed in the cap and the shift is large. The centre stencil
                 // keeps reading `raw_bulge` (below) — the two roles are distinct values.
-                let raw_chain = arc_polyline(segments);
+                let raw_chain = arc.raw_positions(segments);
                 let source_segments = boundary_source_resolution(segments);
                 let emitted = if source_segments == segments {
                     raw_chain
                 } else {
-                    let source = arc_polyline(source_segments);
+                    let source = arc.raw_positions(source_segments);
                     chord_fraction_resample(&raw_chain, &source)
                 };
 
@@ -2783,6 +2798,7 @@ impl LoopMesh {
                     vec![b1, b3],
                     vec![samples.clone()],
                     vec![raw_bulge],
+                    vec![arc],
                     samples,
                 )
             }
@@ -2801,6 +2817,16 @@ impl LoopMesh {
                     vec![b1, b2, b3],
                     vec![vec![b1, mid12, b2], vec![b2, mid23, b3]],
                     vec![mid12_position, mid23_position],
+                    vec![
+                        RingChainProfile::Chord {
+                            start: b1_position,
+                            end: midpoint,
+                        },
+                        RingChainProfile::Chord {
+                            start: midpoint,
+                            end: b3_position,
+                        },
+                    ],
                     vec![b1, mid12, b2, mid23, b3],
                 )
             }
@@ -2909,7 +2935,9 @@ impl LoopMesh {
         // valence-`(s + 1)` cap fill (§8.9.5.3) tiles these heterogeneous chains as the
         // §8.5.5.5 grid, so each must carry its full profile, not just one interior mid.
         let mut internal_chains = internal_chains.into_iter();
+        let mut internal_profiles = internal_profiles.into_iter();
         let mut ring_chains: Vec<Vec<VertexKey>> = Vec::with_capacity(ring.len());
+        let mut ring_profiles: Vec<RingChainProfile> = Vec::with_capacity(ring.len());
         for i in 0..ring.len() {
             let start = ring[i];
             let end = ring[(i + 1) % ring.len()];
@@ -2919,8 +2947,14 @@ impl LoopMesh {
                         .next()
                         .expect("every internal reflex edge has a precreated sample chain");
                     ring_chains.push(chain);
+                    ring_profiles.push(
+                        internal_profiles
+                            .next()
+                            .expect("every internal reflex edge has a precreated profile"),
+                    );
                 }
                 Some(edge) => {
+                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile));
                     // §8.9.5.2: each flanking beveled-edge cross-section carries `segments
                     // − 1` interior samples. The reflex sector's flanking pair runs to an
                     // inward-repositioned arc-start boundvert, making the cell skewed; at
@@ -2994,6 +3028,7 @@ impl LoopMesh {
             boundverts: ring,
             chains: ring_chains,
             raw_coarse_mids,
+            profiles: ring_profiles,
             cross_edges: cross_edge,
             segments,
         });
@@ -3170,7 +3205,7 @@ impl LoopMesh {
         let count = omj.boundverts.len();
         // A miter splits at least one sector of an `s ≥ 3` ring, so the enlarged ring
         // always carries `≥ 4` boundverts.
-        if count < 4 || omj.chains.len() != count {
+        if count < 4 || omj.chains.len() != count || omj.profiles.len() != count {
             return;
         }
         let representative = self
@@ -3189,6 +3224,7 @@ impl LoopMesh {
         self.emit_general_adj_fill(
             omj.vertex,
             &omj.chains,
+            &omj.profiles,
             omj.segments,
             false,
             raw_coarse_mids,
@@ -3201,15 +3237,19 @@ impl LoopMesh {
     /// Emit one **general valence-`s` [V-ADJ] adjacency fill** (BEVEL.md §8.5.5.5) over a
     /// prepared ring of per-edge profile chains. Each `chain_of[i]` is the `segments +
     /// 1`-sample chain on ring edge `i` (oriented `B_i → B_{i+1}`); the two chain ends are
-    /// the ring boundverts. `flat` selects the `r = 1` planar specialisation (fullness
-    /// zeroed, centre on the ring-plane centroid, §8.3.0.2.1). This is the shared core of
-    /// the general non-symmetric junction fill and the outer-miter cap fill (§8.9.5.3):
+    /// the ring boundverts. `profiles[i]` is that ring edge's *generator* — the fill
+    /// re-samples it at each subdivision round's own doubled resolution (§8.5.5.5(c)) and,
+    /// at the coarse resolution, reads its raw `(i, 0, 1)` control point. `flat` selects
+    /// the `r = 1` planar specialisation (fullness zeroed, centre on the ring-plane
+    /// centroid, §8.3.0.2.1), whose net carries no curvature to relax. This is the shared
+    /// core of the general non-symmetric junction fill and the miter cap fills (§8.9.5.3):
     /// the only per-caller difference is where the chains come from.
     #[allow(clippy::too_many_arguments)]
     fn emit_general_adj_fill(
         &mut self,
         vertex: VertexKey,
         chain_of: &[Vec<VertexKey>],
+        profiles: &[RingChainProfile],
         segments: u32,
         flat: bool,
         raw_coarse_mids: Option<&[Vec3]>,
@@ -3221,6 +3261,9 @@ impl LoopMesh {
         let seg = segments as usize;
         let half = seg / 2;
         let even = seg % 2 == 0;
+        if sectors < 3 || profiles.len() != sectors {
+            return;
+        }
         for chain in chain_of {
             // A chain that did not sample to `seg + 1` verts is outside scope; skip the
             // whole fill rather than emit a torn patch.
@@ -3235,44 +3278,13 @@ impl LoopMesh {
         // boundverts (the `(i, 0, 0)` ring corners); the fullness seed is pulled a
         // `fullness` fraction back toward the original corner `v`. The flat straight-chord
         // profile is the `fullness = 0` planar specialisation (§8.3.0.2.1).
-        let centroid = chain_of
+        let boundverts: Vec<Vec3> = chain_of
             .iter()
-            .fold(Vec3::ZERO, |acc, chain| acc + self.vertex_position(chain[0]))
-            / sectors as f32;
+            .map(|chain| self.vertex_position(chain[0]))
+            .collect();
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
         let fullness = if flat { 0.0 } else { adj_fullness(segments) };
         let fullness_seed = centroid + fullness * (vertex_position - centroid);
-
-        // §8.5.5.5(d): the general fill subdivides its coarse net once even at
-        // `segments = 2`, and the even resample keeps that once-subdivided centre
-        // verbatim — the extraordinary-centre stencil pulls the fullness seed in toward
-        // the subdivision-limit position (the §8.9.5 apex pull-in). Larger even counts
-        // keep the raw seed (their multi-round doubling/relax/resample is the deferred
-        // §8.5.5.5(c)/(d) subdivision-relaxation stencil — a Tier-2 interior, §8.5.5.7).
-        // The flat cap keeps the centre on the ring-plane centroid.
-        let centre = if flat {
-            fullness_seed
-        } else if even && seg == 2 {
-            let boundverts: Vec<Vec3> = chain_of
-                .iter()
-                .map(|chain| self.vertex_position(chain[0]))
-                .collect();
-            // §8.5.5.5(d) / §8.9.5.3: the centre stencil consumes the **raw coarse**
-            // profile mids — the pre-resample `(i, 0, 1)` control points — never the
-            // emitted (§8.2.2.1.1-resampled) rim mids. A caller with a resampled rim
-            // (the outer-miter cap) supplies its raw coarse mids; the rest have raw ==
-            // emitted (symmetric cells resample to the identity), so `chain[half]` is
-            // already the raw mid and this stays bit-identical.
-            let mids: Vec<Vec3> = match raw_coarse_mids {
-                Some(raw) if raw.len() == sectors => raw.to_vec(),
-                _ => chain_of
-                    .iter()
-                    .map(|chain| self.vertex_position(chain[half]))
-                    .collect(),
-            };
-            adj_even_extraordinary_centre(vertex_position, &boundverts, &mids, sabin_gamma(sectors))
-        } else {
-            fullness_seed
-        };
 
         // The face-winding anchor (§8.5.5): a point below the cap, on the solid side away
         // from `v`. The flat cap reflects `v` through the centroid (its `fullness = 0`
@@ -3283,35 +3295,67 @@ impl LoopMesh {
             centroid - fullness * (vertex_position - centroid)
         };
 
-        // A small in-cap length used to spread the odd central `s`-gon verts.
-        let cap_scale = chain_of
-            .iter()
-            .map(|chain| (self.vertex_position(chain[half]) - centre).length())
-            .sum::<f32>()
-            / sectors as f32;
-
-        // Per sub-patch corners: `B_i`, the chain-`i` inner end (`P0t`), the
-        // chain-`(i−1)` inner end (`Pt0`), and the inner corner (`Ptt`) — the welded
-        // fullness centre for even `segments`, a distinct central-`s`-gon vert `G_i`
-        // for odd. Interior grid verts bilinearly blend these four.
-        let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
-        for i in 0..sectors {
-            let p00 = self.vertex_position(chain_of[i][0]);
-            let p0t = self.vertex_position(chain_of[i][half]);
-            let prev = (i + sectors - 1) % sectors;
-            let pt0 = self.vertex_position(chain_of[prev][seg - half]);
-            let ptt = if even {
-                centre
-            } else {
-                // Odd centre ring: tilt a small step from the fullness centre toward `B_i`
-                // so the `s` `G_i` form a central `s`-gon around the centre. The exact
-                // spread is a free interior choice (Tier-2, §8.5.5.7).
-                let toward_boundvert = (p00 - centre).normalize_or_zero();
-                let gamma = 1.0 / (half as f32 + 2.0);
-                centre + gamma * cap_scale * toward_boundvert
-            };
-            corners.push([p00, p0t, pt0, ptt]);
+        if flat {
+            // §8.3.0.2.1: the straight-chord cap is planar — its coarse net has no bulge to
+            // relax and its centre is the ring-plane centroid, so the sub-patch bilinear
+            // blend *is* the fill. The odd centre ring's spread is the one free interior
+            // choice this specialisation makes (Tier-2, §8.5.5.7).
+            let cap_scale = chain_of
+                .iter()
+                .map(|chain| (self.vertex_position(chain[half]) - fullness_seed).length())
+                .sum::<f32>()
+                / sectors as f32;
+            let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
+            for i in 0..sectors {
+                let p00 = boundverts[i];
+                let p0t = self.vertex_position(chain_of[i][half]);
+                let prev = (i + sectors - 1) % sectors;
+                let pt0 = self.vertex_position(chain_of[prev][seg - half]);
+                let ptt = if even {
+                    fullness_seed
+                } else {
+                    let toward_boundvert = (p00 - fullness_seed).normalize_or_zero();
+                    let gamma = 1.0 / (half as f32 + 2.0);
+                    fullness_seed + gamma * cap_scale * toward_boundvert
+                };
+                corners.push([p00, p0t, pt0, ptt]);
+            }
+            self.emit_adj_grid(
+                sectors,
+                seg,
+                half,
+                even,
+                chain_of,
+                &AdjInterior::Blend {
+                    corners: &corners,
+                    placement: AdjPlacement::Fullness { anchor },
+                },
+                material,
+                representative,
+                result,
+            );
+            return;
         }
+
+        // §8.5.5.5(a) and the "the centre stencil consumes the *raw coarse* profile mids"
+        // rule: the coarse net's `(i, 0, 1)` control points are each ring edge's own
+        // profile sampled at the coarse `segments = 2` resolution — **never** the emitted
+        // (§8.2.2.1.1-resampled) rim mids, which are a strictly later, emitted-only step.
+        // A caller that already captured them hands them over; otherwise they come
+        // straight off the ring edge's generator.
+        let mids: Vec<Vec3> = (0..sectors)
+            .map(|i| match raw_coarse_mids {
+                Some(raw) if raw.len() == sectors => raw[i],
+                _ => profiles[i].raw_positions(2)[1],
+            })
+            .collect();
+
+        // §8.5.5.5(c)/(d): double the fullness-seeded coarse net — at least once, even at
+        // `segments = 2` — until the working resolution reaches the target, then read the
+        // interior back at the target sample fractions. The rim is *not* read back from
+        // this net: it stays the already-emitted chain (§8.2.2.1.1, "the emitted boundary").
+        let net = adj_relaxed_net(&boundverts, &mids, fullness_seed, profiles, segments);
+        let axis = adj_interior_axis(profiles, segments, 2 * net.half as u32);
 
         self.emit_adj_grid(
             sectors,
@@ -3319,8 +3363,13 @@ impl LoopMesh {
             half,
             even,
             chain_of,
-            &corners,
-            AdjPlacement::Fullness { anchor },
+            &AdjInterior::Relaxed {
+                net: &net,
+                axis: &axis,
+                sectors,
+                segments: seg,
+                anchor,
+            },
             material,
             representative,
             result,
@@ -3460,8 +3509,10 @@ impl LoopMesh {
             half,
             even,
             &chain_of,
-            &corners,
-            AdjPlacement::Sphere { center, radius },
+            &AdjInterior::Blend {
+                corners: &corners,
+                placement: AdjPlacement::Sphere { center, radius },
+            },
             material,
             representative,
             result,
@@ -3479,25 +3530,26 @@ impl LoopMesh {
     ///   `centroid + fullness·(v − centroid)`, blending the boundvert centroid
     ///   toward the original corner `v`. `fullness` is a profile/segment fit scalar
     ///   (the circular default tabulated near `0.55–0.65`), not a per-vertex solve;
-    /// - **subdivision-relaxation interior (§8.5.5.5(c)):** the interior descends
-    ///   from the fullness centre and the pinned profile-chain boundary by a finite
-    ///   local averaging — here the direct sub-patch grid (the same equivalent the
-    ///   cube-corner path constructs in place of literal doubling+resample), with
-    ///   the boundary reused from [P]/[S] rather than re-minted.
+    /// - **subdivision-relaxation interior (§8.5.5.5(c)):** the coarse `segments = 2`
+    ///   control net is refined by repeated cubic (Catmull–Clark, Sabin-modified)
+    ///   rounds — at least one, even at `segments = 2` — each re-pinning the chain
+    ///   boundary from the profile at that round's own doubled resolution; a
+    ///   non-power-of-two target then reads the dense net back at its own profile-arc
+    ///   fractions (§8.5.5.5(d)). The rim is never re-derived: it stays the §8.2.2.1.1
+    ///   read-back the strips already carry.
     ///
     /// The grid **topology** (vert / face counts, per-face histogram, even/odd
     /// centre parity, §8.5.5.5(e)) is identical to the cube-corner grid — only the
     /// vertex *positions* differ (no sphere). Even `segments` weld one shared centre
-    /// vertex (the fullness centre) with no central face; odd `segments` close the
-    /// `s` sectors with one central `s`-gon. The interior is non-unique (Tier-2,
-    /// §8.5.5.7): only the counts / histogram / parity are pinned, and the cap
+    /// vertex (the once-subdivided extraordinary centre, pinned strictly) with no
+    /// central face; odd `segments` close the `s` sectors with one central `s`-gon.
+    /// Only the (d) read-back kernel is a free choice (Tier-2, §8.5.5.7); the cap
     /// pointedly does **not** lie on the cube-corner sphere — the positive signal
-    /// that the general fullness path, not the §8.5.1 snap, produced it.
+    /// that the general relaxation path, not the §8.5.1 snap, produced it.
     ///
-    /// Scope this cycle (§8.5.5.5): irregular rings, oblique corners, valence `s`,
-    /// default circular profile, equal offsets. The pipe / square / square-in
-    /// profile grids and the per-offset numeric `fullness` refit stay deferred
-    /// (§8.5.5.5(f)).
+    /// Scope (§8.5.5.5): irregular rings, oblique corners, valence `s`, default
+    /// circular profile, equal offsets. The pipe / square / square-in profile grids
+    /// and the per-offset numeric `fullness` refit stay deferred (§8.5.5.5(f)).
     fn build_adj_fill_general_nonsymmetric(
         &mut self,
         cut: &JunctionCut,
@@ -3524,19 +3576,28 @@ impl LoopMesh {
             }
         }
 
+        // Each sector's ring-edge generator (§8.5.5.5(a)): the cross-section cell of the
+        // beveled edge that sector's chain crosses. The stencil re-samples it at every
+        // round's doubled resolution and reads its raw coarse mid off it.
+        let mut profiles: Vec<RingChainProfile> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            match self.sector_cell(cut, chains, i) {
+                Some(cell) => profiles.push(RingChainProfile::Cell { cell, profile }),
+                None => return,
+            }
+        }
+
         // §8.5.5.5(b) / §8.3.0.2.1: the flat straight-chord profile (`r = 1`) is the
         // `fullness = 0` planar specialisation — the cap lies in the boundvert ring
         // plane with no bulge toward the corner `v` and no extraordinary-centre
         // relaxation. Every other filled profile (the circular default) keeps the
-        // tabulated fullness seed.
+        // tabulated fullness seed and relaxes.
         let flat = profile_to_exponent(profile) == 1.0;
         let representative = cut.representative_material(self);
-        // The general non-symmetric junction's rim chains are symmetric enough that the
-        // §8.2.2.1.1 resample is the identity on their coarse mids, so `chain[half]` is
-        // already the raw coarse mid (§8.5.5.5(d)); no separate raw-mid feed is needed.
         self.emit_general_adj_fill(
             cut.vertex,
             &chain_of,
+            &profiles,
             segments,
             flat,
             None,
@@ -3546,14 +3607,12 @@ impl LoopMesh {
         );
     }
 
-    /// Tile one valence-`s` adjacency grid from its prepared per-sub-patch corners
-    /// and a vertex-`placement` rule (BEVEL.md §8.5.5). The topology is identical
-    /// for the cube-corner sphere fill (§8.5.5.1–§8.5.5.4) and the general
-    /// non-symmetric fullness fill (§8.5.5.5) — only `placement` differs (snap onto
-    /// the corner sphere vs the raw fullness-blended position). Even `segments` weld
-    /// the `s` sub-patches at one shared centre vertex (no central face); odd
-    /// `segments` bridge them with a ring of seam quads closed by one central
-    /// `s`-gon (§8.5.5.5(e)).
+    /// Tile one valence-`s` adjacency grid from its rim chains and an `interior` rule
+    /// (BEVEL.md §8.5.5). The topology is identical for the cube-corner sphere fill
+    /// (§8.5.5.1–§8.5.5.4) and the general subdivision-relaxation fill (§8.5.5.5) — only
+    /// where interior positions come from differs. Even `segments` weld the `s` sub-patches
+    /// at one shared centre vertex (no central face); odd `segments` bridge them with a
+    /// ring of seam quads closed by one central `s`-gon (§8.5.5.5(e)).
     #[allow(clippy::too_many_arguments)]
     fn emit_adj_grid(
         &mut self,
@@ -3562,13 +3621,12 @@ impl LoopMesh {
         half: usize,
         even: bool,
         chain_of: &[Vec<VertexKey>],
-        corners: &[[Vec3; 4]],
-        placement: AdjPlacement,
+        interior: &AdjInterior<'_>,
         material: i32,
         representative: i32,
         result: &mut BevelResult,
     ) {
-        let anchor = placement.anchor();
+        let anchor = interior.anchor();
         let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
             std::collections::HashMap::new();
 
@@ -3579,20 +3637,20 @@ impl LoopMesh {
             for cell_j in 0..half {
                 for cell_k in 0..half {
                     let a = self.adj_grid_vert(
-                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, corners,
-                        placement, &mut grid, result,
+                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior,
+                        &mut grid, result,
                     );
                     let b = self.adj_grid_vert(
-                        i, cell_j, cell_k + 1, half, seg, sectors, even, chain_of, corners,
-                        placement, &mut grid, result,
+                        i, cell_j, cell_k + 1, half, seg, sectors, even, chain_of, interior,
+                        &mut grid, result,
                     );
                     let c = self.adj_grid_vert(
-                        i, cell_j + 1, cell_k + 1, half, seg, sectors, even, chain_of, corners,
-                        placement, &mut grid, result,
+                        i, cell_j + 1, cell_k + 1, half, seg, sectors, even, chain_of, interior,
+                        &mut grid, result,
                     );
                     let d = self.adj_grid_vert(
-                        i, cell_j + 1, cell_k, half, seg, sectors, even, chain_of, corners,
-                        placement, &mut grid, result,
+                        i, cell_j + 1, cell_k, half, seg, sectors, even, chain_of, interior,
+                        &mut grid, result,
                     );
                     self.emit_patch_face(&[a, b, c, d], anchor, material, representative, result);
                 }
@@ -3615,12 +3673,10 @@ impl LoopMesh {
             let mut row: Vec<VertexKey> = Vec::with_capacity(half + 1);
             for r in 0..=half {
                 column.push(self.adj_grid_vert(
-                    i, r, half, half, seg, sectors, even, chain_of, corners, placement,
-                    &mut grid, result,
+                    i, r, half, half, seg, sectors, even, chain_of, interior, &mut grid, result,
                 ));
                 row.push(self.adj_grid_vert(
-                    next, half, r, half, seg, sectors, even, chain_of, corners, placement,
-                    &mut grid, result,
+                    next, half, r, half, seg, sectors, even, chain_of, interior, &mut grid, result,
                 ));
             }
             for r in 0..half {
@@ -3637,8 +3693,7 @@ impl LoopMesh {
         let mut central: Vec<VertexKey> = Vec::with_capacity(sectors);
         for i in 0..sectors {
             central.push(self.adj_grid_vert(
-                i, half, half, half, seg, sectors, even, chain_of, corners, placement,
-                &mut grid, result,
+                i, half, half, half, seg, sectors, even, chain_of, interior, &mut grid, result,
             ));
         }
         self.emit_patch_face(&central, anchor, material, representative, result);
@@ -3646,10 +3701,10 @@ impl LoopMesh {
 
     /// Resolve the adjacency-grid vert at sub-patch index `(i, j, k)` (BEVEL.md
     /// §8.5.5). Boundary rows (`j == 0` / `k == 0`) reuse the existing chain /
-    /// boundvert keys so the patch shares its rim with the strips; interior verts
-    /// are created once at the bilinear blend of the sub-patch corners, snapped to
-    /// the corner sphere, and cached. For even `segments` the inner column (`k ==
-    /// half`), inner row (`j == half`), and centre alias onto the neighbouring
+    /// boundvert keys so the patch shares its rim with the strips — the rim is the
+    /// deterministic §8.2.2.1.1 read-back and is never re-derived here. Interior verts
+    /// are created once from `interior` and cached. For even `segments` the inner column
+    /// (`k == half`), inner row (`j == half`), and centre alias onto the neighbouring
     /// sub-patch (the welded seams / apex); odd `segments` keeps each sub-patch
     /// independent.
     #[allow(clippy::too_many_arguments)]
@@ -3663,8 +3718,7 @@ impl LoopMesh {
         sectors: usize,
         even: bool,
         chain_of: &[Vec<VertexKey>],
-        corners: &[[Vec3; 4]],
-        placement: AdjPlacement,
+        interior: &AdjInterior<'_>,
         grid: &mut std::collections::HashMap<(usize, usize, usize), VertexKey>,
         result: &mut BevelResult,
     ) -> VertexKey {
@@ -3697,14 +3751,7 @@ impl LoopMesh {
             return existing;
         }
 
-        let [p00, p0t, pt0, ptt] = corners[canon.0];
-        let s = canon.2 as f32 / half as f32;
-        let u = canon.1 as f32 / half as f32;
-        let blended = p00 * ((1.0 - s) * (1.0 - u))
-            + p0t * (s * (1.0 - u))
-            + pt0 * ((1.0 - s) * u)
-            + ptt * (s * u);
-        let position = placement.place(blended);
+        let position = interior.position(canon.0, canon.1, canon.2, half);
         let vertex = self.create_vertex(position);
         result.verts.push(vertex);
         grid.insert(canon, vertex);
@@ -6743,6 +6790,13 @@ struct MiterRingJunction {
     /// bug. Populated only at `segments = 2` (the only width the centre stencil fires
     /// at); empty otherwise.
     raw_coarse_mids: Vec<Vec3>,
+    /// Per ring edge (same order as `chains`), that edge's profile **generator**
+    /// (BEVEL.md §8.5.5.5(a)): the §8.5.5.5(c) subdivision-relaxation stencil re-pins its
+    /// boundary at every round's own doubled resolution, so it needs each chain's profile,
+    /// not just the emitted rim verts. Heterogeneous by construction — a split sector
+    /// contributes an arc (or two patch chords) where the rest contribute cross-section
+    /// cells — and the fill never tests which is which (§8.9.5.3).
+    profiles: Vec<RingChainProfile>,
     /// Per ring edge (same order as `chains`), the beveled edge that ring edge's
     /// cross-section crosses — `None` on a split sector's **internal** (arc /
     /// patch-chord) edges, which cross no beveled edge. This is what makes the split
@@ -10530,6 +10584,77 @@ mod tests {
     /// emitted rim mids and the raw-mid centre stencil is a **bit-identical no-op**
     /// here — the load-bearing guarantee that the raw-coarse-mid fix leaves the blessed
     /// symmetric / B2 path unperturbed while landing exactly on the oracle apex.
+    /// BEVEL.md §8.9.5.3 / §8.5.5.5(c)–(e): the **odd**-`segments` outer-`ARC` cap over the
+    /// same three-edge octagonal fan closes on a central `(s + 1)`-gon — a quad at this
+    /// valence-4 ring — whose four verts the guide pins by oracle read-back. Reaching them
+    /// exercises the whole stencil end to end: the fullness-seeded coarse net, one
+    /// subdivision round to `N = 4` (raw coarse mids in, sharpened boundary as the stencil
+    /// input), and the §8.5.5.5(d) read-back to `segments = 3` — which, because `3` is not
+    /// a power of two, genuinely runs the interior resample.
+    #[test]
+    fn outer_miter_odd_cap_central_ngon_matches_oracle() {
+        let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let central = [
+            Vec3::new(0.146_23, 0.285_17, 0.593_51),
+            Vec3::new(0.023_81, 0.198_35, 0.662_73),
+            Vec3::new(0.198_35, 0.023_81, 0.662_73),
+            Vec3::new(0.285_17, 0.146_23, 0.593_51),
+        ];
+        for expected in central {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, expected),
+                1,
+                "the odd cap's central {expected:?} is the §8.9.5.3 oracle vert",
+            );
+        }
+
+        // §8.5.5.5(e): exactly one central `s`-gon face, and its verts are those four.
+        let closing: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| {
+                mesh.face_vert_keys(face).iter().all(|&v| {
+                    central
+                        .iter()
+                        .any(|&c| (mesh.vertex_position(v) - c).length() < 1.0e-5)
+                })
+            })
+            .collect();
+        assert_eq!(closing.len(), 1, "odd parity closes on exactly one central face");
+        assert_eq!(
+            mesh.face_vert_keys(closing[0]).len(),
+            4,
+            "the central face of a valence-4 ring is a quad",
+        );
+
+        // The reflex arc's own rim samples are untouched by the interior machinery — they
+        // stay the §8.9.5.1 chord-fraction read-back (§8.2.2.1.1, "the emitted boundary").
+        for arc_sample in [
+            Vec3::new(-0.091_67, 0.137_19, 0.683_04),
+            Vec3::new(0.137_19, -0.091_67, 0.683_04),
+        ] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, arc_sample),
+                1,
+                "the emitted rim is still the resampled arc, not a read-back of the grid",
+            );
+        }
+    }
+
     #[test]
     fn outer_miter_symmetric_fan_apex_matches_oracle() {
         let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
@@ -12126,6 +12251,341 @@ mod tests {
         ];
         mesh.face_create(&base, &base_edges, FaceCreateFlags::NONE);
         [apex, b0, b1, b2, b3]
+    }
+
+    /// A regular `sides`-gon pyramid: a valence-`sides` apex with `sides` slant edges, all
+    /// sectors congruent and all offsets equal. Beveling every slant edge presents the apex
+    /// as a symmetric **general** ring (it fails the §8.5.1 tri-corner trigger on valence
+    /// alone for `sides != 3`), so its cap is the §8.5.5.5 fill. Returns `(apex, base ring
+    /// in disk order)`.
+    fn regular_pyramid(mesh: &mut LoopMesh, sides: usize) -> (VertexKey, Vec<VertexKey>) {
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.4));
+        let base: Vec<VertexKey> = (0..sides)
+            .map(|k| {
+                let angle = std::f32::consts::TAU * k as f32 / sides as f32;
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+        for k in 0..sides {
+            let ring = [apex, base[k], base[(k + 1) % sides]];
+            let edges = [
+                mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[2], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        let mut bottom: Vec<VertexKey> = base.clone();
+        bottom.reverse();
+        let bottom_edges: Vec<EdgeKey> = (0..sides)
+            .map(|k| {
+                mesh.create_edge(
+                    [bottom[k], bottom[(k + 1) % sides]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
+            .collect();
+        mesh.face_create(&bottom, &bottom_edges, FaceCreateFlags::NONE);
+        (apex, base)
+    }
+
+    /// The apex's §7.6.2 boundvert ring and per-ring-edge chain generators, re-derived from
+    /// the *sector* geometry alone — independently of the fill — so a test can predict the
+    /// §8.5.5.5 cap. `boundverts[i]` is the meet of the sector between slant edges `i` and
+    /// `i + 1`; ring edge `i` then spans `boundverts[i] → boundverts[i + 1]` across slant
+    /// edge `i + 1`, which is that chain's cross-section cell.
+    fn pyramid_apex_ring(
+        apex: Vec3,
+        base: &[Vec3],
+        offset: f32,
+        profile: f32,
+    ) -> (Vec<Vec3>, Vec<RingChainProfile>) {
+        let sides = base.len();
+        let toward = |p: Vec3| (p - apex).normalize();
+        // §7.6.2 in a planar sector: the two offset lines meet on the bisector at
+        // `v + offset·(d_a + d_b)/sin θ`.
+        let meet = |p: Vec3, q: Vec3| {
+            let (d_a, d_b) = (toward(p), toward(q));
+            apex + offset * (d_a + d_b) / d_a.cross(d_b).length()
+        };
+        let boundverts: Vec<Vec3> = (0..sides)
+            .map(|i| meet(base[i], base[(i + 1) % sides]))
+            .collect();
+        let profiles: Vec<RingChainProfile> = (0..sides)
+            .map(|i| {
+                let crossed = base[(i + 1) % sides];
+                RingChainProfile::Cell {
+                    cell: ProfileCell::new(
+                        boundverts[i],
+                        boundverts[(i + 1) % sides],
+                        apex,
+                        toward(crossed),
+                    ),
+                    profile,
+                }
+            })
+            .collect();
+        (boundverts, profiles)
+    }
+
+    /// Every canonical **interior** grid vert the §8.5.5.5 cap must emit, predicted from
+    /// the ring alone: seed the fullness centre (b), relax the coarse net (c), and read it
+    /// back at the target's profile-arc fractions (d).
+    fn predicted_cap_interior(
+        apex: Vec3,
+        boundverts: &[Vec3],
+        profiles: &[RingChainProfile],
+        segments: u32,
+    ) -> Vec<Vec3> {
+        let sectors = boundverts.len();
+        let seg = segments as usize;
+        let half = seg / 2;
+        let even = seg % 2 == 0;
+        let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
+        let seed = centroid + adj_fullness(segments) * (apex - centroid);
+        let net = adj_relaxed_net(boundverts, &mids, seed, profiles, segments);
+        let axis = adj_interior_axis(profiles, segments, 2 * net.half as u32);
+        let interior = AdjInterior::Relaxed {
+            net: &net,
+            axis: &axis,
+            sectors,
+            segments: seg,
+            anchor: centroid,
+        };
+
+        let mut predicted = Vec::new();
+        for i in 0..sectors {
+            for j in 1..=half {
+                for k in 1..=half {
+                    // Even `segments` weld the `j == half` row onto the previous sub-patch's
+                    // spoke and all the `(half, half)` corners onto one centre; odd keeps
+                    // every `(i, j, k)` its own.
+                    if even && j == half && (k == half && i != 0 || k < half) {
+                        continue;
+                    }
+                    predicted.push(interior.position(i, j, k, half));
+                }
+            }
+        }
+        predicted
+    }
+
+    /// BEVEL.md §8.5.5.5(c)/(d) at a **power-of-two** target: `segments = 4` needs exactly
+    /// one doubling round, lands on the target resolution, and therefore runs **no**
+    /// interior resample — so the cap's interior is the subdivision-relaxation net's own
+    /// verts, deterministically. This pins the whole stencil at the symmetric valence-4
+    /// pyramid apex (a general ring: it fails §8.5.1 on valence alone): the face / edge /
+    /// ordinary-vertex masks, the Sabin extraordinary centre, and the boundary re-pin.
+    #[test]
+    fn adj_general_cap_valence4_segments4_interior_is_the_relaxed_net() {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let apex_position = mesh.vertex_position(apex);
+        let base: Vec<Vec3> = [b0, b1, b2, b3]
+            .iter()
+            .map(|&b| mesh.vertex_position(b))
+            .collect();
+        let slants: Vec<GeomKey> = [b0, b1, b2, b3]
+            .iter()
+            .map(|&b| mesh.query_edge_exists(apex, b).expect("slant edge").into())
+            .collect();
+        let result = mesh.bevel(
+            &slants,
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments: 4,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (boundverts, profiles) = pyramid_apex_ring(apex_position, &base, 0.3, 0.5);
+
+        // Gate part (i) of §8.2.2.1.1: at `segments ∈ {4, 8, …}` the source resolution *is*
+        // the target, so the read-back is the identity — nothing about the interior here is
+        // the Tier-2 kernel's doing.
+        let axis = adj_interior_axis(&profiles, 4, 4);
+        for chain in &axis {
+            for (k, &index) in chain.iter().enumerate() {
+                assert_eq!(index, k as f32, "no resample runs at a power-of-two target");
+            }
+        }
+
+        // 4 sector-interior verts + 4 shared spokes + 1 welded centre.
+        let predicted = predicted_cap_interior(apex_position, &boundverts, &profiles, 4);
+        assert_eq!(predicted.len(), 9);
+        for position in &predicted {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, *position),
+                1,
+                "the cap interior is the relaxed net's vert at {position:?}",
+            );
+        }
+
+        // §8.5.5.5(b)/(c): the stencil *relaxes* the fullness seed — it does not emit it.
+        // A bilinear blend of the sub-patch corners would leave the centre on the seed.
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 4.0;
+        let seed = centroid + adj_fullness(4) * (apex_position - centroid);
+        let centre = predicted[predicted.len() - 1];
+        assert!(
+            (centre - seed).length() > 1.0e-3,
+            "the extraordinary-centre stencil pulls the centre off its fullness seed",
+        );
+        assert!(
+            (centre - centroid).length() < (seed - centroid).length(),
+            "and pulls it *in*, toward the subdivision-limit position",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, seed),
+            0,
+            "the raw fullness seed is never emitted",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.5.5.7 invariant 2 at valence 5, where the central `s`-gon
+    /// is a pentagon and the parity is therefore visible in the face-side histogram: even
+    /// `segments` weld one centre vertex and close no central face; odd `segments` weld
+    /// none and close exactly one pentagon. Both caps' interiors are the same relaxed net,
+    /// read back at their own target fractions.
+    #[test]
+    fn adj_general_cap_valence5_even_odd_centre_parity() {
+        for segments in [4_u32, 3] {
+            let mut mesh = LoopMesh::new();
+            let (apex, base) = regular_pyramid(&mut mesh, 5);
+            let apex_position = mesh.vertex_position(apex);
+            let base_positions: Vec<Vec3> =
+                base.iter().map(|&b| mesh.vertex_position(b)).collect();
+            let slants: Vec<GeomKey> = base
+                .iter()
+                .map(|&b| mesh.query_edge_exists(apex, b).expect("slant edge").into())
+                .collect();
+            let result = mesh.bevel(
+                &slants,
+                BevelOptions {
+                    offset: 0.3,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            let (boundverts, profiles) =
+                pyramid_apex_ring(apex_position, &base_positions, 0.3, 0.5);
+            let predicted = predicted_cap_interior(apex_position, &boundverts, &profiles, segments);
+            for position in &predicted {
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, *position),
+                    1,
+                    "segments {segments}: the cap interior is the relaxed net at {position:?}",
+                );
+            }
+
+            let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 5.0;
+            let on_axis = |p: Vec3| (p - centroid).cross(apex_position - centroid).length() < 1.0e-5;
+            let axial: Vec<VertexKey> = result
+                .verts
+                .iter()
+                .copied()
+                .filter(|&v| on_axis(mesh.vertex_position(v)))
+                .collect();
+            // At odd `segments` the only all-interior face is the central `s`-gon; at even
+            // `segments` the innermost quad of every sector is all-interior too, so the
+            // parity is read off the welded centre instead (§8.5.5.7 invariant 2).
+            let central_faces: Vec<usize> = result
+                .faces
+                .iter()
+                .filter(|&&face| {
+                    mesh.face_vert_keys(face).iter().all(|&v| {
+                        predicted
+                            .iter()
+                            .any(|&p| (mesh.vertex_position(v) - p).length() < 1.0e-5)
+                    })
+                })
+                .map(|&face| mesh.face_vert_keys(face).len())
+                .collect();
+
+            if segments == 4 {
+                // 5 sector-interior + 5 shared spokes + 1 welded centre.
+                assert_eq!(predicted.len(), 11);
+                assert_eq!(
+                    axial.len(),
+                    1,
+                    "even parity welds exactly one centre vertex on the cap axis",
+                );
+                let centre_faces = mesh.vert_face_keys(axial[0]);
+                assert_eq!(
+                    centre_faces.len(),
+                    5,
+                    "the welded centre is the extraordinary point: one quad per sector fans to it",
+                );
+                for face in centre_faces {
+                    assert_eq!(
+                        mesh.face_vert_keys(face).len(),
+                        4,
+                        "even parity closes no central face — every grid face stays a quad",
+                    );
+                }
+            } else {
+                // 5 distinct central-ring verts, none of them on the axis.
+                assert_eq!(predicted.len(), 5);
+                assert!(axial.is_empty(), "odd parity lands no sample on the cap axis");
+                assert_eq!(
+                    central_faces,
+                    vec![5],
+                    "odd parity closes on exactly one central pentagon",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(c): the `(−1/6, +4/3, −1/6)` three-tap masks the **stencil input**
+    /// only. The net a round stores keeps its boundary exactly on the raw profile at that
+    /// round's own doubled resolution (the Dirichlet condition), so the mask never leaks
+    /// into the boundary the grid carries — and hence never into the rim the fill emits.
+    #[test]
+    fn adj_net_round_repins_the_raw_boundary_and_masks_only_the_input() {
+        let mut mesh = LoopMesh::new();
+        let (apex, base) = regular_pyramid(&mut mesh, 5);
+        let apex_position = mesh.vertex_position(apex);
+        let base_positions: Vec<Vec3> = base.iter().map(|&b| mesh.vertex_position(b)).collect();
+        let (boundverts, profiles) = pyramid_apex_ring(apex_position, &base_positions, 0.3, 0.5);
+        let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 5.0;
+        let seed = centroid + adj_fullness(4) * (apex_position - centroid);
+
+        let coarse = AdjNet::coarse(&boundverts, &mids, seed);
+        // The sharpening pulls each interior chain sample a sixth *away* from the mean of
+        // its neighbours, so it moves *outward* from the chord — a curvature sharpening,
+        // never the `(1/6, 2/3, 1/6)` smoothing average.
+        let sharp = coarse.sharpened();
+        for i in 0..5 {
+            let raw = coarse.chains[i][1];
+            let masked = sharp.chains[i][1];
+            let chord_mid = 0.5 * (boundverts[i] + boundverts[(i + 1) % 5]);
+            assert!((masked - raw).length() > 1.0e-4, "the mask moves the stencil input");
+            assert!(
+                (masked - chord_mid).length() > (raw - chord_mid).length(),
+                "and moves it away from the chord — sharpening, not smoothing",
+            );
+            assert_eq!(coarse.at(i, 0, 1), raw, "the stored net keeps the raw sample");
+        }
+
+        let doubled: Vec<Vec<Vec3>> = profiles.iter().map(|p| p.raw_positions(4)).collect();
+        let next = coarse.subdivide(doubled.clone(), sabin_gamma(5));
+        for i in 0..5 {
+            for k in 0..=2 {
+                assert_eq!(
+                    next.at(i, 0, k),
+                    doubled[i][k],
+                    "the round re-pins its boundary on the raw profile at the doubled resolution",
+                );
+            }
+        }
     }
 
     /// Bevel the four slant edges of the square pyramid's apex with `segments`,
@@ -17758,6 +18218,50 @@ fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32)
     points[last]
 }
 
+/// Where each target sample of the §8.2.2.1.1 resample lands on the source polyline,
+/// as a **fractional source index** (`0 … source.len() − 1`) rather than a point. Same
+/// chord-fraction rule, read out one level up: `chord_fraction_resample` is this map
+/// composed with a lerp along the source span.
+///
+/// This is what the §8.5.5.5(d) interior read-back parametrises against ("profile-arc
+/// fractions"): the target grid's `k` axis *is* its chain, so a target column sits over
+/// the dense grid at exactly the fractional column its rim sample sits at. That keeps the
+/// interior consistent with the rim it meets, which uniform index fractions would not.
+fn chord_fraction_indices(raw: &[Vec3], source: &[Vec3]) -> Vec<f32> {
+    let last = source.len() - 1;
+    let target_last = raw.len() - 1;
+    let identity = || {
+        (0..raw.len())
+            .map(|k| k as f32 * last as f32 / target_last as f32)
+            .collect()
+    };
+    let (target_fractions, source_fractions) = match (
+        normalised_chord_fractions(raw),
+        normalised_chord_fractions(source),
+    ) {
+        (Some(target), Some(source)) => (target, source),
+        _ => return identity(),
+    };
+    let mut indices = Vec::with_capacity(raw.len());
+    for &fraction in target_fractions.iter() {
+        let mut index = last as f32;
+        for m in 0..last {
+            if fraction <= source_fractions[m + 1] || m + 1 == last {
+                let span = source_fractions[m + 1] - source_fractions[m];
+                let t = if span <= f32::EPSILON {
+                    0.0
+                } else {
+                    (fraction - source_fractions[m]) / span
+                };
+                index = m as f32 + t;
+                break;
+            }
+        }
+        indices.push(index);
+    }
+    indices
+}
+
 /// The §8.2.2.1.1 chord-fraction resample: each raw target sample carries a chord
 /// fraction along its **own** polyline, and the emitted sample is the point at that
 /// same fraction along the **source** polyline (the profile materialised at the
@@ -18040,9 +18544,9 @@ fn line_line_nearest_on_first(p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3) -> Option<
 
 /// How an adjacency-grid vert is placed from its bilinear sub-patch blend
 /// (BEVEL.md §8.5.5): the cube corner snaps onto the corner sphere of radius
-/// `offset` (§8.5.5.3); the general non-symmetric corner has no such sphere and
-/// keeps the raw fullness-relaxed blend (§8.5.5.5(b)/(c)). `anchor` is the
-/// interior point below the cap used to orient face winding outward.
+/// `offset` (§8.5.5.3); the flat (`r = 1`) planar cap has no such sphere and keeps the
+/// raw blend on the boundvert ring plane (§8.3.0.2.1). `anchor` is the interior point
+/// below the cap used to orient face winding outward.
 #[derive(Clone, Copy)]
 enum AdjPlacement {
     Sphere { center: Vec3, radius: f32 },
@@ -18065,6 +18569,427 @@ impl AdjPlacement {
             AdjPlacement::Fullness { anchor } => anchor,
         }
     }
+}
+
+/// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
+/// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
+/// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
+enum AdjInterior<'a> {
+    /// The bilinear sub-patch blend, then `placement`. Used by the closed-form
+    /// tri-corner cap (blend → superellipsoid snap, §8.5.5.3) and by the flat `r = 1`
+    /// planar cap, whose `fullness = 0` net carries no curvature to relax (§8.3.0.2.1).
+    Blend {
+        corners: &'a [[Vec3; 4]],
+        placement: AdjPlacement,
+    },
+    /// The §8.5.5.5(c) subdivision-relaxation net, read back at the target resolution by
+    /// the §8.5.5.5(d) kernel — bilinear within the source quad, against each axis's own
+    /// **profile-arc fractions** (`axis[i]`, the fractional source index the §8.2.2.1.1
+    /// read-back puts chain `i`'s target sample at). The kernel is the licensed Tier-2
+    /// interior freedom (§8.5.5.7), and it is licensed for these interior rows *only* —
+    /// the rim is never read back through it. Parametrising against the rim's own
+    /// fractions is what keeps the interior consistent with the rim it meets.
+    Relaxed {
+        net: &'a AdjNet,
+        /// Per ring chain, `segments + 1` fractional source indices into the dense net.
+        axis: &'a [Vec<f32>],
+        sectors: usize,
+        segments: usize,
+        anchor: Vec3,
+    },
+}
+
+impl AdjInterior<'_> {
+    fn anchor(&self) -> Vec3 {
+        match self {
+            AdjInterior::Blend { placement, .. } => placement.anchor(),
+            AdjInterior::Relaxed { anchor, .. } => *anchor,
+        }
+    }
+
+    /// The interior position of sub-patch `i`'s grid vert `(j, k)` at target half-width
+    /// `half`. Callers pass the *canonical* `(i, j, k)` so a welded seam / centre resolves
+    /// to one position.
+    fn position(&self, i: usize, j: usize, k: usize, half: usize) -> Vec3 {
+        match self {
+            AdjInterior::Blend { corners, placement } => {
+                let [p00, p0t, pt0, ptt] = corners[i];
+                let s = k as f32 / half as f32;
+                let u = j as f32 / half as f32;
+                let blended = p00 * ((1.0 - s) * (1.0 - u))
+                    + p0t * (s * (1.0 - u))
+                    + pt0 * ((1.0 - s) * u)
+                    + ptt * (s * u);
+                placement.place(blended)
+            }
+            AdjInterior::Relaxed {
+                net,
+                axis,
+                sectors,
+                segments,
+                ..
+            } => {
+                // Sub-patch `i`'s `k` axis is chain `i` read forward; its `j` axis is chain
+                // `i − 1` read *backward* from `B_i`, so its source coordinate is the
+                // complement of that chain's index at target sample `segments − j`.
+                let resolution = (2 * net.half) as f32;
+                let previous = (i + sectors - 1) % sectors;
+                let along_chain = axis[i][k];
+                let along_previous = resolution - axis[previous][segments - j];
+                net.sample(i, along_previous, along_chain)
+            }
+        }
+    }
+}
+
+/// The generating profile of one ring edge of a [V-ADJ] cap (BEVEL.md §8.5.5.5(a)),
+/// re-samplable at any resolution. The subdivision-relaxation stencil re-pins its
+/// boundary at every round's own doubled resolution (§8.5.5.5(c)), so the fill needs each
+/// chain's *generator*, not merely its emitted rim verts: a beveled edge's cross-section
+/// cell (§8.2.2.1), a reflex miter arc in its unit-square frame (§8.9.5.1), or a straight
+/// patch chord (§8.9.5). The three kinds are interchangeable `chain_of` inputs — the fill
+/// never tests which one it holds (§8.9.5.3).
+#[derive(Clone, Copy)]
+enum RingChainProfile {
+    Cell { cell: ProfileCell, profile: f32 },
+    Arc { b1: Vec3, b3: Vec3, midpoint: Vec3 },
+    Chord { start: Vec3, end: Vec3 },
+}
+
+impl RingChainProfile {
+    /// The chain's **raw** (un-resampled) `segments + 1` samples, oriented from the ring
+    /// edge's opening boundvert. Serves three distinct roles, all raw: the §8.2.2.1.1
+    /// *source* polyline, the stencil's pinned Dirichlet boundary at each round's
+    /// resolution, and — at `segments = 2` — the raw coarse `(i, 0, 1)` control point the
+    /// extraordinary-centre stencil consumes (§8.5.5.5, "the centre stencil consumes the
+    /// raw coarse profile mids").
+    fn raw_positions(&self, segments: u32) -> Vec<Vec3> {
+        match *self {
+            RingChainProfile::Cell { cell, profile } => cell.raw_chain_positions(segments, profile),
+            RingChainProfile::Arc { b1, b3, midpoint } => {
+                arc_chain_positions(b1, b3, midpoint, segments)
+            }
+            RingChainProfile::Chord { start, end } => (0..=segments)
+                .map(|k| start + (end - start) * (k as f32 / segments as f32))
+                .collect(),
+        }
+    }
+}
+
+/// The `segments + 1` raw samples of a miter arc (BEVEL.md §8.9.5 / §8.9.5.1) in the
+/// arc's (generally non-orthonormal) unit-square frame: `a_axis = midpoint − b1`,
+/// `b_axis = midpoint − b3`, inner corner `b1 + b3 − midpoint`, sample `k` at
+/// `P(cos θ_k, sin θ_k)` with `θ` **descending** from 90° at `b1` to 0° at `b3`. The
+/// `segments = 2` interior sample keeps the closed-form `(2−√2)·chord_mid + (√2−1)·
+/// midpoint` bulge — the same 45° point, written the way §8.9.5 pins it.
+fn arc_chain_positions(b1: Vec3, b3: Vec3, midpoint: Vec3, segments: u32) -> Vec<Vec3> {
+    let a_axis = midpoint - b1;
+    let b_axis = midpoint - b3;
+    let inner_corner = b1 + b3 - midpoint;
+    let sqrt2 = std::f32::consts::SQRT_2;
+    let chord_mid = 0.5 * (b1 + b3);
+    let bulge = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
+    (0..=segments)
+        .map(|k| {
+            if k == 0 {
+                b1
+            } else if k == segments {
+                b3
+            } else if segments == 2 {
+                bulge
+            } else {
+                let theta = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / segments as f32);
+                a_axis * theta.cos() + b_axis * theta.sin() + inner_corner
+            }
+        })
+        .collect()
+}
+
+/// The [V-ADJ] cap's quad control net at one working resolution (BEVEL.md §8.5.5.5(a)):
+/// `sectors` sub-patches, each a `(half + 1) × (half + 1)` grid of `(j, k)` samples, over
+/// a chain resolution of `N = 2·half` per ring edge. Sub-patch `i`'s `j = 0` row is
+/// chain `i` walked from `B_i`; its `k = 0` column is chain `i − 1` walked back to `B_i`;
+/// its `k = half` column is the radial spoke it **shares** with sub-patch `i + 1`'s
+/// `j = half` row; and `(half, half)` is the one shared centre. So the net is a closed
+/// quad mesh whose only boundary is the `sectors` profile chains and whose only
+/// non-valence-4 interior vertex is that centre — which is exactly what makes the
+/// §8.5.5.5(c) stencil a plain Catmull–Clark round plus one Sabin extraordinary point.
+#[derive(Clone)]
+struct AdjNet {
+    sectors: usize,
+    half: usize,
+    /// The `sectors` raw profile chains at this resolution (`2·half + 1` samples each),
+    /// oriented `B_i → B_{i+1}` — the net's Dirichlet boundary (§8.5.5.5(c)).
+    chains: Vec<Vec<Vec3>>,
+    data: Vec<Vec3>,
+}
+
+impl AdjNet {
+    fn new(sectors: usize, half: usize, chains: Vec<Vec<Vec3>>) -> AdjNet {
+        let stride = (half + 1) * (half + 1);
+        let mut net = AdjNet {
+            sectors,
+            half,
+            chains,
+            data: vec![Vec3::ZERO; sectors * stride],
+        };
+        net.pin_boundary();
+        net
+    }
+
+    /// The coarse `segments = 2` control net of §8.5.5.5(a)/(b): the `s` boundverts, each
+    /// ring edge's single **raw** mid-chain sample, and the fullness-seeded centre.
+    fn coarse(boundverts: &[Vec3], mids: &[Vec3], centre: Vec3) -> AdjNet {
+        let sectors = boundverts.len();
+        let chains = (0..sectors)
+            .map(|i| vec![boundverts[i], mids[i], boundverts[(i + 1) % sectors]])
+            .collect();
+        let mut net = AdjNet::new(sectors, 1, chains);
+        net.set(0, 1, 1, centre);
+        net
+    }
+
+    /// The owning slot of `(i, j, k)`: the `j == half` row is the *previous* sub-patch's
+    /// `k == half` spoke, and every sub-patch's `(half, half)` is the one shared centre.
+    fn canonical(&self, i: usize, j: usize, k: usize) -> usize {
+        let half = self.half;
+        let (i, j, k) = if j == half && k == half {
+            (0, half, half)
+        } else if j == half {
+            ((i + self.sectors - 1) % self.sectors, k, half)
+        } else {
+            (i % self.sectors, j, k)
+        };
+        i * (half + 1) * (half + 1) + j * (half + 1) + k
+    }
+
+    /// Read `(i, j, k)`, following the seam when an index runs one past `half`: sub-patch
+    /// `i`'s chart continues into `i + 1` as `(i, j, half + t) ≡ (i + 1, half − t, j)`
+    /// (and symmetrically backward across `j`). That is what lets the valence-4 vertex
+    /// mask be written once and still be correct on the shared spokes.
+    fn at(&self, i: usize, j: usize, k: usize) -> Vec3 {
+        let half = self.half;
+        if k > half {
+            return self.at((i + 1) % self.sectors, half - (k - half), j);
+        }
+        if j > half {
+            return self.at((i + self.sectors - 1) % self.sectors, k, half - (j - half));
+        }
+        self.data[self.canonical(i, j, k)]
+    }
+
+    fn set(&mut self, i: usize, j: usize, k: usize, position: Vec3) {
+        let slot = self.canonical(i, j, k);
+        self.data[slot] = position;
+    }
+
+    fn pin_boundary(&mut self) {
+        let resolution = 2 * self.half;
+        for i in 0..self.sectors {
+            for k in 0..=self.half {
+                let position = self.chains[i][k];
+                self.set(i, 0, k, position);
+            }
+            let previous = (i + self.sectors - 1) % self.sectors;
+            for j in 0..=self.half {
+                let position = self.chains[previous][resolution - j];
+                self.set(i, j, 0, position);
+            }
+        }
+    }
+
+    /// The stencil's *input* copy of the net (BEVEL.md §8.5.5.5(c)): the boundary chains
+    /// passed through the `(−1/6, +4/3, −1/6)` three-tap. The mask **sharpens** — the
+    /// discrete Laplacian is subtracted, so each sample is pulled a sixth *away* from the
+    /// mean of its two chain neighbours. It touches only what the interior relaxes
+    /// against; the boundary the net stores, and the rim the fill emits, are never masked.
+    fn sharpened(&self) -> AdjNet {
+        let mut input = self.clone();
+        for chain in input.chains.iter_mut() {
+            let raw = chain.clone();
+            let last = raw.len() - 1;
+            for k in 1..last {
+                chain[k] = raw[k] - (1.0 / 6.0) * (raw[k - 1] + raw[k + 1] - 2.0 * raw[k]);
+            }
+        }
+        input.pin_boundary();
+        input
+    }
+
+    /// One cubic (Catmull–Clark, Sabin-modified) subdivision round (BEVEL.md §8.5.5.5(c)):
+    /// face points, interior edge points, the valence-4 vertex mask `E − γ·F + γ·v`, and
+    /// the extraordinary centre `E − γ_s·F + γ_s·centre` — all read off the *sharpened*
+    /// boundary — then the doubled boundary re-pinned from `next_chains`, the raw profile
+    /// samples at the new resolution. A single deterministic pass; no iteration.
+    fn subdivide(&self, next_chains: Vec<Vec<Vec3>>, gamma_s: f32) -> AdjNet {
+        let sectors = self.sectors;
+        let half = self.half;
+        let input = self.sharpened();
+        let mut next = AdjNet::new(sectors, 2 * half, next_chains);
+
+        for i in 0..sectors {
+            for j in 0..half {
+                for k in 0..half {
+                    let face = 0.25
+                        * (input.at(i, j, k)
+                            + input.at(i, j, k + 1)
+                            + input.at(i, j + 1, k)
+                            + input.at(i, j + 1, k + 1));
+                    next.set(i, 2 * j + 1, 2 * k + 1, face);
+                }
+            }
+        }
+
+        // Interior edge points. The chain-direction edges of the `j = 0` row and the
+        // spoke-direction edges of the `k = 0` column are the net's *boundary* edges —
+        // they carry no edge point, because the whole doubled boundary is re-pinned from
+        // the profile instead. Every other edge is interior and flanked by two faces; the
+        // `k == half` spoke edges take their second face from across the seam, which
+        // `at`'s seam continuation supplies.
+        for i in 0..sectors {
+            for j in 1..half {
+                for k in 0..half {
+                    let point = 0.25
+                        * (input.at(i, j, k)
+                            + input.at(i, j, k + 1)
+                            + next.at(i, 2 * j - 1, 2 * k + 1)
+                            + next.at(i, 2 * j + 1, 2 * k + 1));
+                    next.set(i, 2 * j, 2 * k + 1, point);
+                }
+            }
+            for j in 0..half {
+                for k in 1..=half {
+                    let point = 0.25
+                        * (input.at(i, j, k)
+                            + input.at(i, j + 1, k)
+                            + next.at(i, 2 * j + 1, 2 * k - 1)
+                            + next.at(i, 2 * j + 1, 2 * k + 1));
+                    next.set(i, 2 * j + 1, 2 * k, point);
+                }
+            }
+        }
+
+        // Ordinary (valence-4) interior verts, the shared spokes (`k == half`) included.
+        for i in 0..sectors {
+            for j in 1..half {
+                for k in 1..=half {
+                    let old = input.at(i, j, k);
+                    let edges = 0.25
+                        * (next.at(i, 2 * j - 1, 2 * k)
+                            + next.at(i, 2 * j + 1, 2 * k)
+                            + next.at(i, 2 * j, 2 * k - 1)
+                            + next.at(i, 2 * j, 2 * k + 1));
+                    let faces = 0.25
+                        * (next.at(i, 2 * j - 1, 2 * k - 1)
+                            + next.at(i, 2 * j + 1, 2 * k - 1)
+                            + next.at(i, 2 * j - 1, 2 * k + 1)
+                            + next.at(i, 2 * j + 1, 2 * k + 1));
+                    next.set(i, 2 * j, 2 * k, edges - 0.25 * faces + 0.25 * old);
+                }
+            }
+        }
+
+        // The extraordinary centre (valence `sectors`): the mean of the `s` innermost edge
+        // points, less `γ_s` times the mean of the `s` faces around it, plus `γ_s` times
+        // its old position.
+        let mean_edge = (0..sectors)
+            .fold(Vec3::ZERO, |acc, i| {
+                acc + next.at(i, 2 * half - 1, 2 * half)
+            })
+            / sectors as f32;
+        let mean_face = (0..sectors)
+            .fold(Vec3::ZERO, |acc, i| {
+                acc + next.at(i, 2 * half - 1, 2 * half - 1)
+            })
+            / sectors as f32;
+        let centre = self.at(0, half, half);
+        next.set(
+            0,
+            2 * half,
+            2 * half,
+            mean_edge - gamma_s * mean_face + gamma_s * centre,
+        );
+        next
+    }
+
+    /// Read sub-patch `i` at fractional grid coordinates — the §8.5.5.5(d) resample
+    /// kernel, bilinear within the source quad.
+    fn sample(&self, i: usize, j: f32, k: f32) -> Vec3 {
+        let top = self.half as f32;
+        let j = j.clamp(0.0, top);
+        let k = k.clamp(0.0, top);
+        let j0 = (j.floor() as usize).min(self.half - 1);
+        let k0 = (k.floor() as usize).min(self.half - 1);
+        let tj = j - j0 as f32;
+        let tk = k - k0 as f32;
+        self.at(i, j0, k0) * ((1.0 - tj) * (1.0 - tk))
+            + self.at(i, j0, k0 + 1) * ((1.0 - tj) * tk)
+            + self.at(i, j0 + 1, k0) * (tj * (1.0 - tk))
+            + self.at(i, j0 + 1, k0 + 1) * (tj * tk)
+    }
+}
+
+/// The §8.5.5.5(d) read-back parametrisation, one map per ring chain: where target sample
+/// `k` of that chain sits on the dense net's `resolution`-wide axis, as a fractional
+/// index. It is the *same* chord-fraction reparametrisation the emitted rim uses
+/// (§8.2.2.1.1), so a target grid column stands over the dense grid exactly where its own
+/// rim sample stands — the interior meets the rim it is stitched to.
+///
+/// One index is pinned rather than read: at an **even** target the mid index `half` is the
+/// grid's *shared* coordinate — the seam spokes and the welded centre live on it, and both
+/// neighbouring sub-patches must land on the same dense column — so it maps to the dense
+/// mid `resolution / 2` exactly. That is also what makes the even centre the once-
+/// subdivided extraordinary centre **verbatim**, which §8.5.5.7 pins strictly (it is not
+/// Tier-2 free, and on a skewed cell the chord fraction alone would drift off it).
+fn adj_interior_axis(
+    profiles: &[RingChainProfile],
+    segments: u32,
+    resolution: u32,
+) -> Vec<Vec<f32>> {
+    let seg = segments as usize;
+    profiles
+        .iter()
+        .map(|profile| {
+            let mut indices = if resolution == segments {
+                (0..=seg).map(|k| k as f32).collect()
+            } else {
+                chord_fraction_indices(
+                    &profile.raw_positions(segments),
+                    &profile.raw_positions(resolution),
+                )
+            };
+            if seg % 2 == 0 {
+                indices[seg / 2] = resolution as f32 / 2.0;
+            }
+            indices
+        })
+        .collect()
+}
+
+/// Relax a general valence-`s` cap's coarse control net up to the working resolution the
+/// target `segments` needs (BEVEL.md §8.5.5.5(c)): seed the fullness centre, then double
+/// — **at least once, even at `segments = 2`** — until the chain resolution reaches
+/// `next power of two ≥ max(4, segments)`, re-pinning each round's boundary from the ring
+/// chains' own profiles at that round's resolution.
+fn adj_relaxed_net(
+    boundverts: &[Vec3],
+    mids: &[Vec3],
+    centre: Vec3,
+    profiles: &[RingChainProfile],
+    segments: u32,
+) -> AdjNet {
+    let gamma_s = sabin_gamma(boundverts.len());
+    let target = boundary_source_resolution(segments);
+    let mut net = AdjNet::coarse(boundverts, mids, centre);
+    while (2 * net.half as u32) < target {
+        let resolution = 4 * net.half as u32;
+        let next_chains = profiles
+            .iter()
+            .map(|profile| profile.raw_positions(resolution))
+            .collect();
+        net = net.subdivide(next_chains, gamma_s);
+    }
+    net
 }
 
 /// The exact valence-6 Sabin extraordinary-point smoothing weight `γ_6` (BEVEL.md
@@ -18140,27 +19065,25 @@ fn adj_fullness(segments: u32) -> f32 {
 /// the seed in through the valence-`s` extraordinary-centre stencil `apex = E −
 /// γ_s·F + γ_s·centre_0`. The even resample keeps this subdivided centre verbatim.
 fn adj_even_extraordinary_centre(vertex: Vec3, boundverts: &[Vec3], mids: &[Vec3], gamma_s: f32) -> Vec3 {
-    let s = boundverts.len();
-    let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / s as f32;
+    let sectors = boundverts.len();
+    let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
     let centre_0 = centroid + adj_fullness(2) * (vertex - centroid);
 
-    // The curvature-*sharpening* three-tap `(−1/6, +4/3, −1/6)`: negative neighbour
-    // weights pull each sample a sixth *away* from the mean of its chain neighbours.
-    let sharpened: Vec<Vec3> = (0..s)
+    // The centre after one round depends only on the coarse net (the round's re-pinned
+    // doubled boundary is a Dirichlet condition the *next* round reads, never this one),
+    // so any well-formed doubled chain serves here.
+    let doubled: Vec<Vec<Vec3>> = (0..sectors)
         .map(|i| {
-            let sample = mids[i];
-            sample - (1.0 / 6.0) * (boundverts[i] + boundverts[(i + 1) % s] - 2.0 * sample)
+            RingChainProfile::Chord {
+                start: boundverts[i],
+                end: boundverts[(i + 1) % sectors],
+            }
+            .raw_positions(4)
         })
         .collect();
-    let face: Vec<Vec3> = (0..s)
-        .map(|i| 0.25 * (boundverts[i] + sharpened[i] + sharpened[(i + s - 1) % s] + centre_0))
-        .collect();
-    let edge: Vec<Vec3> = (0..s)
-        .map(|i| 0.25 * (sharpened[i] + centre_0 + face[i] + face[(i + 1) % s]))
-        .collect();
-    let mean_edge = edge.iter().fold(Vec3::ZERO, |acc, &e| acc + e) / s as f32;
-    let mean_face = face.iter().fold(Vec3::ZERO, |acc, &f| acc + f) / s as f32;
-    mean_edge - gamma_s * mean_face + gamma_s * centre_0
+    AdjNet::coarse(boundverts, mids, centre_0)
+        .subdivide(doubled, gamma_s)
+        .at(0, 2, 2)
 }
 
 /// The sphere (center, radius) through four points (BEVEL.md §8.5.2: the rounded
