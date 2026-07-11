@@ -973,6 +973,15 @@ impl LoopMesh {
         // boundvert and flags nothing.
         let corner_runs = self.snapshot_corner_runs(&substitutions);
 
+        // §6.7.5.3 step 1: each junction's whole disk — legs included — as mechanism
+        // (2)'s walk reads it. Captured pristine, while the legs still meet the corner.
+        // Mechanism (2) is the *only* reader, so a default bevel pays nothing for it.
+        let junction_disks = if options.mark_seam || options.mark_sharp {
+            self.snapshot_junction_disks(&junctions, &beveled_manifold, &substitutions)
+        } else {
+            Vec::new()
+        };
+
         // Phase 2: re-stitch every incident face, swapping each consumed endpoint
         // corner for the ordered near-corner vert(s) recorded for that (vertex,
         // face) corner (§7.4 / §7.6.1). A terminal third face swaps its corner for
@@ -1037,15 +1046,19 @@ impl LoopMesh {
         // Phase 4.5 (§6.7.4): the `mark_seam` / `mark_sharp` junction bridging.
         // Mechanism (2): bridge the seam / sharp flag across each junction's patch
         // ring segments so the flag runs continuously around the junction, joining
-        // the strip long edges of consecutive seamed beveled edges.
+        // the strip long edges of consecutive seamed beveled edges. The `segments = 1`
+        // ring is one direct patch segment per sector, so the walk's chain steps and
+        // its beveled-edge count are always in registration here.
         if options.mark_seam || options.mark_sharp {
             for patch in &junction_patches {
-                self.bridge_junction_flags(
-                    patch,
-                    &edge_seam_state,
-                    options.mark_seam,
-                    options.mark_sharp,
-                );
+                let Some(disk) = junction_disks
+                    .iter()
+                    .find(|disk| disk.vertex == patch.vertex)
+                else {
+                    continue;
+                };
+                let ring = patch.ring_chains();
+                self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
         }
 
@@ -1224,6 +1237,16 @@ impl LoopMesh {
         // below has laid the runs down as real face boundary edges (phase 4.25b).
         let corner_runs = self.snapshot_corner_runs(&face_subst);
 
+        // §6.7.5.3 step 1: each junction's whole disk — every edge, beveled or not,
+        // in rotational order, with the ring vertex each unbeveled leg re-points onto
+        // (§6.7.5.4 case (4b)). Read pristine, for the same reason the corner runs are.
+        // Mechanism (2) is the *only* reader, so a default bevel pays nothing for it.
+        let junction_disks = if options.mark_seam || options.mark_sharp {
+            self.snapshot_junction_disks(&junctions, &beveled_manifold, &face_subst)
+        } else {
+            Vec::new()
+        };
+
         // Phase 2: re-stitch every incident face once, swapping each consumed
         // endpoint corner for its recorded vert run (§8.3.0.1 absorb / sector
         // 1-for-1), after re-pointing every unbeveled leg onto its near-corner vert
@@ -1339,22 +1362,20 @@ impl LoopMesh {
         // on a split sector's fill chain is a step written here and cleared there.
         if options.mark_seam || options.mark_sharp {
             for cut in &junction_cuts {
+                let Some(disk) = junction_disks.iter().find(|disk| disk.vertex == cut.vertex)
+                else {
+                    continue;
+                };
                 let ring = cut.ring_chains(&chains);
-                self.bridge_junction_flags_multisegment(
-                    &ring,
-                    &edge_seam_state,
-                    options.mark_seam,
-                    options.mark_sharp,
-                );
+                self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
             for omj in &outer_miter_junctions {
+                let Some(disk) = junction_disks.iter().find(|disk| disk.vertex == omj.vertex)
+                else {
+                    continue;
+                };
                 let ring = omj.ring_chains();
-                self.bridge_junction_flags_multisegment(
-                    &ring,
-                    &edge_seam_state,
-                    options.mark_seam,
-                    options.mark_sharp,
-                );
+                self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
         }
 
@@ -4927,37 +4948,7 @@ impl LoopMesh {
                 if beveled.contains(&leg) {
                     continue;
                 }
-
-                let mut fan_empty = true;
-                let mut landing: Option<VertexKey> = None;
-                for loop_key in self.edge_radial_iter(leg) {
-                    let face = self.loop_face(loop_key);
-                    fan_empty = false;
-                    let candidate = face_substitution(substitutions, vertex, face)
-                        .zip(self.face_corner_edges(face, vertex))
-                        .and_then(|(run, (incoming, outgoing))| {
-                            if leg == incoming {
-                                run.first().copied()
-                            } else if leg == outgoing {
-                                run.last().copied()
-                            } else {
-                                None
-                            }
-                        });
-                    match (candidate, landing) {
-                        (Some(vert), None) => landing = Some(vert),
-                        (Some(vert), Some(agreed)) if vert == agreed => {}
-                        _ => {
-                            landing = None;
-                            break;
-                        }
-                    }
-                }
-
-                if fan_empty {
-                    continue;
-                }
-                if let Some(vert) = landing {
+                if let Some(vert) = self.leg_ring_vertex(vertex, leg, substitutions) {
                     debug_assert!(
                         self.edge_radial_iter(leg)
                             .map(|loop_key| self.loop_face(loop_key))
@@ -5263,78 +5254,229 @@ impl LoopMesh {
         }
     }
 
-    /// Bridge the seam / sharp flag across one junction's patch ring segments
-    /// (BEVEL.md §6.7.4 — mechanism (2), gated by `mark_seam` / `mark_sharp`).
+    /// The outermost-ring vertex an unbeveled leg re-points onto (BEVEL.md §6.7.5.4
+    /// case (4b)): its sector's single boundvert at a miter-free sector, the hub under
+    /// `PATCH`, its assigned arc sample under `ARC`. The leg has no boundvert of its
+    /// own, so this vertex is its stand-in — the survivor the re-stitch hangs it on, and
+    /// the point mechanism (2)'s bridge span starts from when the leg is the anchor.
     ///
-    /// The junction's boundverts `B_0, …, B_(s-1)` are in disk-sector order, with
-    /// `opening_edges[k]` the beveled edge `g_k` opening sector `k` (boundvert
-    /// `B_k` lives in that sector). The patch ring segment between consecutive
-    /// boundverts `(B_(m-1), B_m)` is crossed by the beveled edge `g_m` that
-    /// separates the two adjacent sectors. So each patch segment maps one-to-one to
-    /// a beveled edge it crosses — this `segment ↔ crossing-edge` bijection is the
-    /// ordering-robust frame the bridging rides.
+    /// Read straight off the face-substitution runs, in the run-order contract
+    /// [`FaceSubstitution`] states: the leg meets its face's run at the run's first
+    /// vert when the leg is that face's incoming corner edge, at its last when it is
+    /// the outgoing one. Every face on the leg's radial fan must agree; anything else
+    /// (a wire leg with no radial face, a face the placement pass declined to
+    /// substitute, a leg whose two sides disagree) declines and returns `None`.
+    fn leg_ring_vertex(
+        &self,
+        vertex: VertexKey,
+        leg: EdgeKey,
+        substitutions: &[FaceSubstitution],
+    ) -> Option<VertexKey> {
+        let mut landing: Option<VertexKey> = None;
+        for loop_key in self.edge_radial_iter(leg) {
+            let face = self.loop_face(loop_key);
+            let candidate = face_substitution(substitutions, vertex, face)
+                .zip(self.face_corner_edges(face, vertex))
+                .and_then(|(run, (incoming, outgoing))| {
+                    if leg == incoming {
+                        run.first().copied()
+                    } else if leg == outgoing {
+                        run.last().copied()
+                    } else {
+                        None
+                    }
+                })?;
+            match landing {
+                None => landing = Some(candidate),
+                Some(agreed) if agreed == candidate => {}
+                Some(_) => return None,
+            }
+        }
+        landing
+    }
+
+    /// Snapshot every junction's disk as mechanism (2)'s walk reads it (BEVEL.md
+    /// §6.7.5.3 step 1 / §6.7.5.4 case (4b)): **every** disk edge in rotational order,
+    /// beveled or not, with its pristine seam / sharp bits and — for an unbeveled leg —
+    /// the ring vertex it re-points onto.
     ///
-    /// The rule flags the **single direct patch segment spanning each beveled edge
-    /// that lies in a *gap*** — a maximal run of consecutive *unseamed* beveled
-    /// edges flanked on **both** sides by a seamed beveled edge — and flags nothing
-    /// else. It does **not** route the seam the long way around the ring, and a
-    /// seamed run with no enclosing gap (a lone seamed edge, or all edges seamed)
-    /// bridges nothing. Two opposite seamed edges at a ≥4-edge junction enclose two
-    /// separate length-1 gaps and so bridge both; two adjacent seamed edges share a
-    /// length-0 gap (no bridge) and bridge only the far length-2 gap.
+    /// The walk asks two separate questions of each entry. *Is it flagged?* delimits,
+    /// and every disk edge answers it: a flagged leg ends the run that reaches it and
+    /// anchors a span of its own. *Is it beveled?* counts, and only beveled edges add
+    /// to a gap's length. Keeping the two apart is the whole of the leg rule — the count
+    /// is the walk's only `beveled` branch.
     ///
-    /// `seam` and `sharp` run the identical walk on independent bits.
+    /// `ring_vertex` is filled for the unbeveled legs alone, because a beveled edge's
+    /// span-start vertex is the trailing end of its own ring chain and the ring is not
+    /// built yet here; the walk resolves it there (see [`Self::bridge_junction_flags`]).
+    ///
+    /// Must be read against the pristine mesh: the re-stitch consumes the junction
+    /// vertex, so its disk exists only before phase 2. Only mechanism (2) reads this, so
+    /// the callers build it only when `mark_seam` / `mark_sharp` asked for it.
+    fn snapshot_junction_disks(
+        &self,
+        junctions: &[VertexKey],
+        beveled: &[EdgeKey],
+        substitutions: &[FaceSubstitution],
+    ) -> Vec<JunctionDisk> {
+        junctions
+            .iter()
+            .map(|&vertex| {
+                let edges = self
+                    .vertex_corner_ring(vertex)
+                    .into_iter()
+                    .map(|corner| {
+                        let edge = corner.incoming_edge;
+                        let beveled = beveled.contains(&edge);
+                        DiskEdge {
+                            edge,
+                            beveled,
+                            seam: self.edge_seam(edge),
+                            sharp: self.edge_sharp(edge),
+                            ring_vertex: if beveled {
+                                None
+                            } else {
+                                self.leg_ring_vertex(vertex, edge, substitutions)
+                            },
+                        }
+                    })
+                    .collect();
+                JunctionDisk { vertex, edges }
+            })
+            .collect()
+    }
+
+    /// Bridge the seam / sharp flag across one junction's outermost ring (BEVEL.md
+    /// §6.7.4 / §6.7.5.3 — mechanism (2), the only effect `mark_seam` / `mark_sharp`
+    /// gate).
+    ///
+    /// **The operational walk** (§6.7.5.4 case (5)): *count in beveled edges, step in
+    /// ring chains.* From each flagged disk edge, scan forward in rotational order,
+    /// counting the **beveled** edges among the unflagged ones passed, and stop at the
+    /// next **flagged** disk edge — *any* flagged edge, beveled or not, since the
+    /// delimiter test asks every entry (§6.7.5.3 step 1). Then lay the span down from
+    /// the anchor's **span-start ring vertex**, flagging the next `m` outermost-ring
+    /// chains: every cross-section edge of each, not just one edge of it.
+    ///
+    /// Three things make it come out right, and each is load-bearing:
+    ///
+    /// - **The termination clause.** A scan that comes back round to its own anchor
+    ///   without meeting a different flagged edge records nothing — the disk's only
+    ///   flagged edge has no gap to bridge. Omit it and a single-flagged-edge junction
+    ///   flags nearly its whole ring.
+    /// - **A leg is a first-class anchor.** Its span starts at its **ring vertex**
+    ///   (§6.7.5.4 case (4b)); a beveled edge's starts at its trailing boundvert, which
+    ///   is where its own ring chain ends. So a junction whose only flagged *beveled*
+    ///   edge would abort on the termination clause bridges after all once a leg is
+    ///   flagged too.
+    /// - **Counting and stepping desynchronise.** A chain crossing no beveled edge (a
+    ///   split sector's miter fill chain) is *stepped over* but never *counted*, so a
+    ///   span whose ring path enters a split sector burns steps on the fill and comes up
+    ///   short at its far end. Those burned marks land on the split sector's rebuilt
+    ///   face's **corner run**, and the corner-run pass runs **after** this one and
+    ///   *assigns*, so it clears them again: a desync is observable as *missing* bridge
+    ///   edges, never as misplaced ones.
+    ///
+    /// Only the outermost ring is touched; the interior vmesh rings that close the
+    /// corner are never flagged. `seam` and `sharp` run the identical walk on
+    /// independent bits.
     fn bridge_junction_flags(
         &mut self,
-        patch: &JunctionPatch,
-        edge_seam_state: &[(EdgeKey, bool, bool)],
+        ring: &[RingChain],
+        disk: &JunctionDisk,
         seam: bool,
         sharp: bool,
     ) {
-        let count = patch.boundverts.len();
-        if count < 2 {
+        let chain_count = ring.len();
+        let disk_count = disk.edges.len();
+        if chain_count < 2 || disk_count < 2 {
             return;
         }
 
-        let flag_of = |edge: EdgeKey, want_seam: bool| -> bool {
-            edge_seam_state
-                .iter()
-                .find_map(|&(e, s, h)| (e == edge).then_some(if want_seam { s } else { h }))
-                .unwrap_or(false)
+        // The walk *counts* in disk order and *steps* in ring order, so the two orders
+        // must run the same way round the junction; were they ever to disagree
+        // rotationally, every span would be laid on the wrong side of its anchor.
+        debug_assert!(
+            cyclically_equal(
+                &disk
+                    .edges
+                    .iter()
+                    .filter(|entry| entry.beveled)
+                    .map(|entry| entry.edge)
+                    .collect::<Vec<_>>(),
+                &ring.iter().filter_map(|chain| chain.cross_edge).collect::<Vec<_>>(),
+            ),
+            "the disk's beveled edges and the ring's crossings must agree rotationally",
+        );
+
+        // The ring vertex a flagged disk edge's span **starts from**, asked of every
+        // entry the same way (§6.7.5.4 case (4b)): a leg carries its own, snapshotted off
+        // the face-substitution runs; a beveled edge's is its trailing boundvert, which
+        // is exactly where its own crossing chain ends. Both are then resolved through
+        // the one lookup below, so the walk never branches on `beveled` outside the count.
+        let span_vertex = |entry: &DiskEdge| -> Option<VertexKey> {
+            entry.ring_vertex.or_else(|| {
+                ring.iter()
+                    .find(|chain| chain.cross_edge == Some(entry.edge))
+                    .and_then(|chain| chain.samples.last().copied())
+            })
         };
 
-        // `segment_edge(m)` returns the patch segment `(B_(m-1), B_m)`, crossed by
-        // the beveled edge `g_m = opening_edges[m]`.
-        let segment_edge = |m: usize, this: &Self| -> Option<EdgeKey> {
-            let a = patch.boundverts[(m + count - 1) % count];
-            let b = patch.boundverts[m];
-            this.query_edge_exists(a, b)
+        // The first ring chain the span lays down: the chain **beginning** at that
+        // vertex. A leg whose ring vertex is an *interior* sample of a chain (the middle
+        // leg of an odd absorbed-leg count under `ARC`, §8.9.2) begins no whole chain and
+        // so lays nothing — the guide pins no partial-chain span. See
+        // `flagged_middle_absorbed_leg_on_interior_arc_sample_lays_no_span_octagonal`.
+        let span_start = |index: usize| -> Option<usize> {
+            let vertex = span_vertex(&disk.edges[index])?;
+            ring.iter()
+                .position(|chain| chain.samples.first() == Some(&vertex))
         };
 
-        let mut bridge = |want_seam: bool, this: &mut Self| {
-            let seamed = |k: usize| flag_of(patch.opening_edges[k], want_seam);
+        let bridge = |want_seam: bool, this: &mut Self| {
+            let flagged = |index: usize| {
+                let entry = &disk.edges[index];
+                if want_seam {
+                    entry.seam
+                } else {
+                    entry.sharp
+                }
+            };
 
-            let seamed_count = (0..count).filter(|&k| seamed(k)).count();
-            // No gap exists unless seamed and unseamed beveled edges interleave: a
-            // gap needs a seamed edge on each side, so at least two seamed edges and
-            // at least one unseamed edge.
-            if seamed_count < 2 || seamed_count == count {
-                return;
-            }
-
-            // With at least one seamed edge on the cyclic disk, every maximal
-            // unseamed run is flanked by a seamed edge on both sides — so every
-            // unseamed beveled edge is a gap edge. Flag the single direct patch
-            // segment spanning each.
-            for m in 0..count {
-                if seamed(m) {
+            for anchor in 0..disk_count {
+                if !flagged(anchor) {
                     continue;
                 }
-                if let Some(segment) = segment_edge(m, this) {
-                    if want_seam {
-                        this.set_edge_seam(segment, true);
-                    } else {
-                        this.set_edge_sharp(segment, true);
+
+                let mut gap_length = 0usize;
+                let mut delimited_by_another_flag = false;
+                for step in 1..=disk_count {
+                    let index = (anchor + step) % disk_count;
+                    if flagged(index) {
+                        delimited_by_another_flag = index != anchor;
+                        break;
+                    }
+                    if disk.edges[index].beveled {
+                        gap_length += 1;
+                    }
+                }
+                if !delimited_by_another_flag || gap_length == 0 {
+                    continue;
+                }
+                let Some(start) = span_start(anchor) else {
+                    continue;
+                };
+
+                for step in 0..gap_length {
+                    let chain = &ring[(start + step) % chain_count];
+                    for pair in chain.samples.windows(2) {
+                        if let Some(cross) = this.query_edge_exists(pair[0], pair[1]) {
+                            if want_seam {
+                                this.set_edge_seam(cross, true);
+                            } else {
+                                this.set_edge_sharp(cross, true);
+                            }
+                        }
                     }
                 }
             }
@@ -5399,131 +5541,6 @@ impl LoopMesh {
                     }
                 }
             }
-        }
-    }
-
-    /// Multi-segment mechanism (2): bridge one junction's unseamed-gap beveled edges
-    /// as **runs of `segments` outermost-ring cross-section edges** (BEVEL.md
-    /// §6.7.5.3), gated by `mark_seam` / `mark_sharp`.
-    ///
-    /// The gap criterion follows §6.7.4: a *gap* is a maximal run of consecutive
-    /// *unseamed* beveled edges flanked on both sides by a seamed one. A junction with
-    /// all beveled edges seamed, none seamed, or only one seamed has no gap and bridges
-    /// nothing. Where the single-segment rule flagged the *one* direct patch segment
-    /// spanning each gap edge, this flags **every** cross-section edge of the
-    /// outermost-ring profile chain it steps onto — the whole run `(P_0,P_1) …
-    /// (P_(segments−1),P_segments)` (§6.7.5.1). Only the patch-boundary chain (ring
-    /// index 0) is touched; the interior vmesh rings that close the corner (§8.5) are
-    /// never flagged, since they are not this chain.
-    ///
-    /// **The walk counts in beveled edges but steps in ring boundverts** (§6.7.5.4 case
-    /// (5)), and the two indexings coincide only while the ring carries one boundvert
-    /// per sector. `ring` is the junction's outermost ring as the cyclic run of chains
-    /// the walk steps over: a chain that crosses a beveled edge carries that edge in
-    /// `cross_edge`, a **miter fill chain** carries `None`. A fill chain is therefore
-    /// *stepped over* like any other chain but never *counted* — which is precisely the
-    /// desynchronisation: a span whose ring path enters a split sector burns steps on
-    /// that sector's fill chain and comes up short at its far end, leaving the last gap
-    /// edge's own chain unflagged. An absorbed unbeveled leg, by contrast, inserts no
-    /// ring vertex and so adds no chain: it keeps the walk in registration.
-    ///
-    /// The operational walk, per flagged beveled edge `e`:
-    ///
-    /// - scan forward in disk order counting the **unflagged beveled** edges passed,
-    ///   and stop at the next **flagged beveled** edge;
-    /// - if that scan comes back round to `e` itself, `e` is the disk's only flagged
-    ///   edge: there is no gap, record nothing (without this, a single-flagged-edge
-    ///   junction would flag nearly its whole ring);
-    /// - otherwise flag the next `m` ring chains starting at `e`'s **trailing
-    ///   boundvert** — the ring vert its own chain ends on, i.e. the boundvert of the
-    ///   sector the walk is about to enter.
-    ///
-    /// `seam` and `sharp` run the identical walk on independent bits.
-    ///
-    /// **Scope: the walk sees beveled edges only.** Both its counting test and its
-    /// delimiter test read `edge_seam_state`, which is snapshotted over the beveled
-    /// edges alone, so an unbeveled leg is invisible to it — it neither counts nor
-    /// delimits, and it contributes no ring chain to step over. That coincides with the
-    /// general §6.7.5.3 rule exactly while legs are *unflagged*, which is all this row
-    /// covers. The **flagged unbeveled leg** case — where such a leg delimits a gap
-    /// even though it is never counted, and the span then starts at the ring vertex the
-    /// leg re-points onto rather than at a beveled edge's trailing boundvert — is
-    /// **deferred to its own row** ("flagged unbeveled leg at a junction / terminal")
-    /// and is *not* implemented here.
-    ///
-    /// The marks this lays on a fill chain do not survive: the fill chain is the split
-    /// sector's rebuilt face's corner run, and the corner-run pass runs **after** this
-    /// one and **assigns** (§6.7.1.1(a′)), so it clears them again unless its own AND
-    /// independently passes. A desync is thus observable as *missing* bridge edges,
-    /// never as misplaced ones.
-    fn bridge_junction_flags_multisegment(
-        &mut self,
-        ring: &[RingChain],
-        edge_seam_state: &[(EdgeKey, bool, bool)],
-        seam: bool,
-        sharp: bool,
-    ) {
-        let count = ring.len();
-        if count < 2 {
-            return;
-        }
-
-        let flag_of = |edge: EdgeKey, want_seam: bool| -> bool {
-            edge_seam_state
-                .iter()
-                .find_map(|&(e, s, h)| (e == edge).then_some(if want_seam { s } else { h }))
-                .unwrap_or(false)
-        };
-
-        let mut bridge = |want_seam: bool, this: &mut Self| {
-            let is_anchor = |index: usize| -> bool {
-                ring[index]
-                    .cross_edge
-                    .is_some_and(|edge| flag_of(edge, want_seam))
-            };
-
-            for anchor in 0..count {
-                if !is_anchor(anchor) {
-                    continue;
-                }
-
-                let mut gap_length = 0usize;
-                let mut delimited_by_another_anchor = false;
-                for step in 1..=count {
-                    let index = (anchor + step) % count;
-                    match ring[index].cross_edge {
-                        Some(edge) if flag_of(edge, want_seam) => {
-                            delimited_by_another_anchor = index != anchor;
-                            break;
-                        }
-                        Some(_) => gap_length += 1,
-                        None => {}
-                    }
-                }
-                if !delimited_by_another_anchor {
-                    continue;
-                }
-
-                for step in 1..=gap_length {
-                    let index = (anchor + step) % count;
-                    for pair in ring[index].samples.windows(2) {
-                        if let Some(cross) = this.query_edge_exists(pair[0], pair[1]) {
-                            if want_seam {
-                                this.set_edge_seam(cross, true);
-                            } else {
-                                this.set_edge_sharp(cross, true);
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        if seam {
-            bridge(true, self);
-        }
-        if sharp {
-            bridge(false, self);
         }
     }
 
@@ -6533,6 +6550,64 @@ struct JunctionPatch {
     opening_edges: Vec<EdgeKey>,
 }
 
+impl JunctionPatch {
+    /// The junction's boundvert ring as the §6.7.4 walk's chain sequence. At
+    /// `segments = 1` a "chain" is the single direct patch segment `B_i → B_(i+1)`,
+    /// crossed by the beveled edge opening the next sector — the degenerate case of the
+    /// §6.7.5.1 profile chain, so one walk serves both regimes. No miter splits a sector
+    /// here, so every chain crosses a beveled edge and the walk's count and its steps
+    /// stay in registration.
+    fn ring_chains(&self) -> Vec<RingChain> {
+        // One opening edge per sector, one boundvert per sector (§7.6.1) — this is what
+        // makes the `opening_edges` index below in-range for every ring position.
+        debug_assert_eq!(self.boundverts.len(), self.opening_edges.len());
+        let count = self.boundverts.len();
+        (0..count)
+            .map(|i| RingChain {
+                cross_edge: Some(self.opening_edges[(i + 1) % count]),
+                samples: vec![self.boundverts[i], self.boundverts[(i + 1) % count]],
+            })
+            .collect()
+    }
+}
+
+/// Whether the two sequences list the same keys in the same **cyclic** order — some
+/// rotation of `left` equals `right`. Used to check the disk-order / ring-order
+/// agreement mechanism (2)'s walk rests on.
+fn cyclically_equal(left: &[EdgeKey], right: &[EdgeKey]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let count = left.len();
+    count == 0
+        || (0..count).any(|shift| (0..count).all(|i| left[(i + shift) % count] == right[i]))
+}
+
+/// One junction's disk in rotational order, as mechanism (2)'s walk reads it (BEVEL.md
+/// §6.7.5.3 step 1). **Every** disk edge is here, beveled or not: the delimiter test
+/// asks all of them, and only the counting test asks whether an edge is beveled. An
+/// unbeveled leg is therefore a first-class participant — it can end a run and anchor a
+/// span — and the gap count is the walk's only `beveled` branch.
+struct JunctionDisk {
+    vertex: VertexKey,
+    edges: Vec<DiskEdge>,
+}
+
+/// One edge of a junction's disk, with the flags it carried on the pristine mesh
+/// (BEVEL.md §6.7.5.4 case (4b)).
+struct DiskEdge {
+    edge: EdgeKey,
+    beveled: bool,
+    seam: bool,
+    sharp: bool,
+    /// The outermost-ring vertex an unbeveled leg re-points onto — the leg's stand-in
+    /// for a boundvert, and where its bridge span begins. `None` for a beveled edge
+    /// (whose span starts at its trailing boundvert, which the walk reads off the ring
+    /// as its crossing chain's end sample) and for a leg whose landing the placement
+    /// pass declined to pin.
+    ring_vertex: Option<VertexKey>,
+}
+
 /// One beveled edge's profile chain at one endpoint (BEVEL.md §8.2.2 / §8.3.0):
 /// the two ring boundverts (`start` / `end`) it spans plus the `segments − 1`
 /// interior arc samples between them. `start` is the boundvert on the edge's first
@@ -6598,6 +6673,7 @@ impl JunctionCut {
     /// chain crosses a beveled edge and the walk's count and its steps stay in
     /// registration: `B_i → B_(i+1)` is crossed by `g_(i+1)`.
     fn ring_chains(&self, chains: &[EdgeEndChain]) -> Vec<RingChain> {
+        debug_assert_eq!(self.boundverts.len(), self.opening_edges.len());
         let count = self.boundverts.len();
         (0..count)
             .map(|i| {
@@ -13870,20 +13946,32 @@ mod tests {
         }
         // opening_edges[k] = g_k: a stub edge whose seam state encodes `seamed[k]`.
         let mut opening_edges = Vec::with_capacity(s);
-        let mut edge_seam_state = Vec::with_capacity(s);
         for k in 0..s {
             let stub = mesh.create_vertex(Vec3::new(2.0 + k as f32, 0.0, 0.0));
             let g = mesh.create_edge([boundverts[k], stub], EdgeCreateFlags::NONE);
             opening_edges.push(g);
-            edge_seam_state.push((g, seamed[k], false));
         }
 
+        // A leg-free disk in the same rotational order as the ring: every entry beveled,
+        // so the walk's counting and delimiting tests coincide (§6.7.5.3 step 1).
+        let disk = JunctionDisk {
+            vertex: boundverts[0],
+            edges: (0..s)
+                .map(|k| DiskEdge {
+                    edge: opening_edges[k],
+                    beveled: true,
+                    seam: seamed[k],
+                    sharp: false,
+                    ring_vertex: None,
+                })
+                .collect(),
+        };
         let patch = JunctionPatch {
             vertex: boundverts[0],
             boundverts: boundverts.clone(),
             opening_edges,
         };
-        mesh.bridge_junction_flags(&patch, &edge_seam_state, true, false);
+        mesh.bridge_junction_flags(&patch.ring_chains(), &disk, true, false);
 
         // Read back which ring segment (B_(m-1), B_m) ended up seamed.
         (0..s)
@@ -14447,6 +14535,388 @@ mod tests {
             "ARC outer miter: the split sector desyncs the same span on the sharp bit too",
         );
         arc_on.validate_topology();
+    }
+
+    // ---- BEVEL.md §6.7.5.4 case (4b): the **flagged unbeveled leg** ----
+    //
+    // The octagonal apex with `g_1 … g_4` = apex legs 0..=3 beveled and the `> 180°`
+    // reflex sector absorbing the four unbeveled legs `L_5 … L_8` = apex legs 4..=7.
+    // Whole-mesh flag counts (the guide's read-back table): a surviving flagged leg
+    // contributes 1 of its own, each flagged beveled edge 2 outer longitudinal edges,
+    // mechanism (1)'s corner-run AND whatever fill run a doubly-flagged rebuilt face
+    // owns, and mechanism (2) the bridge spans.
+
+    /// Mechanism (2), the **delimiting** half: a flagged leg ends the run that reaches
+    /// it, so a junction whose only flagged *beveled* edge is `g_1` — which alone would
+    /// abort on the walk's termination clause — bridges after all once `L_6` is flagged
+    /// too. `m = 3` (`g_2, g_3, g_4`), so the bridge lays `m · segments = 6` edges. The
+    /// span runs entirely on the bunch side, so all three outer-miter modes agree.
+    #[test]
+    fn flagged_absorbed_leg_anchors_bridge_span_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        let flags = [0, 5]; // g_1 and the absorbed leg L_6
+        for miter in [BevelMiter::Sharp, BevelMiter::Arc, BevelMiter::Patch] {
+            let (on, _) = bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, true, false);
+            let (off, _) =
+                bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, false, false);
+            assert_eq!(
+                seamed_edge_count(&off),
+                3,
+                "{miter:?}: OFF is mechanism (1) alone — g_1's two longitudinals plus the \
+                 surviving flagged leg",
+            );
+            assert_eq!(
+                seamed_edge_count(&on),
+                9,
+                "{miter:?}: the flagged leg delimits g_1's run at m = 3, so the bridge lays \
+                 m · segments = 6 edges (§6.7.5.4 case (4b))",
+            );
+            on.validate_topology();
+        }
+    }
+
+    /// The `mark_sharp` companion: the leg's delimiting is a property of the walk, not
+    /// of the bit it carries.
+    #[test]
+    fn flagged_absorbed_leg_anchors_bridge_span_on_the_sharp_bit_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        let flags = [0, 5];
+        let (on, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &flags, BevelMiter::Arc, false, true);
+        let (off, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &flags, BevelMiter::Arc, false, false);
+        let count = |mesh: &LoopMesh| sharp_edges(mesh).len();
+        assert_eq!(
+            count(&off),
+            3,
+            "OFF: two longitudinals plus the surviving flagged leg"
+        );
+        assert_eq!(
+            count(&on),
+            9,
+            "ON: the leg-delimited m = 3 span bridges six edges"
+        );
+        on.validate_topology();
+    }
+
+    /// The contrast that makes the two bridge arms attributable to the **leg** rather
+    /// than to the fixture: leave the leg unflagged and the lone flagged beveled edge
+    /// (either `g_1` or `g_4`) finds no second flagged disk edge, so the walk's
+    /// termination clause aborts and nothing is bridged — ON ≡ OFF at 2 edges.
+    #[test]
+    fn unflagged_absorbed_leg_leaves_lone_flagged_edge_inert_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        for lone in [0usize, 3] {
+            for miter in [BevelMiter::Sharp, BevelMiter::Arc, BevelMiter::Patch] {
+                let (on, _) =
+                    bevel_octagonal_reflex_flagged(&beveled, &[lone], &[], miter, true, false);
+                let (off, _) =
+                    bevel_octagonal_reflex_flagged(&beveled, &[lone], &[], miter, false, false);
+                assert_eq!(
+                    seamed_edge_count(&on),
+                    2,
+                    "{miter:?}: a lone flagged beveled edge bridges nothing (§6.7.5.4 case (5)'s \
+                     termination clause)",
+                );
+                assert_eq!(
+                    seamed_edge_count(&off),
+                    seamed_edge_count(&on),
+                    "{miter:?}: with no second flagged disk edge the parameter is inert",
+                );
+            }
+        }
+    }
+
+    /// Mechanism (2), the **anchoring** half, and case (5)'s desync reached from a leg
+    /// anchor. Flag `g_4` and `L_6`: `g_4`'s run hits `L_6` at once (`m = 0`), so the
+    /// junction's only span is anchored at the **leg**, laid from its ring vertex, with
+    /// `m = 3` (`g_1, g_2, g_3`). Under `SHARP` the leg's ring vertex is the sector's
+    /// single boundvert and the walk is in registration (`+6`); under `ARC` / `PATCH`
+    /// it is the split sector's *leading* ring vertex, so the span's first step is burnt
+    /// on the fill chain — whose per-face AND is FALSE — and only two chains survive
+    /// (`+4`).
+    #[test]
+    fn flagged_leg_anchored_span_desyncs_at_split_sector_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        let flags = [3, 5]; // g_4 and the absorbed leg L_6
+        for (miter, expected) in [
+            (BevelMiter::Sharp, 9usize),
+            (BevelMiter::Arc, 7),
+            (BevelMiter::Patch, 7),
+        ] {
+            let (on, _) = bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, true, false);
+            let (off, _) =
+                bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, false, false);
+            assert_eq!(
+                seamed_edge_count(&off),
+                3,
+                "{miter:?}: OFF is g_4's two longitudinals plus the surviving flagged leg",
+            );
+            assert_eq!(
+                seamed_edge_count(&on),
+                expected,
+                "{miter:?}: the leg-anchored span desyncs iff its ring path enters a split \
+                 sector (§6.7.5.4 case (4b) / case (5))",
+            );
+            on.validate_topology();
+        }
+    }
+
+    /// **KNOWN GAP (BEVEL.md §6.7.5.4 case (4b) pins no partial-chain span).** A flagged
+    /// leg anchors its span at its ring vertex (case (4b)), and the walk lays whole ring
+    /// **chains** from there — so a leg whose ring vertex is an *interior* sample of a
+    /// chain begins no chain and lays **nothing at all**, even though it still delimits.
+    ///
+    /// This test establishes that the shape is **reachable**, not hypothetical. Bevel
+    /// three of the octagonal apex's eight legs (`g_1 … g_3`) and the `> 180°` reflex
+    /// sector absorbs **five** legs — an *odd* count, so §8.9.2's assignment puts the
+    /// middle one (`L_6`) on profile-sample index `segments / 2`: at `segments = 2` the
+    /// arc's lone interior bulge `s_1`, asserted below against an independent re-derivation
+    /// of the arc samples. Flag `g_3` and `L_6`: `g_3`'s run hits `L_6` at once (`m = 0`),
+    /// so the junction's only span is the leg-anchored one, of length `m = 2` (`g_1, g_2`).
+    ///
+    /// The three outer-miter modes then separate the cause cleanly:
+    ///
+    /// - `SHARP` — the sector is unsplit, the leg's ring vertex is its single boundvert
+    ///   (a chain start), and the span lands in full: `m · segments = 4` edges.
+    /// - `PATCH` — the leg's ring vertex is the hub `B2`, still a chain start, so the span
+    ///   *starts*; its first step is then burnt on a patch fill chain and cleared by the
+    ///   corner-run pass — the ordinary case-(5) desync, `+2`.
+    /// - `ARC` — the ring vertex is `s_1`, **interior** to the reflex arc chain. No chain
+    ///   begins there, so loopmesh drops the whole span: ON ≡ OFF. This is the divergence
+    ///   candidate; the guide does not say what a partial-chain span should lay.
+    #[test]
+    fn flagged_middle_absorbed_leg_on_interior_arc_sample_lays_no_span_octagonal() {
+        let beveled = [0, 1, 2];
+
+        // The middle absorbed leg really does land on the arc's interior bulge sample.
+        let (s0, s1, s2) = octagonal_arc_samples(&beveled);
+        let (mut mesh, _apex, rim, apex_leg) = octagonal_bipyramid_all_legs();
+        let geom: Vec<GeomKey> = beveled.iter().map(|&k| apex_leg[k].into()).collect();
+        mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        let [end_a, end_b] = mesh.edge_vert_keys(apex_leg[5]);
+        let landing = if end_b == rim[5] { end_a } else { end_b };
+        let landing_position = mesh.vertex_position(landing);
+        assert!(
+            (landing_position - s1).length() < 1e-4,
+            "the middle absorbed leg re-points onto the arc's interior sample s_1 \
+             (§8.9.2's `segments / 2` assignment), not onto either arc end",
+        );
+        assert!((landing_position - s0).length() > 1e-3);
+        assert!((landing_position - s2).length() > 1e-3);
+
+        let flags = [2, 5]; // g_3 and the middle absorbed leg L_6
+        for (miter, expected) in [
+            (BevelMiter::Sharp, 7usize),
+            (BevelMiter::Patch, 5),
+            (BevelMiter::Arc, 3),
+        ] {
+            let (on, _) = bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, true, false);
+            let (off, _) =
+                bevel_octagonal_reflex_flagged(&beveled, &flags, &[], miter, false, false);
+            assert_eq!(
+                seamed_edge_count(&off),
+                3,
+                "{miter:?}: OFF is g_3's two longitudinals plus the surviving flagged leg",
+            );
+            assert_eq!(
+                seamed_edge_count(&on),
+                expected,
+                "{miter:?}: the leg-anchored m = 2 span lands in full when its ring vertex \
+                 starts a chain, and vanishes when the vertex is interior to one",
+            );
+            on.validate_topology();
+        }
+    }
+
+    /// Mechanism (1) through a **leg pair**: under `ARC` the fan face bounded by `L_6`
+    /// and `L_7` owns the whole fill run (their ring vertices are the sector's two
+    /// boundverts), so flagging both legs passes that face's corner-run AND and the
+    /// entire `segments`-edge fill chain lights up — with `mark_seam` **off**. Under
+    /// `PATCH` the same two legs share the hub, their fan face's run is empty, and no
+    /// fill edge is flagged: the mirror-negative that shows the rule is the face
+    /// partition and not the fill.
+    #[test]
+    fn flagged_leg_pair_flags_arc_fill_run_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        let flags = [0, 3, 5, 6]; // g_1, g_4, L_6, L_7
+        let (arc_on, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Arc, true, false);
+        let (arc_off, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Arc, false, false);
+        let (patch_on, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Patch, true, false);
+        let (patch_off, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Patch, false, false);
+
+        assert_eq!(
+            seamed_edge_count(&arc_off),
+            8,
+            "ARC / OFF: 4 longitudinals + 2 surviving legs + the 2-edge fill run the \
+             leg-bounded fan face's AND passes on (§6.7.5.4 case (4b))",
+        );
+        assert_eq!(
+            seamed_edge_count(&arc_on),
+            12,
+            "ARC / ON adds the two bridge spans"
+        );
+        assert_eq!(
+            seamed_edge_count(&patch_off),
+            6,
+            "PATCH / OFF: no fill edge — both legs share the hub, so their fan face's run \
+             is empty",
+        );
+        assert_eq!(
+            seamed_edge_count(&patch_on),
+            10,
+            "PATCH / ON adds the same two bridge spans"
+        );
+        arc_off.validate_topology();
+        patch_off.validate_topology();
+    }
+
+    /// Mechanism (1) through a **flank + its nearest leg**: under `PATCH` the leading
+    /// flank face is bounded by `g_4` and `L_5`, and its corner run is that flank's
+    /// patch leg (`B_1 → B_2`), so flagging both lights those `segments` edges with the
+    /// parameter off. Under `ARC` the same flags light nothing — flank and leg share the
+    /// end sample `B_1`, so that face's run is empty.
+    #[test]
+    fn flagged_leg_and_flank_flags_patch_leg_octagonal() {
+        let beveled = [0, 1, 2, 3];
+        let flags = [0, 3, 4]; // g_1, g_4, L_5
+        let (patch_on, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Patch, true, false);
+        let (patch_off, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Patch, false, false);
+        let (arc_on, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Arc, true, false);
+        let (arc_off, _) =
+            bevel_octagonal_reflex_flagged(&beveled, &flags, &[], BevelMiter::Arc, false, false);
+
+        assert_eq!(
+            seamed_edge_count(&patch_off),
+            7,
+            "PATCH / OFF: 4 longitudinals + 1 surviving leg + the flank face's 2-edge patch \
+             leg (§6.7.5.4 case (4b))",
+        );
+        assert_eq!(
+            seamed_edge_count(&patch_on),
+            11,
+            "PATCH / ON adds the two bridge spans"
+        );
+        assert_eq!(
+            seamed_edge_count(&arc_off),
+            5,
+            "ARC / OFF: no fill edge — the flank face's run collapses to the shared end \
+             sample B_1",
+        );
+        assert_eq!(
+            seamed_edge_count(&arc_on),
+            9,
+            "ARC / ON adds the same two bridge spans"
+        );
+        patch_off.validate_topology();
+        arc_off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 (terminal bullet), the `segments ≥ 2` lift: the valence-3
+    /// terminal's absorbing face runs the beveled edge's **far-end cross-section chain**
+    /// as its corner run, against the terminal's two unbeveled legs. Both legs flagged ⇒
+    /// **every** edge of the `segments`-edge chain rides the flag, so the terminal
+    /// contributes `2 + segments`. Unconditional: identical with `mark_seam` on and off.
+    #[test]
+    fn terminal_far_end_chain_flagged_when_both_legs_flagged_multisegment() {
+        for segments in [2u32, 3] {
+            for mark_seam in [false, true] {
+                let mut mesh = LoopMesh::new();
+                mesh_add_cube(&mut mesh);
+                let beveled = cube_edge(
+                    &mesh,
+                    Vec3::new(1.0, -1.0, -1.0),
+                    Vec3::new(-1.0, -1.0, -1.0),
+                );
+                let front_leg =
+                    cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+                let bottom_leg =
+                    cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+                mesh.set_edge_seam(front_leg, true);
+                mesh.set_edge_seam(bottom_leg, true);
+                mesh.set_edge_sharp(front_leg, true);
+                mesh.set_edge_sharp(bottom_leg, true);
+
+                mesh.bevel(
+                    &[beveled.into()],
+                    BevelOptions {
+                        offset: 0.25,
+                        segments,
+                        affect: BevelAffect::Edges,
+                        mark_seam,
+                        mark_sharp: mark_seam,
+                        ..Default::default()
+                    },
+                );
+                mesh.validate_topology();
+
+                assert_eq!(
+                    seamed_edge_count(&mesh),
+                    2 + segments as usize,
+                    "segments={segments}, mark_seam={mark_seam}: the two surviving legs plus \
+                     every edge of the far-end cross-section chain (§6.7.5.4 terminal bullet)",
+                );
+                assert_eq!(
+                    sharp_edges(&mesh).len(),
+                    2 + segments as usize,
+                    "segments={segments}: the sharp bit runs the identical AND",
+                );
+            }
+        }
+    }
+
+    /// The mandatory AND-vs-OR contrast for the row above: **one** flagged leg leaves the
+    /// far-end chain clean at every `segments` (`1 + 1 = 2 + segments`, not `2`).
+    #[test]
+    fn terminal_far_end_chain_clean_when_one_leg_flagged_multisegment() {
+        for segments in [2u32, 3] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let beveled = cube_edge(
+                &mesh,
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+            );
+            let bottom_leg =
+                cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+            mesh.set_edge_seam(bottom_leg, true);
+
+            mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    mark_seam: true,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(
+                seamed_edges(&mesh),
+                vec![bottom_leg],
+                "segments={segments}: one flagged leg ⇒ the corner-run AND fails and the chain \
+                 stays clean",
+            );
+        }
     }
 
     /// Bevel the three apex edges of `single_face_reflex_junction` (`segments = 2`,
