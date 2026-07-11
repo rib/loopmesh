@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 use super::duplicate::GeomKey;
 use crate::loopmesh::*;
@@ -2084,14 +2084,17 @@ impl LoopMesh {
     ///   (`cos = ½`, the signature of mutually perpendicular `d_*`); a non-octant
     ///   corner moves the cosine off ½.
     ///
-    /// The default-profile condition is the circular superellipse (`r = 2`); a
-    /// curved / square / custom profile snaps onto a superellipsoid the closed-form
-    /// sphere fit does not solve (§8.5.5.5), so it declines here.
+    /// The exponent condition is the tri-corner family's **smooth** member
+    /// (§8.5.5.5(f.1) step 3, the `otherwise` arm): every `r` that is neither square nor
+    /// square-in — the circular default (`r = 2`), the whole curved band, and the straight
+    /// chord (`r = 1`, whose octant grid is the flat chamfer plane). All of them are what
+    /// the unit-octant grid of §8.5.5.5(f.2) builds. Only the two square exponents, which
+    /// take closed-form grids of their own (§8.5.5.5(f.4)/(f.5)), are refused here.
     fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32) -> bool {
         if cut.boundverts.len() != 3 {
             return false;
         }
-        if profile_to_exponent(profile) != 2.0 {
+        if !adj_octant_exponent(profile_to_exponent(profile)) {
             return false;
         }
         let vertex = self.vertex_position(cut.vertex);
@@ -2112,17 +2115,21 @@ impl LoopMesh {
     ///   pinwheel meeting at one closed-form welded central apex, snapped onto the
     ///   corner sphere (§8.5.2). Combinatorially forced ⇒ the only strict-isomorphism
     ///   path; handled inline below.
-    /// - **Larger-`segments` 3-way cube corner (§8.5.5.1–§8.5.5.4):** the subdivided
-    ///   sphere grid (`build_adj_fill_general`), still snapped onto the corner sphere.
+    /// - **Larger-`segments` 3-way cube corner (§8.5.5.1–§8.5.5.4 / §8.5.5.5(f.2)):** the
+    ///   unit-octant grid (`build_adj_fill_octant`) — coarse net, subdivision, resample
+    ///   and superellipsoid snap all in octant coordinates, mapped to the corner once at
+    ///   the end. Runs for the circular default and for every genuinely curved exponent;
+    ///   the circular sphere-fit is the special case of it, not the other way round.
     /// - **General valence-`s` corner (§8.5.5.5):** any junction without the
     ///   valence-3 orthonormal sphere — `s ≠ 3`, oblique, or irregular-ring — takes
     ///   the centre-fullness cap (`build_adj_fill_general_nonsymmetric`), which is
     ///   valence-generic. The even/odd centre parity (§8.5.5.5(e)) decides between a
     ///   welded centre vertex and a central `s`-gon for every `s`.
     ///
-    /// Scope this cycle: default circular profile, equal offsets. Curved / square /
-    /// square-in / custom profiles and the seg ≤ 2 oblique coarse net stay unfilled
-    /// (§8.5.5.5(f)).
+    /// Scope this cycle: every **smooth** exponent (circular, curved, and the straight
+    /// chord) at the cube corner; circular and flat at the general ring. The square /
+    /// square-in / pipe grids (§8.5.5.5(f.4)/(f.5)/(f.6)) and the curved *general* ring
+    /// stay unfilled.
     fn build_adj_fill(
         &mut self,
         cut: &JunctionCut,
@@ -2141,31 +2148,25 @@ impl LoopMesh {
         if count < 3 {
             return;
         }
-        // Square / square-in / general-curved profiles take a dedicated non-smooth
-        // grid the rounded subdivision path does not cover (§8.5.5.5(f)). Two profile
-        // exponents fill here: the circular default (`r = 2`, for which both the
-        // cube-corner sphere snap and the general fullness cap are distilled) and the
-        // flat/straight-chord (`r = 1`, §8.3.0.2.1). The flat case fills only through
-        // the general fullness cap below at its `fullness = 0` planar specialisation —
-        // the tri-corner sphere trigger declines any non-circular profile, so a flat
-        // corner always routes to the general cap rather than the sphere snap.
+        // §8.5.5.5(f.1) step 3: the symmetric equal-offset *orthonormal* cube corner at a
+        // smooth exponent — every `r` bar the two squares, the flat chamfer (`r = 1`)
+        // included — takes the tri-corner family: the `segments = 2` pinwheel below and the
+        // unit-octant grid at `segments ≥ 3`. Every other junction — a valence-`s` (`s ≠ 3`)
+        // corner, or an oblique / irregular-ring valence-3 corner (§7.6.6, e.g. a reflex
+        // sector whose dihedral fold fails the tri-corner test) — routes to the general
+        // fullness-relaxation grid of (a)–(e), which loopmesh fills at the circular
+        // (`r = 2`) and straight-chord (`r = 1`, the `fullness = 0` planar specialisation,
+        // §8.3.0.2.1) exponents. The general ring at a *curved* exponent, and the square /
+        // square-in / pipe grids at any ring, stay unfilled (§8.5.5.5(f.4)/(f.5)/(f.6)).
+        // The general fill runs even at `segments = 2`: it subdivides its coarse net once
+        // before resampling (§8.5.5.5(d)), so a declined-tri-corner `segments = 2` ring
+        // gets the centre-vertex pinwheel cap rather than an unfilled hole. Only
+        // `segments < 2` has no interior grid to fill.
         let exponent = profile_to_exponent(profile);
-        if exponent != 2.0 && exponent != 1.0 {
-            return;
-        }
-        // §8.5.1 forced-tri-corner trigger. The symmetric equal-offset *orthonormal*
-        // cube corner has the closed-form sphere of radius `offset` to snap onto, so
-        // it keeps the dedicated cube-corner path (the `segments = 2` pinwheel below
-        // and the larger-`segments` sphere grid). Every other junction — a valence-`s`
-        // (`s ≠ 3`) corner, or an oblique / irregular-ring valence-3 corner (§7.6.6,
-        // e.g. a reflex sector whose dihedral fold fails the tri-corner test) — has no
-        // such sphere; at the same circular profile and equal offsets it routes into
-        // the general valence-`s` fullness-relaxation grid (§8.5.5.5) instead of
-        // declining. The general fill runs even at `segments = 2`: it subdivides its
-        // coarse net once before resampling (§8.5.5.5(d)), so a declined-tri-corner
-        // `segments = 2` ring gets the centre-vertex pinwheel cap here rather than an
-        // unfilled hole. Only `segments < 2` has no interior grid to fill.
         if !self.adj_tri_corner_trigger(cut, profile) {
+            if exponent != 2.0 && exponent != 1.0 {
+                return;
+            }
             match segments {
                 0 | 1 => return,
                 _ => {
@@ -2175,13 +2176,15 @@ impl LoopMesh {
             }
         }
         // The forced `segments = 2` pinwheel (§8.5.1–§8.5.4) keeps its dedicated
-        // closed-form path below; `segments ≥ 3` takes the general subdivided
-        // grid (§8.5.5). `segments < 2` has no interior to fill.
+        // closed-form path below — at `segments = 2` the coarse net *is* the target grid,
+        // so no subdivision round runs on this path at all (§8.5.5.5(f.2), the PRESCALE
+        // guard). `segments ≥ 3` takes the unit-octant subdivided grid.
+        // `segments < 2` has no interior to fill.
         match segments {
             0 | 1 => return,
             2 => {}
             _ => {
-                self.build_adj_fill_general(cut, chains, segments, material, result);
+                self.build_adj_fill_octant(cut, chains, segments, profile, material, result);
                 return;
             }
         }
@@ -2218,25 +2221,41 @@ impl LoopMesh {
         // the sectors' interior arc samples (chain). Fit it from those on-surface
         // verts, then take the apex as its point nearest the junction vertex along the
         // corner's body diagonal: `c + normalize(v − c)·R`.
+        //
+        // At any **non-circular** smooth exponent there is no such sphere (§8.5.5.5(f.2)) —
+        // that includes the flat chamfer `r = 1`, whose surface is a plane — so the apex is
+        // the octant closed form instead: the body-diagonal point of the unit octant snapped
+        // onto the unit superellipsoid is `3^(−1/r)·(1,1,1)` for every `r`, and
+        // `unit_to_corner` carries it to the corner (at `r = 1` that is the boundvert
+        // centroid, on the chamfer plane). At `r = 2` the two agree — `3^(−1/2)` *is*
+        // `c + R·normalize(v − c)` read in octant coordinates — and the circular corner keeps
+        // the sphere fit, which is the strictly-pinned forced case (§8.5.4).
         let vertex_position = self.vertex_position(cut.vertex);
-        let on_surface = [
-            self.vertex_position(cut.boundverts[0]),
-            self.vertex_position(cut.boundverts[1]),
-            self.vertex_position(cut.boundverts[2]),
-            self.vertex_position(interior_of_sector[0]),
-        ];
-        let apex_position = match circumsphere(on_surface) {
-            Some((center, radius)) => {
-                let body_diagonal = (vertex_position - center).normalize_or_zero();
-                center + body_diagonal * radius
+        let apex_position = if exponent != 2.0 {
+            match self.unit_octant(cut) {
+                Some(octant) => octant.to_world(Vec3::splat(3.0_f32.powf(-1.0 / exponent))),
+                None => return,
             }
-            // Degenerate (co-spherically deficient) ring: fall back to the affine image
-            // of the body-diagonal point so the fill still closes.
-            None => {
-                let axis_sum: Vec3 = cut.boundverts.iter().fold(Vec3::ZERO, |acc, &b| {
-                    acc + (self.vertex_position(b) - vertex_position)
-                });
-                vertex_position + axis_sum / 3.0_f32.sqrt()
+        } else {
+            let on_surface = [
+                self.vertex_position(cut.boundverts[0]),
+                self.vertex_position(cut.boundverts[1]),
+                self.vertex_position(cut.boundverts[2]),
+                self.vertex_position(interior_of_sector[0]),
+            ];
+            match circumsphere(on_surface) {
+                Some((center, radius)) => {
+                    let body_diagonal = (vertex_position - center).normalize_or_zero();
+                    center + body_diagonal * radius
+                }
+                // Degenerate (co-spherically deficient) ring: fall back to the affine image
+                // of the body-diagonal point so the fill still closes.
+                None => {
+                    let axis_sum: Vec3 = cut.boundverts.iter().fold(Vec3::ZERO, |acc, &b| {
+                        acc + (self.vertex_position(b) - vertex_position)
+                    });
+                    vertex_position + axis_sum / 3.0_f32.sqrt()
+                }
             }
         };
         let apex = self.create_vertex(apex_position);
@@ -2592,6 +2611,7 @@ impl LoopMesh {
             profiles: ring_profiles,
             cross_edges: cross_edge,
             segments,
+            profile,
         });
         true
     }
@@ -3031,6 +3051,7 @@ impl LoopMesh {
             profiles: ring_profiles,
             cross_edges: cross_edge,
             segments,
+            profile,
         });
         true
     }
@@ -3226,6 +3247,7 @@ impl LoopMesh {
             &omj.chains,
             &omj.profiles,
             omj.segments,
+            omj.profile,
             false,
             raw_coarse_mids,
             material,
@@ -3251,6 +3273,7 @@ impl LoopMesh {
         chain_of: &[Vec<VertexKey>],
         profiles: &[RingChainProfile],
         segments: u32,
+        profile: f32,
         flat: bool,
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
@@ -3283,7 +3306,7 @@ impl LoopMesh {
             .map(|chain| self.vertex_position(chain[0]))
             .collect();
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
-        let fullness = if flat { 0.0 } else { adj_fullness(segments) };
+        let fullness = if flat { 0.0 } else { adj_fullness(profile, segments) };
         let fullness_seed = centroid + fullness * (vertex_position - centroid);
 
         // The face-winding anchor (§8.5.5): a point below the cap, on the solid side away
@@ -3328,7 +3351,7 @@ impl LoopMesh {
                 chain_of,
                 &AdjInterior::Blend {
                     corners: &corners,
-                    placement: AdjPlacement::Fullness { anchor },
+                    anchor,
                 },
                 material,
                 representative,
@@ -3389,38 +3412,55 @@ impl LoopMesh {
         None
     }
 
-    /// Build the rounded adjacency-grid fill for the symmetric equal-offset 3-way
-    /// cube corner at `segments ≥ 3` (BEVEL.md §8.5.5). The `segments = 2` pinwheel
-    /// (§8.5.1–§8.5.4) is the coarse control net; this tiles the larger grid as
-    /// `s = 3` quad **sub-patches** — one per boundvert `B_i`, spanning from `B_i`
-    /// inward to the corner centre — each interior grid vert snapped onto the corner
-    /// superellipsoid (the sphere, for the default circular profile, §8.5.5.3).
+    /// Build the [V-ADJ] fill for the symmetric equal-offset 3-way cube corner at
+    /// `segments ≥ 3`, at any **smooth** exponent (BEVEL.md §8.5.5.5(f.2)). The grid is
+    /// **not** built in world space and there is no circumsphere to fit — for a curved
+    /// `r` no sphere exists at all. It is built entirely in the **unit octant** (the
+    /// three boundverts at the axis points `e_0, e_1, e_2`, the corner at `(1,1,1)`),
+    /// where the target surface is the unit superellipsoid `u_x^r + u_y^r + u_z^r = 1`,
+    /// and mapped into the corner **once**, at the end, by the affine `unit_to_corner`
+    /// map of §8.5.2. The circular sphere-fit is the special case of this, not the
+    /// other way round.
+    ///
+    /// The four stages, all in octant coordinates (§8.5.5.5(f.2)):
+    ///
+    /// 1. **Coarse net** at `segments = 2` — corners `e_i`, sector mids
+    ///    `2^(−1/r)·(e_i + e_{i+1})`, centre `√⅓·(1,1,1)·PRESCALE`. The pre-scale
+    ///    deliberately seeds the centre *off* the surface so the subdivision's smoothing
+    ///    does not pull the cap in too far; it is invisible in the apex (the snap is a
+    ///    radial projection, and radial projection is scale-invariant) and visible one
+    ///    ring in.
+    /// 2. **Subdivide** — the §8.5.5.5(c) stencil, doubling until the working resolution
+    ///    reaches the target.
+    /// 3. **Resample** — the §8.5.5.5(d) kernel, when the doubled resolution overshoots.
+    /// 4. **Snap** — *every* grid vert, interior and emitted rim alike, onto the unit
+    ///    superellipsoid ([`snap_to_unit_superellipsoid`]).
     ///
     /// The centre resolves by parity (§8.5.5.4): even `segments` welds the three
-    /// sub-patches at one apex vertex `c + R·normalize(v − c)`; odd `segments` leaves
-    /// the sub-patches separated by a ring of seam quads closed by a central
-    /// `s`-gon face, with no apex vertex on the body diagonal.
+    /// sub-patches at one apex vertex — the closed form `3^(−1/r)·(1,1,1)` in octant
+    /// coordinates, for every `r` — and odd `segments` leaves them separated by a ring
+    /// of seam quads closed by a central `s`-gon, with no apex vertex on the body
+    /// diagonal.
     ///
-    /// The boundary (the three profile chains and the boundvert ring) is *reused*
-    /// from [P]/[S], not re-minted, so the patch shares its rim with the arriving
-    /// strips. Interior positions are an admissible implementation choice (Tier-2,
-    /// `bevel_vmesh.md`); only their superellipsoid membership and the grid
-    /// counts / parity are pinned.
-    ///
-    /// Scope (§8.5.5.5): the symmetric equal-offset cube corner, default circular
-    /// profile only. Higher valence, unequal offsets, and the pipe / square grids
-    /// are left unfilled.
-    fn build_adj_fill_general(
+    /// The rim is *reused* from [P]/[S] (the deterministic §8.2.2.1.1 read-back the
+    /// arriving strips carry), never re-minted — stage 4 only projects it back out onto
+    /// the surface. Interior positions are an admissible implementation choice (Tier-2,
+    /// `bevel_vmesh.md`); only their superellipsoid membership and the grid counts /
+    /// parity are pinned (§8.5.5.6).
+    fn build_adj_fill_octant(
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: u32,
+        profile: f32,
         material: i32,
         result: &mut BevelResult,
     ) {
         let sectors = cut.boundverts.len(); // 3 (guarded by the caller)
         let seg = segments as usize;
         let half = seg / 2;
+        let even = seg % 2 == 0;
+        let exponent = profile_to_exponent(profile);
 
         // Each sector's profile chain, oriented from its opening boundvert `B_i`
         // (`seg + 1` samples; the two ends are the ring boundverts).
@@ -3435,72 +3475,55 @@ impl LoopMesh {
             }
         }
 
-        let vertex_position = self.vertex_position(cut.vertex);
+        let octant = match self.unit_octant(cut) {
+            Some(octant) => octant,
+            None => return,
+        };
 
-        // The corner sphere the whole patch lies on (§8.5.5.3): `c = v + offset·(d_a +
-        // d_b + d_c)`, `R = offset`. Read it off the ring alone — each §7.6.2 boundvert
-        // is `v + offset·(d_x + d_y)` over the two beveled edges it bridges, and each of
-        // the three edges appears in exactly two boundverts, so `Σ B_i = 3v + 2·offset·Σd`
-        // and hence `c = (Σ B_i − v) / 2`, with `R = |B_i − c| = offset`. Deriving it
-        // from the ring (not from a chain sample) matters: the emitted chain samples are
-        // the §8.2.2.1.1 chord resample and sit *inside* the sphere until step 4's snap
-        // puts them back on it, so fitting through one of them would tilt the sphere the
-        // snap is supposed to restore them to.
-        let center = (cut
-            .boundverts
-            .iter()
-            .fold(Vec3::ZERO, |acc, &b| acc + self.vertex_position(b))
-            - vertex_position)
-            * 0.5;
-        let radius = (self.vertex_position(cut.boundverts[0]) - center).length();
-        if radius <= f32::EPSILON {
-            return;
-        }
-
-        // §8.2.2.1.1 step 4 / §8.5.5.3: the snap is the fill's own **grid-level** step and
-        // runs **last** — after the boundary resample, never before it. On this
-        // (closed-form tri-corner) path it covers the emitted rim as well as the interior,
-        // projecting each chord-resampled chain sample radially back out onto the corner
-        // sphere; the sample survives at a *shifted arc angle* rather than at its raw
-        // even-angle one. It is invoked whether or not a chord resample ran: at
-        // `segments ∈ {4, 8, …}` the raw sample is already on the sphere and the
-        // projection is the identity on the rim (identity, not skipped — the same snap is
-        // what places the interior, below). The two chain ends are ring boundverts and are
-        // already at `R`, so only the interior samples are touched.
+        // Stage 4 on the rim. The snap is the fill's own **grid-level** step and runs
+        // **last** — after the §8.2.2.1.1 boundary resample, never before it — and on this
+        // (tri-corner) path it covers the emitted rim as well as the interior, projecting
+        // each chord-resampled chain sample back out onto the superellipsoid; the sample
+        // survives at a *shifted arc angle* rather than at its raw even-angle one. It is
+        // invoked whether or not a chord resample ran: at `segments ∈ {4, 8, …}` the raw
+        // sample is already on the surface and the projection is the identity on the rim
+        // (identity, not skipped — the same snap is what places the interior, below). The
+        // two chain ends are ring boundverts and are already on it, so only the interior
+        // samples are touched.
         for chain in &chain_of {
             for &sample in chain.iter().take(seg).skip(1) {
-                let position = self.vertex_position(sample);
-                let snapped = center + radius * (position - center).normalize_or_zero();
+                let unit = octant.to_octant(self.vertex_position(sample));
+                let snapped = octant.to_world(snap_to_unit_superellipsoid(unit, exponent));
                 self.set_vertex_position(sample, snapped);
             }
         }
 
-        let even = seg % 2 == 0;
+        // Stage 1: the coarse net, in octant coordinates. Each sector is the quarter
+        // superellipse from `e_i` to `e_{i+1}` bulging toward the unit-square corner
+        // `e_i + e_{i+1}` — the same profile cell the world-space chain rides, expressed
+        // in the canonical frame, so the sector mid is the closed-form
+        // `2^(−1/r)·(e_i + e_{i+1})` the [S] sampler already produces there.
+        let unit_boundverts = [Vec3::X, Vec3::Y, Vec3::Z];
+        let profiles: Vec<RingChainProfile> = (0..sectors)
+            .map(|i| {
+                let start = unit_boundverts[i];
+                let end = unit_boundverts[(i + 1) % sectors];
+                RingChainProfile::Cell {
+                    cell: ProfileCell::from_control_points(start, end, start + end),
+                    profile,
+                }
+            })
+            .collect();
+        let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
+        let centre = Vec3::splat(
+            (1.0_f32 / 3.0).sqrt() * adj_octant_prescale(exponent, segments),
+        );
 
-        // Per sub-patch, its four corner positions: `B_i`, the chain-`i` inner end
-        // (`P0t`), the chain-`(i−1)` inner end (`Pt0`), and the inner corner (`Ptt`)
-        // — the welded apex for even `segments`, a distinct central-ring vert `G_i`
-        // for odd. Interior grid verts are the bilinear blend of these four, snapped
-        // to the sphere (§8.5.5.3).
-        let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
-        for i in 0..sectors {
-            let p00 = self.vertex_position(chain_of[i][0]);
-            let p0t = self.vertex_position(chain_of[i][half]);
-            let prev = (i + sectors - 1) % sectors;
-            let pt0 = self.vertex_position(chain_of[prev][seg - half]);
-            let ptt = if even {
-                center + radius * (vertex_position - center).normalize_or_zero()
-            } else {
-                // Odd centre ring: tilt the body-diagonal direction toward `B_i` so
-                // the three `G_i` form a small central `s`-gon around the diagonal,
-                // each on the sphere. The exact tilt is a free interior choice.
-                let diagonal = (vertex_position - center).normalize_or_zero();
-                let toward_boundvert = (p00 - center).normalize_or_zero();
-                let gamma = 1.0 / (half as f32 + 1.0);
-                center + radius * (diagonal + gamma * toward_boundvert).normalize_or_zero()
-            };
-            corners.push([p00, p0t, pt0, ptt]);
-        }
+        // Stages 2/3: the same subdivision-relaxation stencil and read-back the general
+        // ring runs (§8.5.5.5(c)/(d)) — here fed octant chains, so its output is in octant
+        // coordinates and stage 4 can snap it against the unit surface.
+        let net = adj_relaxed_net(&unit_boundverts, &mids, centre, &profiles, segments);
+        let axis = adj_interior_axis(&profiles, segments, 2 * net.half as u32);
 
         let representative = cut.representative_material(self);
         self.emit_adj_grid(
@@ -3509,14 +3532,35 @@ impl LoopMesh {
             half,
             even,
             &chain_of,
-            &AdjInterior::Blend {
-                corners: &corners,
-                placement: AdjPlacement::Sphere { center, radius },
+            &AdjInterior::Octant {
+                net: &net,
+                axis: &axis,
+                sectors,
+                segments: seg,
+                exponent,
+                octant,
             },
             material,
             representative,
             result,
         );
+    }
+
+    /// The affine `unit_to_corner` map of this tri-corner junction (BEVEL.md §8.5.2 /
+    /// §8.5.5.5(f.2)): the frame in which the whole [V-ADJ] grid is built. `None` when the
+    /// three boundverts and the corner are degenerate enough that the map is singular.
+    fn unit_octant(&self, cut: &JunctionCut) -> Option<UnitOctant> {
+        if cut.boundverts.len() != 3 {
+            return None;
+        }
+        UnitOctant::from_corner(
+            [
+                self.vertex_position(cut.boundverts[0]),
+                self.vertex_position(cut.boundverts[1]),
+                self.vertex_position(cut.boundverts[2]),
+            ],
+            self.vertex_position(cut.vertex),
+        )
     }
 
     /// Build the rounded adjacency-grid fill for a **general non-symmetric**
@@ -3599,6 +3643,7 @@ impl LoopMesh {
             &chain_of,
             &profiles,
             segments,
+            profile,
             flat,
             None,
             material,
@@ -6804,6 +6849,11 @@ struct MiterRingJunction {
     /// `Some` entries but steps over every entry (§6.7.5.4 case (5)).
     cross_edges: Vec<Option<EdgeKey>>,
     segments: u32,
+    /// The junction's `profile` scalar. The miter builders only ever admit the circular
+    /// exponent (a split sector's fill chain is a quarter-circle arc in its unit-square
+    /// frame), so this is `0.5` today — carried rather than re-asserted as a literal at the
+    /// fill, so widening the miter gate cannot silently leave the cap's fullness behind.
+    profile: f32,
 }
 
 impl MiterRingJunction {
@@ -12336,6 +12386,7 @@ mod tests {
         boundverts: &[Vec3],
         profiles: &[RingChainProfile],
         segments: u32,
+        fullness: f32,
     ) -> Vec<Vec3> {
         let sectors = boundverts.len();
         let seg = segments as usize;
@@ -12343,7 +12394,7 @@ mod tests {
         let even = seg % 2 == 0;
         let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
-        let seed = centroid + adj_fullness(segments) * (apex - centroid);
+        let seed = centroid + fullness * (apex - centroid);
         let net = adj_relaxed_net(boundverts, &mids, seed, profiles, segments);
         let axis = adj_interior_axis(profiles, segments, 2 * net.half as u32);
         let interior = AdjInterior::Relaxed {
@@ -12415,7 +12466,8 @@ mod tests {
         }
 
         // 4 sector-interior verts + 4 shared spokes + 1 welded centre.
-        let predicted = predicted_cap_interior(apex_position, &boundverts, &profiles, 4);
+        let predicted =
+            predicted_cap_interior(apex_position, &boundverts, &profiles, 4, adj_fullness(0.5, 4));
         assert_eq!(predicted.len(), 9);
         for position in &predicted {
             assert_eq!(
@@ -12428,7 +12480,7 @@ mod tests {
         // §8.5.5.5(b)/(c): the stencil *relaxes* the fullness seed — it does not emit it.
         // A bilinear blend of the sub-patch corners would leave the centre on the seed.
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 4.0;
-        let seed = centroid + adj_fullness(4) * (apex_position - centroid);
+        let seed = centroid + adj_fullness(0.5, 4) * (apex_position - centroid);
         let centre = predicted[predicted.len() - 1];
         assert!(
             (centre - seed).length() > 1.0e-3,
@@ -12476,7 +12528,13 @@ mod tests {
 
             let (boundverts, profiles) =
                 pyramid_apex_ring(apex_position, &base_positions, 0.3, 0.5);
-            let predicted = predicted_cap_interior(apex_position, &boundverts, &profiles, segments);
+            let predicted = predicted_cap_interior(
+                apex_position,
+                &boundverts,
+                &profiles,
+                segments,
+                adj_fullness(0.5, segments),
+            );
             for position in &predicted {
                 assert_eq!(
                     result_has_vert_near(&mesh, &result, *position),
@@ -12556,7 +12614,7 @@ mod tests {
         let (boundverts, profiles) = pyramid_apex_ring(apex_position, &base_positions, 0.3, 0.5);
         let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 5.0;
-        let seed = centroid + adj_fullness(4) * (apex_position - centroid);
+        let seed = centroid + adj_fullness(0.5, 4) * (apex_position - centroid);
 
         let coarse = AdjNet::coarse(&boundverts, &mids, seed);
         // The sharpening pulls each interior chain sample a sixth *away* from the mean of
@@ -13034,10 +13092,10 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.5.1: the forced-tri-corner trigger predicate read off the
-    /// boundvert ring. The symmetric equal-offset orthonormal cube corner at the
-    /// default circular profile fires it; an unequal-offset corner, a non-right-angle
-    /// corner, or a non-default profile all decline (the §8.5.5.5 deferred cases).
+    /// BEVEL.md §8.5.1: the forced-tri-corner trigger predicate read off the boundvert
+    /// ring. The symmetric equal-offset orthonormal cube corner fires it at every **smooth**
+    /// exponent (§8.5.5.5(f.1) step 3); an unequal-offset corner, a non-right-angle corner,
+    /// and the two square exponents all decline.
     #[test]
     fn adj_tri_corner_trigger_predicate() {
         let mut mesh = LoopMesh::new();
@@ -13063,9 +13121,31 @@ mod tests {
             mesh.adj_tri_corner_trigger(&cube, 0.5),
             "default-profile cube corner fires the §8.5.1 trigger",
         );
+        // §8.5.5.5(f.1) step 3: the *smooth* member of the tri-corner family is every
+        // exponent that is neither square nor square-in — the circle and the whole curved
+        // band alike, both of which the unit-octant grid of (f.2) builds.
         assert!(
-            !mesh.adj_tri_corner_trigger(&cube, 0.7),
-            "a curved profile declines (§8.5.5.5)",
+            mesh.adj_tri_corner_trigger(&cube, 0.7),
+            "a curved (bulging) profile fires the tri-corner family (§8.5.5.5(f.2))",
+        );
+        assert!(
+            mesh.adj_tri_corner_trigger(&cube, 0.3),
+            "a curved (near-linear) profile fires it too",
+        );
+        assert!(
+            !mesh.adj_tri_corner_trigger(&cube, 0.99),
+            "the square exponent takes its own closed-form grid (§8.5.5.5(f.5))",
+        );
+        assert!(
+            !mesh.adj_tri_corner_trigger(&cube, 0.0),
+            "square-in takes the degenerate weld (§8.5.5.5(f.4))",
+        );
+        // The straight chord is *not* an exception: (f.1) step 3's smooth arm is every `r`
+        // bar the two squares, and (f.2)'s own apex table lists `r = 1` (the flat chamfer
+        // plane) as a member. It builds the octant grid like any other smooth exponent.
+        assert!(
+            mesh.adj_tri_corner_trigger(&cube, 0.25),
+            "the straight chord (`r = 1`) is a smooth member too (§8.5.5.5(f.1) step 3)",
         );
 
         // Unequal offset: one spoke is twice as long, so the lengths differ.
@@ -13097,13 +13177,20 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.5.1 / §8.5.5.5: a non-default (curved) profile at the symmetric
-    /// cube corner fails the trigger's default-profile condition, so the
-    /// `segments ≥ 3` general fill (`build_adj_fill_general`) is declined rather than
-    /// snapping the interior onto a sphere it does not lie on. The through-strips
-    /// still build; the corner is simply left unfilled.
-    #[test]
-    fn adj_tri_corner_guard_declines_curved_profile_segments3() {
+    /// Bevel the §8.5.5.8 worked-oracle driver: the same symmetric equal-offset cube
+    /// corner at `offset = 0.25`, with an explicit `profile` (BEVEL.md §8.5.5.5(f.2)).
+    fn cube_corner_adj_profile(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+        cube_corner_adj_profile_offset(segments, profile, 0.25)
+    }
+
+    /// The same driver at an arbitrary bevel width. The corner's shape — and so every
+    /// tri-corner predicate that decides the fill path — is offset-independent; only the
+    /// scale changes.
+    fn cube_corner_adj_profile_offset(
+        segments: u32,
+        profile: f32,
+        offset: f32,
+    ) -> (LoopMesh, BevelResult) {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let e01 = cube_edge(
@@ -13116,62 +13203,742 @@ mod tests {
         let result = mesh.bevel(
             &[e01.into(), e03.into(), e04.into()],
             BevelOptions {
-                offset: 0.25,
+                offset,
                 affect: BevelAffect::Edges,
-                segments: 3,
-                profile: 0.7,
+                segments,
+                profile,
                 vmesh_method: BevelVmeshMethod::Adj,
                 ..Default::default()
             },
         );
+        (mesh, result)
+    }
+
+    /// The driver's corner-grid (cap) faces at an arbitrary bevel width: the `offset`-scaled
+    /// form of [`curved_corner_grid_faces`]. The frame origin `c` sits one `offset` inside
+    /// the corner along each axis, and the whole cap lies within `offset·√3` of it.
+    fn corner_grid_faces_at_offset(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        offset: f32,
+    ) -> Vec<FaceKey> {
+        let centre = Vec3::new(1.0, -1.0, -1.0) + offset * Vec3::new(-1.0, 1.0, 1.0);
+        let reach = offset * 3.0_f32.sqrt() * 1.05;
+        result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&f| {
+                mesh.face_vert_keys(f)
+                    .iter()
+                    .all(|&v| (mesh.vertex_position(v) - centre).length() <= reach)
+            })
+            .collect()
+    }
+
+    /// The §8.5.5.8 driver's octant coordinates of a world point: `c = (0.75, −0.75, −0.75)`
+    /// is the corner frame's origin and `offset = 0.25` its unit. Written out from the
+    /// guide's own axis relabelling rather than through the fill's map, so the check is
+    /// independent of the code under test.
+    fn cube_corner_octant(world: Vec3) -> Vec3 {
+        let c = Vec3::new(0.75, -0.75, -0.75);
+        Vec3::new(
+            (c.z - world.z) / 0.25,
+            (world.x - c.x) / 0.25,
+            (c.y - world.y) / 0.25,
+        )
+    }
+
+    /// The inverse: the world point of an octant coordinate on this driver.
+    fn cube_corner_world(unit: Vec3) -> Vec3 {
+        let c = Vec3::new(0.75, -0.75, -0.75);
+        Vec3::new(
+            c.x + 0.25 * unit.y,
+            c.y - 0.25 * unit.z,
+            c.z - 0.25 * unit.x,
+        )
+    }
+
+    /// The corner-grid (cap) verts of a curved-profile cube corner: every vert of the
+    /// result within `offset·√3` of the corner frame's origin `c`. A curved cap bulges past
+    /// the circular radius (the apex sits at `3^(−1/r)·√3` octant units out), so the
+    /// circular `1.2·R` ball of `adj_in_corner_ball` would miss it; the nearest strip
+    /// cross-section is a whole cube edge away, so this stays unambiguous.
+    fn curved_corner_grid_verts(mesh: &LoopMesh, result: &BevelResult) -> Vec<Vec3> {
+        result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|&p| (p - Vec3::new(0.75, -0.75, -0.75)).length() <= 0.25 * 3.0_f32.sqrt())
+            .collect()
+    }
+
+    fn curved_corner_grid_faces(mesh: &LoopMesh, result: &BevelResult) -> Vec<FaceKey> {
+        result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&f| {
+                mesh.face_vert_keys(f).iter().all(|&v| {
+                    (mesh.vertex_position(v) - Vec3::new(0.75, -0.75, -0.75)).length()
+                        <= 0.25 * 3.0_f32.sqrt()
+                })
+            })
+            .collect()
+    }
+
+    fn assert_position_present(verts: &[Vec3], expected: Vec3, what: &str) {
+        let hits = verts
+            .iter()
+            .filter(|&&p| (p - expected).length() < 1.0e-4)
+            .count();
+        assert_eq!(hits, 1, "{what} at {expected:?} (got {verts:?})");
+    }
+
+    /// BEVEL.md §8.5.5.8, the worked oracle: the curved-profile cube corner at
+    /// `segments = 3`, `profile = 0.7`. The exponent `r = 3.886716…` sits strictly between
+    /// the circle and square gates of the §8.6.2 snap, so it is genuinely curved: there is
+    /// no sphere to fit and no closed form anywhere in the construction. The whole grid is
+    /// built in the unit octant (§8.5.5.5(f.2)) — coarse net with the `1.4` pre-scaled
+    /// centre, one doubling round to 4, the resample back to 3, then the clamped `r`-norm
+    /// snap of every vert — and mapped to the corner once at the end.
+    ///
+    /// Twelve corner-grid verts at the oracle's own coordinates: three boundverts, six
+    /// chain interiors (the permutations of `(0, 0.583876, 0.966646)`) and the three verts
+    /// of the central triangle (the cyclic images of `(0.923438, 0.595228, 0.595228)`),
+    /// closed by one triangle and six quads — the odd-`segments` parity of §8.5.5.4.
+    #[test]
+    fn adj_cube_corner_curved_profile_segments_3_matches_worked_oracle() {
+        let (mesh, result) = cube_corner_adj_profile(3, 0.7);
         mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_eq!(verts.len(), 12, "twelve corner-grid verts (§8.5.5.8)");
+
+        for boundvert in [
+            Vec3::new(0.75, -0.75, -1.0),
+            Vec3::new(1.0, -0.75, -0.75),
+            Vec3::new(0.75, -1.0, -0.75),
+        ] {
+            assert_position_present(&verts, boundvert, "boundvert");
+        }
+        for chain_interior in [
+            Vec3::new(0.991662, -0.75, -0.895969),
+            Vec3::new(0.895969, -0.75, -0.991662),
+            Vec3::new(0.991662, -0.895969, -0.75),
+            Vec3::new(0.895969, -0.991662, -0.75),
+            Vec3::new(0.75, -0.991662, -0.895969),
+            Vec3::new(0.75, -0.895969, -0.991662),
+        ] {
+            assert_position_present(&verts, chain_interior, "chain interior");
+        }
+        for central in [
+            Vec3::new(0.898807, -0.898807, -0.980859),
+            Vec3::new(0.980859, -0.898807, -0.898807),
+            Vec3::new(0.898807, -0.980859, -0.898807),
+        ] {
+            assert_position_present(&verts, central, "central-triangle vert");
+        }
+
+        // §8.5.5.8's own self-check: every corner-grid vert lies on the unit superellipsoid
+        // in octant coordinates. A grid that skips or mis-orders the snap fails this on the
+        // interior even when its rim looks right.
+        let exponent = profile_to_exponent(0.7);
+        for &position in &verts {
+            let unit = cube_corner_octant(position);
+            let norm = unit.x.powf(exponent) + unit.y.powf(exponent) + unit.z.powf(exponent);
+            assert!(
+                (norm - 1.0).abs() < 1.0e-3,
+                "corner-grid vert on the unit superellipsoid: {position:?} → {unit:?}",
+            );
+        }
+
+        let faces = curved_corner_grid_faces(&mesh, &result);
+        let triangles = faces
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 3)
+            .count();
+        let quads = faces
+            .iter()
+            .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
+            .count();
+        assert_eq!(faces.len(), 7, "one central triangle + six quads (§8.5.5.8)");
+        assert_eq!(triangles, 1);
+        assert_eq!(quads, 6);
+    }
+
+    /// BEVEL.md §8.5.5.5(f.2), the PRESCALE: the coarse centre is seeded at
+    /// `√⅓·(1,1,1)·1.4` for every exponent in the bulging band (`r > 1.5` — which the
+    /// circular exponent is inside, not just the curved ones). It is *invisible in the
+    /// apex* (the snap is a radial projection, and radial projection is scale-invariant)
+    /// and *visible one ring in*, so the §8.5.5.8 central triangle is the only place it can
+    /// be seen — and it is what this pins. Dropping the pre-scale moves those three verts
+    /// to the cyclic images of octant `(0.936247, 0.570578, 0.570578)`, ≈`0.006` world
+    /// units off the oracle: far outside the position bucket, and not a Tier-2 free choice.
+    #[test]
+    fn adj_cube_corner_curved_profile_prescale_places_the_central_triangle() {
+        let (mesh, result) = cube_corner_adj_profile(3, 0.7);
+        let verts = curved_corner_grid_verts(&mesh, &result);
+
+        for oracle in [
+            Vec3::new(0.923438, 0.595228, 0.595228),
+            Vec3::new(0.595228, 0.923438, 0.595228),
+            Vec3::new(0.595228, 0.595228, 0.923438),
+        ] {
+            assert_position_present(
+                &verts,
+                cube_corner_world(oracle),
+                "the 1.4-pre-scaled central-triangle vert",
+            );
+        }
+        for unscaled in [
+            Vec3::new(0.936247, 0.570578, 0.570578),
+            Vec3::new(0.570578, 0.936247, 0.570578),
+            Vec3::new(0.570578, 0.570578, 0.936247),
+        ] {
+            let world = cube_corner_world(unscaled);
+            assert_eq!(
+                verts
+                    .iter()
+                    .filter(|&&p| (p - world).length() < 1.0e-4)
+                    .count(),
+                0,
+                "the un-pre-scaled centre is never emitted",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.8's second companion driver: `profile = 0.3` (`r = 1.151433`) at
+    /// `segments = 3`. The exponent lands in the **middle** band of the PRESCALE rule
+    /// (`0.75 ≤ r ≤ 1.5`), so the coarse centre carries **no** pre-scale — the bracket that
+    /// proves the `1.4` is banded on `r` rather than applied unconditionally. Twelve verts
+    /// again: the chain interiors are the permutations of `(0, 0.375476, 0.711987)` and the
+    /// central triangle the cyclic images of `(0.517127, 0.316617, 0.316617)`.
+    #[test]
+    fn adj_cube_corner_curved_profile_segments_3_middle_band_no_prescale() {
+        let (mesh, result) = cube_corner_adj_profile(3, 0.3);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_eq!(verts.len(), 12);
+
+        assert_eq!(adj_octant_prescale(profile_to_exponent(0.3), 3), 1.0);
+        for chain_interior in [
+            Vec3::new(0.0, 0.375476, 0.711987),
+            Vec3::new(0.0, 0.711987, 0.375476),
+            Vec3::new(0.375476, 0.0, 0.711987),
+            Vec3::new(0.711987, 0.0, 0.375476),
+            Vec3::new(0.375476, 0.711987, 0.0),
+            Vec3::new(0.711987, 0.375476, 0.0),
+        ] {
+            assert_position_present(
+                &verts,
+                cube_corner_world(chain_interior),
+                "chain interior",
+            );
+        }
+        for central in [
+            Vec3::new(0.517127, 0.316617, 0.316617),
+            Vec3::new(0.316617, 0.517127, 0.316617),
+            Vec3::new(0.316617, 0.316617, 0.517127),
+        ] {
+            assert_position_present(&verts, cube_corner_world(central), "central-triangle vert");
+        }
+
+        let faces = curved_corner_grid_faces(&mesh, &result);
+        assert_eq!(faces.len(), 7, "one central triangle + six quads");
+    }
+
+    /// BEVEL.md §8.5.5.5(f.2), the closed-form apex: on **even** `segments` the cube corner
+    /// welds one apex vertex, and it is a pure function of the exponent —
+    /// `3^(−1/r)·(1,1,1)` in octant coordinates, for every `r`. At `profile = 0.7` that is
+    /// `0.753778·(1,1,1)`, world `(0.938444, −0.938444, −0.938444)`, and it is the *same*
+    /// point at `segments = 2` (where the coarse net is the target grid, no subdivision
+    /// runs, and the pre-scale is guarded off) and at `segments = 4` (where a doubling
+    /// round and the `1.4` pre-scale both run, and the radial snap makes them invisible in
+    /// the apex — which is exactly why the apex must not be used to "verify" the
+    /// pre-scale).
+    #[test]
+    fn adj_cube_corner_curved_profile_even_apex_is_the_exponent_closed_form() {
+        let exponent = profile_to_exponent(0.7);
+        let apex = cube_corner_world(Vec3::splat(3.0_f32.powf(-1.0 / exponent)));
+        assert!((apex - Vec3::new(0.938444, -0.938444, -0.938444)).length() < 1.0e-5);
+        assert_eq!(adj_octant_prescale(exponent, 2), 1.0, "the seg ≤ 2 guard");
+        assert_eq!(adj_octant_prescale(exponent, 4), 1.4, "the bulging band");
+
+        // `segments = 2`: the three-quad pinwheel of §8.5.3, its apex the octant closed
+        // form rather than a circumsphere fit (a curved corner has no sphere at all).
+        let (mesh, result) = cube_corner_adj_profile(2, 0.7);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_eq!(verts.len(), 7, "3 boundverts + 3 chain mids + the apex");
+        assert_position_present(&verts, apex, "the seg = 2 welded apex");
         assert_eq!(
-            adj_patch_faces(&mesh, &result).len(),
-            0,
-            "curved-profile cube corner declines the §8.5.5 general fill",
+            curved_corner_grid_faces(&mesh, &result).len(),
+            3,
+            "the three-quad pinwheel",
         );
+
+        // `segments = 4`: the same apex, now the welded centre of the subdivided grid, with
+        // 3·(segments/2)² = 12 quads and no central face.
+        let (mesh, result) = cube_corner_adj_profile(4, 0.7);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_position_present(&verts, apex, "the seg = 4 welded apex");
+        let faces = curved_corner_grid_faces(&mesh, &result);
+        assert_eq!(faces.len(), 12, "3·(segments/2)² sub-patch quads");
+        for &face in &faces {
+            assert_eq!(mesh.face_vert_keys(face).len(), 4, "no central face at even parity");
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.2)'s snap, and why it is three branches rather than one formula.
+    /// The circular exponent normalises **unclamped**, so a vert the smoothing pushed a hair
+    /// past a sector seam keeps its sign and stays a hair outside; a curved exponent must
+    /// clamp into the octant first, because a negative base raised to a fractional power is
+    /// `NaN`. Clamping the circular branch too would move those verts, and a curved branch
+    /// without the clamp produces nothing at all.
+    #[test]
+    fn adj_octant_snap_branches_on_the_exponent() {
+        let overshoot = Vec3::new(0.9, 0.5, -0.02);
+
+        let circular = snap_to_unit_superellipsoid(overshoot, 2.0);
+        assert!((circular.length() - 1.0).abs() < 1.0e-6, "unit-norm");
+        assert!(circular.z < 0.0, "the circular branch keeps the negative component");
+
+        let curved = snap_to_unit_superellipsoid(overshoot, profile_to_exponent(0.7));
+        assert!(curved.is_finite(), "the curved branch clamps rather than NaN-ing");
+        assert_eq!(curved.z, 0.0, "and folds the overshoot onto the seam plane");
+        let exponent = profile_to_exponent(0.7);
+        let norm = curved.x.powf(exponent) + curved.y.powf(exponent) + curved.z.powf(exponent);
+        assert!((norm - 1.0).abs() < 1.0e-5, "on the unit superellipsoid");
+
+        // A point already on the surface is a fixed point of either branch.
+        let on_surface = Vec3::splat(3.0_f32.powf(-1.0 / exponent));
+        assert!((snap_to_unit_superellipsoid(on_surface, exponent) - on_surface).length() < 1.0e-6);
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) step 3 + (f.2): the **flat chamfer** (`profile = 0.25`,
+    /// `r = 1`) is a member of the tri-corner family's smooth arm, not an exception to it —
+    /// the arm is "every `r` that is neither `EXP_SQUARE` nor `EXP_SQUARE_IN`", and (f.2)'s
+    /// closed-form apex table lists `r = 1.000000 -> 0.333333·(1,1,1)` explicitly. So a flat
+    /// cube corner **builds the octant grid**: branch R of the snap degenerates to a 1-norm
+    /// radial projection, whose unit surface is the plane `x + y + z = 1` — the chamfer
+    /// plane through the three boundverts — and whose apex is the boundvert centroid.
+    ///
+    /// The pin that matters is the *interior*: a planar bilinear cap would also land the
+    /// apex on the centroid (which is why the apex alone proves nothing here), but its ring
+    /// of interior verts is a different set of points on the same plane. The octant grid
+    /// runs the coarse net (pre-scale `1.0`, the near-linear band), one doubling round and
+    /// the resample, then projects — so every cap vert lies on the plane, and the cap is the
+    /// odd-parity twelve-vert / seven-face grid of §8.5.5.4, not a fan.
+    #[test]
+    fn adj_cube_corner_flat_chamfer_builds_the_octant_grid() {
+        assert_eq!(profile_to_exponent(0.25), 1.0, "the §8.6.2 snap makes `r == 1` exact");
         assert_eq!(
+            adj_octant_prescale(1.0, 3),
+            1.0,
+            "`r = 1` sits in the near-linear PRESCALE band (0.75 ..= 1.5)",
+        );
+
+        let (mesh, result) = cube_corner_adj_profile(3, 0.25);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_eq!(verts.len(), 12, "3 boundverts + 6 chain interiors + 3 central-triangle verts");
+
+        // The whole cap — rim and interior alike — lands on the unit 1-norm surface, i.e.
+        // the flat chamfer plane. This is what routing `r = 1` through branch R *means*.
+        for &world in &verts {
+            let unit = cube_corner_octant(world);
+            assert!(
+                (unit.x + unit.y + unit.z - 1.0).abs() < 1.0e-4,
+                "cap vert {unit:?} is off the chamfer plane x + y + z = 1",
+            );
+        }
+
+        let faces = curved_corner_grid_faces(&mesh, &result);
+        assert_eq!(faces.len(), 7, "one central triangle + six quads (§8.5.5.4 odd parity)");
+
+        // Even parity: the welded apex is (f.2)'s `3^(−1/1)·(1,1,1)` — the boundvert
+        // centroid — and the cap is the twelve-quad grid with no central face.
+        let (mesh, result) = cube_corner_adj_profile(4, 0.25);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_position_present(
+            &verts,
+            cube_corner_world(Vec3::splat(1.0 / 3.0)),
+            "the flat chamfer's welded apex",
+        );
+        let faces = curved_corner_grid_faces(&mesh, &result);
+        assert_eq!(faces.len(), 12, "3·(segments/2)² sub-patch quads");
+        for &face in &faces {
+            assert_eq!(mesh.face_vert_keys(face).len(), 4, "no central face at even parity");
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.2)'s PRESCALE, third band: a **curved-in** exponent (`r < 0.75`)
+    /// seeds the coarse centre *hollow*, at `0.6·√⅓·(1,1,1)`, rather than bulged. The band
+    /// is keyed on `r`, not on `profile`, so `profile = 0.1` (`r ≈ 0.602`) is the bracket
+    /// below the near-linear band that the `0.3` / `0.7` drivers bracket from above. The
+    /// seed is invisible in the apex — the snap is radial — so the observable is that the
+    /// grid still closes and still lands every vert on the unit superellipsoid.
+    #[test]
+    fn adj_octant_hollow_band_prescale_and_membership() {
+        let exponent = profile_to_exponent(0.1);
+        assert!(exponent < 0.75 && exponent > 0.0, "`profile = 0.1` is genuinely curved-in");
+        assert_eq!(adj_octant_prescale(exponent, 3), 0.6, "the hollow band");
+        assert_eq!(adj_octant_prescale(exponent, 2), 1.0, "still guarded off at seg ≤ 2");
+
+        let (mesh, result) = cube_corner_adj_profile(3, 0.1);
+        mesh.validate_topology();
+        let verts = curved_corner_grid_verts(&mesh, &result);
+        assert_eq!(verts.len(), 12);
+        for &world in &verts {
+            let unit = cube_corner_octant(world);
+            let norm =
+                unit.x.powf(exponent) + unit.y.powf(exponent) + unit.z.powf(exponent);
+            assert!(
+                (norm - 1.0).abs() < 1.0e-3,
+                "cap vert {unit:?} is off the unit superellipsoid (r-norm {norm})",
+            );
+        }
+        assert_eq!(curved_corner_grid_faces(&mesh, &result).len(), 7);
+    }
+
+    /// Bevel the four slant edges of the square pyramid's apex with the ADJ vmesh at an
+    /// explicit `segments` / `profile`: a **general, non-tri-corner** ring (valence `s = 4`),
+    /// so the tri-corner family of §8.5.5.5(f.1) step 3 never applies to it.
+    fn pyramid_apex_adj(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let slants = [
+            mesh.query_edge_exists(apex, b0).expect("slant 0"),
+            mesh.query_edge_exists(apex, b1).expect("slant 1"),
+            mesh.query_edge_exists(apex, b2).expect("slant 2"),
+            mesh.query_edge_exists(apex, b3).expect("slant 3"),
+        ];
+        let result = mesh.bevel(
+            &slants.map(Into::into),
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// The **general ring** at a curved exponent is still declined (BEVEL.md §8.5.5.5(f) —
+    /// the profile-grid variants are distilled for the tri-corner family; the curved general
+    /// ring's `fullness` refit is not yet filled). The decline is a clean one, and that is
+    /// what this pins: the valence-4 pyramid apex at `profile = 0.7` emits **no** cap face,
+    /// leaves every through-strip and rebuilt face standing, and the mesh stays valid — the
+    /// junction is simply left open. The circular run of the same corner is the contrast: it
+    /// takes the fullness cap of (a)–(e) and fills, with an otherwise identical face set.
+    #[test]
+    fn adj_general_ring_declines_curved_profile_cleanly() {
+        let apex_cap_faces = |mesh: &LoopMesh, result: &BevelResult| -> usize {
             result
-                .verts
+                .faces
                 .iter()
-                .filter(|&&v| (mesh.vertex_position(v) - adj_apex_position()).length() < 1.0e-4)
-                .count(),
+                .filter(|&&f| {
+                    mesh.face_vert_keys(f)
+                        .iter()
+                        .all(|&v| mesh.vertex_position(v).z > 0.6)
+                })
+                .count()
+        };
+
+        let (curved_mesh, curved) = pyramid_apex_adj(3, 0.7);
+        curved_mesh.validate_topology();
+        assert_eq!(
+            apex_cap_faces(&curved_mesh, &curved),
             0,
-            "no central body-diagonal vertex emitted when the trigger declines",
+            "a curved exponent at a non-tri-corner ring emits no cap at all",
+        );
+
+        let (circular_mesh, circular) = pyramid_apex_adj(3, 0.5);
+        circular_mesh.validate_topology();
+        let filled = apex_cap_faces(&circular_mesh, &circular);
+        assert!(filled > 0, "the circular general ring does fill its cap");
+
+        // Everything but the cap survives the decline: the curved run's face set is the
+        // circular run's minus exactly the cap it declined to build.
+        assert_eq!(
+            curved.faces.len(),
+            circular.faces.len() - filled,
+            "the through-strips and rebuilt faces are untouched by the decline",
         );
     }
 
-    /// BEVEL.md §8.5.1 / §8.5.5.5: the same default-profile guard covers the
-    /// closed-form `segments = 2` pinwheel path. A curved profile declines the
-    /// pinwheel, leaving only the 6 through-strip quads (vs the 9 = 6 strip + 3
-    /// pinwheel of the supported default-profile cube corner).
+    /// The two **square** exponents are the tri-corner family's other two arms
+    /// (§8.5.5.5(f.5) the three-square / parallel-offset grid, (f.4) the degenerate weld),
+    /// and neither is filled yet. They are refused *before* the octant grid — a square
+    /// exponent must never reach it, since `r = 1e4` makes branch R's powers numerically
+    /// dead ((f.2)'s snap note) — and the refusal is clean: the cube corner reaches the ADJ
+    /// dispatch, builds its strips, emits no cap, and stays a valid mesh.
     #[test]
-    fn adj_tri_corner_guard_declines_curved_profile_segments2() {
-        let mut mesh = LoopMesh::new();
-        mesh_add_cube(&mut mesh);
-        let e01 = cube_edge(
-            &mesh,
-            Vec3::new(1.0, -1.0, -1.0),
-            Vec3::new(-1.0, -1.0, -1.0),
+    fn adj_cube_corner_square_exponents_decline_cleanly() {
+        assert!(!adj_octant_exponent(profile_to_exponent(0.99)), "square is refused");
+        assert!(!adj_octant_exponent(profile_to_exponent(0.0)), "square-in is refused");
+
+        for profile in [0.99_f32, 0.0] {
+            let (mesh, result) = cube_corner_adj_profile(3, profile);
+            mesh.validate_topology();
+            assert_eq!(
+                curved_corner_grid_faces(&mesh, &result).len(),
+                0,
+                "profile {profile}: no cap face is emitted",
+            );
+            // Three beveled edges × `segments` cross-sections: the strips are untouched by
+            // the cap's decline, the junction is simply left open.
+            assert_eq!(
+                result.faces.len(),
+                9,
+                "profile {profile}: all 3·3 beveled-edge strip quads are still built",
+            );
+        }
+    }
+
+    /// B1 regression (BEVEL.md §8.5.5.5(f.2)): the unit-octant frame's conditioning test is
+    /// **scale-free**. The frame's three axes are the corner's boundvert spokes, so its raw
+    /// determinant is `±offset³` at the symmetric cube corner — an absolute threshold on it
+    /// would refuse an ordinary narrow bevel and leave the junction an unfilled hole. A
+    /// `1e-4` offset is four orders of magnitude below the fixtures' width and still a
+    /// perfectly conditioned corner: every fill path that rides the octant frame (the
+    /// circular and curved `segments ≥ 3` grids, and the non-circular `segments = 2` apex)
+    /// must build its cap there exactly as at `offset = 0.25`.
+    #[test]
+    fn adj_cube_corner_narrow_offset_still_builds_the_octant_cap() {
+        let offset = 1.0e-4_f32;
+
+        for (segments, profile, cap_faces) in [
+            (3_u32, 0.5_f32, 7_usize), // circular grid: 6 seam quads + 1 central triangle
+            (3, 0.7, 7),               // curved grid: same topology, bulged
+            (4, 0.7, 12),              // curved grid, even parity: welded apex, 3·(4/2)² quads
+            (2, 0.25, 3),              // flat chamfer apex: the three-quad pinwheel
+        ] {
+            let (mesh, result) = cube_corner_adj_profile_offset(segments, profile, offset);
+            mesh.validate_topology();
+            assert_eq!(
+                corner_grid_faces_at_offset(&mesh, &result, offset).len(),
+                cap_faces,
+                "segments {segments} / profile {profile}: the cap builds at a narrow offset",
+            );
+        }
+
+        // The frame is refused only for a genuinely degenerate *shape*, never for a small
+        // one: a flattened (coplanar-spoke) corner still declines.
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        assert!(
+            UnitOctant::from_corner(
+                [
+                    corner + Vec3::new(offset, 0.0, 0.0),
+                    corner + Vec3::new(0.0, offset, 0.0),
+                    corner + Vec3::new(offset, offset, 0.0),
+                ],
+                corner,
+            )
+            .is_none(),
+            "coplanar spokes are still singular, at any scale",
         );
-        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
-        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        assert!(
+            UnitOctant::from_corner(
+                [
+                    corner + Vec3::new(offset, 0.0, 0.0),
+                    corner + Vec3::new(0.0, offset, 0.0),
+                    corner + Vec3::new(0.0, 0.0, offset),
+                ],
+                corner,
+            )
+            .is_some(),
+            "an orthonormal corner is well conditioned at any scale",
+        );
+    }
+
+    /// B2 (BEVEL.md §8.5.5.5(f.2)): the flat chamfer (`r = 1`) is a member of the tri-corner
+    /// family, so a `segments = 2` cube corner at `profile = 0.25` takes the forced pinwheel
+    /// — *not* the general ring's `fullness = 0` planar cap — and its apex is the octant
+    /// closed form `3^(−1/1)·(1,1,1)`, i.e. the boundvert centroid on the chamfer plane. The
+    /// The forced pinwheel and the general grid orient their faces by different rules (the
+    /// pinwheel opposes the arriving strip's traversal of the shared rim edge; the general
+    /// grid flips against an anchor below the cap), so the reroute has to be shown
+    /// winding-neutral as well as position-neutral. The reference is the **circular**
+    /// `segments = 2` corner, whose pinwheel is the strictly-pinned forced case (§8.5.4):
+    /// the flat corner emits the same three faces over the same rim, traversed in the same
+    /// direction, differing only in where the apex sits.
+    #[test]
+    fn adj_cube_corner_flat_chamfer_segments_2_pinwheel() {
+        let (mesh, result) = cube_corner_adj_profile(2, 0.25);
+        mesh.validate_topology();
+        assert_eq!(profile_to_exponent(0.25), 1.0, "profile 0.25 is the straight chord");
+
+        let cap = curved_corner_grid_faces(&mesh, &result);
+        assert_eq!(cap.len(), 3, "the three-quad pinwheel (§8.5.3), no central face");
+        for &face in &cap {
+            assert_eq!(mesh.face_vert_keys(face).len(), 4, "each pinwheel cell is a quad");
+        }
+
+        // The apex: `unit_to_corner`'s image of `3^(−1) ·(1,1,1)` is the mean of the three
+        // boundverts, each the in-face meet point one offset from both of its face's beveled
+        // edges (so `offset·√2` from the corner along a face diagonal, invariant 1).
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let boundverts = [
+            corner + Vec3::new(-0.25, 0.25, 0.0),
+            corner + Vec3::new(-0.25, 0.0, 0.25),
+            corner + Vec3::new(0.0, 0.25, 0.25),
+        ];
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 3.0;
+        let apex: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - centroid).length() < 1.0e-5)
+            .collect();
+        assert_eq!(apex.len(), 1, "one welded apex, at the boundvert centroid");
+        assert_eq!(
+            mesh.face_keys()
+                .into_iter()
+                .filter(|&f| mesh.face_vert_keys(f).contains(&apex[0]))
+                .count(),
+            3,
+            "the three pinwheel quads share it",
+        );
+
+        for &face in &cap {
+            for loop_key in mesh.face_loop_keys(face) {
+                assert_eq!(
+                    mesh.edge_loop_keys(mesh.loop_edge(loop_key)).len(),
+                    2,
+                    "every cap edge is radial-2 — the cap shares the rim, it does not re-mint it",
+                );
+            }
+        }
+
+        // Winding: identical to the circular corner's, face for face. Both runs build the
+        // same rim in the same order, so a cap face's *cyclic key sequence* is its winding;
+        // rotating each to start at its apex makes the three comparable as a set.
+        let cap_winding = |mesh: &LoopMesh, faces: &[FaceKey], apex: VertexKey| {
+            let mut wound: Vec<Vec<VertexKey>> = faces
+                .iter()
+                .map(|&face| {
+                    let verts = mesh.face_vert_keys(face);
+                    let at = verts.iter().position(|&v| v == apex).expect("apex corner");
+                    verts.iter().cycle().skip(at).take(verts.len()).copied().collect()
+                })
+                .collect();
+            wound.sort_by_key(|face| face[1].as_usize());
+            wound
+        };
+
+        let (round_mesh, round_result) = cube_corner_adj_profile(2, 0.5);
+        let round_cap = curved_corner_grid_faces(&round_mesh, &round_result);
+        let round_apex = round_result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| (round_mesh.vertex_position(v) - adj_apex_position()).length() < 1.0e-4)
+            .expect("the circular corner's sphere-snapped apex");
+        assert_eq!(
+            cap_winding(&mesh, &cap, apex[0]),
+            cap_winding(&round_mesh, &round_cap, round_apex),
+            "the flat chamfer's pinwheel winds exactly as the pinned circular one",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.3), the `fullness` law. The circular table runs to
+    /// `segments = 11` and **stops**: at 12 and beyond even the circular profile falls
+    /// through to the regression F3, which lands *below* every table entry from 5 up. The
+    /// law genuinely steps down there — an implementation that extrapolates the table's
+    /// trend ("large odd counts settle toward ≈0.647") is ≈0.07 of fullness off. F3 is a
+    /// regression in the raw `profile` scalar, not in the exponent, and it is free to
+    /// exceed `1` on a bulging profile.
+    #[test]
+    fn adj_fullness_law() {
+        // F2: the straight chord is exactly zero, and the circular table is exact.
+        assert_eq!(adj_fullness(0.25, 4), 0.0);
+        for (segments, expected) in [
+            (2_u32, 0.559_f32),
+            (3, 0.642),
+            (4, 0.551),
+            (5, 0.646),
+            (6, 0.624),
+            (7, 0.646),
+            (8, 0.619),
+            (9, 0.647),
+            (10, 0.639),
+            (11, 0.647),
+        ] {
+            assert_eq!(adj_fullness(0.5, segments), expected, "circle at n = {segments}");
+        }
+
+        // F3: the table's end is a step *down*, not an asymptote.
+        assert!((adj_fullness(0.5, 12) - 0.598664).abs() < 1.0e-5);
+        assert!((adj_fullness(0.5, 13) - 0.577726).abs() < 1.0e-5);
+        assert!(
+            adj_fullness(0.5, 13) < adj_fullness(0.5, 11),
+            "the circular law steps down past the table, it does not settle upward",
+        );
+
+        // F3 on the curved band, in the raw `profile` scalar. `fullness > 1` is normal on a
+        // bulging profile: the fit seeds the centre *past* the original corner `v`.
+        assert!((adj_fullness(0.7, 3) - 1.048906).abs() < 1.0e-5);
+        assert!((adj_fullness(0.7, 4) - 1.088808).abs() < 1.0e-5);
+        assert!((adj_fullness(0.3, 3) - 0.103506).abs() < 1.0e-5);
+    }
+
+    /// BEVEL.md §8.5.5.5(f.3): the extended table is not just tabulated, it is *applied*.
+    /// At `segments = 8` the general valence-4 cap seeds its centre with the table's
+    /// `0.619` — the entry a table truncated at 6 could not have — and the extrapolated
+    /// `0.63` an implementation would otherwise reach for lands the relaxed centre
+    /// somewhere else entirely.
+    #[test]
+    fn adj_fullness_table_past_six_is_applied_to_the_cap() {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let apex_position = mesh.vertex_position(apex);
+        let base: Vec<Vec3> = [b0, b1, b2, b3]
+            .iter()
+            .map(|&b| mesh.vertex_position(b))
+            .collect();
+        let slants: Vec<GeomKey> = [b0, b1, b2, b3]
+            .iter()
+            .map(|&b| mesh.query_edge_exists(apex, b).expect("slant edge").into())
+            .collect();
         let result = mesh.bevel(
-            &[e01.into(), e03.into(), e04.into()],
+            &slants,
             BevelOptions {
-                offset: 0.25,
+                offset: 0.3,
                 affect: BevelAffect::Edges,
-                segments: 2,
-                profile: 0.7,
+                segments: 8,
                 vmesh_method: BevelVmeshMethod::Adj,
                 ..Default::default()
             },
         );
         mesh.validate_topology();
+
+        let (boundverts, profiles) = pyramid_apex_ring(apex_position, &base, 0.3, 0.5);
+        assert_eq!(adj_fullness(0.5, 8), 0.619);
+        let tabulated =
+            predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.619);
+        let extrapolated =
+            predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.63);
+        let centre = tabulated[tabulated.len() - 1];
+        let wrong_centre = extrapolated[extrapolated.len() - 1];
+        assert!(
+            (centre - wrong_centre).length() > 1.0e-4,
+            "the two seeds are distinguishable at the emitted centre",
+        );
         assert_eq!(
-            result.faces.len(),
-            6,
-            "curved-profile seg=2 corner declines the pinwheel: 6 strip quads only",
+            result_has_vert_near(&mesh, &result, centre),
+            1,
+            "the cap centre is the net seeded with the table's n = 8 entry",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, wrong_centre),
+            0,
+            "and not the net seeded with the truncated table's extrapolation",
         );
     }
 
@@ -18047,6 +18814,25 @@ impl ProfileCell {
         }
     }
 
+    /// Build the cell from its three control points directly, with **no** beveled-edge
+    /// projection (BEVEL.md §8.2.2.1: the projection exists to land a world cross-section
+    /// on the crossed edge's mid-plane, and a cell whose control points already lie in the
+    /// plane they belong to has nothing to project). This is what the unit-octant grid of
+    /// §8.5.5.5(f.2) samples its sector arcs from: `start` / `end` are two octant axis
+    /// points and `mid` their unit-square corner.
+    fn from_control_points(start: Vec3, end: Vec3, mid: Vec3) -> Self {
+        let cross = (mid - start).cross(mid - end);
+        let collinear = cross.length() <= 1.0e-6;
+        ProfileCell {
+            start,
+            end,
+            mid,
+            mid_plane_normal: if collinear { Vec3::ZERO } else { cross.normalize() },
+            edge_dir: Vec3::ZERO,
+            collinear,
+        }
+    }
+
     /// §8.2.2.1 terminal-far-end plane override: replace the default `start–mid–end`
     /// mid-plane normal with the normal of the triangle through the terminal vertex
     /// and the two chain endpoints, so the projection lands the far-end cross-section
@@ -18542,45 +19328,17 @@ fn line_line_nearest_on_first(p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3) -> Option<
     Some(p0 + d0n * t)
 }
 
-/// How an adjacency-grid vert is placed from its bilinear sub-patch blend
-/// (BEVEL.md §8.5.5): the cube corner snaps onto the corner sphere of radius
-/// `offset` (§8.5.5.3); the flat (`r = 1`) planar cap has no such sphere and keeps the
-/// raw blend on the boundvert ring plane (§8.3.0.2.1). `anchor` is the interior point
-/// below the cap used to orient face winding outward.
-#[derive(Clone, Copy)]
-enum AdjPlacement {
-    Sphere { center: Vec3, radius: f32 },
-    Fullness { anchor: Vec3 },
-}
-
-impl AdjPlacement {
-    fn place(self, blended: Vec3) -> Vec3 {
-        match self {
-            AdjPlacement::Sphere { center, radius } => {
-                center + radius * (blended - center).normalize_or_zero()
-            }
-            AdjPlacement::Fullness { .. } => blended,
-        }
-    }
-
-    fn anchor(self) -> Vec3 {
-        match self {
-            AdjPlacement::Sphere { center, .. } => center,
-            AdjPlacement::Fullness { anchor } => anchor,
-        }
-    }
-}
-
 /// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
 /// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
 /// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
 enum AdjInterior<'a> {
-    /// The bilinear sub-patch blend, then `placement`. Used by the closed-form
-    /// tri-corner cap (blend → superellipsoid snap, §8.5.5.3) and by the flat `r = 1`
-    /// planar cap, whose `fullness = 0` net carries no curvature to relax (§8.3.0.2.1).
+    /// The raw bilinear sub-patch blend. Used by the flat (`r = 1`) planar cap, whose
+    /// `fullness = 0` net carries no curvature to relax and no surface to snap onto — the
+    /// blend *is* the fill (§8.3.0.2.1). `anchor` is the interior point below the cap that
+    /// orients face winding outward.
     Blend {
         corners: &'a [[Vec3; 4]],
-        placement: AdjPlacement,
+        anchor: Vec3,
     },
     /// The §8.5.5.5(c) subdivision-relaxation net, read back at the target resolution by
     /// the §8.5.5.5(d) kernel — bilinear within the source quad, against each axis's own
@@ -18597,13 +19355,31 @@ enum AdjInterior<'a> {
         segments: usize,
         anchor: Vec3,
     },
+    /// The same §8.5.5.5(c)/(d) net and read-back, but carried in **unit-octant**
+    /// coordinates (§8.5.5.5(f.2)): each interior vert is read off the octant net, snapped
+    /// onto the unit superellipsoid `u_x^r + u_y^r + u_z^r = 1`, and only then mapped into
+    /// the corner. The snap is what the world-space sphere projection of §8.5.5.3 is a
+    /// special case of; the map is applied once, at the very end, so nothing downstream
+    /// needs the corner's (non-existent, for curved `r`) circumsphere.
+    Octant {
+        net: &'a AdjNet,
+        axis: &'a [Vec<f32>],
+        sectors: usize,
+        segments: usize,
+        exponent: f32,
+        octant: UnitOctant,
+    },
 }
 
 impl AdjInterior<'_> {
     fn anchor(&self) -> Vec3 {
         match self {
-            AdjInterior::Blend { placement, .. } => placement.anchor(),
+            AdjInterior::Blend { anchor, .. } => *anchor,
             AdjInterior::Relaxed { anchor, .. } => *anchor,
+            // The octant origin's image is the corner sphere centre `c` — inside the solid,
+            // below the cap, so it orients the patch winding outward exactly as the sphere
+            // centre does on the circular path.
+            AdjInterior::Octant { octant, .. } => octant.origin(),
         }
     }
 
@@ -18612,15 +19388,14 @@ impl AdjInterior<'_> {
     /// to one position.
     fn position(&self, i: usize, j: usize, k: usize, half: usize) -> Vec3 {
         match self {
-            AdjInterior::Blend { corners, placement } => {
+            AdjInterior::Blend { corners, .. } => {
                 let [p00, p0t, pt0, ptt] = corners[i];
                 let s = k as f32 / half as f32;
                 let u = j as f32 / half as f32;
-                let blended = p00 * ((1.0 - s) * (1.0 - u))
+                p00 * ((1.0 - s) * (1.0 - u))
                     + p0t * (s * (1.0 - u))
                     + pt0 * ((1.0 - s) * u)
-                    + ptt * (s * u);
-                placement.place(blended)
+                    + ptt * (s * u)
             }
             AdjInterior::Relaxed {
                 net,
@@ -18638,8 +19413,177 @@ impl AdjInterior<'_> {
                 let along_previous = resolution - axis[previous][segments - j];
                 net.sample(i, along_previous, along_chain)
             }
+            AdjInterior::Octant {
+                net,
+                axis,
+                sectors,
+                segments,
+                exponent,
+                octant,
+            } => {
+                let resolution = (2 * net.half) as f32;
+                let previous = (i + sectors - 1) % sectors;
+                let along_chain = axis[i][k];
+                let along_previous = resolution - axis[previous][segments - j];
+                let unit = net.sample(i, along_previous, along_chain);
+                octant.to_world(snap_to_unit_superellipsoid(unit, *exponent))
+            }
         }
     }
+}
+
+/// The affine `unit_to_corner` frame of a tri-corner junction (BEVEL.md §8.5.2,
+/// restated for the grid in §8.5.5.5(f.2)): the map sending the three unit axis points to
+/// the three boundverts, the unit origin to the corner sphere's **centre** `c`, and hence
+/// the unit body-corner `(1,1,1)` to the junction vertex `v`. For the orthonormal
+/// equal-offset cube corner it is a similarity — a permutation of the world axes scaled by
+/// `offset` — so "octant coordinates" and "world coordinates measured from `c` in units of
+/// `offset`" coincide up to an axis relabelling.
+///
+/// The `(1,1,1) → v` row is not an extra condition, it follows from the other four; keeping
+/// it in view is what catches the natural mis-statement `origin → v`, which would put the
+/// unit surface's centre *at* the corner and place every grid vert at twice its true
+/// distance from `v`.
+#[derive(Clone, Copy)]
+struct UnitOctant {
+    linear: Mat3,
+    inverse: Mat3,
+    translation: Vec3,
+}
+
+impl UnitOctant {
+    fn from_corner(boundverts: [Vec3; 3], vertex: Vec3) -> Option<UnitOctant> {
+        let [b0, b1, b2] = boundverts;
+        let axes = [
+            (b0 - b1 - b2 + vertex) * 0.5,
+            (-b0 + b1 - b2 + vertex) * 0.5,
+            (-b0 - b1 + b2 + vertex) * 0.5,
+        ];
+
+        // Degeneracy here is a question about the frame's *shape*, never its size: each axis
+        // is one boundvert's spoke, so the raw determinant scales as the cube of the bevel
+        // width (at the symmetric cube corner it is exactly ±offset³). Any absolute threshold
+        // on it would therefore reject ordinary narrow bevels — a 1e-3 offset is a perfectly
+        // conditioned corner. Guard the axis lengths against an absolute floor and against
+        // each other, then test conditioning on the *normalised* frame, whose determinant is
+        // the scale-free sine of the solid angle the three axes span. Same relative shape as
+        // the tri-corner spoke test.
+        let lengths = axes.map(|axis: Vec3| axis.length());
+        let longest = lengths.iter().copied().fold(0.0_f32, f32::max);
+        if longest <= 1.0e-6 || lengths.iter().any(|&length| length <= longest * 1.0e-3) {
+            return None;
+        }
+        let conditioning =
+            Mat3::from_cols(axes[0] / lengths[0], axes[1] / lengths[1], axes[2] / lengths[2])
+                .determinant()
+                .abs();
+        if conditioning <= 1.0e-4 {
+            return None;
+        }
+
+        let linear = Mat3::from_cols(axes[0], axes[1], axes[2]);
+        Some(UnitOctant {
+            linear,
+            inverse: linear.inverse(),
+            translation: (b0 + b1 + b2 - vertex) * 0.5,
+        })
+    }
+
+    fn to_world(&self, unit: Vec3) -> Vec3 {
+        self.translation + self.linear * unit
+    }
+
+    fn to_octant(&self, world: Vec3) -> Vec3 {
+        self.inverse * (world - self.translation)
+    }
+
+    /// The image of the octant origin: the corner surface's centre `c`, not `v`.
+    fn origin(&self) -> Vec3 {
+        self.translation
+    }
+}
+
+/// Whether `exponent` selects the tri-corner family's **smooth** member — the unit-octant
+/// grid of BEVEL.md §8.5.5.5(f.2). Its scope is stated exactly: *every* `r` that is neither
+/// the square sentinel nor square-in, those two taking closed-form grids of their own
+/// ((f.5)/(f.4)). So the straight chord (`r = 1`, the flat chamfer) **is** a member — its
+/// snap is branch R's 1-norm radial projection onto the plane `x + y + z = 1`, i.e. the
+/// chamfer plane through the three boundverts, and its apex is (f.2)'s `3^(−1/1)·(1,1,1)`,
+/// the boundvert centroid. A flat cube corner builds the octant grid like any other smooth
+/// exponent; only a *non*-tri-corner ring takes the planar `fullness = 0` cap
+/// (§8.3.0.2.1).
+///
+/// The comparisons are exact float equalities against the snapped exponents of §8.6.2 —
+/// which is what that snap exists for (§8.5.5.5(f.1a)): a raw logarithm would route every
+/// junction down the curved path.
+fn adj_octant_exponent(exponent: f32) -> bool {
+    exponent != PROFILE_SQUARE_EXPONENT && exponent != 0.0
+}
+
+/// The coarse centre's pre-scale (BEVEL.md §8.5.5.5(f.2), step 1). The centre starts at the
+/// octant body-diagonal unit vector `√⅓·(1,1,1)` and is multiplied by a scalar that depends
+/// only on the exponent *band* — deliberately pushing it **off** the surface so the
+/// subdivision's smoothing does not pull the whole cap in too far. The band thresholds are
+/// `1.5` and `0.75`, **not** `2` and `1`: the circular exponent sits comfortably inside the
+/// bulging band, so the circular cube corner pre-scales by `1.4` too.
+///
+/// The `segments ≤ 2` guard is not cosmetic: at two segments the coarse net *is* the target
+/// grid on this path (no subdivision round runs at all), so the centre is snapped straight
+/// from its seed and the scale would be a pure no-op.
+///
+/// Its effect on the apex is nil by construction — the snap is a radial projection, and
+/// radial projection is scale-invariant — so it is *invisible in the apex* and *visible in
+/// the ring of interior verts around it*. Do not "verify" it by checking the apex.
+fn adj_octant_prescale(exponent: f32, segments: u32) -> f32 {
+    if segments <= 2 {
+        return 1.0;
+    }
+    if exponent > 1.5 {
+        1.4
+    } else if exponent < 0.75 {
+        0.6
+    } else {
+        1.0
+    }
+}
+
+/// Project an octant point onto the unit superellipsoid `u_x^r + u_y^r + u_z^r = 1` along
+/// its own ray from the octant origin (BEVEL.md §8.5.5.5(f.2), step 4). The rule genuinely
+/// **branches** on the exponent, and the branches are not each other's special cases:
+///
+/// - **the circular exponent** is a plain, **unclamped** normalise. Subdivision can push an
+///   interior vert slightly negative in one octant coordinate (the smoothing overshoots
+///   past a sector seam); the unclamped normalise keeps that sign, leaving the vert a hair
+///   outside its sector rather than exactly on the seam. Clamping first would move those
+///   verts — and the circular corner's positions are pinned;
+/// - **every other (curved) exponent** must clamp into the octant first, because a negative
+///   base raised to a fractional power is `NaN`. The clamp is a *necessity of the general
+///   exponent*, not a shared step, and it folds an overshooting vert onto the seam plane.
+///
+/// (The third branch — the axis snap the square exponents take — is 2-D and reached only
+/// from the pipe post-pass, which is not filled; the square grids never come through here.)
+///
+/// A vert already on the surface is a fixed point in either branch, so the snap is safe to
+/// apply unconditionally to the boundverts and to any rim sample that happens to be exact.
+/// The curved branch divides through by the leading coordinate before taking the powers:
+/// the two forms agree in exact arithmetic, but only this one keeps the intermediate
+/// magnitudes near `1` at a large `r`. It has no ray to project along when the clamp
+/// annihilates every coordinate, which is the one degenerate case the branch guards; past
+/// that guard the leading coordinate of `scaled` is exactly `1`, so the `r`-norm is `≥ 1`
+/// and the division is safe.
+fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
+    if exponent == 2.0 {
+        return unit.normalize_or_zero();
+    }
+    let clamped = Vec3::new(unit.x.max(0.0), unit.y.max(0.0), unit.z.max(0.0));
+    let leading = clamped.x.max(clamped.y).max(clamped.z);
+    if leading <= 0.0 {
+        return clamped;
+    }
+    let scaled = clamped / leading;
+    let norm = (scaled.x.powf(exponent) + scaled.y.powf(exponent) + scaled.z.powf(exponent))
+        .powf(1.0 / exponent);
+    scaled / norm
 }
 
 /// The generating profile of one ring edge of a [V-ADJ] cap (BEVEL.md §8.5.5.5(a)),
@@ -19035,24 +19979,51 @@ fn sabin_gamma_formula(valence: usize) -> f64 {
     (k * x + 2.0 * k * k - 1.0) / (x * x * (k * x + 1.0))
 }
 
-/// The §8.5.5.5(b) centre-fullness fit scalar for the **default circular** profile:
-/// an exact tabulated constant depending only on `segments` (separately for even and
-/// odd), not a per-vertex solve. The table does **not** rise monotonically — even
-/// counts sit lower than the odd counts that bracket them (§8.5.5.5(b)) — so it is
-/// pinned directly, not interpolated. The centre it seeds is Tier-2 (non-unique,
-/// §8.5.5.7); the offline per-offset refit for genuinely unequal offsets is deferred
-/// (§8.5.5.5(f)). `segments = 2 → 0.559` is the value the inner-miter apex of §8.9.5
-/// consumes.
-fn adj_fullness(segments: u32) -> f32 {
-    match segments {
-        0 | 1 | 2 => 0.559,
-        3 => 0.642,
-        4 => 0.551,
-        5 => 0.646,
-        6 => 0.624,
-        // Larger odd counts settle toward ≈0.647; even counts stay a touch lower.
-        _ if segments % 2 == 0 => 0.63,
-        _ => 0.647,
+/// The circular exponent's tabulated `fullness`, indexed by `segments` (BEVEL.md
+/// §8.5.5.5(f.3), law **F2**). It runs to `segments = 11` and **stops** — past that even
+/// the circular profile falls through to the regression **F3**. The table does not rise
+/// monotonically: it oscillates with parity, even counts sitting below the odd counts that
+/// bracket them, because an even cap closes on a welded apex and an odd one on a central
+/// polygon (§8.5.5.5(e)) — which is why it is pinned directly rather than fitted.
+const ADJ_FULLNESS_CIRCLE: [f32; 12] = [
+    0.0, 0.0, 0.559, 0.642, 0.551, 0.646, 0.624, 0.646, 0.619, 0.647, 0.639, 0.647,
+];
+
+/// The §8.5.5.5(b)/(f.3) centre-fullness fit scalar: how far the general ring's cap bulges
+/// from the boundvert centroid toward the original corner `v`. It is a fit constant of the
+/// profile and the segment count (separately for even and odd), not a per-vertex solve.
+///
+/// Three branches, tested in order (law **F2** then **F3**; the custom-profile law **F1**
+/// has no filled path yet):
+///
+/// - the straight chord (`r = 1`) is exactly `0` — the cap is planar and its centre sits on
+///   the boundvert centroid;
+/// - the circular exponent is the tabulated [`ADJ_FULLNESS_CIRCLE`], for `1 ≤ n ≤ 11`;
+/// - **everything else** — a curved exponent, the square exponents, *and the circular
+///   exponent at `n ≥ 12`* — is an empirical linear regression in the **raw `profile`
+///   scalar** (not in `r`), with a near-nil segment-count term and a separate even/odd fit.
+///
+/// Two things the law makes unavoidable. It **steps down** at the table's end rather than
+/// asymptoting — `n = 11` (circle) is `0.647`, `n = 13` is `0.5777` — so the table must not
+/// be extrapolated. And `fullness > 1` is normal on a bulging profile (`profile > 0.5`): the
+/// fit runs past `1`, seeding the centre *beyond* `v`, and clamping it to `[0, 1]` "for
+/// safety" would silently flatten every bulging cap.
+///
+/// The centre it seeds is Tier-2 (non-unique, §8.5.5.7). `profile = 0.5, segments = 2 →
+/// 0.559` is the value the inner-miter apex of §8.9.5 consumes.
+fn adj_fullness(profile: f32, segments: u32) -> f32 {
+    let exponent = profile_to_exponent(profile);
+    if exponent == 1.0 {
+        return 0.0;
+    }
+    if exponent == 2.0 && (segments as usize) < ADJ_FULLNESS_CIRCLE.len() {
+        return ADJ_FULLNESS_CIRCLE[segments as usize];
+    }
+    let count = segments as f32;
+    if segments % 2 == 0 {
+        2.4506 * profile - 0.000_003_0 * count - 0.6266
+    } else {
+        2.3635 * profile + 0.000_152 * count - 0.6060
     }
 }
 
@@ -19067,7 +20038,7 @@ fn adj_fullness(segments: u32) -> f32 {
 fn adj_even_extraordinary_centre(vertex: Vec3, boundverts: &[Vec3], mids: &[Vec3], gamma_s: f32) -> Vec3 {
     let sectors = boundverts.len();
     let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
-    let centre_0 = centroid + adj_fullness(2) * (vertex - centroid);
+    let centre_0 = centroid + adj_fullness(0.5, 2) * (vertex - centroid);
 
     // The centre after one round depends only on the coarse net (the round's re-pinned
     // doubled boundary is a Dirichlet condition the *next* round reads, never this one),
