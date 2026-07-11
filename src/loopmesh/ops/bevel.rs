@@ -1060,6 +1060,15 @@ impl LoopMesh {
         let mut outer_miter_junctions: Vec<OuterMiterJunction> = Vec::new();
         let mut terminal_fans: Vec<TerminalFan> = Vec::new();
 
+        // §8.2.2.1.1: the chord-fraction resample is a property of the [V-ADJ] cap's
+        // *boundary emission*, so it fires on every ring-edge chain of a junction the
+        // adjacency grid will own. The cutoff fill (§8.3, the rule's Scope blockquote)
+        // is not a [V-ADJ] cap and consumes the coarse chain verts directly.
+        let junction_emission = match options.vmesh_method {
+            BevelVmeshMethod::Adj => ChainEmission::Resampled,
+            BevelVmeshMethod::Cutoff => ChainEmission::ResampledAtControlResolution,
+        };
+
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
                 // §8.9.3: the inner miter rides the forced tri-corner [V-ADJ] fill.
@@ -1111,6 +1120,7 @@ impl LoopMesh {
                         offset,
                         segments,
                         profile,
+                        junction_emission,
                         &mut chains,
                         &mut face_subst,
                         &mut junction_cuts,
@@ -1285,6 +1295,7 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        emission: ChainEmission,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         junction_cuts: &mut Vec<JunctionCut>,
@@ -1326,7 +1337,7 @@ impl LoopMesh {
                 segments,
                 profile,
                 None,
-                ChainEmission::ResampledAtControlResolution,
+                emission,
                 result,
             );
             chains.push(EdgeEndChain {
@@ -2291,7 +2302,7 @@ impl LoopMesh {
                     segments,
                     profile,
                     None,
-                    ChainEmission::ResampledAtControlResolution,
+                    ChainEmission::Resampled,
                     result,
                 );
             // Invariant: a circular `segments = 2` cross-section always yields exactly
@@ -3251,23 +3262,46 @@ impl LoopMesh {
             }
         }
 
-        // The corner sphere the whole patch lies on (§8.5.5.3): fit it from the
-        // three ring boundverts and one on-arc chain sample, all at distance `R`
-        // from the centre `c`. For the default circular profile the superellipsoid
-        // is exactly this sphere, so every grid vert snaps onto it by the radial
-        // projection `c + R·normalize(p − c)`.
-        let on_surface = [
-            self.vertex_position(cut.boundverts[0]),
-            self.vertex_position(cut.boundverts[1]),
-            self.vertex_position(cut.boundverts[2]),
-            self.vertex_position(chain_of[0][1]),
-        ];
-        let (center, radius) = match circumsphere(on_surface) {
-            Some(sphere) => sphere,
-            None => return,
-        };
-
         let vertex_position = self.vertex_position(cut.vertex);
+
+        // The corner sphere the whole patch lies on (§8.5.5.3): `c = v + offset·(d_a +
+        // d_b + d_c)`, `R = offset`. Read it off the ring alone — each §7.6.2 boundvert
+        // is `v + offset·(d_x + d_y)` over the two beveled edges it bridges, and each of
+        // the three edges appears in exactly two boundverts, so `Σ B_i = 3v + 2·offset·Σd`
+        // and hence `c = (Σ B_i − v) / 2`, with `R = |B_i − c| = offset`. Deriving it
+        // from the ring (not from a chain sample) matters: the emitted chain samples are
+        // the §8.2.2.1.1 chord resample and sit *inside* the sphere until step 4's snap
+        // puts them back on it, so fitting through one of them would tilt the sphere the
+        // snap is supposed to restore them to.
+        let center = (cut
+            .boundverts
+            .iter()
+            .fold(Vec3::ZERO, |acc, &b| acc + self.vertex_position(b))
+            - vertex_position)
+            * 0.5;
+        let radius = (self.vertex_position(cut.boundverts[0]) - center).length();
+        if radius <= f32::EPSILON {
+            return;
+        }
+
+        // §8.2.2.1.1 step 4 / §8.5.5.3: the snap is the fill's own **grid-level** step and
+        // runs **last** — after the boundary resample, never before it. On this
+        // (closed-form tri-corner) path it covers the emitted rim as well as the interior,
+        // projecting each chord-resampled chain sample radially back out onto the corner
+        // sphere; the sample survives at a *shifted arc angle* rather than at its raw
+        // even-angle one. It is invoked whether or not a chord resample ran: at
+        // `segments ∈ {4, 8, …}` the raw sample is already on the sphere and the
+        // projection is the identity on the rim (identity, not skipped — the same snap is
+        // what places the interior, below). The two chain ends are ring boundverts and are
+        // already at `R`, so only the interior samples are touched.
+        for chain in &chain_of {
+            for &sample in chain.iter().take(seg).skip(1) {
+                let position = self.vertex_position(sample);
+                let snapped = center + radius * (position - center).normalize_or_zero();
+                self.set_vertex_position(sample, snapped);
+            }
+        }
+
         let even = seg % 2 == 0;
 
         // Per sub-patch, its four corner positions: `B_i`, the chain-`i` inner end
@@ -10370,6 +10404,213 @@ mod tests {
         );
     }
 
+    /// A cell point's coordinates `(u, v)` in the §8.2.2.1 profile cell: solve
+    /// `p = origin + u·a_axis + v·b_axis` in the (non-orthogonal) cell basis.
+    fn cell_uv(cell: &ProfileCell, position: Vec3) -> (f32, f32) {
+        let origin = cell.start + cell.end - cell.mid;
+        let a_axis = cell.mid - cell.start;
+        let b_axis = cell.mid - cell.end;
+        let offset = position - origin;
+        let (aa, ab, bb) = (a_axis.dot(a_axis), a_axis.dot(b_axis), b_axis.dot(b_axis));
+        let (oa, ob) = (offset.dot(a_axis), offset.dot(b_axis));
+        let determinant = aa * bb - ab * ab;
+        (
+            (oa * bb - ob * ab) / determinant,
+            (ob * aa - oa * ab) / determinant,
+        )
+    }
+
+    /// The **cell radius** `√(u² + v²)` of a rim sample (BEVEL.md §8.2.2.1.1's read-out
+    /// table). For the circular default the profile curve is the unit superellipse in
+    /// exactly this frame, so `= 1` ⟺ the sample sits *on* the curve (it was snapped
+    /// back, §8.5.5.3) and `< 1` ⟺ it is the bare chord point of the resample, strictly
+    /// inside the curve (the general cap, which has no superellipsoid to snap onto).
+    fn cell_radius(cell: &ProfileCell, position: Vec3) -> f32 {
+        let (u, v) = cell_uv(cell, position);
+        (u * u + v * v).sqrt()
+    }
+
+    /// The `segments = 3` cube corner's profile cell across the beveled edge running to
+    /// `far`, between the two boundverts that bridge it. At a right-angled sector the
+    /// §7.6.2 meet is `v + offset·(d_a + d_b)`.
+    fn cube_corner_cell(far: Vec3, other_a: Vec3, other_b: Vec3) -> ProfileCell {
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let toward = |p: Vec3| (p - corner).normalize();
+        let (d_far, d_a, d_b) = (toward(far), toward(other_a), toward(other_b));
+        ProfileCell::new(
+            corner + 0.25 * (d_far + d_a),
+            corner + 0.25 * (d_far + d_b),
+            corner,
+            d_far,
+        )
+    }
+
+    /// BEVEL.md §8.2.2.1.1 (steps 1–4) / §8.5.5.3 / §8.5.5.5's three-way gate table: on
+    /// the **closed-form tri-corner cap** at a non-power-of-two `segments` the chord
+    /// resample *does* run (it is not gated on cap kind), and the fill's grid-level
+    /// superellipsoid snap then projects the chord point radially back **out** onto the
+    /// corner sphere. So the emitted rim sample keeps cell radius `1` — it satisfies the
+    /// §8.5.5.6 (2) membership invariant — but sits at a **shifted arc angle**,
+    /// ≈`1.9e-4` (≈19 quanta) from the raw even-angle sample it would carry if the
+    /// resample had been skipped.
+    #[test]
+    fn adj_cap_rim_tri_corner_resamples_then_snaps_onto_the_sphere() {
+        let (mesh, result) = cube_corner_adj(3);
+        mesh.validate_topology();
+
+        let cell = cube_corner_cell(
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        );
+        let raw = cell.chain_positions(3, 0.5, ChainEmission::Raw);
+        let chord = cell.chain_positions(3, 0.5, ChainEmission::Resampled);
+        let snap = |p: Vec3| {
+            adj_sphere_center() + ADJ_SPHERE_RADIUS * (p - adj_sphere_center()).normalize()
+        };
+
+        for k in 1..3 {
+            let emitted = snap(chord[k]);
+
+            assert!(
+                (cell_radius(&cell, raw[k]) - 1.0).abs() < 1.0e-4,
+                "the raw even-angle sample is on the profile curve by construction",
+            );
+            assert!(
+                cell_radius(&cell, chord[k]) < 1.0 - 1.0e-3,
+                "step 3's chord point lies strictly inside the curve",
+            );
+            assert!(
+                (cell_radius(&cell, emitted) - 1.0).abs() < 1.0e-4,
+                "step 4's snap puts the emitted rim sample back on the curve (cell radius 1)",
+            );
+
+            let shift = (emitted - raw[k]).length();
+            assert!(
+                (1.0e-4..3.0e-4).contains(&shift),
+                "resample + snap is an *angular* shift of ≈19 quanta, not a radial one (got {shift})",
+            );
+
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, emitted),
+                1,
+                "the tri-corner cap emits the resampled-then-snapped rim sample",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, raw[k]),
+                0,
+                "the raw even-angle sample is never emitted at a non-power-of-two segments",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1.1 step 4 / §8.5.5.5 ("The emitted boundary"): a **general** cap
+    /// — here the symmetric equal-offset valence-4 pyramid apex, which fails the §8.5.1
+    /// trigger on **valence alone** — has no superellipsoid, so the snap does not run and
+    /// the emitted rim is step 3's **bare chord point**: cell radius strictly `< 1`,
+    /// inside the profile curve. Emitting the raw even-angle chain here instead is a
+    /// ≈490-quantum error that every invariant of §8.5.5.7 is blind to.
+    #[test]
+    fn adj_cap_rim_general_ring_emits_the_bare_resample_unsnapped() {
+        let mut mesh = LoopMesh::new();
+        let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
+        let apex_position = mesh.vertex_position(apex);
+        let base = [b0, b1, b2, b3].map(|b| mesh.vertex_position(b));
+        let slants = [b0, b1, b2, b3].map(|b| {
+            mesh.query_edge_exists(apex, b)
+                .expect("slant edge exists")
+                .into()
+        });
+        let result = mesh.bevel(
+            &slants,
+            BevelOptions {
+                offset: 0.3,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // §7.6.2 in a planar sector: the two offset lines meet on the angle bisector at
+        // `v + offset·(d_a + d_b)/sin θ`, which reduces to the cube corner's
+        // `v + offset·(d_a + d_b)` only at a right-angled sector.
+        let toward = |p: Vec3| (p - apex_position).normalize();
+        let meet = |p: Vec3, q: Vec3| {
+            let (d_a, d_b) = (toward(p), toward(q));
+            let sin_sector = d_a.cross(d_b).length();
+            apex_position + 0.3 * (d_a + d_b) / sin_sector
+        };
+        // The chain across slant edge `apex→b0` runs between the meets of the two sectors
+        // that edge bounds (`b3–b0` and `b0–b1`).
+        let cell = ProfileCell::new(
+            meet(base[3], base[0]),
+            meet(base[0], base[1]),
+            apex_position,
+            toward(base[0]),
+        );
+        for endpoint in [cell.start, cell.end] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, endpoint),
+                1,
+                "the §7.6.2 ring boundverts are the chain's two ends",
+            );
+        }
+
+        let raw = cell.chain_positions(3, 0.5, ChainEmission::Raw);
+        let chord = cell.chain_positions(3, 0.5, ChainEmission::Resampled);
+        for k in 1..3 {
+            assert!(
+                cell_radius(&cell, chord[k]) < 1.0 - 1.0e-2,
+                "the general cap's emitted rim is the bare chord point, inside the curve",
+            );
+            assert!(
+                (chord[k] - raw[k]).length() > 1.0e-3,
+                "the bare resample is ≈490 quanta off the raw even-angle sample",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, chord[k]),
+                1,
+                "the general cap emits the unsnapped chord-fraction resample",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, raw[k]),
+                0,
+                "no general-cap rim vert carries the raw even-angle sample",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1.1 gate part (i) / the three-way table's third row: at
+    /// `segments ∈ {4, 8, 16, …}` the source resolution lands on the target, no chord
+    /// resample runs, and the emitted rim **is** the raw profile chain — on the curve, at
+    /// the raw even-angle sample. The tri-corner snap still runs there; it is simply the
+    /// identity on the rim.
+    #[test]
+    fn adj_cap_rim_power_of_two_segments_emits_the_raw_profile_chain() {
+        let (mesh, result) = cube_corner_adj(4);
+        mesh.validate_topology();
+
+        let cell = cube_corner_cell(
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        );
+        let raw = cell.chain_positions(4, 0.5, ChainEmission::Raw);
+        for k in 1..4 {
+            assert!(
+                (cell_radius(&cell, raw[k]) - 1.0).abs() < 1.0e-4,
+                "a power-of-two raw sample is already on the curve, so the snap is the identity",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, raw[k]),
+                1,
+                "the raw chain is emitted verbatim at segments = 4",
+            );
+        }
+    }
+
     /// BEVEL.md §8.2.2.1 / §8.3.0.1: at a valence-≥3 terminal the profile plane is
     /// snapped to the triangle through the terminal vertex and the two chain
     /// endpoints, flattening the far-end cross-section into the terminal's rim plane
@@ -15736,17 +15977,19 @@ enum ChainEmission {
     /// The raw profile chain. A terminal far end has no adjacency fill behind it
     /// (§6.7.5.4), so it consumes the raw samples directly.
     Raw,
-    /// The chord-fraction resample, run at every `segments` — every ring-edge chain of
-    /// a [V-ADJ] cap that is pinned to the emitted (post-doubling) rim: the outer
-    /// miter's arc, its flanking cross-sections, and its interior-sector strips
-    /// (§8.9.5.1 / §8.9.5.2). No chain-kind test, no skew test.
+    /// The chord-fraction resample (§8.2.2.1.1 steps 1–3), run at every `segments` on
+    /// **every** ring-edge chain of **every** [V-ADJ] cap — the plain junction ring, the
+    /// outer miter's arc, its flanking cross-sections, and its interior-sector strips
+    /// (§8.9.5.1 / §8.9.5.2). No chain-kind test, no skew test, no cap-kind test: steps
+    /// 1–3 are safe to run unconditionally, returning the sample unchanged wherever the
+    /// gate says it should not move. Whether the emitted sample is then projected back
+    /// onto the profile curve is a *grid-level* decision the fill makes (step 4), not a
+    /// chain-level one.
     Resampled,
-    /// The resample restricted to the `segments = 2` control resolution. The plain
-    /// junction fills route here: their pinned emission is the seg = 2 one, while at a
-    /// non-power-of-two count the guide's own cube-corner membership invariant
-    /// (§8.5.5.6 (2) — boundverts *and chain samples* lie on the corner superellipsoid)
-    /// cannot hold for an off-profile rim unless the fill re-snaps it, which is not
-    /// stated. Until that is settled these chains keep the pinned seg = 2 behaviour.
+    /// The resample restricted to the `segments = 2` control resolution — the cutoff
+    /// junction fill's emission. §8.2.2.1.1's Scope blockquote puts the cutoff fill
+    /// (§8.3) outside the boundary resample: it consumes the coarse chain verts, so at
+    /// a non-power-of-two count its chain stays raw.
     ResampledAtControlResolution,
 }
 
