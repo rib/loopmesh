@@ -274,11 +274,70 @@ impl LoopMesh {
         input_faces: &[FaceKey],
         use_existing_faces: bool,
     ) -> ConvexHullResult {
-        let mut result = ConvexHullResult::default();
+        self.convex_hull_dispatch(
+            verts,
+            input_edges,
+            input_faces,
+            use_existing_faces,
+            &Quickhull,
+        )
+    }
 
+    /// [`Self::convex_hull_with_input`] with the hull *primitive* supplied by the
+    /// caller instead of the in-tree [`Quickhull`] default.
+    ///
+    /// Only the hull geometry is delegated: the provider is handed the input
+    /// verts' positions as a point cloud (index `i` is `verts[i]`, §1.1) and
+    /// hands back a neutral index-based [`HullTopology`]. Everything downstream —
+    /// the fan (§3.1), the no-double edge/face surgery (§6), the reuse/holes pass
+    /// (§5), and the interior/unused classification (§4, §7) — is the operator's
+    /// own and consumes the returned topology **verbatim**: each facet's loop is
+    /// fanned from *its own* first vertex, in *its own* order, with *its own*
+    /// winding. Facets are neither sorted, rotated, re-merged, nor re-wound, so
+    /// a provider's facet order and loop rotation are observable in the built
+    /// mesh's diagonals and normals.
+    ///
+    /// The provider must uphold the [`ConvexHullProvider`] contract: face indices
+    /// address the *input* slice, faces are CCW as seen from outside, and
+    /// `vertices` is the on-hull index subset in strictly ascending order — and,
+    /// with facets present, exactly the set of indices its own faces reference
+    /// (the operator emits `geom.out`'s verts in that order, and treats indices
+    /// absent from it as interior). Violations corrupt the output slots silently,
+    /// so the contract is audited on entry by
+    /// [`assert_provider_contract`], compiled only under `debug_assertions` —
+    /// debug builds name the broken clause; release builds pay nothing.
+    ///
+    /// This is the injection point behind the prerequisite's "Pluggability" rule:
+    /// the boundary is coarse (one call per whole hull), so `&dyn` dispatch costs
+    /// a single virtual call per operator run, while the three default entry
+    /// points reach the same body monomorphised on the ZST [`Quickhull`] and pay
+    /// nothing.
+    pub fn convex_hull_with_provider(
+        &mut self,
+        verts: &[VertexKey],
+        input_edges: &[EdgeKey],
+        input_faces: &[FaceKey],
+        use_existing_faces: bool,
+        provider: &dyn ConvexHullProvider,
+    ) -> ConvexHullResult {
+        self.convex_hull_dispatch(verts, input_edges, input_faces, use_existing_faces, provider)
+    }
+
+    /// The provider-generic front half: guard, cloud, hull. Kept deliberately
+    /// small — it is the *only* code monomorphised per provider, so the ZST
+    /// default path inlines to a direct `Quickhull` call while the operator's
+    /// (large) surgery body is compiled exactly once and shared by both paths.
+    fn convex_hull_dispatch<P: ConvexHullProvider + ?Sized>(
+        &mut self,
+        verts: &[VertexKey],
+        input_edges: &[EdgeKey],
+        input_faces: &[FaceKey],
+        use_existing_faces: bool,
+        provider: &P,
+    ) -> ConvexHullResult {
         // §1.2 — minimum-input guard: a count, not a non-degeneracy test.
         if verts.len() < 3 {
-            return result;
+            return ConvexHullResult::default();
         }
 
         // §1.1 — only the verts drive the cloud. Map each input vertex's
@@ -290,9 +349,33 @@ impl LoopMesh {
             .map(|&v| self.vertex_position(v).as_dvec3())
             .collect();
 
-        let Some(topology) = Quickhull.convex_hull(&points) else {
-            return result;
+        let Some(topology) = provider.convex_hull(&points) else {
+            return ConvexHullResult::default();
         };
+
+        self.convex_hull_from_topology(
+            verts,
+            input_edges,
+            input_faces,
+            use_existing_faces,
+            &topology,
+        )
+    }
+
+    /// The operator proper: everything downstream of the hull primitive. Takes
+    /// the provider's topology as given (see [`Self::convex_hull_with_provider`]).
+    fn convex_hull_from_topology(
+        &mut self,
+        verts: &[VertexKey],
+        input_edges: &[EdgeKey],
+        input_faces: &[FaceKey],
+        use_existing_faces: bool,
+        topology: &HullTopology,
+    ) -> ConvexHullResult {
+        #[cfg(debug_assertions)]
+        assert_provider_contract(verts.len(), topology);
+
+        let mut result = ConvexHullResult::default();
 
         // §3.1 — fan every facet into outward-wound triangles up front, keyed
         // back to the mesh's vertex handles. The reuse test (§5) and the surgery
@@ -753,6 +836,108 @@ impl LoopMesh {
         }
         result.hole_edges = hole_edges.into_iter().collect();
         result.hole_edges.sort_unstable_by_key(ElementKey::as_usize);
+    }
+}
+
+/// Audit of the [`ConvexHullProvider`] contract, run against whatever topology
+/// the provider handed back. The whole function is `#[cfg(debug_assertions)]`
+/// (and only called from behind the same gate), so its plain `assert!`s are
+/// debug-only and release builds pay nothing — do not "fix" them into
+/// `debug_assert!`, which would merely double-gate them.
+///
+/// [`Quickhull`] upholds every clause by construction; the check exists for
+/// *injected* providers (a foreign hull engine behind an adapter), where a
+/// contract slip would otherwise corrupt **silently**: an index the facets use
+/// but `vertices` omits vanishes from every output slot, an index `vertices`
+/// lists but no facet uses is handed to a downstream delete as unused, an
+/// unsorted or duplicated `vertices` reorders or doubles `geom.out`, and a
+/// facet-less topology is indistinguishable from the legitimate collinear hull.
+/// Each message names its clause distinctly, so an adapter author reading the
+/// failure knows exactly which obligation they broke.
+#[cfg(debug_assertions)]
+fn assert_provider_contract(cloud_len: usize, topology: &HullTopology) {
+    // Clause: `vertices` is the on-hull subset of the input indices, strictly
+    // ascending (which also rules out duplicates). Checked first — the facet
+    // membership test below binary-searches it.
+    for window in topology.vertices.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "ConvexHullProvider contract: `vertices` must be strictly ascending input \
+             indices, but {} is followed by {} (a descending pair, or a duplicate that \
+             would be emitted twice in geom.out)",
+            window[0],
+            window[1]
+        );
+    }
+    for &index in &topology.vertices {
+        assert!(
+            index < cloud_len,
+            "ConvexHullProvider contract: `vertices` lists out-of-range point index \
+             {index}; the cloud has only {cloud_len} point(s), and `vertices` addresses \
+             the input slice"
+        );
+    }
+
+    for (facet_index, facet) in topology.faces.iter().enumerate() {
+        assert!(
+            facet.vertices.len() >= 3,
+            "ConvexHullProvider contract: facet {facet_index} has too few corners ({}); a \
+             hull face has at least three (a shorter loop is silently dropped from the fan)",
+            facet.vertices.len()
+        );
+        for &index in &facet.vertices {
+            assert!(
+                index < cloud_len,
+                "ConvexHullProvider contract: facet {facet_index} references out-of-range \
+                 point index {index}; the cloud has only {cloud_len} point(s), and facet \
+                 loops address the input slice"
+            );
+            assert!(
+                topology.vertices.binary_search(&index).is_ok(),
+                "ConvexHullProvider contract: facet {facet_index} references point index \
+                 {index}, which `vertices` omits; `vertices` must contain every index its \
+                 own facets reference (an omitted index is built into a face yet reported \
+                 in no output slot)"
+            );
+        }
+    }
+
+    // Clause (the other half of the set equality): with facets present, `vertices`
+    // is exactly the facets' index set — so no listed index may go unused. An
+    // extra one is reported on-hull yet built into no face, and is then handed to
+    // the reuse/delete pass as an unused vert. (Only checked with facets present:
+    // the facet-less 1D seam's two endpoints legitimately belong to no face, and
+    // the clause below owns that case.)
+    if !topology.faces.is_empty() {
+        for &index in &topology.vertices {
+            assert!(
+                topology
+                    .faces
+                    .iter()
+                    .any(|facet| facet.vertices.contains(&index)),
+                "ConvexHullProvider contract: `vertices` lists point index {index}, which no \
+                 facet uses; with facets present `vertices` must be exactly the set of \
+                 indices its own facets reference (a listed-but-unused index is reported \
+                 on-hull yet built into no face)"
+            );
+        }
+    }
+
+    // Clause (derived): the only facet-less hull is the 1D (collinear) seam, whose
+    // hull *is* its two extreme endpoints — a provider returns `None` below two
+    // distinct points, and any 2D/3D cloud has at least one facet. So a facet-less
+    // topology carrying anything but two verts is an adapter that lost its faces,
+    // and without this check it would be taken for a valid degenerate hull: every
+    // listed vert emitted on-hull, not one face built.
+    if topology.faces.is_empty() {
+        assert!(
+            topology.vertices.len() == 2,
+            "ConvexHullProvider contract: a facet-less hull is the 1D (collinear) seam and \
+             must report exactly its two extreme endpoints, but `vertices` has {} \
+             entries — a hull with no faces over a 2D/3D cloud means the provider lost its \
+             facets",
+            topology.vertices.len()
+        );
     }
 }
 
@@ -2106,5 +2291,310 @@ mod tests {
         let result = mesh.convex_hull(&input);
         assert!(result.geom_holes_out().is_empty(), "default path has no holes");
         mesh.validate_topology();
+    }
+
+    // ---- Provider seam ----
+    //
+    // The operator must consume the *injected* provider's topology verbatim —
+    // its facets, its loop order, its winding — and never recompute a hull of
+    // its own. These tests pin that with a stub provider that hands back a
+    // hand-authored topology deliberately unlike anything `Quickhull` would
+    // return for the same cloud.
+
+    /// A provider that ignores the point cloud and replays a fixed topology.
+    struct FixedHull {
+        vertices: Vec<usize>,
+        faces: Vec<Vec<usize>>,
+    }
+
+    impl ConvexHullProvider for FixedHull {
+        fn convex_hull(&self, _points: &[glam::DVec3]) -> Option<HullTopology> {
+            Some(HullTopology {
+                vertices: self.vertices.clone(),
+                faces: self
+                    .faces
+                    .iter()
+                    .map(|f| HullFace { vertices: f.clone() })
+                    .collect(),
+            })
+        }
+    }
+
+    /// The six outward-wound quad facets of `cube_corners()`, each loop rotated
+    /// left by `rotation` — so the fan apex (`corners[0]`) and hence each
+    /// facet's diagonal change with `rotation`, while the hull itself does not.
+    fn cube_quad_facets(rotation: usize) -> Vec<Vec<usize>> {
+        [
+            [0, 1, 3, 2],
+            [4, 6, 7, 5],
+            [0, 4, 5, 1],
+            [2, 3, 7, 6],
+            [0, 2, 6, 4],
+            [1, 5, 7, 3],
+        ]
+        .iter()
+        .map(|quad| (0..4).map(|i| quad[(i + rotation) % 4]).collect())
+        .collect()
+    }
+
+    #[test]
+    fn injected_provider_topology_is_used_instead_of_quickhull() {
+        // The cloud is a cube (Quickhull: 8 on-hull verts, 12 triangles, 18
+        // edges), but the injected provider reports only the inscribed
+        // tetrahedron over corners 0/3/5/6. The operator must build *that* —
+        // proving it never recomputes a hull of its own.
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &cube_corners());
+
+        let provider = FixedHull {
+            vertices: vec![0, 3, 5, 6],
+            faces: vec![vec![0, 5, 3], vec![0, 6, 5], vec![0, 3, 6], vec![3, 5, 6]],
+        };
+        let result = mesh.convex_hull_with_provider(&input, &[], &[], false, &provider);
+
+        assert_eq!(result.faces().len(), 4, "the provider's four facets, not 12");
+        assert_eq!(result.edges().len(), 6, "the provider's tetrahedron, not 18");
+        assert_eq!(
+            result.verts(),
+            &[input[0], input[3], input[5], input[6]],
+            "geom.out's verts are the provider's on-hull set, in the contract's \
+             ascending-index order"
+        );
+
+        // The four corners the provider omitted are classified interior + unused,
+        // even though they are geometrically extremal.
+        assert_eq!(
+            vert_set(result.interior_verts()),
+            vert_set(&[input[1], input[2], input[4], input[7]]),
+            "corners the provider left off the hull are interior"
+        );
+        assert_eq!(vert_set(result.unused_verts()), vert_set(result.interior_verts()));
+
+        // The provider's winding is carried verbatim into the built faces.
+        assert_closed_hull_invariants(
+            &mut mesh,
+            &result,
+            &[input[0], input[3], input[5], input[6]],
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn injected_provider_loop_rotation_drives_the_fan_diagonal() {
+        // Same six quad facets, two different loop rotations. The operator fans
+        // each facet from *its own* first vertex, so the diagonal of every facet
+        // must follow the provider's rotation — the property T2d's adapter leans
+        // on when it passes the foreign engine's loops through untouched.
+        let expected_diagonals = |rotation: usize| -> Vec<[usize; 2]> {
+            cube_quad_facets(rotation)
+                .iter()
+                .map(|quad| {
+                    let (a, b) = (quad[0], quad[2]);
+                    if a <= b { [a, b] } else { [b, a] }
+                })
+                .collect()
+        };
+
+        for rotation in [0usize, 1] {
+            let mut mesh = LoopMesh::new();
+            let input = cloud(&mut mesh, &cube_corners());
+            let provider = FixedHull {
+                vertices: (0..8).collect(),
+                faces: cube_quad_facets(rotation),
+            };
+
+            let result = mesh.convex_hull_with_provider(&input, &[], &[], false, &provider);
+
+            assert_eq!(result.faces().len(), 12, "six quads fan to twelve triangles");
+            assert_eq!(result.edges().len(), 18, "12 cube edges + 6 facet diagonals");
+
+            let present = |a: usize, b: usize| mesh.query_edge_exists(input[a], input[b]).is_some();
+            for [a, b] in expected_diagonals(rotation) {
+                assert!(
+                    present(a, b),
+                    "rotation {rotation}: the facet's apex diagonal {a}-{b} must be built"
+                );
+            }
+            // The *other* diagonal of each facet — the one a different rotation
+            // would have produced — must be absent.
+            for [a, b] in expected_diagonals(rotation + 1) {
+                assert!(
+                    !present(a, b),
+                    "rotation {rotation}: diagonal {a}-{b} belongs to another rotation"
+                );
+            }
+
+            assert_closed_hull_invariants(&mut mesh, &result, &input);
+            mesh.validate_topology();
+        }
+    }
+
+    // ---- Provider contract (debug-only guard rail) ----
+    //
+    // Every clause below is a silent corrupter if it slips through, so the
+    // operator audits the injected topology under `debug_assert`. These tests
+    // only apply where that audit is compiled in.
+
+    #[cfg(debug_assertions)]
+    fn hull_cube_with(provider: FixedHull) {
+        let mut mesh = LoopMesh::new();
+        let input = cloud(&mut mesh, &cube_corners());
+        mesh.convex_hull_with_provider(&input, &[], &[], false, &provider);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "which `vertices` omits")]
+    fn provider_vertices_omitting_a_facet_index_is_rejected() {
+        // Index 6 is built into a face yet reported in no output slot.
+        hull_cube_with(FixedHull {
+            vertices: vec![0, 3, 5],
+            faces: vec![vec![0, 5, 3], vec![0, 6, 5], vec![0, 3, 6], vec![3, 5, 6]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "strictly ascending")]
+    fn provider_vertices_out_of_order_or_duplicated_is_rejected() {
+        hull_cube_with(FixedHull {
+            vertices: vec![0, 5, 3, 6],
+            faces: vec![vec![0, 5, 3], vec![0, 6, 5], vec![0, 3, 6], vec![3, 5, 6]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "`vertices` lists point index 1, which no facet uses")]
+    fn provider_vertices_listing_an_unused_index_is_rejected() {
+        // All eight corners reported on-hull, but only the inscribed tetrahedron
+        // built — 1/2/4/7 would be emitted in geom.out yet belong to no face.
+        hull_cube_with(FixedHull {
+            vertices: (0..8).collect(),
+            faces: vec![vec![0, 5, 3], vec![0, 6, 5], vec![0, 3, 6], vec![3, 5, 6]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "facet 1 references out-of-range point index 9")]
+    fn provider_facet_index_out_of_range_is_rejected() {
+        // `vertices` itself stays in range, so the facet loop's own range check is
+        // the clause under test (it runs before the superset check, which index 9
+        // would also trip).
+        hull_cube_with(FixedHull {
+            vertices: vec![0, 3, 5],
+            faces: vec![vec![0, 5, 3], vec![0, 9, 5]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "`vertices` lists out-of-range point index 9")]
+    fn provider_vertices_index_out_of_range_is_rejected() {
+        hull_cube_with(FixedHull {
+            vertices: vec![0, 3, 5, 9],
+            faces: vec![vec![0, 5, 3], vec![0, 9, 5], vec![0, 3, 9], vec![3, 5, 9]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "facet 1 has too few corners (2)")]
+    fn provider_facet_with_fewer_than_three_corners_is_rejected() {
+        // A two-corner loop fans to no triangle at all, so the facet would vanish
+        // from the built hull without a word.
+        hull_cube_with(FixedHull {
+            vertices: vec![0, 3, 5, 6],
+            faces: vec![vec![0, 5, 3], vec![0, 6], vec![0, 3, 6], vec![3, 5, 6]],
+        });
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "facet-less hull is the 1D (collinear) seam")]
+    fn provider_losing_its_facets_is_not_mistaken_for_a_collinear_hull() {
+        // The 3D cloud's eight corners with no faces at all — the shape a raw
+        // adapter takes when the foreign engine hands back zero facets. Without
+        // the guard this is indistinguishable from a valid 1D hull.
+        hull_cube_with(FixedHull {
+            vertices: (0..8).collect(),
+            faces: vec![],
+        });
+    }
+
+    #[test]
+    fn quickhull_provider_matches_the_default_entry_points() {
+        // Delegating the default path through the seam must be behaviour-neutral:
+        // an explicit `&Quickhull` injection reproduces `convex_hull` exactly.
+        let mut direct = LoopMesh::new();
+        let direct_input = cloud(&mut direct, &cube_corners());
+        let direct_result = direct.convex_hull(&direct_input);
+
+        let mut injected = LoopMesh::new();
+        let injected_input = cloud(&mut injected, &cube_corners());
+        let injected_result =
+            injected.convex_hull_with_provider(&injected_input, &[], &[], false, &Quickhull);
+
+        assert_eq!(direct_result.verts(), injected_result.verts());
+        assert_eq!(direct_result.edges(), injected_result.edges());
+        assert_eq!(direct_result.faces(), injected_result.faces());
+        assert_eq!(direct.face_count(), injected.face_count());
+        assert_eq!(direct.edge_count(), injected.edge_count());
+    }
+
+    #[test]
+    fn quickhull_provider_matches_the_default_entry_points_with_existing_faces() {
+        // The same delegation neutrality on the branch carrying the most state:
+        // the partial-patch bipyramid with use_existing_faces = true, which
+        // exercises reuse capture (§5 step 1), the hole-cleanup pass, the built
+        // remainder, and the interior/unused classification over input faces.
+        // `convex_hull_with_faces` and an explicit `&Quickhull` injection must
+        // agree slot for slot.
+        let build = |mesh: &mut LoopMesh| -> (Vec<VertexKey>, [FaceKey; 2]) {
+            let input = cloud(mesh, &bipyramid_positions());
+            let upper_a = mesh.face_create_verts(
+                &[input[0], input[1], input[3]],
+                FaceCreateFlags::NO_DUPLICATE,
+            );
+            let upper_b = mesh.face_create_verts(
+                &[input[1], input[2], input[3]],
+                FaceCreateFlags::NO_DUPLICATE,
+            );
+            (input, [upper_a, upper_b])
+        };
+
+        let mut direct = LoopMesh::new();
+        let (direct_input, direct_faces) = build(&mut direct);
+        let direct_result = direct.convex_hull_with_faces(&direct_input, &direct_faces, true);
+
+        let mut injected = LoopMesh::new();
+        let (injected_input, injected_faces) = build(&mut injected);
+        let injected_result = injected.convex_hull_with_provider(
+            &injected_input,
+            &[],
+            &injected_faces,
+            true,
+            &Quickhull,
+        );
+
+        assert!(!direct_result.hole_faces().is_empty(), "the fixture must reuse faces");
+        assert!(!direct_result.faces().is_empty(), "the fixture must also build faces");
+
+        assert_eq!(direct_result.verts(), injected_result.verts());
+        assert_eq!(direct_result.edges(), injected_result.edges());
+        assert_eq!(direct_result.faces(), injected_result.faces());
+        assert_eq!(direct_result.hole_faces(), injected_result.hole_faces());
+        assert_eq!(direct_result.hole_edges(), injected_result.hole_edges());
+        assert_eq!(direct_result.interior_verts(), injected_result.interior_verts());
+        assert_eq!(direct_result.interior_edges(), injected_result.interior_edges());
+        assert_eq!(direct_result.interior_faces(), injected_result.interior_faces());
+        assert_eq!(direct_result.unused_verts(), injected_result.unused_verts());
+        assert_eq!(direct_result.unused_edges(), injected_result.unused_edges());
+        assert_eq!(direct_result.unused_faces(), injected_result.unused_faces());
+        assert_eq!(direct.face_count(), injected.face_count());
+        assert_eq!(direct.edge_count(), injected.edge_count());
+        direct.validate_topology();
+        injected.validate_topology();
     }
 }

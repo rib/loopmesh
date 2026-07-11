@@ -53,12 +53,44 @@ pub struct HullTopology {
 /// per hull. The production path uses the zero-sized [`Quickhull`] default via
 /// static dispatch, so the abstraction inlines to a direct call and taxes the
 /// loopmesh-native path nothing.
+///
+/// # Contract
+///
+/// This list is the **whole specification** an implementor gets — a hull engine
+/// wrapped behind an adapter has to satisfy every clause, because consumers rely
+/// on all of them and a slip corrupts their output silently rather than failing
+/// loudly. The convex-hull operator audits these clauses on entry in debug
+/// builds, naming the broken one.
+///
+/// An implementor **must**:
+///
+/// 1. Return `None` **exactly when** the cloud holds fewer than two distinct
+///    points — i.e. `None` is *required* there, and *forbidden* anywhere else.
+///    (A cloud of three coincident points has no hull of any dimension: return
+///    `None`, not a one-vertex topology.) Distinctness is exact positional
+///    equality.
+/// 2. Return a genuine degenerate hull, never `None`, for a cloud that is merely
+///    lower-dimensional: a collinear cloud's hull is its two extreme endpoints
+///    (`vertices.len() == 2`, `faces` empty — the *only* legitimate facet-less
+///    topology); a coplanar cloud's hull is a single flat n-gon facet.
+/// 3. Index every output — both `HullTopology::vertices` and each
+///    `HullFace::vertices` — into the **input `points` slice**, never into a
+///    remapped hull-local vertex set. Every index must be `< points.len()`.
+/// 4. Emit `HullTopology::vertices` as the on-hull index subset in **strictly
+///    ascending** order: sorted, with no duplicates.
+/// 5. Make `HullTopology::vertices` **exactly** the set of indices its own facets
+///    reference, whenever `faces` is non-empty — neither a proper subset (an
+///    index built into a face but reported on no output slot) nor a proper
+///    superset (an index reported on-hull that no face uses).
+/// 6. Give every facet at least three corners, wound counter-clockwise as seen
+///    from **outside** the hull, with coplanar input merged into a single n-gon
+///    facet rather than split into a triangle fan.
 pub trait ConvexHullProvider {
-    /// Compute the convex hull of `points`.
+    /// Compute the convex hull of `points`, upholding the trait's contract.
     ///
-    /// Returns `None` only when no hull of any dimension exists (fewer than two
-    /// distinct points). Coplanar and collinear clouds resolve to their genuine
-    /// degenerate hulls.
+    /// Returns `None` **exactly when** fewer than two distinct points exist (no
+    /// hull of any dimension). Coplanar and collinear clouds are *not* that case:
+    /// they resolve to their genuine degenerate hulls.
     fn convex_hull(&self, points: &[DVec3]) -> Option<HullTopology>;
 }
 
@@ -114,7 +146,7 @@ impl WorkFace {
 
 /// Compute the 3D convex hull of `points`.
 ///
-/// Returns `None` only when fewer than two distinct points exist (no hull of
+/// Returns `None` exactly when fewer than two distinct points exist (no hull of
 /// any dimension). Collinear clouds reduce to their two extreme endpoints;
 /// coplanar clouds reduce to a single flat polygon over their 2D boundary;
 /// full-dimensional clouds yield a closed polytope with coplanar faces merged.
