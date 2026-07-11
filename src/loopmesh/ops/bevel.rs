@@ -1205,7 +1205,7 @@ impl LoopMesh {
         // is not a [V-ADJ] cap and consumes the coarse chain verts directly.
         let junction_emission = match options.vmesh_method {
             BevelVmeshMethod::Adj => ChainEmission::Resampled,
-            BevelVmeshMethod::Cutoff => ChainEmission::ResampledAtControlResolution,
+            BevelVmeshMethod::Cutoff => ChainEmission::Raw,
         };
 
         for &endpoint in &endpoints {
@@ -1520,6 +1520,7 @@ impl LoopMesh {
                 vertex,
                 &boundverts,
                 &opening_edges,
+                &corners,
                 is_beveled,
                 segments,
                 profile,
@@ -1533,7 +1534,7 @@ impl LoopMesh {
             for k in 0..count {
                 let next = (k + 1) % count;
                 let crossing = opening_edges[next];
-                let rescue = self.mid_rescue(vertex, crossing, is_beveled);
+                let rescue = self.mid_rescue(vertex, crossing, &corners, is_beveled);
                 let (interior, cell) = self.build_chain_between(
                     boundverts[k],
                     boundverts[next],
@@ -1583,6 +1584,7 @@ impl LoopMesh {
         vertex: VertexKey,
         boundverts: &[VertexKey],
         opening_edges: &[EdgeKey],
+        corners: &[VertexCorner],
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         segments: u32,
         profile: f32,
@@ -1600,13 +1602,13 @@ impl LoopMesh {
             first_boundvert,
             second_boundvert,
             first_edge,
-            self.mid_rescue(vertex, first_edge, is_beveled),
+            self.mid_rescue(vertex, first_edge, corners, is_beveled),
         );
         let mut second = self.derive_profile_cell(
             second_boundvert,
             first_boundvert,
             second_edge,
-            self.mid_rescue(vertex, second_edge, is_beveled),
+            self.mid_rescue(vertex, second_edge, corners, is_beveled),
         );
         ProfileCell::override_weld_plane(&mut first, &mut second, self.vertex_position(vertex));
 
@@ -1810,8 +1812,9 @@ impl LoopMesh {
         // valence-≥3 terminal (any terminal endpoint reaching this point), so the
         // §8.2.2.1 terminal-far-end plane override applies: pass the terminal vertex.
         let terminal_position = self.vertex_position(vertex);
-        let is_beveled = |candidate: EdgeKey| beveled.contains(&candidate);
-        let rescue = self.mid_rescue(vertex, edge, &is_beveled);
+        // A terminal endpoint carries exactly one beveled edge, so §8.2.2.1's tier-2 gate
+        // (`s ≥ 3`) can never open here — no corner ring needed to find that out.
+        let rescue = MidRescue::tier1_only(terminal_position);
         let (interior, cell) = self.build_chain_between(
             strip_left,
             strip_right,
@@ -2110,25 +2113,29 @@ impl LoopMesh {
 
     /// The §8.2.2.1 rescue context for the chain crossing `edge` at `vertex`: the
     /// original vertex, plus tier 2's two offset-line directions when — and only when —
-    /// both of `edge`'s disk-neighbours at `vertex` are themselves beveled and the vertex
-    /// carries `s ≥ 3` beveled edges. Read off the pristine disk, with the boundary
-    /// building that follows.
+    /// both of `edge`'s **rotational** neighbours at `vertex` are themselves beveled and
+    /// the vertex carries `s ≥ 3` beveled edges. Read off the pristine corner ring, which
+    /// is the rotational order §7.6.1 walks — the radial structure's own edge cycle is
+    /// insertion-ordered and says nothing about which edges flank `edge` around the fan.
+    /// The returned directions are ordered `(start-side, end-side)` to match the chain's
+    /// `start` / `end` boundverts, since the ring the sectors were split from is the ring
+    /// indexed here.
     fn mid_rescue(
         &self,
         vertex: VertexKey,
         edge: EdgeKey,
+        corners: &[VertexCorner],
         is_beveled: &dyn Fn(EdgeKey) -> bool,
     ) -> MidRescue {
         let vertex_position = self.vertex_position(vertex);
-        let disk: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
-        let beveled_count = disk.iter().filter(|&&e| is_beveled(e)).count();
+        let beveled_count = self
+            .iter_disk_edges(vertex)
+            .filter(|&e| is_beveled(e))
+            .count();
         let neighbour_dirs = (beveled_count >= 3)
-            .then(|| disk.iter().position(|&e| e == edge))
+            .then(|| rotational_edge_neighbours(corners, edge))
             .flatten()
-            .and_then(|index| {
-                let count = disk.len();
-                let before = disk[(index + count - 1) % count];
-                let after = disk[(index + 1) % count];
+            .and_then(|(before, after)| {
                 if !is_beveled(before) || !is_beveled(after) {
                     return None;
                 }
@@ -2955,7 +2962,7 @@ impl LoopMesh {
                     );
                 }
                 Some(edge) => {
-                    let rescue = self.mid_rescue(vertex, edge, is_beveled);
+                    let rescue = self.mid_rescue(vertex, edge, &corners, is_beveled);
                     ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
                     let (interior, cell) = self.build_chain_between(
                         start,
@@ -3008,7 +3015,7 @@ impl LoopMesh {
                     ring[(i + 1) % ring_count],
                     edge,
                     profile,
-                    self.mid_rescue(vertex, edge, is_beveled),
+                    self.mid_rescue(vertex, edge, &corners, is_beveled),
                 ),
             })
             .collect();
@@ -3384,7 +3391,7 @@ impl LoopMesh {
                     );
                 }
                 Some(edge) => {
-                    let rescue = self.mid_rescue(vertex, edge, is_beveled);
+                    let rescue = self.mid_rescue(vertex, edge, &corners, is_beveled);
                     ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
                     // §8.9.5.2: each flanking beveled-edge cross-section carries `segments
                     // − 1` interior samples. The reflex sector's flanking pair runs to an
@@ -3452,7 +3459,7 @@ impl LoopMesh {
                         ring[(i + 1) % ring.len()],
                         edge,
                         profile,
-                        self.mid_rescue(vertex, edge, is_beveled),
+                        self.mid_rescue(vertex, edge, &corners, is_beveled),
                     ),
                 })
                 .collect()
@@ -4853,7 +4860,38 @@ impl LoopMesh {
             }
         }
 
-        ring
+        // The start face is arbitrary, so on an open fan (a boundary vertex) it can sit
+        // mid-fan and the forward walk reaches only the faces after it. Walk backward off
+        // the start's other edge too, or the ring is silently truncated — and a truncated
+        // ring loses whole sectors and mis-answers the rotational-neighbour query.
+        let mut leading: Vec<VertexCorner> = Vec::new();
+        let mut back_edge = start_e0;
+        while ring.len() + leading.len() < face_edges.len() {
+            let previous = face_edges.iter().enumerate().find(|(index, (_, e0, e1))| {
+                !used[*index] && (*e0 == back_edge || *e1 == back_edge)
+            });
+            match previous {
+                Some((index, &(face, e0, e1))) => {
+                    used[index] = true;
+                    let incoming = if e0 == back_edge { e1 } else { e0 };
+                    leading.push(VertexCorner {
+                        incoming_edge: incoming,
+                        face,
+                        outgoing_edge: back_edge,
+                    });
+                    back_edge = incoming;
+                }
+                None => break,
+            }
+        }
+
+        if leading.is_empty() {
+            ring
+        } else {
+            leading.reverse();
+            leading.extend(ring);
+            leading
+        }
     }
 
     /// Place a sector's boundvert by the pairwise offset-line meet (BEVEL.md
@@ -7481,6 +7519,34 @@ fn ring_has_repeat(ring: &[VertexKey]) -> bool {
     false
 }
 
+/// `edge`'s two neighbours in the vertex's **rotational** edge order — the order §7.6.1
+/// walks the fan in, and the one §8.2.2.1's tier-2 gate means by an edge's "disk
+/// neighbours". The corner ring is the only carrier of that order: the radial structure's
+/// per-vertex edge cycle is linked in insertion order and its successor is generally not
+/// the next edge *around* the vertex.
+///
+/// Returned as `(predecessor, successor)` in the ring's own direction, so the predecessor
+/// flanks the sector that opens before `edge` — the sector whose boundvert is a crossing
+/// chain's `start`. `None` at a fan end (an open fan's first / last edge has no
+/// wrap-around neighbour, so no tier-2 pair exists there).
+fn rotational_edge_neighbours(
+    corners: &[VertexCorner],
+    edge: EdgeKey,
+) -> Option<(EdgeKey, EdgeKey)> {
+    let first = corners.first()?;
+    let last = corners.last()?;
+    let closed = last.outgoing_edge == first.incoming_edge;
+    let index = corners.iter().position(|c| c.incoming_edge == edge)?;
+    let predecessor = if index > 0 {
+        corners[index - 1].incoming_edge
+    } else if closed {
+        last.incoming_edge
+    } else {
+        return None;
+    };
+    Some((predecessor, corners[index].outgoing_edge))
+}
+
 /// Split a vertex's rotational corner ring into sectors at the beveled edges
 /// (BEVEL.md §7.6.1). Each sector runs from one beveled edge, through any unbeveled
 /// edges/faces, to the next beveled edge, and yields one boundvert. Returns one
@@ -7660,6 +7726,46 @@ mod tests {
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
         (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
+    }
+
+    /// A flat `spokes`-triangle fan around a centre vertex at the origin, rim at unit
+    /// radius: a **planar** junction, so every beveled-edge sector's `start` / `mid` /
+    /// `end` comes out collinear and every profile rides the §8.2.2.1 rescue.
+    fn planar_fan(spokes: usize) -> (LoopMesh, VertexKey, Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let rim: Vec<VertexKey> = (0..spokes)
+            .map(|k| {
+                let angle = std::f32::consts::TAU * (k as f32) / (spokes as f32);
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+        for k in 0..spokes {
+            let next = (k + 1) % spokes;
+            mesh.face_create_verts(&[centre, rim[k], rim[next]], FaceCreateFlags::NONE);
+        }
+        (mesh, centre, rim)
+    }
+
+    /// A half-disc fan: `spokes` rim verts spread over 180°, so the centre is a
+    /// **boundary** vertex with `spokes - 1` faces and an *open* corner ring whose two
+    /// ends are the extreme spokes. Faces are created starting at `first_face` and wrapping,
+    /// which shifts which face the ring walk starts from — the same mesh either way.
+    fn open_planar_fan(spokes: usize, first_face: usize) -> (LoopMesh, VertexKey, Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let rim: Vec<VertexKey> = (0..spokes)
+            .map(|k| {
+                let angle = std::f32::consts::PI * (k as f32) / ((spokes - 1) as f32);
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+        let faces = spokes - 1;
+        for step in 0..faces {
+            let k = (first_face + step) % faces;
+            mesh.face_create_verts(&[centre, rim[k], rim[k + 1]], FaceCreateFlags::NONE);
+        }
+        (mesh, centre, rim)
     }
 
     fn vert_at(mesh: &LoopMesh, position: Vec3) -> VertexKey {
@@ -8357,6 +8463,238 @@ mod tests {
             "a collapsed profile has no projection setup — the signature both overrides key on",
         );
         assert_eq!(collapsed.mid, (start + end) * 0.5, "the chord's plain midpoint");
+    }
+
+    /// BEVEL.md §8.2.2.1's tier-2 gate reads the beveled edge's **rotational** neighbours
+    /// — the edges flanking it *around* the vertex — which only the corner ring carries.
+    /// The radial structure's own per-vertex edge cycle is linked in insertion order, so
+    /// on this fan it lists the beveled spokes as `60°, 0°, 120°` and would hand the gate
+    /// the wrong flanks entirely (firing on the 0° spoke, whose true rotational
+    /// predecessor is an unbeveled leg, and never on the 60° spoke, which is the one
+    /// genuinely flanked by two beveled edges).
+    #[test]
+    fn tier2_gate_reads_the_rotational_neighbours_not_the_edge_cycle() {
+        let (mesh, centre, rim) = planar_fan(6);
+        let corners = mesh.vertex_corner_ring(centre);
+        let spoke = |k: usize| mesh.query_edge_exists(centre, rim[k]).expect("spoke exists");
+        let beveled: Vec<EdgeKey> = (0..3).map(spoke).collect();
+        let is_beveled = |candidate: EdgeKey| beveled.contains(&candidate);
+
+        let (before, after) = mesh
+            .mid_rescue(centre, spoke(1), &corners, &is_beveled)
+            .neighbour_dirs
+            .expect("the middle beveled spoke is flanked by two beveled spokes");
+        let flanks = [before, after];
+        for k in [0usize, 2] {
+            let direction = mesh.vertex_position(rim[k]).normalize();
+            assert!(
+                flanks.iter().any(|f| (*f - direction).length() < 1.0e-5),
+                "the tier-2 pair is the two rotationally adjacent beveled spokes",
+            );
+        }
+
+        for k in [0usize, 2] {
+            assert!(
+                mesh.mid_rescue(centre, spoke(k), &corners, &is_beveled)
+                    .neighbour_dirs
+                    .is_none(),
+                "an outer beveled spoke has an unbeveled rotational neighbour — tier 1 stands",
+            );
+        }
+    }
+
+    /// A **boundary** vertex's corner ring is an open fan, and the start face the walk
+    /// picks is arbitrary — so it can sit mid-fan. Chaining forward only would never reach
+    /// the faces *before* it and the ring would come back silently truncated, which drops
+    /// sectors (§7.6.1) and, through §8.2.2.1's tier-2 gate — which reads an edge's
+    /// rotational neighbours off exactly this ring — moves emitted profile positions.
+    #[test]
+    fn open_fan_corner_ring_reaches_both_sides_of_its_start_face() {
+        // Every rotation of the build order — the walk's start face lands on each of the
+        // fan's four faces in turn, including the two that have a face on *both* sides.
+        for first_face in 0..4 {
+            let (mesh, centre, rim) = open_planar_fan(5, first_face);
+            let spoke = |k: usize| mesh.query_edge_exists(centre, rim[k]).expect("spoke exists");
+            let corners = mesh.vertex_corner_ring(centre);
+
+            assert_eq!(
+                corners.len(),
+                4,
+                "one corner per incident face — the boundary fan is not truncated",
+            );
+            assert!(
+                corners
+                    .windows(2)
+                    .all(|pair| pair[0].outgoing_edge == pair[1].incoming_edge),
+                "consecutive corners share an edge",
+            );
+            let open_ends = [corners[0].incoming_edge, corners[3].outgoing_edge];
+            assert!(
+                open_ends.contains(&spoke(0)) && open_ends.contains(&spoke(4)),
+                "the ring's two open ends are the fan's two boundary spokes",
+            );
+
+            // On the truncated ring the tier-2 gate answered `None` for every spoke the
+            // ring had lost, silently falling back to tier 1 — an emitted-position change.
+            let beveled: Vec<EdgeKey> = (1..4).map(spoke).collect();
+            let is_beveled = |candidate: EdgeKey| beveled.contains(&candidate);
+            assert!(
+                mesh.mid_rescue(centre, spoke(2), &corners, &is_beveled)
+                    .neighbour_dirs
+                    .is_some(),
+                "the middle beveled spoke of a boundary fan is flanked by two beveled spokes",
+            );
+            for k in [1usize, 3] {
+                assert!(
+                    mesh.mid_rescue(centre, spoke(k), &corners, &is_beveled)
+                        .neighbour_dirs
+                        .is_none(),
+                    "an outer beveled spoke's other flank is the unbeveled boundary spoke",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1 at a **planar `s == 3` junction**: every sector is collinear, so
+    /// every profile rides the rescue — and the two tiers land in genuinely different
+    /// places. The middle beveled spoke (both rotational neighbours beveled) takes tier
+    /// 2's meet of the two neighbours' offset lines; the outer two keep tier 1's
+    /// vertex-derived bulge. The tier-2 pairing is directional — the predecessor's offset
+    /// line runs through `start`, the successor's through `end` — and swapping it puts the
+    /// bulge on the far side of the chord, so all three candidates are pinned apart here.
+    #[test]
+    fn planar_junction_middle_sector_takes_the_tier2_offset_line_meet() {
+        let (mut mesh, centre, rim) = planar_fan(6);
+        let geom: Vec<GeomKey> = (0..3)
+            .map(|k| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The 60° wedges put their boundverts `2·offset` out along the bisector (§7.6.2).
+        let start = Vec3::new(0.34641016, 0.2, 0.0);
+        let end = Vec3::new(0.0, 0.4, 0.0);
+        // Tier 2: the 0° spoke's offset line (through `start`) meets the 120° spoke's
+        // (through `end`) here — a milder bulge than the vertex, and on the vertex's side.
+        let tier2 = Vec3::new(0.11547005, 0.2, 0.0);
+        // The two rivals: tier 1's vertex bulge, and the same meet with the two offset
+        // lines swapped onto the wrong chain ends (which bulges *away* from the vertex).
+        let tier1 = Vec3::ZERO;
+        let swapped = Vec3::new(0.23094011, 0.4, 0.0);
+
+        let sample = |mid: Vec3| {
+            ProfileCell::from_control_points(start, end, mid)
+                .chain_positions(2, 0.5, ChainEmission::Resampled)[1]
+        };
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, sample(tier2)),
+            1,
+            "the middle sector's chain vert is sampled through the tier-2 cell",
+        );
+        for rival in [tier1, swapped] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, sample(rival)),
+                0,
+                "no chain vert may land on a rival `mid`",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1: tier 1 is **unconditional**, so a *mixed* sector — one of the
+    /// crossed edge's rotational neighbours unbeveled — keeps the vertex-derived bulge
+    /// even at `s == 3`. The reflex-side chain of the same planar junction pins it: its
+    /// cell is `start` / `end` on the two outer boundverts with the original vertex as the
+    /// bulge, a skewed cell whose lone interior sample the §8.2.2.1.1 resample then moves.
+    #[test]
+    fn planar_junction_outer_sector_keeps_the_tier1_vertex_bulge() {
+        let (mut mesh, centre, rim) = planar_fan(6);
+        let geom: Vec<GeomKey> = (0..3)
+            .map(|k| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The chain crossing the 0° spoke spans the 30° boundvert and the reflex sector's
+        // boundvert (`offset / sin 120°` out along the 240° bisector).
+        let start = Vec3::new(0.34641016, 0.2, 0.0);
+        let end = Vec3::new(-0.11547005, -0.2, 0.0);
+        let expected = ProfileCell::from_control_points(start, end, Vec3::ZERO)
+            .chain_positions(2, 0.5, ChainEmission::Resampled)[1];
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, expected),
+            1,
+            "a mixed sector's bulge is the original vertex — tier 1 does not gate on `s`",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1.1's Scope blockquote: the chord-fraction resample is a property
+    /// of a [V-ADJ] **cap's** boundary emission, and the cutoff fill is not a cap — it
+    /// consumes the coarse chain verts directly, so its chains are emitted **raw**. Every
+    /// cutoff cell the suite had was symmetric, where the resample is the identity and the
+    /// two readings coincide; the planar junction's outer sectors are skewed, and there it
+    /// is worth ~25 position quanta.
+    #[test]
+    fn cutoff_junction_chain_is_emitted_raw() {
+        let (mut mesh, centre, rim) = planar_fan(6);
+        let geom: Vec<GeomKey> = (0..3)
+            .map(|k| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The skewed outer (tier-1) cell of the planar junction: legs 0.4 and 0.23.
+        let cell = ProfileCell::from_control_points(
+            Vec3::new(0.34641016, 0.2, 0.0),
+            Vec3::new(-0.11547005, -0.2, 0.0),
+            Vec3::ZERO,
+        );
+        let raw = cell.chain_positions(2, 0.5, ChainEmission::Raw)[1];
+        let resampled = cell.chain_positions(2, 0.5, ChainEmission::Resampled)[1];
+        assert!(
+            (raw - resampled).length() > 1.0e-4,
+            "the cell must be skewed enough for the two emissions to be distinguishable",
+        );
+        assert_eq!(result_has_vert_near(&mesh, &result, raw), 1);
+        assert_eq!(result_has_vert_near(&mesh, &result, resampled), 0);
     }
 
     /// BEVEL.md §8.3.0.2 / §8.5.5.5: a valence-4 junction (and, at the far ends,
@@ -19977,6 +20315,19 @@ struct MidRescue {
     neighbour_dirs: Option<(Vec3, Vec3)>,
 }
 
+impl MidRescue {
+    /// The rescue context for a vertex that cannot reach tier 2 by construction: tier 2
+    /// needs `s ≥ 3` beveled edges at the vertex, so any site with a *known* smaller `s`
+    /// (a terminal endpoint's `s = 1`, §7.5.1) states that here instead of paying for a
+    /// corner-ring walk whose answer is fixed.
+    fn tier1_only(vertex: Vec3) -> Self {
+        MidRescue {
+            vertex,
+            neighbour_dirs: None,
+        }
+    }
+}
+
 /// The 3-D frame of one sector's profile cell (BEVEL.md §8.2.2.1): the three
 /// control points `start` / `end` / `mid` plus the derived in-plane axes and the
 /// mid-plane normal. `start` / `end` are the two ring boundverts the chain spans;
@@ -20218,10 +20569,8 @@ impl ProfileCell {
         if self.collinear {
             return raw;
         }
-        match emission {
-            ChainEmission::Raw => return raw,
-            ChainEmission::ResampledAtControlResolution if segments != 2 => return raw,
-            _ => {}
+        if emission == ChainEmission::Raw {
+            return raw;
         }
         let source_segments = boundary_source_resolution(segments);
         if source_segments == segments {
@@ -20271,8 +20620,12 @@ impl ProfileCell {
 /// How a cross-section chain emits its samples (BEVEL.md §8.2.2.1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChainEmission {
-    /// The raw profile chain. A terminal far end has no adjacency fill behind it
-    /// (§6.7.5.4), so it consumes the raw samples directly.
+    /// The raw profile chain. Emitted by everything §8.2.2.1.1's Scope blockquote puts
+    /// outside the boundary resample: the **cutoff** fill (§8.3), which consumes the
+    /// coarse chain verts directly, and the terminal far end (§6.7.5.4), which has no
+    /// adjacency fill behind it. The resample is a [V-ADJ] *cap* property, and neither of
+    /// those is a cap — the distinction is invisible on a symmetric cell, where the
+    /// resample is the identity, and worth ≈25 quanta on a skewed one.
     Raw,
     /// The chord-fraction resample (§8.2.2.1.1 steps 1–3), run at every `segments` on
     /// **every** ring-edge chain of **every** [V-ADJ] cap — the plain junction ring, the
@@ -20283,11 +20636,6 @@ enum ChainEmission {
     /// onto the profile curve is a *grid-level* decision the fill makes (step 4), not a
     /// chain-level one.
     Resampled,
-    /// The resample restricted to the `segments = 2` control resolution — the cutoff
-    /// junction fill's emission. §8.2.2.1.1's Scope blockquote puts the cutoff fill
-    /// (§8.3) outside the boundary resample: it consumes the coarse chain verts, so at
-    /// a non-power-of-two count its chain stays raw.
-    ResampledAtControlResolution,
 }
 
 /// The source resolution of the §8.2.2.1.1 boundary resample: the round-over fill's
