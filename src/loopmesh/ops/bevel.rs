@@ -1234,12 +1234,26 @@ impl LoopMesh {
         // bridge each junction's unseamed-gap beveled edge as a **run of `segments`
         // outermost-ring cross-section edges** — the whole profile chain spanning
         // that gap edge, not the single patch segment of the `segments = 1` case. The
-        // gap criterion is verbatim §6.7.4; only the junction fills (`junction_cuts`)
-        // bridge — terminals and miters stay inert (§6.7.5.4).
+        // gap criterion is verbatim §6.7.4. Both the plain cutoff / adj junction fills
+        // (`junction_cuts`) and the **reflex outer miter** junctions
+        // (`outer_miter_junctions`, §6.7.5.4 case (4)) bridge — the walk is indexed on
+        // beveled edges, so the miter's reflex-arc re-stitch leaves the bunch-side gap
+        // run in registration. Terminals and the miter fill itself stay inert.
         if options.mark_seam || options.mark_sharp {
             for cut in &junction_cuts {
                 self.bridge_junction_flags_multisegment(
-                    cut,
+                    cut.vertex,
+                    &cut.opening_edges,
+                    &chains,
+                    &edge_seam_state,
+                    options.mark_seam,
+                    options.mark_sharp,
+                );
+            }
+            for omj in &outer_miter_junctions {
+                self.bridge_junction_flags_multisegment(
+                    omj.vertex,
+                    &omj.opening_edges,
                     &chains,
                     &edge_seam_state,
                     options.mark_seam,
@@ -2748,6 +2762,10 @@ impl LoopMesh {
             vertex,
             boundverts: ring,
             chains: ring_chains,
+            // Disk-order beveled edges (one per sector) — the reflex sector's own
+            // opening edge included; the bridge treats it like any other and, being a
+            // seam flank rather than a gap, never bridges into the reflex arc.
+            opening_edges: sectors.iter().map(|s| s.bounding_edges[0]).collect(),
             segments,
         });
         true
@@ -4952,15 +4970,24 @@ impl LoopMesh {
     /// by `(edge = g_m, endpoint = vertex)` — the §8.3.0 chain the build laid between
     /// `g_m`'s two flanking boundverts `B_(m−1)` and `B_m`. `seam` and `sharp` run the
     /// identical walk on independent bits.
+    ///
+    /// The walk is indexed on **beveled edges** (`opening_edges`), never on raw ring
+    /// boundverts, so it is identical whether the junction is a plain cutoff fill or a
+    /// **reflex outer miter** (§6.7.5.4 case (4)): each gap edge's *own* cross-section
+    /// chain is flagged, so an absorbed unbeveled leg contributes no `opening_edges`
+    /// entry (it is stepped over, not counted) and the outer miter's inserted
+    /// reflex-arc boundverts never fall in a flagged span (the bunch is the `< 180°`
+    /// complement of the reflex sector, so every gap's short arc stays bunch-side).
     fn bridge_junction_flags_multisegment(
         &mut self,
-        cut: &JunctionCut,
+        vertex: VertexKey,
+        opening_edges: &[EdgeKey],
         chains: &[EdgeEndChain],
         edge_seam_state: &[(EdgeKey, bool, bool)],
         seam: bool,
         sharp: bool,
     ) {
-        let count = cut.opening_edges.len();
+        let count = opening_edges.len();
         if count < 2 {
             return;
         }
@@ -4973,7 +5000,7 @@ impl LoopMesh {
         };
 
         let mut bridge = |want_seam: bool, this: &mut Self| {
-            let seamed = |k: usize| flag_of(cut.opening_edges[k], want_seam);
+            let seamed = |k: usize| flag_of(opening_edges[k], want_seam);
 
             let seamed_count = (0..count).filter(|&k| seamed(k)).count();
             // A gap needs a seamed edge on each side: at least two seamed edges and
@@ -4989,10 +5016,10 @@ impl LoopMesh {
                 if seamed(m) {
                     continue;
                 }
-                let gap_edge = cut.opening_edges[m];
+                let gap_edge = opening_edges[m];
                 let Some(chain) = chains
                     .iter()
-                    .find(|c| c.edge == gap_edge && c.endpoint == cut.vertex)
+                    .find(|c| c.edge == gap_edge && c.endpoint == vertex)
                 else {
                     continue;
                 };
@@ -6192,6 +6219,11 @@ struct OuterMiterJunction {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
     chains: Vec<Vec<VertexKey>>,
+    /// Per sector `k` (disk order), the beveled edge `g_k` that opens it — the same
+    /// convention as `JunctionCut::opening_edges`, so the §6.7.5.3 seam / sharp
+    /// bunch-side bridge (case (4)) walks the reflex junction's beveled edges without
+    /// counting the reflex sector or any absorbed unbeveled leg.
+    opening_edges: Vec<EdgeKey>,
     segments: u32,
 }
 
@@ -13116,6 +13148,196 @@ mod tests {
             "e04's far-end cross-section chain is not bridged at the terminal (§6.7.5.4)",
         );
         mesh.validate_topology();
+    }
+
+    /// Bevel a bunch of the octagonal bipyramid's apex legs (`segments = 2`,
+    /// `offset = 0.2`, `vmesh_method = ADJ`, circular profile) with a chosen
+    /// `miter_outer`, seaming / sharpening the named apex-leg indices and passing
+    /// the corresponding `mark_seam` / `mark_sharp`. `beveled` / `seamed` /
+    /// `sharped` are apex-leg indices (`k` = leg `A–R_(k+1)`, so scaffold edge
+    /// `{0, k+1}` = `apex_leg[k]`). Drives BEVEL.md §6.7.5.4 case (4).
+    fn bevel_octagonal_reflex_flagged(
+        beveled: &[usize],
+        seamed: &[usize],
+        sharped: &[usize],
+        miter_outer: BevelMiter,
+        mark_seam: bool,
+        mark_sharp: bool,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, _apex, _rim, apex_leg) = octagonal_bipyramid_all_legs();
+        for &k in seamed {
+            mesh.set_edge_seam(apex_leg[k], true);
+        }
+        for &k in sharped {
+            mesh.set_edge_sharp(apex_leg[k], true);
+        }
+        let geom: Vec<GeomKey> = beveled.iter().map(|&k| apex_leg[k].into()).collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer,
+                mark_seam,
+                mark_sharp,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// Count the still-live newly minted edges carrying `flag`. Mechanism (1) fires
+    /// unconditionally, so the ON−OFF delta of this over `mark_seam` isolates the
+    /// mechanism-(2) bunch-side bridge run (§6.7.5.3).
+    fn count_flagged_result_edges(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        flag: impl Fn(&LoopMesh, EdgeKey) -> bool,
+    ) -> usize {
+        result
+            .edges
+            .iter()
+            .filter(|&&e| mesh.edge_keys().contains(&e) && flag(mesh, e))
+            .count()
+    }
+
+    /// BEVEL.md §6.7.5.4 case (4): a **multi-face reflex outer `ARC` miter** does not
+    /// desync the mechanism-(2) bunch-side bridge. Octagonal apex, legs `A–R1..A–R4`
+    /// beveled (a `< 180°` bunch, `> 180°` reflex sector absorbing legs 5..8); the two
+    /// flanking legs `A–R1` / `A–R4` seamed, the interior `A–R2` / `A–R3` the length-2
+    /// gap. `mark_seam` ON must bridge that gap as its own `2 gap edges × 2 segments =
+    /// 4`-edge run on the bunch side, exactly as at a miter-free junction — the outer
+    /// miter's inserted reflex-arc boundverts fall outside every bridge span.
+    #[test]
+    fn multiface_reflex_arc_seam_gap_bridge_contiguous() {
+        let beveled = [0, 1, 2, 3];
+        let flanks = [0, 3];
+        let (on, on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Arc, true, false);
+        let (off, off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Arc, false, false);
+        let (bare, bare_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &[], BevelMiter::Arc, true, false);
+
+        let on_count = count_flagged_result_edges(&on, &on_r, |m, e| m.edge_seam(e));
+        let off_count = count_flagged_result_edges(&off, &off_r, |m, e| m.edge_seam(e));
+        let bare_count = count_flagged_result_edges(&bare, &bare_r, |m, e| m.edge_seam(e));
+
+        assert_eq!(
+            on_count - off_count,
+            4,
+            "mark_seam must add exactly the interior gap's `2 × 2 = 4`-edge bunch-side \
+             run across a multi-face reflex ARC miter (§6.7.5.4 case (4))",
+        );
+        assert!(on_count > off_count, "the bridge must be non-vacuous (on differs from off)");
+        assert_eq!(
+            bare_count, 0,
+            "no seamed input ⇒ no gap and no mechanism-(1) flag: the ARC fill stays inert",
+        );
+        on.validate_topology();
+        off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (4): the `mark_sharp` companion of the ARC contiguous
+    /// gap bridge — the run-bridge fires on the sharp bit independently and the
+    /// multi-face reflex ARC miter leaves it inert on the wide arc.
+    #[test]
+    fn multiface_reflex_arc_sharp_gap_bridge_contiguous() {
+        let beveled = [0, 1, 2, 3];
+        let flanks = [0, 3];
+        let (on, on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &flanks, BevelMiter::Arc, false, true);
+        let (off, off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &flanks, BevelMiter::Arc, false, false);
+
+        let on_count = count_flagged_result_edges(&on, &on_r, |m, e| m.edge_sharp(e));
+        let off_count = count_flagged_result_edges(&off, &off_r, |m, e| m.edge_sharp(e));
+        assert_eq!(
+            on_count - off_count,
+            4,
+            "mark_sharp must add exactly the interior gap's `2 × 2 = 4`-edge bunch-side \
+             run across a multi-face reflex ARC miter (§6.7.5.4 case (4))",
+        );
+        on.validate_topology();
+        off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (4): the mechanism-(2) walk STEPS OVER an absorbed
+    /// unbeveled leg. Octagonal apex, legs `A–R1`, `A–R3`, `A–R4` beveled with `A–R2`
+    /// unbeveled (absorbed into the convex `A–R1`–`A–R3` sector); `A–R1` / `A–R4`
+    /// seamed, the interior `A–R3` the length-1 gap. The bridge from `A–R1` reaches
+    /// the gap `A–R3` skipping the absorbed `A–R2` (unbeveled legs are not counted
+    /// toward gap length) and flags `A–R3`'s own `1 × 2 = 2`-edge run and nothing more.
+    #[test]
+    fn multiface_reflex_arc_seam_gap_bridge_absorbed_leg() {
+        let beveled = [0, 2, 3];
+        let flanks = [0, 3];
+        let (on, on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Arc, true, false);
+        let (off, off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Arc, false, false);
+
+        let on_count = count_flagged_result_edges(&on, &on_r, |m, e| m.edge_seam(e));
+        let off_count = count_flagged_result_edges(&off, &off_r, |m, e| m.edge_seam(e));
+        assert_eq!(
+            on_count - off_count,
+            2,
+            "mark_seam must bridge the length-1 gap over the absorbed leg as its own \
+             `1 × 2 = 2`-edge run and nothing more (§6.7.5.4 case (4))",
+        );
+        on.validate_topology();
+        off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (4): the strongest desync check — a multi-face reflex
+    /// outer `PATCH` miter inserts the MOST boundverts on the wide reflex arc (the
+    /// patch-middle plus patch-end, §8.9.6), yet the bunch-side contiguous gap still
+    /// bridges to exactly `2 × 2 = 4` edges and no patch fill edge is flagged.
+    #[test]
+    fn multiface_reflex_patch_seam_gap_bridge_contiguous() {
+        let beveled = [0, 1, 2, 3];
+        let flanks = [0, 3];
+        let (on, on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Patch, true, false);
+        let (off, off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Patch, false, false);
+
+        let on_count = count_flagged_result_edges(&on, &on_r, |m, e| m.edge_seam(e));
+        let off_count = count_flagged_result_edges(&off, &off_r, |m, e| m.edge_seam(e));
+        assert_eq!(
+            on_count - off_count,
+            4,
+            "mark_seam must add exactly `2 × 2 = 4` bunch-side seam edges under a \
+             multi-face reflex PATCH miter and flag no patch fill edge (§6.7.5.4 case (4))",
+        );
+        on.validate_topology();
+        off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (4): the degenerate baseline — a multi-face reflex outer
+    /// `SHARP` miter inserts NO reflex-arc boundverts. The bunch-side contiguous gap
+    /// bridges to `2 × 2 = 4` edges through the plain cutoff / adj junction fill path.
+    #[test]
+    fn multiface_reflex_sharp_miter_seam_gap_bridge_contiguous() {
+        let beveled = [0, 1, 2, 3];
+        let flanks = [0, 3];
+        let (on, on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Sharp, true, false);
+        let (off, off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &flanks, &[], BevelMiter::Sharp, false, false);
+
+        let on_count = count_flagged_result_edges(&on, &on_r, |m, e| m.edge_seam(e));
+        let off_count = count_flagged_result_edges(&off, &off_r, |m, e| m.edge_seam(e));
+        assert_eq!(
+            on_count - off_count,
+            4,
+            "mark_seam must add exactly `2 × 2 = 4` bunch-side seam edges under a \
+             multi-face reflex SHARP miter (§6.7.5.4 case (4))",
+        );
+        on.validate_topology();
+        off.validate_topology();
     }
 
     /// The minimum ring slide of a corner: distance from the original corner
