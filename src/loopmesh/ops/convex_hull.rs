@@ -30,9 +30,17 @@ pub struct ConvexHullResult {
 }
 
 impl ConvexHullResult {
-    /// On-hull vertices — the extremal subset of the input cloud. These are
-    /// existing input verts (the operator never invents a point, CONVEX_HULL.md
-    /// §2), so their positions equal the input positions exactly.
+    /// On-hull vertices — the corners of every **materialised** hull triangle
+    /// (CONVEX_HULL.md §4.3): one the operator built a face for, or one the §5
+    /// reuse pass covered with an existing face. These are existing input verts
+    /// (the operator never invents a point, CONVEX_HULL.md §2), so their
+    /// positions equal the input positions exactly.
+    ///
+    /// On any non-degenerate cloud this set *is* the extremal subset, but the
+    /// rule is materialisation, not geometry, and the two part company on a
+    /// collinear cloud: nothing is materialised there, so this slot is **empty**
+    /// even though the segment's endpoints are plainly extremal
+    /// (CONVEX_HULL.md §4.1, §8).
     pub fn verts(&self) -> &[VertexKey] {
         &self.verts
     }
@@ -60,10 +68,15 @@ impl ConvexHullResult {
         out
     }
 
-    /// Interior (buried) input vertices — every input vert that is *not* a hull
-    /// corner: the culled coplanar-interior point, the collinear intermediate
-    /// points, a coincident duplicate's key, and any 3D buried point
-    /// (CONVEX_HULL.md §4, §4.1).
+    /// Interior (buried) input vertices — every input vert that is *not* a corner
+    /// of a materialised hull triangle: the culled coplanar-interior point, a
+    /// coincident duplicate's key, any 3D buried point — and, on a collinear
+    /// cloud, *every* input vert including the two extreme endpoints, since
+    /// nothing is materialised there and the optimistic interior pre-tag is only
+    /// ever cleared by materialisation (CONVEX_HULL.md §4, §4.1, §8).
+    ///
+    /// On-hull and interior are exact complements over the input vertex set, for
+    /// any input, degenerate or not (CONVEX_HULL.md §4.3).
     pub fn interior_verts(&self) -> &[VertexKey] {
         &self.interior_verts
     }
@@ -198,9 +211,13 @@ impl LoopMesh {
     /// - **Coplanar** input yields a single planar facet, fanned into a flat
     ///   outward-wound triangle patch; culled interior points are absent from
     ///   the provider's on-hull set and so from `geom.out`.
-    /// - **Collinear** input yields a 1D hull — two extreme endpoints, no
-    ///   facet. No faces are built; the two endpoints are reported as on-hull
-    ///   verts in `geom.out`.
+    /// - **Collinear** input yields a 1D hull — a sub-three-corner "facet" that
+    ///   the fan discards, leaving an **empty** triangle list (§3.1). Nothing is
+    ///   materialised, so the mesh is untouched and `geom.out` is **empty, verts
+    ///   included**: the segment's two extreme endpoints are extremal, but
+    ///   on-hull is raised only on the corners of a materialised triangle, and
+    ///   there are none. Every input vert (endpoints and intermediates alike)
+    ///   comes back interior — and, loose, unused (§4.1, §4.3, §8).
     /// - **Coincident** duplicate input verts are deduplicated by the provider
     ///   before the hull runs, so a non-representative duplicate never appears
     ///   in the on-hull set.
@@ -525,34 +542,27 @@ impl LoopMesh {
             }
         }
 
-        // §2 / §8 — the on-hull vertex set is the extremal subset of the input,
-        // emitted in the provider's ascending-index order so the slot is stable.
+        // §4.3 — on-hull is a *consequence of materialisation*, never a geometric
+        // judgement: `on_hull_verts` was raised only from inside the per-triangle
+        // loop above (build path and skip path alike), and nothing else may add to
+        // it. In particular the provider's own `vertices` list is **not** a source
+        // of on-hull status (§3.1) — it is read here purely as a stable ascending
+        // emission order for the set the loop already settled.
         //
-        // The emission filter (`on_hull_verts.contains`) coincides with the
-        // provider's own vertex set for a full-3D hull: every vertex the provider
-        // reports is a corner of some materialised triangle, so the two agree.
-        // The degenerate paths populate `result.verts` directly because no facet
-        // bounds the on-hull verts there: a 1D collinear hull (§8 collinear
-        // bullet) builds no faces yet its two extreme endpoints are still on-hull,
-        // and a coplanar flat hull with on-hull verts is covered by the facet
-        // path. Coincident duplicates never reach the on-hull set — the provider
+        // The two coincide on any hull with facets. They part company on a 1D
+        // (collinear) hull, where the provider still names the segment's two
+        // extreme endpoints — a true statement about the hull *math* — while the
+        // operator materialised no triangle at all, so `geom.out` is empty, verts
+        // included, and every input vert stays interior (§8 collinear bullet).
+        //
+        // Coincident duplicates never reach the on-hull set either: the provider
         // deduplicates coincident positions before the hull runs, so a
-        // non-representative duplicate is simply absent from `topology.vertices`
-        // (§8 coincident bullet) and lands in the interior/unused slots instead.
-        //
-        // `no_facets` distinguishes a genuinely degenerate (collinear) hull from
-        // one whose facets were all reused as holes (§5): in the reuse case the
-        // facets exist and bound their verts, so the `on_hull_verts.contains`
-        // filter is correct and we must *not* fall into the no-facets seam.
-        let no_facets = triangles.is_empty();
+        // non-representative duplicate bounds no facet (§8 coincident bullet) and
+        // lands in the interior/unused slots.
         for &index in &topology.vertices {
             let vert = verts[index];
-            if no_facets || on_hull_verts.contains(&vert) {
+            if on_hull_verts.contains(&vert) {
                 result.verts.push(vert);
-                // No-op for the facet path; load-bearing for the no-faces
-                // (collinear) path — seeds on-hull so the later classification
-                // pass excludes these endpoints from interior.
-                on_hull_verts.insert(vert);
             }
         }
         // The on-hull edges are accumulated through a HashSet (drain order is
@@ -902,10 +912,12 @@ impl LoopMesh {
 /// [`Quickhull`] upholds every clause by construction; the check exists for
 /// *injected* providers (a foreign hull engine behind an adapter), where a
 /// contract slip would otherwise corrupt **silently**: an index the facets use
-/// but `vertices` omits vanishes from every output slot, an index `vertices`
-/// lists but no facet uses is handed to a downstream delete as unused, an
-/// unsorted or duplicated `vertices` reorders or doubles `geom.out`, and a
-/// facet-less topology is indistinguishable from the legitimate collinear hull.
+/// but `vertices` omits vanishes from `geom.out` (the emission walks `vertices`)
+/// while its face is still built, an unsorted or duplicated `vertices` reorders
+/// or doubles `geom.out`, and a facet-less topology is indistinguishable from
+/// the legitimate collinear hull — which now materialises nothing, so a provider
+/// that merely *lost* its facets would report a whole 3D cloud as interior +
+/// unused, i.e. safe to delete.
 /// Each message names its clause distinctly, so an adapter author reading the
 /// failure knows exactly which obligation they broke.
 #[cfg(debug_assertions)]
@@ -957,11 +969,12 @@ fn assert_provider_contract(cloud_len: usize, topology: &HullTopology) {
     }
 
     // Clause (the other half of the set equality): with facets present, `vertices`
-    // is exactly the facets' index set — so no listed index may go unused. An
-    // extra one is reported on-hull yet built into no face, and is then handed to
-    // the reuse/delete pass as an unused vert. (Only checked with facets present:
-    // the facet-less 1D seam's two endpoints legitimately belong to no face, and
-    // the clause below owns that case.)
+    // is exactly the facets' index set — so no listed index may go unused. The
+    // operator would silently *drop* an extra one (on-hull status comes from the
+    // materialisation loop, not from this list, §4.3), reporting a vertex the
+    // adapter believes extremal as interior + unused. (Only checked with facets
+    // present: the facet-less 1D seam's two endpoints legitimately belong to no
+    // face, and the clause below owns that case.)
     if !topology.faces.is_empty() {
         for &index in &topology.vertices {
             assert!(
@@ -1230,10 +1243,14 @@ mod tests {
     }
 
     #[test]
-    fn collinear_cloud_builds_no_faces_two_endpoints_on_hull() {
-        // Five points strung along the x axis: the hull is a 1D segment with two
-        // extreme endpoints and no facet (CONVEX_HULL.md §8 collinear bullet).
-        // The operator builds no faces; the two endpoints are on-hull verts.
+    fn collinear_cloud_materialises_nothing_and_geom_out_is_empty() {
+        // Five points strung along the x axis. The 1D hull's "facet" has fewer
+        // than three corners, so the fan discards it and the triangle list comes
+        // out **empty** (CONVEX_HULL.md §3.1). Nothing is materialised, so nothing
+        // is flagged on-hull — not even the two extreme endpoints, however
+        // obviously extremal they are: on-hull is a consequence of being a corner
+        // of a materialised triangle, never a geometric judgement, and it is never
+        // seeded from the hull-math provider's own vertex list (§4.1, §4.3, §8).
         let mut mesh = LoopMesh::new();
         let input = cloud(
             &mut mesh,
@@ -1248,38 +1265,72 @@ mod tests {
 
         let result = mesh.convex_hull(&input);
 
-        assert!(result.faces().is_empty(), "a 1D hull builds no faces");
-        assert!(result.edges().is_empty(), "a 1D hull builds no hull edges");
+        // The mesh is untouched: edges are only ever minted as a side-effect of
+        // building a triangle, and no triangle was built (§8).
         assert_eq!(mesh.face_count(), 0, "no face is materialised");
         assert_eq!(mesh.edge_count(), 0, "no edge is materialised");
 
-        // The two extreme endpoints (x = -2 and x = 2) are the on-hull verts.
-        let on_hull: std::collections::HashSet<VertexKey> =
-            result.verts().iter().copied().collect();
-        assert_eq!(result.verts().len(), 2, "exactly the two extreme endpoints");
-        assert!(on_hull.contains(&input[0]), "x = -2 endpoint is on-hull");
-        assert!(on_hull.contains(&input[4]), "x = 2 endpoint is on-hull");
-        for interior in [input[1], input[2], input[3]] {
-            assert!(
-                !on_hull.contains(&interior),
-                "the three interior collinear points are not on-hull"
-            );
-        }
+        // geom.out is empty — of verts as well as of edges and faces.
+        assert!(
+            result.geom_out().is_empty(),
+            "a 1D hull materialises nothing, so geom.out is empty (verts included)"
+        );
+        assert!(result.verts().is_empty(), "the extreme endpoints are NOT on-hull");
+        assert!(result.edges().is_empty(), "a 1D hull builds no hull edges");
+        assert!(result.faces().is_empty(), "a 1D hull builds no faces");
+        assert!(result.geom_holes_out().is_empty(), "nothing to reuse ⇒ no holes");
 
-        // The no-faces path must still populate geom.out verts directly (the
-        // degenerate-path seam): the two endpoints are reported as verts even
-        // though no facet bounds them.
-        let geom_verts: std::collections::HashSet<VertexKey> = result
-            .geom_out()
-            .into_iter()
-            .filter_map(|g| match g {
-                GeomKey::Vert(v) => Some(v),
-                _ => None,
-            })
+        // Every input vert — endpoints included — keeps its optimistic interior
+        // pre-tag, and (loose) passes the §7 unused test vacuously.
+        let all = vert_set(&input);
+        assert_eq!(
+            vert_set(result.interior_verts()),
+            all,
+            "every input vert is interior, endpoints alongside intermediates"
+        );
+        assert_eq!(
+            vert_set(result.unused_verts()),
+            all,
+            "every input vert is unused — a caller deleting geom_unused.out drops \
+             the whole degenerate selection, leaving no orphan endpoints"
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn collinear_polyline_edges_are_interior_and_unused() {
+        // The same collinear cloud, fed together with the edges wiring it into a
+        // polyline. No extra rule is needed: an empty triangle list makes the §4.2
+        // hull-edge lookup empty, so no input edge's endpoint pair is a hull edge
+        // and every one of them is interior — then unused, its faces (none) being
+        // vacuously all-input (CONVEX_HULL.md §8 collinear bullet, §7).
+        let mut mesh = LoopMesh::new();
+        let input = cloud(
+            &mut mesh,
+            &[
+                Vec3::new(-2.0, 0.0, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+        );
+        let edges: Vec<EdgeKey> = input
+            .windows(2)
+            .map(|pair| mesh.create_edge([pair[0], pair[1]], EdgeCreateFlags::NO_DUPLICATE))
             .collect();
-        assert_eq!(geom_verts.len(), 2, "geom.out reports two endpoint verts");
-        assert!(geom_verts.contains(&input[0]), "x = -2 endpoint in geom.out");
-        assert!(geom_verts.contains(&input[4]), "x = 2 endpoint in geom.out");
+
+        let result = mesh.convex_hull_with_input(&input, &edges, &[], false);
+
+        assert!(result.geom_out().is_empty(), "geom.out is empty — verts and edges alike");
+        assert_eq!(mesh.face_count(), 0, "the mesh is untouched");
+        assert_eq!(mesh.edge_count(), 4, "no edge is minted on top of the polyline");
+
+        // All 2n − 1 elements land in both the interior and the unused slots.
+        assert_eq!(result.interior_verts().len(), 5);
+        assert_eq!(result.interior_edges().len(), 4, "no polyline edge is a hull edge");
+        assert_eq!(result.geom_interior_out().len(), 9);
+        assert_eq!(result.geom_unused_out().len(), 9);
         mesh.validate_topology();
     }
 
@@ -1393,27 +1444,30 @@ mod tests {
     }
 
     #[test]
-    fn collinear_intermediates_are_interior_and_unused() {
-        // Five x-axis points: the two extreme endpoints are on-hull; the three
-        // intermediate points are interior, and (loose) unused (CONVEX_HULL.md
-        // §8 collinear bullet, §7).
+    fn collinear_oblique_cloud_verts_are_all_interior_and_unused() {
+        // An off-axis collinear cloud, so the degenerate path cannot be passing by
+        // accident of an axis-aligned provider shortcut: the segment still
+        // materialises no triangle, so *every* vert — the two extreme endpoints
+        // included — keeps its interior pre-tag and is (loose) unused
+        // (CONVEX_HULL.md §4.1, §8 collinear bullet, §7).
         let mut mesh = LoopMesh::new();
         let input = cloud(
             &mut mesh,
             &[
-                Vec3::new(-2.0, 0.0, 0.0),
-                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(-2.0, -4.0, -6.0),
+                Vec3::new(-1.0, -2.0, -3.0),
                 Vec3::new(0.0, 0.0, 0.0),
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(1.0, 2.0, 3.0),
+                Vec3::new(2.0, 4.0, 6.0),
             ],
         );
 
         let result = mesh.convex_hull(&input);
 
-        let expected = vert_set(&[input[1], input[2], input[3]]);
-        assert_eq!(vert_set(result.interior_verts()), expected, "three intermediates interior");
-        assert_eq!(vert_set(result.unused_verts()), expected, "loose intermediates unused");
+        let all = vert_set(&input);
+        assert!(result.verts().is_empty(), "no vert is on-hull on a 1D hull");
+        assert_eq!(vert_set(result.interior_verts()), all, "every vert is interior");
+        assert_eq!(vert_set(result.unused_verts()), all, "every loose vert is unused");
         mesh.validate_topology();
     }
 
