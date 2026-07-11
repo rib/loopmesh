@@ -1197,6 +1197,7 @@ impl LoopMesh {
         let mut junction_cuts: Vec<JunctionCut> = Vec::new();
         let mut miter_ring_junctions: Vec<MiterRingJunction> = Vec::new();
         let mut terminal_fans: Vec<TerminalFan> = Vec::new();
+        let mut cross_welds: Vec<CrossWeld> = Vec::new();
 
         // §8.2.2.1.1: the chord-fraction resample is a property of the [V-ADJ] cap's
         // *boundary emission*, so it fires on every ring-edge chain of a junction the
@@ -1263,6 +1264,7 @@ impl LoopMesh {
                         &mut chains,
                         &mut face_subst,
                         &mut junction_cuts,
+                        &mut cross_welds,
                         result,
                     );
                 }
@@ -1333,12 +1335,29 @@ impl LoopMesh {
             );
         }
 
+        // Phase 3b (§8.3.0.3 attribute note): at a **cross** weld — a valence-4 welded
+        // junction whose two beveled edges are opposite in the disk — the welded chain
+        // reads as the continuation of the two crossing legs, so its edges take those
+        // legs' per-edge attributes rather than fresh ones. Runs here, in strip order,
+        // once the chain's edges exist: the two donations write the same edges and the
+        // later one prevails.
+        for cross in &cross_welds {
+            self.apply_cross_weld_attributes(cross, &beveled_manifold);
+        }
+
         // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
         // adjacency grid (§8.5), per `vmesh_method`. ADJ fills the cube corner (any
         // `segments`) and the general valence-`s` corner at the default circular
         // profile (§8.5.5.5); only the deferred profile / pipe variants of
         // §8.5.5.5(f) take no ADJ fill yet.
         for cut in &junction_cuts {
+            // §8.3.0.3: the fill kind is chosen by the ring's boundvert count, not by the
+            // beveled-edge count and not by `vmesh_method`. A two-boundvert ring bounds a
+            // zero-area 2-gon — its two arcs are one welded chain and both strips already
+            // terminate on it — so **no** fill face is correct here, under either method.
+            if cut.boundverts.len() < 3 {
+                continue;
+            }
             match options.vmesh_method {
                 BevelVmeshMethod::Cutoff => {
                     self.build_cutoff_fill(
@@ -1465,6 +1484,7 @@ impl LoopMesh {
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         junction_cuts: &mut Vec<JunctionCut>,
+        cross_welds: &mut Vec<CrossWeld>,
         result: &mut BevelResult,
     ) {
         let corners = self.vertex_corner_ring(vertex);
@@ -1491,28 +1511,49 @@ impl LoopMesh {
         let outward = self.junction_outward_normal(vertex);
         let count = boundverts.len();
 
-        // One chain per consecutive boundvert pair (B_k → B_{k+1}), crossing the
-        // beveled edge shared by sectors k and k+1 (= the edge opening sector k+1).
-        for k in 0..count {
-            let next = (k + 1) % count;
-            let crossing = opening_edges[next];
-            let interior = self.build_chain_between(
-                boundverts[k],
-                boundverts[next],
-                crossing,
+        if count == 2 {
+            // §8.3.0.3: a two-boundvert ring bounds no region — the two sectors' chains
+            // span the *same* boundvert pair in opposite directions. They are welded into
+            // one chain, minted once, and both arriving strips terminate on it, so the
+            // corner closes with no fill face under either method.
+            self.build_welded_chain(
+                vertex,
+                &boundverts,
+                &opening_edges,
+                is_beveled,
                 segments,
                 profile,
-                None,
-                emission,
+                chains,
+                cross_welds,
                 result,
             );
-            chains.push(EdgeEndChain {
-                edge: crossing,
-                endpoint: vertex,
-                start: boundverts[k],
-                interior,
-                end: boundverts[next],
-            });
+        } else {
+            // One chain per consecutive boundvert pair (B_k → B_{k+1}), crossing the
+            // beveled edge shared by sectors k and k+1 (= the edge opening sector k+1).
+            for k in 0..count {
+                let next = (k + 1) % count;
+                let crossing = opening_edges[next];
+                let rescue = self.mid_rescue(vertex, crossing, is_beveled);
+                let (interior, cell) = self.build_chain_between(
+                    boundverts[k],
+                    boundverts[next],
+                    crossing,
+                    segments,
+                    profile,
+                    rescue,
+                    None,
+                    emission,
+                    result,
+                );
+                chains.push(EdgeEndChain {
+                    edge: crossing,
+                    endpoint: vertex,
+                    start: boundverts[k],
+                    interior,
+                    end: boundverts[next],
+                    cell: Some(cell),
+                });
+            }
         }
 
         junction_cuts.push(JunctionCut {
@@ -1521,6 +1562,172 @@ impl LoopMesh {
             opening_edges,
             outward,
         });
+    }
+
+    /// Weld the two chains of an `n == 2` junction ring into one (BEVEL.md §8.3.0.3).
+    ///
+    /// Both sectors' chains run between the same two boundverts, so they are identified
+    /// vertex-for-vertex in reverse: the junction mints `segments − 1` interior verts
+    /// **once**, and the single chain `[B_0, w_1 … w_(segments−1), B_1]` becomes the shared
+    /// terminal rung of both arriving strips. Each chain edge then lands on exactly two
+    /// faces — one quad per strip — so the corner is closed with zero fill faces.
+    ///
+    /// Both profiles' frames are derived from scratch here (rescue included), *then* the
+    /// weld-plane override replaces each plane's normal, *then* both chains are sampled:
+    /// the override is what makes the two samplings coincide, rather than papering over a
+    /// difference by averaging. The merge below is BMesh's defensive midpoint — it does
+    /// real work only in the fallback where the override was abandoned.
+    #[allow(clippy::too_many_arguments)]
+    fn build_welded_chain(
+        &mut self,
+        vertex: VertexKey,
+        boundverts: &[VertexKey],
+        opening_edges: &[EdgeKey],
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        segments: u32,
+        profile: f32,
+        chains: &mut Vec<EdgeEndChain>,
+        cross_welds: &mut Vec<CrossWeld>,
+        result: &mut BevelResult,
+    ) {
+        // Sector 0's chain runs B_0 → B_1 across the edge opening sector 1, and sector
+        // 1's runs B_1 → B_0 across the edge opening sector 0.
+        let [first_boundvert, second_boundvert] = [boundverts[0], boundverts[1]];
+        let first_edge = opening_edges[1];
+        let second_edge = opening_edges[0];
+
+        let mut first = self.derive_profile_cell(
+            first_boundvert,
+            second_boundvert,
+            first_edge,
+            self.mid_rescue(vertex, first_edge, is_beveled),
+        );
+        let mut second = self.derive_profile_cell(
+            second_boundvert,
+            first_boundvert,
+            second_edge,
+            self.mid_rescue(vertex, second_edge, is_beveled),
+        );
+        ProfileCell::override_weld_plane(&mut first, &mut second, self.vertex_position(vertex));
+
+        // The welded chain is no cap boundary — neither method fills this corner — so
+        // both profiles emit their raw samples (§8.2.2.1.1's resample is a [V-ADJ] cap
+        // property), which is why `Cutoff` and `Adj` land the same verts here.
+        let first_samples = first.chain_positions(segments, profile, ChainEmission::Raw);
+        let second_samples = second.chain_positions(segments, profile, ChainEmission::Raw);
+
+        let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
+        for index in 1..segments as usize {
+            let from_first = first_samples[index];
+            let from_second = second_samples[segments as usize - index];
+            // The midpoint, except where exactly one profile collapsed to a chord — then
+            // the curved one's sample stands. (That is precisely the case in which the
+            // override above was abandoned and the two samplings were never reconciled.)
+            let position = match (first.collinear, second.collinear) {
+                (true, false) => from_second,
+                (false, true) => from_first,
+                _ => (from_first + from_second) * 0.5,
+            };
+            let welded = self.create_vertex(position);
+            result.verts.push(welded);
+            interior.push(welded);
+        }
+
+        if let Some(cross) =
+            self.cross_weld(vertex, first_boundvert, second_boundvert, &interior, is_beveled)
+        {
+            cross_welds.push(cross);
+        }
+
+        let mut reversed = interior.clone();
+        reversed.reverse();
+        chains.push(EdgeEndChain {
+            edge: first_edge,
+            endpoint: vertex,
+            start: first_boundvert,
+            interior,
+            end: second_boundvert,
+            cell: Some(first),
+        });
+        chains.push(EdgeEndChain {
+            edge: second_edge,
+            endpoint: vertex,
+            start: second_boundvert,
+            interior: reversed,
+            end: first_boundvert,
+            cell: Some(second),
+        });
+    }
+
+    /// Classify the §8.3.0.3 **cross** weld and capture its donor legs, off the pristine
+    /// disk: a valence-4 welded junction whose two beveled edges sit **opposite** each
+    /// other in the disk, so the two unbeveled legs are opposite too and the welded chain
+    /// reads as the continuation of the two crossing legs. Every other weld — valence 3,
+    /// or valence 4 with the beveled edges adjacent — donates nothing.
+    fn cross_weld(
+        &self,
+        vertex: VertexKey,
+        first_boundvert: VertexKey,
+        second_boundvert: VertexKey,
+        interior: &[VertexKey],
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+    ) -> Option<CrossWeld> {
+        let disk: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
+        if disk.len() != 4 {
+            return None;
+        }
+        let beveled: Vec<usize> = (0..4).filter(|&i| is_beveled(disk[i])).collect();
+        let [before, after] = [beveled.first()?, beveled.get(1)?];
+        if after - before != 2 {
+            return None;
+        }
+
+        let mut chain = Vec::with_capacity(interior.len() + 2);
+        chain.push(first_boundvert);
+        chain.extend_from_slice(interior);
+        chain.push(second_boundvert);
+        Some(CrossWeld {
+            chain,
+            // Each beveled edge donates from its own disk-**predecessor** leg, so the two
+            // runs have different donors — the two crossing legs, one each.
+            donors: [*before, *after]
+                .map(|index| (disk[index], disk[(index + 3) % 4]))
+                .to_vec(),
+        })
+    }
+
+    /// Apply the §8.3.0.3 cross-weld per-edge attribute rule, once every strip has laid
+    /// the welded chain's edges down. The copy runs **once per beveled edge**, in strip
+    /// order, each run donating that edge's own disk-predecessor leg's per-edge
+    /// customdata onto the *same* chain edges — so the two runs collide and **the later
+    /// one prevails**. Both runs then apply the same two reconciliations, computed from
+    /// **both** crossing legs and therefore order-independent: a seam only crosses if it
+    /// crosses on both sides, and the shading stays smooth unless both sides are sharp.
+    fn apply_cross_weld_attributes(&mut self, cross: &CrossWeld, strip_order: &[EdgeKey]) {
+        let chain_edges: Vec<EdgeKey> = cross
+            .chain
+            .windows(2)
+            .filter_map(|pair| self.query_edge_exists(pair[0], pair[1]))
+            .collect();
+        if chain_edges.is_empty() {
+            return;
+        }
+
+        let legs: Vec<EdgeKey> = cross.donors.iter().map(|&(_, leg)| leg).collect();
+        let seam = legs.iter().all(|&leg| self.edge_seam(leg));
+        let sharp = legs.iter().all(|&leg| self.edge_sharp(leg));
+
+        for &beveled in strip_order {
+            let Some(&(_, donor)) = cross.donors.iter().find(|&&(edge, _)| edge == beveled) else {
+                continue;
+            };
+            for &chain_edge in &chain_edges {
+                self.edge_attribs
+                    .copy_into(chain_edge.as_usize(), donor.as_usize());
+                self.set_edge_seam(chain_edge, seam);
+                self.set_edge_sharp(chain_edge, sharp);
+            }
+        }
     }
 
     /// Place a terminal's boundverts and build its single edge's chain (BEVEL.md
@@ -1603,12 +1810,15 @@ impl LoopMesh {
         // valence-≥3 terminal (any terminal endpoint reaching this point), so the
         // §8.2.2.1 terminal-far-end plane override applies: pass the terminal vertex.
         let terminal_position = self.vertex_position(vertex);
-        let interior = self.build_chain_between(
+        let is_beveled = |candidate: EdgeKey| beveled.contains(&candidate);
+        let rescue = self.mid_rescue(vertex, edge, &is_beveled);
+        let (interior, cell) = self.build_chain_between(
             strip_left,
             strip_right,
             edge,
             segments,
             profile,
+            rescue,
             Some(terminal_position),
             ChainEmission::Raw,
             result,
@@ -1752,6 +1962,7 @@ impl LoopMesh {
             start: strip_left,
             interior,
             end: strip_right,
+            cell: Some(cell),
         });
     }
 
@@ -1826,7 +2037,11 @@ impl LoopMesh {
 
     /// Build a profile chain's `segments − 1` interior verts between two ring
     /// boundverts crossing beveled edge `edge` (BEVEL.md §8.2.2.1 / §8.3.6). The
-    /// endpoints are passed in; the interior arc samples are minted here.
+    /// endpoints are passed in; the interior arc samples are minted here. Returns the
+    /// interior verts and the frame they were sampled through — the frame is *derived
+    /// here, once*, so a caller that overrides it (the §8.3.0.3 weld) hands its own cell
+    /// in via `derive_profile_cell` rather than re-deriving downstream.
+    #[allow(clippy::too_many_arguments)]
     fn build_chain_between(
         &mut self,
         start: VertexKey,
@@ -1834,17 +2049,12 @@ impl LoopMesh {
         edge: EdgeKey,
         segments: u32,
         profile: f32,
+        rescue: MidRescue,
         terminal_vertex: Option<Vec3>,
         emission: ChainEmission,
         result: &mut BevelResult,
-    ) -> Vec<VertexKey> {
-        let start_position = self.vertex_position(start);
-        let end_position = self.vertex_position(end);
-        let [ea, eb] = self.edge_vert_keys(edge);
-        let edge_point = self.vertex_position(ea);
-        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
-
-        let mut cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
+    ) -> (Vec<VertexKey>, ProfileCell) {
+        let mut cell = self.derive_profile_cell(start, end, edge, rescue);
         // §8.2.2.1 terminal-far-end override: at a valence-≥3 terminal the default
         // `start–mid–end` mid-plane is tilted up out of the rim by `mid` (the on-edge
         // foot, which sits partway up the beveled edge), lifting the samples off the
@@ -1853,8 +2063,42 @@ impl LoopMesh {
         if let Some(terminal) = terminal_vertex {
             cell.snap_terminal_plane(terminal);
         }
-        let positions = cell.chain_positions(segments, profile, emission);
+        let interior = self.mint_chain_interior(&cell, segments, profile, emission, result);
+        (interior, cell)
+    }
 
+    /// Derive one beveled-edge sector's profile frame from scratch (BEVEL.md §8.2.2.1,
+    /// rescue included) — beat 1 of the derive → override → mark discipline.
+    fn derive_profile_cell(
+        &self,
+        start: VertexKey,
+        end: VertexKey,
+        edge: EdgeKey,
+        rescue: MidRescue,
+    ) -> ProfileCell {
+        let [ea, eb] = self.edge_vert_keys(edge);
+        let edge_point = self.vertex_position(ea);
+        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
+        let mut cell = ProfileCell::new(
+            self.vertex_position(start),
+            self.vertex_position(end),
+            edge_point,
+            edge_dir,
+        );
+        cell.rescue_degenerate_mid(&rescue);
+        cell
+    }
+
+    /// Mint the `segments − 1` interior verts of a chain sampled through `cell`.
+    fn mint_chain_interior(
+        &mut self,
+        cell: &ProfileCell,
+        segments: u32,
+        profile: f32,
+        emission: ChainEmission,
+        result: &mut BevelResult,
+    ) -> Vec<VertexKey> {
+        let positions = cell.chain_positions(segments, profile, emission);
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for position in positions.iter().take(positions.len() - 1).skip(1) {
             let vertex = self.create_vertex(*position);
@@ -1864,14 +2108,55 @@ impl LoopMesh {
         interior
     }
 
+    /// The §8.2.2.1 rescue context for the chain crossing `edge` at `vertex`: the
+    /// original vertex, plus tier 2's two offset-line directions when — and only when —
+    /// both of `edge`'s disk-neighbours at `vertex` are themselves beveled and the vertex
+    /// carries `s ≥ 3` beveled edges. Read off the pristine disk, with the boundary
+    /// building that follows.
+    fn mid_rescue(
+        &self,
+        vertex: VertexKey,
+        edge: EdgeKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+    ) -> MidRescue {
+        let vertex_position = self.vertex_position(vertex);
+        let disk: Vec<EdgeKey> = self.iter_disk_edges(vertex).collect();
+        let beveled_count = disk.iter().filter(|&&e| is_beveled(e)).count();
+        let neighbour_dirs = (beveled_count >= 3)
+            .then(|| disk.iter().position(|&e| e == edge))
+            .flatten()
+            .and_then(|index| {
+                let count = disk.len();
+                let before = disk[(index + count - 1) % count];
+                let after = disk[(index + 1) % count];
+                if !is_beveled(before) || !is_beveled(after) {
+                    return None;
+                }
+                let direction_before = self.edge_direction_from(before, vertex, vertex_position)?;
+                let direction_after = self.edge_direction_from(after, vertex, vertex_position)?;
+                Some((direction_before, direction_after))
+            });
+        MidRescue {
+            vertex: vertex_position,
+            neighbour_dirs,
+        }
+    }
+
     /// The **raw coarse** `(i, 0, 1)` profile mid of a flank / strip ring edge at the
     /// `segments = 2` control-net resolution (BEVEL.md §8.5.5.5(d) / §8.9.5.3): the
     /// naive cross-section sample *before* the §8.2.2.1.1 chord-fraction resample. On a
     /// symmetric (equal-offset) cell this equals the emitted rim mid (the resample is the
     /// identity there); on the skewed arc-flanking cell it is the un-skewed point the
     /// extraordinary-centre stencil must see instead of the resampled rim value.
-    fn coarse_flank_mid(&self, start: VertexKey, end: VertexKey, edge: EdgeKey, profile: f32) -> Vec3 {
-        self.ring_flank_profile(start, end, edge, profile)
+    fn coarse_flank_mid(
+        &self,
+        start: VertexKey,
+        end: VertexKey,
+        edge: EdgeKey,
+        profile: f32,
+        rescue: MidRescue,
+    ) -> Vec3 {
+        self.ring_flank_profile(start, end, edge, profile, rescue)
             .raw_positions(2)[1]
     }
 
@@ -1885,17 +2170,10 @@ impl LoopMesh {
         end: VertexKey,
         edge: EdgeKey,
         profile: f32,
+        rescue: MidRescue,
     ) -> RingChainProfile {
-        let [ea, eb] = self.edge_vert_keys(edge);
-        let edge_point = self.vertex_position(ea);
-        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
         RingChainProfile::Cell {
-            cell: ProfileCell::new(
-                self.vertex_position(start),
-                self.vertex_position(end),
-                edge_point,
-                edge_dir,
-            ),
+            cell: self.derive_profile_cell(start, end, edge, rescue),
             profile,
         }
     }
@@ -2075,7 +2353,8 @@ impl LoopMesh {
         result: &mut BevelResult,
     ) {
         let count = cut.boundverts.len();
-        if count < 2 {
+        // §8.3.0.3: an `n == 2` ring is the welded chain, which no method fills.
+        if count < 3 {
             return;
         }
         let representative = cut.representative_material(self);
@@ -2676,13 +2955,15 @@ impl LoopMesh {
                     );
                 }
                 Some(edge) => {
-                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile));
-                    let interior = self.build_chain_between(
+                    let rescue = self.mid_rescue(vertex, edge, is_beveled);
+                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
+                    let (interior, cell) = self.build_chain_between(
                         start,
                         end,
                         edge,
                         segments,
                         profile,
+                        rescue,
                         None,
                         ChainEmission::Resampled,
                         result,
@@ -2706,6 +2987,7 @@ impl LoopMesh {
                         start,
                         interior,
                         end,
+                        cell: Some(cell),
                     });
                 }
             }
@@ -2721,9 +3003,13 @@ impl LoopMesh {
                 None => *bulges
                     .next()
                     .expect("every internal ring edge has a pre-minted raw bulge"),
-                Some(edge) => {
-                    self.coarse_flank_mid(ring[i], ring[(i + 1) % ring_count], edge, profile)
-                }
+                Some(edge) => self.coarse_flank_mid(
+                    ring[i],
+                    ring[(i + 1) % ring_count],
+                    edge,
+                    profile,
+                    self.mid_rescue(vertex, edge, is_beveled),
+                ),
             })
             .collect();
 
@@ -3098,18 +3384,20 @@ impl LoopMesh {
                     );
                 }
                 Some(edge) => {
-                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile));
+                    let rescue = self.mid_rescue(vertex, edge, is_beveled);
+                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
                     // §8.9.5.2: each flanking beveled-edge cross-section carries `segments
                     // − 1` interior samples. The reflex sector's flanking pair runs to an
                     // inward-repositioned arc-start boundvert, making the cell skewed; at
                     // `segments = 2` its lone interior sample is the §8.2.2.1.1 chord-
                     // fraction resample (identity on the symmetric interior sector strips).
-                    let interior = self.build_chain_between(
+                    let (interior, cell) = self.build_chain_between(
                         start,
                         end,
                         edge,
                         segments,
                         profile,
+                        rescue,
                         None,
                         ChainEmission::Resampled,
                         result,
@@ -3137,6 +3425,7 @@ impl LoopMesh {
                         start,
                         interior,
                         end,
+                        cell: Some(cell),
                     });
                 }
             }
@@ -3158,9 +3447,13 @@ impl LoopMesh {
                         internal_index += 1;
                         mid
                     }
-                    Some(edge) => {
-                        self.coarse_flank_mid(ring[i], ring[(i + 1) % ring.len()], edge, profile)
-                    }
+                    Some(edge) => self.coarse_flank_mid(
+                        ring[i],
+                        ring[(i + 1) % ring.len()],
+                        edge,
+                        profile,
+                        self.mid_rescue(vertex, edge, is_beveled),
+                    ),
                 })
                 .collect()
         } else {
@@ -4051,8 +4344,9 @@ impl LoopMesh {
         boundvert_position + down * push
     }
 
-    /// The profile cell of sector `k` at the junction (BEVEL.md §8.2.2.1), rebuilt
-    /// from that sector's chain (B_k → B_{k+1}) and its crossing beveled edge.
+    /// The profile cell of sector `k` at the junction (BEVEL.md §8.2.2.1) — the frame the
+    /// chain was actually sampled through, read back off the chain rather than re-derived
+    /// (§8.2.2.1 "The recompute…": a derived-from-scratch frame would drop any override).
     fn sector_cell(
         &self,
         cut: &JunctionCut,
@@ -4063,20 +4357,14 @@ impl LoopMesh {
         let next = (k + 1) % count;
         let start_boundvert = cut.boundverts[k];
         let end_boundvert = cut.boundverts[next];
-        let chain = chains.iter().find(|c| {
-            c.endpoint == cut.vertex
-                && ((c.start == start_boundvert && c.end == end_boundvert)
-                    || (c.start == end_boundvert && c.end == start_boundvert))
-        })?;
-        let [ea, eb] = self.edge_vert_keys(chain.edge);
-        let edge_point = self.vertex_position(ea);
-        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
-        Some(ProfileCell::new(
-            self.vertex_position(start_boundvert),
-            self.vertex_position(end_boundvert),
-            edge_point,
-            edge_dir,
-        ))
+        chains
+            .iter()
+            .find(|c| {
+                c.endpoint == cut.vertex
+                    && ((c.start == start_boundvert && c.end == end_boundvert)
+                        || (c.start == end_boundvert && c.end == start_boundvert))
+            })
+            .and_then(|chain| chain.cell)
     }
 
     /// A junction vertex's outward surface normal: the summed plane normals of its
@@ -6851,6 +7139,11 @@ struct EdgeEndChain {
     start: VertexKey,
     interior: Vec<VertexKey>,
     end: VertexKey,
+    /// The frame the chain was sampled through (BEVEL.md §8.2.2.1), kept rather than
+    /// re-derived: an overridden frame (the terminal snap, the §8.3.0.3 weld plane) is
+    /// not recoverable from the boundverts alone, and a downstream re-derivation would
+    /// silently restore the default mid-plane — the "recompute erases the override" bug.
+    cell: Option<ProfileCell>,
 }
 
 impl EdgeEndChain {
@@ -6932,6 +7225,21 @@ impl JunctionCut {
             .map(|&face| mesh.face_material_index(face))
             .unwrap_or(0)
     }
+}
+
+/// One **cross** weld (BEVEL.md §8.3.0.3's attribute note): a valence-4 welded junction
+/// whose two beveled edges are opposite in the disk, so the two unbeveled legs are
+/// opposite too and the beveled edges run *through* the vertex with the legs crossing
+/// them. The welded chain then continues the crossing legs, and takes their per-edge
+/// attributes. A flag / customdata rule only — no topology, no placement.
+struct CrossWeld {
+    /// The welded chain's `segments + 1` verts, `B_0 → w_1 … → B_1`. Its edges are laid
+    /// down by the strips, so they are resolved from these verts afterwards.
+    chain: Vec<VertexKey>,
+    /// Per beveled edge, the disk-**predecessor** leg it donates from. Two entries with
+    /// two *different* donors (the two crossing legs, one each), both writing the same
+    /// chain edges — the strip built last prevails.
+    donors: Vec<(EdgeKey, EdgeKey)>,
 }
 
 /// One valence-≥4 terminal's poly-fan (BEVEL.md §8.3.0.2). The fan polygon walks
@@ -7600,35 +7908,23 @@ mod tests {
         assert_cube_corner_bevel_sound(2, 1..=4, &[BevelVmeshMethod::Adj]);
     }
 
-    /// The same mixed case under `Cutoff`. A 2-sector junction has *two* chains over
-    /// the *same* boundvert pair `{B_0, B_1}` — one per beveled edge — but the cutoff
-    /// fill looks a sector's chain up by that unordered pair alone, ignoring which
-    /// edge the chain crosses. Both sectors therefore resolve to the *same* chain: its
-    /// fill is emitted twice (the second copy reflected, so the pair traverses every
-    /// shared edge the same way), while the other edge's chain gets no fill face at
-    /// all. Whether BEVEL.md §8.3.2 even specifies the 2-sector cutoff junction is an
-    /// open question — the fix waits on that read-back.
+    /// The same mixed case under `Cutoff`. A 2-sector junction's two chains span the
+    /// *same* boundvert pair `{B_0, B_1}`, so BEVEL.md §8.3.0.3 welds them into one and
+    /// gives the corner **no** fill face under either method — a cut face per "sector"
+    /// here would emit one chain's fill twice (the second copy reflected, traversing
+    /// every shared edge the same way as the first) and the other's never.
     #[test]
-    #[ignore = "the 2-sector cutoff junction resolves both sectors to one chain (the pair \
-                lookup ignores the crossing edge): one chain's fill is built twice with \
-                conflicting winding, the other edge's chain gets no fill face; see \
-                BEVEL.md §8.3.2"]
     fn edge_bevel_cube_two_edges_cutoff_winding_consistent_all_segments() {
         assert_cube_corner_bevel_sound(2, 2..=4, &[BevelVmeshMethod::Cutoff]);
     }
 
-    /// The 2-sector junction is *unroofed* under `Adj` too, so the defect above is not
-    /// a `Cutoff`-only one: at `segments ≥ 2` the two chains spanning `{B_0, B_1}` bow
-    /// apart into two arcs and nothing fills the lens between them (`Adj` builds no fill
-    /// there at all; `Cutoff` builds one chain's fill twice and the other's never), so
-    /// the result carries `2 × segments` boundary edges. `segments = 1` is closed — the
-    /// two chains are then the two direct ring segments and the strips meet flush, the
-    /// §7.6 "through junction adds no patch" case. A hole disturbs neither the winding
-    /// nor the volume assertion, so only a closedness check sees it.
+    /// BEVEL.md §8.3.0.3: the welded two-sector junction is **closed** with zero fill
+    /// faces. The single chain `[B_0, w_1 … w_(segments−1), B_1]` is the shared terminal
+    /// rung of both arriving strips, so every chain edge lands on exactly two faces (one
+    /// quad per strip). Minting a chain per beveled edge instead would leave a
+    /// `2 × segments`-edge hole — which disturbs neither the winding nor the volume
+    /// assertion, so only a closedness check sees it.
     #[test]
-    #[ignore = "the 2-sector junction gets no fill face at segments >= 2 under Adj: the lens \
-                between its two boundvert-pair-spanning chains is left open (2 * segments \
-                boundary edges); see BEVEL.md §8.3.1 / §8.3.2"]
     fn edge_bevel_cube_two_edges_adj_junction_is_closed() {
         for segments in 2..=4 {
             let mut mesh = LoopMesh::new();
@@ -7660,6 +7956,407 @@ mod tests {
                 "segments = {segments}: {open} boundary edge(s) — the beveled solid is open",
             );
         }
+    }
+
+    /// The §8.3.0.3 worked fixture: bevel the `−x` and `+y` edges at the cube corner
+    /// `(1, −1, −1)`, leaving the `+z` edge as the unbeveled leg of the sector that holds
+    /// it. Both beveled edges' far ends are valence-3 terminals.
+    fn bevel_two_edge_corner(
+        segments: u32,
+        vmesh_method: BevelVmeshMethod,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let geom: Vec<GeomKey> = [Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)]
+            .into_iter()
+            .map(|far| {
+                let edge = mesh
+                    .query_edge_exists(corner, vert_at(&mesh, far))
+                    .expect("the cube corner's beveled edge");
+                GeomKey::from(edge)
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.3.0.3: the welded junction mints `segments − 1` interior verts
+    /// **once, not per sector**, and contributes **no face at all** — so the beveled
+    /// solid lands the oracle counts, and its only non-quads are the two *terminal*
+    /// far-end faces absorbing their through-chains (§8.3.0.1).
+    #[test]
+    fn edge_bevel_two_edge_junction_welds_one_chain_at_oracle_counts() {
+        for (segments, expected, absorbing_face) in
+            [(2u32, (14usize, 22usize, 10usize), 6usize), (3, (17, 27, 12), 7)]
+        {
+            for vmesh_method in [BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff] {
+                let (mesh, _) = bevel_two_edge_corner(segments, vmesh_method);
+                assert_eq!(
+                    counts(&mesh),
+                    expected,
+                    "segments = {segments}, {vmesh_method:?}: V/E/F",
+                );
+                let mut sizes: Vec<usize> = mesh
+                    .face_keys()
+                    .iter()
+                    .map(|&face| mesh.face_vert_keys(face).len())
+                    .collect();
+                sizes.sort_unstable();
+                let absorbing = sizes.iter().filter(|&&n| n == absorbing_face).count();
+                let quads = sizes.iter().filter(|&&n| n == 4).count();
+                assert_eq!(
+                    (quads, absorbing),
+                    (expected.2 - 2, 2),
+                    "segments = {segments}, {vmesh_method:?}: face sizes {sizes:?} — expected \
+                     only quads plus the two terminal absorbing faces",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.3.0.3 (the weld-plane override): the two chains are sampled in
+    /// *different* planes by default and must be re-planed onto plane(`v`, `B_0`, `B_1`)
+    /// before they can be identified. The override is load-bearing: averaging the
+    /// un-overridden samples would land the interior vert at `(0.9009, −0.9009, −0.9268)`,
+    /// which is not where the corner's cross-section runs.
+    #[test]
+    fn edge_bevel_two_edge_junction_weld_vert_sits_on_the_weld_plane() {
+        let (mesh, result) = bevel_two_edge_corner(2, BevelVmeshMethod::Adj);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.75, -0.75, -1.0)),
+            1,
+            "B_0 — the in-face meet of the two beveled edges' offset lines",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(1.0, -1.0, -0.75)),
+            1,
+            "B_1 — the meet in the sector holding the leg, which lands on the leg",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.926_776_7, -0.926_776_7, -0.926_776_7)),
+            1,
+            "the single welded interior vert, sampled in the weld plane x + y = 0",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.900_888, -0.900_888, -0.926_776_7)),
+            0,
+            "the midpoint of the two un-overridden samples is not the answer",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.3: at `s == 2` the fill dispatch keys on the boundvert ring count,
+    /// not on `vmesh_method` — both methods fill nothing — so `Cutoff` and `Adj` produce
+    /// identical meshes, vertex for vertex. (They diverge at `s == 3`, where the ring
+    /// really does bound a region: §8.5's rounded apex vs §8.3's flat cut corner.)
+    #[test]
+    fn edge_bevel_two_edge_junction_cutoff_matches_adj() {
+        for segments in 2..=4 {
+            let (cutoff, _) = bevel_two_edge_corner(segments, BevelVmeshMethod::Cutoff);
+            let (adj, _) = bevel_two_edge_corner(segments, BevelVmeshMethod::Adj);
+            assert!(
+                positions_multiset_eq(&cutoff, &adj, 1.0e-5),
+                "segments = {segments}: the two methods disagree on vertex positions",
+            );
+            assert!(
+                faces_match(&cutoff, &adj, 1.0e-5),
+                "segments = {segments}: the two methods disagree on faces",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.3's strip-rung counts: the welded chain is the shared terminal rung
+    /// of *both* strips, so each chain edge carries one quad from each (radial 2), and an
+    /// interior weld vert has 4 faces and 4 edges — the two chain edges plus one
+    /// longitudinal rung into each strip. A per-sector chain instead would leave the
+    /// interior verts at radial 1 on their own side.
+    #[test]
+    fn edge_bevel_two_edge_junction_weld_vert_is_shared_by_both_strips() {
+        let (mesh, result) = bevel_two_edge_corner(2, BevelVmeshMethod::Adj);
+        let weld = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| {
+                (mesh.vertex_position(v) - Vec3::new(0.926_776_7, -0.926_776_7, -0.926_776_7))
+                    .length()
+                    < 1.0e-5
+            })
+            .expect("the welded interior chain vert");
+        assert_eq!(
+            mesh.vert_face_keys(weld).len(),
+            4,
+            "the weld vert takes two quads from each arriving strip",
+        );
+        let disk: Vec<EdgeKey> = mesh.iter_disk_edges(weld).collect();
+        assert_eq!(
+            disk.len(),
+            4,
+            "two chain edges plus one longitudinal rung edge into each strip",
+        );
+        for edge in disk {
+            assert_eq!(
+                mesh.edge_radial_iter(edge).count(),
+                2,
+                "every edge at the weld vert is manifold",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.3: `s == 2 ⇒ n == 2` **regardless of the vertex's valence** — the
+    /// unbeveled legs are absorbed into their sector's boundvert and never add a ring
+    /// corner. The octahedron apex is valence 4 with its two beveled edges *opposite* in
+    /// the disk (the "cross"), and it welds and closes exactly like the valence-3 corner,
+    /// with no fill face under either method.
+    #[test]
+    fn edge_bevel_cross_weld_valence_four_apex_is_closed() {
+        for segments in 2..=3 {
+            for vmesh_method in [BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff] {
+                let (mesh, result) = bevel_octahedron_cross(segments, vmesh_method, false, false);
+                assert_bevel_sound(&mesh, &result, &format!("cross weld, segments = {segments}"));
+                let open = mesh
+                    .edge_keys()
+                    .iter()
+                    .filter(|&&edge| mesh.edge_radial_iter(edge).count() != 2)
+                    .count();
+                assert_eq!(
+                    open, 0,
+                    "segments = {segments}, {vmesh_method:?}: {open} boundary edge(s) — the \
+                     valence-4 cross weld is open",
+                );
+            }
+        }
+        for segments in 2..=3 {
+            let (cutoff, _) = bevel_octahedron_cross(segments, BevelVmeshMethod::Cutoff, false, false);
+            let (adj, _) = bevel_octahedron_cross(segments, BevelVmeshMethod::Adj, false, false);
+            assert!(
+                positions_multiset_eq(&cutoff, &adj, 1.0e-5) && faces_match(&cutoff, &adj, 1.0e-5),
+                "segments = {segments}: the two methods disagree at the valence-4 weld",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.3's attribute note: at the **cross** weld the chain reads as the
+    /// continuation of the two crossing legs, so its edges take those legs' flags — the
+    /// seam only crosses if it crosses on **both** sides, and the shading stays smooth
+    /// unless **both** sides are sharp. Both reconciliations are computed from both legs,
+    /// so they are order-independent even though the two donations collide.
+    #[test]
+    fn edge_bevel_cross_weld_chain_reconciles_the_two_crossing_legs() {
+        for (both_legs, expected) in [(true, true), (false, false)] {
+            let (mesh, result) = bevel_octahedron_cross(2, BevelVmeshMethod::Adj, both_legs, true);
+            // The fixture is mirror-symmetric in both `x` (swapping the two beveled edges)
+            // and `y` (swapping the two boundverts), so the whole welded chain lies on
+            // `x = 0` and its lone interior vert on the `y = 0` axis with it. The strips'
+            // longitudinal rungs are the only other edges at that vert, and they run off
+            // along `±x`.
+            let on_weld_plane = |v: VertexKey| mesh.vertex_position(v).x.abs() < 1.0e-4;
+            let weld = result
+                .verts
+                .iter()
+                .copied()
+                .find(|&v| on_weld_plane(v) && mesh.vertex_position(v).y.abs() < 1.0e-4)
+                .expect("the welded interior chain vert");
+            let chain_edges: Vec<EdgeKey> = mesh
+                .iter_disk_edges(weld)
+                .filter(|&edge| {
+                    let [a, b] = mesh.edge_vert_keys(edge);
+                    on_weld_plane(if a == weld { b } else { a })
+                })
+                .collect();
+            assert_eq!(chain_edges.len(), 2, "the weld vert owns the two chain edges");
+            for edge in chain_edges {
+                assert_eq!(
+                    mesh.edge_seam(edge),
+                    expected,
+                    "the seam crosses the weld only when both crossing legs carry it",
+                );
+                assert_eq!(
+                    mesh.edge_sharp(edge),
+                    expected,
+                    "the weld stays smooth unless both crossing legs are sharp",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.3.0.3's attribute note, the ordering half: the copy runs once per
+    /// beveled edge, each donating from **that edge's own** disk-predecessor leg, and both
+    /// runs write the *same* chain edges. There is no unique donor — the strip built
+    /// **last** supplies the surviving per-edge customdata. Invisible in the seam / smooth
+    /// bits (their reconciliation is symmetric); visible the moment the two legs differ in
+    /// any other per-edge attribute.
+    #[test]
+    fn edge_bevel_cross_weld_chain_takes_the_last_built_strips_donor_leg() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_octahedron(&mut mesh);
+        let apex = vert_at(&mesh, Vec3::new(0.0, 0.0, 1.0));
+        let edge_to = |mesh: &LoopMesh, position: Vec3| {
+            mesh.query_edge_exists(apex, vert_at(mesh, position))
+                .expect("the apex's edge")
+        };
+        let tint = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let legs = [
+            edge_to(&mesh, Vec3::new(0.0, 1.0, 0.0)),
+            edge_to(&mesh, Vec3::new(0.0, -1.0, 0.0)),
+        ];
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, legs[0].as_usize(), [1.0, 0.0, 0.0]);
+        mesh.edge_attribs_mut()
+            .set_vec3(tint, legs[1].as_usize(), [0.0, 1.0, 0.0]);
+
+        // The strips are built in the order the beveled edges are given, so the `−x` edge
+        // is the last run; the donor is *its* disk-predecessor leg.
+        let beveled = [
+            edge_to(&mesh, Vec3::new(1.0, 0.0, 0.0)),
+            edge_to(&mesh, Vec3::new(-1.0, 0.0, 0.0)),
+        ];
+        let disk: Vec<EdgeKey> = mesh.iter_disk_edges(apex).collect();
+        let last = disk
+            .iter()
+            .position(|&edge| edge == beveled[1])
+            .expect("the last-built beveled edge is in the apex disk");
+        let donor = disk[(last + 3) % 4];
+        let expected = mesh
+            .edge_attribs()
+            .get_vec3(tint, donor.as_usize())
+            .unwrap();
+
+        let result = mesh.bevel(
+            &beveled.map(GeomKey::from),
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+
+        let on_weld_plane = |v: VertexKey| mesh.vertex_position(v).x.abs() < 1.0e-4;
+        let weld = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| on_weld_plane(v) && mesh.vertex_position(v).y.abs() < 1.0e-4)
+            .expect("the welded interior chain vert");
+        let chain_edges: Vec<EdgeKey> = mesh
+            .iter_disk_edges(weld)
+            .filter(|&edge| {
+                let [a, b] = mesh.edge_vert_keys(edge);
+                on_weld_plane(if a == weld { b } else { a })
+            })
+            .collect();
+        assert_eq!(chain_edges.len(), 2, "the weld vert owns the two chain edges");
+        for edge in chain_edges {
+            assert_eq!(
+                mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap(),
+                expected,
+                "the welded chain carries the last-built strip's donor leg's per-edge CD",
+            );
+        }
+    }
+
+    /// The §8.3.0.3 cross-weld fixture: bevel two **opposite** edges at the octahedron's
+    /// valence-4 apex (`+x` and `−x`), leaving the `±y` edges as the crossing legs.
+    /// `seam_both` flags both legs; otherwise only the first is flagged — the case the
+    /// reconciliation has to clear.
+    fn bevel_octahedron_cross(
+        segments: u32,
+        vmesh_method: BevelVmeshMethod,
+        both_legs: bool,
+        flag_legs: bool,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_octahedron(&mut mesh);
+        let apex = vert_at(&mesh, Vec3::new(0.0, 0.0, 1.0));
+        let edge_to = |mesh: &LoopMesh, position: Vec3| {
+            mesh.query_edge_exists(apex, vert_at(mesh, position))
+                .expect("the apex's edge")
+        };
+        if flag_legs {
+            let first_leg = edge_to(&mesh, Vec3::new(0.0, 1.0, 0.0));
+            let second_leg = edge_to(&mesh, Vec3::new(0.0, -1.0, 0.0));
+            mesh.set_edge_seam(first_leg, true);
+            mesh.set_edge_sharp(first_leg, true);
+            mesh.set_edge_seam(second_leg, both_legs);
+            mesh.set_edge_sharp(second_leg, both_legs);
+        }
+        let geom: Vec<GeomKey> = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)]
+            .into_iter()
+            .map(|position| GeomKey::from(edge_to(&mesh, position)))
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.2.2.1 (the degenerate-`mid` rescue, tier 1): a planar corner's
+    /// closest-approach `mid` lands *on* the `start`–`end` line and supplies no bulge.
+    /// The bulge is then taken from the original vertex — off the chord, in the plane the
+    /// legs span — so the profile stays a **curve**, and the samples drop orthogonally
+    /// into that plane rather than being cast along the edge.
+    #[test]
+    fn profile_cell_collinear_corner_rescues_the_bulge_to_the_vertex() {
+        let edge_point = Vec3::ZERO;
+        let edge_dir = Vec3::X;
+        let start = Vec3::new(2.0, 1.0, 0.0);
+        let end = Vec3::new(4.0, 3.0, 0.0);
+
+        let plain = ProfileCell::new(start, end, edge_point, edge_dir);
+        assert!(
+            plain.collinear,
+            "the start–end line meets the edge's line, so the on-edge mid is collinear",
+        );
+
+        let mut rescued = plain;
+        rescued.rescue_degenerate_mid(&MidRescue {
+            vertex: Vec3::new(2.0, 3.0, 0.0),
+            neighbour_dirs: None,
+        });
+        assert!(!rescued.collinear, "tier 1 recovers a frame");
+        assert_eq!(rescued.mid, Vec3::new(2.0, 3.0, 0.0), "the bulge is the vertex");
+        assert!(
+            (rescued.projection_dir - rescued.mid_plane_normal).length() < 1.0e-6,
+            "a rescued profile projects along its own plane normal, not along the edge",
+        );
+
+        // Tier 3: with the vertex itself on the start–end line even the re-derived
+        // triangle is degenerate, and only then is the profile a straight chord.
+        let mut collapsed = plain;
+        collapsed.rescue_degenerate_mid(&MidRescue {
+            vertex: Vec3::new(0.0, -1.0, 0.0),
+            neighbour_dirs: None,
+        });
+        assert!(collapsed.collinear, "a still-collinear triangle collapses");
+        assert_eq!(
+            collapsed.projection_dir,
+            Vec3::ZERO,
+            "a collapsed profile has no projection setup — the signature both overrides key on",
+        );
+        assert_eq!(collapsed.mid, (start + end) * 0.5, "the chord's plain midpoint");
     }
 
     /// BEVEL.md §8.3.0.2 / §8.5.5.5: a valence-4 junction (and, at the far ends,
@@ -11273,7 +11970,13 @@ mod tests {
         let ep1 = mesh.create_vertex(Vec3::new(-0.70711, 0.70711, 0.0));
         let edge = mesh.create_edge([ep0, ep1], EdgeCreateFlags::NONE);
 
-        let raw = mesh.coarse_flank_mid(start, end, edge, 0.5);
+        // The cell is not collinear, so the §8.2.2.1 rescue is inert here; the apex
+        // stands in for the corner vertex.
+        let rescue = MidRescue {
+            vertex: mesh.vertex_position(ep0),
+            neighbour_dirs: None,
+        };
+        let raw = mesh.coarse_flank_mid(start, end, edge, 0.5, rescue);
         let edge_dir = (mesh.vertex_position(ep1) - mesh.vertex_position(ep0)).normalize_or_zero();
         let cell = ProfileCell::new(
             mesh.vertex_position(start),
@@ -19120,6 +19823,16 @@ const MEET_PLANAR_TOLERANCE: f32 = 1.0e-4;
 /// mid-plane is kept instead of snapping.
 const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
 
+/// Cross-product length below which a profile cell's three control points are treated
+/// as collinear — the §8.2.2.1 degenerate-`mid` condition, and the same floor the
+/// §8.3.0.3 weld plane and each profile's existing projection plane are tested against.
+const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
+
+/// (Anti)parallel tolerance on two unit plane **normals** for the §8.3.0.3 weld
+/// override's per-profile coplanarity skip: a profile whose projection plane already is
+/// the weld plane keeps its own normal.
+const COPLANAR_NORMAL_TOLERANCE: f32 = 1.0e-4;
+
 /// Length tolerance below which the two closest points of two lines are treated as
 /// the same point (a crossing) rather than skew (§7.6.2).
 const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
@@ -19250,6 +19963,20 @@ fn order_ring_cycle(
     }
 }
 
+/// The context the §8.2.2.1 degenerate-`mid` rescue needs for one beveled-edge sector:
+/// the original vertex the corner is being cut off, and — only for tier 2 — the two
+/// offset-line directions the bulge follows when the crossed edge's own disk-neighbours
+/// are themselves beveled.
+#[derive(Clone, Copy)]
+struct MidRescue {
+    vertex: Vec3,
+    /// The crossed beveled edge's disk-predecessor / disk-successor directions at the
+    /// vertex. `Some` **only** when both of those disk-neighbours are themselves beveled
+    /// *and* the vertex carries `s ≥ 3` beveled edges — the one case where neither chain
+    /// endpoint is a leg point and there is no leg plane for tier 1 to stay in.
+    neighbour_dirs: Option<(Vec3, Vec3)>,
+}
+
 /// The 3-D frame of one sector's profile cell (BEVEL.md §8.2.2.1): the three
 /// control points `start` / `end` / `mid` plus the derived in-plane axes and the
 /// mid-plane normal. `start` / `end` are the two ring boundverts the chain spans;
@@ -19262,9 +19989,13 @@ struct ProfileCell {
     end: Vec3,
     mid: Vec3,
     mid_plane_normal: Vec3,
-    /// Unit direction of the crossed beveled edge, used to project each cell
-    /// sample onto the mid-plane (BEVEL.md §8.2.2.1). Zero requests no projection.
-    edge_dir: Vec3,
+    /// The direction each cell sample is cast along to land on the profile plane
+    /// (BEVEL.md §8.2.2.1). Initialised to the crossed beveled edge's unit direction,
+    /// but **not synonymous with it**: the degenerate-`mid` rescue re-points it at the
+    /// rescued plane's normal, and a tier-3 collapse zeroes it. Zero is the
+    /// machine-checkable signature of a collapsed (straight-chord) profile — every
+    /// downstream override keys on it — and requests no projection.
+    projection_dir: Vec3,
     collinear: bool,
 }
 
@@ -19279,7 +20010,7 @@ impl ProfileCell {
         let a_axis = mid - start;
         let b_axis = mid - end;
         let cross = a_axis.cross(b_axis);
-        let collinear = cross.length() <= 1.0e-6;
+        let collinear = cross.length() <= COLLINEAR_MID_TOLERANCE;
         let mid_plane_normal = if collinear {
             Vec3::ZERO
         } else {
@@ -19291,8 +20022,128 @@ impl ProfileCell {
             end,
             mid,
             mid_plane_normal,
-            edge_dir,
+            projection_dir: edge_dir,
             collinear,
+        }
+    }
+
+    /// The §8.2.2.1 degenerate-`mid` rescue — two tiers, then collapse. Runs as part of
+    /// the frame derivation of every beveled-edge sector's cell (any `s`, any
+    /// `segments`), and only bites when the closest-approach `mid` came out collinear
+    /// with `start`/`end` — a planar corner's normal state, not a pathology.
+    ///
+    /// Tier 1 (unconditional) takes the bulge from the original vertex itself, which
+    /// lies in the plane the corner's unbeveled legs span and off the `start`–`end`
+    /// chord, so a planar corner still bevels as a *curve* and not a facet. Tier 2
+    /// (only when both of the crossed edge's disk-neighbours are themselves beveled and
+    /// the vertex carries `s ≥ 3` beveled edges — then there is no leg plane to stay in)
+    /// takes the bulge from the meet of those two neighbours' offset lines instead.
+    /// Tier 3 — a still-collinear triangle, or a failed tier-2 meet — is the straight
+    /// chord.
+    ///
+    /// A successful rescue re-planes the cell: the projection direction switches from the
+    /// edge direction to the rescued plane's own normal, so the samples drop orthogonally
+    /// into that plane rather than being cast along the edge. The plane's anchor stays
+    /// `start`.
+    fn rescue_degenerate_mid(&mut self, rescue: &MidRescue) {
+        if !self.collinear {
+            return;
+        }
+
+        let mut mid = rescue.vertex;
+        if let Some((direction_before, direction_after)) = rescue.neighbour_dirs {
+            if direction_before.cross(direction_after).length() <= LINE_PARALLEL_TOLERANCE {
+                self.collapse();
+                return;
+            }
+            let meet = intersect_lines(
+                &Line {
+                    point: self.start,
+                    direction: direction_before,
+                },
+                &Line {
+                    point: self.end,
+                    direction: direction_after,
+                },
+            );
+            match meet {
+                LineMeet::Crossing(point) | LineMeet::Skew(point) => mid = point,
+                LineMeet::Collinear => {
+                    self.collapse();
+                    return;
+                }
+            }
+        }
+
+        let cross = (mid - self.start).cross(mid - self.end);
+        if cross.length() <= COLLINEAR_MID_TOLERANCE {
+            self.collapse();
+            return;
+        }
+        self.mid = mid;
+        self.mid_plane_normal = cross.normalize();
+        self.projection_dir = self.mid_plane_normal;
+        self.collinear = false;
+    }
+
+    /// The §8.2.2.1 tier-3 collapse: the profile is a straight chord, so `mid` is the
+    /// plain chord midpoint and the projection setup is dropped wholesale.
+    fn collapse(&mut self) {
+        self.mid = (self.start + self.end) * 0.5;
+        self.mid_plane_normal = Vec3::ZERO;
+        self.projection_dir = Vec3::ZERO;
+        self.collinear = true;
+    }
+
+    /// The §8.3.0.3 weld-plane override for the two profiles of an `n == 2` junction
+    /// ring: replace **only** each profile's plane normal with the normal of the single
+    /// plane through the original vertex and the two boundverts, so the two chains —
+    /// which span the same boundvert pair in opposite directions — sample to the *same*
+    /// points and can be welded vertex-for-vertex.
+    ///
+    /// Each profile keeps its own anchor (its own chain `start`) and its own projection
+    /// direction. The override is abandoned outright when either profile has collapsed
+    /// to a chord (no projection direction to re-plane), when the weld plane itself
+    /// degenerates, or when *both* profiles' existing projection planes degenerate; with
+    /// exactly one degenerate the override still proceeds and that profile *is*
+    /// re-planed. A profile whose projection plane already **is** the weld plane keeps
+    /// its own normal — a per-profile skip, unlike the abandonment arms.
+    fn override_weld_plane(first: &mut ProfileCell, second: &mut ProfileCell, vertex: Vec3) {
+        if first.projection_dir.length_squared() <= f32::EPSILON
+            || second.projection_dir.length_squared() <= f32::EPSILON
+        {
+            return;
+        }
+
+        let to_first = vertex - first.start;
+        let to_second = vertex - second.start;
+        let weld = to_first.cross(to_second);
+        if weld.length() <= COLLINEAR_MID_TOLERANCE {
+            return;
+        }
+        let weld_plane_normal = weld.normalize();
+
+        let existing_plane_normal = |cell: &ProfileCell, to_boundvert: Vec3| -> Option<Vec3> {
+            let normal = to_boundvert.cross(cell.projection_dir);
+            (normal.length() > COLLINEAR_MID_TOLERANCE).then(|| normal.normalize())
+        };
+        let normal_first = existing_plane_normal(first, to_first);
+        let normal_second = existing_plane_normal(second, to_second);
+        if normal_first.is_none() && normal_second.is_none() {
+            return;
+        }
+
+        for (cell, existing) in [(first, normal_first), (second, normal_second)] {
+            // A profile already coplanar with the weld plane keeps its own normal; a
+            // degenerate `existing` cannot be (anti)parallel to anything, so it re-planes.
+            let coplanar = existing
+                .map(|normal| {
+                    weld_plane_normal.dot(normal).abs() >= 1.0 - COPLANAR_NORMAL_TOLERANCE
+                })
+                .unwrap_or(false);
+            if !coplanar {
+                cell.mid_plane_normal = weld_plane_normal;
+            }
         }
     }
 
@@ -19304,13 +20155,13 @@ impl ProfileCell {
     /// points and `mid` their unit-square corner.
     fn from_control_points(start: Vec3, end: Vec3, mid: Vec3) -> Self {
         let cross = (mid - start).cross(mid - end);
-        let collinear = cross.length() <= 1.0e-6;
+        let collinear = cross.length() <= COLLINEAR_MID_TOLERANCE;
         ProfileCell {
             start,
             end,
             mid,
             mid_plane_normal: if collinear { Vec3::ZERO } else { cross.normalize() },
-            edge_dir: Vec3::ZERO,
+            projection_dir: Vec3::ZERO,
             collinear,
         }
     }
@@ -19325,6 +20176,10 @@ impl ProfileCell {
     /// mid-plane stands. The plane's sign is irrelevant — it defines a plane, not a
     /// half-space — so no orientation is needed.
     fn snap_terminal_plane(&mut self, terminal: Vec3) {
+        // §8.2.2.1 precondition 1: a collapsed profile has no projection to re-plane.
+        if self.projection_dir.length_squared() <= f32::EPSILON {
+            return;
+        }
         let to_start = (terminal - self.start).normalize_or_zero();
         let to_end = (terminal - self.end).normalize_or_zero();
         let candidate = to_start.cross(to_end);
@@ -19333,9 +20188,7 @@ impl ProfileCell {
             return;
         }
         let candidate = candidate / length;
-        if self.edge_dir.length_squared() > f32::EPSILON
-            && candidate.dot(self.edge_dir).abs() >= 1.0 - TERMINAL_PLANE_TOLERANCE
-        {
+        if candidate.dot(self.projection_dir).abs() >= 1.0 - TERMINAL_PLANE_TOLERANCE {
             return;
         }
         self.mid_plane_normal = candidate;
@@ -19347,10 +20200,11 @@ impl ProfileCell {
     fn sample(&self, u: f32, v: f32) -> Vec3 {
         let origin = self.start + self.end - self.mid;
         let raw = origin + u * (self.mid - self.start) + v * (self.mid - self.end);
-        if self.edge_dir.length_squared() <= f32::EPSILON || self.collinear {
+        if self.projection_dir.length_squared() <= f32::EPSILON || self.collinear {
             return raw;
         }
-        intersect_line_plane(raw, self.edge_dir, self.start, self.mid_plane_normal).unwrap_or(raw)
+        intersect_line_plane(raw, self.projection_dir, self.start, self.mid_plane_normal)
+            .unwrap_or(raw)
     }
 
     /// The chain's `segments + 1` sample positions (BEVEL.md §8.2.2.1 / §8.6).
