@@ -1692,6 +1692,22 @@ impl LoopMesh {
         interior
     }
 
+    /// The **raw coarse** `(i, 0, 1)` profile mid of a flank / strip ring edge at the
+    /// `segments = 2` control-net resolution (BEVEL.md §8.5.5.5(d) / §8.9.5.3): the
+    /// naive cross-section sample *before* the §8.2.2.1.1 chord-fraction resample. On a
+    /// symmetric (equal-offset) cell this equals the emitted rim mid (the resample is the
+    /// identity there); on the skewed arc-flanking cell it is the un-skewed point the
+    /// extraordinary-centre stencil must see instead of the resampled rim value.
+    fn coarse_flank_mid(&self, start: VertexKey, end: VertexKey, edge: EdgeKey, profile: f32) -> Vec3 {
+        let start_position = self.vertex_position(start);
+        let end_position = self.vertex_position(end);
+        let [ea, eb] = self.edge_vert_keys(edge);
+        let edge_point = self.vertex_position(ea);
+        let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
+        let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
+        cell.chain_positions(2, profile, false)[1]
+    }
+
     /// Build one beveled edge's `segments`-wide strip (BEVEL.md §8.3.0): `segments`
     /// quads joining the edge's two endpoint chains rung-to-rung, `p`'s sample `k`
     /// against `q`'s sample `segments − k`. Each quad shares its rung edges with
@@ -2758,10 +2774,32 @@ impl LoopMesh {
             }
         }
 
+        // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil must consume each
+        // ring chain's *raw coarse* `(i, 0, 1)` profile mid, not the emitted rim mid.
+        // For an internal edge (the reflex arc or a patch chord) the emitted coarse mid
+        // is never resampled, so its `chain[1]` at `segments = 2` already is the raw
+        // mid. For a flank / strip edge the emitted mid is the §8.2.2.1.1 chord-fraction
+        // resample; the centre needs the pre-resample naive point instead (the identity
+        // on symmetric strips, a shift on the skewed arc-flanking pair). Only the
+        // `segments = 2` centre stencil consumes these, so populate them only there.
+        let raw_coarse_mids: Vec<Vec3> = if segments == 2 {
+            (0..ring.len())
+                .map(|i| match cross_edge[i] {
+                    None => self.vertex_position(ring_chains[i][1]),
+                    Some(edge) => {
+                        self.coarse_flank_mid(ring[i], ring[(i + 1) % ring.len()], edge, profile)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         outer_miter_junctions.push(OuterMiterJunction {
             vertex,
             boundverts: ring,
             chains: ring_chains,
+            raw_coarse_mids,
             // Disk-order beveled edges (one per sector) — the reflex sector's own
             // opening edge included; the bridge treats it like any other and, being a
             // seam flank rather than a gap, never bridges into the reflex arc.
@@ -2947,11 +2985,19 @@ impl LoopMesh {
             .map(|&face| self.face_material_index(face))
             .unwrap_or(0);
         // The arc forces the circular profile, so this fill is never the flat cap.
+        // §8.9.5.3: feed the centre stencil the raw coarse control-net mids (populated
+        // at `segments = 2`), so the resampled arc-flanking rim mids never skew the apex.
+        let raw_coarse_mids = if omj.raw_coarse_mids.len() == count {
+            Some(omj.raw_coarse_mids.as_slice())
+        } else {
+            None
+        };
         self.emit_general_adj_fill(
             omj.vertex,
             &omj.chains,
             omj.segments,
             false,
+            raw_coarse_mids,
             material,
             representative,
             result,
@@ -2972,6 +3018,7 @@ impl LoopMesh {
         chain_of: &[Vec<VertexKey>],
         segments: u32,
         flat: bool,
+        raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
         representative: i32,
         result: &mut BevelResult,
@@ -3015,10 +3062,19 @@ impl LoopMesh {
                 .iter()
                 .map(|chain| self.vertex_position(chain[0]))
                 .collect();
-            let mids: Vec<Vec3> = chain_of
-                .iter()
-                .map(|chain| self.vertex_position(chain[half]))
-                .collect();
+            // §8.5.5.5(d) / §8.9.5.3: the centre stencil consumes the **raw coarse**
+            // profile mids — the pre-resample `(i, 0, 1)` control points — never the
+            // emitted (§8.2.2.1.1-resampled) rim mids. A caller with a resampled rim
+            // (the outer-miter cap) supplies its raw coarse mids; the rest have raw ==
+            // emitted (symmetric cells resample to the identity), so `chain[half]` is
+            // already the raw mid and this stays bit-identical.
+            let mids: Vec<Vec3> = match raw_coarse_mids {
+                Some(raw) if raw.len() == sectors => raw.to_vec(),
+                _ => chain_of
+                    .iter()
+                    .map(|chain| self.vertex_position(chain[half]))
+                    .collect(),
+            };
             adj_even_extraordinary_centre(vertex_position, &boundverts, &mids, sabin_gamma(sectors))
         } else {
             fullness_seed
@@ -3258,11 +3314,15 @@ impl LoopMesh {
         // tabulated fullness seed.
         let flat = profile_to_exponent(profile) == 1.0;
         let representative = cut.representative_material(self);
+        // The general non-symmetric junction's rim chains are symmetric enough that the
+        // §8.2.2.1.1 resample is the identity on their coarse mids, so `chain[half]` is
+        // already the raw coarse mid (§8.5.5.5(d)); no separate raw-mid feed is needed.
         self.emit_general_adj_fill(
             cut.vertex,
             &chain_of,
             segments,
             flat,
+            None,
             material,
             representative,
             result,
@@ -6219,6 +6279,15 @@ struct OuterMiterJunction {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
     chains: Vec<Vec<VertexKey>>,
+    /// Per ring edge (same order as `chains`), the **raw coarse control-net mid** —
+    /// the sector's single coarse `(i, 0, 1)` profile point at the `segments = 2`
+    /// resolution, sampled *before* the §8.2.2.1.1 chord-fraction resample skews the
+    /// arc-flanking cross-sections (BEVEL.md §8.5.5.5(d) / §8.9.5.3). This is what the
+    /// even-`segments = 2` extraordinary-centre stencil consumes; feeding it the
+    /// emitted (resampled) rim mids instead is the diagnosed multiface-reflex apex
+    /// bug. Populated only at `segments = 2` (the only width the centre stencil fires
+    /// at); empty otherwise.
+    raw_coarse_mids: Vec<Vec3>,
     /// Per sector `k` (disk order), the beveled edge `g_k` that opens it — the same
     /// convention as `JunctionCut::opening_edges`, so the §6.7.5.3 seam / sharp
     /// bunch-side bridge (case (4)) walks the reflex junction's beveled edges without
@@ -9950,6 +10019,147 @@ mod tests {
             result_has_vert_near(&mesh, &result, Vec3::new(0.515, 0.27005, 0.72995)),
             1,
             "the arc-end boundvert sits at the corrected §8.9.2 oracle position",
+        );
+    }
+
+    /// BEVEL.md §8.9.5.3 / §8.5.5.5(d): the outer-`ARC` cap over the **symmetric**
+    /// three-edge octagonal fan welds its valence-4 apex at the oracle-verified
+    /// `(0.14539, 0.14539, 0.66793)`. Because this ring is congruent, each flanking
+    /// cell's §8.2.2.1.1 resample is the identity, so the raw coarse mids equal the
+    /// emitted rim mids and the raw-mid centre stencil is a **bit-identical no-op**
+    /// here — the load-bearing guarantee that the raw-coarse-mid fix leaves the blessed
+    /// symmetric / B2 path unperturbed while landing exactly on the oracle apex.
+    #[test]
+    fn outer_miter_symmetric_fan_apex_matches_oracle() {
+        let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.145_385, 0.145_385, 0.667_927)),
+            1,
+            "the symmetric outer-miter fan welds its apex at the §8.9.5.3 oracle centre",
+        );
+    }
+
+    /// BEVEL.md §8.9.5.3: the once-subdivided valence-4 extraordinary-centre stencil
+    /// collapses to the fixed affine blend `apex = 0.5·mean_mid + 0.186·mean_b +
+    /// 0.314·v` in its coarse inputs (fullness `0.559`, `γ_4 = 0.25`, sharpening mask
+    /// `(−1/6, +4/3, −1/6)`). Pinning the kernel to this closed form is the proof that
+    /// it is the **faithful** coarse-net reconstruction over the *true* ring adjacency —
+    /// not a symmetry-only contraction — and that exactly **half** of any mid-selection
+    /// error passes to the apex, which is why feeding the resampled rim mids in place of
+    /// the raw coarse mids is a correctness bug, not a Tier-2 rounding.
+    #[test]
+    fn extraordinary_centre_is_affine_blend_of_raw_coarse_inputs() {
+        // An asymmetric (non-congruent) valence-4 ring so the identity is not trivially
+        // masked by symmetry.
+        let v = Vec3::new(0.2, -0.1, 1.3);
+        let boundverts = [
+            Vec3::new(0.7, 0.1, 0.6),
+            Vec3::new(0.2, 0.8, 0.5),
+            Vec3::new(-0.6, 0.3, 0.55),
+            Vec3::new(-0.1, -0.7, 0.62),
+        ];
+        let mids = [
+            Vec3::new(0.55, 0.5, 0.75),
+            Vec3::new(-0.25, 0.62, 0.72),
+            Vec3::new(-0.42, -0.28, 0.7),
+            Vec3::new(0.34, -0.35, 0.71),
+        ];
+        let apex = adj_even_extraordinary_centre(v, &boundverts, &mids, sabin_gamma(4));
+        let mean_mid = mids.iter().fold(Vec3::ZERO, |acc, &m| acc + m) / 4.0;
+        let mean_b = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 4.0;
+        let affine = 0.5 * mean_mid + 0.185_5625 * mean_b + 0.314_4375 * v;
+        assert!(
+            (apex - affine).length() < 1.0e-6,
+            "the valence-4 centre stencil equals the §8.9.5.3 affine blend (got {apex:?} vs {affine:?})",
+        );
+
+        // Half of any mid-selection error reaches the apex: perturbing one mid by `d`
+        // moves the apex by exactly `0.5 · d / 4`.
+        let mut perturbed = mids;
+        let bump = Vec3::new(0.04, -0.03, 0.02);
+        perturbed[0] += bump;
+        let moved = adj_even_extraordinary_centre(v, &boundverts, &perturbed, sabin_gamma(4));
+        assert!(
+            (moved - apex - 0.5 * bump / 4.0).length() < 1.0e-6,
+            "a resampled-vs-raw mid difference propagates to the apex at coefficient 0.5",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(d) / §8.9.5.3: `coarse_flank_mid` reads the **pre-resample**
+    /// coarse `(i, 0, 1)` profile point — the naive cell sample the §8.2.2.1.1
+    /// chord-fraction resample would correct. On the skewed arc-flanking cell it differs
+    /// from the emitted (resampled) rim mid; on a symmetric equal-offset cell the two
+    /// coincide (the resample is the identity), which is why the raw-mid centre feed is
+    /// a no-op on congruent rings and only bites on the asymmetric ones.
+    #[test]
+    fn coarse_flank_mid_is_the_raw_pre_resample_sample() {
+        // The proven skewed arc-flanking cell of `segment2_flanking_resample_matches_worked_trace`
+        // (unequal legs 0.200 / 0.133), rebuilt through vertex keys / an edge so it drives
+        // the method: `ea` is the crossed edge's apex, `eb` its rim end.
+        let mut mesh = LoopMesh::new();
+        let start = mesh.create_vertex(Vec3::new(-0.19194, 0.46338, 0.45712));
+        let end = mesh.create_vertex(Vec3::new(-0.36871, 0.24371, 0.42679));
+        let ep0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let ep1 = mesh.create_vertex(Vec3::new(-0.70711, 0.70711, 0.0));
+        let edge = mesh.create_edge([ep0, ep1], EdgeCreateFlags::NONE);
+
+        let raw = mesh.coarse_flank_mid(start, end, edge, 0.5);
+        let edge_dir = (mesh.vertex_position(ep1) - mesh.vertex_position(ep0)).normalize_or_zero();
+        let cell = ProfileCell::new(
+            mesh.vertex_position(start),
+            mesh.vertex_position(end),
+            mesh.vertex_position(ep0),
+            edge_dir,
+        );
+        let naive = cell.chain_positions(2, 0.5, false)[1];
+        let emitted = cell.chain_positions(2, 0.5, true)[1];
+        assert!(
+            (raw - naive).length() < 1.0e-6,
+            "coarse_flank_mid is the non-resampled naive coarse mid",
+        );
+        assert!(
+            (raw - emitted).length() > 1.0e-4,
+            "on the skewed flanking cell the raw coarse mid differs from the emitted resampled rim mid",
+        );
+    }
+
+    /// BEVEL.md §8.9.5.3 / §8.5.5.7: an **asymmetric** outer-`ARC` cap — non-contiguous
+    /// beveled legs, a convex-side absorbed leg, and a wide reflex arc — still closes on
+    /// a single welded valence-4 apex, and that apex is the deterministic raw-coarse-mid
+    /// extraordinary centre (fed loopmesh's own boundverts / coarse mids). The pin guards
+    /// the asymmetric-ring centre against re-regressing onto the emitted resampled mids.
+    #[test]
+    fn outer_miter_absorbed_leg_asymmetric_cap_welds_raw_mid_apex() {
+        let (mut mesh, _apex, _rim, legs) = octagonal_bipyramid_all_legs();
+        let result = mesh.bevel(
+            &[legs[1].into(), legs[3].into(), legs[4].into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        // The reflex arc raises the ring to valence 4 and the even cap welds one apex.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(-0.115_204, 0.068_405, 0.735_506)),
+            1,
+            "the asymmetric absorbed-leg cap welds its apex at the raw-mid extraordinary centre",
         );
     }
 
