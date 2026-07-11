@@ -605,6 +605,29 @@ impl LoopMesh {
             return result;
         }
 
+        // §7.5 stub: at `segments = 1` only the valence-3 terminal close is
+        // implemented (the surviving third face absorbs the corner); a valence ≥ 4
+        // terminal needs the on-edge-vert fill. Decline such an edge here, whole —
+        // `bevel_single_edge` already declines it, and the junction path must too,
+        // or it half-builds the edge (boundverts at the junction end, no near-corner
+        // vert at the terminal end) and the strip build finds no corner to land on.
+        let beveled = self.single_segment_buildable_edges(&beveled);
+        if beveled.is_empty() {
+            return result;
+        }
+        // Declining an edge can demote its junction, so read the junctions back off
+        // the surviving set.
+        let junctions: Vec<VertexKey> = junctions
+            .into_iter()
+            .filter(|&vertex| {
+                beveled
+                    .iter()
+                    .filter(|&&edge| self.edge_vert_keys(edge).contains(&vertex))
+                    .count()
+                    >= 2
+            })
+            .collect();
+
         if junctions.is_empty() {
             // No shared endpoint: every edge is isolated, every endpoint terminal
             // — the foundational §7 path, unchanged.
@@ -616,6 +639,33 @@ impl LoopMesh {
 
         self.bevel_edges_with_junctions(&beveled, &junctions, options, &mut result);
         result
+    }
+
+    /// The beveled edges the `segments = 1` path can actually build (BEVEL.md §7.5):
+    /// every endpoint must be either a junction (§7.6, any valence) or a valence-3
+    /// terminal. Dropping an edge can turn a junction into a terminal, which can drop
+    /// a further edge, so the set is shrunk to a fixed point.
+    fn single_segment_buildable_edges(&self, beveled: &[EdgeKey]) -> Vec<EdgeKey> {
+        let mut buildable: Vec<EdgeKey> = beveled.to_vec();
+        loop {
+            let kept: Vec<EdgeKey> = buildable
+                .iter()
+                .copied()
+                .filter(|&edge| {
+                    self.edge_vert_keys(edge).into_iter().all(|endpoint| {
+                        let beveled_here = buildable
+                            .iter()
+                            .filter(|&&other| self.edge_vert_keys(other).contains(&endpoint))
+                            .count();
+                        beveled_here >= 2 || self.iter_disk_edges(endpoint).count() == 3
+                    })
+                })
+                .collect();
+            if kept.len() == buildable.len() {
+                return kept;
+            }
+            buildable = kept;
+        }
     }
 
     /// Bevel one isolated manifold edge (BEVEL.md §7). Places the four strip verts
@@ -1872,30 +1922,55 @@ impl LoopMesh {
         };
 
         // The §8.3.0 rung join pairs `p` sample k with the `q` sample on the *same
-        // physical face side* of E. Orient `q` so its `start` sits on the same side
-        // as `p`'s — the rails then run *along* E (short) instead of crossing it.
-        // Picked by the shorter total rail length, which is unambiguous since the
-        // two endpoints' chains face each other across E.
+        // physical face side* of E, so the strip's outer rails run *along* E rather
+        // than crossing it. Which `q` end that is, is decided *topologically*: the
+        // re-stitched original on each side of E already owns the rail joining the
+        // two chains' outer samples (§6.7.5.2), so the rail's mere existence names
+        // the side. There is no geometric fallback: a length compare is
+        // ill-conditioned as the offset shrinks (the aligned and swapped rail sums
+        // then differ only at second order in offset / |E|) and would twist the
+        // strip on a narrow bevel. The chains' own start/end order carries no such
+        // information — `build_junction_chains` orders a chain by ring order alone,
+        // and the ring rotates oppositely at E's two endpoints, so the two ends'
+        // chains are generally anti-aligned. Hence: rails or nothing.
         let p_samples = chain_a.samples();
         let mut q_samples = chain_b.samples();
-        let aligned = (self.vertex_position(p_samples[0])
-            - self.vertex_position(q_samples[0]))
-        .length()
-            + (self.vertex_position(p_samples[p_samples.len() - 1])
-                - self.vertex_position(q_samples[q_samples.len() - 1]))
-            .length();
-        let swapped = (self.vertex_position(p_samples[0])
-            - self.vertex_position(q_samples[q_samples.len() - 1]))
-        .length()
-            + (self.vertex_position(p_samples[p_samples.len() - 1])
-                - self.vertex_position(q_samples[0]))
-            .length();
-        if swapped < aligned {
+        let q_last = q_samples.len() - 1;
+        let p_last = p_samples.len() - 1;
+        let rail_aligned = self
+            .query_edge_exists(p_samples[0], q_samples[0])
+            .or_else(|| self.query_edge_exists(p_samples[p_last], q_samples[q_last]))
+            .is_some();
+        let rail_swapped = self
+            .query_edge_exists(p_samples[0], q_samples[q_last])
+            .or_else(|| self.query_edge_exists(p_samples[p_last], q_samples[0]))
+            .is_some();
+        let swap = match (rail_aligned, rail_swapped) {
+            (false, true) => true,
+            // Neither pairing is railed: both of E's originals lost their rebuild, so
+            // there is nothing left to pair against — the same broken invariant
+            // `strip_runs_with_restitched_face` asserts on. Keep one deterministic
+            // handedness rather than re-arming a metric compare that a narrow offset
+            // cannot resolve.
+            (false, false) => {
+                debug_assert!(false, "strip has no re-stitched rail to pair its chain ends");
+                false
+            }
+            // A winding-inconsistent input across E can rail both pairings; the strip
+            // is one surface and cannot honour both, so it keeps the aligned reading.
+            _ => false,
+        };
+        if swap {
             q_samples.reverse();
         }
         if p_samples.len() != segments as usize + 1 || q_samples.len() != segments as usize + 1 {
             return;
         }
+
+        // The strip's absolute winding is anchored on an outer longitudinal rail
+        // (§5.1 / §6.7.5.2) — see `strip_runs_with_restitched_face`. A rung edge
+        // borders the *fill*, not a rebuilt original, so it is no such anchor.
+        let reversed = self.strip_runs_with_restitched_face(&p_samples, &q_samples);
 
         for k in 1..=segments as usize {
             let ring = [
@@ -1913,28 +1988,77 @@ impl LoopMesh {
             if distinct.len() < 3 {
                 continue;
             }
-            // Wind opposite the re-stitched face traversal on the long edge so each
-            // long edge stays radial-2 (§5.1).
             let mut quad = distinct;
-            if let Some(long_edge) = self.query_edge_exists(ring[0], ring[1]) {
-                let runs_forward = self
-                    .edge_loop_keys(long_edge)
-                    .first()
-                    .map(|&l| {
-                        let start = self.loop_vertex(l);
-                        let next = self.loop_vertex(self.loop_next(l));
-                        start == ring[0] && next == ring[1]
-                    })
-                    .unwrap_or(false);
-                if runs_forward {
-                    quad.reverse();
-                }
+            if reversed {
+                quad.reverse();
             }
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
             self.assign_bevel_face_material(face, material, representative, BevelNewFaceKind::Strip);
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
+    }
+
+    /// Whether the `[p_(k−1), p_k, q_k, q_(k−1)]` strip order (BEVEL.md §8.3.0)
+    /// would traverse an outer longitudinal rail the *same* way the re-stitched
+    /// original face already traverses it — i.e. whether the strip must be reversed
+    /// to keep every rail radial-2 (§5.1).
+    ///
+    /// The strip's two *outer* longitudinal rails — sample 0 and sample `segments`
+    /// (§6.7.5.2) — are the boundary the two re-stitched originals rebuilt along E's
+    /// sides, so they are the strip's only absolute winding anchor: an interior rung
+    /// or arc edge borders only new fill, and the chain's own start/end order is an
+    /// artefact of which radial face of E came first. One flip decision serves the
+    /// whole strip, since consecutive quads traverse their shared interior rail
+    /// oppositely by construction.
+    ///
+    /// Quad 1 runs the sample-0 rail `q_0 → p_0` and quad `segments` runs the
+    /// sample-`segments` rail `p_s → q_s`; each must run *opposite* the re-stitched
+    /// face already owning that rail, so the rail ends radial-2. The sample-0 rail
+    /// decides whenever it carries a face; the sample-`segments` rail is the fallback
+    /// for a collapsed chain end. Should the input mesh be winding-inconsistent across
+    /// E the two rails disagree — the sample-0 rail then wins, deliberately: the strip
+    /// is one surface and cannot satisfy both, so it keeps a single handedness rather
+    /// than tearing.
+    fn strip_runs_with_restitched_face(
+        &self,
+        p_samples: &[VertexKey],
+        q_samples: &[VertexKey],
+    ) -> bool {
+        debug_assert_eq!(p_samples.len(), q_samples.len());
+        debug_assert!(!p_samples.is_empty());
+        let last = p_samples.len() - 1;
+        let rails = [
+            (q_samples[0], p_samples[0]),
+            (p_samples[last], q_samples[last]),
+        ];
+        for (from, to) in rails {
+            let Some(rail) = self.query_edge_exists(from, to) else {
+                continue;
+            };
+            let mut radial = self.edge_radial_iter(rail).peekable();
+            if radial.peek().is_none() {
+                continue;
+            }
+            // "Does *some* face run this rail `from → to`?" is only the right question
+            // while the rail carries exactly the one re-stitched face: on a radial-2
+            // rail one of the two faces always runs it forward, so `any` would be true
+            // unconditionally and force-reverse the strip.
+            debug_assert_eq!(
+                self.edge_radial_iter(rail).count(),
+                1,
+                "the strip's winding anchor must be the lone re-stitched face on the rail",
+            );
+            return radial.any(|loop_key| {
+                self.loop_vertex(loop_key) == from
+                    && self.loop_vertex(self.loop_next(loop_key)) == to
+            });
+        }
+        // Only edges that passed the radial-count-2 gate are beveled here, and both
+        // their originals are re-stitched before any strip is built, so at least one
+        // outer rail always carries a face.
+        debug_assert!(false, "strip has no re-stitched rail to anchor its winding");
+        false
     }
 
     /// Build the cutoff fill at one junction (BEVEL.md §8.3.2 / §8.3.4): one cut
@@ -4155,7 +4279,10 @@ impl LoopMesh {
 
         // §7.5 foundational pin: only the valence-3 terminal close is implemented
         // — the surviving third face absorbs the corner. Valence ≥ 4 needs the
-        // on-edge-vert fill (§7.5), still a stub; skip it.
+        // on-edge-vert fill (§7.5), still a stub. `single_segment_buildable_edges`
+        // has already declined any edge landing here, so this is a guard, not a
+        // mid-surgery bail: leaving the corner unrecorded would strand the strip
+        // build with no near-corner vert to land on.
         if self.iter_disk_edges(vertex).count() != 3 {
             return;
         }
@@ -6710,9 +6837,14 @@ struct DiskEdge {
 
 /// One beveled edge's profile chain at one endpoint (BEVEL.md §8.2.2 / §8.3.0):
 /// the two ring boundverts (`start` / `end`) it spans plus the `segments − 1`
-/// interior arc samples between them. `start` is the boundvert on the edge's first
-/// radial face, so both ends of the edge order their chains consistently for the
-/// strip's rung-to-rung join.
+/// interior arc samples between them.
+///
+/// `start` / `end` carry **no** cross-endpoint meaning: a junction chain is ordered
+/// by the boundvert ring alone (never by the crossing edge's radial order), and the
+/// ring rotates oppositely at the edge's two endpoints, so an edge's two chains are
+/// generally *anti*-aligned. The strip's rung join must therefore pair the two ends'
+/// samples topologically at build time — see `build_multisegment_strip` — rather
+/// than trust this order.
 struct EdgeEndChain {
     edge: EdgeKey,
     endpoint: VertexKey,
@@ -7309,6 +7441,356 @@ mod tests {
             }
         }
         true
+    }
+
+    /// BEVEL.md §5.1: every interior manifold edge must be traversed in
+    /// *opposite* directions by its two adjacent faces. Returns the directed
+    /// vertex pairs that two faces traverse the same way (a winding conflict) —
+    /// empty for a globally winding-consistent mesh.
+    fn winding_conflicts(mesh: &LoopMesh) -> Vec<(VertexKey, VertexKey)> {
+        let mut directed: Vec<(VertexKey, VertexKey)> = Vec::new();
+        for &face in mesh.face_keys().iter() {
+            let verts = mesh.face_vert_keys(face);
+            for index in 0..verts.len() {
+                directed.push((verts[index], verts[(index + 1) % verts.len()]));
+            }
+        }
+        let mut conflicts: Vec<(VertexKey, VertexKey)> = Vec::new();
+        for (index, &pair) in directed.iter().enumerate() {
+            if directed[index + 1..].contains(&pair) {
+                conflicts.push(pair);
+            }
+        }
+        conflicts
+    }
+
+    /// A unit octahedron (6 verts, 8 triangles), every vertex valence 4 and every
+    /// face wound outward — the closed solid the valence-≥4 junction / terminal-fan
+    /// paths need.
+    fn mesh_add_octahedron(mesh: &mut LoopMesh) {
+        let px = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let py = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let nx = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let ny = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let nadir = mesh.create_vertex(Vec3::new(0.0, 0.0, -1.0));
+        for ring in [[px, py], [py, nx], [nx, ny], [ny, px]] {
+            mesh.face_create_verts(&[ring[0], ring[1], apex], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[ring[1], ring[0], nadir], FaceCreateFlags::NONE);
+        }
+    }
+
+    /// Signed volume of a closed mesh, as the divergence-theorem fan sum over its
+    /// faces. Positive exactly when the faces wind outward, so it catches a result
+    /// that is winding-*consistent* yet globally inside out.
+    fn signed_volume(mesh: &LoopMesh) -> f32 {
+        let mut total = 0.0;
+        for &face in mesh.face_keys().iter() {
+            let verts = mesh.face_vert_keys(face);
+            let apex = mesh.vertex_position(verts[0]);
+            for index in 1..verts.len().saturating_sub(1) {
+                let b = mesh.vertex_position(verts[index]);
+                let c = mesh.vertex_position(verts[index + 1]);
+                total += apex.dot(b.cross(c)) / 6.0;
+            }
+        }
+        total
+    }
+
+    /// A beveled closed solid must stay a valid, non-degenerate, winding-consistent,
+    /// outward-wound mesh (BEVEL.md §5.1).
+    fn assert_bevel_sound(mesh: &LoopMesh, result: &BevelResult, case: &str) {
+        mesh.validate_topology();
+        assert!(!result.faces.is_empty(), "{case}: bevel produced no faces");
+        let conflicts = winding_conflicts(mesh);
+        assert!(
+            conflicts.is_empty(),
+            "{case}: {} shared edge(s) traversed the same way by both adjacent faces",
+            conflicts.len(),
+        );
+        let volume = signed_volume(mesh);
+        assert!(
+            volume > 0.0,
+            "{case}: signed volume {volume} — the solid is consistent but inside out",
+        );
+    }
+
+    /// Bevel the given edges of a cube corner, sweeping segments / vmesh method /
+    /// profile, and assert every result is sound. `edge_count` names how many of the
+    /// corner's three incident edges to bevel: 3 = every strip end is a junction,
+    /// 2 = each strip has one junction end and one terminal end, 1 = both ends
+    /// terminal.
+    fn assert_cube_corner_bevel_sound(
+        edge_count: usize,
+        segment_range: std::ops::RangeInclusive<u32>,
+        methods: &[BevelVmeshMethod],
+    ) {
+        for segments in segment_range {
+            for &vmesh_method in methods {
+                for profile in [0.5f32, 0.25, 0.85] {
+                    let mut mesh = LoopMesh::new();
+                    mesh_add_cube(&mut mesh);
+                    let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+                    let incident = mesh.vert_edge_keys(corner);
+                    assert_eq!(incident.len(), 3, "the cube corner has three incident edges");
+                    let geom: Vec<GeomKey> = incident
+                        .into_iter()
+                        .take(edge_count)
+                        .map(GeomKey::from)
+                        .collect();
+
+                    let result = mesh.bevel(
+                        &geom,
+                        BevelOptions {
+                            offset: 0.25,
+                            affect: BevelAffect::Edges,
+                            segments,
+                            profile,
+                            vmesh_method,
+                            ..Default::default()
+                        },
+                    );
+
+                    let case = format!(
+                        "{edge_count} edge(s), segments = {segments}, profile = {profile}, \
+                         {vmesh_method:?}"
+                    );
+                    assert_bevel_sound(&mesh, &result, &case);
+                    assert!(
+                        result.faces.len() >= edge_count * segments as usize,
+                        "{case}: {} new face(s) — expected at least one strip quad per \
+                         segment per beveled edge",
+                        result.faces.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// BEVEL.md §5.1 / §8.3.0: the multi-segment strip and the cap must join the
+    /// re-stitched originals with consistent loop traversal, so the whole beveled
+    /// cube corner stays globally winding-consistent at every segment count. Here
+    /// every strip end is a junction.
+    #[test]
+    fn edge_bevel_cube_corner_winding_consistent_all_segments() {
+        assert_cube_corner_bevel_sound(
+            3,
+            1..=4,
+            &[BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff],
+        );
+    }
+
+    /// BEVEL.md §5.1 / §8.3.0.1: a lone beveled cube edge — *both* strip ends are
+    /// valence-3 terminals, so the outer-rail winding anchor governs a strip that
+    /// no junction cap touches.
+    #[test]
+    fn edge_bevel_single_cube_edge_winding_consistent_all_segments() {
+        assert_cube_corner_bevel_sound(
+            1,
+            1..=4,
+            &[BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff],
+        );
+    }
+
+    /// BEVEL.md §5.1: the mixed case — two beveled edges at one corner give each
+    /// strip a junction end and a terminal end, so the strip's two outer rails are
+    /// anchored by faces the *junction* and the *terminal* close rebuilt.
+    #[test]
+    fn edge_bevel_cube_two_edges_winding_consistent_all_segments() {
+        assert_cube_corner_bevel_sound(2, 1..=4, &[BevelVmeshMethod::Adj]);
+    }
+
+    /// The same mixed case under `Cutoff`. A 2-sector junction has *two* chains over
+    /// the *same* boundvert pair `{B_0, B_1}` — one per beveled edge — but the cutoff
+    /// fill looks a sector's chain up by that unordered pair alone, ignoring which
+    /// edge the chain crosses. Both sectors therefore resolve to the *same* chain: its
+    /// fill is emitted twice (the second copy reflected, so the pair traverses every
+    /// shared edge the same way), while the other edge's chain gets no fill face at
+    /// all. Whether BEVEL.md §8.3.2 even specifies the 2-sector cutoff junction is an
+    /// open question — the fix waits on that read-back.
+    #[test]
+    #[ignore = "the 2-sector cutoff junction resolves both sectors to one chain (the pair \
+                lookup ignores the crossing edge): one chain's fill is built twice with \
+                conflicting winding, the other edge's chain gets no fill face; see \
+                BEVEL.md §8.3.2"]
+    fn edge_bevel_cube_two_edges_cutoff_winding_consistent_all_segments() {
+        assert_cube_corner_bevel_sound(2, 2..=4, &[BevelVmeshMethod::Cutoff]);
+    }
+
+    /// The 2-sector junction is *unroofed* under `Adj` too, so the defect above is not
+    /// a `Cutoff`-only one: at `segments ≥ 2` the two chains spanning `{B_0, B_1}` bow
+    /// apart into two arcs and nothing fills the lens between them (`Adj` builds no fill
+    /// there at all; `Cutoff` builds one chain's fill twice and the other's never), so
+    /// the result carries `2 × segments` boundary edges. `segments = 1` is closed — the
+    /// two chains are then the two direct ring segments and the strips meet flush, the
+    /// §7.6 "through junction adds no patch" case. A hole disturbs neither the winding
+    /// nor the volume assertion, so only a closedness check sees it.
+    #[test]
+    #[ignore = "the 2-sector junction gets no fill face at segments >= 2 under Adj: the lens \
+                between its two boundvert-pair-spanning chains is left open (2 * segments \
+                boundary edges); see BEVEL.md §8.3.1 / §8.3.2"]
+    fn edge_bevel_cube_two_edges_adj_junction_is_closed() {
+        for segments in 2..=4 {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+            let geom: Vec<GeomKey> = mesh
+                .vert_edge_keys(corner)
+                .into_iter()
+                .take(2)
+                .map(GeomKey::from)
+                .collect();
+            mesh.bevel(
+                &geom,
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    ..Default::default()
+                },
+            );
+            let open = mesh
+                .edge_keys()
+                .iter()
+                .filter(|&&edge| mesh.edge_radial_iter(edge).count() != 2)
+                .count();
+            assert_eq!(
+                open, 0,
+                "segments = {segments}: {open} boundary edge(s) — the beveled solid is open",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.2 / §8.5.5.5: a valence-4 junction (and, at the far ends,
+    /// valence-4 terminals taking the poly-fan close) must wind as consistently as
+    /// the valence-3 cube corner.
+    #[test]
+    fn edge_bevel_valence_four_junction_winding_consistent_all_segments() {
+        assert_octahedron_junction_bevel_sound(2..=3, &[BevelVmeshMethod::Adj]);
+    }
+
+    /// The same octahedron at `segments = 1`, where it is the beveled edges' *far*
+    /// (terminal) ends, not the apex junction, that are unbuildable: both are valence-4
+    /// terminals, and the single-segment close implements only the valence-3 terminal
+    /// (BEVEL.md §7.5 — valence ≥ 4 wants the on-edge-vert fill, still a stub). Every
+    /// edge is therefore declined and the bevel is a no-op.
+    #[test]
+    #[ignore = "the segments = 1 terminal close is valence-3 only, so both beveled edges of \
+                the octahedron apex are declined at their valence-4 terminal ends and the \
+                bevel builds nothing; needs the on-edge-vert fill, see BEVEL.md §7.5"]
+    fn edge_bevel_valence_four_terminal_single_segment_winding_consistent() {
+        assert_octahedron_junction_bevel_sound(
+            1..=1,
+            &[BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff],
+        );
+    }
+
+    /// BEVEL.md §8.3.0 / §6.7.5.2: the strip's rung join is decided by the re-stitched
+    /// outer rail that already spans the two chains' outer samples — never by a length
+    /// compare, which goes ill-conditioned as the offset shrinks (the aligned and
+    /// swapped rail sums then differ only at second order in offset / |E|) and twists
+    /// the strip. Asserted at the mechanism: on a closed solid every rail the strip
+    /// lays down must end radial-2, which a twisted strip cannot manage — it abandons
+    /// the re-stitched outer rails at radial-1 and mints crossing ones in their place.
+    #[test]
+    fn edge_bevel_narrow_offset_strip_is_not_twisted() {
+        let both = [BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff];
+        for offset in [1.0e-4f32, 1.0e-2] {
+            // 1 = both strip ends terminal, 3 = both ends junctions. The mixed 2-edge
+            // corner is left out: its 2-sector junction is short a fill face at *any*
+            // offset (the pin below), so its result is not closed to begin with.
+            for (edge_count, methods) in [(1, &both[..]), (3, &both[..])] {
+                for segments in 2..=4 {
+                    for &vmesh_method in methods {
+                        let mut mesh = LoopMesh::new();
+                        mesh_add_cube(&mut mesh);
+                        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+                        let geom: Vec<GeomKey> = mesh
+                            .vert_edge_keys(corner)
+                            .into_iter()
+                            .take(edge_count)
+                            .map(GeomKey::from)
+                            .collect();
+
+                        let result = mesh.bevel(
+                            &geom,
+                            BevelOptions {
+                                offset,
+                                affect: BevelAffect::Edges,
+                                segments,
+                                vmesh_method,
+                                ..Default::default()
+                            },
+                        );
+
+                        let case = format!(
+                            "{edge_count} edge(s), offset = {offset}, segments = {segments}, \
+                             {vmesh_method:?}"
+                        );
+                        assert!(!result.faces.is_empty(), "{case}: bevel produced no faces");
+                        mesh.validate_topology();
+                        for &edge in mesh.edge_keys().iter() {
+                            let radial = mesh.edge_radial_iter(edge).count();
+                            assert_eq!(
+                                radial, 2,
+                                "{case}: an edge ended radial-{radial} — the strip crossed E \
+                                 instead of running along it",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bevel two of the four edges at the octahedron apex — a valence-4 junction at
+    /// one end of each strip, a valence-4 terminal (the poly-fan close, §8.3.0.2) at
+    /// the other — and assert every result is sound.
+    fn assert_octahedron_junction_bevel_sound(
+        segment_range: std::ops::RangeInclusive<u32>,
+        methods: &[BevelVmeshMethod],
+    ) {
+        for segments in segment_range {
+            for &vmesh_method in methods {
+                for profile in [0.5f32, 0.3] {
+                    let mut mesh = LoopMesh::new();
+                    mesh_add_octahedron(&mut mesh);
+                    let apex = vert_at(&mesh, Vec3::new(0.0, 0.0, 1.0));
+                    let incident = mesh.vert_edge_keys(apex);
+                    assert_eq!(incident.len(), 4, "the octahedron apex has valence 4");
+                    let geom: Vec<GeomKey> = incident
+                        .into_iter()
+                        .take(2)
+                        .map(GeomKey::from)
+                        .collect();
+
+                    let result = mesh.bevel(
+                        &geom,
+                        BevelOptions {
+                            offset: 0.2,
+                            affect: BevelAffect::Edges,
+                            segments,
+                            profile,
+                            vmesh_method,
+                            ..Default::default()
+                        },
+                    );
+
+                    let case = format!(
+                        "valence-4 junction, segments = {segments}, profile = {profile}, \
+                         {vmesh_method:?}"
+                    );
+                    assert_bevel_sound(&mesh, &result, &case);
+                    assert!(
+                        result.faces.len() >= 2 * segments as usize,
+                        "{case}: {} new face(s) — expected at least one strip quad per \
+                         segment per beveled edge",
+                        result.faces.len(),
+                    );
+                }
+            }
+        }
     }
 
     /// BEVEL.md §4.4.3: beveling the two shared-edge endpoints of the cube with
@@ -20098,3 +20580,4 @@ fn intersect_line_plane(
     let t = (plane_point - point).dot(plane_normal) / denominator;
     Some(point + direction * t)
 }
+
