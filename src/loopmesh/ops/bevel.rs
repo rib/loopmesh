@@ -1326,6 +1326,7 @@ impl LoopMesh {
                 segments,
                 profile,
                 None,
+                ChainEmission::ResampledAtControlResolution,
                 result,
             );
             chains.push(EdgeEndChain {
@@ -1432,6 +1433,7 @@ impl LoopMesh {
             segments,
             profile,
             Some(terminal_position),
+            ChainEmission::Raw,
             result,
         );
 
@@ -1656,6 +1658,7 @@ impl LoopMesh {
         segments: u32,
         profile: f32,
         terminal_vertex: Option<Vec3>,
+        emission: ChainEmission,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
         let start_position = self.vertex_position(start);
@@ -1673,15 +1676,7 @@ impl LoopMesh {
         if let Some(terminal) = terminal_vertex {
             cell.snap_terminal_plane(terminal);
         }
-        // §8.2.2.1.1 applies the seg=2 boundary resample to every cross-section that
-        // bounds a [V-ADJ] adjacency fill. A terminal far end has no junction fill
-        // face (§6.7.5.4) — its through-strip is capped by the naive profile chain,
-        // not a doubled-then-down-resampled vmesh boundary — so the resample is
-        // inert there. Everywhere else (junction and miter-patch cross-sections) it
-        // is applied unconditionally: the identity on symmetric cells leaves every
-        // equal-offset strip untouched, correcting only the skewed arc-flanking ones.
-        let resample_seg2 = terminal_vertex.is_none();
-        let positions = cell.chain_positions(segments, profile, resample_seg2);
+        let positions = cell.chain_positions(segments, profile, emission);
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for position in positions.iter().take(positions.len() - 1).skip(1) {
@@ -1705,7 +1700,7 @@ impl LoopMesh {
         let edge_point = self.vertex_position(ea);
         let edge_dir = (self.vertex_position(eb) - edge_point).normalize_or_zero();
         let cell = ProfileCell::new(start_position, end_position, edge_point, edge_dir);
-        cell.chain_positions(2, profile, false)[1]
+        cell.chain_positions(2, profile, ChainEmission::Raw)[1]
     }
 
     /// Build one beveled edge's `segments`-wide strip (BEVEL.md §8.3.0): `segments`
@@ -2289,7 +2284,16 @@ impl LoopMesh {
             let start = arc_end[k];
             let end = arc_start[next];
             let interior = self
-                .build_chain_between(start, end, crossing, segments, profile, None, result);
+                .build_chain_between(
+                    start,
+                    end,
+                    crossing,
+                    segments,
+                    profile,
+                    None,
+                    ChainEmission::ResampledAtControlResolution,
+                    result,
+                );
             // Invariant: a circular `segments = 2` cross-section always yields exactly
             // one interior sample. Reaching here with none would mean `build_chain_between`
             // returned no interior sample despite the `segments == 2` gate above — an
@@ -2572,52 +2576,96 @@ impl LoopMesh {
         //     (`Patch` is seg = 2-only, gated above.)
         // `reflex_ring` is the sector's ordered ring boundverts; `internal_chains` holds
         // one full `k + 1`-sample chain per internal (`None` cross-edge) edge between them
-        // (oriented along the ring); `forward_run` is the reflex face's rebuilt boundary
-        // threading `B1 … B3` in sector order.
-        let (reflex_ring, internal_chains, forward_run): (
+        // (oriented along the ring); `raw_internal_mids` holds each of those chains' *raw*
+        // coarse `(i, 0, 1)` control point — the pre-resample profile mid the centre
+        // stencil consumes (§8.5.5.5(d) / §8.9.5.3), which is **not** the emitted rim
+        // sample; `forward_run` is the reflex face's rebuilt boundary threading `B1 … B3`
+        // in sector order.
+        let (reflex_ring, internal_chains, raw_internal_mids, forward_run): (
             Vec<VertexKey>,
             Vec<Vec<VertexKey>>,
+            Vec<Vec3>,
             Vec<VertexKey>,
         ) = match mode {
             BevelMiter::Arc => {
                 // §8.9.5.1 segments-general arc sampling in the (non-orthonormal) unit-
                 // square frame: `a_axis = midpoint − B1`, `b_axis = midpoint − B3`, inner
-                // corner `B1 + B3 − midpoint`, sample `k` at `P(cos θ_k, sin θ_k)`. The
-                // seg = 2 sample keeps the closed-form `(2−√2)·chord_mid + (√2−1)·midpoint`
-                // bulge verbatim so the pinned seg = 2 miter stays bit-identical.
+                // corner `B1 + B3 − midpoint`, sample `k` at `P(cos θ_k, sin θ_k)` with
+                // `θ` *descending* from 90° at `B1` to 0° at `B3`. The seg = 2 raw sample
+                // keeps the closed-form `(2−√2)·chord_mid + (√2−1)·midpoint` bulge, which
+                // is that same 45° point.
                 let a_axis = midpoint - b1_position;
                 let b_axis = midpoint - b3_position;
                 let inner_corner = b1_position + b3_position - midpoint;
+                let arc_sample = |theta: f32| {
+                    a_axis * theta.cos() + b_axis * theta.sin() + inner_corner
+                };
+                let sqrt2 = std::f32::consts::SQRT_2;
+                let chord_mid = 0.5 * (b1_position + b3_position);
+                let raw_bulge = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
+                let arc_polyline = |count: u32| -> Vec<Vec3> {
+                    (0..=count)
+                        .map(|k| {
+                            if k == 0 {
+                                b1_position
+                            } else if k == count {
+                                b3_position
+                            } else if count == 2 {
+                                raw_bulge
+                            } else {
+                                let theta = std::f32::consts::FRAC_PI_2
+                                    * (1.0 - k as f32 / count as f32);
+                                arc_sample(theta)
+                            }
+                        })
+                        .collect()
+                };
+
+                // §8.2.2.1.1 / §8.9.5.2: the arc is a ring-edge chain of the [V-ADJ] cap
+                // like any other, so its *emitted* rim samples are the chord-fraction
+                // resample of the raw arc against the profile materialised at the source
+                // resolution. On an asymmetric (absorbed-leg) reflex fan the arc cell is
+                // the most skewed in the cap and the shift is large. The centre stencil
+                // keeps reading `raw_bulge` (below) — the two roles are distinct values.
+                let raw_chain = arc_polyline(segments);
+                let source_segments = boundary_source_resolution(segments);
+                let emitted = if source_segments == segments {
+                    raw_chain
+                } else {
+                    let source = arc_polyline(source_segments);
+                    chord_fraction_resample(&raw_chain, &source)
+                };
+
                 let mut samples = Vec::with_capacity(segments as usize + 1);
-                let mut interior = Vec::with_capacity(segments as usize - 1);
                 samples.push(b1);
-                for k in 1..segments {
-                    let position = if segments == 2 {
-                        let sqrt2 = std::f32::consts::SQRT_2;
-                        let chord_mid = 0.5 * (b1_position + b3_position);
-                        (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint
-                    } else {
-                        let theta = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / segments as f32);
-                        a_axis * theta.cos() + b_axis * theta.sin() + inner_corner
-                    };
-                    let sample = self.create_vertex(position);
+                for position in emitted.iter().take(segments as usize).skip(1) {
+                    let sample = self.create_vertex(*position);
                     result.verts.push(sample);
-                    interior.push(sample);
                     samples.push(sample);
                 }
                 samples.push(b3);
-                (vec![b1, b3], vec![samples.clone()], samples)
+                (
+                    vec![b1, b3],
+                    vec![samples.clone()],
+                    vec![raw_bulge],
+                    samples,
+                )
             }
             BevelMiter::Patch => {
                 let b2 = self.create_vertex(midpoint);
-                let mid12 = self.create_vertex(0.5 * (b1_position + midpoint));
-                let mid23 = self.create_vertex(0.5 * (midpoint + b3_position));
+                let mid12_position = 0.5 * (b1_position + midpoint);
+                let mid23_position = 0.5 * (midpoint + b3_position);
+                let mid12 = self.create_vertex(mid12_position);
+                let mid23 = self.create_vertex(mid23_position);
                 result.verts.push(b2);
                 result.verts.push(mid12);
                 result.verts.push(mid23);
+                // The patch legs are straight chords: their chord-fraction resample is the
+                // identity, so raw and emitted mids coincide.
                 (
                     vec![b1, b2, b3],
                     vec![vec![b1, mid12, b2], vec![b2, mid23, b3]],
+                    vec![mid12_position, mid23_position],
                     vec![b1, mid12, b2, mid23, b3],
                 )
             }
@@ -2744,7 +2792,14 @@ impl LoopMesh {
                     // `segments = 2` its lone interior sample is the §8.2.2.1.1 chord-
                     // fraction resample (identity on the symmetric interior sector strips).
                     let interior = self.build_chain_between(
-                        start, end, edge, segments, profile, None, result,
+                        start,
+                        end,
+                        edge,
+                        segments,
+                        profile,
+                        None,
+                        ChainEmission::Resampled,
+                        result,
                     );
                     // A circular cross-section always samples to `segments − 1` interior
                     // verts; a short chain here would be an internal-invariant violation,
@@ -2774,18 +2829,22 @@ impl LoopMesh {
             }
         }
 
-        // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil must consume each
-        // ring chain's *raw coarse* `(i, 0, 1)` profile mid, not the emitted rim mid.
-        // For an internal edge (the reflex arc or a patch chord) the emitted coarse mid
-        // is never resampled, so its `chain[1]` at `segments = 2` already is the raw
-        // mid. For a flank / strip edge the emitted mid is the §8.2.2.1.1 chord-fraction
-        // resample; the centre needs the pre-resample naive point instead (the identity
-        // on symmetric strips, a shift on the skewed arc-flanking pair). Only the
+        // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil must consume each ring
+        // chain's *raw coarse* `(i, 0, 1)` profile mid, never the emitted rim mid. Every
+        // chain — the reflex arc included — emits the §8.2.2.1.1 chord-fraction resample,
+        // so on a skewed cell the two values differ and reading the rim vertex back would
+        // skew the centre. Flank mids come from the pre-resample cell sample; the internal
+        // (arc / patch-chord) mids were captured raw when the chain was minted. Only the
         // `segments = 2` centre stencil consumes these, so populate them only there.
+        let mut internal_index = 0usize;
         let raw_coarse_mids: Vec<Vec3> = if segments == 2 {
             (0..ring.len())
                 .map(|i| match cross_edge[i] {
-                    None => self.vertex_position(ring_chains[i][1]),
+                    None => {
+                        let mid = raw_internal_mids[internal_index];
+                        internal_index += 1;
+                        mid
+                    }
                     Some(edge) => {
                         self.coarse_flank_mid(ring[i], ring[(i + 1) % ring.len()], edge, profile)
                     }
@@ -9532,12 +9591,14 @@ mod tests {
         );
     }
 
-    /// Re-derive a reflex sector's `segments + 1` `ARC` sample positions on the pristine
-    /// octagonal bipyramid, generalising `octagonal_arc_samples` to any `segments`
+    /// Re-derive a reflex sector's `segments + 1` **emitted** `ARC` sample positions on the
+    /// pristine octagonal bipyramid, generalising `octagonal_arc_samples` to any `segments`
     /// (BEVEL.md §8.9.5.1): the two arc ends `s_0 = B1` / `s_segments = B3` (the §8.9.2
-    /// reposition) and the interior samples `s_k = P(cos θ_k, sin θ_k)`,
-    /// `θ_k = 90°·(1 − k / segments)`, on the inscribed circular profile. Returns the
-    /// ordered chain `s_0 … s_segments`.
+    /// reposition), the raw interior samples `s_k = P(cos θ_k, sin θ_k)`,
+    /// `θ_k = 90°·(1 − k / segments)` on the inscribed circular profile, then the
+    /// §8.2.2.1.1 chord-fraction resample of that chain against the profile materialised
+    /// at `N = next power of two ≥ max(4, segments)` — the arc is a [V-ADJ] cap ring chain
+    /// like any other. Returns the ordered chain `s_0 … s_segments`.
     fn octagonal_arc_chain(beveled: &[usize], segments: u32) -> Vec<Vec3> {
         let offset = 0.2;
         let (mesh, apex, _rim, apex_leg) = octagonal_bipyramid_all_legs();
@@ -9572,13 +9633,27 @@ mod tests {
         let a_axis = midpoint - b1;
         let b_axis = midpoint - b3;
         let inner = b1 + b3 - midpoint;
-        let mut chain = vec![b1];
-        for k in 1..segments {
-            let theta = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / segments as f32);
-            chain.push(a_axis * theta.cos() + b_axis * theta.sin() + inner);
+        let polyline = |count: u32| -> Vec<Vec3> {
+            (0..=count)
+                .map(|k| {
+                    if k == 0 {
+                        b1
+                    } else if k == count {
+                        b3
+                    } else {
+                        let theta =
+                            std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / count as f32);
+                        a_axis * theta.cos() + b_axis * theta.sin() + inner
+                    }
+                })
+                .collect()
+        };
+        let raw = polyline(segments);
+        let source_segments = boundary_source_resolution(segments);
+        if source_segments == segments {
+            return raw;
         }
-        chain.push(b3);
-        chain
+        chord_fraction_resample(&raw, &polyline(source_segments))
     }
 
     /// Classify a beveled octagonal-bipyramid result's reflex-hole faces (those touching
@@ -9835,8 +9910,8 @@ mod tests {
         let end = Vec3::new(-0.36871, 0.24371, 0.42679);
         let cell = ProfileCell::new(start, end, apex, edge_dir);
 
-        let filled = cell.chain_positions(2, 0.5, true);
-        let terminal = cell.chain_positions(2, 0.5, false);
+        let filled = cell.chain_positions(2, 0.5, ChainEmission::Resampled);
+        let terminal = cell.chain_positions(2, 0.5, ChainEmission::Raw);
 
         // Endpoints are identical; only the single interior sample can differ.
         assert_eq!(filled.len(), 3);
@@ -10123,8 +10198,8 @@ mod tests {
             mesh.vertex_position(ep0),
             edge_dir,
         );
-        let naive = cell.chain_positions(2, 0.5, false)[1];
-        let emitted = cell.chain_positions(2, 0.5, true)[1];
+        let naive = cell.chain_positions(2, 0.5, ChainEmission::Raw)[1];
+        let emitted = cell.chain_positions(2, 0.5, ChainEmission::Resampled)[1];
         assert!(
             (raw - naive).length() < 1.0e-6,
             "coarse_flank_mid is the non-resampled naive coarse mid",
@@ -10160,6 +10235,138 @@ mod tests {
             result_has_vert_near(&mesh, &result, Vec3::new(-0.115_204, 0.068_405, 0.735_506)),
             1,
             "the asymmetric absorbed-leg cap welds its apex at the raw-mid extraordinary centre",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1.1 / §8.9.5.1: the reflex **arc** is a ring-edge chain of the
+    /// [V-ADJ] cap like any other, so its emitted rim samples are the chord-fraction
+    /// resample of the raw arc against the profile at `N = next pow2 ≥ max(4, segments)` —
+    /// never the raw `P(45°)` bulge. On this absorbed-leg driver the arc cell is grossly
+    /// skewed (legs `0.664` / `0.280`) and the raw bulge misses the emitted sample by
+    /// ≈`0.008` world-units (≈803 position quanta), so emitting the raw point is a hard
+    /// divergence, not a rounding.
+    ///
+    /// The apex assertion is the paired guard: the rim is resampled, but the cap **centre**
+    /// stencil still consumes the *raw* coarse `(i, 0, 1)` bulge (§8.5.5.5(d) / §8.9.5.3).
+    /// Aliasing the two — feeding the centre the emitted rim vertex — moves the apex, so
+    /// this pin fails the moment the raw/emitted split is collapsed.
+    ///
+    /// (This fixture's octagon is the guide driver's rotated 45° about `z` — its rim
+    /// numbering starts one leg over — so every worked coordinate appears here rotated;
+    /// the arc cell, its legs, and every displacement are congruent.)
+    #[test]
+    fn multiface_reflex_absorbed_leg_arc_rim_mid_is_the_chord_resample() {
+        let (mut mesh, _apex, _rim, legs) = octagonal_bipyramid_all_legs();
+        let result = mesh.bevel(
+            &[legs[1].into(), legs[3].into(), legs[4].into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let emitted = Vec3::new(-0.052_441, -0.045_032, 0.702_732);
+        let raw_bulge = Vec3::new(-0.059_892, -0.047_334, 0.700_830);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, emitted),
+            1,
+            "the arc rim mid is the §8.2.2.1.1 chord-fraction resample",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, raw_bulge),
+            0,
+            "the raw 45° bulge is never emitted as a rim vertex on a skewed arc cell",
+        );
+        assert!(
+            (emitted - raw_bulge).length() > 0.007,
+            "the raw-vs-emitted arc gap is the ≈803-quantum divergence, not a rounding",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(-0.115_204, 0.068_405, 0.735_506)),
+            1,
+            "the apex still welds at the raw-mid extraordinary centre — the centre reads the raw bulge, the rim the resampled one",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1.1 (gate part (i)) / §8.9.5.1: at a **non-power-of-two**
+    /// `segments` the source resolution is `N = next pow2 ≥ max(4, segments)` — `4` at
+    /// `segments = 3`, *not* `2·segments` — so every interior arc sample is displaced off
+    /// the raw profile. The gate is `segments`-first: not a skew test, and not a
+    /// `segments = 2` special case.
+    #[test]
+    fn multiface_reflex_absorbed_leg_arc_segments3_samples_are_resampled() {
+        let (mut mesh, _apex, _rim, legs) = octagonal_bipyramid_all_legs();
+        let result = mesh.bevel(
+            &[legs[1].into(), legs[3].into(), legs[4].into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        for emitted in [
+            Vec3::new(-0.175_752, -0.066_595, 0.631_479),
+            Vec3::new(0.046_653, -0.014_437, 0.727_964),
+        ] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, emitted),
+                1,
+                "the odd-segments arc sample is the chord-fraction resample of the 4-segment profile",
+            );
+        }
+        for raw in [
+            Vec3::new(-0.179_437, -0.069_608, 0.635_060),
+            Vec3::new(0.043_777, -0.018_307, 0.734_420),
+        ] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, raw),
+                0,
+                "the raw even-angle arc sample is not emitted at a non-power-of-two segments",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1.1: the source resolution is the next power of two at or above
+    /// `max(4, segments)` (the fill's control cage is 2 wide and always doubles once), and
+    /// the resample is the exact identity when the source lands on the target — so
+    /// `4, 8, 16, …` emit the raw chain and nothing else does.
+    #[test]
+    fn boundary_resample_source_resolution_and_identity() {
+        assert_eq!(boundary_source_resolution(2), 4);
+        assert_eq!(boundary_source_resolution(3), 4);
+        assert_eq!(boundary_source_resolution(4), 4);
+        assert_eq!(boundary_source_resolution(5), 8);
+        assert_eq!(boundary_source_resolution(8), 8);
+        assert_eq!(boundary_source_resolution(9), 16);
+
+        // The skewed arc-flanking cell of the §8.2.2.1.1 worked trace.
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let rim = Vec3::new(-0.70711, 0.70711, 0.0);
+        let cell = ProfileCell::new(
+            Vec3::new(-0.19194, 0.46338, 0.45712),
+            Vec3::new(-0.36871, 0.24371, 0.42679),
+            apex,
+            (rim - apex).normalize(),
+        );
+        assert_eq!(
+            cell.chain_positions(4, 0.5, ChainEmission::Resampled),
+            cell.chain_positions(4, 0.5, ChainEmission::Raw),
+            "segments = 4 lands on the source resolution, so the resample is the identity",
+        );
+        assert_ne!(
+            cell.chain_positions(3, 0.5, ChainEmission::Resampled),
+            cell.chain_positions(3, 0.5, ChainEmission::Raw),
+            "segments = 3 reads back off the 4-segment profile, moving the interior samples",
         );
     }
 
@@ -15468,7 +15675,29 @@ impl ProfileCell {
     /// `profile` (§8.6.4, reducing to the §8.3.6 circular default at `profile =
     /// 0.5`) mapped through the cell. A collinear (flat) corner has no bulge and
     /// falls back to the even straight subdivision of the chord (§8.2.2.1).
-    fn chain_positions(&self, segments: u32, profile: f32, resample_seg2: bool) -> Vec<Vec3> {
+    fn chain_positions(&self, segments: u32, profile: f32, emission: ChainEmission) -> Vec<Vec3> {
+        let raw = self.raw_chain_positions(segments, profile);
+        if self.collinear {
+            return raw;
+        }
+        match emission {
+            ChainEmission::Raw => return raw,
+            ChainEmission::ResampledAtControlResolution if segments != 2 => return raw,
+            _ => {}
+        }
+        let source_segments = boundary_source_resolution(segments);
+        if source_segments == segments {
+            return raw;
+        }
+        let source = self.raw_chain_positions(source_segments, profile);
+        chord_fraction_resample(&raw, &source)
+    }
+
+    /// The chain's raw (un-resampled) `segments + 1` profile samples: the two ring
+    /// boundverts and the `SUPERELLIPSE` cell coordinates between them. This is the
+    /// coarse control chain the fill's centre stencil reads (§8.5.5.5(d)); the emitted
+    /// rim is `chain_positions`' resample of it (§8.2.2.1.1).
+    fn raw_chain_positions(&self, segments: u32, profile: f32) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
         if self.collinear {
@@ -15483,74 +15712,14 @@ impl ProfileCell {
             }
         }
         positions.push(self.end);
-        // §8.2.2.1.1 [V-ADJ] boundary resample: at `segments == 2` the round-over
-        // fill reaches its width by doubling a 2-segment control cage to 4 and
-        // resampling back down *by chord fraction*, not cell angle. On a symmetric
-        // (equal-offset) cell that is the identity, but on the skewed arc-flanking
-        // cross-section (a repositioned arc-start boundvert shortens one leg) it
-        // shifts the single interior sample off the naive 45° point. `resample_seg2`
-        // is set for every vmesh-fill-bounding cross-section (the caller clears it
-        // only for a terminal far end, which has no adjacency fill — §6.7.5.4); the
-        // identity on symmetric cells then leaves every equal-offset strip untouched,
-        // correcting only the skewed arc-flanking cross-sections.
-        if resample_seg2 && segments == 2 && !self.collinear {
-            positions[1] = self.segment2_boundary_resample(profile);
-        }
         positions
     }
 
-    /// §8.2.2.1.1 `segments = 2` chord-fraction resample of the single interior
-    /// sample. Materialise the cross-section at the doubled (4-segment) resolution
-    /// (`Q_0 = start`, `Q_m = S(22.5°·m)`, `Q_4 = end`), take the chord fraction `f`
-    /// of the naive 45° sample along the 2-segment chord `[start, P_1, end]`, and
-    /// read the 4-segment polyline back at chord fraction `f`. Identity on symmetric
-    /// cells (`f = 0.5` lands exactly on `Q_2 = P_1`); the skew pushes `f` toward the
-    /// shorter leg.
+    /// §8.2.2.1.1 at `segments = 2`: the chord-fraction resample of the single interior
+    /// sample against the doubled (4-segment) profile. Identity on a symmetric cell
+    /// (`f = 0.5` lands on `Q_2`); the skew pushes `f` toward the shorter leg.
     fn segment2_boundary_resample(&self, profile: f32) -> Vec3 {
-        let coarse = superellipse_chain(profile, 2);
-        let naive = self.sample(coarse[1].0, coarse[1].1);
-
-        let fine = superellipse_chain(profile, 4);
-        let q = [
-            self.start,
-            self.sample(fine[1].0, fine[1].1),
-            self.sample(fine[2].0, fine[2].1),
-            self.sample(fine[3].0, fine[3].1),
-            self.end,
-        ];
-
-        let to_start = (naive - self.start).length();
-        let to_end = (self.end - naive).length();
-        let chord = to_start + to_end;
-        if chord <= f32::EPSILON {
-            return naive;
-        }
-        let f = to_start / chord;
-
-        let mut g = [0.0f32; 5];
-        for m in 1..5 {
-            g[m] = g[m - 1] + (q[m] - q[m - 1]).length();
-        }
-        let total = g[4];
-        if total <= f32::EPSILON {
-            return naive;
-        }
-        for value in g.iter_mut() {
-            *value /= total;
-        }
-
-        for j in 0..4 {
-            if f <= g[j + 1] || j == 3 {
-                let span = g[j + 1] - g[j];
-                let t = if span <= f32::EPSILON {
-                    0.0
-                } else {
-                    (f - g[j]) / span
-                };
-                return q[j] + (q[j + 1] - q[j]) * t;
-            }
-        }
-        naive
+        self.chain_positions(2, profile, ChainEmission::Resampled)[1]
     }
 
     /// The profile's "height" (BEVEL.md §8.3.3): the span between the cell's
@@ -15559,6 +15728,104 @@ impl ProfileCell {
     fn height(&self) -> f32 {
         (2.0 * self.mid - self.start - self.end).length()
     }
+}
+
+/// How a cross-section chain emits its samples (BEVEL.md §8.2.2.1.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChainEmission {
+    /// The raw profile chain. A terminal far end has no adjacency fill behind it
+    /// (§6.7.5.4), so it consumes the raw samples directly.
+    Raw,
+    /// The chord-fraction resample, run at every `segments` — every ring-edge chain of
+    /// a [V-ADJ] cap that is pinned to the emitted (post-doubling) rim: the outer
+    /// miter's arc, its flanking cross-sections, and its interior-sector strips
+    /// (§8.9.5.1 / §8.9.5.2). No chain-kind test, no skew test.
+    Resampled,
+    /// The resample restricted to the `segments = 2` control resolution. The plain
+    /// junction fills route here: their pinned emission is the seg = 2 one, while at a
+    /// non-power-of-two count the guide's own cube-corner membership invariant
+    /// (§8.5.5.6 (2) — boundverts *and chain samples* lie on the corner superellipsoid)
+    /// cannot hold for an off-profile rim unless the fill re-snaps it, which is not
+    /// stated. Until that is settled these chains keep the pinned seg = 2 behaviour.
+    ResampledAtControlResolution,
+}
+
+/// The source resolution of the §8.2.2.1.1 boundary resample: the round-over fill's
+/// control cage is always 2 segments wide and always doubles at least once, so the
+/// profile is materialised at `next power of two ≥ max(4, segments)` — **not** at
+/// `2·segments`. It equals `segments` exactly at `4, 8, 16, …`, where no down-resample
+/// runs and the emitted chain is the raw chain.
+fn boundary_source_resolution(segments: u32) -> u32 {
+    let mut resolution = 4;
+    while resolution < segments {
+        resolution *= 2;
+    }
+    resolution
+}
+
+/// The normalised chord fractions of a polyline (`0` at the first point, `1` at the
+/// last). `None` for a zero-length polyline, which carries no fractions.
+fn normalised_chord_fractions(points: &[Vec3]) -> Option<Vec<f32>> {
+    let mut fractions = Vec::with_capacity(points.len());
+    let mut travelled = 0.0;
+    fractions.push(0.0);
+    for pair in points.windows(2) {
+        travelled += (pair[1] - pair[0]).length();
+        fractions.push(travelled);
+    }
+    if travelled <= f32::EPSILON {
+        return None;
+    }
+    for fraction in fractions.iter_mut() {
+        *fraction /= travelled;
+    }
+    Some(fractions)
+}
+
+/// Read a polyline at a normalised chord fraction: find the span holding `fraction`
+/// and interpolate linearly within it.
+fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32) -> Vec3 {
+    let last = points.len() - 1;
+    for j in 0..last {
+        if fraction <= fractions[j + 1] || j + 1 == last {
+            let span = fractions[j + 1] - fractions[j];
+            let t = if span <= f32::EPSILON {
+                0.0
+            } else {
+                (fraction - fractions[j]) / span
+            };
+            return points[j] + (points[j + 1] - points[j]) * t;
+        }
+    }
+    points[last]
+}
+
+/// The §8.2.2.1.1 chord-fraction resample: each raw target sample carries a chord
+/// fraction along its **own** polyline, and the emitted sample is the point at that
+/// same fraction along the **source** polyline (the profile materialised at the
+/// doubling resolution). The two endpoints are fixed, so only the interior samples can
+/// move; it is the identity wherever the source polyline already contains the raw
+/// sample at the same fraction, so it is safe to run on every chain unconditionally.
+fn chord_fraction_resample(raw: &[Vec3], source: &[Vec3]) -> Vec<Vec3> {
+    let target_fractions = match normalised_chord_fractions(raw) {
+        Some(fractions) => fractions,
+        None => return raw.to_vec(),
+    };
+    let source_fractions = match normalised_chord_fractions(source) {
+        Some(fractions) => fractions,
+        None => return raw.to_vec(),
+    };
+    let mut emitted = Vec::with_capacity(raw.len());
+    emitted.push(raw[0]);
+    for k in 1..raw.len() - 1 {
+        emitted.push(polyline_at_chord_fraction(
+            source,
+            &source_fractions,
+            target_fractions[k],
+        ));
+    }
+    emitted.push(raw[raw.len() - 1]);
+    emitted
 }
 
 /// A large finite stand-in for the square exponent `r → ∞` (BEVEL.md §8.6.2).
