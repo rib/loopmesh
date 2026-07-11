@@ -597,9 +597,9 @@ impl LoopMesh {
             .map(|(v, _)| *v)
             .collect();
 
-        // Multi-segment cutoff (BEVEL.md §8.2 / §8.3) needs at least one
-        // multi-beveled-edge junction to fill — an all-isolated edge set has no
-        // cutoff corner. The orchestrator itself no-ops on the junction-free case.
+        // The multi-segment orchestrator (BEVEL.md §8.2 / §8.3) drives junctions and
+        // terminals alike: a junction-free edge set simply has no fill to build, and
+        // resolves to the §8.3.0.1 terminal-to-terminal through-strip.
         if options.segments >= 2 {
             self.bevel_edges_cutoff_multisegment(&beveled, &junctions, options, &mut result);
             return result;
@@ -698,35 +698,65 @@ impl LoopMesh {
             .verts
             .extend([strip_a_left, strip_a_right, strip_b_left, strip_b_right]);
 
-        let substitutions = EdgeBevelSubstitutions {
-            a,
-            b,
-            face_left,
-            face_right,
-            strip_a_left,
-            strip_a_right,
-            strip_b_left,
-            strip_b_right,
-            left_other_a,
-            right_other_a,
-            left_other_b,
-            right_other_b,
-        };
+        // §7.4 / §7.6.1: what each incident face's endpoint corner becomes. fL / fR
+        // swap 1-for-1 onto their own strip vert; the surviving third face absorbs
+        // the corner as the 1-for-2 run of both strip verts, ordered so the one
+        // sharing the face's incoming leg comes first (the run is laid down in the
+        // face's winding order, which is what lets the leg re-point read its landing
+        // vert straight off it).
+        let mut substitutions: Vec<FaceSubstitution> = Vec::new();
+        let endpoints = [a, b];
+        let endpoint_frames = [
+            (a, strip_a_left, strip_a_right, left_other_a, right_other_a),
+            (b, strip_b_left, strip_b_right, left_other_b, right_other_b),
+        ];
+        for &(endpoint, strip_left, strip_right, left_other, right_other) in &endpoint_frames {
+            set_face_substitution(&mut substitutions, endpoint, face_left, vec![strip_left]);
+            set_face_substitution(&mut substitutions, endpoint, face_right, vec![strip_right]);
+            for face in self.vert_face_keys(endpoint) {
+                if face == face_left || face == face_right {
+                    continue;
+                }
+                let Some(run) = self.order_third_face_strip(
+                    face,
+                    endpoint,
+                    left_other,
+                    right_other,
+                    strip_left,
+                    strip_right,
+                ) else {
+                    continue;
+                };
+                set_face_substitution(&mut substitutions, endpoint, face, run);
+            }
+        }
+
+        // §6.7.1.1(a′): the third face's absorbed corner is its corner run — a single
+        // cross edge here — flagged iff *both* of that face's endpoint-incident
+        // originals (the terminal's two unbeveled legs) are flagged. Read off the
+        // pristine mesh; applied once the re-stitch has laid the run down (below).
+        let corner_runs = self.snapshot_corner_runs(&substitutions);
+
+        // §6.7.1 mechanism (1): `E`'s own flag rides the two edges the re-stitched
+        // radial faces rebuild along `E`'s two original sides — the strip's two long
+        // edges. Snapshot it before the surgery consumes `E`.
+        let edge_seam = self.edge_seam(edge);
+        let edge_sharp = self.edge_sharp(edge);
 
         // §7.1 item 4 / §7.4: re-stitch every face incident to a or b. fL/fR swap
         // their endpoint corners 1-for-1 (a→aL/aR, b→bL/bR), staying the same
         // size and adopting the strip's near long edge as their new `E` side. Each
         // third face replaces its single endpoint corner with the endpoint's two
-        // strip verts (1-for-2), growing by one side.
+        // strip verts (1-for-2), growing by one side. The four unbeveled legs are
+        // re-pointed in place first, so each keeps its per-edge attributes (§6.5
+        // item 1).
         let mut incident_faces: Vec<FaceKey> = self.vert_face_keys(a);
         for face in self.vert_face_keys(b) {
             if !incident_faces.contains(&face) {
                 incident_faces.push(face);
             }
         }
-        for face in incident_faces {
-            self.restitch_edge_bevel_face(face, &substitutions);
-        }
+        self.restitch_consumed_endpoints(&incident_faces, &endpoints, &[edge], &substitutions);
 
         // §7.1 item 2 / §5.1 winding: build the strip quad over the four strip
         // verts, wound opposite to how fL traverses its new `aL–bL` long edge so
@@ -748,9 +778,42 @@ impl LoopMesh {
         result.faces.push(strip.face);
         result.edges.extend(strip.edges);
 
-        // §7.1 item 5 / §6.3: both endpoints are now loose. Free them.
-        self.free_loose_vertex(a);
-        self.free_loose_vertex(b);
+        // §6.7.1 mechanism (1) / §6.7.5.2, UNCONDITIONAL — not gated by `mark_seam` /
+        // `mark_sharp`, which are inert for an isolated edge (§6.7.3). `E`'s flag rides
+        // **both** outer long edges of its strip (aL–bL flanking fL, aR–bR flanking
+        // fR): those are the two edges the re-stitched radial faces rebuilt along `E`'s
+        // two original sides, so they inherit `E`'s per-edge block exactly as a
+        // re-pointed survivor keeps its own. The two end chords run *across* the strip,
+        // descend from no original edge, and stay clean.
+        if edge_seam || edge_sharp {
+            for (near_a, near_b) in [(strip_a_left, strip_b_left), (strip_a_right, strip_b_right)] {
+                if let Some(long_edge) = self.query_edge_exists(near_a, near_b) {
+                    if edge_seam {
+                        self.set_edge_seam(long_edge, true);
+                    }
+                    if edge_sharp {
+                        self.set_edge_sharp(long_edge, true);
+                    }
+                }
+            }
+        }
+
+        // §6.7.1.1(a′) mechanism (1)'s corner-run half, UNCONDITIONAL: the third
+        // face's absorbed cross edge carries the flag iff both of that terminal's
+        // unbeveled legs carry it. Run after the re-stitch, when the run's verts are
+        // consecutive on the rebuilt face's boundary and so the cross edge exists.
+        self.apply_corner_run_flags(&corner_runs);
+
+        // §7.1 item 5 / §6.3: both endpoints are now loose. Free them. Gated on
+        // looseness rather than asserted: a face the placement pass declined to
+        // substitute (a corner it could not resolve on a malformed fan) is never
+        // rebuilt and so still holds its endpoint — an input shape, not a broken
+        // invariant, so it must not fire the free's assert.
+        for endpoint in [a, b] {
+            if self.vertex_is_loose(endpoint) {
+                self.free_loose_vertex(endpoint);
+            }
+        }
     }
 
     /// Free a beveled endpoint after re-stitch (BEVEL.md §5.1.1 / §6.3). The
@@ -914,7 +977,9 @@ impl LoopMesh {
         // corner for the ordered near-corner vert(s) recorded for that (vertex,
         // face) corner (§7.4 / §7.6.1). A terminal third face swaps its corner for
         // two strip verts (1-for-2); a strip's radial face and every junction
-        // sector face swap for one (1-for-1).
+        // sector face swap for one (1-for-1). Every unbeveled leg is re-pointed in
+        // place onto its near-corner vert first, so it survives the re-stitch with
+        // its per-edge attributes — seam / sharp included (§6.5 item 1).
         let mut incident_faces: Vec<FaceKey> = Vec::new();
         for &endpoint in &endpoints {
             for face in self.vert_face_keys(endpoint) {
@@ -923,9 +988,12 @@ impl LoopMesh {
                 }
             }
         }
-        for face in incident_faces {
-            self.restitch_junction_face(face, &endpoints, &substitutions);
-        }
+        self.restitch_consumed_endpoints(
+            &incident_faces,
+            &endpoints,
+            &beveled_manifold,
+            &substitutions,
+        );
 
         // Phase 3: one strip quad per beveled edge over its four near/far corner
         // verts (§7.1 item 2). §6.6: stamp / inherit each new strip's material.
@@ -1012,13 +1080,6 @@ impl LoopMesh {
         let segments = options.segments;
         let profile = options.profile;
 
-        // §8.3: the cutoff fill needs at least one multi-beveled-edge junction —
-        // an all-isolated / junction-free edge set has no corner to fold, so it is
-        // a clean no-op rather than partial through-strip geometry.
-        if junctions.is_empty() {
-            return;
-        }
-
         let mut beveled_manifold: Vec<EdgeKey> = Vec::new();
         for &edge in beveled {
             if self.edge_radial_iter(edge).count() == 2 {
@@ -1043,10 +1104,12 @@ impl LoopMesh {
             .collect();
 
         // §6.7.5: snapshot each beveled edge's seam / sharp state against the
-        // pristine mesh, keyed by edge, for the multi-segment flag propagation. The
-        // beveled edges survive (re-pointed) so their flags persist, but a pristine
-        // snapshot keeps the bridging decision independent of surgery order — the
-        // same guard the single-segment junction path (§6.7.4) uses.
+        // pristine mesh, keyed by edge, for the multi-segment flag propagation. A
+        // beveled edge does *not* survive its own bevel — both its endpoints are
+        // consumed, so it dies with them (only *unbeveled* legs are re-pointed) and
+        // its flag reaches the strip by mechanism (1)'s inheritance instead. Reading
+        // the flags pristine also keeps the bridging decision independent of surgery
+        // order — the same guard the single-segment junction path (§6.7.4) uses.
         let edge_seam_state: Vec<(EdgeKey, bool, bool)> = beveled_manifold
             .iter()
             .map(|&edge| (edge, self.edge_seam(edge), self.edge_sharp(edge)))
@@ -1163,7 +1226,8 @@ impl LoopMesh {
 
         // Phase 2: re-stitch every incident face once, swapping each consumed
         // endpoint corner for its recorded vert run (§8.3.0.1 absorb / sector
-        // 1-for-1).
+        // 1-for-1), after re-pointing every unbeveled leg onto its near-corner vert
+        // so the leg keeps its per-edge attributes across the bevel (§6.5 item 1).
         let mut incident_faces: Vec<FaceKey> = Vec::new();
         for &endpoint in &endpoints {
             for face in self.vert_face_keys(endpoint) {
@@ -1172,9 +1236,12 @@ impl LoopMesh {
                 }
             }
         }
-        for face in incident_faces {
-            self.restitch_junction_face(face, &endpoints, &face_subst);
-        }
+        self.restitch_consumed_endpoints(
+            &incident_faces,
+            &endpoints,
+            &beveled_manifold,
+            &face_subst,
+        );
 
         // Phase 3: one strip (segments quads) per beveled edge over its two
         // endpoint chains (§8.3.0).
@@ -4017,14 +4084,16 @@ impl LoopMesh {
             if face == face_left || face == face_right {
                 continue;
             }
-            let ordered = self.order_third_face_strip(
+            let Some(ordered) = self.order_third_face_strip(
                 face,
                 vertex,
                 left_other,
                 right_other,
                 strip_left,
                 strip_right,
-            );
+            ) else {
+                continue;
+            };
             set_face_substitution(substitutions, vertex, face, ordered);
         }
     }
@@ -4154,10 +4223,22 @@ impl LoopMesh {
         }
     }
 
-    /// Order a terminal third face's two strip verts so the one sharing the
-    /// face's incoming leg at `vertex` comes first (BEVEL.md §7.4). The third face
-    /// shares the unbeveled leg `left_other` with the strip's left face and
-    /// `right_other` with its right face.
+    /// Order a terminal third face's two strip verts into a [`FaceSubstitution`] run —
+    /// the near-corner vert of the face's *incoming* leg first, of its *outgoing* leg
+    /// last (BEVEL.md §7.4). The third face shares the unbeveled leg `left_other` with
+    /// the strip's left face and `right_other` with its right face, so the only two
+    /// near-corner verts a `segments = 1` terminal has are `strip_left` (on `left_other`)
+    /// and `strip_right` (on `right_other`).
+    ///
+    /// Keyed on **both** corner edges rather than the incoming one alone, so the runs of
+    /// two adjacent faces can never disagree about where a shared leg lands. A face whose
+    /// corner reaches the endpoint along some *other* leg — only possible at a valence-≥4
+    /// terminal, where §7.5 wants an on-edge vert per non-flanking leg that this path does
+    /// not mint — has no near-corner vert to name and so is **declined** (`None`), rather
+    /// than fabricating a run the leg re-point would then read two different landings off.
+    /// (Both `segments = 1` terminal paths gate on valence 3 upstream, so the decline is
+    /// currently unreachable; the multi-segment path mints those verts as its §8.3.0.2
+    /// poly-fan and needs no decline.)
     fn order_third_face_strip(
         &self,
         face: FaceKey,
@@ -4166,24 +4247,18 @@ impl LoopMesh {
         right_other: EdgeKey,
         strip_left: VertexKey,
         strip_right: VertexKey,
-    ) -> Vec<VertexKey> {
-        let cycle_verts = self.face_vert_keys(face);
-        let cycle_length = cycle_verts.len();
-        let index = cycle_verts
-            .iter()
-            .position(|&w| w == vertex)
-            .expect("third face has the endpoint as a corner");
-        let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
-        let incoming_edge = self
-            .query_edge_exists(prev_vertex, vertex)
-            .expect("third face's incoming corner edge exists");
-        if incoming_edge == left_other {
-            vec![strip_left, strip_right]
-        } else if incoming_edge == right_other {
-            vec![strip_right, strip_left]
-        } else {
-            vec![strip_left, strip_right]
-        }
+    ) -> Option<Vec<VertexKey>> {
+        let (incoming, outgoing) = self.face_corner_edges(face, vertex)?;
+        let near_of = |leg: EdgeKey| -> Option<VertexKey> {
+            if leg == left_other {
+                Some(strip_left)
+            } else if leg == right_other {
+                Some(strip_right)
+            } else {
+                None
+            }
+        };
+        Some(vec![near_of(incoming)?, near_of(outgoing)?])
     }
 
     /// The rotational ring of (edge-pair, face) corners around `vertex`: each
@@ -4743,43 +4818,163 @@ impl LoopMesh {
         (length > f32::EPSILON).then(|| segment / length)
     }
 
-    /// Re-stitch one face incident to a consumed endpoint (BEVEL.md §7.4 /
-    /// §7.6.1). Each consumed-endpoint corner of `face` is replaced by the ordered
-    /// near-corner vert(s) recorded for that (vertex, face) corner: one vert for a
-    /// strip's radial face or a junction sector face (1-for-1), two for a terminal
-    /// third face (1-for-2). A corner with no recorded substitution is left as-is.
-    fn restitch_junction_face(
+    /// Re-stitch every face incident to a consumed endpoint (BEVEL.md §7.4 /
+    /// §7.6.1), preserving each surviving unbeveled leg's identity (§6.5 item 1).
+    ///
+    /// Three steps that cannot interleave:
+    ///
+    /// 1. Read each incident face's rebuilt vertex cycle off the *current* mesh —
+    ///    every consumed-endpoint corner replaced by the ordered near-corner vert(s)
+    ///    recorded for that (vertex, face) corner: one vert for a strip's radial face
+    ///    or a miter-free junction sector face (1-for-1), a whole run for a terminal's
+    ///    absorbing face or a mitered sector (1-for-many). A corner with no recorded
+    ///    substitution is left as-is, and a face with no substituted corner is not
+    ///    rebuilt at all.
+    /// 2. Re-point every unbeveled **leg** in place onto the near-corner vert it lands
+    ///    on. The leg then *is* the original edge — same `EdgeKey`, same `edge_attribs`
+    ///    slot — so its per-edge customdata and its seam / sharp bits survive the bevel
+    ///    (§6.5 item 1 / §6.7.1 item 1), and step 3 reuses it rather than minting a
+    ///    blank edge in its place.
+    /// 3. Kill each face and re-create it over its rebuilt cycle, carrying the face's
+    ///    own attributes across.
+    ///
+    /// Step 2 patches the leg's radial loops as well as its disk, so the cycles of
+    /// step 1 must already be in hand when it runs.
+    fn restitch_consumed_endpoints(
         &mut self,
-        face: FaceKey,
+        incident_faces: &[FaceKey],
         endpoints: &[VertexKey],
+        beveled: &[EdgeKey],
         substitutions: &[FaceSubstitution],
     ) {
-        let cycle_verts = self.face_vert_keys(face);
+        let mut rebuilds: Vec<(FaceKey, Vec<VertexKey>)> = Vec::with_capacity(incident_faces.len());
+        for &face in incident_faces {
+            let cycle_verts = self.face_vert_keys(face);
 
-        let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_verts.len() + 1);
-        let mut changed = false;
-        for &w in &cycle_verts {
-            if !endpoints.contains(&w) {
-                new_cycle.push(w);
-                continue;
-            }
-            match face_substitution(substitutions, w, face) {
-                Some(replacement) => {
-                    new_cycle.extend_from_slice(replacement);
-                    changed = true;
+            let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_verts.len() + 1);
+            let mut changed = false;
+            for &w in &cycle_verts {
+                if !endpoints.contains(&w) {
+                    new_cycle.push(w);
+                    continue;
                 }
-                None => new_cycle.push(w),
+                match face_substitution(substitutions, w, face) {
+                    Some(replacement) => {
+                        new_cycle.extend_from_slice(replacement);
+                        changed = true;
+                    }
+                    None => new_cycle.push(w),
+                }
+            }
+
+            if changed {
+                rebuilds.push((face, new_cycle));
             }
         }
 
-        if !changed {
-            return;
+        self.repoint_unbeveled_legs(endpoints, beveled, substitutions, &rebuilds);
+
+        for (face, new_cycle) in rebuilds {
+            self.face_kill(face);
+            let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
+            self.face_attribs
+                .copy_into(new_face.as_usize(), face.as_usize());
+        }
+    }
+
+    /// Re-point each consumed endpoint's unbeveled legs onto their near-corner verts
+    /// (BEVEL.md §6.5 item 1 / §6.7.1 item 1) — the edge-bevel analogue of the vertex
+    /// bevel's [`LoopMesh::repoint_incident_edges`].
+    ///
+    /// A leg's landing vert is read straight off the substitution runs, per the
+    /// [`FaceSubstitution`] run-order contract: a face lays its corner run down in its
+    /// own winding order, so the corner's *incoming* edge meets the run's first vert
+    /// and its *outgoing* edge the run's last. A leg is therefore re-pointed only when
+    /// **every** face on its radial fan has a recorded run and all of them agree on the
+    /// landing vert — the manifold case. Anything else (a face the placement pass
+    /// declined to substitute, a leg whose two sides disagree) declines the re-point and
+    /// leaves the leg to be rebuilt blank, which is no worse than not running this pass
+    /// at all.
+    ///
+    /// That "every radial face has a run" condition is doing two jobs. Besides pinning
+    /// the landing vert, it is the **topological safety property**: `rebuilds` holds
+    /// exactly the faces with a run, so re-pointing only fully-covered legs guarantees
+    /// every face whose loops this pass mutates is killed and re-created straight after
+    /// (see [`FaceSubstitution`]'s safety invariant). The `debug_assert!` below is that
+    /// property, checked.
+    ///
+    /// The absorbed-leg case falls out of the same read: several legs inside one
+    /// junction sector all land on that sector's single boundvert, so they are all
+    /// re-pointed onto it and keep their own attributes.
+    ///
+    /// Scope: a leg whose fan is only *partly* covered keeps the consumed endpoint and
+    /// is rebuilt blank, losing its per-edge attributes. Every path that consumes an
+    /// endpoint covers that endpoint's whole fan, so this is unreachable today — the
+    /// one shape that could produce a partial cover, a valence-≥4 terminal at
+    /// `segments = 1`, is declined wholesale upstream (`place_terminal_strip_verts` /
+    /// `bevel_single_edge` both gate on valence 3), leaving the endpoint alive and its
+    /// legs untouched.
+    fn repoint_unbeveled_legs(
+        &mut self,
+        endpoints: &[VertexKey],
+        beveled: &[EdgeKey],
+        substitutions: &[FaceSubstitution],
+        rebuilds: &[(FaceKey, Vec<VertexKey>)],
+    ) {
+        let mut repoints: Vec<(EdgeKey, VertexKey, VertexKey)> = Vec::new();
+
+        for &vertex in endpoints {
+            for leg in self.iter_disk_edges(vertex) {
+                if beveled.contains(&leg) {
+                    continue;
+                }
+
+                let mut fan_empty = true;
+                let mut landing: Option<VertexKey> = None;
+                for loop_key in self.edge_radial_iter(leg) {
+                    let face = self.loop_face(loop_key);
+                    fan_empty = false;
+                    let candidate = face_substitution(substitutions, vertex, face)
+                        .zip(self.face_corner_edges(face, vertex))
+                        .and_then(|(run, (incoming, outgoing))| {
+                            if leg == incoming {
+                                run.first().copied()
+                            } else if leg == outgoing {
+                                run.last().copied()
+                            } else {
+                                None
+                            }
+                        });
+                    match (candidate, landing) {
+                        (Some(vert), None) => landing = Some(vert),
+                        (Some(vert), Some(agreed)) if vert == agreed => {}
+                        _ => {
+                            landing = None;
+                            break;
+                        }
+                    }
+                }
+
+                if fan_empty {
+                    continue;
+                }
+                if let Some(vert) = landing {
+                    debug_assert!(
+                        self.edge_radial_iter(leg)
+                            .map(|loop_key| self.loop_face(loop_key))
+                            .all(|face| rebuilds.iter().any(|(rebuilt, _)| *rebuilt == face)),
+                        "re-pointing leg {leg:?} would leave a live face with a rewritten corner loop",
+                    );
+                    if !self.edge_vert_keys(leg).contains(&vert) {
+                        repoints.push((leg, vertex, vert));
+                    }
+                }
+            }
         }
 
-        self.face_kill(face);
-        let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-        self.face_attribs
-            .copy_into(new_face.as_usize(), face.as_usize());
+        for (leg, vertex, landing) in repoints {
+            self.edge_replace_vertex_raw(leg, vertex, landing);
+        }
     }
 
     /// Build one beveled edge's strip quad over its four near/far corner verts
@@ -5295,78 +5490,6 @@ impl LoopMesh {
         if sharp {
             bridge(false, self);
         }
-    }
-
-    /// Re-stitch one face incident to a beveled edge's endpoint(s) (BEVEL.md §7.4
-    /// / §7.5). The two radial faces swap each beveled-edge endpoint corner for the
-    /// single matching strip vert (1-for-1); every other face swaps an endpoint
-    /// corner for that endpoint's two strip verts (1-for-2), ordered so the strip
-    /// vert sharing the re-pointed incoming edge stays adjacent to that edge.
-    fn restitch_edge_bevel_face(&mut self, face: FaceKey, sub: &EdgeBevelSubstitutions) {
-        let cycle_verts = self.face_vert_keys(face);
-        let cycle_length = cycle_verts.len();
-
-        let mut new_cycle: Vec<VertexKey> = Vec::with_capacity(cycle_length + 1);
-        for (index, &w) in cycle_verts.iter().enumerate() {
-            if w != sub.a && w != sub.b {
-                new_cycle.push(w);
-                continue;
-            }
-
-            if face == sub.face_left {
-                new_cycle.push(if w == sub.a {
-                    sub.strip_a_left
-                } else {
-                    sub.strip_b_left
-                });
-            } else if face == sub.face_right {
-                new_cycle.push(if w == sub.a {
-                    sub.strip_a_right
-                } else {
-                    sub.strip_b_right
-                });
-            } else {
-                // Third face: replace the corner with both strip verts, ordered so
-                // the one sharing the incoming edge sits next to `prev`.
-                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
-                let incoming_edge = self
-                    .query_edge_exists(prev_vertex, w)
-                    .expect("third face's incoming corner edge exists");
-                let (left_other, right_other, strip_left, strip_right) = if w == sub.a {
-                    (
-                        sub.left_other_a,
-                        sub.right_other_a,
-                        sub.strip_a_left,
-                        sub.strip_a_right,
-                    )
-                } else {
-                    (
-                        sub.left_other_b,
-                        sub.right_other_b,
-                        sub.strip_b_left,
-                        sub.strip_b_right,
-                    )
-                };
-                if incoming_edge == left_other {
-                    new_cycle.push(strip_left);
-                    new_cycle.push(strip_right);
-                } else if incoming_edge == right_other {
-                    new_cycle.push(strip_right);
-                    new_cycle.push(strip_left);
-                } else {
-                    // Defensive: an incident face that is neither radial face nor
-                    // a genuine third face touching one of the shared edges should
-                    // not arise for an isolated valence-3 edge.
-                    new_cycle.push(strip_left);
-                    new_cycle.push(strip_right);
-                }
-            }
-        }
-
-        self.face_kill(face);
-        let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
-        self.face_attribs
-            .copy_into(new_face.as_usize(), face.as_usize());
     }
 
     /// Build the strip quad over the four strip verts in the cyclic order
@@ -6492,8 +6615,27 @@ struct OuterMiterJunction {
 /// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
 /// §7.6.1): the ordered near-corner vert(s) the re-stitch substitutes for the
 /// single corner vertex `vertex` on `face`. One vert for a 1-for-1 swap (a strip's
-/// radial face or a junction sector face), two for a terminal third face's
-/// 1-for-2 absorbed corner.
+/// radial face or a junction sector face), two or more for an absorbed corner run
+/// (a terminal third face, a junction's multi-face sector, a `segments ≥ 2` chain).
+///
+/// **Run-order contract — every producer must honour it.** A run is recorded in
+/// `face`'s own winding order: the corner's **incoming** edge (the one arriving at
+/// `vertex` in the face's loop traversal) meets `verts.first()`, and its **outgoing**
+/// edge meets `verts.last()`. `repoint_unbeveled_legs` reads each leg's landing vert
+/// straight off that ordering, so a producer that lays a run down backwards silently
+/// re-points the legs onto the wrong near-corner verts.
+///
+/// **Safety invariant — a recorded run is a promise the face gets rebuilt.** A face
+/// with a run always substitutes at least one corner, so `restitch_consumed_endpoints`
+/// always sees `changed` for it and rebuilds it. `repoint_unbeveled_legs` relies on
+/// that: it re-points a leg's disk *and radial loops* onto the landing vert, which
+/// deliberately leaves each corner loop inconsistent (the loop's `vertex` is rewritten
+/// while its `edge` still names the consumed endpoint) — harmless only because
+/// `face_kill` keys on `loop.edge` and every such face is killed moments later. A
+/// producer that recorded a run for a face which then failed the `changed` test would
+/// strand a live, corrupted face; the `debug_assert!` in `repoint_unbeveled_legs`
+/// guards exactly that. A face a producer *declines* to substitute is fine — the
+/// decline propagates to the legs, which then keep the consumed endpoint too.
 struct FaceSubstitution {
     vertex: VertexKey,
     face: FaceKey,
@@ -6805,25 +6947,6 @@ fn point_in_wedge(dir_one: Vec3, dir_two: Vec3, dir_projected: Vec3, normal: Vec
 struct StripQuad {
     face: FaceKey,
     edges: Vec<EdgeKey>,
-}
-
-/// The per-edge frame an edge bevel's re-stitch reads: the beveled edge, its two
-/// endpoints, its two radial faces, the four strip verts, and each radial face's
-/// non-`E` edge at each endpoint (BEVEL.md §7.4). Captured against the pristine
-/// local geometry before any face is cut (§7.5).
-struct EdgeBevelSubstitutions {
-    a: VertexKey,
-    b: VertexKey,
-    face_left: FaceKey,
-    face_right: FaceKey,
-    strip_a_left: VertexKey,
-    strip_a_right: VertexKey,
-    strip_b_left: VertexKey,
-    strip_b_right: VertexKey,
-    left_other_a: EdgeKey,
-    right_other_a: EdgeKey,
-    left_other_b: EdgeKey,
-    right_other_b: EdgeKey,
 }
 
 #[cfg(test)]
@@ -12211,15 +12334,15 @@ mod tests {
         assert_eq!(counts(&mesh), before, "segments≥2 vertex bevel is a no-op");
     }
 
-    /// BEVEL.md §8.3: the cutoff fill needs at least one multi-beveled-edge
-    /// junction. A `segments ≥ 2`, `Cutoff` call over a junction-free edge set
-    /// (here two disjoint, non-shared cube edges) is a clean no-op — it must not
-    /// emit partial through-strip geometry.
+    /// BEVEL.md §8.3.0.1: a junction-free `segments ≥ 2` edge set has no corner to
+    /// fold, but it is *not* inert — each isolated edge still sheds its
+    /// terminal-to-terminal through-strip, absorbed at both ends by the surviving
+    /// third face. Two disjoint cube edges at `segments = 2` each contribute
+    /// +4 V / +6 E / +2 F (six chain verts, two consumed endpoints; two strip quads).
     #[test]
-    fn cutoff_no_junction_is_noop() {
+    fn junction_free_multisegment_builds_through_strips() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        let before = counts(&mesh);
 
         // Two disjoint edges with no shared endpoint: every endpoint is terminal,
         // so there is no junction for the cutoff to fold.
@@ -12241,10 +12364,17 @@ mod tests {
             },
         );
 
-        assert_eq!(counts(&mesh), before, "junction-free cutoff is a no-op");
-        assert!(result.verts.is_empty(), "no new verts");
-        assert!(result.edges.is_empty(), "no new edges");
-        assert!(result.faces.is_empty(), "no new faces");
+        assert_eq!(
+            counts(&mesh),
+            (16, 24, 10),
+            "two isolated edges each shed a 2-quad through-strip",
+        );
+        assert_eq!(
+            result.verts.len(),
+            12,
+            "three chain verts per terminal, four terminals",
+        );
+        assert_eq!(result.faces.len(), 4, "two strip quads per beveled edge");
         mesh.validate_topology();
     }
 
@@ -15775,6 +15905,385 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Mechanism (1) on the lone (non-junction) beveled edge and its legs ----
+    //
+    // Cube corner `v0 = (1,-1,-1)`; the beveled edge `E = {v0, v1}` runs along −X at
+    // `y = z = −1`, flanked by the front (`z = −1`) and bottom (`y = −1`) faces. `v0`'s
+    // two unbeveled legs are `{v0, v3}` (to `(1,1,-1)`, in the front face) and
+    // `{v0, v4}` (to `(1,-1,1)`, in the bottom face); the surviving third face at `v0`
+    // is the `x = 1` side, which absorbs the terminal (BEVEL.md §7.5 / §8.3.0.1).
+
+    fn seamed_edges(mesh: &LoopMesh) -> Vec<EdgeKey> {
+        mesh.edge_keys()
+            .into_iter()
+            .filter(|&e| mesh.edge_seam(e))
+            .collect()
+    }
+
+    fn sharp_edges(mesh: &LoopMesh) -> Vec<EdgeKey> {
+        mesh.edge_keys()
+            .into_iter()
+            .filter(|&e| mesh.edge_sharp(e))
+            .collect()
+    }
+
+    fn flag_vert_at(mesh: &LoopMesh, position: Vec3) -> VertexKey {
+        mesh.vert_keys()
+            .into_iter()
+            .find(|&v| (mesh.vertex_position(v) - position).length() < 1.0e-3)
+            .unwrap_or_else(|| panic!("a vert sits at {position:?}"))
+    }
+
+    /// BEVEL.md §6.7.5.2: a beveled edge's flag rides **both** outer longitudinal
+    /// edges of its strip — the two the re-stitched adjacent faces rebuilt along `E`'s
+    /// original sides — at *every* `segments`, junction or not. Mechanism (1) is
+    /// unconditional, so this fires with `mark_seam` / `mark_sharp` off (they are inert
+    /// for a lone edge, §6.7.3). The end chords across the strip descend from no
+    /// original edge and stay clean.
+    #[test]
+    fn lone_beveled_edge_flag_rides_both_outer_longitudinal_edges() {
+        for segments in [1u32, 2, 3] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let beveled = cube_edge(
+                &mesh,
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+            );
+            mesh.set_edge_seam(beveled, true);
+            mesh.set_edge_sharp(beveled, true);
+
+            mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            let seams = seamed_edges(&mesh);
+            assert_eq!(
+                seams.len(),
+                2,
+                "segments={segments}: both outer longitudinal edges seamed, nothing else",
+            );
+            assert_eq!(
+                sharp_edges(&mesh).len(),
+                2,
+                "segments={segments}: the sharp bit runs the identical copy",
+            );
+            for seam in seams {
+                let [p, q] = mesh.edge_vert_keys(seam);
+                let span = (mesh.vertex_position(p).x - mesh.vertex_position(q).x).abs();
+                assert!(
+                    span > 1.9,
+                    "segments={segments}: a flagged edge runs the strip's whole length, not across it",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §6.5 item 1 / §6.7.1 item 1: an unbeveled leg *survives* an edge bevel
+    /// — it is re-pointed onto its near-corner vert, keeping the same `EdgeKey` and so
+    /// its whole per-edge attribute block, seam / sharp bits included. Pinned on the
+    /// terminal path (a lone beveled edge) at every `segments`.
+    #[test]
+    fn unbeveled_leg_keeps_its_flags_and_identity_across_a_terminal() {
+        for segments in [1u32, 2, 3] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let beveled = cube_edge(
+                &mesh,
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+            );
+            let leg = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+            let untouched = cube_edge(&mesh, Vec3::new(-1.0, 1.0, -1.0), Vec3::new(-1.0, 1.0, 1.0));
+            mesh.set_edge_seam(leg, true);
+            mesh.set_edge_sharp(leg, true);
+
+            mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(
+                seamed_edges(&mesh),
+                vec![leg],
+                "segments={segments}: the seam stays on the same leg edge, and spreads nowhere",
+            );
+            assert_eq!(
+                sharp_edges(&mesh),
+                vec![leg],
+                "segments={segments}: same for sharp",
+            );
+
+            let far = flag_vert_at(&mesh, Vec3::new(1.0, -1.0, 1.0));
+            let near = flag_vert_at(&mesh, Vec3::new(1.0, -1.0, -0.75));
+            assert_eq!(
+                mesh.query_edge_exists(near, far),
+                Some(leg),
+                "segments={segments}: the leg is re-pointed onto the bottom-side strip vert",
+            );
+            assert!(
+                !mesh.edge_seam(untouched) && !mesh.edge_sharp(untouched),
+                "segments={segments}: a far edge is untouched",
+            );
+        }
+    }
+
+    /// BEVEL.md §6.7.1.1(a′) / §6.7.5.4 (terminal bullet): the terminal's absorbing
+    /// face runs its far-end cross-section chain against the terminal's **two unbeveled
+    /// legs** — the chain is flagged iff *both* legs are flagged. Positive arm: both
+    /// legs seamed, so the absorbed cross edge joins them, giving three seamed edges.
+    /// Unconditional — `mark_seam` is off here.
+    #[test]
+    fn terminal_absorbed_corner_flags_cross_edge_when_both_legs_flagged() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let beveled = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let front_leg = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let bottom_leg = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        mesh.set_edge_seam(front_leg, true);
+        mesh.set_edge_seam(bottom_leg, true);
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let cross = mesh
+            .query_edge_exists(
+                flag_vert_at(&mesh, Vec3::new(1.0, -0.75, -1.0)),
+                flag_vert_at(&mesh, Vec3::new(1.0, -1.0, -0.75)),
+            )
+            .expect("the absorbing face's corner run is a single cross edge");
+        assert!(mesh.edge_seam(cross), "both legs flagged ⇒ the AND passes");
+        assert_eq!(
+            seamed_edges(&mesh).len(),
+            3,
+            "the two re-pointed legs plus the one absorbed cross edge",
+        );
+    }
+
+    /// The negative arm of the same AND (BEVEL.md §6.7.1.1(b)): **one** flagged leg
+    /// leaves the terminal's absorbed cross edge clean — the corner run is stamped from
+    /// one flanking owner and suppressed unless the other agrees. This is what
+    /// distinguishes the contiguity AND from a raw leading-owner copy.
+    #[test]
+    fn terminal_absorbed_corner_leaves_cross_edge_clean_when_one_leg_flagged() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let beveled = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let bottom_leg = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        mesh.set_edge_seam(bottom_leg, true);
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let cross = mesh
+            .query_edge_exists(
+                flag_vert_at(&mesh, Vec3::new(1.0, -0.75, -1.0)),
+                flag_vert_at(&mesh, Vec3::new(1.0, -1.0, -0.75)),
+            )
+            .expect("the absorbing face's corner run is a single cross edge");
+        assert!(!mesh.edge_seam(cross), "one flagged leg ⇒ the AND fails");
+        assert_eq!(
+            seamed_edges(&mesh),
+            vec![bottom_leg],
+            "the flagged leg alone stays flagged; nothing new is",
+        );
+    }
+
+    /// The same leg preservation on the **junction** path (BEVEL.md §7.6.1: an absorbed
+    /// leg is re-pointed onto its sector's boundvert). Bevel two edges of cube corner
+    /// `v0` and flag its one remaining leg: the leg survives the junction re-stitch with
+    /// its flags, and flags nothing else — the beveled edges carry no flag here, so
+    /// mechanism (1)'s longitudinal half has nothing to copy and mechanism (2) has no
+    /// gap to bridge.
+    #[test]
+    fn unbeveled_leg_keeps_its_flags_across_a_junction() {
+        for segments in [1u32, 2] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let first = cube_edge(
+                &mesh,
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+            );
+            let second = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+            let leg = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+            mesh.set_edge_seam(leg, true);
+            mesh.set_edge_sharp(leg, true);
+
+            mesh.bevel(
+                &[first.into(), second.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    mark_seam: true,
+                    mark_sharp: true,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(
+                seamed_edges(&mesh),
+                vec![leg],
+                "segments={segments}: the absorbed leg keeps its seam and spreads none",
+            );
+            assert_eq!(
+                sharp_edges(&mesh),
+                vec![leg],
+                "segments={segments}: same for sharp",
+            );
+            let far = flag_vert_at(&mesh, Vec3::new(1.0, -1.0, 1.0));
+            let [p, q] = mesh.edge_vert_keys(leg);
+            assert!(
+                p == far || q == far,
+                "segments={segments}: the leg still runs to its far endpoint",
+            );
+        }
+    }
+
+    // ---- The valence-≥4 terminal: its *middle* leg (the one flanking neither radial
+    // face of the beveled edge) is the leg BEVEL.md §7.5 gives an on-edge vert to. The
+    // bipyramid's rim verts are valence-4, so beveling one rim edge puts a valence-4
+    // terminal at each of its ends: at `R1` the flanking legs are `A–R1` / `B–R1` and
+    // the middle leg is the next rim edge `R1–R2`.
+
+    fn bipyramid_rim_edge(mesh: &LoopMesh, rim: &[VertexKey; 8], k: usize) -> EdgeKey {
+        mesh.query_edge_exists(rim[k], rim[(k + 1) % 8])
+            .expect("the bipyramid's rim edge exists")
+    }
+
+    /// BEVEL.md §8.3.0.2: at `segments ≥ 2` the valence-≥4 terminal builds its poly-fan,
+    /// minting an on-edge vert per non-flanking leg — so the middle leg has a landing to
+    /// be re-pointed onto and survives with its `EdgeKey`, and so its whole per-edge
+    /// attribute block (§6.5 item 1).
+    #[test]
+    fn terminal_valence_four_middle_leg_keeps_its_flags_and_identity() {
+        for segments in [2u32, 3] {
+            let (mut mesh, _apex, rim, _apex_leg) = octagonal_bipyramid_all_legs();
+            let beveled = bipyramid_rim_edge(&mesh, &rim, 0);
+            let middle = bipyramid_rim_edge(&mesh, &rim, 1);
+            mesh.set_edge_seam(middle, true);
+            mesh.set_edge_sharp(middle, true);
+            let offset = 0.2;
+            let leg_direction =
+                (mesh.vertex_position(rim[2]) - mesh.vertex_position(rim[1])).normalize();
+            let landing = mesh.vertex_position(rim[1]) + leg_direction * offset;
+
+            mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(
+                seamed_edges(&mesh),
+                vec![middle],
+                "segments={segments}: the middle leg keeps its seam, and nothing else gains one",
+            );
+            assert_eq!(
+                sharp_edges(&mesh),
+                vec![middle],
+                "segments={segments}: same for sharp",
+            );
+            let [p, q] = mesh.edge_vert_keys(middle);
+            assert!(
+                p == rim[2] || q == rim[2],
+                "segments={segments}: the leg still runs to its far rim vert",
+            );
+            let near = if p == rim[2] { q } else { p };
+            assert!(
+                (mesh.vertex_position(near) - landing).length() < 1.0e-4,
+                "segments={segments}: the leg is re-pointed onto its poly-fan on-edge vert",
+            );
+        }
+    }
+
+    /// The `segments = 1` counterpart, pinning the **scope of the §7.5 stub**: the
+    /// single-segment terminal close only implements the valence-3 absorb, so a
+    /// valence-≥4 terminal is declined *wholesale* — the endpoint is never consumed, no
+    /// corner run is recorded for any of its faces, and the whole edge is left alone.
+    /// The middle leg therefore keeps its flags trivially (it is never re-stitched), and
+    /// the leg re-point never sees a fan whose faces disagree about where it lands. This
+    /// is a stub, not a mesh: when §7.5's on-edge-vert fill lands here, this test should
+    /// change to the re-pointed assertions of the multi-segment case above.
+    #[test]
+    fn terminal_valence_four_at_segments_one_declines_whole_edge() {
+        let (mut mesh, _apex, rim, _apex_leg) = octagonal_bipyramid_all_legs();
+        let beveled = bipyramid_rim_edge(&mesh, &rim, 0);
+        let middle = bipyramid_rim_edge(&mesh, &rim, 1);
+        mesh.set_edge_seam(middle, true);
+        mesh.set_edge_sharp(middle, true);
+        let before = counts(&mesh);
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert!(
+            result.verts.is_empty() && result.faces.is_empty(),
+            "the valence-≥4 terminal close is a §7.5 stub: the bevel declines the edge",
+        );
+        assert_eq!(counts(&mesh), before, "and leaves the mesh untouched");
+        assert_eq!(
+            seamed_edges(&mesh),
+            vec![middle],
+            "so the middle leg keeps its seam",
+        );
+        assert_eq!(sharp_edges(&mesh), vec![middle], "and its sharp");
+        let [p, q] = mesh.edge_vert_keys(middle);
+        assert!(
+            (p == rim[1] && q == rim[2]) || (p == rim[2] && q == rim[1]),
+            "and its original endpoints",
+        );
     }
 }
 
