@@ -1326,47 +1326,49 @@ impl LoopMesh {
             &edge_seam_state,
         );
 
-        // Phase 4.25b (§6.7.1.1(a′) mechanism (1)'s corner-run half, UNCONDITIONAL):
-        // every rebuilt original face's corner run carries the flag iff **both** of
-        // that face's endpoint-incident original edges carry it. One pass, no case
-        // analysis: a miter-free sector's run is a lone boundvert and flags nothing, a
-        // mitered sector's run is the miter fill chain (flagged when both flanking
-        // beveled edges are), a multi-face reflex sector's absorbed legs break the AND
-        // on every face that owns a fill edge, and a terminal's absorbing face runs the
-        // far-end cross-section chain against its two unbeveled legs.
-        self.apply_corner_run_flags(&corner_runs);
-
         // Phase 4.5 (§6.7.5.3 mechanism (2), gated by `mark_seam` / `mark_sharp`):
-        // bridge each junction's unseamed-gap beveled edge as a **run of `segments`
-        // outermost-ring cross-section edges** — the whole profile chain spanning
-        // that gap edge, not the single patch segment of the `segments = 1` case. The
-        // gap criterion is verbatim §6.7.4. Both the plain cutoff / adj junction fills
-        // (`junction_cuts`) and the **reflex outer miter** junctions
-        // (`outer_miter_junctions`, §6.7.5.4 case (4)) bridge — the walk is indexed on
-        // beveled edges, so the miter's reflex-arc re-stitch leaves the bunch-side gap
-        // run in registration. Terminals and the miter fill itself stay inert.
+        // bridge each junction's gap as a run of outermost-ring chains, counting the
+        // gap's length in **beveled edges** but stepping it out in **ring boundverts**
+        // (§6.7.5.4 case (5)). Both the plain cutoff / adj junction fills
+        // (`junction_cuts`, one boundvert per sector — count and steps in registration)
+        // and the **reflex outer miter** junctions (`outer_miter_junctions`, whose split
+        // sector carries `+1` / `+2` boundverts and so costs a crossing span extra
+        // steps) run the same walk over their own ring. Terminals stay inert.
+        //
+        // This runs **before** the corner-run pass below, which assigns: a step burned
+        // on a split sector's fill chain is a step written here and cleared there.
         if options.mark_seam || options.mark_sharp {
             for cut in &junction_cuts {
+                let ring = cut.ring_chains(&chains);
                 self.bridge_junction_flags_multisegment(
-                    cut.vertex,
-                    &cut.opening_edges,
-                    &chains,
+                    &ring,
                     &edge_seam_state,
                     options.mark_seam,
                     options.mark_sharp,
                 );
             }
             for omj in &outer_miter_junctions {
+                let ring = omj.ring_chains();
                 self.bridge_junction_flags_multisegment(
-                    omj.vertex,
-                    &omj.opening_edges,
-                    &chains,
+                    &ring,
                     &edge_seam_state,
                     options.mark_seam,
                     options.mark_sharp,
                 );
             }
         }
+
+        // Phase 4.6 (§6.7.1.1(a′) mechanism (1)'s corner-run half, UNCONDITIONAL):
+        // every rebuilt original face's corner run carries the flag iff **both** of
+        // that face's endpoint-incident original edges carry it. One pass, no case
+        // analysis: a miter-free sector's run is a lone boundvert and flags nothing, a
+        // mitered sector's run is the miter fill chain (flagged when both flanking
+        // beveled edges are), a multi-face reflex sector's absorbed legs break the AND
+        // on every face that owns a fill edge, and a terminal's absorbing face runs the
+        // far-end cross-section chain against its two unbeveled legs. The pass
+        // **assigns**, so a FALSE AND also *clears* — including any mark a desynced
+        // phase-4.5 span left on a fill chain.
+        self.apply_corner_run_flags(&corner_runs);
 
         // Phase 5: free each consumed endpoint that the strip build actually left
         // loose (§5.1.1). On a closed solid a terminal endpoint can remain incident
@@ -2966,10 +2968,7 @@ impl LoopMesh {
             boundverts: ring,
             chains: ring_chains,
             raw_coarse_mids,
-            // Disk-order beveled edges (one per sector) — the reflex sector's own
-            // opening edge included; the bridge treats it like any other and, being a
-            // seam flank rather than a gap, never bridges into the reflex arc.
-            opening_edges: sectors.iter().map(|s| s.bounding_edges[0]).collect(),
+            cross_edges: cross_edge,
             segments,
         });
         true
@@ -5223,11 +5222,10 @@ impl LoopMesh {
             else {
                 continue;
             };
+            // A FALSE AND is recorded too, and matters: the pass **assigns**, so a
+            // false run *clears* its corner segments (§6.7.5.4 case (5)'s write order).
             let seam = self.edge_seam(incoming) && self.edge_seam(outgoing);
             let sharp = self.edge_sharp(incoming) && self.edge_sharp(outgoing);
-            if !seam && !sharp {
-                continue;
-            }
             runs.push(CornerRun {
                 verts: substitution.verts.clone(),
                 seam,
@@ -5244,18 +5242,23 @@ impl LoopMesh {
     /// a rebuilt face's boundary and so the corner segments exist. A run of `> 1`
     /// segment (a miter fill chain, a terminal's far-end chain) is flagged all or
     /// nothing: the AND is evaluated once per face, not once per segment.
+    ///
+    /// The pass **assigns**, it does not accumulate — a face whose AND is FALSE clears
+    /// its whole corner run. That is what makes a desynchronised ring walk (§6.7.5.4
+    /// case (5)) observable as *missing* bridge edges rather than misplaced ones: the
+    /// steps such a span burns land on a split sector's fill chain, which is that
+    /// sector's rebuilt face's corner run, so this pass — which runs **after** the walk
+    /// — wipes them again. Only corner segments are assigned; a rebuilt face's
+    /// longitudinal boundary edges take their own original's flag from the per-edge
+    /// copy and are untouched here.
     fn apply_corner_run_flags(&mut self, runs: &[CornerRun]) {
         for run in runs {
             for pair in run.verts.windows(2) {
                 let Some(segment) = self.query_edge_exists(pair[0], pair[1]) else {
                     continue;
                 };
-                if run.seam {
-                    self.set_edge_seam(segment, true);
-                }
-                if run.sharp {
-                    self.set_edge_sharp(segment, true);
-                }
+                self.set_edge_seam(segment, run.seam);
+                self.set_edge_sharp(segment, run.sharp);
             }
         }
     }
@@ -5403,39 +5406,64 @@ impl LoopMesh {
     /// as **runs of `segments` outermost-ring cross-section edges** (BEVEL.md
     /// §6.7.5.3), gated by `mark_seam` / `mark_sharp`.
     ///
-    /// The gap criterion is verbatim §6.7.4: walk the junction's beveled edges in
-    /// disk order (`opening_edges[k] = g_k`, the edge opening sector `k`); a *gap* is
-    /// a maximal run of consecutive *unseamed* beveled edges flanked on both sides by
-    /// a seamed one. A junction with all beveled edges seamed, none seamed, or only
-    /// one seamed has no gap and bridges nothing. Where the single-segment rule
-    /// flagged the *one* direct patch segment spanning each gap edge, this flags
-    /// **every** cross-section edge of that gap edge's outermost-ring profile chain —
-    /// the whole run `(P_0,P_1) … (P_(segments−1),P_segments)` (§6.7.5.1). Only the
-    /// patch-boundary chain (ring index 0) is touched; the interior vmesh rings that
-    /// close the corner (§8.5) are never flagged, since they are not this chain.
+    /// The gap criterion follows §6.7.4: a *gap* is a maximal run of consecutive
+    /// *unseamed* beveled edges flanked on both sides by a seamed one. A junction with
+    /// all beveled edges seamed, none seamed, or only one seamed has no gap and bridges
+    /// nothing. Where the single-segment rule flagged the *one* direct patch segment
+    /// spanning each gap edge, this flags **every** cross-section edge of the
+    /// outermost-ring profile chain it steps onto — the whole run `(P_0,P_1) …
+    /// (P_(segments−1),P_segments)` (§6.7.5.1). Only the patch-boundary chain (ring
+    /// index 0) is touched; the interior vmesh rings that close the corner (§8.5) are
+    /// never flagged, since they are not this chain.
     ///
-    /// The chain spanning `g_m = opening_edges[m]` at this junction is the one keyed
-    /// by `(edge = g_m, endpoint = vertex)` — the §8.3.0 chain the build laid between
-    /// `g_m`'s two flanking boundverts `B_(m−1)` and `B_m`. `seam` and `sharp` run the
-    /// identical walk on independent bits.
+    /// **The walk counts in beveled edges but steps in ring boundverts** (§6.7.5.4 case
+    /// (5)), and the two indexings coincide only while the ring carries one boundvert
+    /// per sector. `ring` is the junction's outermost ring as the cyclic run of chains
+    /// the walk steps over: a chain that crosses a beveled edge carries that edge in
+    /// `cross_edge`, a **miter fill chain** carries `None`. A fill chain is therefore
+    /// *stepped over* like any other chain but never *counted* — which is precisely the
+    /// desynchronisation: a span whose ring path enters a split sector burns steps on
+    /// that sector's fill chain and comes up short at its far end, leaving the last gap
+    /// edge's own chain unflagged. An absorbed unbeveled leg, by contrast, inserts no
+    /// ring vertex and so adds no chain: it keeps the walk in registration.
     ///
-    /// The walk is indexed on **beveled edges** (`opening_edges`), never on raw ring
-    /// boundverts, so it is identical whether the junction is a plain cutoff fill or a
-    /// **reflex outer miter** (§6.7.5.4 case (4)): each gap edge's *own* cross-section
-    /// chain is flagged, so an absorbed unbeveled leg contributes no `opening_edges`
-    /// entry (it is stepped over, not counted) and the outer miter's inserted
-    /// reflex-arc boundverts never fall in a flagged span (the bunch is the `< 180°`
-    /// complement of the reflex sector, so every gap's short arc stays bunch-side).
+    /// The operational walk, per flagged beveled edge `e`:
+    ///
+    /// - scan forward in disk order counting the **unflagged beveled** edges passed,
+    ///   and stop at the next **flagged beveled** edge;
+    /// - if that scan comes back round to `e` itself, `e` is the disk's only flagged
+    ///   edge: there is no gap, record nothing (without this, a single-flagged-edge
+    ///   junction would flag nearly its whole ring);
+    /// - otherwise flag the next `m` ring chains starting at `e`'s **trailing
+    ///   boundvert** — the ring vert its own chain ends on, i.e. the boundvert of the
+    ///   sector the walk is about to enter.
+    ///
+    /// `seam` and `sharp` run the identical walk on independent bits.
+    ///
+    /// **Scope: the walk sees beveled edges only.** Both its counting test and its
+    /// delimiter test read `edge_seam_state`, which is snapshotted over the beveled
+    /// edges alone, so an unbeveled leg is invisible to it — it neither counts nor
+    /// delimits, and it contributes no ring chain to step over. That coincides with the
+    /// general §6.7.5.3 rule exactly while legs are *unflagged*, which is all this row
+    /// covers. The **flagged unbeveled leg** case — where such a leg delimits a gap
+    /// even though it is never counted, and the span then starts at the ring vertex the
+    /// leg re-points onto rather than at a beveled edge's trailing boundvert — is
+    /// **deferred to its own row** ("flagged unbeveled leg at a junction / terminal")
+    /// and is *not* implemented here.
+    ///
+    /// The marks this lays on a fill chain do not survive: the fill chain is the split
+    /// sector's rebuilt face's corner run, and the corner-run pass runs **after** this
+    /// one and **assigns** (§6.7.1.1(a′)), so it clears them again unless its own AND
+    /// independently passes. A desync is thus observable as *missing* bridge edges,
+    /// never as misplaced ones.
     fn bridge_junction_flags_multisegment(
         &mut self,
-        vertex: VertexKey,
-        opening_edges: &[EdgeKey],
-        chains: &[EdgeEndChain],
+        ring: &[RingChain],
         edge_seam_state: &[(EdgeKey, bool, bool)],
         seam: bool,
         sharp: bool,
     ) {
-        let count = opening_edges.len();
+        let count = ring.len();
         if count < 2 {
             return;
         }
@@ -5448,36 +5476,43 @@ impl LoopMesh {
         };
 
         let mut bridge = |want_seam: bool, this: &mut Self| {
-            let seamed = |k: usize| flag_of(opening_edges[k], want_seam);
+            let is_anchor = |index: usize| -> bool {
+                ring[index]
+                    .cross_edge
+                    .is_some_and(|edge| flag_of(edge, want_seam))
+            };
 
-            let seamed_count = (0..count).filter(|&k| seamed(k)).count();
-            // A gap needs a seamed edge on each side: at least two seamed edges and
-            // at least one unseamed edge (identical to `segments = 1`, §6.7.4).
-            if seamed_count < 2 || seamed_count == count {
-                return;
-            }
-
-            // Every maximal unseamed run on the cyclic disk is then flanked by a
-            // seamed edge on both sides, so every unseamed beveled edge is a gap edge:
-            // bridge its whole outermost-ring profile chain (`segments` edges).
-            for m in 0..count {
-                if seamed(m) {
+            for anchor in 0..count {
+                if !is_anchor(anchor) {
                     continue;
                 }
-                let gap_edge = opening_edges[m];
-                let Some(chain) = chains
-                    .iter()
-                    .find(|c| c.edge == gap_edge && c.endpoint == vertex)
-                else {
+
+                let mut gap_length = 0usize;
+                let mut delimited_by_another_anchor = false;
+                for step in 1..=count {
+                    let index = (anchor + step) % count;
+                    match ring[index].cross_edge {
+                        Some(edge) if flag_of(edge, want_seam) => {
+                            delimited_by_another_anchor = index != anchor;
+                            break;
+                        }
+                        Some(_) => gap_length += 1,
+                        None => {}
+                    }
+                }
+                if !delimited_by_another_anchor {
                     continue;
-                };
-                let samples = chain.samples();
-                for pair in samples.windows(2) {
-                    if let Some(cross) = this.query_edge_exists(pair[0], pair[1]) {
-                        if want_seam {
-                            this.set_edge_seam(cross, true);
-                        } else {
-                            this.set_edge_sharp(cross, true);
+                }
+
+                for step in 1..=gap_length {
+                    let index = (anchor + step) % count;
+                    for pair in ring[index].samples.windows(2) {
+                        if let Some(cross) = this.query_edge_exists(pair[0], pair[1]) {
+                            if want_seam {
+                                this.set_edge_seam(cross, true);
+                            } else {
+                                this.set_edge_sharp(cross, true);
+                            }
                         }
                     }
                 }
@@ -6531,6 +6566,18 @@ impl EdgeEndChain {
     }
 }
 
+/// One chain of a junction's outermost boundvert ring, in ring order — the unit the
+/// §6.7.5.3 seam / sharp walk steps over (BEVEL.md §6.7.5.4 case (5)).
+///
+/// A chain either crosses a beveled edge (a strip cross-section, `cross_edge =
+/// Some`) or fills a **split** sector (a miter fill chain, `cross_edge = None`). The
+/// walk counts only the former but steps over both, which is exactly why a span whose
+/// ring path enters a split sector desynchronises.
+struct RingChain {
+    cross_edge: Option<EdgeKey>,
+    samples: Vec<VertexKey>,
+}
+
 /// One multi-edge junction's cutoff-fill data (BEVEL.md §8.3): its ordered
 /// boundvert ring, the per-sector opening beveled edge, and the outward surface
 /// normal that orients the down-push (§8.3.3).
@@ -6546,6 +6593,28 @@ struct JunctionCut {
 }
 
 impl JunctionCut {
+    /// The junction's outermost ring as the §6.7.5.3 walk's chain sequence. Every
+    /// sector carries exactly one boundvert here (no miter splits it), so every ring
+    /// chain crosses a beveled edge and the walk's count and its steps stay in
+    /// registration: `B_i → B_(i+1)` is crossed by `g_(i+1)`.
+    fn ring_chains(&self, chains: &[EdgeEndChain]) -> Vec<RingChain> {
+        let count = self.boundverts.len();
+        (0..count)
+            .map(|i| {
+                let cross_edge = self.opening_edges[(i + 1) % count];
+                let samples = chains
+                    .iter()
+                    .find(|c| c.edge == cross_edge && c.endpoint == self.vertex)
+                    .map(EdgeEndChain::samples)
+                    .unwrap_or_default();
+                RingChain {
+                    cross_edge: Some(cross_edge),
+                    samples,
+                }
+            })
+            .collect()
+    }
+
     /// The `material < 0` inherit source for this junction's new fill faces
     /// (BEVEL.md §6.6.1): a face incident to the junction vertex. The vertex is
     /// consumed during surgery, so this is only valid before phase 5.
@@ -6604,12 +6673,30 @@ struct OuterMiterJunction {
     /// bug. Populated only at `segments = 2` (the only width the centre stencil fires
     /// at); empty otherwise.
     raw_coarse_mids: Vec<Vec3>,
-    /// Per sector `k` (disk order), the beveled edge `g_k` that opens it — the same
-    /// convention as `JunctionCut::opening_edges`, so the §6.7.5.3 seam / sharp
-    /// bunch-side bridge (case (4)) walks the reflex junction's beveled edges without
-    /// counting the reflex sector or any absorbed unbeveled leg.
-    opening_edges: Vec<EdgeKey>,
+    /// Per ring edge (same order as `chains`), the beveled edge that ring edge's
+    /// cross-section crosses — `None` on the reflex sector's **internal** (arc /
+    /// patch-chord) edges, which cross no beveled edge. This is what makes the split
+    /// sector cost the §6.7.5.3 walk its extra ring step(s): the walk counts only the
+    /// `Some` entries but steps over every entry (§6.7.5.4 case (5)).
+    cross_edges: Vec<Option<EdgeKey>>,
     segments: u32,
+}
+
+impl OuterMiterJunction {
+    /// The junction's enlarged outermost ring as the §6.7.5.3 walk's chain sequence.
+    /// The reflex sector contributes `p − 1` fill chains (`p = 2` for `ARC`, `3` for
+    /// `PATCH`) that no beveled edge crosses, so a span stepping through it comes up
+    /// that many chains short at its far end.
+    fn ring_chains(&self) -> Vec<RingChain> {
+        self.cross_edges
+            .iter()
+            .zip(self.chains.iter())
+            .map(|(&cross_edge, samples)| RingChain {
+                cross_edge,
+                samples: samples.clone(),
+            })
+            .collect()
+    }
 }
 
 /// What a consumed endpoint corner becomes on one specific face (BEVEL.md §7.4 /
@@ -14237,6 +14324,129 @@ mod tests {
         );
         on.validate_topology();
         off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (5), the **long-span desync**: mechanism (2) counts a gap
+    /// in beveled edges but steps it out in **ring boundverts**, so a span whose ring
+    /// path enters a **split** sector burns a step on that sector's fill chain and comes
+    /// up short at its far end.
+    ///
+    /// Same octagonal apex and same four beveled legs as case (4)'s arms, with the flags
+    /// moved to the **interior** pair: legs `A–R2` / `A–R3` seamed, so the gap is
+    /// `{A–R4, A–R1}` — length `m = 2`, straddling the reflex sector — and the span's
+    /// anchor `A–R3` never touches that sector. `SHARP` leaves the sector unsplit and the
+    /// walk stays in registration: the full `m · segments = 4`-edge bridge lands. `ARC`
+    /// splits it, so of the span's two chain-steps one lands on the gap's own strip chain
+    /// and the other is burned on the reflex fill chain — whose per-face AND is FALSE
+    /// (both flanks unflagged), so the corner-run pass clears it again. Net: **half** the
+    /// idealised bridge, and never a flagged edge in the wrong place.
+    #[test]
+    fn multiface_reflex_arc_desyncs_long_span_while_sharp_bridges_it() {
+        let beveled = [0, 1, 2, 3];
+        let interior = [1, 2];
+
+        let (arc_on, arc_on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Arc, true, false);
+        let (arc_off, arc_off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Arc, false, false);
+        let (sharp_on, sharp_on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Sharp, true, false);
+        let (sharp_off, sharp_off_r) = bevel_octagonal_reflex_flagged(
+            &beveled,
+            &interior,
+            &[],
+            BevelMiter::Sharp,
+            false,
+            false,
+        );
+
+        let seam = |m: &LoopMesh, e: EdgeKey| m.edge_seam(e);
+        let arc_on_count = count_flagged_result_edges(&arc_on, &arc_on_r, seam);
+        let arc_off_count = count_flagged_result_edges(&arc_off, &arc_off_r, seam);
+        let sharp_on_count = count_flagged_result_edges(&sharp_on, &sharp_on_r, seam);
+        let sharp_off_count = count_flagged_result_edges(&sharp_off, &sharp_off_r, seam);
+
+        assert_eq!(
+            arc_off_count, sharp_off_count,
+            "the two runs' OFF baselines are mechanism (1)'s longitudinals alone, so the \
+             boundvert split must not move them",
+        );
+        assert_eq!(
+            arc_off_count, 4,
+            "OFF: the two seamed strips' `2 × segments = 4` outer longitudinal edges \
+             (§6.7.5.2), and no fill edge (the reflex flanks are unflagged)",
+        );
+        assert_eq!(
+            sharp_on_count - sharp_off_count,
+            4,
+            "SHARP: the sector is unsplit, so the `m = 2` span steps the two gap edges' \
+             own chains — the full `m · segments = 4`-edge bridge (§6.7.5.4 case (5))",
+        );
+        assert_eq!(
+            arc_on_count - arc_off_count,
+            2,
+            "ARC: the split sector costs the span one of its two steps, so only the first \
+             gap edge's `segments = 2` chain is bridged and the far one is left unflagged \
+             (§6.7.5.4 case (5))",
+        );
+
+        // The desync is *missing* bridge edges, never misplaced ones: the walk's burned
+        // step lands on the reflex fill chain, which is that sector's rebuilt face's
+        // corner run, and the corner-run pass then clears it. So ON adds edges to OFF and
+        // never moves one — the OFF set survives intact inside the ON set.
+        let arc_on_flagged = flagged_new_edge_set(&arc_on, &arc_on_r, seam);
+        let arc_off_flagged = flagged_new_edge_set(&arc_off, &arc_off_r, seam);
+        assert!(
+            arc_off_flagged.is_subset(&arc_on_flagged),
+            "the desynced span must not disturb mechanism (1)'s longitudinal edges",
+        );
+        assert_eq!(
+            arc_on_flagged.len() - arc_off_flagged.len(),
+            2,
+            "ON adds exactly the one bridged chain, and nothing on the fill chain",
+        );
+
+        arc_on.validate_topology();
+        sharp_on.validate_topology();
+    }
+
+    /// The `mark_sharp` companion of the long-span desync (BEVEL.md §6.7.5.4 case (5)):
+    /// the desynchronisation is a property of the ring walk, not of the bit it carries.
+    #[test]
+    fn multiface_reflex_arc_desyncs_long_span_on_the_sharp_bit() {
+        let beveled = [0, 1, 2, 3];
+        let interior = [1, 2];
+
+        let (arc_on, arc_on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Arc, false, true);
+        let (arc_off, arc_off_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Arc, false, false);
+        let (sharp_on, sharp_on_r) =
+            bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Sharp, false, true);
+        let (sharp_off, sharp_off_r) = bevel_octagonal_reflex_flagged(
+            &beveled,
+            &[],
+            &interior,
+            BevelMiter::Sharp,
+            false,
+            false,
+        );
+
+        let sharp_bit = |m: &LoopMesh, e: EdgeKey| m.edge_sharp(e);
+        let arc_delta = count_flagged_result_edges(&arc_on, &arc_on_r, sharp_bit)
+            - count_flagged_result_edges(&arc_off, &arc_off_r, sharp_bit);
+        let sharp_delta = count_flagged_result_edges(&sharp_on, &sharp_on_r, sharp_bit)
+            - count_flagged_result_edges(&sharp_off, &sharp_off_r, sharp_bit);
+
+        assert_eq!(
+            sharp_delta, 4,
+            "SHARP outer miter: the `m = 2` span bridges in full on the sharp bit",
+        );
+        assert_eq!(
+            arc_delta, 2,
+            "ARC outer miter: the split sector desyncs the same span on the sharp bit too",
+        );
+        arc_on.validate_topology();
     }
 
     /// Bevel the three apex edges of `single_face_reflex_junction` (`segments = 2`,
