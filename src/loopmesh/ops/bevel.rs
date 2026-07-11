@@ -241,15 +241,15 @@ pub struct BevelOptions<'a> {
     /// start** — one extra boundvert on the far flank, the original meet-point
     /// stored as the arc midpoint, and a circular miter profile the [V-ADJ] grid
     /// spans (§8.9.5). `Patch` and `Arc` produce identical inner geometry
-    /// (§8.9.3). Only engages on the forced tri-corner [V-ADJ] fill
-    /// (`vmesh_method = Adj`, `segments = 2`, the symmetric cube corner); other
-    /// junctions decline to `Sharp`. A junction carrying a reflex sector (the
-    /// outer-miter case, §8.9.2) also declines for now.
+    /// (§8.9.3). Engages on the [V-ADJ] fill (`vmesh_method = Adj`, `segments = 2`)
+    /// at a convex tri-corner and at a junction whose one reflex sector the outer
+    /// miter leaves `Sharp` (there the reflex sector keeps its meet-point and only
+    /// the non-reflex sectors split); other junctions decline to `Sharp`.
     pub miter_inner: BevelMiter,
     /// How a junction's corner is reshaped at a **reflex** (outer) sector
-    /// (BEVEL.md §8.9.2). Accepted for surface compatibility but **not yet
-    /// implemented**: any value (including non-`Sharp`) currently behaves as
-    /// `Sharp` — the reflex `s ≥ 3` junction path is a later cycle. Defaults to
+    /// (BEVEL.md §8.9.2). `Sharp` (the default) keeps the foundational V-join; `Arc`
+    /// and `Patch` rebuild the one reflex sector of an `s ≥ 3` junction past the
+    /// §8.9.1 firing margin. Engages on the [V-ADJ] fill; other junctions decline to
     /// `Sharp`.
     pub miter_outer: BevelMiter,
     /// How far an inner `Arc` miter is pushed away from the junction along each
@@ -1145,8 +1145,7 @@ impl LoopMesh {
         let mut chains: Vec<EdgeEndChain> = Vec::new();
         let mut face_subst: Vec<FaceSubstitution> = Vec::new();
         let mut junction_cuts: Vec<JunctionCut> = Vec::new();
-        let mut miter_junctions: Vec<MiterJunction> = Vec::new();
-        let mut outer_miter_junctions: Vec<OuterMiterJunction> = Vec::new();
+        let mut miter_ring_junctions: Vec<MiterRingJunction> = Vec::new();
         let mut terminal_fans: Vec<TerminalFan> = Vec::new();
 
         // §8.2.2.1.1: the chord-fraction resample is a property of the [V-ADJ] cap's
@@ -1160,11 +1159,11 @@ impl LoopMesh {
 
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
-                // §8.9.3: the inner miter rides the forced tri-corner [V-ADJ] fill.
+                // §8.9.3: the inner miter splits every non-reflex sector into an arc.
                 // It engages only for `vmesh_method = Adj` with a non-sharp inner
                 // miter; `build_junction_inner_miter` itself declines (without
-                // mutating) any junction outside the convex tri-corner case, falling
-                // back to the sharp boundvert ring below.
+                // mutating) any junction outside its scope, falling back to the sharp
+                // boundvert ring below.
                 let inner_miter = options.miter_inner != BevelMiter::Sharp
                     && options.vmesh_method == BevelVmeshMethod::Adj
                     && self.build_junction_inner_miter(
@@ -1174,9 +1173,10 @@ impl LoopMesh {
                         segments,
                         profile,
                         options.spread,
+                        options.miter_outer,
                         &mut chains,
                         &mut face_subst,
-                        &mut miter_junctions,
+                        &mut miter_ring_junctions,
                         result,
                     );
                 // §8.9.2: the outer miter reshapes the one reflex sector of an `s ≥ 3`
@@ -1199,7 +1199,7 @@ impl LoopMesh {
                         options.miter_outer,
                         &mut chains,
                         &mut face_subst,
-                        &mut outer_miter_junctions,
+                        &mut miter_ring_junctions,
                         result,
                     );
                 if !inner_miter && !outer_miter {
@@ -1323,17 +1323,13 @@ impl LoopMesh {
             self.build_terminal_fan(fan, material, result);
         }
 
-        // Phase 4b (§8.9.3 / §8.9.5): the inner-miter junctions take the enlarged
-        // tri-corner [V-ADJ] fill — the six-quad pinwheel over the arc-start ring.
-        for mj in &miter_junctions {
-            self.build_adj_fill_inner_miter(mj, material, result);
-        }
-
-        // Phase 4c (§8.9.2 / §8.9.5): the outer-miter junctions take the general
-        // valence-`s` [V-ADJ] fill over the enlarged `(s + 1)`-boundvert ring (the
-        // non-reflex sharp meet-points plus the reflex sector's arc pair).
-        for omj in &outer_miter_junctions {
-            self.build_adj_fill_outer_miter(omj, material, result);
+        // Phase 4b (§8.9.2 / §8.9.3 / §8.9.5): every mitered junction — inner, outer, or
+        // both — takes the general valence-`s` [V-ADJ] fill over its enlarged ring. A
+        // miter is a ring perturbation, so the fill needs no miter-specific step: each
+        // split sector simply contributes an extra boundvert and an internal (fill)
+        // chain the cap tiles like any cross-section (§8.9.5.3).
+        for ring in &miter_ring_junctions {
+            self.build_adj_fill_miter_ring(ring, material, result);
         }
 
         // Phase 4.25 (§6.7.5.2 mechanism (1), UNCONDITIONAL): each seamed / sharp
@@ -1354,9 +1350,10 @@ impl LoopMesh {
         // gap's length in **beveled edges** but stepping it out in **ring boundverts**
         // (§6.7.5.4 case (5)). Both the plain cutoff / adj junction fills
         // (`junction_cuts`, one boundvert per sector — count and steps in registration)
-        // and the **reflex outer miter** junctions (`outer_miter_junctions`, whose split
-        // sector carries `+1` / `+2` boundverts and so costs a crossing span extra
-        // steps) run the same walk over their own ring. Terminals stay inert.
+        // and the **mitered** junctions (`miter_ring_junctions`, each of whose split
+        // sectors carries `+1` / `+2` boundverts and so costs a crossing span extra
+        // steps — outer and inner miters alike, §6.7.5.4 case (6)) run the same walk
+        // over their own ring. Terminals stay inert.
         //
         // This runs **before** the corner-run pass below, which assigns: a step burned
         // on a split sector's fill chain is a step written here and cleared there.
@@ -1369,12 +1366,12 @@ impl LoopMesh {
                 let ring = cut.ring_chains(&chains);
                 self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
-            for omj in &outer_miter_junctions {
-                let Some(disk) = junction_disks.iter().find(|disk| disk.vertex == omj.vertex)
+            for miter in &miter_ring_junctions {
+                let Some(disk) = junction_disks.iter().find(|disk| disk.vertex == miter.vertex)
                 else {
                     continue;
                 };
-                let ring = omj.ring_chains();
+                let ring = miter.ring_chains();
                 self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
         }
@@ -2260,24 +2257,30 @@ impl LoopMesh {
         }
     }
 
-    /// Build a junction's **inner-miter** boundvert ring and strip cross-section
-    /// chains, riding the forced tri-corner [V-ADJ] fill (BEVEL.md §8.9.3 / §8.9.5).
+    /// Build a junction's **inner-miter** boundvert ring and its cross-section chains
+    /// (BEVEL.md §8.9.3 / §8.9.5).
     ///
-    /// Each convex non-reflex sector is rebuilt as an **arc start** (§8.9.3): the
-    /// `§7.6.2` meet-point becomes the stored **arc midpoint**, and the sector gains
-    /// two ring boundverts — `B1` keeping the opening edge's side and a new `B3`
-    /// taking over the closing edge's side. Both are pushed `spread` away from the
-    /// junction along their respective beveled edges from the stored midpoint
-    /// (§8.9.4). The strip across each beveled edge now spans `B3` of one sector and
-    /// `B1` of the next, and each sector face re-stitches its corner onto the arc run
-    /// `B1 → midpoint → B3`.
+    /// Every **non-reflex** sector is rebuilt as an **arc start** (§8.9.3): its §7.6.2
+    /// meet-point becomes the stored **arc midpoint**, and the sector gains two ring
+    /// boundverts — `B1` keeping the opening edge's side and a new `B3` taking over the
+    /// closing edge's side. Both are pushed `spread` away from the junction along their
+    /// own beveled edge from that stored midpoint (§8.9.4), and the sector's rebuilt
+    /// face(s) re-stitch onto the arc run `B1 → bulge → B3`. `miter_inner` only
+    /// distinguishes sharp from non-sharp (§8.9.3), so `Arc` and `Patch` build the same
+    /// arc here; the caller gates on that.
     ///
-    /// This is scoped to the **inner** miter only (§8.9.3): the forced tri-corner —
-    /// three sectors, all non-reflex (the convex cube corner), circular profile,
-    /// `segments = 2`. The method performs all classification read-only first and
-    /// returns `false` **without mutating** for any junction outside that case (a
-    /// reflex sector — the deferred outer miter §8.9.2 — a non-tri-corner, or a
-    /// non-circular profile), so the caller falls back to the sharp ring.
+    /// A junction may also carry **one reflex sector** (§8.9.1). That sector belongs to
+    /// `miter_outer`, so this builder handles it only when the outer miter is `Sharp`:
+    /// the reflex sector then keeps its single sharp meet-point boundvert and the ring is
+    /// the mixed `s + (split sectors)` one the general valence-`s` cap fills. With a
+    /// non-sharp `miter_outer` the whole junction is declined here and
+    /// [`Self::build_junction_outer_miter`] owns it.
+    ///
+    /// All classification runs read-only first; the method returns `false` **without
+    /// mutating** for any junction outside its scope (`segments != 2`, a non-circular
+    /// profile, fewer than three sectors, an all-non-reflex ring that is not the forced
+    /// tri-corner geometry, more than one reflex sector, or a reflex sector the outer
+    /// miter owns), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_inner_miter(
         &mut self,
@@ -2287,37 +2290,36 @@ impl LoopMesh {
         segments: u32,
         profile: f32,
         spread: f32,
+        miter_outer: BevelMiter,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
-        miter_junctions: &mut Vec<MiterJunction>,
+        miter_ring_junctions: &mut Vec<MiterRingJunction>,
         result: &mut BevelResult,
     ) -> bool {
-        // §8.9.5: the inner miter only rides the forced `segments = 2` circular
-        // tri-corner grid.
+        // §8.9.5: the inner miter rides the `segments = 2` circular control net.
         if segments != 2 || profile_to_exponent(profile) != 2.0 {
             return false;
         }
         let corners = self.vertex_corner_ring(vertex);
         let sectors = sector_split(&corners, is_beveled);
-        if sectors.len() != 3 {
+        let sector_count = sectors.len();
+        if sector_count < 3 {
             return false;
         }
         let vertex_position = self.vertex_position(vertex);
 
-        // Read-only classification pass (§8.9.1): solve each sector's meet-point and
-        // its two flanking edge directions, and run the winding-invariant signed
-        // reflex test. Decline the whole junction the moment any sector is reflex —
-        // that is outer-miter territory (§8.9.2), out of scope this cycle.
+        // Read-only classification pass (§8.9.1): solve each sector's meet-point and its
+        // two flanking edge directions, and run the winding-invariant signed reflex test
+        // in the genuine incident-face frame (`cross · n_ref < 0` ⇒ reflex).
         struct SectorPlan {
-            face: FaceKey,
             opening: EdgeKey,
             closing: EdgeKey,
-            midpoint: Vec3,
+            meet: Vec3,
             dir_open: Vec3,
             dir_close: Vec3,
+            reflex: bool,
         }
-        let mut plans: Vec<SectorPlan> = Vec::with_capacity(3);
-        let mut meet_points: Vec<Vec3> = Vec::with_capacity(3);
+        let mut plans: Vec<SectorPlan> = Vec::with_capacity(sector_count);
         for sector in &sectors {
             if sector.bounding_edges.len() < 2 {
                 return false;
@@ -2336,222 +2338,225 @@ impl LoopMesh {
                 Some(direction) => direction,
                 None => return false,
             };
-            // §8.9.1: the two unit directions *toward* `v`, their cross product, and a
-            // genuine incident-face normal reference. `cross · n_ref < 0` ⇒ reflex.
             let cross = (-dir_open).cross(-dir_close);
             let reference = self.face_plane_normal(face);
-            if cross.dot(reference) < 0.0 {
-                return false;
-            }
-            let midpoint = self.solve_meet_point(vertex, vertex_position, sector, offset);
-            meet_points.push(midpoint);
+            let reflex = cross.dot(reference) < 0.0;
+            let meet = self.solve_meet_point(vertex, vertex_position, sector, offset);
             plans.push(SectorPlan {
-                face,
                 opening,
                 closing,
-                midpoint,
+                meet,
                 dir_open,
                 dir_close,
+                reflex,
             });
         }
 
-        // §8.5.1 / §8.9.5: the forced tri-corner geometry — equal-length spokes and
-        // a mutually-60° convex octant. A non-tri-corner ring has no closed-form grid
-        // here, so decline to the sharp fill.
-        if !tri_corner_meet_geometry(vertex_position, &meet_points) {
-            return false;
+        // §8.9.1: a junction has at most one reflex sector. Two or more contradicts that
+        // invariant, so decline rather than build an ill-defined ring.
+        let reflex_count = plans.iter().filter(|plan| plan.reflex).count();
+        match reflex_count {
+            // The all-convex ring keeps the §8.5.1 forced tri-corner geometry gate: an
+            // oblique or unequal-offset convex junction has no distilled inner-miter fill.
+            0 => {
+                let meet_points: Vec<Vec3> = plans.iter().map(|plan| plan.meet).collect();
+                if !tri_corner_meet_geometry(vertex_position, &meet_points) {
+                    return false;
+                }
+            }
+            // The reflex sector is `miter_outer`'s. Only when the outer miter is `Sharp`
+            // does it stay a plain meet-point this builder can carry; otherwise the outer
+            // builder owns the whole ring.
+            1 => {
+                if miter_outer != BevelMiter::Sharp {
+                    return false;
+                }
+            }
+            _ => return false,
         }
 
-        // Mutation pass: every check has passed. Build the enlarged arc-start ring.
-        let count = plans.len();
-        let mut arc_start: Vec<VertexKey> = Vec::with_capacity(count);
-        let mut arc_mid: Vec<VertexKey> = Vec::with_capacity(count);
-        let mut arc_end: Vec<VertexKey> = Vec::with_capacity(count);
+        // Mutation pass: every check has passed. Each non-reflex sector splits into its
+        // arc pair; the reflex sector (if any) keeps its single sharp meet-point.
         let sqrt2 = std::f32::consts::SQRT_2;
+        // Per sector: its ring boundverts in ring order (one when sharp, `B1`/`B3` when
+        // split), the split sector's internal arc chain `[B1, bulge, B3]`, and that arc's
+        // raw bulge position. The arc cell is always symmetric (`|meet − B1| = |meet − B3|
+        // = spread`), so the §8.2.2.1.1 boundary resample is the identity on it and the
+        // raw bulge is also the emitted rim sample (§8.9.5).
+        let mut sector_ring: Vec<Vec<VertexKey>> = Vec::with_capacity(sector_count);
+        let mut sector_arc: Vec<Option<Vec<VertexKey>>> = Vec::with_capacity(sector_count);
+        let mut sector_bulge: Vec<Option<Vec3>> = Vec::with_capacity(sector_count);
         for plan in &plans {
-            // §8.9.3 / §8.9.4: B1 and B3 are pushed `spread` out along their own
+            if plan.reflex {
+                let boundvert = self.create_vertex(plan.meet);
+                result.verts.push(boundvert);
+                sector_ring.push(vec![boundvert]);
+                sector_arc.push(None);
+                sector_bulge.push(None);
+                continue;
+            }
+            // §8.9.3 / §8.9.4: `B1` and `B3` are pushed `spread` out along their own
             // beveled edge from the stored meet-point.
-            let b1_position = plan.midpoint + plan.dir_open * spread;
-            let b3_position = plan.midpoint + plan.dir_close * spread;
+            let b1_position = plan.meet + plan.dir_open * spread;
+            let b3_position = plan.meet + plan.dir_close * spread;
             // §8.9.5: the stored meet-point is the outer corner of the square that
             // circumscribes the arc, not a point on the arc. The single `segments = 2`
-            // interior sample is the inscribed circle's 45° point — pulled in a
-            // fraction `√2 − 1` of the way from the chord midpoint toward that corner.
+            // interior sample is the inscribed circle's 45° point — pulled in a fraction
+            // `√2 − 1` of the way from the chord midpoint toward that corner.
             let chord_mid = 0.5 * (b1_position + b3_position);
-            let bulge_mid = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * plan.midpoint;
+            let bulge_position = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * plan.meet;
             let b1 = self.create_vertex(b1_position);
+            let bulge = self.create_vertex(bulge_position);
             let b3 = self.create_vertex(b3_position);
-            let mid = self.create_vertex(bulge_mid);
             result.verts.push(b1);
+            result.verts.push(bulge);
             result.verts.push(b3);
-            result.verts.push(mid);
-            arc_start.push(b1);
-            arc_mid.push(mid);
-            arc_end.push(b3);
+            sector_ring.push(vec![b1, b3]);
+            sector_arc.push(Some(vec![b1, bulge, b3]));
+            sector_bulge.push(Some(bulge_position));
         }
 
-        // Re-stitch each sector face onto its arc run `B1 → midpoint → B3`, ordered to
-        // match the face loop's traversal through `v` (the boundvert near the loop's
-        // incoming edge comes first).
-        for (k, plan) in plans.iter().enumerate() {
-            let run = match self.face_corner_edges(plan.face, vertex) {
-                Some((incoming, _)) if incoming == plan.opening => {
-                    vec![arc_start[k], arc_mid[k], arc_end[k]]
+        // Re-stitch each sector's face(s). A sharp sector collapses its corner onto the
+        // lone boundvert (1-for-1). A split sector's single face threads the whole arc run
+        // in its own winding; a split sector that absorbed unbeveled legs (§7.6.1) is a
+        // **multi-face** sector, and its faces tile contiguous runs of the arc's profile
+        // samples by the §8.9.2.2 assignment — the same rule the outer arc uses, since
+        // §8.9.3 builds the identical arc.
+        for (k, sector) in sectors.iter().enumerate() {
+            match &sector_arc[k] {
+                None => {
+                    let boundvert = sector_ring[k][0];
+                    for &(_, face) in &sector.corners {
+                        set_face_substitution(face_subst, vertex, face, vec![boundvert]);
+                    }
                 }
-                _ => vec![arc_end[k], arc_mid[k], arc_start[k]],
-            };
-            set_face_substitution(face_subst, vertex, plan.face, run);
+                Some(arc) => {
+                    let mut faces: Vec<FaceKey> = Vec::new();
+                    for &(_, face) in &sector.corners {
+                        if !faces.contains(&face) {
+                            faces.push(face);
+                        }
+                    }
+                    if faces.len() == 1 {
+                        let face = faces[0];
+                        let run = match self.face_corner_edges(face, vertex) {
+                            Some((incoming, _)) if incoming == plans[k].opening => arc.clone(),
+                            _ => {
+                                let mut reversed = arc.clone();
+                                reversed.reverse();
+                                reversed
+                            }
+                        };
+                        set_face_substitution(face_subst, vertex, face, run);
+                    } else {
+                        self.restitch_multiface_arc_sector(
+                            vertex,
+                            sector,
+                            arc,
+                            segments,
+                            face_subst,
+                        );
+                    }
+                }
+            }
         }
 
-        // §8.9.5: the strip across each beveled edge spans `B3` of one sector and
-        // `B1` of the next; build that cross-section chain (one interior arc sample at
-        // `segments = 2`). The miter arc rim itself (B1 → midpoint → B3) is internal
-        // to the patch and consumed only by the fill — not a strip.
-        let mut cross: Vec<VertexKey> = Vec::with_capacity(count);
-        for k in 0..count {
-            let next = (k + 1) % count;
-            let crossing = plans[k].closing; // == plans[next].opening
-            let start = arc_end[k];
-            let end = arc_start[next];
-            let interior = self
-                .build_chain_between(
-                    start,
-                    end,
-                    crossing,
-                    segments,
-                    profile,
-                    None,
-                    ChainEmission::Resampled,
-                    result,
-                );
-            // Invariant: a circular `segments = 2` cross-section always yields exactly
-            // one interior sample. Reaching here with none would mean `build_chain_between`
-            // returned no interior sample despite the `segments == 2` gate above — an
-            // internal-invariant violation, not an expected failure. We are already past
-            // the read-only classification pass (arc verts and face substitutions are
-            // minted), so a graceful decline here is impossible without orphaning geometry:
-            // the only correct return-false paths live in the classification pass above.
-            let sample = *interior
-                .first()
-                .expect("segments=2 cross-section must have exactly one interior sample");
-            cross.push(sample);
-            chains.push(EdgeEndChain {
-                edge: crossing,
-                endpoint: vertex,
-                start,
-                interior,
-                end,
-            });
+        // The enlarged ring in disk order, with the beveled edge each ring edge crosses:
+        // `None` on a split sector's internal arc edge (which crosses none — this is what
+        // desynchronises the §6.7.5.3 walk, case (6)), `Some` on each strip cross-section.
+        let mut ring: Vec<VertexKey> = Vec::with_capacity(sector_count + 2);
+        let mut cross_edge: Vec<Option<EdgeKey>> = Vec::with_capacity(sector_count + 2);
+        for k in 0..sector_count {
+            let boundverts = &sector_ring[k];
+            for (slot, &boundvert) in boundverts.iter().enumerate() {
+                ring.push(boundvert);
+                if slot + 1 < boundverts.len() {
+                    cross_edge.push(None);
+                } else {
+                    // The sector's closing beveled edge opens the next sector, so it is
+                    // the edge the strip cross-section leaving this sector crosses.
+                    cross_edge.push(Some(plans[k].closing));
+                }
+            }
         }
 
-        miter_junctions.push(MiterJunction {
+        // One full `segments + 1`-sample chain per ring edge (oriented `ring[i] →
+        // ring[i+1]`): the pre-minted arc chain on an internal edge, or the strip
+        // cross-section across the shared beveled edge (§8.9.5.2), which is also
+        // registered as the beveled edge's chain so the strip build joins onto it.
+        let ring_count = ring.len();
+        let mut arc_chains = sector_arc.iter().flatten();
+        let mut ring_chains: Vec<Vec<VertexKey>> = Vec::with_capacity(ring_count);
+        for i in 0..ring_count {
+            let start = ring[i];
+            let end = ring[(i + 1) % ring_count];
+            match cross_edge[i] {
+                None => {
+                    let chain = arc_chains
+                        .next()
+                        .expect("every internal ring edge has a pre-minted arc chain");
+                    ring_chains.push(chain.clone());
+                }
+                Some(edge) => {
+                    let interior = self.build_chain_between(
+                        start,
+                        end,
+                        edge,
+                        segments,
+                        profile,
+                        None,
+                        ChainEmission::Resampled,
+                        result,
+                    );
+                    // Unreachable: the profile sampler emits exactly `segments + 1`
+                    // positions regardless of the cell's geometry, so a short chain would
+                    // be an internal-invariant violation — and we are past the read-only
+                    // classification pass, so a graceful decline here would orphan the
+                    // verts and substitutions already minted.
+                    if interior.len() != segments as usize - 1 {
+                        panic!("cross-section must sample to segments−1 interior verts");
+                    }
+                    let mut chain = Vec::with_capacity(segments as usize + 1);
+                    chain.push(start);
+                    chain.extend_from_slice(&interior);
+                    chain.push(end);
+                    ring_chains.push(chain);
+                    chains.push(EdgeEndChain {
+                        edge,
+                        endpoint: vertex,
+                        start,
+                        interior,
+                        end,
+                    });
+                }
+            }
+        }
+
+        // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil consumes each ring
+        // chain's *raw coarse* profile mid, never the emitted (resampled) rim mid — the
+        // arc-flanking cross-sections of a spread-pushed ring are skewed cells, where the
+        // two differ. The arc's own mid is symmetric, so its raw bulge is both.
+        let mut bulges = sector_bulge.iter().flatten();
+        let raw_coarse_mids: Vec<Vec3> = (0..ring_count)
+            .map(|i| match cross_edge[i] {
+                None => *bulges
+                    .next()
+                    .expect("every internal ring edge has a pre-minted raw bulge"),
+                Some(edge) => {
+                    self.coarse_flank_mid(ring[i], ring[(i + 1) % ring_count], edge, profile)
+                }
+            })
+            .collect();
+
+        miter_ring_junctions.push(MiterRingJunction {
             vertex,
-            arc_start,
-            arc_mid,
-            arc_end,
-            cross,
+            boundverts: ring,
+            chains: ring_chains,
+            raw_coarse_mids,
+            cross_edges: cross_edge,
+            segments,
         });
         true
-    }
-
-    /// Build the inner-miter [V-ADJ] fill (BEVEL.md §8.9.5): the inner miter turns
-    /// each non-reflex sector into a two-boundvert arc, so the junction presents a
-    /// **six-boundvert** ring and is filled by the general non-symmetric adjacency
-    /// grid at valence `s = 6` (§8.5.5.5) — *not* the three-boundvert tri-corner
-    /// sphere snap (§8.5.2), which fires only for exactly three boundverts.
-    ///
-    /// The enlarged rim alternates the six ring boundverts `B_i` with their six
-    /// mid-chain samples `m_i`: per sector `k` the arc bulge `arc_mid[k]` (between
-    /// `B1` and `B3`) and the strip cross-section `cross[k]` (between this sector's
-    /// `B3` and the next sector's `B1`). At `segments = 2` (`half = 1`, even) the grid
-    /// tiles as one six-quad pinwheel meeting a single welded apex, so this routes the
-    /// ring straight through the shared [`emit_adj_grid`](Self::emit_adj_grid) tiler.
-    ///
-    /// The apex is the fullness-seeded, once-subdivided extraordinary centre of the
-    /// six-boundvert ring (§8.5.5.5(b)–(d)), carried in closed form for the even
-    /// `segments = 2` base (`adj_even_extraordinary_centre`): there is no sphere or
-    /// body-diagonal fit — the seed `centre_0 = centroid + fullness·(v − centroid)` is
-    /// pulled in by one valence-6 subdivision round.
-    fn build_adj_fill_inner_miter(
-        &mut self,
-        mj: &MiterJunction,
-        material: i32,
-        result: &mut BevelResult,
-    ) {
-        let count = mj.arc_start.len();
-        if count != 3
-            || mj.arc_mid.len() != count
-            || mj.arc_end.len() != count
-            || mj.cross.len() != count
-        {
-            return;
-        }
-
-        // The six-boundvert ring in ring order: each sector contributes its arc start
-        // then its arc end, and the six mid-chain samples alternate the arc bulge
-        // (between a sector's own two boundverts) with the strip cross-section (between
-        // one sector's arc end and the next sector's arc start).
-        let sectors = 2 * count; // 6
-        let mut boundverts: Vec<VertexKey> = Vec::with_capacity(sectors);
-        let mut mids: Vec<VertexKey> = Vec::with_capacity(sectors);
-        for k in 0..count {
-            boundverts.push(mj.arc_start[k]);
-            boundverts.push(mj.arc_end[k]);
-            mids.push(mj.arc_mid[k]);
-            mids.push(mj.cross[k]);
-        }
-        let boundvert_pos: Vec<Vec3> =
-            boundverts.iter().map(|&b| self.vertex_position(b)).collect();
-        let mid_pos: Vec<Vec3> = mids.iter().map(|&m| self.vertex_position(m)).collect();
-
-        let vertex_position = self.vertex_position(mj.vertex);
-        let apex_position = adj_even_extraordinary_centre(
-            vertex_position,
-            &boundvert_pos,
-            &mid_pos,
-            SABIN_GAMMA_6,
-        );
-
-        // Route the valence-6 grid topology through the shared adjacency-grid tiler.
-        // At `segments = 2` each sector is one cell whose inner corner is the welded
-        // apex; the tiler reuses the existing rim keys and mints only that apex.
-        let seg = 2usize;
-        let half = 1usize;
-        let mut chain_of: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
-        let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
-        for i in 0..sectors {
-            let next = (i + 1) % sectors;
-            let prev = (i + sectors - 1) % sectors;
-            chain_of.push(vec![boundverts[i], mids[i], boundverts[next]]);
-            corners.push([boundvert_pos[i], mid_pos[i], mid_pos[prev], apex_position]);
-        }
-
-        // §8.5.5.5(b): the outward-winding anchor is an interior point below the cap on
-        // the solid side away from `v` (the fullness centre reflected through the rim
-        // centroid), so every cap face winds outward against it.
-        let centroid =
-            boundvert_pos.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
-        let fullness = adj_fullness(seg as u32);
-        let anchor = centroid - fullness * (vertex_position - centroid);
-
-        let representative = self
-            .vert_face_keys(mj.vertex)
-            .first()
-            .map(|&face| self.face_material_index(face))
-            .unwrap_or(0);
-
-        self.emit_adj_grid(
-            sectors,
-            seg,
-            half,
-            true,
-            &chain_of,
-            &corners,
-            AdjPlacement::Fullness { anchor },
-            material,
-            representative,
-            result,
-        );
     }
 
     /// Build a junction's **outer-miter** boundvert ring for its one reflex sector,
@@ -2571,7 +2576,7 @@ impl LoopMesh {
     /// engage at a **single-face** reflex sector (no absorbed unbeveled legs); a
     /// **multi-face** reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to
     /// the hub `B2` (§8.9.2.1, `restitch_multiface_patch_reflex`) and for `ARC` by
-    /// tiling the arc's profile-sample run (§8.9.2.2, `restitch_multiface_arc_reflex`,
+    /// tiling the arc's profile-sample run (§8.9.2.2, `restitch_multiface_arc_sector`,
     /// **even `segments` only** — odd `segments` stays on the sharp-ring decline). All
     /// classification runs read-only first; the method returns `false` **without
     /// mutating** for any junction outside those cases (no reflex sector — the miter is
@@ -2588,7 +2593,7 @@ impl LoopMesh {
         mode: BevelMiter,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
-        outer_miter_junctions: &mut Vec<OuterMiterJunction>,
+        miter_ring_junctions: &mut Vec<MiterRingJunction>,
         result: &mut BevelResult,
     ) -> bool {
         // §8.9.5: the outer miter rides the [V-ADJ] grid, so `segments ≥ 2`, and the
@@ -2862,7 +2867,7 @@ impl LoopMesh {
                 // s_segments = B3]`, so each face threads the inclusive run between its two
                 // legs' assigned sample indices.
                 BevelMiter::Arc => {
-                    self.restitch_multiface_arc_reflex(
+                    self.restitch_multiface_arc_sector(
                         vertex,
                         &sectors[r],
                         &forward_run,
@@ -2984,7 +2989,7 @@ impl LoopMesh {
             Vec::new()
         };
 
-        outer_miter_junctions.push(OuterMiterJunction {
+        miter_ring_junctions.push(MiterRingJunction {
             vertex,
             boundverts: ring,
             chains: ring_chains,
@@ -3065,25 +3070,27 @@ impl LoopMesh {
         }
     }
 
-    /// Re-stitch a **multi-face** reflex sector for the outer `ARC` miter
-    /// (BEVEL.md §8.9.2.2, **even `segments`**). Unlike `PATCH`, `ARC` has **no** `B2`
+    /// Re-stitch a **multi-face** arc-split sector (BEVEL.md §8.9.2.2, **even
+    /// `segments`**) — the outer `ARC` miter's reflex sector, or an inner-mitered
+    /// non-reflex sector that absorbed unbeveled legs, since §8.9.3 builds the identical
+    /// arc there. Unlike `PATCH`, an arc has **no** `B2`
     /// ring hub: the arc between `B1` and `B3` is realised as its full profile — the
     /// sample chain `[s_0 = B1, s_1, …, s_segments = B3]` (`sample_chain`, all interior
-    /// samples materialised whether or not a leg lands on one) — and the reflex faces
+    /// samples materialised whether or not a leg lands on one) — and the sector's faces
     /// **tile contiguous runs** of that chain rather than fanning to a point.
     ///
     /// Each absorbed leg gets a profile-sample index by the §8.9.2 assignment (walking
     /// the absorbed legs in disk order: first half → `0`, second half → `segments`, and
     /// — for an odd absorbed-leg count — the single middle leg → `segments / 2`); the two
     /// flanking beveled edges take the arc ends (`0` for the leading flank, `segments` for
-    /// the trailing). The indices are non-decreasing in disk order. Each reflex face,
+    /// the trailing). The indices are non-decreasing in disk order. Each sector face,
     /// bounded by two legs with indices `i ≤ j`, then rebuilds by substituting its apex
     /// corner with the inclusive sample run `s_i … s_j` — a single sample (triangle) when
     /// `i = j`, one extra vertex per interior sample the run crosses (a face straddling an
     /// un-pinned interior sample threads it rather than skipping it). A flank face's rim
     /// vertex on the beveled side is replaced by that edge's terminal boundvert through the
     /// ordinary beveled-edge restitch — not here — exactly as for `PATCH`.
-    fn restitch_multiface_arc_reflex(
+    fn restitch_multiface_arc_sector(
         &self,
         vertex: VertexKey,
         reflex_sector: &Sector,
@@ -3144,24 +3151,25 @@ impl LoopMesh {
         }
     }
 
-    /// Build the outer-miter [V-ADJ] fill (BEVEL.md §8.9.2 / §8.9.5.3): the enlarged
-    /// `(s + 1)`-boundvert ring is filled by the **general valence-`(s + 1)` adjacency
-    /// grid** of §8.5.5.5 — the same centre-fullness / subdivision-relaxation machinery
-    /// the general non-symmetric junction rides — over the outer miter's heterogeneous
-    /// ring (non-reflex sharp meet-points interleaved with the reflex sector's arc
-    /// chain). The two chain kinds (the reflex arc, §8.9.5.1, and each flanking / interior
-    /// beveled edge's cross-section, §8.9.5.2) are interchangeable `chain_of` inputs, so
-    /// the fill needs no miter-specific step: the parity of `segments` decides the centre
-    /// by §8.5.5.5(e) — even welds one extraordinary-centre apex (no central face), odd
-    /// closes on a central `(s + 1)`-gon.
-    fn build_adj_fill_outer_miter(
+    /// Build a mitered junction's [V-ADJ] fill (BEVEL.md §8.9.2 / §8.9.3 / §8.9.5.3): the
+    /// enlarged ring is filled by the **general valence-`s` adjacency grid** of §8.5.5.5 —
+    /// the same centre-fullness / subdivision-relaxation machinery the general
+    /// non-symmetric junction rides — over the miter's heterogeneous ring (unsplit sharp
+    /// meet-points interleaved with each split sector's arc / patch chain). The two chain
+    /// kinds (a split sector's fill chain, §8.9.5.1, and each beveled edge's cross-section,
+    /// §8.9.5.2) are interchangeable `chain_of` inputs, so the fill needs no miter-specific
+    /// step — inner and outer miters differ only in *which* sectors split. The parity of
+    /// `segments` decides the centre by §8.5.5.5(e) — even welds one extraordinary-centre
+    /// apex (no central face), odd closes on a central `s`-gon.
+    fn build_adj_fill_miter_ring(
         &mut self,
-        omj: &OuterMiterJunction,
+        omj: &MiterRingJunction,
         material: i32,
         result: &mut BevelResult,
     ) {
         let count = omj.boundverts.len();
-        // The outer miter always enlarges an `s ≥ 3` ring to `s + 1 ≥ 4` boundverts.
+        // A miter splits at least one sector of an `s ≥ 3` ring, so the enlarged ring
+        // always carries `≥ 4` boundverts.
         if count < 4 || omj.chains.len() != count {
             return;
         }
@@ -6714,29 +6722,15 @@ struct TerminalFan {
     representative: i32,
 }
 
-/// One junction's **inner-miter** ring data (BEVEL.md §8.9.3 / §8.9.5), consumed by
-/// the six-quad pinwheel fill. Per convex non-reflex sector `k` (disk order): the
-/// arc-start boundvert `arc_start[k]` (`B1`, near the opening edge), the stored arc
-/// midpoint `arc_mid[k]` (the unmoved §7.6.2 meet-point), the arc-end boundvert
-/// `arc_end[k]` (`B3`, near the closing edge), and the strip cross-section sample
-/// `cross[k]` between this sector's `B3` and the next sector's `B1`.
-struct MiterJunction {
-    vertex: VertexKey,
-    arc_start: Vec<VertexKey>,
-    arc_mid: Vec<VertexKey>,
-    arc_end: Vec<VertexKey>,
-    cross: Vec<VertexKey>,
-}
-
-/// One junction's **outer-miter** ring data (BEVEL.md §8.9.2 / §8.9.5), consumed by
-/// the general valence-`(s + 1)` [V-ADJ] fill. `boundverts` is the enlarged ring in
-/// disk order — each non-reflex sector's single sharp meet-point plus the reflex
-/// sector's arc pair `B1`/`B3` — and `chains[i]` is the full `segments + 1`-sample
-/// profile chain on the ring edge from `boundverts[i]` to `boundverts[(i+1) % len]`
-/// (oriented that way): a strip cross-section across the shared beveled edge
-/// (§8.9.5.2), or the reflex arc chain `s_0 … s_segments` between `B1` and `B3`
-/// (§8.9.5.1). `segments` is the fill width.
-struct OuterMiterJunction {
+/// One **mitered** junction's ring data (BEVEL.md §8.9.2 / §8.9.3 / §8.9.5), consumed
+/// by the general valence-`s` [V-ADJ] fill. `boundverts` is the enlarged ring in disk
+/// order — one sharp meet-point per unsplit sector, plus the arc pair `B1`/`B3` (or
+/// `PATCH`'s `B1`/`B2`/`B3`) of every **split** sector, whichever miter split it — and
+/// `chains[i]` is the full `segments + 1`-sample profile chain on the ring edge from
+/// `boundverts[i]` to `boundverts[(i+1) % len]` (oriented that way): a strip
+/// cross-section across the shared beveled edge (§8.9.5.2), or a split sector's own
+/// fill chain `s_0 … s_segments` (§8.9.5.1). `segments` is the fill width.
+struct MiterRingJunction {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
     chains: Vec<Vec<VertexKey>>,
@@ -6750,7 +6744,7 @@ struct OuterMiterJunction {
     /// at); empty otherwise.
     raw_coarse_mids: Vec<Vec3>,
     /// Per ring edge (same order as `chains`), the beveled edge that ring edge's
-    /// cross-section crosses — `None` on the reflex sector's **internal** (arc /
+    /// cross-section crosses — `None` on a split sector's **internal** (arc /
     /// patch-chord) edges, which cross no beveled edge. This is what makes the split
     /// sector cost the §6.7.5.3 walk its extra ring step(s): the walk counts only the
     /// `Some` entries but steps over every entry (§6.7.5.4 case (5)).
@@ -6758,11 +6752,12 @@ struct OuterMiterJunction {
     segments: u32,
 }
 
-impl OuterMiterJunction {
+impl MiterRingJunction {
     /// The junction's enlarged outermost ring as the §6.7.5.3 walk's chain sequence.
-    /// The reflex sector contributes `p − 1` fill chains (`p = 2` for `ARC`, `3` for
-    /// `PATCH`) that no beveled edge crosses, so a span stepping through it comes up
-    /// that many chains short at its far end.
+    /// Each split sector contributes `p − 1` fill chains (`p = 2` for an arc, `3` for the
+    /// outer `PATCH`) that no beveled edge crosses, so a span stepping through it comes up
+    /// that many chains short at its far end — outer and inner miters alike (§6.7.5.4
+    /// cases (5) and (6)).
     fn ring_chains(&self) -> Vec<RingChain> {
         self.cross_edges
             .iter()
@@ -11404,6 +11399,283 @@ mod tests {
             counts(&sharp_mesh),
             counts(&arc_mesh),
             "an Arc inner miter is not a silent no-op",
+        );
+    }
+
+    /// Bevel the three apex edges of `single_face_reflex_junction` (`segments = 2`,
+    /// `offset = 0.2`, `spread = 0.1`, ADJ, circular profile) with a chosen
+    /// `miter_inner` and `miter_outer = Sharp`, seaming / sharpening the named apex
+    /// edges. Apex edge `k` is `v–{a, b, c}[k]`, so the two non-reflex sectors are
+    /// flanked by `(0, 1)` and `(1, 2)` and the reflex quad by `(2, 0)`.
+    fn reflex_apex_inner_miter_flagged(
+        miter_inner: BevelMiter,
+        seamed: &[usize],
+        sharped: &[usize],
+        mark_seam: bool,
+        mark_sharp: bool,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, _apex, apex_edges) = single_face_reflex_junction();
+        for &k in seamed {
+            mesh.set_edge_seam(apex_edges[k], true);
+        }
+        for &k in sharped {
+            mesh.set_edge_sharp(apex_edges[k], true);
+        }
+        let geom: Vec<GeomKey> = apex_edges.iter().map(|&e| e.into()).collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.1,
+                mark_seam,
+                mark_sharp,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.9.1 / §8.9.3: the inner miter fires on **every** non-reflex sector,
+    /// including at a junction that also carries a reflex one — the reflex sector is
+    /// `miter_outer`'s, and with the outer miter `Sharp` it simply keeps its single
+    /// meet-point boundvert while both non-reflex sectors split into their arc pair.
+    /// The ring therefore grows `3 → 5` boundverts and the corner closes on the general
+    /// valence-5 cap: `+4 V` (two `B3` + two arc bulges), `+6 E` (each split sector's
+    /// two-edge fill chain plus the cap spokes), a valid closed manifold throughout.
+    #[test]
+    fn inner_miter_arc_splits_nonreflex_sectors_of_reflex_junction() {
+        let (arc_mesh, arc_result) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[], &[], false, false);
+        arc_mesh.validate_topology();
+
+        let (sharp_mesh, _sharp) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Sharp, &[], &[], false, false);
+        assert_eq!(
+            counts(&sharp_mesh),
+            (17, 28, 13),
+            "the sharp reflex-junction baseline is unchanged (§7.6.6)",
+        );
+        let (vertices, edges, _faces) = counts(&arc_mesh);
+        assert_eq!(
+            (vertices, edges),
+            (21, 34),
+            "the inner miter splits both non-reflex sectors: 17 → 21 V, 28 → 34 E (§8.9.6)",
+        );
+        assert_eq!(
+            vertices as i64 - edges as i64 + arc_mesh.face_count() as i64,
+            2,
+            "the inner-mitered reflex junction stays a closed χ = 2 manifold",
+        );
+
+        // The enlarged ring is five boundverts (three sectors, two of them split), so
+        // the even-`segments` cap welds five quads at one apex — the sole new vertex
+        // with five incident faces, all quads (§8.5.5.5(e)).
+        let apex: Vec<VertexKey> = arc_result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                let incident: Vec<FaceKey> = arc_mesh
+                    .face_keys()
+                    .into_iter()
+                    .filter(|&face| arc_mesh.face_vert_keys(face).contains(&candidate))
+                    .collect();
+                incident.len() == 5
+                    && incident
+                        .iter()
+                        .all(|&face| arc_mesh.face_vert_keys(face).len() == 4)
+            })
+            .collect();
+        assert_eq!(
+            apex.len(),
+            1,
+            "the five-boundvert ring closes on one welded apex shared by five cap quads",
+        );
+    }
+
+    /// BEVEL.md §6.7.5.4 case (6) / §6.7.1.1(a′): an inner-miter **fill chain is a corner
+    /// run**, flagged by the same unconditional per-rebuilt-face AND as any other — no
+    /// `miter_*` gate, no "did this sector split" gate. Seaming the two flanks of one
+    /// non-reflex triangle, **with `mark_seam` off**: the sharp inner miter carries only
+    /// mechanism (1)'s four outer longitudinals; the arc adds exactly the two fill-chain
+    /// edges of the sector whose two apex-incident originals are *both* seamed. The other
+    /// split sector — one seamed flank, one clean — keeps its fill chain clean in the
+    /// same mesh: the AND bites twice, with opposite answers.
+    #[test]
+    fn inner_miter_arc_fill_chain_is_a_flagged_corner_run() {
+        let flanks = [0usize, 1];
+        let (sharp, sharp_result) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Sharp, &flanks, &[], false, false);
+        let (arc, arc_result) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &flanks, &[], false, false);
+
+        let sharp_count = count_flagged_result_edges(&sharp, &sharp_result, |m, e| m.edge_seam(e));
+        let arc_count = count_flagged_result_edges(&arc, &arc_result, |m, e| m.edge_seam(e));
+        assert_eq!(
+            sharp_count, 4,
+            "sharp inner miter: only mechanism (1)'s two outer longitudinals per seamed strip",
+        );
+        assert_eq!(
+            arc_count, 6,
+            "the arc adds exactly the doubly-seamed sector's two fill-chain edges — and \
+             leaves the singly-seamed sector's fill chain clean (§6.7.5.4 case (6))",
+        );
+        arc.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 cases (5)/(6): the inner miter's extra boundvert **desynchronises**
+    /// mechanism (2)'s ring walk, and the desync is observable as *missing* bridge edges,
+    /// never misplaced ones. Same junction, same miter, same seam count — only the anchor's
+    /// following sector differs:
+    ///
+    /// - flanks `(0, 1)`: the gap edge `2` is anchored at `1`, whose following sector is the
+    ///   *split* `[v, b, c]`, so the span's single ring step lands on that sector's arc fill
+    ///   chain instead of edge `2`'s strip chain. The corner-run pass runs *after* the walk
+    ///   and *assigns*, so that sector's FALSE AND wipes the burnt step: `mark_seam` ON is
+    ///   canonically identical to OFF (6 → 6) — the parameter is fully inert here, while the
+    ///   same walk with a `Sharp` inner miter bridges normally (4 → 6).
+    /// - flanks `(1, 2)`: the span is anchored at `2`, whose following sector is the
+    ///   *unsplit* reflex quad, so it bridges normally (6 → 8 = `m · segments`).
+    #[test]
+    fn inner_miter_arc_desynchronises_the_ring_walk() {
+        let seam = |m: &LoopMesh, e: EdgeKey| m.edge_seam(e);
+
+        // The desynced arm: the burnt step is erased, so ON ≡ OFF.
+        let (arc_on, arc_on_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0, 1], &[], true, false);
+        let (arc_off, arc_off_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0, 1], &[], false, false);
+        assert_eq!(
+            count_flagged_result_edges(&arc_off, &arc_off_r, seam),
+            6,
+            "mechanism (1) alone: four longitudinals + the doubly-seamed fill chain",
+        );
+        assert_eq!(
+            count_flagged_result_edges(&arc_on, &arc_on_r, seam),
+            6,
+            "the desynced span burns its only step on a fill chain, which the corner-run \
+             pass then clears: mark_seam is inert at this junction (§6.7.5.4 case (6))",
+        );
+
+        // The same walk over an unsplit sector bridges normally.
+        let (sharp_on, sharp_on_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Sharp, &[0, 1], &[], true, false);
+        assert_eq!(
+            count_flagged_result_edges(&sharp_on, &sharp_on_r, seam),
+            6,
+            "with no split sector in the span's path the gap bridges: 4 → 6",
+        );
+
+        // The mirror configuration: the anchor's following sector is the unsplit reflex
+        // quad, so the arc miter bridges normally too.
+        let (mirror_on, mirror_on_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[1, 2], &[], true, false);
+        let (mirror_off, mirror_off_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[1, 2], &[], false, false);
+        assert_eq!(
+            count_flagged_result_edges(&mirror_off, &mirror_off_r, seam),
+            6,
+            "mechanism (1) is symmetric between the two non-reflex sectors",
+        );
+        assert_eq!(
+            count_flagged_result_edges(&mirror_on, &mirror_on_r, seam),
+            8,
+            "anchored at an unsplit following sector, the span lands on the gap's strip \
+             chain: 6 → 8 = m · segments (§6.7.5.4 case (5))",
+        );
+        arc_on.validate_topology();
+        mirror_on.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (6), `mark_sharp` companion: the sharp bit runs the identical
+    /// mechanisms on an independent flag, so the inner miter's fill-chain corner run and its
+    /// ring-walk desync reproduce the seam counts exactly.
+    #[test]
+    fn inner_miter_arc_fill_chain_sharp_bit_matches_the_seam_counts() {
+        let sharp_flag = |m: &LoopMesh, e: EdgeKey| m.edge_sharp(e);
+        let (off, off_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[], &[0, 1], false, false);
+        let (on, on_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[], &[0, 1], false, true);
+        let (mirror_on, mirror_on_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[], &[1, 2], false, true);
+
+        assert_eq!(count_flagged_result_edges(&off, &off_r, sharp_flag), 6);
+        assert_eq!(
+            count_flagged_result_edges(&on, &on_r, sharp_flag),
+            6,
+            "mark_sharp desyncs on the inner miter exactly as mark_seam does",
+        );
+        assert_eq!(
+            count_flagged_result_edges(&mirror_on, &mirror_on_r, sharp_flag),
+            8,
+            "the mirror configuration bridges on the sharp bit too",
+        );
+    }
+
+    /// BEVEL.md §6.7.5.4 case (2) / §6.7.1.1(a′): one flagged flank alone cannot flag a
+    /// fill chain — the per-face AND fails — and cannot bridge either (a lone flagged disk
+    /// edge has no gap to delimit). So a single seamed apex edge leaves only its own strip's
+    /// two outer longitudinals, with `mark_seam` on or off.
+    #[test]
+    fn inner_miter_arc_single_flagged_flank_is_inert() {
+        let seam = |m: &LoopMesh, e: EdgeKey| m.edge_seam(e);
+        let (on, on_r) = reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0], &[], true, false);
+        let (off, off_r) = reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0], &[], false, false);
+        assert_eq!(
+            count_flagged_result_edges(&off, &off_r, seam),
+            2,
+            "one seamed flank: mechanism (1)'s two longitudinals, no fill chain",
+        );
+        assert_eq!(
+            count_flagged_result_edges(&on, &on_r, seam),
+            2,
+            "a lone flagged disk edge has no gap to bridge (§6.7.5.4 case (2))",
+        );
+    }
+
+    /// BEVEL.md §7.6.1 / §8.9.2.2: a **multi-face** split sector — a non-reflex sector that
+    /// absorbed an unbeveled leg — re-stitches *every* one of its faces onto the arc's
+    /// profile-sample run, not just the first. Octagonal apex with legs `0, 2, 3` beveled
+    /// (leg 1 absorbed into the non-reflex `0 → 2` sector) and an inner arc miter over the
+    /// `Sharp` reflex sector: the junction vertex must be fully consumed — a face left
+    /// pointing at it would strand the about-to-be-freed apex.
+    #[test]
+    fn inner_miter_arc_multiface_sector_restitches_every_face() {
+        let (mut mesh, apex, _rim, apex_leg) = octagonal_bipyramid_all_legs();
+        let geom: Vec<GeomKey> = [0usize, 2, 3].iter().map(|&k| apex_leg[k].into()).collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: BevelMiter::Arc,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.1,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert!(
+            !mesh.vert_keys().contains(&apex),
+            "the junction vertex is consumed — no absorbed-leg face still hangs off it",
+        );
+        assert!(
+            !result.verts.is_empty(),
+            "the inner miter engaged at the reflex-carrying octagonal apex",
+        );
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "the multi-face inner-mitered junction stays a closed χ = 2 manifold",
         );
     }
 
