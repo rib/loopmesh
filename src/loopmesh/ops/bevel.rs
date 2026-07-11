@@ -903,6 +903,13 @@ impl LoopMesh {
             }
         }
 
+        // §6.7.1.1(a′): the corner runs, read off the pristine mesh (see the
+        // multi-segment path). At `segments = 1` the only non-empty run is a terminal
+        // third face's 1-for-2 absorbed corner, whose two flanking originals are the
+        // terminal's unbeveled legs; every junction sector face's run is a single
+        // boundvert and flags nothing.
+        let corner_runs = self.snapshot_corner_runs(&substitutions);
+
         // Phase 2: re-stitch every incident face, swapping each consumed endpoint
         // corner for the ordered near-corner vert(s) recorded for that (vertex,
         // face) corner (§7.4 / §7.6.1). A terminal third face swaps its corner for
@@ -952,6 +959,12 @@ impl LoopMesh {
         // (the patch ring segments) are *not* descendants of any single edge — they
         // are the parameter-gated bridging segments of phase 4.5 below.
         self.inherit_strip_long_edge_flags(&beveled_manifold, &corner_vert, &edge_seam_state);
+
+        // Phase 4.25b (§6.7.1.1(a′) mechanism (1)'s corner-run half, UNCONDITIONAL):
+        // the same per-face AND the multi-segment path runs — here it bites only on a
+        // terminal's absorbed corner (flagged iff both of that terminal's unbeveled
+        // legs are flagged).
+        self.apply_corner_run_flags(&corner_runs);
 
         // Phase 4.5 (§6.7.4): the `mark_seam` / `mark_sharp` junction bridging.
         // Mechanism (2): bridge the seam / sharp flag across each junction's patch
@@ -1142,6 +1155,12 @@ impl LoopMesh {
             }
         }
 
+        // §6.7.1.1(a′): read every rebuilt original face's corner run — and the AND of
+        // its two endpoint-incident original edges' flags — off the *pristine* mesh,
+        // while those originals still meet at the corner. Applied once the re-stitch
+        // below has laid the runs down as real face boundary edges (phase 4.25b).
+        let corner_runs = self.snapshot_corner_runs(&face_subst);
+
         // Phase 2: re-stitch every incident face once, swapping each consumed
         // endpoint corner for its recorded vert run (§8.3.0.1 absorb / sector
         // 1-for-1).
@@ -1239,6 +1258,16 @@ impl LoopMesh {
             &chains,
             &edge_seam_state,
         );
+
+        // Phase 4.25b (§6.7.1.1(a′) mechanism (1)'s corner-run half, UNCONDITIONAL):
+        // every rebuilt original face's corner run carries the flag iff **both** of
+        // that face's endpoint-incident original edges carry it. One pass, no case
+        // analysis: a miter-free sector's run is a lone boundvert and flags nothing, a
+        // mitered sector's run is the miter fill chain (flagged when both flanking
+        // beveled edges are), a multi-face reflex sector's absorbed legs break the AND
+        // on every face that owns a fill edge, and a terminal's absorbing face runs the
+        // far-end cross-section chain against its two unbeveled legs.
+        self.apply_corner_run_flags(&corner_runs);
 
         // Phase 4.5 (§6.7.5.3 mechanism (2), gated by `mark_seam` / `mark_sharp`):
         // bridge each junction's unseamed-gap beveled edge as a **run of `segments`
@@ -4965,6 +4994,77 @@ impl LoopMesh {
         }
     }
 
+    /// Snapshot mechanism (1)'s **corner runs** against the pristine mesh
+    /// (BEVEL.md §6.7.1.1(a′) / §6.7.5.2), before the re-stitch consumes the
+    /// beveled endpoints' corners.
+    ///
+    /// Re-stitching a face `f` that touched a consumed endpoint `v` replaces `v`'s
+    /// corner by the ordered run of outermost-ring verts recorded for `(v, f)` —
+    /// that run *is* `f`'s corner run, and every edge joining two consecutive verts
+    /// of it is a corner segment. The run carries `f`'s two `v`-incident **original**
+    /// edges' flags ANDed together: it is flagged iff *both* of them are flagged.
+    ///
+    /// Because the runs come from the face-substitution table, only faces that
+    /// **existed before the bevel** are ever considered — the face-provenance half of
+    /// §6.7.1.1(a). An edge whose two faces are both new (a patch side, an interior
+    /// vmesh ring, a junction-end cross-section chain) belongs to no corner run and is
+    /// governed by mechanism (2) alone.
+    ///
+    /// The pass is deliberately free of case analysis: it does not look at the miter
+    /// kind, at whether the sector's boundvert was split, or at `mark_seam` /
+    /// `mark_sharp`. A miter-free junction sector's run is a single boundvert (zero
+    /// edges — the gate runs and does no work); a mitered sector's run is the miter's
+    /// fill chain; a terminal's absorbing face's run is the beveled edge's far-end
+    /// cross-section chain, whose two flanking originals are the terminal's unbeveled
+    /// legs.
+    fn snapshot_corner_runs(&self, substitutions: &[FaceSubstitution]) -> Vec<CornerRun> {
+        let mut runs: Vec<CornerRun> = Vec::new();
+        for substitution in substitutions {
+            if substitution.verts.len() < 2 {
+                continue; // an empty run: nothing to flag
+            }
+            let Some((incoming, outgoing)) =
+                self.face_corner_edges(substitution.face, substitution.vertex)
+            else {
+                continue;
+            };
+            let seam = self.edge_seam(incoming) && self.edge_seam(outgoing);
+            let sharp = self.edge_sharp(incoming) && self.edge_sharp(outgoing);
+            if !seam && !sharp {
+                continue;
+            }
+            runs.push(CornerRun {
+                verts: substitution.verts.clone(),
+                seam,
+                sharp,
+            });
+        }
+        runs
+    }
+
+    /// Stamp the snapshotted corner runs' seam / sharp bits onto the rebuilt faces'
+    /// corner segments (BEVEL.md §6.7.1.1(a′), mechanism (1) — UNCONDITIONAL).
+    ///
+    /// Run after the re-stitch, when each run's consecutive verts are consecutive on
+    /// a rebuilt face's boundary and so the corner segments exist. A run of `> 1`
+    /// segment (a miter fill chain, a terminal's far-end chain) is flagged all or
+    /// nothing: the AND is evaluated once per face, not once per segment.
+    fn apply_corner_run_flags(&mut self, runs: &[CornerRun]) {
+        for run in runs {
+            for pair in run.verts.windows(2) {
+                let Some(segment) = self.query_edge_exists(pair[0], pair[1]) else {
+                    continue;
+                };
+                if run.seam {
+                    self.set_edge_seam(segment, true);
+                }
+                if run.sharp {
+                    self.set_edge_sharp(segment, true);
+                }
+            }
+        }
+    }
+
     /// Bridge the seam / sharp flag across one junction's patch ring segments
     /// (BEVEL.md §6.7.4 — mechanism (2), gated by `mark_seam` / `mark_sharp`).
     ///
@@ -6398,6 +6498,17 @@ struct FaceSubstitution {
     vertex: VertexKey,
     face: FaceKey,
     verts: Vec<VertexKey>,
+}
+
+/// One rebuilt original face's **corner run** at a consumed endpoint, with the
+/// flags mechanism (1) hands it (BEVEL.md §6.7.1.1(a′)): the ordered outermost-ring
+/// verts the face's corner became, plus the AND of that face's two `v`-incident
+/// original edges' seam / sharp bits. Snapshotted against the pristine mesh, applied
+/// after the re-stitch.
+struct CornerRun {
+    verts: Vec<VertexKey>,
+    seam: bool,
+    sharp: bool,
 }
 
 /// Record (or overwrite) the ordered substitution for `(vertex, face)`.
@@ -13996,6 +14107,149 @@ mod tests {
         );
         on.validate_topology();
         off.validate_topology();
+    }
+
+    /// Bevel the three apex edges of `single_face_reflex_junction` (`segments = 2`,
+    /// `offset = 0.2`, `vmesh_method = ADJ`) with the named apex edges seamed. The
+    /// reflex sector is the wide quad `v–c–w–a`, so its two `v`-incident originals are
+    /// the flanking beveled edges `va` (index 0) and `vc` (index 2); `vb` (index 1) is
+    /// the narrow (bunch-side) edge between them. Drives BEVEL.md §6.7.5.4 cases
+    /// (2)–(3).
+    fn bevel_single_face_reflex_seamed(
+        seamed: &[usize],
+        miter_outer: BevelMiter,
+        mark_seam: bool,
+    ) -> LoopMesh {
+        let (mut mesh, _apex, apex_edges) = single_face_reflex_junction();
+        for &k in seamed {
+            mesh.set_edge_seam(apex_edges[k], true);
+        }
+        mesh.bevel(
+            &apex_edges.map(GeomKey::from),
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer,
+                mark_seam,
+                ..Default::default()
+            },
+        );
+        mesh
+    }
+
+    /// Every live seamed edge of the mesh.
+    fn seamed_edge_count(mesh: &LoopMesh) -> usize {
+        mesh.edge_keys()
+            .into_iter()
+            .filter(|&e| mesh.edge_seam(e))
+            .count()
+    }
+
+    /// BEVEL.md §6.7.5.4 case (3): at a **single-face** reflex `ARC` miter the reflex
+    /// sector's one wide face has the miter's fill chain as its **corner run**, and its
+    /// two `v`-incident originals are the two flanking beveled edges. Both flanks
+    /// seamed ⇒ the §6.7.1.1 AND passes ⇒ **every** fill-chain edge is seamed. With
+    /// `mark_seam` ON the junction carries `4` outer longitudinal (mechanism (1)) + `2`
+    /// gap-bridge (mechanism (2), `1 × segments` across the unseamed `vb`) + `2`
+    /// arc-fill (the corner run) = **8** seam edges.
+    #[test]
+    fn single_face_reflex_arc_fill_chain_flagged_when_both_flanks_seamed() {
+        let mesh = bevel_single_face_reflex_seamed(&[0, 2], BevelMiter::Arc, true);
+        assert_eq!(
+            seamed_edge_count(&mesh),
+            8,
+            "4 outer longitudinal + 2 gap-bridge + 2 arc-fill seam edges (§6.7.5.4 case (3))",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (3): the corner-run AND is **mechanism (1)** and so is
+    /// *not* gated by `mark_seam`. Turning the parameter off removes only the two
+    /// gap-bridge edges across the unseamed narrow edge — the four outer longitudinal
+    /// edges and the **two arc-fill edges** stay seamed (`8 − 2 = 6`). This is the
+    /// sharpest available demonstration that the fill chain is not parameter-gated.
+    #[test]
+    fn single_face_reflex_arc_fill_chain_fires_with_mark_seam_off() {
+        let on = bevel_single_face_reflex_seamed(&[0, 2], BevelMiter::Arc, true);
+        let off = bevel_single_face_reflex_seamed(&[0, 2], BevelMiter::Arc, false);
+        assert_eq!(
+            seamed_edge_count(&on) - seamed_edge_count(&off),
+            2,
+            "mark_seam adds only the `1 × segments = 2`-edge bunch-side gap bridge",
+        );
+        assert_eq!(
+            seamed_edge_count(&off),
+            6,
+            "with the parameter OFF mechanism (1) still flags the 4 outer longitudinal \
+             edges AND the 2 arc-fill corner-run edges (§6.7.5.4 case (3))",
+        );
+        off.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.5.4 case (2): a **single** seamed edge into the same reflex `ARC`
+    /// miter junction leaves both mechanisms inert on the fill. Mechanism (2) never
+    /// runs (a lone flagged edge finds no second one, so there is no gap); the corner-run
+    /// AND fails (only one of the reflex face's two flanking originals is seamed). The
+    /// seam runs up the seamed strip's two outer longitudinal edges and stops — 2 seam
+    /// edges, and identical with `mark_seam` off.
+    #[test]
+    fn single_seamed_edge_into_reflex_arc_miter_is_inert() {
+        let on = bevel_single_face_reflex_seamed(&[0], BevelMiter::Arc, true);
+        let off = bevel_single_face_reflex_seamed(&[0], BevelMiter::Arc, false);
+        assert_eq!(
+            seamed_edge_count(&on),
+            2,
+            "one seamed flank flags only its strip's two outer longitudinal edges: the \
+             arc fill's corner-run AND fails and no gap exists (§6.7.5.4 case (2))",
+        );
+        assert_eq!(
+            seamed_edge_count(&off),
+            seamed_edge_count(&on),
+            "with one seamed edge the parameter is inert (§6.7.5.4 case (2))",
+        );
+        on.validate_topology();
+    }
+
+    /// BEVEL.md §6.7.1.1(a): the face-provenance half of the corner-segment test. An
+    /// **all-seamed** three-edge junction must flag **no** patch ring segment — every
+    /// patch side lies between the patch fill and a strip, both new, so it is not a
+    /// corner segment however its two boundverts trace back. An implementation that
+    /// tests only endpoint ownership over-flags the whole boundvert ring here.
+    #[test]
+    fn all_seamed_junction_does_not_overflag_the_patch_ring() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let p0 = Vec3::new(1.0, -1.0, -1.0);
+        let e01 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, p0, Vec3::new(1.0, -1.0, 1.0));
+        for edge in [e01, e03, e04] {
+            mesh.set_edge_seam(edge, true);
+        }
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                mark_seam: true,
+                ..Default::default()
+            },
+        );
+
+        let sets = junction_expected_sets();
+        let seamed = flagged_new_edge_set(&mesh, &result, |m, e| m.edge_seam(e));
+        assert!(
+            seamed.is_disjoint(&sets.ring),
+            "an all-seamed junction bridges nothing: no patch ring segment is a corner \
+             segment (§6.7.1.1(a) / §6.7.4)",
+        );
+        assert!(
+            !seamed.is_empty(),
+            "the seamed beveled edges still flag their strip long edges (mechanism (1))",
+        );
+        mesh.validate_topology();
     }
 
     /// The minimum ring slide of a corner: distance from the original corner
