@@ -277,7 +277,11 @@ impl LoopMesh {
         }
 
         if matrix != Mat4::IDENTITY {
-            for &vert in [north, south].iter().chain(arc_a.iter()).chain(arc_b.iter()) {
+            for &vert in [north, south]
+                .iter()
+                .chain(arc_a.iter())
+                .chain(arc_b.iter())
+            {
                 let local = self.vertex_position(vert);
                 self.set_vertex_position(vert, matrix.transform_point3(local));
             }
@@ -286,7 +290,11 @@ impl LoopMesh {
         for &face in &faces {
             self.face_calc_normal(face);
         }
-        for &vert in [north, south].iter().chain(arc_a.iter()).chain(arc_b.iter()) {
+        for &vert in [north, south]
+            .iter()
+            .chain(arc_a.iter())
+            .chain(arc_b.iter())
+        {
             self.vert_normal_update(vert);
         }
 
@@ -320,7 +328,8 @@ impl LoopMesh {
 
         let mut loops: smallvec::SmallVec<[LoopKey; 4]> = smallvec::SmallVec::new();
         // (loop, u, v, is_pole)
-        let mut corners: smallvec::SmallVec<[(LoopKey, f32, f32, bool); 4]> = smallvec::SmallVec::new();
+        let mut corners: smallvec::SmallVec<[(LoopKey, f32, f32, bool); 4]> =
+            smallvec::SmallVec::new();
 
         for &face in faces {
             loops.clear();
@@ -394,7 +403,11 @@ impl LoopMesh {
         }
 
         // Final left-justify: subtract the global minimum u.
-        let shift = if global_min_u.is_finite() { global_min_u } else { 0.0 };
+        let shift = if global_min_u.is_finite() {
+            global_min_u
+        } else {
+            0.0
+        };
         for (loop_key, uv) in painted {
             self.loop_attribs_mut()
                 .set_vec2(uv_layer, loop_key.as_usize(), [uv[0] - shift, uv[1]]);
@@ -515,7 +528,11 @@ mod tests {
         bicone.create_uvsphere(u as i32, 2, r, Mat4::IDENTITY, false);
 
         assert_eq!(
-            (bicone.vertex_count(), bicone.edge_count(), bicone.face_count()),
+            (
+                bicone.vertex_count(),
+                bicone.edge_count(),
+                bicone.face_count()
+            ),
             (u + 2, 3 * u, 2 * u)
         );
         assert_eq!(euler(&bicone), 2, "bicone is a closed shell (χ = 2)");
@@ -636,8 +653,14 @@ mod tests {
 
         mesh.create_uvsphere(8, 6, r, matrix, false);
 
-        assert!(has_vertex_near(&mesh, matrix.transform_point3(Vec3::new(0.0, 0.0, r))));
-        assert!(has_vertex_near(&mesh, matrix.transform_point3(Vec3::new(0.0, 0.0, -r))));
+        assert!(has_vertex_near(
+            &mesh,
+            matrix.transform_point3(Vec3::new(0.0, 0.0, r))
+        ));
+        assert!(has_vertex_near(
+            &mesh,
+            matrix.transform_point3(Vec3::new(0.0, 0.0, -r))
+        ));
         // The untransformed pole does not survive.
         assert!(!has_vertex_near(&mesh, Vec3::new(0.0, 0.0, r)));
 
@@ -672,11 +695,7 @@ mod tests {
 
         assert_eq!(
             (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
-            (
-                4 + u * (v - 1) + 2,
-                4 + u * (2 * v - 1),
-                1 + u * v
-            )
+            (4 + u * (v - 1) + 2, 4 + u * (2 * v - 1), 1 + u * v)
         );
         for &p in &corners {
             assert!(has_vertex_near(&mesh, p), "prior island vertex {p:?} moved");
@@ -721,7 +740,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_north_top && saw_south_bottom, "poles unwrap to the v edges");
+        assert!(
+            saw_north_top && saw_south_bottom,
+            "poles unwrap to the v edges"
+        );
         assert!(min_u.abs() < EPS, "the unwrap is left-justified to u = 0");
     }
 
@@ -769,7 +791,11 @@ mod tests {
         let mut clamped = LoopMesh::new();
         clamped.create_uvsphere(0, v as i32, 1.0, Mat4::IDENTITY, false);
         assert_eq!(
-            (clamped.vertex_count(), clamped.edge_count(), clamped.face_count()),
+            (
+                clamped.vertex_count(),
+                clamped.edge_count(),
+                clamped.face_count()
+            ),
             (2 * v, 3 * v - 1, v)
         );
 
@@ -801,8 +827,14 @@ mod tests {
         // first interior ring places one vertex at +y and one at −y.
         let phi = std::f64::consts::PI / (v as f64);
         let (s, c) = (phi.sin() as f32, phi.cos() as f32);
-        assert!(has_vertex_near(&mesh, Vec3::new(0.0, s, c)), "j=0 column at +y");
-        assert!(has_vertex_near(&mesh, Vec3::new(0.0, -s, c)), "j=1 column at -y");
+        assert!(
+            has_vertex_near(&mesh, Vec3::new(0.0, s, c)),
+            "j=0 column at +y"
+        );
+        assert!(
+            has_vertex_near(&mesh, Vec3::new(0.0, -s, c)),
+            "j=1 column at -y"
+        );
 
         // The lens keeps half the well-formed `u·v` faces (the coincident pairs
         // welded), so it differs from an unwelded double count.
@@ -832,7 +864,11 @@ mod tests {
         let mut clamped = LoopMesh::new();
         clamped.create_uvsphere(6, 0, 1.0, Mat4::IDENTITY, false);
         assert_eq!(
-            (clamped.vertex_count(), clamped.edge_count(), clamped.face_count()),
+            (
+                clamped.vertex_count(),
+                clamped.edge_count(),
+                clamped.face_count()
+            ),
             (2, 1, 0)
         );
         mesh.validate_topology();

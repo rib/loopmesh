@@ -181,7 +181,6 @@ impl LoopMesh {
     }
 
     /// Append an edge to the disk loop of this hub vertex
-    /// like: bmesh_disk_edge_append
     pub(crate) fn vertex_disk_append_edge(&mut self, vertex: VertexKey, edge: EdgeKey) {
         let disk_loop_start = self.vertices.get(vertex).disk_loop_start;
         match disk_loop_start {
@@ -474,15 +473,20 @@ impl LoopMesh {
 
         let key_watermark = self.loops.key_watermark();
         self.loop_attribs.mint_slot(loopi.as_usize(), key_watermark);
-        self.op_flags.mint_loop_slot(loopi.as_usize(), key_watermark);
+        self.op_flags
+            .mint_loop_slot(loopi.as_usize(), key_watermark);
 
         loopi
     }
 
-    // like: bmesh_radial_loop_append
-    //
-    // Invariant: a loop with a non-null edge is linked into that edge's radial
-    // cycle. A loop is only transiently edge-null while an Euler op rewires it.
+    /// Append `loopi` to `axis_edge`'s radial cycle (§6.5's radial append): the
+    /// new loop is spliced in immediately **after the current entry**, and the
+    /// entry moves onto it. Under the head-anchored storage (entry =
+    /// `radial_link.prev`) that is exactly "insert as the head's predecessor",
+    /// which is what this does — the entry needs no explicit write.
+    ///
+    /// Invariant: a loop with a non-null edge is linked into that edge's radial
+    /// cycle. A loop is only transiently edge-null while an Euler op rewires it.
     pub(crate) fn face_loop_connect_edge(&mut self, axis_edge: EdgeKey, loopi: LoopKey) {
         let cur = self.loops.get(loopi).edge;
         assert!(
@@ -513,7 +517,12 @@ impl LoopMesh {
         self.loops.get_mut(loopi).edge = axis_edge;
     }
 
-    /// like: bmesh_radial_loop_remove
+    /// Remove `loopi` from its edge's radial cycle (§6.5's radial removal). The
+    /// survivors keep their cyclic order; only the **entry** can move, and it
+    /// moves **forward** — onto the removed loop's radial successor — exactly
+    /// when the removed loop *was* the entry. Observably: the traversal after
+    /// the removal is the traversal before it minus the removed loop; nothing
+    /// rotates.
     pub(crate) fn face_loop_disconnect_edge(&mut self, loopi: LoopKey) {
         // Bind the edge value into a local first so subsequent get_mut
         // calls on the same loop don't conflict with an outstanding borrow.
@@ -525,8 +534,7 @@ impl LoopMesh {
 
         // Two cases:
         // - last loop on this edge's radial — set edge.radial_link = None.
-        // - otherwise — splice out the loop. If edge.radial_link == loopi,
-        //   redirect it to old_links.next.
+        // - otherwise — splice out the loop and re-seat the head as needed.
         // Detect "only loop in the cycle" via `next == loopi` (a single-
         // element cycle self-points). A length-2 cycle has prev == next ==
         // the OTHER loop, so `prev != next` would incorrectly mark it as
@@ -544,8 +552,28 @@ impl LoopMesh {
             self.loops.get_mut(loopi).edge_radial_links = old_links;
             self.loops.get_mut(nexti).edge_radial_links = next_links;
 
-            if self.edges.get(axis_edge).radial_link == Some(loopi) {
+            let head = self
+                .edges
+                .get(axis_edge)
+                .radial_link
+                .expect("a loop on a radial cycle implies the edge has a head");
+            if head == loopi {
+                // The head left. The entry (`head.prev`) is untouched by the
+                // splice, so the head only has to step forward to keep naming
+                // the same cycle — the derived entry is unchanged.
                 self.edges.get_mut(axis_edge).radial_link = Some(nexti);
+            } else if nexti == head {
+                // The loop that left WAS the entry (entry == head.prev, i.e.
+                // entry.next == head). §6.5's companion re-seat for a
+                // head-anchored layout: step the head forward, so the derived
+                // entry lands on the *old* head — the removed entry's radial
+                // successor. Leaving the head put would slide the entry
+                // backwards instead, which is invisible below radial length 3
+                // and wrong above it. (At length 2 the head's post-splice
+                // successor is itself, so the sole survivor stays both head and
+                // entry.)
+                let new_head = self.loops.get(head).edge_radial_links.next;
+                self.edges.get_mut(axis_edge).radial_link = Some(new_head);
             }
         } else {
             self.edges.get_mut(axis_edge).radial_link = None;
@@ -722,8 +750,6 @@ impl LoopMesh {
     ///                                      ^
     ///                               invalid loop
     /// ```
-    ///
-    /// like: bmesh_edge_vert_swap (but swapped dst/src arguments)
     pub(crate) fn edge_replace_vertex_raw(
         &mut self,
         edge: EdgeKey,
@@ -887,7 +913,10 @@ impl LoopMesh {
     ///
     /// Both faces must be live and distinct.
     pub(crate) fn face_adopt_loop_cycle(&mut self, dst: FaceKey, donor: FaceKey) {
-        assert_ne!(dst, donor, "face_adopt_loop_cycle: dst and donor must differ");
+        assert_ne!(
+            dst, donor,
+            "face_adopt_loop_cycle: dst and donor must differ"
+        );
 
         // Free dst's current loop cycle, leaving its face slab entry in place.
         let dst_first = self.faces.get(dst).first_edge_loop;
@@ -923,6 +952,183 @@ impl LoopMesh {
         self.flags |= LoopMeshFlags::LOOPS_INDEX_DIRTY;
 
         self.remove_face_slab_entry(donor);
+    }
+}
+
+#[cfg(test)]
+mod radial_entry_convention_tests {
+    use crate::loopmesh::*;
+    use glam::Vec3;
+
+    /// `n` triangular pages sharing one spine edge, attached in build order:
+    /// page `k` is `[spine_a, spine_b, tip_k]`. The spine's radial cycle is
+    /// therefore a pristine (append-only) cycle of length `n`, with pages
+    /// `L₁ … Lₙ` in attachment order. Returns `(spine_edge, pages)`.
+    fn build_book(mesh: &mut LoopMesh, n: usize) -> (EdgeKey, Vec<FaceKey>) {
+        let spine_a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let spine_b = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let pages: Vec<FaceKey> = (0..n)
+            .map(|i| {
+                let tip = mesh.create_vertex(Vec3::new(1.0 + i as f32, 0.5, 0.0));
+                mesh.face_create_verts(&[spine_a, spine_b, tip], FaceCreateFlags::NONE)
+            })
+            .collect();
+        let spine = mesh
+            .query_edge_exists(spine_a, spine_b)
+            .expect("every page adopted the same spine");
+        (spine, pages)
+    }
+
+    /// The §6.2 traversal of `edge`'s radial cycle, read as faces.
+    fn traversal(mesh: &LoopMesh, edge: EdgeKey) -> Vec<FaceKey> {
+        mesh.edge_radial_iter(edge)
+            .map(|l| mesh.loop_face(l))
+            .collect()
+    }
+
+    /// Add one more page to an existing spine — a fresh radial append.
+    fn append_page(mesh: &mut LoopMesh, spine: EdgeKey, tip_x: f32) -> FaceKey {
+        let [spine_a, spine_b] = mesh.edge_vert_keys(spine);
+        let tip = mesh.create_vertex(Vec3::new(tip_x, 0.5, 0.0));
+        mesh.face_create_verts(&[spine_a, spine_b, tip], FaceCreateFlags::NONE)
+    }
+
+    /// §6.2 — the radial walk starts at the **entry**, which on a pristine
+    /// (append-only) cycle is the *last*-attached loop: `Lₙ, L₁, …, Lₙ₋₁`.
+    /// A walk seeded from the stored head would read `L₁ … Lₙ` — the same cycle
+    /// rotated by one. Radial length 3 is the shortest that separates them from
+    /// a mere reversal.
+    #[test]
+    fn radial_traversal_starts_at_the_entry_not_the_head() {
+        let mut mesh = LoopMesh::new();
+        let (spine, p) = build_book(&mut mesh, 3);
+
+        assert_eq!(
+            traversal(&mesh, spine),
+            vec![p[2], p[0], p[1]],
+            "§6.2: forward from the entry (the last-attached page), not from the head"
+        );
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(spine).expect("non-wire spine")),
+            p[2],
+        );
+    }
+
+    /// §6.5 Consequence 1 — "the traversal after a removal is the traversal
+    /// before it, minus the removed loop; nothing rotates." Checked at radial
+    /// length 4 for every removal position, including the **entry** itself,
+    /// which is the only position that moves the pointer (forward, onto the
+    /// removed loop's successor). Below length 3 every candidate re-seat rule
+    /// agrees, so this has to be tested up here.
+    #[test]
+    fn radial_removal_leaves_the_traversal_minus_the_removed_loop() {
+        // Pristine traversal is L4 L1 L2 L3; each case strikes one page out.
+        let cases: [(usize, [usize; 3]); 4] = [
+            (0, [3, 1, 2]), // the stored head, not the entry
+            (1, [3, 0, 2]), // a middle page
+            (2, [3, 0, 1]), // a middle page
+            (3, [0, 1, 2]), // the ENTRY — re-seats FORWARD onto L4.next = L1
+        ];
+        for (killed, expected) in cases {
+            let mut mesh = LoopMesh::new();
+            let (spine, p) = build_book(&mut mesh, 4);
+            assert_eq!(traversal(&mesh, spine), vec![p[3], p[0], p[1], p[2]]);
+
+            mesh.face_kill(p[killed]);
+            mesh.validate_topology();
+
+            assert_eq!(
+                traversal(&mesh, spine),
+                expected.iter().map(|&i| p[i]).collect::<Vec<_>>(),
+                "removing page {killed} must delete it from the traversal, not rotate it \
+                 (a backwards re-seat of the entry would rotate the whole walk)"
+            );
+        }
+    }
+
+    /// §6.5's removal→append→removal trace — the case that separates the
+    /// **local** rule (the entry steps one place forward along the cycle) from
+    /// every rule phrased in terms of attachment order. After an entry removal
+    /// the forward order is no longer attachment order, permanently, so
+    /// "re-seat onto the first-attached survivor" and "onto the last-attached
+    /// survivor" both part company with the model here.
+    #[test]
+    fn radial_entry_reseat_is_local_not_attachment_order() {
+        let mut mesh = LoopMesh::new();
+        let (spine, p) = build_book(&mut mesh, 4);
+
+        // Kill the entry L4: entry goes forward onto L1.
+        mesh.face_kill(p[3]);
+        assert_eq!(traversal(&mesh, spine), vec![p[0], p[1], p[2]]);
+
+        // Append L5: it splices in after the entry L1 and the entry moves onto
+        // it, giving the cycle L1 → L5 → L2 → L3 and the traversal L5 L2 L3 L1.
+        let p4 = append_page(&mut mesh, spine, 9.0);
+        mesh.validate_topology();
+        assert_eq!(
+            traversal(&mesh, spine),
+            vec![p4, p[1], p[2], p[0]],
+            "the append lands after the entry, and the forward order has now \
+             diverged from attachment order for good"
+        );
+
+        // Kill the entry L5: forward onto L5.next = L2.
+        mesh.face_kill(p4);
+        mesh.validate_topology();
+        let after = traversal(&mesh, spine);
+        assert_eq!(after, vec![p[1], p[2], p[0]], "entry := removed.next = L2");
+        assert_ne!(
+            after,
+            vec![p[0], p[1], p[2]],
+            "not the first-attached survivor"
+        );
+        assert_ne!(
+            after,
+            vec![p[2], p[0], p[1]],
+            "not the last-attached survivor"
+        );
+    }
+
+    /// §8.7 — the edge splice consumes `e_src` in its §6.2 traversal order and
+    /// appends each loop by the ordinary radial append, so `e_dst`'s post-splice
+    /// entry is the loop visited **last**. This is the guide's worked example on
+    /// the nose: `e_dst` reading `[F3, F2]` and `e_src` reading `[F1, F0]` splice
+    /// to `e_dst` reading `[F0, F2, F3, F1]`.
+    ///
+    /// A snapshot taken from `e_src`'s *head* instead would visit `F0, F1` and
+    /// land `[F1, F2, F3, F0]` — same faces, same incidences, different cycle
+    /// and different entry.
+    #[test]
+    fn edge_splice_folds_src_traversal_onto_dst_entry() {
+        let mut mesh = LoopMesh::new();
+        let (e_dst, p) = build_book(&mut mesh, 4);
+
+        // Peel pages 0 and 1 (in that order) onto a parallel edge, leaving
+        // e_dst reading [p3, p2] and building e_src reading [p1, p0].
+        let e_src = mesh.create_edge(mesh.edge_vert_keys(e_dst), EdgeCreateFlags::NONE);
+        for page in [p[0], p[1]] {
+            let l = mesh
+                .face_edge_share_loop(page, e_dst)
+                .expect("page sits on the spine");
+            mesh.face_loop_disconnect_edge(l);
+            mesh.face_loop_connect_edge(e_src, l);
+        }
+        assert_eq!(traversal(&mesh, e_dst), vec![p[3], p[2]]);
+        assert_eq!(traversal(&mesh, e_src), vec![p[1], p[0]]);
+
+        assert!(mesh.edge_splice(e_dst, e_src));
+        mesh.validate_topology();
+
+        assert_eq!(
+            traversal(&mesh, e_dst),
+            vec![p[0], p[2], p[3], p[1]],
+            "§8.7's closed form: fold [s₀ … sₖ₋₁] over [d₀ … dₘ₋₁] one append at a time"
+        );
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(e_dst).expect("non-wire")),
+            p[0],
+            "the post-splice entry is the loop visited last",
+        );
     }
 }
 

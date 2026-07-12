@@ -343,7 +343,13 @@ impl LoopMesh {
         use_existing_faces: bool,
         provider: &dyn ConvexHullProvider,
     ) -> ConvexHullResult {
-        self.convex_hull_dispatch(verts, input_edges, input_faces, use_existing_faces, provider)
+        self.convex_hull_dispatch(
+            verts,
+            input_edges,
+            input_faces,
+            use_existing_faces,
+            provider,
+        )
     }
 
     /// The provider-generic front half: guard, cloud, hull. Kept deliberately
@@ -1055,11 +1061,19 @@ mod tests {
     /// Assert the closed-surface invariants the guide names for a fully
     /// 3D hull (CONVEX_HULL.md §9, "Full-stack invariants"): every input vert
     /// on the hull, all faces triangles, Euler V−E+F=2, and outward winding.
-    fn assert_closed_hull_invariants(mesh: &mut LoopMesh, result: &ConvexHullResult, input: &[VertexKey]) {
+    fn assert_closed_hull_invariants(
+        mesh: &mut LoopMesh,
+        result: &ConvexHullResult,
+        input: &[VertexKey],
+    ) {
         // Every input vertex is extremal for these clouds → on the hull.
-        let on_hull: std::collections::HashSet<VertexKey> = result.verts().iter().copied().collect();
+        let on_hull: std::collections::HashSet<VertexKey> =
+            result.verts().iter().copied().collect();
         for &v in input {
-            assert!(on_hull.contains(&v), "input vertex {v:?} must be on the hull");
+            assert!(
+                on_hull.contains(&v),
+                "input vertex {v:?} must be on the hull"
+            );
         }
 
         // All hull faces are triangles (the fan output, §3.1).
@@ -1071,7 +1085,11 @@ mod tests {
         let v = result.verts().len() as i64;
         let e = result.edges().len() as i64;
         let f = result.faces().len() as i64;
-        assert_eq!(v - e + f, 2, "Euler characteristic of a closed hull surface is 2");
+        assert_eq!(
+            v - e + f,
+            2,
+            "Euler characteristic of a closed hull surface is 2"
+        );
 
         // Outward winding: each face normal points away from the centroid (§3.2).
         let center = centroid(mesh, input);
@@ -1098,7 +1116,11 @@ mod tests {
         assert_eq!(result.verts().len(), 8, "all eight corners are extremal");
         // A cube hull is 6 quad facets, each fanned into 2 triangles → 12.
         assert_eq!(result.faces().len(), 12, "cube hull fans to 12 triangles");
-        assert_eq!(result.edges().len(), 18, "12 cube edges + 6 facet diagonals");
+        assert_eq!(
+            result.edges().len(),
+            18,
+            "12 cube edges + 6 facet diagonals"
+        );
 
         assert_closed_hull_invariants(&mut mesh, &result, &input);
         mesh.validate_topology();
@@ -1120,7 +1142,11 @@ mod tests {
 
         assert_eq!(mesh.vertex_count(), 4, "no vertex is created");
         assert_eq!(result.verts().len(), 4, "all four corners are extremal");
-        assert_eq!(result.faces().len(), 4, "a tetrahedron hull is four triangles");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "a tetrahedron hull is four triangles"
+        );
         assert_eq!(result.edges().len(), 6, "a tetrahedron has six edges");
 
         assert_closed_hull_invariants(&mut mesh, &result, &input);
@@ -1140,13 +1166,18 @@ mod tests {
 
         let result = mesh.convex_hull(&input);
 
-        let on_hull: std::collections::HashSet<VertexKey> = result.verts().iter().copied().collect();
+        let on_hull: std::collections::HashSet<VertexKey> =
+            result.verts().iter().copied().collect();
         assert!(
             !on_hull.contains(&interior),
             "the buried centre point must not be on the hull"
         );
         assert_eq!(result.verts().len(), 8, "only the eight extremal corners");
-        assert_eq!(result.faces().len(), 12, "the hull is still the cube → 12 triangles");
+        assert_eq!(
+            result.faces().len(),
+            12,
+            "the hull is still the cube → 12 triangles"
+        );
         // The closed-hull invariants hold over the eight extremal corners.
         assert_closed_hull_invariants(&mut mesh, &result, &input[..8]);
         mesh.validate_topology();
@@ -1229,9 +1260,17 @@ mod tests {
         // A flat patch is a disk, not a closed surface: it is fanned into
         // triangles, every face stays in the input plane (no invented vertex).
         // A quad facet fans into 4 − 2 = 2 triangles.
-        assert_eq!(result.faces().len(), 2, "the quad facet fans to two triangles");
+        assert_eq!(
+            result.faces().len(),
+            2,
+            "the quad facet fans to two triangles"
+        );
         for &face in result.faces() {
-            assert_eq!(mesh.face_len(face), 3, "the flat facet is fanned to triangles");
+            assert_eq!(
+                mesh.face_len(face),
+                3,
+                "the flat facet is fanned to triangles"
+            );
         }
         for &v in result.verts() {
             assert!(
@@ -1275,10 +1314,16 @@ mod tests {
             result.geom_out().is_empty(),
             "a 1D hull materialises nothing, so geom.out is empty (verts included)"
         );
-        assert!(result.verts().is_empty(), "the extreme endpoints are NOT on-hull");
+        assert!(
+            result.verts().is_empty(),
+            "the extreme endpoints are NOT on-hull"
+        );
         assert!(result.edges().is_empty(), "a 1D hull builds no hull edges");
         assert!(result.faces().is_empty(), "a 1D hull builds no faces");
-        assert!(result.geom_holes_out().is_empty(), "nothing to reuse ⇒ no holes");
+        assert!(
+            result.geom_holes_out().is_empty(),
+            "nothing to reuse ⇒ no holes"
+        );
 
         // Every input vert — endpoints included — keeps its optimistic interior
         // pre-tag, and (loose) passes the §7 unused test vacuously.
@@ -1322,13 +1367,24 @@ mod tests {
 
         let result = mesh.convex_hull_with_input(&input, &edges, &[], false);
 
-        assert!(result.geom_out().is_empty(), "geom.out is empty — verts and edges alike");
+        assert!(
+            result.geom_out().is_empty(),
+            "geom.out is empty — verts and edges alike"
+        );
         assert_eq!(mesh.face_count(), 0, "the mesh is untouched");
-        assert_eq!(mesh.edge_count(), 4, "no edge is minted on top of the polyline");
+        assert_eq!(
+            mesh.edge_count(),
+            4,
+            "no edge is minted on top of the polyline"
+        );
 
         // All 2n − 1 elements land in both the interior and the unused slots.
         assert_eq!(result.interior_verts().len(), 5);
-        assert_eq!(result.interior_edges().len(), 4, "no polyline edge is a hull edge");
+        assert_eq!(
+            result.interior_edges().len(),
+            4,
+            "no polyline edge is a hull edge"
+        );
         assert_eq!(result.geom_interior_out().len(), 9);
         assert_eq!(result.geom_unused_out().len(), 9);
         mesh.validate_topology();
@@ -1355,7 +1411,11 @@ mod tests {
         let result = mesh.convex_hull(&input);
 
         assert_eq!(mesh.vertex_count(), 5, "no vertex is created");
-        assert_eq!(result.faces().len(), 4, "the hull is still a four-triangle tetrahedron");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "the hull is still a four-triangle tetrahedron"
+        );
 
         let on_hull: std::collections::HashSet<VertexKey> =
             result.verts().iter().copied().collect();
@@ -1366,7 +1426,10 @@ mod tests {
         // Exactly one of {corner 0, its duplicate} represents that position; the
         // on-hull set is the four distinct tetrahedron corners.
         assert_eq!(result.verts().len(), 4, "four distinct extremal corners");
-        assert!(on_hull.contains(&input[0]), "the representative corner 0 is on-hull");
+        assert!(
+            on_hull.contains(&input[0]),
+            "the representative corner 0 is on-hull"
+        );
         mesh.validate_topology();
     }
 
@@ -1402,7 +1465,10 @@ mod tests {
         // The on-hull corners are neither interior nor unused.
         let on_hull = vert_set(result.verts());
         for v in result.interior_verts() {
-            assert!(!on_hull.contains(v), "interior verts are excluded from geom.out");
+            assert!(
+                !on_hull.contains(v),
+                "interior verts are excluded from geom.out"
+            );
         }
 
         // geom_interior.out / geom_unused.out mirror the typed accessors.
@@ -1438,8 +1504,16 @@ mod tests {
 
         let result = mesh.convex_hull(&input);
 
-        assert_eq!(result.interior_verts(), &[center], "the culled centre is interior");
-        assert_eq!(result.unused_verts(), &[center], "the culled centre is unused");
+        assert_eq!(
+            result.interior_verts(),
+            &[center],
+            "the culled centre is interior"
+        );
+        assert_eq!(
+            result.unused_verts(),
+            &[center],
+            "the culled centre is unused"
+        );
         mesh.validate_topology();
     }
 
@@ -1466,8 +1540,16 @@ mod tests {
 
         let all = vert_set(&input);
         assert!(result.verts().is_empty(), "no vert is on-hull on a 1D hull");
-        assert_eq!(vert_set(result.interior_verts()), all, "every vert is interior");
-        assert_eq!(vert_set(result.unused_verts()), all, "every loose vert is unused");
+        assert_eq!(
+            vert_set(result.interior_verts()),
+            all,
+            "every vert is interior"
+        );
+        assert_eq!(
+            vert_set(result.unused_verts()),
+            all,
+            "every loose vert is unused"
+        );
         mesh.validate_topology();
     }
 
@@ -1497,7 +1579,11 @@ mod tests {
             interior == input[0] || interior == duplicate,
             "the buried key is corner 0 or its duplicate"
         );
-        assert_eq!(vert_set(result.unused_verts()), vert_set(&[interior]), "the buried key is unused");
+        assert_eq!(
+            vert_set(result.unused_verts()),
+            vert_set(&[interior]),
+            "the buried key is unused"
+        );
         mesh.validate_topology();
     }
 
@@ -1517,7 +1603,10 @@ mod tests {
 
         let result = mesh.convex_hull(&input);
 
-        assert!(result.interior_verts().is_empty(), "every corner is extremal");
+        assert!(
+            result.interior_verts().is_empty(),
+            "every corner is extremal"
+        );
         assert!(result.unused_verts().is_empty(), "nothing to delete");
         mesh.validate_topology();
     }
@@ -1540,7 +1629,11 @@ mod tests {
 
         let result = mesh.convex_hull(&input);
 
-        assert_eq!(result.interior_verts(), &[interior], "the buried point is still interior");
+        assert_eq!(
+            result.interior_verts(),
+            &[interior],
+            "the buried point is still interior"
+        );
         assert!(
             result.unused_verts().is_empty(),
             "a vert leaned on by a non-input edge is not unused"
@@ -1588,7 +1681,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(interior_edges.contains(&chord), "geom_interior.out carries the chord");
+        assert!(
+            interior_edges.contains(&chord),
+            "geom_interior.out carries the chord"
+        );
         mesh.validate_topology();
     }
 
@@ -1645,7 +1741,11 @@ mod tests {
         let result = mesh.convex_hull_with_input(&input, &[inner], &[], false);
 
         let interior = vert_set(result.interior_verts());
-        assert_eq!(interior, vert_set(&[buried_a, buried_b]), "both buried points interior");
+        assert_eq!(
+            interior,
+            vert_set(&[buried_a, buried_b]),
+            "both buried points interior"
+        );
         // Both are unused: each one's only incident edge is the input `inner`,
         // which has no faces — the general guard passes though neither is loose.
         let _ = inner;
@@ -1655,8 +1755,16 @@ mod tests {
             "all-input-incidence buried verts are unused (not loose, but guarded)"
         );
         // The shared input edge is itself interior + unused (faceless).
-        assert_eq!(result.interior_edges(), &[inner], "the inner edge is interior");
-        assert_eq!(result.unused_edges(), &[inner], "the faceless inner edge is unused");
+        assert_eq!(
+            result.interior_edges(),
+            &[inner],
+            "the inner edge is interior"
+        );
+        assert_eq!(
+            result.unused_edges(),
+            &[inner],
+            "the faceless inner edge is unused"
+        );
         mesh.validate_topology();
     }
 
@@ -1675,18 +1783,22 @@ mod tests {
         // An input chord edge from a cube corner to the buried point.
         let chord = mesh.create_edge([input[0], buried], EdgeCreateFlags::NO_DUPLICATE);
         // A NON-input face that uses both the buried vert and the chord edge.
-        let _non_input_face = mesh.face_create_verts(
-            &[input[0], buried, input[1]],
-            FaceCreateFlags::NO_DUPLICATE,
-        );
+        let _non_input_face =
+            mesh.face_create_verts(&[input[0], buried, input[1]], FaceCreateFlags::NO_DUPLICATE);
 
         // Only the chord is an input edge; the non-input face is not in the input
         // face set.
         let result = mesh.convex_hull_with_input(&input, &[chord], &[], false);
 
         // Both are interior.
-        assert!(result.interior_verts().contains(&buried), "buried vert interior");
-        assert!(result.interior_edges().contains(&chord), "chord edge interior");
+        assert!(
+            result.interior_verts().contains(&buried),
+            "buried vert interior"
+        );
+        assert!(
+            result.interior_edges().contains(&chord),
+            "chord edge interior"
+        );
 
         // Neither is unused: the non-input face leans on both.
         assert!(
@@ -1743,7 +1855,10 @@ mod tests {
         let result = mesh.convex_hull_with_faces(&input, &faces, true);
 
         // No hull triangle is materialised — all four are reused.
-        assert!(result.faces().is_empty(), "every facet is reused, none built");
+        assert!(
+            result.faces().is_empty(),
+            "every facet is reused, none built"
+        );
         assert_eq!(mesh.face_count(), faces_before, "no new face is created");
         assert_eq!(mesh.edge_count(), edges_before, "no new edge is created");
 
@@ -1803,7 +1918,10 @@ mod tests {
 
         let result = mesh.convex_hull_with_input(&input, &patch_edges, &faces, true);
 
-        assert!(result.faces().is_empty(), "every facet is reused, none built");
+        assert!(
+            result.faces().is_empty(),
+            "every facet is reused, none built"
+        );
         assert_eq!(result.hole_faces().len(), 4, "all four facets are holes");
         assert_eq!(
             result.hole_edges().len(),
@@ -1817,8 +1935,15 @@ mod tests {
             "a hole edge is not also reported in geom.out (§6.2 'not already holes')"
         );
         // The input edges are hull edges, so none of them is interior either.
-        assert!(result.interior_edges().is_empty(), "hull edges are not interior");
-        assert_eq!(result.geom_holes_out().len(), 10, "6 hole edges + 4 hole faces");
+        assert!(
+            result.interior_edges().is_empty(),
+            "hull edges are not interior"
+        );
+        assert_eq!(
+            result.geom_holes_out().len(),
+            10,
+            "6 hole edges + 4 hole faces"
+        );
         mesh.validate_topology();
     }
 
@@ -1851,11 +1976,19 @@ mod tests {
             result.faces().is_empty(),
             "every facet is covered by a pre-existing face, so none is built"
         );
-        assert_eq!(mesh.face_count(), faces_before, "no duplicate face is minted");
+        assert_eq!(
+            mesh.face_count(),
+            faces_before,
+            "no duplicate face is minted"
+        );
 
         let holes: std::collections::HashSet<FaceKey> =
             result.hole_faces().iter().copied().collect();
-        assert_eq!(holes.len(), 6, "all six pre-existing facets are reused as holes");
+        assert_eq!(
+            holes.len(),
+            6,
+            "all six pre-existing facets are reused as holes"
+        );
         for &face in &pre {
             assert!(
                 holes.contains(&face),
@@ -1866,8 +1999,14 @@ mod tests {
         // A reused non-input face is not an input face, so it never reaches the
         // interior/unused slots; the two *input* ones were reused, so they don't
         // either.
-        assert!(result.interior_faces().is_empty(), "no reused facet is interior");
-        assert!(result.unused_faces().is_empty(), "no reused facet is unused");
+        assert!(
+            result.interior_faces().is_empty(),
+            "no reused facet is interior"
+        );
+        assert!(
+            result.unused_faces().is_empty(),
+            "no reused facet is unused"
+        );
         mesh.validate_topology();
     }
 
@@ -1915,14 +2054,21 @@ mod tests {
 
         let result = mesh.convex_hull_with_faces(&input, &quads, true);
 
-        assert!(result.faces().is_empty(), "every facet is covered — none is built");
+        assert!(
+            result.faces().is_empty(),
+            "every facet is covered — none is built"
+        );
         assert_eq!(mesh.vertex_count(), 8, "no vertex is created");
         assert_eq!(
             mesh.edge_count(),
             12,
             "no fan diagonal is minted — the skipped triangles build no edge"
         );
-        assert_eq!(mesh.face_count(), 6, "no duplicate triangle is stacked on a quad");
+        assert_eq!(
+            mesh.face_count(),
+            6,
+            "no duplicate triangle is stacked on a quad"
+        );
 
         // The closed cube gives every edge two faces, so no quad is a border face:
         // all six survive the §5 cleanup as holes.
@@ -1936,9 +2082,18 @@ mod tests {
         // A reused face is reclassified out of interior at reuse time, so nothing
         // is named safe-to-delete — the six real hull quads must never be routed
         // into geom_unused.out.
-        assert!(result.interior_faces().is_empty(), "no reused quad is interior");
-        assert!(result.unused_faces().is_empty(), "no hull quad is safe-to-delete");
-        assert!(result.interior_verts().is_empty(), "every cube corner is extremal");
+        assert!(
+            result.interior_faces().is_empty(),
+            "no reused quad is interior"
+        );
+        assert!(
+            result.unused_faces().is_empty(),
+            "no hull quad is safe-to-delete"
+        );
+        assert!(
+            result.interior_verts().is_empty(),
+            "every cube corner is extremal"
+        );
         assert!(result.unused_verts().is_empty());
         assert_eq!(result.verts().len(), 8, "all eight corners on-hull (§6.2)");
         mesh.validate_topology();
@@ -1986,8 +2141,16 @@ mod tests {
             "the rejected candidate means the flat facet is fanned and built fresh"
         );
         // The rejected pentagon is a plain interior input face, hence unused.
-        assert_eq!(result.interior_faces(), &[pentagon], "the pentagon is interior");
-        assert_eq!(result.unused_faces(), &[pentagon], "every interior face is unused");
+        assert_eq!(
+            result.interior_faces(),
+            &[pentagon],
+            "the pentagon is interior"
+        );
+        assert_eq!(
+            result.unused_faces(),
+            &[pentagon],
+            "every interior face is unused"
+        );
         assert!(
             result.interior_verts().contains(&input[4]),
             "the culled interior point is interior"
@@ -2024,7 +2187,11 @@ mod tests {
             result.faces().is_empty(),
             "both fan triangles are covered by the one quad — nothing is built"
         );
-        assert_eq!(mesh.face_count(), 1, "no duplicate triangle is stacked on the quad");
+        assert_eq!(
+            mesh.face_count(),
+            1,
+            "no duplicate triangle is stacked on the quad"
+        );
         assert_eq!(mesh.edge_count(), 4, "no fan diagonal is minted");
 
         // Reused, then un-holed as a border face — but never re-marked interior.
@@ -2036,7 +2203,10 @@ mod tests {
             !result.interior_faces().contains(&quad),
             "a reused facet is not interior, un-holed or not"
         );
-        assert!(result.unused_faces().is_empty(), "and so is never safe-to-delete");
+        assert!(
+            result.unused_faces().is_empty(),
+            "and so is never safe-to-delete"
+        );
         assert_eq!(result.verts().len(), 4, "all four corners on-hull (§6.2)");
         mesh.validate_topology();
     }
@@ -2055,10 +2225,14 @@ mod tests {
         // holes. This test is the ordering, not the arithmetic.
         let mut mesh = LoopMesh::new();
         let input = cloud(&mut mesh, &tetra_positions());
-        let patch_a =
-            mesh.face_create_verts(&[input[0], input[2], input[1]], FaceCreateFlags::NO_DUPLICATE);
-        let patch_b =
-            mesh.face_create_verts(&[input[0], input[1], input[3]], FaceCreateFlags::NO_DUPLICATE);
+        let patch_a = mesh.face_create_verts(
+            &[input[0], input[2], input[1]],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
+        let patch_b = mesh.face_create_verts(
+            &[input[0], input[1], input[3]],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
         let patch = [patch_a, patch_b];
 
         // The patch's five edges, fed as input so the hole-edge half of the cleanup
@@ -2071,7 +2245,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(patch_edges.len(), 5, "two triangles sharing one edge have five");
+        assert_eq!(
+            patch_edges.len(),
+            5,
+            "two triangles sharing one edge have five"
+        );
 
         let result = mesh.convex_hull_with_input(&input, &patch_edges, &patch, true);
 
@@ -2086,7 +2264,10 @@ mod tests {
             result.hole_edges().is_empty(),
             "no surviving hole face means no all-hole edge"
         );
-        assert!(result.geom_holes_out().is_empty(), "geom_holes.out is empty");
+        assert!(
+            result.geom_holes_out().is_empty(),
+            "geom_holes.out is empty"
+        );
 
         // The two pre-built facets are still *reused* — skipped, not rebuilt — and
         // the two missing facets are built.
@@ -2134,9 +2315,17 @@ mod tests {
 
         let result = mesh.convex_hull_with_faces(&input, &quads, true);
 
-        assert_eq!(result.faces().len(), 2, "the open facet is fanned into two triangles");
+        assert_eq!(
+            result.faces().len(),
+            2,
+            "the open facet is fanned into two triangles"
+        );
         assert_eq!(mesh.face_count(), 7, "5 reused quads + 2 built triangles");
-        assert_eq!(mesh.edge_count(), 13, "12 cube edges + the open facet's diagonal");
+        assert_eq!(
+            mesh.edge_count(),
+            13,
+            "12 cube edges + the open facet's diagonal"
+        );
 
         // `quads[0]` is facet 0 (x = −1), opposite the omitted facet 1 (x = +1).
         assert_eq!(
@@ -2147,8 +2336,14 @@ mod tests {
 
         // Every reused quad, un-holed or not, stays out of the interior/unused
         // slots.
-        assert!(result.interior_faces().is_empty(), "no reused quad is interior");
-        assert!(result.unused_faces().is_empty(), "no hull quad is safe-to-delete");
+        assert!(
+            result.interior_faces().is_empty(),
+            "no reused quad is interior"
+        );
+        assert!(
+            result.unused_faces().is_empty(),
+            "no hull quad is safe-to-delete"
+        );
         assert_eq!(result.verts().len(), 8, "all eight corners on-hull");
         mesh.validate_topology();
     }
@@ -2171,7 +2366,11 @@ mod tests {
         // face already occupies its footprint (§5 last ¶): the four facets are
         // reported as *built* output, and at least as many faces exist as before
         // (the unconditional build never removes the input faces).
-        assert_eq!(result.faces().len(), 4, "four hull facets reported as built");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "four hull facets reported as built"
+        );
         assert!(
             mesh.face_count() >= faces_before,
             "the unconditional build never drops the input faces"
@@ -2181,8 +2380,14 @@ mod tests {
         // The contrast contract (the whole point of this pair): the holes slot
         // is empty when the flag is clear.
         assert!(result.hole_faces().is_empty(), "no holes when flag clear");
-        assert!(result.hole_edges().is_empty(), "no hole edges when flag clear");
-        assert!(result.geom_holes_out().is_empty(), "geom_holes.out empty when flag clear");
+        assert!(
+            result.hole_edges().is_empty(),
+            "no hole edges when flag clear"
+        );
+        assert!(
+            result.geom_holes_out().is_empty(),
+            "geom_holes.out empty when flag clear"
+        );
         mesh.validate_topology();
     }
 
@@ -2204,10 +2409,17 @@ mod tests {
         let result = mesh.convex_hull_with_faces(&input, &faces, false);
 
         // The four input faces were found, not rebuilt.
-        assert_eq!(mesh.face_count(), faces_before, "no duplicate face is minted");
+        assert_eq!(
+            mesh.face_count(),
+            faces_before,
+            "no duplicate face is minted"
+        );
         let on_hull: std::collections::HashSet<FaceKey> = result.faces().iter().copied().collect();
         for &face in &faces {
-            assert!(on_hull.contains(&face), "the found face {face:?} is on the hull");
+            assert!(
+                on_hull.contains(&face),
+                "the found face {face:?} is on the hull"
+            );
         }
 
         // The crux: none of them is interior, and none is unused.
@@ -2220,7 +2432,10 @@ mod tests {
             "a live hull face is never named safe-to-delete"
         );
         // The holes slot stays empty — the flag is clear (§5 last ¶).
-        assert!(result.hole_faces().is_empty(), "no holes when the flag is clear");
+        assert!(
+            result.hole_faces().is_empty(),
+            "no holes when the flag is clear"
+        );
         mesh.validate_topology();
     }
 
@@ -2295,7 +2510,10 @@ mod tests {
         // three verts are in geom.out even though nothing was built. Its edges are
         // not — the skip path reports only *input* edges, and the input slot here
         // carries no edges.
-        assert!(result.faces().is_empty(), "the only facet was reused, none built");
+        assert!(
+            result.faces().is_empty(),
+            "the only facet was reused, none built"
+        );
         assert_eq!(result.verts().len(), 3, "all three corners on-hull");
         assert!(
             result.edges().is_empty(),
@@ -2327,8 +2545,14 @@ mod tests {
         let result = mesh.convex_hull_with_faces(&input, &[patch], true);
 
         // Reused-and-then-un-holed: not a (surviving) hole, none built.
-        assert!(result.hole_faces().is_empty(), "the border face is un-holed");
-        assert!(result.faces().is_empty(), "the facet was reused, none built");
+        assert!(
+            result.hole_faces().is_empty(),
+            "the border face is un-holed"
+        );
+        assert!(
+            result.faces().is_empty(),
+            "the facet was reused, none built"
+        );
 
         // The crux: the reused face is on the hull surface, so it is neither
         // interior nor unused — reporting it would name a hull-surface face as
@@ -2425,7 +2649,10 @@ mod tests {
             "cleanup runs pre-build, when the reused patch is still open — both \
              border faces are un-holed"
         );
-        assert!(result.hole_edges().is_empty(), "no surviving hole to carry an edge");
+        assert!(
+            result.hole_edges().is_empty(),
+            "no surviving hole to carry an edge"
+        );
 
         // The reused facets are still skipped, not rebuilt: the total face count is
         // exactly the two pre-built facets plus the built remainder.
@@ -2434,13 +2661,19 @@ mod tests {
             faces_before + result.faces().len(),
             "every new face is genuinely new — no duplicate minted over a reused facet"
         );
-        assert_eq!(result.faces().len(), 4, "the four un-covered facets are built");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "the four un-covered facets are built"
+        );
 
         // The two reused facets are not double-counted as built.
-        let built: std::collections::HashSet<FaceKey> =
-            result.faces().iter().copied().collect();
+        let built: std::collections::HashSet<FaceKey> = result.faces().iter().copied().collect();
         for &pre in &pre_faces {
-            assert!(!built.contains(&pre), "a reused facet is not also a built face");
+            assert!(
+                !built.contains(&pre),
+                "a reused facet is not also a built face"
+            );
         }
 
         // Every built face is outward-wound (normal points away from the
@@ -2450,8 +2683,7 @@ mod tests {
         for face in built_faces {
             mesh.face_normal_update(face);
             let normal = mesh.face_normal(face);
-            let face_point =
-                mesh.vertex_position(mesh.loop_vertex(mesh.face_first_loop(face)));
+            let face_point = mesh.vertex_position(mesh.loop_vertex(mesh.face_first_loop(face)));
             assert!(
                 normal.dot(face_point - center) > 0.0,
                 "built hull face {face:?} must be wound outward"
@@ -2496,8 +2728,10 @@ mod tests {
         // facet, so the hull's surgery reuses it and the neighbour is found
         // across it.
         let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
-        let neighbour =
-            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+        let neighbour = mesh.face_create_verts(
+            &[input[0], input[1], outsider],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
 
         // Distinctive customdata on the neighbour: a face-layer value and a
         // single loop-layer value on every corner (so the per-loop copy is
@@ -2541,9 +2775,17 @@ mod tests {
             let v = mesh.loop_vertex(loop_key);
             let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
             if v == input[0] || v == input[1] {
-                assert_eq!(got, Some(LOOP_VALUE), "shared-edge corner inherits per-loop CD");
+                assert_eq!(
+                    got,
+                    Some(LOOP_VALUE),
+                    "shared-edge corner inherits per-loop CD"
+                );
             } else {
-                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+                assert_eq!(
+                    got,
+                    Some(0),
+                    "the unshared corner keeps default per-loop CD"
+                );
             }
         }
         mesh.validate_topology();
@@ -2566,8 +2808,10 @@ mod tests {
 
         let input = cloud(&mut mesh, &tetra_positions());
         let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
-        let neighbour =
-            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+        let neighbour = mesh.face_create_verts(
+            &[input[0], input[1], outsider],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
 
         // Distinct value per neighbour corner, keyed by which vertex the corner
         // sits at.
@@ -2607,11 +2851,23 @@ mod tests {
             let v = mesh.loop_vertex(loop_key);
             let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
             if v == input[0] {
-                assert_eq!(got, Some(VALUE_AT_0), "corner at input[0] gets the matching value");
+                assert_eq!(
+                    got,
+                    Some(VALUE_AT_0),
+                    "corner at input[0] gets the matching value"
+                );
             } else if v == input[1] {
-                assert_eq!(got, Some(VALUE_AT_1), "corner at input[1] gets the matching value");
+                assert_eq!(
+                    got,
+                    Some(VALUE_AT_1),
+                    "corner at input[1] gets the matching value"
+                );
             } else {
-                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+                assert_eq!(
+                    got,
+                    Some(0),
+                    "the unshared corner keeps default per-loop CD"
+                );
             }
         }
         mesh.validate_topology();
@@ -2657,16 +2913,20 @@ mod tests {
         const VALUE_B_AT_1: i32 = 200;
         for loop_key in mesh.face_loop_keys(neighbour_a) {
             if mesh.loop_vertex(loop_key) == input[1] {
-                assert!(mesh
-                    .loop_attribs_mut()
-                    .set_i32(loop_layer, loop_key.as_usize(), VALUE_A_AT_1));
+                assert!(mesh.loop_attribs_mut().set_i32(
+                    loop_layer,
+                    loop_key.as_usize(),
+                    VALUE_A_AT_1
+                ));
             }
         }
         for loop_key in mesh.face_loop_keys(neighbour_b) {
             if mesh.loop_vertex(loop_key) == input[1] {
-                assert!(mesh
-                    .loop_attribs_mut()
-                    .set_i32(loop_layer, loop_key.as_usize(), VALUE_B_AT_1));
+                assert!(mesh.loop_attribs_mut().set_i32(
+                    loop_layer,
+                    loop_key.as_usize(),
+                    VALUE_B_AT_1
+                ));
             }
         }
 
@@ -2737,7 +2997,11 @@ mod tests {
         let input = cloud(&mut mesh, &tetra_positions());
         let result = mesh.convex_hull(&input);
 
-        assert_eq!(result.faces().len(), 4, "the loose tetra cloud builds four faces");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "the loose tetra cloud builds four faces"
+        );
         for &face in result.faces() {
             assert_eq!(
                 mesh.face_attribs().get_i32(face_layer, face.as_usize()),
@@ -2771,14 +3035,18 @@ mod tests {
         let outsider = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
         // A neighbour across the hull edge (input[0], input[1]) — and it IS an
         // input face this time. The corrected criterion accepts it.
-        let input_neighbour =
-            mesh.face_create_verts(&[input[0], input[1], outsider], FaceCreateFlags::NO_DUPLICATE);
+        let input_neighbour = mesh.face_create_verts(
+            &[input[0], input[1], outsider],
+            FaceCreateFlags::NO_DUPLICATE,
+        );
 
         const FACE_VALUE: i32 = 4242;
         const LOOP_VALUE: i32 = 777;
-        assert!(mesh
-            .face_attribs_mut()
-            .set_i32(face_layer, input_neighbour.as_usize(), FACE_VALUE));
+        assert!(mesh.face_attribs_mut().set_i32(
+            face_layer,
+            input_neighbour.as_usize(),
+            FACE_VALUE
+        ));
         for loop_key in mesh.face_loop_keys(input_neighbour) {
             assert!(mesh
                 .loop_attribs_mut()
@@ -2801,7 +3069,8 @@ mod tests {
 
         // Per-face customdata inherited from the input example face.
         assert_eq!(
-            mesh.face_attribs().get_i32(face_layer, candidate.as_usize()),
+            mesh.face_attribs()
+                .get_i32(face_layer, candidate.as_usize()),
             Some(FACE_VALUE),
             "an input neighbour IS chosen as the example face — per-face CD inherited"
         );
@@ -2811,9 +3080,17 @@ mod tests {
             let v = mesh.loop_vertex(loop_key);
             let got = mesh.loop_attribs().get_i32(loop_layer, loop_key.as_usize());
             if v == input[0] || v == input[1] {
-                assert_eq!(got, Some(LOOP_VALUE), "shared-edge corner inherits per-loop CD");
+                assert_eq!(
+                    got,
+                    Some(LOOP_VALUE),
+                    "shared-edge corner inherits per-loop CD"
+                );
             } else {
-                assert_eq!(got, Some(0), "the unshared corner keeps default per-loop CD");
+                assert_eq!(
+                    got,
+                    Some(0),
+                    "the unshared corner keeps default per-loop CD"
+                );
             }
         }
         mesh.validate_topology();
@@ -2826,7 +3103,10 @@ mod tests {
         let mut mesh = LoopMesh::new();
         let input = cloud(&mut mesh, &cube_corners());
         let result = mesh.convex_hull(&input);
-        assert!(result.geom_holes_out().is_empty(), "default path has no holes");
+        assert!(
+            result.geom_holes_out().is_empty(),
+            "default path has no holes"
+        );
         mesh.validate_topology();
     }
 
@@ -2851,7 +3131,9 @@ mod tests {
                 faces: self
                     .faces
                     .iter()
-                    .map(|f| HullFace { vertices: f.clone() })
+                    .map(|f| HullFace {
+                        vertices: f.clone(),
+                    })
                     .collect(),
             })
         }
@@ -2889,8 +3171,16 @@ mod tests {
         };
         let result = mesh.convex_hull_with_provider(&input, &[], &[], false, &provider);
 
-        assert_eq!(result.faces().len(), 4, "the provider's four facets, not 12");
-        assert_eq!(result.edges().len(), 6, "the provider's tetrahedron, not 18");
+        assert_eq!(
+            result.faces().len(),
+            4,
+            "the provider's four facets, not 12"
+        );
+        assert_eq!(
+            result.edges().len(),
+            6,
+            "the provider's tetrahedron, not 18"
+        );
         assert_eq!(
             result.verts(),
             &[input[0], input[3], input[5], input[6]],
@@ -2905,7 +3195,10 @@ mod tests {
             vert_set(&[input[1], input[2], input[4], input[7]]),
             "corners the provider left off the hull are interior"
         );
-        assert_eq!(vert_set(result.unused_verts()), vert_set(result.interior_verts()));
+        assert_eq!(
+            vert_set(result.unused_verts()),
+            vert_set(result.interior_verts())
+        );
 
         // The provider's winding is carried verbatim into the built faces.
         assert_closed_hull_invariants(
@@ -2927,7 +3220,11 @@ mod tests {
                 .iter()
                 .map(|quad| {
                     let (a, b) = (quad[0], quad[2]);
-                    if a <= b { [a, b] } else { [b, a] }
+                    if a <= b {
+                        [a, b]
+                    } else {
+                        [b, a]
+                    }
                 })
                 .collect()
         };
@@ -2942,8 +3239,16 @@ mod tests {
 
             let result = mesh.convex_hull_with_provider(&input, &[], &[], false, &provider);
 
-            assert_eq!(result.faces().len(), 12, "six quads fan to twelve triangles");
-            assert_eq!(result.edges().len(), 18, "12 cube edges + 6 facet diagonals");
+            assert_eq!(
+                result.faces().len(),
+                12,
+                "six quads fan to twelve triangles"
+            );
+            assert_eq!(
+                result.edges().len(),
+                18,
+                "12 cube edges + 6 facet diagonals"
+            );
 
             let present = |a: usize, b: usize| mesh.query_edge_exists(input[a], input[b]).is_some();
             for [a, b] in expected_diagonals(rotation) {
@@ -3107,17 +3412,32 @@ mod tests {
             &Quickhull,
         );
 
-        assert!(!direct_result.hole_faces().is_empty(), "the fixture must reuse faces");
-        assert!(!direct_result.faces().is_empty(), "the fixture must also build faces");
+        assert!(
+            !direct_result.hole_faces().is_empty(),
+            "the fixture must reuse faces"
+        );
+        assert!(
+            !direct_result.faces().is_empty(),
+            "the fixture must also build faces"
+        );
 
         assert_eq!(direct_result.verts(), injected_result.verts());
         assert_eq!(direct_result.edges(), injected_result.edges());
         assert_eq!(direct_result.faces(), injected_result.faces());
         assert_eq!(direct_result.hole_faces(), injected_result.hole_faces());
         assert_eq!(direct_result.hole_edges(), injected_result.hole_edges());
-        assert_eq!(direct_result.interior_verts(), injected_result.interior_verts());
-        assert_eq!(direct_result.interior_edges(), injected_result.interior_edges());
-        assert_eq!(direct_result.interior_faces(), injected_result.interior_faces());
+        assert_eq!(
+            direct_result.interior_verts(),
+            injected_result.interior_verts()
+        );
+        assert_eq!(
+            direct_result.interior_edges(),
+            injected_result.interior_edges()
+        );
+        assert_eq!(
+            direct_result.interior_faces(),
+            injected_result.interior_faces()
+        );
         assert_eq!(direct_result.unused_verts(), injected_result.unused_verts());
         assert_eq!(direct_result.unused_edges(), injected_result.unused_edges());
         assert_eq!(direct_result.unused_faces(), injected_result.unused_faces());

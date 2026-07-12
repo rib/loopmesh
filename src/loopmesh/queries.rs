@@ -212,7 +212,10 @@ impl LoopMesh {
     /// is skipped by the grow direction of `region_extend` and ignored by its
     /// shrink direction (REGION_EXTEND.md §2.3 / §5.2).
     pub fn set_vert_hidden(&mut self, v: VertexKey, hidden: bool) {
-        self.vertices.get_mut(v).eflags.set(ElementFlags::HIDDEN, hidden);
+        self.vertices
+            .get_mut(v)
+            .eflags
+            .set(ElementFlags::HIDDEN, hidden);
     }
 
     pub fn is_vert_hidden(&self, v: VertexKey) -> bool {
@@ -241,7 +244,10 @@ impl LoopMesh {
     /// public "element tag" convention, so a caller and the operators it drives
     /// agree on one bit; TAG1/TAG2 stay free for transient operator scratch use.
     pub fn set_vert_tag(&mut self, v: VertexKey, tagged: bool) {
-        self.vertices.get_mut(v).eflags.set(ElementFlags::TAG0, tagged);
+        self.vertices
+            .get_mut(v)
+            .eflags
+            .set(ElementFlags::TAG0, tagged);
     }
 
     /// Read a vertex's persistent element-tag header bit (see [`Self::set_vert_tag`]).
@@ -251,7 +257,10 @@ impl LoopMesh {
 
     /// Set or clear the edge's persistent HIDDEN header bit.
     pub fn set_edge_hidden(&mut self, e: EdgeKey, hidden: bool) {
-        self.edges.get_mut(e).eflags.set(ElementFlags::HIDDEN, hidden);
+        self.edges
+            .get_mut(e)
+            .eflags
+            .set(ElementFlags::HIDDEN, hidden);
     }
 
     pub fn is_edge_hidden(&self, e: EdgeKey) -> bool {
@@ -260,7 +269,10 @@ impl LoopMesh {
 
     /// Set or clear the face's persistent HIDDEN header bit.
     pub fn set_face_hidden(&mut self, f: FaceKey, hidden: bool) {
-        self.faces.get_mut(f).eflags.set(ElementFlags::HIDDEN, hidden);
+        self.faces
+            .get_mut(f)
+            .eflags
+            .set(ElementFlags::HIDDEN, hidden);
     }
 
     pub fn is_face_hidden(&self, f: FaceKey) -> bool {
@@ -270,7 +282,10 @@ impl LoopMesh {
     /// Set or clear the face's persistent SMOOTH header bit. A face carrying the
     /// bit is smooth-shaded; cleared, it is flat (EDGELOOP_FILL.md §1/§5).
     pub fn set_face_smooth(&mut self, f: FaceKey, smooth: bool) {
-        self.faces.get_mut(f).eflags.set(ElementFlags::SMOOTH, smooth);
+        self.faces
+            .get_mut(f)
+            .eflags
+            .set(ElementFlags::SMOOTH, smooth);
     }
 
     pub fn is_face_smooth(&self, f: FaceKey) -> bool {
@@ -353,24 +368,31 @@ impl LoopMesh {
         self.loops.get(l).edge_radial_links.prev
     }
 
-    /// The loop **last attached** to `edge`'s radial cycle — the *radial entry*
-    /// of [`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
-    /// §6.5, and the only radial pick an order-sensitive consumer may use: the
-    /// fan's first corner, and the start of the radial walk an edge-splitting
-    /// rebuild must follow (§8.1 step 4), are both defined off it.
+    /// `edge`'s **radial entry** — the loop every radial traversal starts at
+    /// ([`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+    /// §6.2), and the only radial pick an order-sensitive consumer may use: the
+    /// fan's first corner (§6.5) and the start of the walk an edge-splitting
+    /// rebuild must follow (§8.1 step 4) are both defined off it.
     ///
-    /// The disk and the radial cycle use **opposite** entry conventions, and
-    /// this crate's storage mirrors the disk one on both: `radial_link` stays
-    /// pinned to the loop attached **first**, with each later loop spliced in
-    /// immediately *before* it. Forward (`next`) order is therefore attachment
-    /// order, and the last-attached loop is the stored head's radial-`prev` —
-    /// exactly the translation §6.5's "Implementation asymmetry" box mandates
-    /// for a layout like this one. Reading `radial_link` directly picks the
-    /// **first**-attached face and lands the wrong corner on any edge that two
-    /// or more faces adopted; every such read must go through here instead.
-    pub fn edge_radial_last_attached(&self, edge: EdgeKey) -> Option<LoopKey> {
-        let first_attached = self.edges.get(edge).radial_link?;
-        Some(self.loop_radial_prev(first_attached))
+    /// The entry is *not* "the last-attached loop" — that is a reading that
+    /// holds only while the cycle has never had a loop removed. It is defined
+    /// by two local rules: an append splices the new loop in immediately after
+    /// the entry and re-seats the entry onto it; a removal re-seats the entry
+    /// **forward**, onto the removed loop's radial successor, and only when the
+    /// removed loop *was* the entry (§6.5).
+    ///
+    /// This crate uses the head-anchored storage of §6.5's "Implementation
+    /// asymmetry" box: `radial_link` names the cycle's *head* — the loop the
+    /// entry's successor-chain wraps back to — and each newly appended loop is
+    /// spliced in as the head's predecessor, i.e. immediately after the entry.
+    /// The entry is therefore the derived quantity `radial_link.prev`, which
+    /// stays valid because [`LoopMesh::face_loop_disconnect_edge`] carries the
+    /// companion re-seat (`head := head.next` on an entry removal) that box
+    /// mandates. Reading `radial_link` directly yields a walk rotated by one;
+    /// every order-sensitive read must go through here instead.
+    pub fn edge_radial_entry(&self, edge: EdgeKey) -> Option<LoopKey> {
+        let head = self.edges.get(edge).radial_link?;
+        Some(self.loop_radial_prev(head))
     }
 
     pub fn vertex_disk_print_links(&self, vertex: VertexKey) {
@@ -416,8 +438,6 @@ impl LoopMesh {
 
     /// Iterates through all the edges in the disk loop of the given `hub_vertex` to
     /// determine if the `other_vertex` is also contained in the disk loop
-    ///
-    /// like: bmesh_disk_edge_exists
     pub fn vertex_disk_contains_edge(
         &mut self,
         hub_vertex: VertexKey,
@@ -433,8 +453,6 @@ impl LoopMesh {
 
     /// Iterates through all the edges in the disk loop of the given `hub_vertex` to
     /// count the number of edges in the loop.
-    ///
-    /// like: bmesh_disk_count
     pub fn vertex_disk_count_edges(&self, hub_vertex: VertexKey) -> usize {
         let mut count = 0;
         for _ in self.vertex_disk_iter(hub_vertex) {
@@ -445,8 +463,6 @@ impl LoopMesh {
 
     /// Iterates through all the edges in the disk loop of the given `hub_vertex` to
     /// count the number of edges in the loop, up to `max_count`.
-    ///
-    /// like: bmesh_disk_count
     pub(crate) fn vertex_disk_count_edges_capped(
         &self,
         hub_vertex: VertexKey,
@@ -464,8 +480,6 @@ impl LoopMesh {
 
     /// Validates the integrity of a disk loop around the given `hub_vertex` with respect to a
     /// known edge member and an expected edge count.
-    ///
-    /// like: bmesh_disk_validate
     pub(crate) fn vertex_disk_validate_edge_state(
         &mut self,
         hub_vertex: VertexKey,
@@ -613,28 +627,29 @@ impl LoopMesh {
         None
     }
 
+    /// A face incident to both `v0` and `v1`, if any. Every face on every edge
+    /// of `v0`'s disk is a candidate — including the far-side faces of a
+    /// radial-≥2 edge, which a walk that only looked at one loop per edge would
+    /// never see. Each edge's radial walk is seeded at the edge's **entry**
+    /// ([`LoopMesh::edge_radial_entry`], §6.2), so the reported face is
+    /// reproducible rather than a function of which loop the stored head names.
     pub fn query_vertex_shared_face(&self, v0: VertexKey, v1: VertexKey) -> Option<FaceKey> {
         for e0 in self.vertex_disk_iter(v0) {
-            if let Some(loopi0) = self.edges.get(e0).radial_link {
-                for l0 in self.face_loop_iter(loopi0) {
-                    let face0 = self.loops.get(l0).face;
-
-                    for e1 in self.vertex_disk_iter(v1) {
-                        if let Some(loopi1) = self.edges.get(e1).radial_link {
-                            for l1 in self.face_loop_iter(loopi1) {
-                                let face1 = self.loops.get(l1).face;
-
-                                if face0 == face1 {
-                                    return Some(face0);
-                                }
-                            }
-                        }
-                    }
+            for radial_loop in self.edge_radial_iter(e0) {
+                let face = self.loops.get(radial_loop).face;
+                if self.face_contains_vertex(face, v1) {
+                    return Some(face);
                 }
             }
         }
 
         None
+    }
+
+    fn face_contains_vertex(&self, face: FaceKey, vertex: VertexKey) -> bool {
+        let first = self.faces.get(face).first_edge_loop;
+        self.face_loop_iter(first)
+            .any(|l| self.loops.get(l).vertex == vertex)
     }
 
     /// Resolve the active UV layer: the loop-domain layer UV-aware operators
@@ -713,7 +728,11 @@ mod tests {
         let again = mesh.face_create_verts(&[b, c, a], FaceCreateFlags::NO_DUPLICATE);
 
         assert_eq!(again, face, "a rotated query reuses the existing face");
-        assert_eq!(mesh.face_count(), faces_before, "no duplicate face is minted");
+        assert_eq!(
+            mesh.face_count(),
+            faces_before,
+            "no duplicate face is minted"
+        );
         mesh.validate_topology();
     }
 }

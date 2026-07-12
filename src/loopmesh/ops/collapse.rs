@@ -621,14 +621,19 @@ impl LoopMesh {
     ///   first non-wire edge `e0`. Because a face create mints its perimeter
     ///   closing-edge-first, a hub vertex listed first anchors on its *closing*
     ///   spoke, so `e0` is that closing spoke rather than the leading one.
-    /// - **Radial pick — last-attached.** Take the loop *last* attached to `e0`.
-    ///   §6.5 fixes the pick on the last-attached loop (the disk/radial
-    ///   asymmetry). This crate's radial cycle keeps its `radial_link` pointer
-    ///   on the *first*-attached loop and splices each new loop in immediately
-    ///   *before* it, so the last-attached loop is `radial_link`'s radial-prev.
-    ///   For the closed `disk_fan` that is the face that *re-adopts* the anchor
-    ///   spoke last (build-face 1 for the canonical builder, for every n), not
-    ///   the wrap face and not the earliest-built face.
+    /// - **Radial pick — the entry.** Take `e0`'s radial *entry*
+    ///   ([`LoopMesh::edge_radial_entry`]) — the loop §6.5 fixes the pick on,
+    ///   and the loop §6.2's traversal starts at. The entry *is the rule*; the
+    ///   familiar "last-attached loop" reading is only what the entry happens to
+    ///   coincide with on a pristine cycle — one that has never had a loop
+    ///   removed — because an append splices the new loop in after the entry and
+    ///   re-seats the entry onto it. (This is the disk/radial asymmetry: the
+    ///   disk anchor stays pinned to the *first*-attached edge, while the radial
+    ///   entry moves forward onto each newly appended loop.) Once a loop has been
+    ///   removed from the cycle, the two readings part company and only the entry
+    ///   is correct. For the closed `disk_fan` the entry is the face that
+    ///   *re-adopts* the anchor spoke last (build-face 1 for the canonical
+    ///   builder, for every n), not the wrap face and not the earliest-built one.
     /// - Land on the corner at `vertex`: that loop if its own corner sits at
     ///   `vertex`, else one step forward along its face (its loop-next), which by
     ///   the core loop↔edge invariant (§5.1) sits at `e0`'s other endpoint.
@@ -637,13 +642,13 @@ impl LoopMesh {
     /// `vertex` is isolated).
     fn fan_first_loop(&self, vertex: VertexKey) -> Option<LoopKey> {
         for edge in self.vertex_disk_iter(vertex) {
-            let Some(last_attached) = self.edge_radial_last_attached(edge) else {
+            let Some(entry) = self.edge_radial_entry(edge) else {
                 continue; // wire edge — skip in disk insertion order.
             };
-            return Some(if self.loop_vertex(last_attached) == vertex {
-                last_attached
+            return Some(if self.loop_vertex(entry) == vertex {
+                entry
             } else {
-                self.loop_next(last_attached)
+                self.loop_next(entry)
             });
         }
         None

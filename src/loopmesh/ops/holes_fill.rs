@@ -259,8 +259,7 @@ impl LoopMesh {
                         // meeting fronts' accumulated flags.
                         let spans_distinct = vertex_spans || spans[&other];
                         if spans_distinct {
-                            let cycle =
-                                self.holes_fill_assemble_cycle(vertex, other, front, &pred);
+                            let cycle = self.holes_fill_assemble_cycle(vertex, other, front, &pred);
                             if self.holes_fill_cycle_accepted(&cycle) {
                                 return Some(cycle);
                             }
@@ -490,7 +489,8 @@ impl LoopMesh {
     /// Shared with [`LoopMesh::face_attribute_fill`], which is the same bare
     /// face-domain inheritance pass exposed on its own.
     pub(crate) fn holes_fill_copy_face_attribs(&mut self, donor: FaceKey, cap: FaceKey) {
-        self.face_attribs.copy_into(cap.as_usize(), donor.as_usize());
+        self.face_attribs
+            .copy_into(cap.as_usize(), donor.as_usize());
         let smooth = self.is_face_smooth(donor);
         self.set_face_smooth(cap, smooth);
     }
@@ -607,7 +607,12 @@ mod tests {
             })
             .collect();
         (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect()
     }
 
@@ -624,7 +629,11 @@ mod tests {
         assert_eq!(mesh.face_count(), 9, "hole capped by exactly one quad");
 
         let cap = result.faces()[0];
-        assert_eq!(mesh.face_len(cap), 4, "the cap is a quad over the four rim verts");
+        assert_eq!(
+            mesh.face_len(cap),
+            4,
+            "the cap is a quad over the four rim verts"
+        );
 
         // §6.2 — the cap must be wound coherently with the surrounding ring: it
         // traverses each shared rim edge opposite to the neighbour ring face.
@@ -648,7 +657,11 @@ mod tests {
         // sides large enough to keep a 4-perimeter cap (and the formal no-limit
         // sentinel 0 behaves the same for this fixture).
         let result = mesh.holes_fill(&rim, &HolesFillParams { sides: 1000 });
-        assert_eq!(result.faces().len(), 1, "the quad cap survives the sides filter");
+        assert_eq!(
+            result.faces().len(),
+            1,
+            "the quad cap survives the sides filter"
+        );
         assert_eq!(mesh.face_count(), 9, "hole stays capped (8 ring + 1 cap)");
 
         let (mut mesh0, rim0) = grid_3x3_center_hole();
@@ -665,10 +678,21 @@ mod tests {
         // The hole is still filled by the unconstrained search, then its quad cap
         // (perimeter 4 > 3) is deleted by the post-fill pass (§5).
         let result = mesh.holes_fill(&rim, &HolesFillParams { sides: 3 });
-        assert!(result.is_empty(), "the oversized cap is deleted → empty faces.out");
-        assert_eq!(mesh.face_count(), 8, "hole reopened: only the 8 ring faces remain");
+        assert!(
+            result.is_empty(),
+            "the oversized cap is deleted → empty faces.out"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            8,
+            "hole reopened: only the 8 ring faces remain"
+        );
         assert_eq!(mesh.vertex_count(), 16, "no vertex left behind");
-        assert_eq!(mesh.edge_count(), 24, "rim edges remain (cap kill leaves them)");
+        assert_eq!(
+            mesh.edge_count(),
+            24,
+            "rim edges remain (cap kill leaves them)"
+        );
         mesh.validate_topology();
     }
 
@@ -712,7 +736,8 @@ mod tests {
             mesh.set_face_smooth(face, true);
         }
         for l in mesh.loop_keys() {
-            mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [0.25, 0.75]);
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [0.25, 0.75]);
         }
 
         let result = mesh.holes_fill(&rim, &HolesFillParams { sides: 0 });
@@ -726,9 +751,13 @@ mod tests {
         );
         assert!(mesh.is_face_smooth(cap), "cap inherits the smooth flag");
         for cap_loop in mesh.face_loop_keys(cap) {
-            let got = mesh.loop_attribs().get_vec2(uv, cap_loop.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, cap_loop.as_usize())
+                .unwrap();
             assert_eq!(
-                got, [0.25, 0.75],
+                got,
+                [0.25, 0.75],
                 "every cap corner inherits the surrounding corner UV"
             );
         }
@@ -755,7 +784,10 @@ mod tests {
         assert_eq!(mesh.face_material_index(cap), 0, "default material slot 0");
         assert!(!mesh.is_face_smooth(cap), "default cap is flat");
         for cap_loop in mesh.face_loop_keys(cap) {
-            let got = mesh.loop_attribs().get_vec2(uv, cap_loop.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, cap_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.0, 0.0], "isolated cap keeps default corner UV");
         }
         mesh.validate_topology();
@@ -790,7 +822,11 @@ mod tests {
         assert!(result.is_empty(), "interior-edge-net triangle is refused");
         assert_eq!(mesh.face_count(), 1, "only the original quad remains");
         assert_eq!(mesh.vertex_count(), 4, "no vertex created");
-        assert_eq!(mesh.edge_count(), 5, "the four quad edges plus the diagonal");
+        assert_eq!(
+            mesh.edge_count(),
+            5,
+            "the four quad edges plus the diagonal"
+        );
         mesh.validate_topology();
     }
 

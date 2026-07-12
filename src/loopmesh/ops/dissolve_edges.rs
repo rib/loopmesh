@@ -720,11 +720,11 @@ impl LoopMesh {
     /// (wire, boundary, self-radial, non-manifold) is `NoOp`.
     fn dissolve_edges_classify(&self, edge: EdgeKey) -> EdgeClass {
         let mut radial = self.radial_loops(edge);
-        let Some(head_loop) = radial.next(self) else {
+        let Some(entry_loop) = radial.next(self) else {
             // Radial cycle empty: wire edge (§3 row 1).
             return EdgeClass::NoOp;
         };
-        let Some(second_loop) = radial.next(self) else {
+        let Some(other_loop) = radial.next(self) else {
             // Radial cycle length 1: boundary edge (§3 row 2).
             return EdgeClass::NoOp;
         };
@@ -734,21 +734,19 @@ impl LoopMesh {
         }
         // §3.1 / §11 survivor rule: the merged face keeps the per-face
         // customdata of the face on the dissolved edge's primary loop `e.l` —
-        // the **second-built** of the two flanking faces. In this crate's
-        // radial cycle the *first-built* face's loop sits at the radial head
-        // (`radial_loops` emits it first); the second-built face's loop is the
-        // head's radial-next, i.e. `second_loop` here. So the survivor `face_a`
-        // is `second_loop`'s face, and `face_b` is the head loop's face.
-        let head_face = self.loops.get(head_loop).face;
-        let second_face = self.loops.get(second_loop).face;
-        if head_face == second_face {
+        // the edge's radial **entry**, which `radial_loops` (a §6.2 traversal)
+        // emits first. On a radial-2 spoke that has never lost a loop that is
+        // the second-built of the two flanking faces.
+        let entry_face = self.loops.get(entry_loop).face;
+        let other_face = self.loops.get(other_loop).face;
+        if entry_face == other_face {
             // Radial cycle length 2 but both loops on the same face: a
             // self-radial fin (§3 row 4).
             return EdgeClass::NoOp;
         }
         EdgeClass::ManifoldPair {
-            face_a: second_face,
-            face_b: head_face,
+            face_a: entry_face,
+            face_b: other_face,
         }
     }
 }

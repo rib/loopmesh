@@ -112,7 +112,12 @@ mod tests {
             })
             .collect();
         (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect()
     }
 
@@ -210,7 +215,10 @@ mod tests {
             7,
             "free-net cap keeps the caller's material"
         );
-        assert!(mesh.is_face_smooth(cap), "free-net cap keeps the caller's smooth flag");
+        assert!(
+            mesh.is_face_smooth(cap),
+            "free-net cap keeps the caller's smooth flag"
+        );
         assert!(
             mesh.face_normal(cap).length_squared() > 1e-6,
             "§5/§6.2 fallback gives the isolated cap a well-defined normal"
@@ -263,7 +271,11 @@ mod tests {
         assert_eq!(mesh.face_count(), 4);
         for &cap in result.faces() {
             assert_eq!(mesh.face_len(cap), 4, "each cap is a quad");
-            assert_eq!(mesh.face_material_index(cap), 4, "free cap keeps caller material");
+            assert_eq!(
+                mesh.face_material_index(cap),
+                4,
+                "free cap keeps caller material"
+            );
             assert!(mesh.is_face_smooth(cap), "free cap keeps caller smooth");
         }
         // The shared interior wire edges became manifold (two caps each); the outer
@@ -273,7 +285,10 @@ mod tests {
             .into_iter()
             .filter(|&e| mesh.edge_loop_keys(e).len() == 2)
             .count();
-        assert_eq!(manifold, 4, "the four interior cross wires are now manifold");
+        assert_eq!(
+            manifold, 4,
+            "the four interior cross wires are now manifold"
+        );
         mesh.validate_topology();
     }
 
@@ -286,7 +301,11 @@ mod tests {
         let ring_a = convex_wire_ring(&mut mesh_unbounded, 5, 1.0);
         let result_a = mesh_unbounded.edgenet_fill(
             &ring_a,
-            &EdgenetFillParams { mat_nr: 0, use_smooth: false, sides: 1000 },
+            &EdgenetFillParams {
+                mat_nr: 0,
+                use_smooth: false,
+                sides: 1000,
+            },
         );
         assert_eq!(result_a.faces().len(), 1, "unbounded sides keeps the cap");
         assert_eq!(mesh_unbounded.face_count(), 1);
@@ -297,9 +316,17 @@ mod tests {
             &ring_b,
             // sides = 4 < perimeter 5: holes_fill would delete this cap; edgenet
             // keeps it.
-            &EdgenetFillParams { mat_nr: 0, use_smooth: false, sides: 4 },
+            &EdgenetFillParams {
+                mat_nr: 0,
+                use_smooth: false,
+                sides: 4,
+            },
         );
-        assert_eq!(result_b.faces().len(), 1, "sides below perimeter still keeps the cap");
+        assert_eq!(
+            result_b.faces().len(),
+            1,
+            "sides below perimeter still keeps the cap"
+        );
         assert_eq!(mesh_below.face_count(), 1, "no post-fill deletion");
         assert_eq!(mesh_below.face_len(result_b.faces()[0]), 5);
         mesh_unbounded.validate_topology();
@@ -320,7 +347,11 @@ mod tests {
         let result = mesh.edgenet_fill(
             &rim,
             // distinct caller mat_nr = 7, use_smooth = false — both overridden.
-            &EdgenetFillParams { mat_nr: 7, use_smooth: false, sides: 0 },
+            &EdgenetFillParams {
+                mat_nr: 7,
+                use_smooth: false,
+                sides: 0,
+            },
         );
 
         assert_eq!(result.faces().len(), 1, "one cap fills the hole");
@@ -330,7 +361,10 @@ mod tests {
             3,
             "cap inherits the surface material, not the caller's 7"
         );
-        assert!(mesh.is_face_smooth(cap), "cap inherits the surface smooth flag");
+        assert!(
+            mesh.is_face_smooth(cap),
+            "cap inherits the surface smooth flag"
+        );
         // §6.2 — coherent winding with the surrounding ring.
         for shared in mesh.face_edge_keys(cap) {
             let radial = mesh.edge_loop_keys(shared);

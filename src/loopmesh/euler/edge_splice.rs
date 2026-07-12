@@ -17,13 +17,13 @@ impl LoopMesh {
             return false;
         }
 
-        // Move every loop currently on e_src's radial cycle to e_dst's.
-        let src_loops: Vec<LoopKey> = if self.edges.get(e_src).radial_link.is_some() {
-            self.edge_radial_iter(e_src).collect()
-        } else {
-            Vec::new()
-        };
-        for &l in &src_loops {
+        // §8.7: repeatedly take e_src's *entry* loop, remove it, and append it
+        // to e_dst. Because removing the entry re-seats the entry forward onto
+        // its successor (§6.5), the loops come off in e_src's §6.2 traversal
+        // order — no snapshot needed, since each loop lands on a different edge
+        // and e_src's cycle only ever shrinks. e_dst's post-splice entry is
+        // therefore the loop moved last.
+        while let Some(l) = self.edge_radial_entry(e_src) {
             self.face_loop_disconnect_edge(l);
             self.face_loop_connect_edge(e_dst, l);
         }

@@ -310,7 +310,10 @@ mod tests {
         assert_eq!(mesh.face_material_index(center), 3, "inherits material");
         assert!(mesh.is_face_smooth(center), "inherits smooth flag");
         for center_loop in mesh.face_loop_keys(center) {
-            let got = mesh.loop_attribs().get_vec2(uv, center_loop.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, center_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.25, 0.75], "every centre corner inherits UV");
         }
         mesh.validate_topology();
@@ -327,11 +330,17 @@ mod tests {
 
         let result = mesh.face_attribute_fill(&[center], false, false);
 
-        assert!(result.is_empty(), "centre still reachable with both flags off");
+        assert!(
+            result.is_empty(),
+            "centre still reachable with both flags off"
+        );
         assert_eq!(mesh.face_material_index(center), 0, "default material kept");
         assert!(!mesh.is_face_smooth(center), "default flat shading kept");
         for center_loop in mesh.face_loop_keys(center) {
-            let got = mesh.loop_attribs().get_vec2(uv, center_loop.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, center_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.0, 0.0], "default corner UV kept");
         }
         mesh.validate_topology();
@@ -422,7 +431,10 @@ mod tests {
         let (mut mesh, faces) = grid_faces(5);
         let uv = register_uv(&mut mesh);
         let at = |row: usize, col: usize| faces[row * 5 + col];
-        let block: Vec<FaceKey> = (1..4).flat_map(|r| (1..4).map(move |c| (r, c))).map(|(r, c)| at(r, c)).collect();
+        let block: Vec<FaceKey> = (1..4)
+            .flat_map(|r| (1..4).map(move |c| (r, c)))
+            .map(|(r, c)| at(r, c))
+            .collect();
         decorate_surround(&mut mesh, uv, &faces, &block);
         let center = at(2, 2);
 
@@ -431,7 +443,11 @@ mod tests {
 
         // Face data is transitive: the whole block ends uniformly materialled.
         for &face in &block {
-            assert_eq!(mesh.face_material_index(face), 3, "material floods to interior");
+            assert_eq!(
+                mesh.face_material_index(face),
+                3,
+                "material floods to interior"
+            );
             assert!(mesh.is_face_smooth(face), "smooth floods to interior");
         }
 
@@ -439,7 +455,10 @@ mod tests {
         // at any corner — all four neighbours are block faces — so every corner of
         // the centre stays at default UV.
         for center_loop in mesh.face_loop_keys(center) {
-            let got = mesh.loop_attribs().get_vec2(uv, center_loop.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, center_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.0, 0.0], "interior loop corner stays default");
         }
 
@@ -450,7 +469,10 @@ mod tests {
             .face_loop_keys(edge_face)
             .into_iter()
             .any(|l| mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap() == [0.25, 0.75]);
-        assert!(inherited, "rim face inherits UV on its frame-touching corners");
+        assert!(
+            inherited,
+            "rim face inherits UV on its frame-touching corners"
+        );
         mesh.validate_topology();
     }
 
@@ -474,7 +496,12 @@ mod tests {
         let at = |row: usize, col: usize| base[row * stride + col];
         for row in 0..3 {
             for col in 0..3 {
-                let ring = [at(row, col), at(row, col + 1), at(row + 1, col + 1), at(row + 1, col)];
+                let ring = [
+                    at(row, col),
+                    at(row, col + 1),
+                    at(row + 1, col + 1),
+                    at(row + 1, col),
+                ];
                 faces_b.push(mesh_a.face_create_verts(&ring, FaceCreateFlags::NO_DUPLICATE));
             }
         }
@@ -485,14 +512,28 @@ mod tests {
         assert!(result.is_empty(), "both centres reachable in one call");
 
         // Each centre inherits *its own* region's value, with no cross-region bleed.
-        assert_eq!(mesh_a.face_material_index(center_a), 3, "block A inherits A's ring");
-        assert_eq!(mesh_a.face_material_index(center_b), 6, "block B inherits B's ring");
+        assert_eq!(
+            mesh_a.face_material_index(center_a),
+            3,
+            "block A inherits A's ring"
+        );
+        assert_eq!(
+            mesh_a.face_material_index(center_b),
+            6,
+            "block B inherits B's ring"
+        );
         for center_loop in mesh_a.face_loop_keys(center_a) {
-            let got = mesh_a.loop_attribs().get_vec2(uv, center_loop.as_usize()).unwrap();
+            let got = mesh_a
+                .loop_attribs()
+                .get_vec2(uv, center_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.25, 0.75], "block A corner UV is A's, not B's");
         }
         for center_loop in mesh_a.face_loop_keys(center_b) {
-            let got = mesh_a.loop_attribs().get_vec2(uv, center_loop.as_usize()).unwrap();
+            let got = mesh_a
+                .loop_attribs()
+                .get_vec2(uv, center_loop.as_usize())
+                .unwrap();
             assert_eq!(got, [0.5, 0.125], "block B corner UV is B's, not A's");
         }
         mesh_a.validate_topology();
@@ -508,7 +549,8 @@ mod tests {
         for &face in &faces {
             mesh.set_face_material_index(face, 7);
             for l in mesh.face_loop_keys(face) {
-                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), [1.0, 2.0]);
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, l.as_usize(), [1.0, 2.0]);
             }
         }
 
@@ -539,8 +581,16 @@ mod tests {
 
         let result = mesh.face_attribute_fill(&[face], true, true);
 
-        assert_eq!(result.faces_fail(), [face], "boundary-only face cannot inherit");
-        assert_eq!(mesh.face_material_index(face), 5, "failed face left unchanged");
+        assert_eq!(
+            result.faces_fail(),
+            [face],
+            "boundary-only face cannot inherit"
+        );
+        assert_eq!(
+            mesh.face_material_index(face),
+            5,
+            "failed face left unchanged"
+        );
         mesh.validate_topology();
     }
 

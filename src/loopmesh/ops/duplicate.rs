@@ -963,7 +963,11 @@ mod tests {
         let e_bc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
         let e_cd = mesh.create_edge([c, d], EdgeCreateFlags::NONE);
         let e_da = mesh.create_edge([d, a], EdgeCreateFlags::NONE);
-        let face = mesh.face_create(&[a, b, c, d], &[e_ab, e_bc, e_cd, e_da], FaceCreateFlags::NONE);
+        let face = mesh.face_create(
+            &[a, b, c, d],
+            &[e_ab, e_bc, e_cd, e_da],
+            FaceCreateFlags::NONE,
+        );
         (face, e_ab)
     }
 
@@ -982,7 +986,10 @@ mod tests {
             let result = mesh.duplicate(&[edge.into()], flag);
             let clone = result.boundary_map.get(&edge).copied().unwrap();
             let [c0, c1] = mesh.edge_vertices(clone);
-            ([c0, c1], [mesh.vertex_position(c0), mesh.vertex_position(c1)])
+            (
+                [c0, c1],
+                [mesh.vertex_position(c0), mesh.vertex_position(c1)],
+            )
         };
 
         let (false_keys, false_pos) = edge_order(false);
@@ -997,11 +1004,7 @@ mod tests {
         // The endpoint *set* (by position) is unchanged — same two verts joined.
         let set = |p: [Vec3; 2]| {
             let mut s = [p[0], p[1]];
-            s.sort_by(|x, y| {
-                (x.x, x.y, x.z)
-                    .partial_cmp(&(y.x, y.y, y.z))
-                    .unwrap()
-            });
+            s.sort_by(|x, y| (x.x, x.y, x.z).partial_cmp(&(y.x, y.y, y.z)).unwrap());
             s
         };
         assert_eq!(set(false_pos), set(true_pos), "endpoint set unchanged");
@@ -1190,7 +1193,11 @@ mod tests {
         assert_eq!(result.vert_map.len(), 4, "forward-only source -> clone");
         assert_eq!(result.edge_map.len(), 4);
         assert_eq!(result.face_map.len(), 1);
-        assert_eq!(result.boundary_map.len(), 4, "every perimeter edge frontier");
+        assert_eq!(
+            result.boundary_map.len(),
+            4,
+            "every perimeter edge frontier"
+        );
         assert!(result.isovert_map.is_empty());
 
         // Each clone vert lands in `dest` at its source's exact position (§2).
@@ -1253,11 +1260,19 @@ mod tests {
             "source-only layer dropped"
         );
         for (&sv, &cv) in result.vert_map.iter() {
-            let want = src.vertex_attribs().get_vec3(v_color, sv.as_usize()).unwrap();
-            let got = dest.vertex_attribs().get_vec3(d_color, cv.as_usize()).unwrap();
+            let want = src
+                .vertex_attribs()
+                .get_vec3(v_color, sv.as_usize())
+                .unwrap();
+            let got = dest
+                .vertex_attribs()
+                .get_vec3(d_color, cv.as_usize())
+                .unwrap();
             assert_eq!(want, got, "matched layer copied source -> clone");
             assert_eq!(
-                dest.vertex_attribs().get_vec3(d_extra, cv.as_usize()).unwrap(),
+                dest.vertex_attribs()
+                    .get_vec3(d_extra, cv.as_usize())
+                    .unwrap(),
                 [0.0; 3],
                 "dest-only layer defaulted on the clone"
             );
@@ -1271,7 +1286,9 @@ mod tests {
         // §8.5.2 degenerate (identity) remap: matching layouts on both meshes
         // across all four CD homes -> every clone element equals its source,
         // exercising the per-loop remap path too.
-        fn register(m: &mut LoopMesh) -> (
+        fn register(
+            m: &mut LoopMesh,
+        ) -> (
             ElementAttributeKey,
             ElementAttributeKey,
             ElementAttributeKey,

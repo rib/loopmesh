@@ -193,7 +193,8 @@ impl LoopMesh {
             let position = self.vertex_position(self.loops.get(loops[current]).vertex);
             let previous_position = self.vertex_position(self.loops.get(loops[previous]).vertex);
             let next_position = self.vertex_position(self.loops.get(loops[next]).vertex);
-            let weight = (position - previous_position).length() + (next_position - position).length();
+            let weight =
+                (position - previous_position).length() + (next_position - position).length();
             accumulated += position * weight;
             total_weight += weight;
         }
@@ -270,7 +271,8 @@ mod tests {
         // centroid and check every vertex's signed distance is ~0.
         let normal = mesh.face_normal(face);
         let positions: Vec<Vec3> = verts.iter().map(|&v| mesh.vertex_position(v)).collect();
-        let centroid = positions.iter().fold(Vec3::ZERO, |acc, &p| acc + p) / positions.len() as f32;
+        let centroid =
+            positions.iter().fold(Vec3::ZERO, |acc, &p| acc + p) / positions.len() as f32;
         for p in &positions {
             assert!(
                 normal.dot(*p - centroid).abs() < 1e-3,
@@ -350,9 +352,7 @@ mod tests {
 
         let make_quad = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| -> FaceKey {
             let edges: Vec<EdgeKey> = (0..4)
-                .map(|i| {
-                    mesh.create_edge([vs[i], vs[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
-                })
+                .map(|i| mesh.create_edge([vs[i], vs[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
                 .collect();
             let face = mesh.face_create(&vs, &edges, FaceCreateFlags::NONE);
             mesh.face_calc_normal(face);
@@ -370,7 +370,8 @@ mod tests {
                 .iter()
                 .map(|&v| mesh.vertex_position(v))
                 .collect();
-            let centroid = positions.iter().fold(Vec3::ZERO, |acc, &p| acc + p) / positions.len() as f32;
+            let centroid =
+                positions.iter().fold(Vec3::ZERO, |acc, &p| acc + p) / positions.len() as f32;
             positions
                 .iter()
                 .map(|p| normal.dot(*p - centroid).abs())
@@ -411,9 +412,7 @@ mod tests {
 
         let make_quad = |mesh: &mut LoopMesh, vs: [VertexKey; 4]| -> FaceKey {
             let edges: Vec<EdgeKey> = (0..4)
-                .map(|i| {
-                    mesh.create_edge([vs[i], vs[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
-                })
+                .map(|i| mesh.create_edge([vs[i], vs[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
                 .collect();
             let face = mesh.face_create(&vs, &edges, FaceCreateFlags::NONE);
             mesh.face_calc_normal(face);
@@ -449,7 +448,12 @@ mod tests {
         let t2 = mesh.create_vertex(Vec3::new(5.5, 1.0, 0.3));
         let tri_verts = [t0, t1, t2];
         let tri_edges: Vec<EdgeKey> = (0..3)
-            .map(|i| mesh.create_edge([tri_verts[i], tri_verts[(i + 1) % 3]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [tri_verts[i], tri_verts[(i + 1) % 3]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect();
         let triangle = mesh.face_create(&tri_verts, &tri_edges, FaceCreateFlags::NONE);
         mesh.face_calc_normal(triangle);

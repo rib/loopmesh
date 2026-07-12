@@ -479,7 +479,8 @@ impl LoopMesh {
                     frame_pos += self.vertex_normal(v) * (centre_offset * scale);
                 }
                 let frame = self.create_vertex(frame_pos);
-                self.vertex_attribs.copy_into(frame.as_usize(), v.as_usize());
+                self.vertex_attribs
+                    .copy_into(frame.as_usize(), v.as_usize());
                 inset_of_loop[l.as_usize()] = Some(frame);
             }
         }
@@ -830,7 +831,8 @@ impl LoopMesh {
         };
 
         let frame = self.create_vertex(here + outward * inset_dist);
-        self.vertex_attribs.copy_into(frame.as_usize(), v.as_usize());
+        self.vertex_attribs
+            .copy_into(frame.as_usize(), v.as_usize());
         frame
     }
 
@@ -839,7 +841,12 @@ impl LoopMesh {
     /// already created by the strut/cap quad (deduplicated under
     /// `NO_DUPLICATE`), so this looks it up rather than creating it; a hub edge
     /// shared by two adjacent struts is creased idempotently.
-    fn wireframe_crease_hub_edge(&mut self, frame: VertexKey, shell: VertexKey, crease_weight: f32) {
+    fn wireframe_crease_hub_edge(
+        &mut self,
+        frame: VertexKey,
+        shell: VertexKey,
+        crease_weight: f32,
+    ) {
         if let Some(edge) = self.query_edge_exists(frame, shell) {
             self.set_edge_crease(edge, crease_weight);
         }
@@ -862,7 +869,8 @@ impl LoopMesh {
             self.create_edge([verts[3], verts[0]], EdgeCreateFlags::NO_DUPLICATE),
         ];
         let face = self.face_create(&verts, &edges, FaceCreateFlags::NONE);
-        self.face_attribs.copy_into(face.as_usize(), src_face.as_usize());
+        self.face_attribs
+            .copy_into(face.as_usize(), src_face.as_usize());
 
         if !self.loop_attribs.is_empty() {
             let mut ql = self.face_first_loop(face);
@@ -933,11 +941,7 @@ mod tests {
 
         assert_eq!(result.strut_faces.len(), 16, "8 inner + 8 rim caps");
         assert_eq!(mesh.face_count(), 17, "16 struts + 1 retained source");
-        assert_eq!(
-            mesh.vertex_count(),
-            20,
-            "16 (open case) + 4 boundary verts"
-        );
+        assert_eq!(mesh.vertex_count(), 20, "16 (open case) + 4 boundary verts");
         mesh.validate_topology();
     }
 
@@ -1005,7 +1009,11 @@ mod tests {
 
         let result = mesh.wireframe(&[centre], 0.2, false);
 
-        assert_eq!(result.strut_faces.len(), 8, "all four edges are wire-boundary");
+        assert_eq!(
+            result.strut_faces.len(),
+            8,
+            "all four edges are wire-boundary"
+        );
         // 9 grid faces + 8 struts (centre retained) = 17.
         assert_eq!(mesh.face_count(), 17);
         // New verts: 4 inset + 8 shell; the 16 grid verts persist.
@@ -1074,7 +1082,10 @@ mod tests {
                 saw_surface = true;
             }
         }
-        assert!(saw_neg && saw_pos && saw_surface, "offset=0 straddles symmetrically");
+        assert!(
+            saw_neg && saw_pos && saw_surface,
+            "offset=0 straddles symmetrically"
+        );
 
         plus.validate_topology();
     }
@@ -1091,15 +1102,31 @@ mod tests {
         let fk = flat_quad(&mut kept);
         let kept_result = kept.wireframe_with_replace(&[fk], 0.2, 0.0, false, false);
         assert_eq!(kept_result.strut_faces.len(), 8);
-        assert_eq!(kept.face_count(), 9, "source retained when use_replace clear");
-        assert_eq!(kept.vertex_count(), 16, "4 original kept + 4 inset + 8 shell");
+        assert_eq!(
+            kept.face_count(),
+            9,
+            "source retained when use_replace clear"
+        );
+        assert_eq!(
+            kept.vertex_count(),
+            16,
+            "4 original kept + 4 inset + 8 shell"
+        );
         kept.validate_topology();
 
         let mut replaced = LoopMesh::new();
         let fr = flat_quad(&mut replaced);
         let replaced_result = replaced.wireframe_with_replace(&[fr], 0.2, 0.0, false, true);
-        assert_eq!(replaced_result.strut_faces.len(), 8, "struts unchanged by replace");
-        assert_eq!(replaced.face_count(), 8, "source face consumed under use_replace");
+        assert_eq!(
+            replaced_result.strut_faces.len(),
+            8,
+            "struts unchanged by replace"
+        );
+        assert_eq!(
+            replaced.face_count(),
+            8,
+            "source face consumed under use_replace"
+        );
         assert_eq!(
             replaced.vertex_count(),
             12,
@@ -1217,7 +1244,10 @@ mod tests {
         for slot in 0..flat.vertex_count() {
             let a = flat.vertex_position(VertexKey::from_usize(slot));
             let b = even_off.vertex_position(VertexKey::from_usize(slot));
-            assert_eq!(a, b, "vert {slot}: use_even_offset=false must equal flat path");
+            assert_eq!(
+                a, b,
+                "vert {slot}: use_even_offset=false must equal flat path"
+            );
         }
         even_off.validate_topology();
     }
@@ -1305,7 +1335,10 @@ mod tests {
             "90° factor {f90} should be √2",
         );
         let f180 = super::even_offset_factor(dir(0.0), dir(180.0));
-        assert!((f180 - 1.0).abs() < 1.0e-4, "flat corner factor {f180} should be 1.0");
+        assert!(
+            (f180 - 1.0).abs() < 1.0e-4,
+            "flat corner factor {f180} should be 1.0"
+        );
     }
 
     /// An axis-irregular planar quad lying in z = 0, wound +Z, whose four edges
@@ -1362,7 +1395,10 @@ mod tests {
         for slot in 0..absolute.vertex_count() {
             let a = absolute.vertex_position(VertexKey::from_usize(slot));
             let b = rel_clear.vertex_position(VertexKey::from_usize(slot));
-            assert_eq!(a, b, "vert {slot}: relative-offset clear must equal absolute path");
+            assert_eq!(
+                a, b,
+                "vert {slot}: relative-offset clear must equal absolute path"
+            );
         }
         rel_clear.validate_topology();
     }
@@ -1449,9 +1485,8 @@ mod tests {
             let mut nearest = 0usize;
             let mut best = f32::MAX;
             for c in 0..4 {
-                let d = (Vec3::new(corners[c].x, corners[c].y, 0.0)
-                    - Vec3::new(p.x, p.y, 0.0))
-                .length_squared();
+                let d = (Vec3::new(corners[c].x, corners[c].y, 0.0) - Vec3::new(p.x, p.y, 0.0))
+                    .length_squared();
                 if d < best {
                     best = d;
                     nearest = c;
@@ -1465,7 +1500,10 @@ mod tests {
             );
             shell_hits += 1;
         }
-        assert_eq!(shell_hits, 8, "all eight shell verts (a +/- pair per corner) checked");
+        assert_eq!(
+            shell_hits, 8,
+            "all eight shell verts (a +/- pair per corner) checked"
+        );
 
         // The per-corner factors are genuinely distinct here — the test would be
         // vacuous on a rectangle (uniform factor).
@@ -1485,7 +1523,11 @@ mod tests {
         // numerator is both edge lengths and the divisor is 2, so the factor is
         // their mean — here mean and median coincide, the pitfall a lone quad
         // hides.
-        assert_eq!(super::relative_offset_factor(3.0 + 7.0, 2), 5.0, "two-edge fan → mean");
+        assert_eq!(
+            super::relative_offset_factor(3.0 + 7.0, 2),
+            5.0,
+            "two-edge fan → mean"
+        );
 
         // Degree-4 interior vertex with unequal edges {1, 2, 4, 8}: the mean is
         // 15/4 = 3.75, whereas a statistical median would be (2 + 4)/2 = 3.0.
@@ -1507,7 +1549,11 @@ mod tests {
 
         // A vertex with no incident edges (never reached for a region vertex)
         // falls back to 0.0.
-        assert_eq!(super::relative_offset_factor(0.0, 0), 0.0, "empty disk → 0.0 fallback");
+        assert_eq!(
+            super::relative_offset_factor(0.0, 0),
+            0.0,
+            "empty disk → 0.0 fallback"
+        );
     }
 
     #[test]
@@ -1561,11 +1607,9 @@ mod tests {
         // Interior vertex v[1][1] = (1, 2): all four disk edges stay in-region,
         // so the factor is their mean. Lengths {1, 4, 2, 8} → 15/4 = 3.75; a
         // median would give (2 + 4)/2 = 3.0.
-        let interior_factor = (len((1, 1), (0, 1))
-            + len((1, 1), (2, 1))
-            + len((1, 1), (1, 0))
-            + len((1, 1), (1, 2)))
-            / 4.0;
+        let interior_factor =
+            (len((1, 1), (0, 1)) + len((1, 1), (2, 1)) + len((1, 1), (1, 0)) + len((1, 1), (1, 2)))
+                / 4.0;
         assert!((interior_factor - 3.75).abs() < 1.0e-6);
         let interior_median = 3.0_f32; // (2 + 4)/2 over sorted {1,2,4,8}
         assert!(
@@ -1578,8 +1622,7 @@ mod tests {
         // length is dropped from the sum yet still counts toward the degree, so
         // the factor is (4 + 2 + 8)/4 = 3.5 — NOT (4 + 2 + 8)/3 ≈ 4.667 (the
         // qualifying-count divisor) and NOT a median over {2,4,8} = 4.
-        let border_factor =
-            (len((2, 1), (1, 1)) + len((2, 1), (2, 0)) + len((2, 1), (2, 2))) / 4.0;
+        let border_factor = (len((2, 1), (1, 1)) + len((2, 1), (2, 0)) + len((2, 1), (2, 2))) / 4.0;
         assert!((border_factor - 3.5).abs() < 1.0e-6);
         let border_qualifying_divisor =
             (len((2, 1), (1, 1)) + len((2, 1), (2, 0)) + len((2, 1), (2, 2))) / 3.0;
@@ -1613,7 +1656,11 @@ mod tests {
         };
 
         let interior_zs = shell_abs_z(&mesh, pos(1, 1));
-        assert_eq!(interior_zs.len(), 2, "one +/- shell pair at the interior vertex");
+        assert_eq!(
+            interior_zs.len(),
+            2,
+            "one +/- shell pair at the interior vertex"
+        );
         for z in interior_zs {
             assert!(
                 (z - half * interior_factor).abs() < 1.0e-5,
@@ -1623,7 +1670,11 @@ mod tests {
         }
 
         let border_zs = shell_abs_z(&mesh, pos(2, 1));
-        assert_eq!(border_zs.len(), 2, "one +/- shell pair at the border vertex");
+        assert_eq!(
+            border_zs.len(),
+            2,
+            "one +/- shell pair at the border vertex"
+        );
         for z in border_zs {
             assert!(
                 (z - half * border_factor).abs() < 1.0e-5,
@@ -1779,7 +1830,11 @@ mod tests {
             42,
             "24 inner struts + 18 rim caps (2 per boundary edge × 9 boundary edges)",
         );
-        assert_eq!(mesh.face_count(), 45, "42 strut/cap faces + 3 retained source");
+        assert_eq!(
+            mesh.face_count(),
+            45,
+            "42 strut/cap faces + 3 retained source"
+        );
         assert_eq!(
             mesh.vertex_count(),
             44,
@@ -1975,7 +2030,11 @@ mod tests {
             );
         }
         for &e in &other {
-            assert_eq!(mesh.edge_crease(e), 0.0, "non-hub edge {e:?} stays uncreased");
+            assert_eq!(
+                mesh.edge_crease(e),
+                0.0,
+                "non-hub edge {e:?} stays uncreased"
+            );
         }
         mesh.validate_topology();
     }
@@ -1994,7 +2053,10 @@ mod tests {
 
         let (hub, _other) = classify_quad_edges(&mesh, orig);
         let creased = hub.iter().filter(|&&e| mesh.edge_crease(e) > 0.0).count();
-        assert_eq!(creased, 8, "no rim caps → only the 8 inner hub edges creased");
+        assert_eq!(
+            creased, 8,
+            "no rim caps → only the 8 inner hub edges creased"
+        );
         mesh.validate_topology();
     }
 
@@ -2009,9 +2071,15 @@ mod tests {
 
         assert_eq!(mesh.edge_crease(e), 0.0, "default crease is 0.0 (no layer)");
         mesh.set_edge_crease(e, 0.75);
-        assert!((mesh.edge_crease(e) - 0.75).abs() < 1.0e-6, "value round-trips");
+        assert!(
+            (mesh.edge_crease(e) - 0.75).abs() < 1.0e-6,
+            "value round-trips"
+        );
         mesh.set_edge_crease(e, 0.25);
-        assert!((mesh.edge_crease(e) - 0.25).abs() < 1.0e-6, "layer reused on update");
+        assert!(
+            (mesh.edge_crease(e) - 0.25).abs() < 1.0e-6,
+            "layer reused on update"
+        );
     }
 
     #[test]
@@ -2037,8 +2105,16 @@ mod tests {
         let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NO_DUPLICATE);
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NO_DUPLICATE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NO_DUPLICATE);
-        let a = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let b = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let a = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let b = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let result = mesh.wireframe(&[a, b], 0.2, false);
 

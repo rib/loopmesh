@@ -560,7 +560,13 @@ impl LoopMesh {
         let new_faces: HashSet<FaceKey> = result.faces.iter().copied().collect();
 
         if mode != BevelFaceStrengthMode::None {
-            self.stamp_face_strengths(mode, &original_faces, &original_verts, &new_faces, &cap_faces);
+            self.stamp_face_strengths(
+                mode,
+                &original_faces,
+                &original_verts,
+                &new_faces,
+                &cap_faces,
+            );
         }
         // §8.10.2 is a leaf independent of §8.10.1: it runs whenever the caller
         // requested it and the bevel actually built new geometry (nonzero offset).
@@ -1711,7 +1717,9 @@ impl LoopMesh {
                 self.bridge_junction_flags(&ring, disk, options.mark_seam, options.mark_sharp);
             }
             for miter in &miter_ring_junctions {
-                let Some(disk) = junction_disks.iter().find(|disk| disk.vertex == miter.vertex)
+                let Some(disk) = junction_disks
+                    .iter()
+                    .find(|disk| disk.vertex == miter.vertex)
                 else {
                     continue;
                 };
@@ -1932,9 +1940,13 @@ impl LoopMesh {
             interior.push(welded);
         }
 
-        if let Some(cross) =
-            self.cross_weld(vertex, first_boundvert, second_boundvert, &interior, is_beveled)
-        {
+        if let Some(cross) = self.cross_weld(
+            vertex,
+            first_boundvert,
+            second_boundvert,
+            &interior,
+            is_beveled,
+        ) {
             cross_welds.push(cross);
         }
 
@@ -2172,11 +2184,10 @@ impl LoopMesh {
                 if leg == edge || leg == left_other || leg == right_other {
                     continue;
                 }
-                let leg_direction =
-                    match self.edge_direction_from(leg, vertex, terminal_position) {
-                        Some(direction) => direction,
-                        None => continue,
-                    };
+                let leg_direction = match self.edge_direction_from(leg, vertex, terminal_position) {
+                    Some(direction) => direction,
+                    None => continue,
+                };
                 // §5.2.4: not yet minted from the corner.
                 let leg_vert = self.create_vertex(terminal_position + leg_direction * offset);
                 result.verts.push(leg_vert);
@@ -2303,8 +2314,7 @@ impl LoopMesh {
             return;
         }
         let representative = templates.resolve(fan.representative);
-        let mut ring: Vec<VertexKey> =
-            Vec::with_capacity(fan.boundary.len() + fan.leg_verts.len());
+        let mut ring: Vec<VertexKey> = Vec::with_capacity(fan.boundary.len() + fan.leg_verts.len());
         ring.extend_from_slice(&fan.boundary);
         ring.extend_from_slice(&fan.leg_verts);
         let count = ring.len();
@@ -2325,7 +2335,12 @@ impl LoopMesh {
             let mut triangle = vec![a, b, c];
             self.wind_fan_triangle_opposite_neighbor(&mut triangle);
             let face = self.face_create_verts(&triangle, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
+            self.assign_bevel_face_attributes(
+                face,
+                material,
+                representative,
+                BevelNewFaceKind::Cap,
+            );
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -2557,7 +2572,10 @@ impl LoopMesh {
             // handedness rather than re-arming a metric compare that a narrow offset
             // cannot resolve.
             (false, false) => {
-                debug_assert!(false, "strip has no re-stitched rail to pair its chain ends");
+                debug_assert!(
+                    false,
+                    "strip has no re-stitched rail to pair its chain ends"
+                );
                 false
             }
             // A winding-inconsistent input across E can rail both pairings; the strip
@@ -2597,7 +2615,12 @@ impl LoopMesh {
                 quad.reverse();
             }
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Strip);
+            self.assign_bevel_face_attributes(
+                face,
+                material,
+                representative,
+                BevelNewFaceKind::Strip,
+            );
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -2778,7 +2801,12 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&face_verts, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
+            self.assign_bevel_face_attributes(
+                face,
+                material,
+                representative,
+                BevelNewFaceKind::Cap,
+            );
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -2801,7 +2829,12 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
+            self.assign_bevel_face_attributes(
+                face,
+                material,
+                representative,
+                BevelNewFaceKind::Cap,
+            );
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -3035,7 +3068,12 @@ impl LoopMesh {
                 }
             }
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
+            self.assign_bevel_face_attributes(
+                face,
+                material,
+                representative,
+                BevelNewFaceKind::Cap,
+            );
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
@@ -3245,11 +3283,7 @@ impl LoopMesh {
                         set_face_substitution(face_subst, vertex, face, run);
                     } else {
                         self.restitch_multiface_arc_sector(
-                            vertex,
-                            sector,
-                            arc,
-                            segments,
-                            face_subst,
+                            vertex, sector, arc, segments, face_subst,
                         );
                     }
                 }
@@ -3860,7 +3894,11 @@ impl LoopMesh {
         // one `(incoming_leg, face)` per face in order, plus one trailing duplicate for
         // the closing beveled edge — so the legs are every corner's edge and the face
         // between `legs[i]` and `legs[i + 1]` is `corners[i].1`.
-        let legs: Vec<EdgeKey> = reflex_sector.corners.iter().map(|&(edge, _)| edge).collect();
+        let legs: Vec<EdgeKey> = reflex_sector
+            .corners
+            .iter()
+            .map(|&(edge, _)| edge)
+            .collect();
         let leg_count = legs.len();
         // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed
         // leg; anything shorter is single-face and never reaches here. `patch_chain` is
@@ -3935,7 +3973,11 @@ impl LoopMesh {
         // and the face bounded by each consecutive leg pair, `corners[i].1` between
         // `legs[i]` and `legs[i + 1]` — the same layout `restitch_multiface_patch_reflex`
         // consumes.
-        let legs: Vec<EdgeKey> = reflex_sector.corners.iter().map(|&(edge, _)| edge).collect();
+        let legs: Vec<EdgeKey> = reflex_sector
+            .corners
+            .iter()
+            .map(|&(edge, _)| edge)
+            .collect();
         let leg_count = legs.len();
         let seg = segments as usize;
         // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed leg;
@@ -4080,7 +4122,11 @@ impl LoopMesh {
             .map(|chain| self.vertex_position(chain[0]))
             .collect();
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
-        let fullness = if flat { 0.0 } else { adj_fullness(profile, segments) };
+        let fullness = if flat {
+            0.0
+        } else {
+            adj_fullness(profile, segments)
+        };
         let fullness_seed = centroid + fullness * (vertex_position - centroid);
 
         // The face-winding anchor (§8.5.5): a point below the cap, on the solid side away
@@ -4291,9 +4337,7 @@ impl LoopMesh {
             })
             .collect();
         let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
-        let centre = Vec3::splat(
-            (1.0_f32 / 3.0).sqrt() * adj_octant_prescale(exponent, segments),
-        );
+        let centre = Vec3::splat((1.0_f32 / 3.0).sqrt() * adj_octant_prescale(exponent, segments));
 
         // Stages 2/3: the same subdivision-relaxation stencil and read-back the general
         // ring runs (§8.5.5.5(c)/(d)) — here fed octant chains, so its output is in octant
@@ -4460,20 +4504,47 @@ impl LoopMesh {
             for cell_j in 0..half {
                 for cell_k in 0..half {
                     let a = self.adj_grid_vert(
-                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior,
-                        &mut grid, result,
+                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior, &mut grid,
+                        result,
                     );
                     let b = self.adj_grid_vert(
-                        i, cell_j, cell_k + 1, half, seg, sectors, even, chain_of, interior,
-                        &mut grid, result,
+                        i,
+                        cell_j,
+                        cell_k + 1,
+                        half,
+                        seg,
+                        sectors,
+                        even,
+                        chain_of,
+                        interior,
+                        &mut grid,
+                        result,
                     );
                     let c = self.adj_grid_vert(
-                        i, cell_j + 1, cell_k + 1, half, seg, sectors, even, chain_of, interior,
-                        &mut grid, result,
+                        i,
+                        cell_j + 1,
+                        cell_k + 1,
+                        half,
+                        seg,
+                        sectors,
+                        even,
+                        chain_of,
+                        interior,
+                        &mut grid,
+                        result,
                     );
                     let d = self.adj_grid_vert(
-                        i, cell_j + 1, cell_k, half, seg, sectors, even, chain_of, interior,
-                        &mut grid, result,
+                        i,
+                        cell_j + 1,
+                        cell_k,
+                        half,
+                        seg,
+                        sectors,
+                        even,
+                        chain_of,
+                        interior,
+                        &mut grid,
+                        result,
                     );
                     self.emit_patch_face(&[a, b, c, d], anchor, material, representative, result);
                 }
@@ -5172,19 +5243,24 @@ impl LoopMesh {
     /// cyclic sequence of `VertexCorner { incoming_edge, face, outgoing_edge }`
     /// chained so consecutive corners share an edge — the disk walk order.
     fn vertex_corner_ring(&self, vertex: VertexKey) -> Vec<VertexCorner> {
-        // Per incident face: its two edges at `vertex`.
+        // Per incident face: its two edges at `vertex`, ordered so that the ring
+        // *enters* the corner on the edge the face **leaves** `vertex` on (its corner
+        // edge, RADIAL_EDGE_STRUCTURE.md §6.5) and exits on the edge the face arrives
+        // at `vertex` on. That makes the walk run against the face winding, uniformly
+        // — so the face "just past" a corner's opening edge is that corner's own face,
+        // which is the reference normal BEVEL.md §8.9.1's signed reflex test names.
+        //
+        // The order must come off the winding, not off whichever of the two edges a
+        // face-loop scan happens to reach first: that would let the seed corner face
+        // either way round, leaving the ring's rotational direction a property of the
+        // fan's start face rather than of the surface orientation, and flipping the
+        // reflex sign on fixtures that merely built their faces in a different order.
         let mut face_edges: Vec<(FaceKey, EdgeKey, EdgeKey)> = Vec::new();
         for face in self.vert_face_keys(vertex) {
-            let mut at_vertex: Vec<EdgeKey> = Vec::new();
-            for loop_key in self.face_loop_keys(face) {
-                let edge = self.loop_edge(loop_key);
-                let [p, q] = self.edge_vert_keys(edge);
-                if (p == vertex || q == vertex) && !at_vertex.contains(&edge) {
-                    at_vertex.push(edge);
+            if let Some((arrives_on, leaves_on)) = self.face_corner_edges(face, vertex) {
+                if arrives_on != leaves_on {
+                    face_edges.push((face, leaves_on, arrives_on));
                 }
-            }
-            if at_vertex.len() == 2 {
-                face_edges.push((face, at_vertex[0], at_vertex[1]));
             }
         }
 
@@ -5377,15 +5453,14 @@ impl LoopMesh {
         // out-of-plane (silhouette) legs are the ones whose flanking faces are not
         // coplanar. Cases 1 and 2 (no legs, or all legs in-plane) share one sector
         // plane; case 3 (≥1 out-of-plane leg) gives each line its own local normal.
-        let has_out_of_plane = between_edges
-            .iter()
-            .enumerate()
-            .any(|(index, _)| {
-                let before = faces[index];
-                let after = faces[index + 1];
-                let dot = self.face_plane_normal(before).dot(self.face_plane_normal(after));
-                dot.abs() < 1.0 - MEET_PLANAR_TOLERANCE
-            });
+        let has_out_of_plane = between_edges.iter().enumerate().any(|(index, _)| {
+            let before = faces[index];
+            let after = faces[index + 1];
+            let dot = self
+                .face_plane_normal(before)
+                .dot(self.face_plane_normal(after));
+            dot.abs() < 1.0 - MEET_PLANAR_TOLERANCE
+        });
 
         // Each base-point perpendicular is in the sector plane and perpendicular to
         // its edge, oriented so the offset pushes *into* the sector. Cases 1/2 (one
@@ -5403,16 +5478,18 @@ impl LoopMesh {
             // through a boundary leg that no later corner re-reports, so the recorded
             // list starts one edge late and would pair `g_k` with an edge from a
             // different face's corner entirely.
-            let first_leg = self
-                .walk_corner(face_first, vertex, edge_first)
-                .and_then(|(next_edge, _)| {
-                    self.edge_direction_from(next_edge, vertex, vertex_position)
-                });
+            let first_leg =
+                self.walk_corner(face_first, vertex, edge_first)
+                    .and_then(|(next_edge, _)| {
+                        self.edge_direction_from(next_edge, vertex, vertex_position)
+                    });
             let last_leg = between_edges
                 .last()
                 .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
             let normal_first = match first_leg {
-                Some(leg) => orient_normal(dir_first.cross(leg), self.face_plane_normal(face_first)),
+                Some(leg) => {
+                    orient_normal(dir_first.cross(leg), self.face_plane_normal(face_first))
+                }
                 None => self.face_plane_normal(face_first),
             };
             let normal_second = match last_leg {
@@ -5494,7 +5571,8 @@ impl LoopMesh {
             ) else {
                 continue;
             };
-            let Some(dir_next) = self.edge_direction_from(next_edge, vertex, vertex_position) else {
+            let Some(dir_next) = self.edge_direction_from(next_edge, vertex, vertex_position)
+            else {
                 continue;
             };
             drop_candidates.push(DropCandidate {
@@ -5806,13 +5884,12 @@ impl LoopMesh {
         // collapses (a flank gone collinear with the leg) the ratio diverges, so
         // override it to `1` rather than evaluate the blow-up — an unconstrained side
         // makes equal demands on the leg, so a balanced ratio adds no bias.
-        let flank_sine_ratio = if sin_alpha_before < LOOP_SLIDE_TOLERANCE
-            || sin_alpha_after < LOOP_SLIDE_TOLERANCE
-        {
-            1.0
-        } else {
-            sin_alpha_after / sin_alpha_before
-        };
+        let flank_sine_ratio =
+            if sin_alpha_before < LOOP_SLIDE_TOLERANCE || sin_alpha_after < LOOP_SLIDE_TOLERANCE {
+                1.0
+            } else {
+                sin_alpha_after / sin_alpha_before
+            };
 
         Some(SlideRecord {
             flank_sine_ratio,
@@ -6451,7 +6528,10 @@ impl LoopMesh {
                     .filter(|entry| entry.beveled)
                     .map(|entry| entry.edge)
                     .collect::<Vec<_>>(),
-                &ring.iter().filter_map(|chain| chain.cross_edge).collect::<Vec<_>>(),
+                &ring
+                    .iter()
+                    .filter_map(|chain| chain.cross_edge)
+                    .collect::<Vec<_>>(),
             ),
             "the disk's beveled edges and the ring's crossings must agree rotationally",
         );
@@ -6994,7 +7074,8 @@ impl LoopMesh {
                         .query_edge_exists(w, next_vertex)
                         .expect("incident face's outgoing corner edge exists");
 
-                    let leading_ring = self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge);
+                    let leading_ring =
+                        self.ring_vertex_of(&corner.ring_vert_for_edge, incoming_edge);
                     let trailing_ring =
                         self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing_edge);
 
@@ -7280,7 +7361,8 @@ impl LoopMesh {
         kind: BevelNewFaceKind,
     ) {
         if let Some((blocks, donor)) = representative.block {
-            self.face_attribs.restore_slot(face.as_usize(), blocks, donor);
+            self.face_attribs
+                .restore_slot(face.as_usize(), blocks, donor);
         }
         if material >= 0 {
             self.set_face_material_index(face, material);
@@ -7325,14 +7407,20 @@ impl LoopMesh {
         // walk borrows `self` (face cycles), the write borrows it mutably.
         let mut writes: Vec<(FaceKey, i32)> = Vec::new();
         for face in self.face_keys() {
-            if let Some(value) =
-                self.face_strength_value(face, mode, original_faces, original_verts, new_faces, cap_faces)
-            {
+            if let Some(value) = self.face_strength_value(
+                face,
+                mode,
+                original_faces,
+                original_verts,
+                new_faces,
+                cap_faces,
+            ) {
                 writes.push((face, value));
             }
         }
         for (face, value) in writes {
-            self.face_attribs_mut().set_i32(layer, face.as_usize(), value);
+            self.face_attribs_mut()
+                .set_i32(layer, face.as_usize(), value);
         }
     }
 
@@ -7416,8 +7504,13 @@ impl LoopMesh {
             for loop_key in self.face_loop_keys(face) {
                 let edge = self.loop_edge(loop_key);
                 if let Some(neighbour) = self.radial_other_face(edge, face) {
-                    if self.harden_face_kind(neighbour, original_faces, original_verts, new_faces, cap_faces)
-                        == HardenFaceKind::Reconstructed
+                    if self.harden_face_kind(
+                        neighbour,
+                        original_faces,
+                        original_verts,
+                        new_faces,
+                        cap_faces,
+                    ) == HardenFaceKind::Reconstructed
                     {
                         seam_edges.push(edge);
                     }
@@ -7490,9 +7583,7 @@ impl LoopMesh {
 
     /// The radial face of `edge` other than `face`, or `None` at a boundary edge.
     fn radial_other_face(&self, edge: EdgeKey, face: FaceKey) -> Option<FaceKey> {
-        self.edge_face_keys(edge)
-            .into_iter()
-            .find(|&f| f != face)
+        self.edge_face_keys(edge).into_iter().find(|&f| f != face)
     }
 
     /// The target **world-space** custom split normal for one loop of a new bevel
@@ -7521,7 +7612,9 @@ impl LoopMesh {
         let neighbour_prev = self.radial_other_face(edge_prev, face);
 
         let kind_of = |f: Option<FaceKey>| {
-            f.map(|f| self.harden_face_kind(f, original_faces, original_verts, new_faces, cap_faces))
+            f.map(|f| {
+                self.harden_face_kind(f, original_faces, original_verts, new_faces, cap_faces)
+            })
         };
 
         let own_flat = self.face_normal(face);
@@ -7567,8 +7660,8 @@ impl LoopMesh {
             HardenFaceKind::Cap => {
                 let k_own = kind_of(neighbour_own);
                 let k_prev = kind_of(neighbour_prev);
-                let both_caps = k_own == Some(HardenFaceKind::Cap)
-                    && k_prev == Some(HardenFaceKind::Cap);
+                let both_caps =
+                    k_own == Some(HardenFaceKind::Cap) && k_prev == Some(HardenFaceKind::Cap);
                 if both_caps {
                     // Enclosed entirely by cap faces: the corner reads as a smooth
                     // rounded point at the vertex's own smoothed normal.
@@ -7757,8 +7850,7 @@ fn cyclically_equal(left: &[EdgeKey], right: &[EdgeKey]) -> bool {
         return false;
     }
     let count = left.len();
-    count == 0
-        || (0..count).any(|shift| (0..count).all(|i| left[(i + shift) % count] == right[i]))
+    count == 0 || (0..count).any(|shift| (0..count).all(|i| left[(i + shift) % count] == right[i]))
 }
 
 /// One junction's disk in rotational order, as mechanism (2)'s walk reads it (BEVEL.md
@@ -7883,7 +7975,6 @@ impl JunctionCut {
             })
             .collect()
     }
-
 }
 
 /// One **cross** weld (BEVEL.md §8.3.0.3's attribute note): a valence-4 welded junction
@@ -8424,14 +8515,24 @@ mod tests {
     /// key-keyed because two independent builds may assign different internal
     /// element keys while producing identical geometry.
     fn positions_multiset_eq(a: &LoopMesh, b: &LoopMesh, tol: f32) -> bool {
-        let positions_a: Vec<Vec3> = a.vert_keys().iter().map(|&v| a.vertex_position(v)).collect();
-        let mut positions_b: Vec<Vec3> =
-            b.vert_keys().iter().map(|&v| b.vertex_position(v)).collect();
+        let positions_a: Vec<Vec3> = a
+            .vert_keys()
+            .iter()
+            .map(|&v| a.vertex_position(v))
+            .collect();
+        let mut positions_b: Vec<Vec3> = b
+            .vert_keys()
+            .iter()
+            .map(|&v| b.vertex_position(v))
+            .collect();
         if positions_a.len() != positions_b.len() {
             return false;
         }
         for target in &positions_a {
-            match positions_b.iter().position(|q| (*q - *target).length() < tol) {
+            match positions_b
+                .iter()
+                .position(|q| (*q - *target).length() < tol)
+            {
                 Some(i) => {
                     positions_b.swap_remove(i);
                 }
@@ -8473,15 +8574,16 @@ mod tests {
                 .map(|&v| mesh.vertex_position(v))
                 .collect()
         };
-        let faces_a: Vec<Vec<Vec3>> =
-            a.face_keys().iter().map(|&f| face_cycle(a, f)).collect();
-        let mut faces_b: Vec<Vec<Vec3>> =
-            b.face_keys().iter().map(|&f| face_cycle(b, f)).collect();
+        let faces_a: Vec<Vec<Vec3>> = a.face_keys().iter().map(|&f| face_cycle(a, f)).collect();
+        let mut faces_b: Vec<Vec<Vec3>> = b.face_keys().iter().map(|&f| face_cycle(b, f)).collect();
         if faces_a.len() != faces_b.len() {
             return false;
         }
         for face in &faces_a {
-            match faces_b.iter().position(|other| cycle_matches(face, other, tol)) {
+            match faces_b
+                .iter()
+                .position(|other| cycle_matches(face, other, tol))
+            {
                 Some(i) => {
                     faces_b.swap_remove(i);
                 }
@@ -8580,7 +8682,11 @@ mod tests {
                     mesh_add_cube(&mut mesh);
                     let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
                     let incident = mesh.vert_edge_keys(corner);
-                    assert_eq!(incident.len(), 3, "the cube corner has three incident edges");
+                    assert_eq!(
+                        incident.len(),
+                        3,
+                        "the cube corner has three incident edges"
+                    );
                     let geom: Vec<GeomKey> = incident
                         .into_iter()
                         .take(edge_count)
@@ -8736,9 +8842,10 @@ mod tests {
     /// far-end faces absorbing their through-chains (§8.3.0.1).
     #[test]
     fn edge_bevel_two_edge_junction_welds_one_chain_at_oracle_counts() {
-        for (segments, expected, absorbing_face) in
-            [(2u32, (14usize, 22usize, 10usize), 6usize), (3, (17, 27, 12), 7)]
-        {
+        for (segments, expected, absorbing_face) in [
+            (2u32, (14usize, 22usize, 10usize), 6usize),
+            (3, (17, 27, 12), 7),
+        ] {
             for vmesh_method in [BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff] {
                 let (mesh, _) = bevel_two_edge_corner(segments, vmesh_method);
                 assert_eq!(
@@ -8783,12 +8890,20 @@ mod tests {
             "B_1 — the meet in the sector holding the leg, which lands on the leg",
         );
         assert_eq!(
-            result_has_vert_near(&mesh, &result, Vec3::new(0.926_776_7, -0.926_776_7, -0.926_776_7)),
+            result_has_vert_near(
+                &mesh,
+                &result,
+                Vec3::new(0.926_776_7, -0.926_776_7, -0.926_776_7)
+            ),
             1,
             "the single welded interior vert, sampled in the weld plane x + y = 0",
         );
         assert_eq!(
-            result_has_vert_near(&mesh, &result, Vec3::new(0.900_888, -0.900_888, -0.926_776_7)),
+            result_has_vert_near(
+                &mesh,
+                &result,
+                Vec3::new(0.900_888, -0.900_888, -0.926_776_7)
+            ),
             0,
             "the midpoint of the two un-overridden samples is not the answer",
         );
@@ -8862,7 +8977,11 @@ mod tests {
         for segments in 2..=3 {
             for vmesh_method in [BevelVmeshMethod::Adj, BevelVmeshMethod::Cutoff] {
                 let (mesh, result) = bevel_octahedron_cross(segments, vmesh_method, false, false);
-                assert_bevel_sound(&mesh, &result, &format!("cross weld, segments = {segments}"));
+                assert_bevel_sound(
+                    &mesh,
+                    &result,
+                    &format!("cross weld, segments = {segments}"),
+                );
                 let open = mesh
                     .edge_keys()
                     .iter()
@@ -8876,7 +8995,8 @@ mod tests {
             }
         }
         for segments in 2..=3 {
-            let (cutoff, _) = bevel_octahedron_cross(segments, BevelVmeshMethod::Cutoff, false, false);
+            let (cutoff, _) =
+                bevel_octahedron_cross(segments, BevelVmeshMethod::Cutoff, false, false);
             let (adj, _) = bevel_octahedron_cross(segments, BevelVmeshMethod::Adj, false, false);
             assert!(
                 positions_multiset_eq(&cutoff, &adj, 1.0e-5) && faces_match(&cutoff, &adj, 1.0e-5),
@@ -8913,7 +9033,11 @@ mod tests {
                     on_weld_plane(if a == weld { b } else { a })
                 })
                 .collect();
-            assert_eq!(chain_edges.len(), 2, "the weld vert owns the two chain edges");
+            assert_eq!(
+                chain_edges.len(),
+                2,
+                "the weld vert owns the two chain edges"
+            );
             for edge in chain_edges {
                 assert_eq!(
                     mesh.edge_seam(edge),
@@ -8972,7 +9096,10 @@ mod tests {
             .max_by_key(|edge| edge.as_usize())
             .expect("two beveled edges");
         let donor = walk_predecessor(&mesh, apex, last);
-        assert!(legs.contains(&donor), "the donor is one of the crossing legs");
+        assert!(
+            legs.contains(&donor),
+            "the donor is one of the crossing legs"
+        );
         let expected = mesh
             .edge_attribs()
             .get_vec3(tint, donor.as_usize())
@@ -9003,7 +9130,11 @@ mod tests {
                 on_weld_plane(if a == weld { b } else { a })
             })
             .collect();
-        assert_eq!(chain_edges.len(), 2, "the weld vert owns the two chain edges");
+        assert_eq!(
+            chain_edges.len(),
+            2,
+            "the weld vert owns the two chain edges"
+        );
         for edge in chain_edges {
             assert_eq!(
                 mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap(),
@@ -9030,8 +9161,11 @@ mod tests {
             ))
             .expect("Vec3 is a supported edge attribute format");
         for (index, edge) in mesh.edge_keys().into_iter().enumerate() {
-            mesh.edge_attribs_mut()
-                .set_vec3(layer, edge.as_usize(), [index as f32 + 1.0, 0.0, 0.0]);
+            mesh.edge_attribs_mut().set_vec3(
+                layer,
+                edge.as_usize(),
+                [index as f32 + 1.0, 0.0, 0.0],
+            );
         }
         layer
     }
@@ -9290,7 +9424,11 @@ mod tests {
             );
 
             for (index, endpoint_legs) in legs.iter().enumerate() {
-                assert_eq!(endpoint_legs.len(), 3, "an octahedron terminal has three legs");
+                assert_eq!(
+                    endpoint_legs.len(),
+                    3,
+                    "an octahedron terminal has three legs"
+                );
                 let carried: usize = endpoint_legs
                     .iter()
                     .map(|&tint| tint_count(&mesh, layer, tint))
@@ -9495,7 +9633,11 @@ mod tests {
             neighbour_dirs: None,
         });
         assert!(!rescued.collinear, "tier 1 recovers a frame");
-        assert_eq!(rescued.mid, Vec3::new(2.0, 3.0, 0.0), "the bulge is the vertex");
+        assert_eq!(
+            rescued.mid,
+            Vec3::new(2.0, 3.0, 0.0),
+            "the bulge is the vertex"
+        );
         assert!(
             (rescued.projection_dir - rescued.mid_plane_normal).length() < 1.0e-6,
             "a rescued profile projects along its own plane normal, not along the edge",
@@ -9514,7 +9656,11 @@ mod tests {
             Vec3::ZERO,
             "a collapsed profile has no projection setup — the signature both overrides key on",
         );
-        assert_eq!(collapsed.mid, (start + end) * 0.5, "the chord's plain midpoint");
+        assert_eq!(
+            collapsed.mid,
+            (start + end) * 0.5,
+            "the chord's plain midpoint"
+        );
     }
 
     /// BEVEL.md §8.2.2.1's tier-2 gate reads the beveled edge's **rotational** neighbours
@@ -9528,7 +9674,10 @@ mod tests {
     fn tier2_gate_reads_the_rotational_neighbours_not_the_edge_cycle() {
         let (mesh, centre, rim) = planar_fan(6);
         let corners = mesh.vertex_corner_ring(centre);
-        let spoke = |k: usize| mesh.query_edge_exists(centre, rim[k]).expect("spoke exists");
+        let spoke = |k: usize| {
+            mesh.query_edge_exists(centre, rim[k])
+                .expect("spoke exists")
+        };
         let beveled: Vec<EdgeKey> = (0..3).map(spoke).collect();
         let is_beveled = |candidate: EdgeKey| beveled.contains(&candidate);
 
@@ -9566,7 +9715,10 @@ mod tests {
         // fan's four faces in turn, including the two that have a face on *both* sides.
         for first_face in 0..4 {
             let (mesh, centre, rim) = open_planar_fan(5, first_face);
-            let spoke = |k: usize| mesh.query_edge_exists(centre, rim[k]).expect("spoke exists");
+            let spoke = |k: usize| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("spoke exists")
+            };
             let corners = mesh.vertex_corner_ring(centre);
 
             assert_eq!(
@@ -9648,8 +9800,11 @@ mod tests {
         let swapped = Vec3::new(0.23094011, 0.4, 0.0);
 
         let sample = |mid: Vec3| {
-            ProfileCell::from_control_points(start, end, mid)
-                .chain_positions(2, 0.5, ChainEmission::Resampled)[1]
+            ProfileCell::from_control_points(start, end, mid).chain_positions(
+                2,
+                0.5,
+                ChainEmission::Resampled,
+            )[1]
         };
         assert_eq!(
             result_has_vert_near(&mesh, &result, sample(tier2)),
@@ -9831,8 +9986,11 @@ mod tests {
         // boundvert (`offset / sin 120°` out along the 240° bisector).
         let start = Vec3::new(0.34641016, 0.2, 0.0);
         let end = Vec3::new(-0.11547005, -0.2, 0.0);
-        let expected = ProfileCell::from_control_points(start, end, Vec3::ZERO)
-            .chain_positions(2, 0.5, ChainEmission::Resampled)[1];
+        let expected = ProfileCell::from_control_points(start, end, Vec3::ZERO).chain_positions(
+            2,
+            0.5,
+            ChainEmission::Resampled,
+        )[1];
         assert_eq!(
             result_has_vert_near(&mesh, &result, expected),
             1,
@@ -9981,11 +10139,8 @@ mod tests {
                     let apex = vert_at(&mesh, Vec3::new(0.0, 0.0, 1.0));
                     let incident = mesh.vert_edge_keys(apex);
                     assert_eq!(incident.len(), 4, "the octahedron apex has valence 4");
-                    let geom: Vec<GeomKey> = incident
-                        .into_iter()
-                        .take(2)
-                        .map(GeomKey::from)
-                        .collect();
+                    let geom: Vec<GeomKey> =
+                        incident.into_iter().take(2).map(GeomKey::from).collect();
 
                     let result = mesh.bevel(
                         &geom,
@@ -10239,7 +10394,9 @@ mod tests {
     /// Bevel the interior valence-3 cube corner `(1,-1,-1)` at `offset = 0.25`
     /// with the given strength mode, returning the mesh, the result, and the cap
     /// face (`result.faces[0]`, the single triangular corner-cap).
-    fn beveled_cube_corner_strength(mode: BevelFaceStrengthMode) -> (LoopMesh, BevelResult, FaceKey) {
+    fn beveled_cube_corner_strength(
+        mode: BevelFaceStrengthMode,
+    ) -> (LoopMesh, BevelResult, FaceKey) {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
@@ -10482,7 +10639,11 @@ mod tests {
         // their hardened normals are the three axis normals as a set — a bijection
         // onto the fan sectors, independent of the two-reconstructed tie-break.
         assert_eq!(count_matching(&normals, CORNER_FRONT_N()), 1, "one loop -Z");
-        assert_eq!(count_matching(&normals, CORNER_BOTTOM_N()), 1, "one loop -Y");
+        assert_eq!(
+            count_matching(&normals, CORNER_BOTTOM_N()),
+            1,
+            "one loop -Y"
+        );
         assert_eq!(count_matching(&normals, CORNER_RIGHT_N()), 1, "one loop +X");
         // None is the cap's own diagonal flat normal (the naive writeback).
         for n in &normals {
@@ -10522,11 +10683,7 @@ mod tests {
         }
 
         // An untouched cube edge (the far top crease) stays smooth.
-        let untouched = cube_edge(
-            &mesh,
-            Vec3::new(-1.0, 1.0, 1.0),
-            Vec3::new(1.0, 1.0, 1.0),
-        );
+        let untouched = cube_edge(&mesh, Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
         assert!(
             !mesh.edge_sharp(untouched),
             "an edge the bevel never touched must not be marked sharp",
@@ -10989,7 +11146,10 @@ mod tests {
                 .iter()
                 .filter(|&&v| (mesh.vertex_position(v) - target).length() < 1.0e-3)
                 .count();
-            assert_eq!(hits, 1, "a strip vert lands at the §7.5.1 leg meet {target:?}");
+            assert_eq!(
+                hits, 1,
+                "a strip vert lands at the §7.5.1 leg meet {target:?}"
+            );
             // The §7.3 slide keeps x = 0 at this corner; the leg meet pulls it off.
             assert!(target.x > 1.0e-2, "leg meet is off the §7.3 in-face slide");
         }
@@ -11308,10 +11468,15 @@ mod tests {
 
         // The general solver equalises chords for a larger even count too.
         let chain4 = superellipse_chain(0.7, 4);
-        let chords: Vec<f32> = (0..4).map(|k| cell_chord(chain4[k], chain4[k + 1])).collect();
+        let chords: Vec<f32> = (0..4)
+            .map(|k| cell_chord(chain4[k], chain4[k + 1]))
+            .collect();
         let max = chords.iter().cloned().fold(0.0_f32, f32::max);
         let min = chords.iter().cloned().fold(f32::INFINITY, f32::min);
-        assert!((max - min) < 1.0e-3, "general solver equalises chords: {chords:?}");
+        assert!(
+            (max - min) < 1.0e-3,
+            "general solver equalises chords: {chords:?}"
+        );
         // Symmetric about the diagonal: sample k mirrors sample n−k.
         assert!((chain4[1].0 - chain4[3].1).abs() < 1.0e-5);
     }
@@ -11332,8 +11497,14 @@ mod tests {
         assert!((chain[2].0 - 1.0).abs() < 1.0e-6 && (chain[2].1 - 1.0).abs() < 1.0e-6);
         // Interior samples lie on the legs: the first-leg point has v == 1 (top
         // edge), the mirrored second-leg point has u == 1 (right edge).
-        assert!((chain[1].1 - 1.0).abs() < 1.0e-6, "chain[1] on top leg (v=1)");
-        assert!((chain[3].0 - 1.0).abs() < 1.0e-6, "chain[3] on right leg (u=1)");
+        assert!(
+            (chain[1].1 - 1.0).abs() < 1.0e-6,
+            "chain[1] on top leg (v=1)"
+        );
+        assert!(
+            (chain[3].0 - 1.0).abs() < 1.0e-6,
+            "chain[3] on right leg (u=1)"
+        );
         // Equal chords: each of the 4 chords is 2/segments = 0.5 long.
         for k in 0..4 {
             assert!((cell_chord(chain[k], chain[k + 1]) - 0.5).abs() < 1.0e-6);
@@ -11343,7 +11514,10 @@ mod tests {
         let chain_in = superellipse_chain(0.0, 4);
         assert!((chain_in[2].0).abs() < 1.0e-6 && (chain_in[2].1).abs() < 1.0e-6);
         assert!((chain_in[1].0).abs() < 1.0e-6, "chain[1] on left leg (u=0)");
-        assert!((chain_in[3].1).abs() < 1.0e-6, "chain[3] on bottom leg (v=0)");
+        assert!(
+            (chain_in[3].1).abs() < 1.0e-6,
+            "chain[3] on bottom leg (v=0)"
+        );
         for k in 0..4 {
             assert!((cell_chord(chain_in[k], chain_in[k + 1]) - 0.5).abs() < 1.0e-6);
         }
@@ -11391,7 +11565,10 @@ mod tests {
         // not square-in): every interior square-in sample has v < 1.
         let chain = superellipse_chain(0.0, 4);
         for k in 1..4 {
-            assert!(chain[k].1 < 1.0 - 1.0e-6, "square-in sample {k} off flat top");
+            assert!(
+                chain[k].1 < 1.0 - 1.0e-6,
+                "square-in sample {k} off flat top"
+            );
         }
     }
 
@@ -11428,8 +11605,14 @@ mod tests {
         // flat (−0.875) is shallowest, then circle (−0.927), then 0.7 (deeper).
         assert!(bulge.y < circle.y, "0.7 bulges past the circle sample");
         assert!(circle.y < flat.y, "the circle bulges past the flat chord");
-        assert!((bulge - circle).length() > 1.0e-3, "0.7 is a distinct position");
-        assert!((bulge - flat).length() > 1.0e-3, "0.7 is not the chord midpoint");
+        assert!(
+            (bulge - circle).length() > 1.0e-3,
+            "0.7 is a distinct position"
+        );
+        assert!(
+            (bulge - flat).length() > 1.0e-3,
+            "0.7 is not the chord midpoint"
+        );
     }
 
     /// BEVEL.md §8.3.2 / §8.3.4 / §8.3.0.1: the `s = 3`, `segments = 2` cube-corner
@@ -11485,7 +11668,11 @@ mod tests {
 
         // No bottom face beyond the three cut faces: the collapse omits it (§8.3.4).
         // The new geometry is 6 strip quads + 3 cut quads = 9 faces.
-        assert_eq!(result.faces.len(), 9, "6 strip quads + 3 cut quads, no bottom");
+        assert_eq!(
+            result.faces.len(),
+            9,
+            "6 strip quads + 3 cut quads, no bottom"
+        );
     }
 
     /// The same cube-corner cutoff junction at an explicit `profile`, returning the
@@ -11589,7 +11776,10 @@ mod tests {
             .iter()
             .filter(|&&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
             .count();
-        assert_eq!(at_apex, 1, "the curved 0.7 profile still collapses to one apex");
+        assert_eq!(
+            at_apex, 1,
+            "the curved 0.7 profile still collapses to one apex"
+        );
 
         assert_eq!(
             result.faces.len(),
@@ -11816,7 +12006,11 @@ mod tests {
                 (radius - 0.396_095).abs() < 1.0e-4 && (p.z - 0.407_614).abs() < 1.0e-4
             })
             .collect();
-        assert_eq!(ring.len(), 6, "six corner verts form the corrected apex ring");
+        assert_eq!(
+            ring.len(),
+            6,
+            "six corner verts form the corrected apex ring"
+        );
     }
 
     /// BEVEL.md §8.3.0.2.1 / §8.5.5.5(b): the fully-surrounded valence-6 apex under
@@ -11881,9 +12075,17 @@ mod tests {
             .copied()
             .filter(|&f| mesh.face_vert_keys(f).contains(&centre))
             .collect();
-        assert_eq!(cap_faces.len(), 6, "six vmesh quads fan around the flat apex centre");
+        assert_eq!(
+            cap_faces.len(),
+            6,
+            "six vmesh quads fan around the flat apex centre"
+        );
         for &f in &cap_faces {
-            assert_eq!(mesh.face_vert_keys(f).len(), 4, "each apex cap face is a quad");
+            assert_eq!(
+                mesh.face_vert_keys(f).len(),
+                4,
+                "each apex cap face is a quad"
+            );
         }
     }
 
@@ -11917,14 +12119,20 @@ mod tests {
             .iter()
             .filter(|&&v| (mesh.vertex_position(v) - round_centre).length() < 1.0e-4)
             .count();
-        assert_eq!(bulged, 1, "the round ADJ apex centre stays bulged at (0, 0, 0.703618)");
+        assert_eq!(
+            bulged, 1,
+            "the round ADJ apex centre stays bulged at (0, 0, 0.703618)"
+        );
 
         let flattened = result
             .verts
             .iter()
             .filter(|&&v| (mesh.vertex_position(v) - flat_centre).length() < 1.0e-4)
             .count();
-        assert_eq!(flattened, 0, "the round centre is not pinned to the flat ring plane");
+        assert_eq!(
+            flattened, 0,
+            "the round centre is not pinned to the flat ring plane"
+        );
     }
 
     /// BEVEL.md §8.2.2.1 / §8.3.6: the lone `segments = 2` interior chain vert is
@@ -11984,7 +12192,10 @@ mod tests {
             .iter()
             .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - expected).abs() < 1.0e-4)
             .count();
-        assert_eq!(ring_verts, 3, "three §7.6.2 boundverts, unchanged by segments");
+        assert_eq!(
+            ring_verts, 3,
+            "three §7.6.2 boundverts, unchanged by segments"
+        );
 
         // The junction corner and all three far endpoints are consumed.
         for removed in [
@@ -12137,8 +12348,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let cross = (-d_open).cross(-d_close);
             reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
             meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
@@ -12380,8 +12595,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let cross = (-d_open).cross(-d_close);
             reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
             meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
@@ -12416,8 +12635,16 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(result_has_vert_near(&mesh, &result, b1), 1, "B1 end is minted");
-        assert_eq!(result_has_vert_near(&mesh, &result, b3), 1, "B3 end is minted");
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, b1),
+            1,
+            "B1 end is minted"
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, b3),
+            1,
+            "B3 end is minted"
+        );
         assert_eq!(
             result_has_vert_near(&mesh, &result, midpoint),
             1,
@@ -12459,8 +12686,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let cross = (-d_open).cross(-d_close);
             reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
             meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
@@ -12583,8 +12814,15 @@ mod tests {
         // §8.9.2.1 worked trace: six reflex faces = four interior hub triangles + two
         // flank pentagons. All carry the hub `B2`; only the flanks reach `B1` / `B3`.
         assert_eq!(reflex_face_count, 6, "six reflex faces wrap the 270° gap");
-        assert_eq!(interior_hub_tris, 4, "four interior faces fan to the hub as triangles");
-        assert_eq!(flank_pentagons.len(), 2, "two flank faces open into pentagons");
+        assert_eq!(
+            interior_hub_tris, 4,
+            "four interior faces fan to the hub as triangles"
+        );
+        assert_eq!(
+            flank_pentagons.len(),
+            2,
+            "two flank faces open into pentagons"
+        );
 
         // One flank pentagon threads {B1, B2}, the other {B2, B3}; `B1` and `B3` each
         // appear in exactly that one reflex face (their own flank), never in the fan.
@@ -12650,7 +12888,11 @@ mod tests {
         mesh.validate_topology();
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "ARC miter closes to a χ = 2 manifold"
+        );
 
         let find = |p: Vec3| {
             result
@@ -12772,7 +13014,11 @@ mod tests {
         mesh.validate_topology();
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "ARC miter closes to a χ = 2 manifold"
+        );
 
         let find = |p: Vec3| {
             result
@@ -12850,8 +13096,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let cross = (-d_open).cross(-d_close);
             reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
             meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
@@ -12875,8 +13125,7 @@ mod tests {
                     } else if k == count {
                         b3
                     } else {
-                        let theta =
-                            std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / count as f32);
+                        let theta = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / count as f32);
                         a_axis * theta.cos() + b_axis * theta.sin() + inner
                     }
                 })
@@ -12958,7 +13207,11 @@ mod tests {
         mesh.validate_topology();
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "ARC miter closes to a χ = 2 manifold"
+        );
         assert_eq!(
             (v, e, f),
             (37, 78, 43),
@@ -12968,12 +13221,12 @@ mod tests {
         let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
         let observed = classify_reflex_arc_faces(&mesh, &result, &absorbed, &chain);
         let mut expected = vec![
-            (vec![0], 3),          // leading flank [B1, T3, R4]
-            (vec![0], 3),          // [B1, R4, R5]              run 0→0
-            (vec![0, 1], 4),       // [s1, B1, R5, R6]          run 0→1 (leading step, quad)
-            (vec![1, 2, 3], 5),    // [B3, s2, s1, R6, R7]      run 1→3 (trailing step, pentagon)
-            (vec![3], 3),          // [B3, R7, R8]              run 3→3
-            (vec![3], 3),          // trailing flank [B3, R8, T1]
+            (vec![0], 3),       // leading flank [B1, T3, R4]
+            (vec![0], 3),       // [B1, R4, R5]              run 0→0
+            (vec![0, 1], 4),    // [s1, B1, R5, R6]          run 0→1 (leading step, quad)
+            (vec![1, 2, 3], 5), // [B3, s2, s1, R6, R7]      run 1→3 (trailing step, pentagon)
+            (vec![3], 3),       // [B3, R7, R8]              run 3→3
+            (vec![3], 3),       // trailing flank [B3, R8, T1]
         ];
         expected.sort();
         assert_eq!(
@@ -13008,17 +13261,21 @@ mod tests {
         mesh.validate_topology();
 
         let (v, e, f) = counts(&mesh);
-        assert_eq!(v as i64 - e as i64 + f as i64, 2, "ARC miter closes to a χ = 2 manifold");
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "ARC miter closes to a χ = 2 manifold"
+        );
 
         let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
         let observed = classify_reflex_arc_faces(&mesh, &result, &absorbed, &chain);
         let mut expected = vec![
-            (vec![0], 3),             // leading flank [B1, T3, R4]
-            (vec![0], 3),             // [B1, R4, R5]                run 0→0
-            (vec![0, 1, 2], 5),       // [s2, s1, B1, R5, R6]        run 0→2 (leading step, pentagon)
-            (vec![2, 3, 4], 5),       // [B3, s3, s2, R6, R7]        run 2→4 (trailing step, pentagon)
-            (vec![4], 3),             // [B3, R7, R8]                run 4→4
-            (vec![4], 3),             // trailing flank [B3, R8, T1]
+            (vec![0], 3),       // leading flank [B1, T3, R4]
+            (vec![0], 3),       // [B1, R4, R5]                run 0→0
+            (vec![0, 1, 2], 5), // [s2, s1, B1, R5, R6]        run 0→2 (leading step, pentagon)
+            (vec![2, 3, 4], 5), // [B3, s3, s2, R6, R7]        run 2→4 (trailing step, pentagon)
+            (vec![4], 3),       // [B3, R7, R8]                run 4→4
+            (vec![4], 3),       // trailing flank [B3, R8, T1]
         ];
         expected.sort();
         assert_eq!(
@@ -13190,8 +13447,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let cross = (-d_open).cross(-d_close);
             reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
             meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
@@ -13250,8 +13511,16 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(result_has_vert_near(&mesh, &result, b1), 1, "B1 arc end is minted");
-        assert_eq!(result_has_vert_near(&mesh, &result, b3), 1, "B3 arc end is minted");
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, b1),
+            1,
+            "B1 arc end is minted"
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, b3),
+            1,
+            "B3 arc end is minted"
+        );
         assert_eq!(
             result_has_vert_near(&mesh, &result, bulge),
             1,
@@ -13287,8 +13556,12 @@ mod tests {
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
             let face = sector.corners[0].1;
-            let d_open = mesh.edge_direction_from(opening, apex, apex_position).unwrap();
-            let d_close = mesh.edge_direction_from(closing, apex, apex_position).unwrap();
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
             let reflex = (-d_open).cross(-d_close).dot(mesh.face_plane_normal(face)) < 0.0;
             if reflex {
                 reflex_meet = Some(meet);
@@ -13388,7 +13661,11 @@ mod tests {
                 })
             })
             .collect();
-        assert_eq!(closing.len(), 1, "odd parity closes on exactly one central face");
+        assert_eq!(
+            closing.len(),
+            1,
+            "odd parity closes on exactly one central face"
+        );
         assert_eq!(
             mesh.face_vert_keys(closing[0]).len(),
             4,
@@ -13930,8 +14207,16 @@ mod tests {
             Vec3::new(1.0, -1.0, -1.0),
             Vec3::new(-1.0, -1.0, -1.0),
         );
-        let e03 = cube_edge(&arc_mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
-        let e04 = cube_edge(&arc_mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let e03 = cube_edge(
+            &arc_mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+        );
+        let e04 = cube_edge(
+            &arc_mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        );
         arc_mesh.bevel(
             &[e01.into(), e03.into(), e04.into()],
             BevelOptions {
@@ -13992,7 +14277,11 @@ mod tests {
             .copied()
             .filter(|&v| (mesh.vertex_position(v) - apex_position).length() < 1.0e-4)
             .collect();
-        assert_eq!(apex.len(), 1, "the three pinwheel apex corners weld to one apex");
+        assert_eq!(
+            apex.len(),
+            1,
+            "the three pinwheel apex corners weld to one apex"
+        );
         let apex = apex[0];
 
         // §8.5.3: exactly three quad faces meet at the apex (the pinwheel).
@@ -14022,7 +14311,11 @@ mod tests {
                 );
             }
         }
-        assert_eq!(result.faces.len(), 9, "6 strip quads + 3 pinwheel quads, no bottom");
+        assert_eq!(
+            result.faces.len(),
+            9,
+            "6 strip quads + 3 pinwheel quads, no bottom"
+        );
     }
 
     /// BEVEL.md §8.5.3: the ADJ apex sits *on* the rounded surface (the body-diagonal
@@ -14084,7 +14377,10 @@ mod tests {
             .iter()
             .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - expected).abs() < 1.0e-4)
             .count();
-        assert_eq!(ring_verts, 3, "three §7.6.2 boundverts, unchanged by vmesh method");
+        assert_eq!(
+            ring_verts, 3,
+            "three §7.6.2 boundverts, unchanged by vmesh method"
+        );
 
         // The Front-Bottom interior chain vert across edge {0,1} is the arc 45° point
         // (§8.3.6), shared with cutoff — not the straight chord midpoint.
@@ -14104,7 +14400,10 @@ mod tests {
 
     /// Bevel the cube corner of `cube_corner_adj_segments2` with an inner miter
     /// (BEVEL.md §8.9.3), `miter_inner = kind`, pushed out by `spread`.
-    fn cube_corner_adj_segments2_inner_miter(kind: BevelMiter, spread: f32) -> (LoopMesh, BevelResult) {
+    fn cube_corner_adj_segments2_inner_miter(
+        kind: BevelMiter,
+        spread: f32,
+    ) -> (LoopMesh, BevelResult) {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let e01 = cube_edge(
@@ -14128,6 +14427,78 @@ mod tests {
             },
         );
         (mesh, result)
+    }
+
+    /// BEVEL.md §8.9.1: the reflex/non-reflex sign is a property of the *surface
+    /// orientation*, not of the order the fixture happened to build its faces in. This
+    /// cube is the same solid as `mesh_add_cube` — same winding — but its faces are
+    /// created in the reverse order and each face's loop cycle starts one corner along,
+    /// which rotates the vertex fan and moves each face's first loop. Both are inputs
+    /// the corner ring's rotational direction must *not* depend on: if it does, every
+    /// sector's `cross · n_ref` flips, the convex corner classifies as three reflex
+    /// sectors, and the inner miter silently declines to the sharp ring.
+    #[test]
+    fn inner_miter_arc_fires_independently_of_face_build_order() {
+        let mut mesh = LoopMesh::new();
+
+        let v0 = mesh.create_vertex(Vec3::new(1.0, -1.0, -1.0));
+        let v1 = mesh.create_vertex(Vec3::new(-1.0, -1.0, -1.0));
+        let v2 = mesh.create_vertex(Vec3::new(-1.0, 1.0, -1.0));
+        let v3 = mesh.create_vertex(Vec3::new(1.0, 1.0, -1.0));
+        let v4 = mesh.create_vertex(Vec3::new(1.0, -1.0, 1.0));
+        let v5 = mesh.create_vertex(Vec3::new(-1.0, -1.0, 1.0));
+        let v6 = mesh.create_vertex(Vec3::new(-1.0, 1.0, 1.0));
+        let v7 = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
+
+        let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e2 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e3 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e4 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e5 = mesh.create_edge([v5, v6], EdgeCreateFlags::NONE);
+        let e6 = mesh.create_edge([v6, v7], EdgeCreateFlags::NONE);
+        let e7 = mesh.create_edge([v7, v4], EdgeCreateFlags::NONE);
+        let e8 = mesh.create_edge([v0, v4], EdgeCreateFlags::NONE);
+        let e9 = mesh.create_edge([v1, v5], EdgeCreateFlags::NONE);
+        let e10 = mesh.create_edge([v2, v6], EdgeCreateFlags::NONE);
+        let e11 = mesh.create_edge([v3, v7], EdgeCreateFlags::NONE);
+
+        // Same six faces, same winding, reverse creation order, each cycle rotated by one.
+        mesh.face_create(&[v4, v5, v1, v0], &[e4, e9, e0, e8], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v2, v6, v7, v3],
+            &[e10, e6, e11, e2],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(&[v0, v3, v7, v4], &[e3, e11, e7, e8], FaceCreateFlags::NONE);
+        mesh.face_create(&[v4, v7, v6, v5], &[e7, e6, e5, e4], FaceCreateFlags::NONE);
+        mesh.face_create(&[v5, v6, v2, v1], &[e5, e10, e1, e9], FaceCreateFlags::NONE);
+        mesh.face_create(&[v1, v2, v3, v0], &[e1, e2, e3, e0], FaceCreateFlags::NONE);
+
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let e01 = cube_edge(&mesh, corner, Vec3::new(-1.0, -1.0, -1.0));
+        let e03 = cube_edge(&mesh, corner, Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, corner, Vec3::new(1.0, -1.0, 1.0));
+
+        mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: BevelMiter::Arc,
+                spread: 0.3,
+                ..Default::default()
+            },
+        );
+
+        mesh.validate_topology();
+        assert_eq!(
+            counts(&mesh),
+            (26, 42, 18),
+            "the inner miter fires on the convex corner whatever order the cube was built in",
+        );
     }
 
     /// BEVEL.md §8.9.3 / §8.9.5: the inner miter rebuilds every convex non-reflex
@@ -14172,10 +14543,18 @@ mod tests {
                     == 6
             })
             .collect();
-        assert_eq!(apex.len(), 1, "exactly one apex is shared by six pinwheel quads");
+        assert_eq!(
+            apex.len(),
+            1,
+            "exactly one apex is shared by six pinwheel quads"
+        );
         for &f in &mesh.face_keys() {
             if mesh.face_vert_keys(f).contains(&apex[0]) {
-                assert_eq!(mesh.face_vert_keys(f).len(), 4, "each pinwheel cell is a quad");
+                assert_eq!(
+                    mesh.face_vert_keys(f).len(),
+                    4,
+                    "each pinwheel cell is a quad"
+                );
             }
         }
 
@@ -14511,7 +14890,8 @@ mod tests {
     fn inner_miter_arc_single_flagged_flank_is_inert() {
         let seam = |m: &LoopMesh, e: EdgeKey| m.edge_seam(e);
         let (on, on_r) = reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0], &[], true, false);
-        let (off, off_r) = reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0], &[], false, false);
+        let (off, off_r) =
+            reflex_apex_inner_miter_flagged(BevelMiter::Arc, &[0], &[], false, false);
         assert_eq!(
             count_flagged_result_edges(&off, &off_r, seam),
             2,
@@ -14606,7 +14986,11 @@ mod tests {
             .faces
             .iter()
             .copied()
-            .filter(|&f| mesh.face_vert_keys(f).iter().all(|&v| adj_in_corner_ball(mesh, v)))
+            .filter(|&f| {
+                mesh.face_vert_keys(f)
+                    .iter()
+                    .all(|&v| adj_in_corner_ball(mesh, v))
+            })
             .collect()
     }
 
@@ -14624,7 +15008,9 @@ mod tests {
         let ring = result
             .verts
             .iter()
-            .filter(|&&v| ((mesh.vertex_position(v) - corner).length() - ring_radius).abs() < 1.0e-4)
+            .filter(|&&v| {
+                ((mesh.vertex_position(v) - corner).length() - ring_radius).abs() < 1.0e-4
+            })
             .count();
         assert_eq!(ring, 3, "three §7.6.2 boundverts (invariant 1)");
 
@@ -14682,7 +15068,11 @@ mod tests {
 
         // Invariant 3 (§8.5.5.6): 12 all-quad sub-patch faces.
         let patch_faces = adj_patch_faces(&mesh, &result);
-        assert_eq!(patch_faces.len(), 12, "3·(segments/2)² = 12 sub-patch quads");
+        assert_eq!(
+            patch_faces.len(),
+            12,
+            "3·(segments/2)² = 12 sub-patch quads"
+        );
         for &f in &patch_faces {
             assert_eq!(
                 mesh.face_vert_keys(f).len(),
@@ -14722,7 +15112,10 @@ mod tests {
             .iter()
             .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
             .count();
-        assert_eq!(triangles, 1, "exactly one central s-gon (triangle) at odd parity");
+        assert_eq!(
+            triangles, 1,
+            "exactly one central s-gon (triangle) at odd parity"
+        );
         assert_eq!(quads, 6, "3 corner sub-patch quads + 3 seam quads");
         assert_eq!(patch_faces.len(), 7);
     }
@@ -14743,7 +15136,11 @@ mod tests {
                 .filter(|&&v| (mesh.vertex_position(v) - apex_pos).length() < 1.0e-4)
                 .count()
         };
-        assert_eq!(apex_count(&even_mesh, &even), 1, "even → welded apex vertex");
+        assert_eq!(
+            apex_count(&even_mesh, &even),
+            1,
+            "even → welded apex vertex"
+        );
         assert_eq!(apex_count(&odd_mesh, &odd), 0, "odd → no apex vertex");
 
         let central_triangles = |mesh: &LoopMesh, result: &BevelResult| {
@@ -14752,8 +15149,16 @@ mod tests {
                 .filter(|&f| mesh.face_vert_keys(f).len() == 3)
                 .count()
         };
-        assert_eq!(central_triangles(&odd_mesh, &odd), 1, "odd → one central triangle");
-        assert_eq!(central_triangles(&even_mesh, &even), 0, "even → no central face");
+        assert_eq!(
+            central_triangles(&odd_mesh, &odd),
+            1,
+            "odd → one central triangle"
+        );
+        assert_eq!(
+            central_triangles(&even_mesh, &even),
+            0,
+            "even → no central face"
+        );
     }
 
     /// Bevel the three oblique legs of the irregular tetrahedron's `v0` corner with
@@ -14830,10 +15235,7 @@ mod tests {
     /// max deviation of the rest; a true §8.5.1 snap would leave every cap vert on
     /// one sphere of radius `offset` (deviation ≈ 0), so a large deviation is the
     /// positive signal that the general fullness path produced the cap.
-    fn oblique_cap_off_sphere_deviation(
-        mesh: &LoopMesh,
-        patch: &[FaceKey],
-    ) -> f32 {
+    fn oblique_cap_off_sphere_deviation(mesh: &LoopMesh, patch: &[FaceKey]) -> f32 {
         let positions: Vec<Vec3> = oblique_cap_incidence(mesh, patch)
             .keys()
             .map(|&v| mesh.vertex_position(v))
@@ -14881,7 +15283,10 @@ mod tests {
         oblique_assert_manifold(&mesh);
 
         let patch = oblique_patch_faces(&mesh, &result, corner);
-        assert!(!patch.is_empty(), "the oblique junction builds a corner-grid fill");
+        assert!(
+            !patch.is_empty(),
+            "the oblique junction builds a corner-grid fill"
+        );
 
         let triangles = patch
             .iter()
@@ -14891,7 +15296,10 @@ mod tests {
             .iter()
             .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
             .count();
-        assert_eq!(triangles, 1, "odd parity → exactly one central s-gon (triangle)");
+        assert_eq!(
+            triangles, 1,
+            "odd parity → exactly one central s-gon (triangle)"
+        );
         assert_eq!(quads, 6, "3 corner sub-patch quads + 3 seam quads");
         assert_eq!(patch.len(), 7);
 
@@ -14959,11 +15367,27 @@ mod tests {
                 .filter(|&&f| mesh.face_vert_keys(f).len() == 3)
                 .count()
         };
-        assert_eq!(triangles(&odd_mesh, &odd_patch), 1, "segments = 3 → central triangle");
-        assert_eq!(triangles(&even_mesh, &even_patch), 0, "segments = 4 → no central face");
+        assert_eq!(
+            triangles(&odd_mesh, &odd_patch),
+            1,
+            "segments = 3 → central triangle"
+        );
+        assert_eq!(
+            triangles(&even_mesh, &even_patch),
+            0,
+            "segments = 4 → no central face"
+        );
 
-        assert_eq!(oblique_welded_centre_count(&odd_mesh, &odd_patch), 0, "odd → no welded vertex");
-        assert_eq!(oblique_welded_centre_count(&even_mesh, &even_patch), 1, "even → welded vertex");
+        assert_eq!(
+            oblique_welded_centre_count(&odd_mesh, &odd_patch),
+            0,
+            "odd → no welded vertex"
+        );
+        assert_eq!(
+            oblique_welded_centre_count(&even_mesh, &even_patch),
+            1,
+            "even → welded vertex"
+        );
 
         // Both are the general (non-sphere) fullness cap.
         assert!(oblique_cap_off_sphere_deviation(&odd_mesh, &odd_patch) > 0.02);
@@ -15176,8 +15600,13 @@ mod tests {
         }
 
         // 4 sector-interior verts + 4 shared spokes + 1 welded centre.
-        let predicted =
-            predicted_cap_interior(apex_position, &boundverts, &profiles, 4, adj_fullness(0.5, 4));
+        let predicted = predicted_cap_interior(
+            apex_position,
+            &boundverts,
+            &profiles,
+            4,
+            adj_fullness(0.5, 4),
+        );
         assert_eq!(predicted.len(), 9);
         for position in &predicted {
             assert_eq!(
@@ -15218,8 +15647,7 @@ mod tests {
             let mut mesh = LoopMesh::new();
             let (apex, base) = regular_pyramid(&mut mesh, 5);
             let apex_position = mesh.vertex_position(apex);
-            let base_positions: Vec<Vec3> =
-                base.iter().map(|&b| mesh.vertex_position(b)).collect();
+            let base_positions: Vec<Vec3> = base.iter().map(|&b| mesh.vertex_position(b)).collect();
             let slants: Vec<GeomKey> = base
                 .iter()
                 .map(|&b| mesh.query_edge_exists(apex, b).expect("slant edge").into())
@@ -15254,7 +15682,8 @@ mod tests {
             }
 
             let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 5.0;
-            let on_axis = |p: Vec3| (p - centroid).cross(apex_position - centroid).length() < 1.0e-5;
+            let on_axis =
+                |p: Vec3| (p - centroid).cross(apex_position - centroid).length() < 1.0e-5;
             let axial: Vec<VertexKey> = result
                 .verts
                 .iter()
@@ -15301,7 +15730,10 @@ mod tests {
             } else {
                 // 5 distinct central-ring verts, none of them on the axis.
                 assert_eq!(predicted.len(), 5);
-                assert!(axial.is_empty(), "odd parity lands no sample on the cap axis");
+                assert!(
+                    axial.is_empty(),
+                    "odd parity lands no sample on the cap axis"
+                );
                 assert_eq!(
                     central_faces,
                     vec![5],
@@ -15335,12 +15767,19 @@ mod tests {
             let raw = coarse.chains[i][1];
             let masked = sharp.chains[i][1];
             let chord_mid = 0.5 * (boundverts[i] + boundverts[(i + 1) % 5]);
-            assert!((masked - raw).length() > 1.0e-4, "the mask moves the stencil input");
+            assert!(
+                (masked - raw).length() > 1.0e-4,
+                "the mask moves the stencil input"
+            );
             assert!(
                 (masked - chord_mid).length() > (raw - chord_mid).length(),
                 "and moves it away from the chord — sharpening, not smoothing",
             );
-            assert_eq!(coarse.at(i, 0, 1), raw, "the stored net keeps the raw sample");
+            assert_eq!(
+                coarse.at(i, 0, 1),
+                raw,
+                "the stored net keeps the raw sample"
+            );
         }
 
         let doubled: Vec<Vec<Vec3>> = profiles.iter().map(|p| p.raw_positions(4)).collect();
@@ -15460,8 +15899,7 @@ mod tests {
             );
             // The leg vert sits the plain offset along the bottom spoke from the old
             // rim position (§8.3.0.2).
-            let bottom_dir =
-                (mesh.vertex_position(bottom) - rim_positions[k]).normalize();
+            let bottom_dir = (mesh.vertex_position(bottom) - rim_positions[k]).normalize();
             let leg = rim_positions[k] + bottom_dir * 0.25;
             assert!(
                 mesh.vert_keys()
@@ -15562,7 +16000,11 @@ mod tests {
         oblique_assert_manifold(&mesh);
 
         let patch = oblique_patch_faces(&mesh, &result, corner);
-        assert_eq!(patch.len(), 9, "(segments+1)² regular grid → 4×4 = 9 cap quads");
+        assert_eq!(
+            patch.len(),
+            9,
+            "(segments+1)² regular grid → 4×4 = 9 cap quads"
+        );
         for &f in &patch {
             assert_eq!(
                 mesh.face_vert_keys(f).len(),
@@ -15570,7 +16012,11 @@ mod tests {
                 "every valence-4 cap face is a quad (the central s-gon is itself a quad)",
             );
         }
-        assert_eq!(oblique_cap_incidence(&mesh, &patch).len(), 16, "4×4 grid → 16 cap verts");
+        assert_eq!(
+            oblique_cap_incidence(&mesh, &patch).len(),
+            16,
+            "4×4 grid → 16 cap verts"
+        );
 
         assert_eq!(
             cap_on_axis_vert_count(&mesh, &patch, corner),
@@ -15594,11 +16040,23 @@ mod tests {
         oblique_assert_manifold(&mesh);
 
         let patch = oblique_patch_faces(&mesh, &result, corner);
-        assert_eq!(patch.len(), 16, "(segments+1)² regular grid → 5×5 = 16 cap quads");
+        assert_eq!(
+            patch.len(),
+            16,
+            "(segments+1)² regular grid → 5×5 = 16 cap quads"
+        );
         for &f in &patch {
-            assert_eq!(mesh.face_vert_keys(f).len(), 4, "every cap face is a quad at even parity");
+            assert_eq!(
+                mesh.face_vert_keys(f).len(),
+                4,
+                "every cap face is a quad at even parity"
+            );
         }
-        assert_eq!(oblique_cap_incidence(&mesh, &patch).len(), 25, "5×5 grid → 25 cap verts");
+        assert_eq!(
+            oblique_cap_incidence(&mesh, &patch).len(),
+            25,
+            "5×5 grid → 25 cap verts"
+        );
 
         assert_eq!(
             cap_on_axis_vert_count(&mesh, &patch, corner),
@@ -15624,10 +16082,26 @@ mod tests {
         let odd_patch = oblique_patch_faces(&odd_mesh, &odd, odd_corner);
         let even_patch = oblique_patch_faces(&even_mesh, &even, even_corner);
 
-        assert_eq!(cap_on_axis_vert_count(&odd_mesh, &odd_patch, odd_corner), 0, "odd → no on-axis vertex");
-        assert_eq!(cap_on_axis_vert_count(&even_mesh, &even_patch, even_corner), 1, "even → one on-axis vertex");
-        assert_eq!(cap_on_axis_face_count(&odd_mesh, &odd_patch, odd_corner), 1, "odd → one on-axis face");
-        assert_eq!(cap_on_axis_face_count(&even_mesh, &even_patch, even_corner), 0, "even → no on-axis face");
+        assert_eq!(
+            cap_on_axis_vert_count(&odd_mesh, &odd_patch, odd_corner),
+            0,
+            "odd → no on-axis vertex"
+        );
+        assert_eq!(
+            cap_on_axis_vert_count(&even_mesh, &even_patch, even_corner),
+            1,
+            "even → one on-axis vertex"
+        );
+        assert_eq!(
+            cap_on_axis_face_count(&odd_mesh, &odd_patch, odd_corner),
+            1,
+            "odd → one on-axis face"
+        );
+        assert_eq!(
+            cap_on_axis_face_count(&even_mesh, &even_patch, even_corner),
+            0,
+            "even → no on-axis face"
+        );
 
         assert_ne!(
             oblique_cap_incidence(&odd_mesh, &odd_patch).len(),
@@ -15648,8 +16122,7 @@ mod tests {
         let radius = 1.4_f32;
         let mut base = [apex; 5];
         for k in 0..5 {
-            let angle =
-                std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 5.0;
+            let angle = std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 5.0;
             base[k] =
                 mesh.create_vertex(Vec3::new(radius * angle.cos(), radius * angle.sin(), 0.0));
         }
@@ -15734,7 +16207,10 @@ mod tests {
             .iter()
             .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
             .count();
-        assert_eq!(pentagons, 1, "odd parity → exactly one central s-gon (pentagon)");
+        assert_eq!(
+            pentagons, 1,
+            "odd parity → exactly one central s-gon (pentagon)"
+        );
         assert_eq!(quads, 10, "5 corner sub-patch quads + 5 seam quads");
         assert_eq!(patch.len(), 11);
 
@@ -15755,7 +16231,11 @@ mod tests {
         oblique_assert_manifold(&mesh);
 
         let patch = oblique_patch_faces(&mesh, &result, corner);
-        assert_eq!(patch.len(), 20, "s·(segments/2)² = 5·4 = 20 sub-patch quads");
+        assert_eq!(
+            patch.len(),
+            20,
+            "s·(segments/2)² = 5·4 = 20 sub-patch quads"
+        );
         for &f in &patch {
             assert_eq!(
                 mesh.face_vert_keys(f).len(),
@@ -15788,11 +16268,27 @@ mod tests {
                 .filter(|&&f| mesh.face_vert_keys(f).len() == 5)
                 .count()
         };
-        assert_eq!(pentagons(&odd_mesh, &odd_patch), 1, "segments = 3 → central pentagon");
-        assert_eq!(pentagons(&even_mesh, &even_patch), 0, "segments = 4 → no central face");
+        assert_eq!(
+            pentagons(&odd_mesh, &odd_patch),
+            1,
+            "segments = 3 → central pentagon"
+        );
+        assert_eq!(
+            pentagons(&even_mesh, &even_patch),
+            0,
+            "segments = 4 → no central face"
+        );
 
-        assert_eq!(cap_welded_centre_count(&odd_mesh, &odd_patch, 5), 0, "odd → no welded vertex");
-        assert_eq!(cap_welded_centre_count(&even_mesh, &even_patch, 5), 1, "even → welded vertex");
+        assert_eq!(
+            cap_welded_centre_count(&odd_mesh, &odd_patch, 5),
+            0,
+            "odd → no welded vertex"
+        );
+        assert_eq!(
+            cap_welded_centre_count(&even_mesh, &even_patch, 5),
+            1,
+            "even → welded vertex"
+        );
 
         // The two parities are observably distinct caps (different vert counts).
         assert_ne!(
@@ -16072,7 +16568,11 @@ mod tests {
             .iter()
             .filter(|&&f| mesh.face_vert_keys(f).len() == 4)
             .count();
-        assert_eq!(faces.len(), 7, "one central triangle + six quads (§8.5.5.8)");
+        assert_eq!(
+            faces.len(),
+            7,
+            "one central triangle + six quads (§8.5.5.8)"
+        );
         assert_eq!(triangles, 1);
         assert_eq!(quads, 6);
     }
@@ -16140,11 +16640,7 @@ mod tests {
             Vec3::new(0.375476, 0.711987, 0.0),
             Vec3::new(0.711987, 0.375476, 0.0),
         ] {
-            assert_position_present(
-                &verts,
-                cube_corner_world(chain_interior),
-                "chain interior",
-            );
+            assert_position_present(&verts, cube_corner_world(chain_interior), "chain interior");
         }
         for central in [
             Vec3::new(0.517127, 0.316617, 0.316617),
@@ -16197,7 +16693,11 @@ mod tests {
         let faces = curved_corner_grid_faces(&mesh, &result);
         assert_eq!(faces.len(), 12, "3·(segments/2)² sub-patch quads");
         for &face in &faces {
-            assert_eq!(mesh.face_vert_keys(face).len(), 4, "no central face at even parity");
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "no central face at even parity"
+            );
         }
     }
 
@@ -16213,10 +16713,16 @@ mod tests {
 
         let circular = snap_to_unit_superellipsoid(overshoot, 2.0);
         assert!((circular.length() - 1.0).abs() < 1.0e-6, "unit-norm");
-        assert!(circular.z < 0.0, "the circular branch keeps the negative component");
+        assert!(
+            circular.z < 0.0,
+            "the circular branch keeps the negative component"
+        );
 
         let curved = snap_to_unit_superellipsoid(overshoot, profile_to_exponent(0.7));
-        assert!(curved.is_finite(), "the curved branch clamps rather than NaN-ing");
+        assert!(
+            curved.is_finite(),
+            "the curved branch clamps rather than NaN-ing"
+        );
         assert_eq!(curved.z, 0.0, "and folds the overshoot onto the seam plane");
         let exponent = profile_to_exponent(0.7);
         let norm = curved.x.powf(exponent) + curved.y.powf(exponent) + curved.z.powf(exponent);
@@ -16243,7 +16749,11 @@ mod tests {
     /// odd-parity twelve-vert / seven-face grid of §8.5.5.4, not a fan.
     #[test]
     fn adj_cube_corner_flat_chamfer_builds_the_octant_grid() {
-        assert_eq!(profile_to_exponent(0.25), 1.0, "the §8.6.2 snap makes `r == 1` exact");
+        assert_eq!(
+            profile_to_exponent(0.25),
+            1.0,
+            "the §8.6.2 snap makes `r == 1` exact"
+        );
         assert_eq!(
             adj_octant_prescale(1.0, 3),
             1.0,
@@ -16253,7 +16763,11 @@ mod tests {
         let (mesh, result) = cube_corner_adj_profile(3, 0.25);
         mesh.validate_topology();
         let verts = curved_corner_grid_verts(&mesh, &result);
-        assert_eq!(verts.len(), 12, "3 boundverts + 6 chain interiors + 3 central-triangle verts");
+        assert_eq!(
+            verts.len(),
+            12,
+            "3 boundverts + 6 chain interiors + 3 central-triangle verts"
+        );
 
         // The whole cap — rim and interior alike — lands on the unit 1-norm surface, i.e.
         // the flat chamfer plane. This is what routing `r = 1` through branch R *means*.
@@ -16266,7 +16780,11 @@ mod tests {
         }
 
         let faces = curved_corner_grid_faces(&mesh, &result);
-        assert_eq!(faces.len(), 7, "one central triangle + six quads (§8.5.5.4 odd parity)");
+        assert_eq!(
+            faces.len(),
+            7,
+            "one central triangle + six quads (§8.5.5.4 odd parity)"
+        );
 
         // Even parity: the welded apex is (f.2)'s `3^(−1/1)·(1,1,1)` — the boundvert
         // centroid — and the cap is the twelve-quad grid with no central face.
@@ -16281,7 +16799,11 @@ mod tests {
         let faces = curved_corner_grid_faces(&mesh, &result);
         assert_eq!(faces.len(), 12, "3·(segments/2)² sub-patch quads");
         for &face in &faces {
-            assert_eq!(mesh.face_vert_keys(face).len(), 4, "no central face at even parity");
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "no central face at even parity"
+            );
         }
     }
 
@@ -16294,9 +16816,16 @@ mod tests {
     #[test]
     fn adj_octant_hollow_band_prescale_and_membership() {
         let exponent = profile_to_exponent(0.1);
-        assert!(exponent < 0.75 && exponent > 0.0, "`profile = 0.1` is genuinely curved-in");
+        assert!(
+            exponent < 0.75 && exponent > 0.0,
+            "`profile = 0.1` is genuinely curved-in"
+        );
         assert_eq!(adj_octant_prescale(exponent, 3), 0.6, "the hollow band");
-        assert_eq!(adj_octant_prescale(exponent, 2), 1.0, "still guarded off at seg ≤ 2");
+        assert_eq!(
+            adj_octant_prescale(exponent, 2),
+            1.0,
+            "still guarded off at seg ≤ 2"
+        );
 
         let (mesh, result) = cube_corner_adj_profile(3, 0.1);
         mesh.validate_topology();
@@ -16304,8 +16833,7 @@ mod tests {
         assert_eq!(verts.len(), 12);
         for &world in &verts {
             let unit = cube_corner_octant(world);
-            let norm =
-                unit.x.powf(exponent) + unit.y.powf(exponent) + unit.z.powf(exponent);
+            let norm = unit.x.powf(exponent) + unit.y.powf(exponent) + unit.z.powf(exponent);
             assert!(
                 (norm - 1.0).abs() < 1.0e-3,
                 "cap vert {unit:?} is off the unit superellipsoid (r-norm {norm})",
@@ -16391,8 +16919,14 @@ mod tests {
     /// dispatch, builds its strips, emits no cap, and stays a valid mesh.
     #[test]
     fn adj_cube_corner_square_exponents_decline_cleanly() {
-        assert!(!adj_octant_exponent(profile_to_exponent(0.99)), "square is refused");
-        assert!(!adj_octant_exponent(profile_to_exponent(0.0)), "square-in is refused");
+        assert!(
+            !adj_octant_exponent(profile_to_exponent(0.99)),
+            "square is refused"
+        );
+        assert!(
+            !adj_octant_exponent(profile_to_exponent(0.0)),
+            "square-in is refused"
+        );
 
         for profile in [0.99_f32, 0.0] {
             let (mesh, result) = cube_corner_adj_profile(3, profile);
@@ -16483,12 +17017,24 @@ mod tests {
     fn adj_cube_corner_flat_chamfer_segments_2_pinwheel() {
         let (mesh, result) = cube_corner_adj_profile(2, 0.25);
         mesh.validate_topology();
-        assert_eq!(profile_to_exponent(0.25), 1.0, "profile 0.25 is the straight chord");
+        assert_eq!(
+            profile_to_exponent(0.25),
+            1.0,
+            "profile 0.25 is the straight chord"
+        );
 
         let cap = curved_corner_grid_faces(&mesh, &result);
-        assert_eq!(cap.len(), 3, "the three-quad pinwheel (§8.5.3), no central face");
+        assert_eq!(
+            cap.len(),
+            3,
+            "the three-quad pinwheel (§8.5.3), no central face"
+        );
         for &face in &cap {
-            assert_eq!(mesh.face_vert_keys(face).len(), 4, "each pinwheel cell is a quad");
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                4,
+                "each pinwheel cell is a quad"
+            );
         }
 
         // The apex: `unit_to_corner`'s image of `3^(−1) ·(1,1,1)` is the mean of the three
@@ -16536,7 +17082,13 @@ mod tests {
                 .map(|&face| {
                     let verts = mesh.face_vert_keys(face);
                     let at = verts.iter().position(|&v| v == apex).expect("apex corner");
-                    verts.iter().cycle().skip(at).take(verts.len()).copied().collect()
+                    verts
+                        .iter()
+                        .cycle()
+                        .skip(at)
+                        .take(verts.len())
+                        .copied()
+                        .collect()
                 })
                 .collect();
             wound.sort_by_key(|face| face[1].as_usize());
@@ -16581,7 +17133,11 @@ mod tests {
             (10, 0.639),
             (11, 0.647),
         ] {
-            assert_eq!(adj_fullness(0.5, segments), expected, "circle at n = {segments}");
+            assert_eq!(
+                adj_fullness(0.5, segments),
+                expected,
+                "circle at n = {segments}"
+            );
         }
 
         // F3: the table's end is a step *down*, not an asymptote.
@@ -16631,10 +17187,8 @@ mod tests {
 
         let (boundverts, profiles) = pyramid_apex_ring(apex_position, &base, 0.3, 0.5);
         assert_eq!(adj_fullness(0.5, 8), 0.619);
-        let tabulated =
-            predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.619);
-        let extrapolated =
-            predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.63);
+        let tabulated = predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.619);
+        let extrapolated = predicted_cap_interior(apex_position, &boundverts, &profiles, 8, 0.63);
         let centre = tabulated[tabulated.len() - 1];
         let wrong_centre = extrapolated[extrapolated.len() - 1];
         assert!(
@@ -16984,7 +17538,8 @@ mod tests {
             .get_vec3(tint, shared_edge.as_usize())
             .unwrap();
         assert_eq!(
-            carried, [0.42, 0.0, 0.0],
+            carried,
+            [0.42, 0.0, 0.0],
             "the surviving edge keeps its original per-edge CD",
         );
         mesh.validate_topology();
@@ -17058,7 +17613,8 @@ mod tests {
             .get_vec3(tint, shared_edge.as_usize())
             .unwrap();
         assert_eq!(
-            carried, [0.0, 0.7, 0.0],
+            carried,
+            [0.0, 0.7, 0.0],
             "the surviving boundary edge keeps its per-edge CD",
         );
         mesh.validate_topology();
@@ -17100,7 +17656,8 @@ mod tests {
             .get_vec3(tint, shared_edge.as_usize())
             .unwrap();
         assert_eq!(
-            carried, [0.1, 0.2, 0.3],
+            carried,
+            [0.1, 0.2, 0.3],
             "even the collapsed edge keeps its per-edge CD",
         );
         mesh.validate_topology();
@@ -17156,7 +17713,8 @@ mod tests {
             .get_vec3(tint, adjacent_edge.as_usize())
             .unwrap();
         assert_eq!(
-            carried, [0.0, 0.0, 0.9],
+            carried,
+            [0.0, 0.0, 0.9],
             "the single-beveled-endpoint edge keeps its per-edge CD",
         );
         mesh.validate_topology();
@@ -17201,7 +17759,8 @@ mod tests {
         let mut tagged: Vec<(EdgeKey, [f32; 3])> = Vec::new();
         for &(near, far, value) in &incident {
             let edge = cube_edge(&mesh, near, far);
-            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+            mesh.edge_attribs_mut()
+                .set_vec3(tint, edge.as_usize(), value);
             tagged.push((edge, value));
         }
 
@@ -17284,8 +17843,7 @@ mod tests {
                 .filter(|&edge| {
                     let [a, b] = mesh.edge_vert_keys(edge);
                     (a == ring || b == ring)
-                        && mesh.edge_attribs().get_vec3(tint, edge.as_usize())
-                            == Some(shared_value)
+                        && mesh.edge_attribs().get_vec3(tint, edge.as_usize()) == Some(shared_value)
                 })
                 .collect();
             assert!(
@@ -17342,7 +17900,8 @@ mod tests {
         let mut tagged_values: Vec<[f32; 3]> = Vec::new();
         for &(near, far, value) in &incident {
             let edge = cube_edge(&mesh, near, far);
-            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+            mesh.edge_attribs_mut()
+                .set_vec3(tint, edge.as_usize(), value);
             tagged_values.push(value);
         }
 
@@ -17369,7 +17928,8 @@ mod tests {
             chamfer_count += 1;
             let carried = mesh.edge_attribs().get_vec3(tint, edge.as_usize()).unwrap();
             assert_ne!(
-                carried, [0.0, 0.0, 0.0],
+                carried,
+                [0.0, 0.0, 0.0],
                 "chamfer edge {edge:?} must inherit an owning edge's CD, not default",
             );
             assert!(
@@ -17411,13 +17971,10 @@ mod tests {
         let e0_value = [0.10, 0.5, 0.5];
         let e3_value = [0.20, 0.5, 0.5];
         let e8_value = [0.30, 0.5, 0.5];
-        for &(near, far, value) in &[
-            (p0, p1, e0_value),
-            (p0, p3, e3_value),
-            (p0, p4, e8_value),
-        ] {
+        for &(near, far, value) in &[(p0, p1, e0_value), (p0, p3, e3_value), (p0, p4, e8_value)] {
             let edge = cube_edge(&mesh, near, far);
-            mesh.edge_attribs_mut().set_vec3(tint, edge.as_usize(), value);
+            mesh.edge_attribs_mut()
+                .set_vec3(tint, edge.as_usize(), value);
         }
 
         let v0 = vert_at(&mesh, p0);
@@ -17578,7 +18135,10 @@ mod tests {
 
         let cap = beveled_corner_cap(&mesh, &result);
         let cap_slot = mesh.face_material_index(cap);
-        assert_ne!(cap_slot, 0, "the inherited cap slot is never the default 0 (§6.6.1)");
+        assert_ne!(
+            cap_slot, 0,
+            "the inherited cap slot is never the default 0 (§6.6.1)"
+        );
         assert!(
             incident_slots.contains(&cap_slot),
             "the cap inherits a representative incident face of v's slot ({incident_slots:?}), got {cap_slot}"
@@ -17723,7 +18283,7 @@ mod tests {
         let p0 = Vec3::new(1.0, -1.0, -1.0);
         let e0 = cube_edge(&mesh, p0, Vec3::new(-1.0, -1.0, -1.0)); // -> r_e0
         let e3 = cube_edge(&mesh, p0, Vec3::new(1.0, 1.0, -1.0)); // -> r_e3
-        // Seam e0 + e3; sharp the same pair to cover the sharp bit identically.
+                                                                  // Seam e0 + e3; sharp the same pair to cover the sharp bit identically.
         mesh.set_edge_seam(e0, true);
         mesh.set_edge_seam(e3, true);
         mesh.set_edge_sharp(e0, true);
@@ -17921,10 +18481,7 @@ mod tests {
     }
 
     /// An undirected edge as the sorted pair of its endpoint position keys.
-    fn edge_pos_pair(
-        mesh: &LoopMesh,
-        edge: EdgeKey,
-    ) -> ((i32, i32, i32), (i32, i32, i32)) {
+    fn edge_pos_pair(mesh: &LoopMesh, edge: EdgeKey) -> ((i32, i32, i32), (i32, i32, i32)) {
         let [a, b] = mesh.edge_vert_keys(edge);
         let mut ka = pos_key(mesh.vertex_position(a));
         let mut kb = pos_key(mesh.vertex_position(b));
@@ -17998,8 +18555,9 @@ mod tests {
         let b1 = k(0.75, -1.0, -0.75);
         let b2 = k(1.0, -0.75, -0.75);
         // The three patch ring segments.
-        let ring: std::collections::BTreeSet<_> =
-            [pair(b0, b1), pair(b0, b2), pair(b1, b2)].into_iter().collect();
+        let ring: std::collections::BTreeSet<_> = [pair(b0, b1), pair(b0, b2), pair(b1, b2)]
+            .into_iter()
+            .collect();
         // The §6.7.4 single direct patch segment spanning the unseamed gap edge e03:
         // the edge joining e03's two flanking boundverts (both carry y=-0.75, the
         // slide along e03), i.e. [0.75,-0.75,-1] and [1,-0.75,-0.75].
@@ -18349,7 +18907,11 @@ mod tests {
              two-edge outermost-ring chain spanning the e03 gap (§6.7.5.3) — a run of \
              `segments` edges, not one",
         );
-        assert_eq!(bridge.len(), 2, "the length-1 gap bridge is a run of segments=2 edges");
+        assert_eq!(
+            bridge.len(),
+            2,
+            "the length-1 gap bridge is a run of segments=2 edges"
+        );
         mesh.validate_topology();
     }
 
@@ -18422,8 +18984,7 @@ mod tests {
         };
         let e01_terminal =
             terminal_chain(Vec3::new(-1.0, -0.75, -1.0), Vec3::new(-1.0, -1.0, -0.75));
-        let e04_terminal =
-            terminal_chain(Vec3::new(0.75, -1.0, 1.0), Vec3::new(1.0, -0.75, 1.0));
+        let e04_terminal = terminal_chain(Vec3::new(0.75, -1.0, 1.0), Vec3::new(1.0, -0.75, 1.0));
         assert!(
             seamed.is_disjoint(&e01_terminal),
             "e01's far-end cross-section chain is not bridged at the terminal (§6.7.5.4)",
@@ -18516,7 +19077,10 @@ mod tests {
             "mark_seam must add exactly the interior gap's `2 × 2 = 4`-edge bunch-side \
              run across a multi-face reflex ARC miter (§6.7.5.4 case (4))",
         );
-        assert!(on_count > off_count, "the bridge must be non-vacuous (on differs from off)");
+        assert!(
+            on_count > off_count,
+            "the bridge must be non-vacuous (on differs from off)"
+        );
         assert_eq!(
             bare_count, 0,
             "no seamed input ⇒ no gap and no mechanism-(1) flag: the ARC fill stays inert",
@@ -18648,8 +19212,14 @@ mod tests {
             bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Arc, true, false);
         let (arc_off, arc_off_r) =
             bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Arc, false, false);
-        let (sharp_on, sharp_on_r) =
-            bevel_octagonal_reflex_flagged(&beveled, &interior, &[], BevelMiter::Sharp, true, false);
+        let (sharp_on, sharp_on_r) = bevel_octagonal_reflex_flagged(
+            &beveled,
+            &interior,
+            &[],
+            BevelMiter::Sharp,
+            true,
+            false,
+        );
         let (sharp_off, sharp_off_r) = bevel_octagonal_reflex_flagged(
             &beveled,
             &interior,
@@ -18720,8 +19290,14 @@ mod tests {
             bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Arc, false, true);
         let (arc_off, arc_off_r) =
             bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Arc, false, false);
-        let (sharp_on, sharp_on_r) =
-            bevel_octagonal_reflex_flagged(&beveled, &[], &interior, BevelMiter::Sharp, false, true);
+        let (sharp_on, sharp_on_r) = bevel_octagonal_reflex_flagged(
+            &beveled,
+            &[],
+            &interior,
+            BevelMiter::Sharp,
+            false,
+            true,
+        );
         let (sharp_off, sharp_off_r) = bevel_octagonal_reflex_flagged(
             &beveled,
             &[],
@@ -19349,14 +19925,21 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let mut positions: Vec<Vec3> =
-                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            let mut positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
             positions.sort_by(|a, b| {
                 a.to_array()
                     .partial_cmp(&b.to_array())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            (positions, nearest_ring_slide(&mesh, &result, pos0), nearest_ring_slide(&mesh, &result, pos6))
+            (
+                positions,
+                nearest_ring_slide(&mesh, &result, pos0),
+                nearest_ring_slide(&mesh, &result, pos6),
+            )
         };
 
         // Build the weighted-1.0 call with the same fixture's keys. The keys are
@@ -19591,8 +20174,7 @@ mod tests {
 
         // §8.8.3: the slid boundvert lies on the leg's line through the apex, so
         // its component perpendicular to the leg direction vanishes.
-        let perpendicular =
-            ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
+        let perpendicular = ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
         assert!(
             perpendicular < 1.0e-4,
             "slid boundvert sits on the silhouette leg's line, perp={perpendicular}",
@@ -19683,8 +20265,11 @@ mod tests {
                 },
             );
             mesh.validate_topology();
-            let positions: Vec<Vec3> =
-                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            let positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
             (apex_pos, positions)
         };
 
@@ -19695,7 +20280,11 @@ mod tests {
         // by the far endpoints). `result.verts` is built in the same order both runs,
         // so positions correspond index-for-index.
         assert_eq!(on_positions.len(), off_positions.len(), "same vert count");
-        assert_eq!(on_positions.len(), 6, "two apex boundverts + four terminal strip verts");
+        assert_eq!(
+            on_positions.len(),
+            6,
+            "two apex boundverts + four terminal strip verts"
+        );
 
         let mut apex_drift_max: f32 = 0.0;
         let mut terminal_count = 0;
@@ -19736,8 +20325,7 @@ mod tests {
     /// of that plane at *unequal* angles (an irregular junction, §8.8.5), so the
     /// §7.6.2 meet floats off `z = 0` while the §8.8.3 slide pins the boundvert back
     /// onto it. Returns (mesh, apex, [v1..v4], beveled edges {0,1} and {0,3}).
-    fn irregular_apex_junction_planar_leg() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2])
-    {
+    fn irregular_apex_junction_planar_leg() -> (LoopMesh, VertexKey, [VertexKey; 4], [EdgeKey; 2]) {
         let mut mesh = LoopMesh::new();
         let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
         // s2 — the silhouette leg — lies in z = 0. s1 and s3 (the beveled flanks)
@@ -19885,8 +20473,11 @@ mod tests {
                 },
             );
             mesh.validate_topology();
-            let positions: Vec<Vec3> =
-                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            let positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
             let firing2 = firing_boundvert(&mesh, &result, apex_pos, leg2_dir);
             let firing4 = firing_boundvert(&mesh, &result, apex_pos, leg4_dir);
             (apex_pos, leg2_dir, leg4_dir, positions, firing2, firing4)
@@ -19965,7 +20556,11 @@ mod tests {
         // ripple — not a recipe change — so their drift is bounded well below the apex
         // slide's, distinguishing the legitimate ripple from a routing bug (§8.8.5).
         assert_eq!(on_positions.len(), off_positions.len(), "same vert count");
-        assert_eq!(on_positions.len(), 6, "two apex boundverts + four terminal strip verts");
+        assert_eq!(
+            on_positions.len(),
+            6,
+            "two apex boundverts + four terminal strip verts"
+        );
         let drifted = on_positions
             .iter()
             .zip(off_positions.iter())
@@ -20015,8 +20610,11 @@ mod tests {
                 },
             );
             mesh.validate_topology();
-            let positions: Vec<Vec3> =
-                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            let positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
             (apex_pos, leg2, leg4, edge01, edge03, positions)
         };
 
@@ -20104,9 +20702,8 @@ mod tests {
         // the lopsided sector they are distinguishably *not* the undamped apex offsets
         // the overshoot bug carried to the terminal.
         let mut max_damp_gap: f32 = 0.0;
-        for (got, (want_damped, want_apex)) in recovered
-            .iter()
-            .zip(damped.iter().zip(apex_sorted.iter()))
+        for (got, (want_damped, want_apex)) in
+            recovered.iter().zip(damped.iter().zip(apex_sorted.iter()))
         {
             assert!(
                 (got - want_damped).abs() < 5.0e-4,
@@ -20160,11 +20757,7 @@ mod tests {
                 .iter()
                 .map(|&v| mesh.vertex_position(v))
                 .collect();
-            positions.sort_by(|a, b| {
-                (a.x, a.y, a.z)
-                    .partial_cmp(&(b.x, b.y, b.z))
-                    .unwrap()
-            });
+            positions.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap());
             positions
         };
 
@@ -20275,8 +20868,7 @@ mod tests {
 
         // And — the point of the guard — that retained meet-point genuinely floats
         // off the leg's line (the slide it rejected would have pinned it on-line).
-        let perpendicular =
-            ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
+        let perpendicular = ((b_on - apex_pos) - leg_dir * (b_on - apex_pos).dot(leg_dir)).length();
         assert!(
             perpendicular > 1.0e-4,
             "rejected slide keeps the off-line §7.6.2 meet, perp={perpendicular}",
@@ -20708,9 +21300,8 @@ mod tests {
         );
 
         let has = |set: &[Vec<VertexKey>], a, b, c| {
-            set.iter().any(|verts| {
-                verts.contains(&a) && verts.contains(&b) && verts.contains(&c)
-            })
+            set.iter()
+                .any(|verts| verts.contains(&a) && verts.contains(&b) && verts.contains(&c))
         };
         assert!(
             has(&triangles, leg, start, peak),
@@ -20788,7 +21379,11 @@ mod tests {
             };
             let a = rim_verts(&cutoff);
             let b = rim_verts(&adj);
-            assert_eq!(a.len(), b.len(), "rim {i} same fan vert count under both fills");
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "rim {i} same fan vert count under both fills"
+            );
             for target in &a {
                 assert!(
                     b.iter().any(|q| (*q - *target).length() < 1.0e-4),
@@ -21390,7 +21985,10 @@ mod tests {
             .iter()
             .filter(|&&edge| mesh.edge_radial_iter(edge).count() != 2)
             .count();
-        assert_eq!(open, 0, "{site}: {open} boundary edge(s) — the corner is unfilled");
+        assert_eq!(
+            open, 0,
+            "{site}: {open} boundary edge(s) — the corner is unfilled"
+        );
     }
 
     /// The three cube edges meeting at the `(1, 1, 1)` corner, as bevel input, plus the
@@ -21470,11 +22068,7 @@ mod tests {
         mesh_add_cube(&mut mesh);
         let tint = tint_and_slot_faces(&mut mesh);
 
-        let edge = cube_edge(
-            &mesh,
-            Vec3::new(1.0, 1.0, 1.0),
-            Vec3::new(-1.0, 1.0, 1.0),
-        );
+        let edge = cube_edge(&mesh, Vec3::new(1.0, 1.0, 1.0), Vec3::new(-1.0, 1.0, 1.0));
         let flanking: Vec<(i32, [f32; 3])> = mesh
             .edge_face_keys(edge)
             .iter()
@@ -21503,7 +22097,9 @@ mod tests {
 
         let inherited = (
             mesh.face_material_index(strip),
-            mesh.face_attribs().get_vec3(tint, strip.as_usize()).unwrap(),
+            mesh.face_attribs()
+                .get_vec3(tint, strip.as_usize())
+                .unwrap(),
         );
         assert!(
             flanking.contains(&inherited),
@@ -21539,10 +22135,11 @@ mod tests {
             },
         );
 
-        for (&face, (slot, value)) in result
-            .faces
-            .iter()
-            .zip(face_blocks(&mesh, tint, &result.faces))
+        for (&face, (slot, value)) in
+            result
+                .faces
+                .iter()
+                .zip(face_blocks(&mesh, tint, &result.faces))
         {
             assert_eq!(
                 slot, 3,
@@ -21583,11 +22180,7 @@ mod tests {
                 .iter()
                 .map(|&face| {
                     let value = mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap();
-                    [
-                        value[0].to_bits(),
-                        value[1].to_bits(),
-                        value[2].to_bits(),
-                    ]
+                    [value[0].to_bits(), value[1].to_bits(), value[2].to_bits()]
                 })
                 .collect();
             tints.sort_unstable();
@@ -21782,12 +22375,16 @@ mod tests {
         mesh.validate_topology();
 
         let mut template_less = 0;
-        for (&face, (slot, value)) in result
-            .faces
-            .iter()
-            .zip(face_blocks(&mesh, tint, &result.faces))
+        for (&face, (slot, value)) in
+            result
+                .faces
+                .iter()
+                .zip(face_blocks(&mesh, tint, &result.faces))
         {
-            assert_eq!(slot, 7, "stage 2 stamps every new face's slot, face {face:?}");
+            assert_eq!(
+                slot, 7,
+                "stage 2 stamps every new face's slot, face {face:?}"
+            );
             if value == TEMPLATE_LESS_BLOCK.1 {
                 template_less += 1;
             } else {
@@ -22013,12 +22610,12 @@ mod tests {
             let (far_position, far_heat) = *legs
                 .iter()
                 .min_by(|(a, _), (b, _)| {
-                    let da = (position - corner_position).normalize().dot(
-                        (*a - corner_position).normalize(),
-                    );
-                    let db = (position - corner_position).normalize().dot(
-                        (*b - corner_position).normalize(),
-                    );
+                    let da = (position - corner_position)
+                        .normalize()
+                        .dot((*a - corner_position).normalize());
+                    let db = (position - corner_position)
+                        .normalize()
+                        .dot((*b - corner_position).normalize());
                     db.partial_cmp(&da).expect("finite")
                 })
                 .expect("the ring vert sits on one of the three legs");
@@ -22277,10 +22874,7 @@ mod tests {
             .map(|edge| {
                 let [a, b] = mesh.edge_vert_keys(edge);
                 let leg_far = if a == near { b } else { a };
-                (
-                    mesh.vertex_position(leg_far),
-                    heat_of(&mesh, heat, leg_far),
-                )
+                (mesh.vertex_position(leg_far), heat_of(&mesh, heat, leg_far))
             })
             .collect();
         assert_eq!(legs.len(), 2);
@@ -22861,7 +23455,11 @@ impl ProfileCell {
             start,
             end,
             mid,
-            mid_plane_normal: if collinear { Vec3::ZERO } else { cross.normalize() },
+            mid_plane_normal: if collinear {
+                Vec3::ZERO
+            } else {
+                cross.normalize()
+            },
             projection_dir: Vec3::ZERO,
             collinear,
         }
@@ -23308,7 +23906,9 @@ fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
     // target, repeat until the chord spread is negligible (BEVEL.md §8.6.4
     // step 3/4).
     for _ in 0..64 {
-        let target = (0..n).map(|k| cell_chord(samples[k], samples[k + 1])).sum::<f32>()
+        let target = (0..n)
+            .map(|k| cell_chord(samples[k], samples[k + 1]))
+            .sum::<f32>()
             / segments as f32;
         let mut next = samples.clone();
         for k in 1..n {
@@ -23507,10 +24107,13 @@ impl UnitOctant {
         if longest <= 1.0e-6 || lengths.iter().any(|&length| length <= longest * 1.0e-3) {
             return None;
         }
-        let conditioning =
-            Mat3::from_cols(axes[0] / lengths[0], axes[1] / lengths[1], axes[2] / lengths[2])
-                .determinant()
-                .abs();
+        let conditioning = Mat3::from_cols(
+            axes[0] / lengths[0],
+            axes[1] / lengths[1],
+            axes[2] / lengths[2],
+        )
+        .determinant()
+        .abs();
         if conditioning <= 1.0e-4 {
             return None;
         }
@@ -23870,16 +24473,12 @@ impl AdjNet {
         // The extraordinary centre (valence `sectors`): the mean of the `s` innermost edge
         // points, less `γ_s` times the mean of the `s` faces around it, plus `γ_s` times
         // its old position.
-        let mean_edge = (0..sectors)
-            .fold(Vec3::ZERO, |acc, i| {
-                acc + next.at(i, 2 * half - 1, 2 * half)
-            })
-            / sectors as f32;
-        let mean_face = (0..sectors)
-            .fold(Vec3::ZERO, |acc, i| {
-                acc + next.at(i, 2 * half - 1, 2 * half - 1)
-            })
-            / sectors as f32;
+        let mean_edge = (0..sectors).fold(Vec3::ZERO, |acc, i| {
+            acc + next.at(i, 2 * half - 1, 2 * half)
+        }) / sectors as f32;
+        let mean_face = (0..sectors).fold(Vec3::ZERO, |acc, i| {
+            acc + next.at(i, 2 * half - 1, 2 * half - 1)
+        }) / sectors as f32;
         let centre = self.at(0, half, half);
         next.set(
             0,
@@ -24069,7 +24668,12 @@ fn adj_fullness(profile: f32, segments: u32) -> f32 {
 /// (boundary sharpening `(−1/6, +4/3, −1/6)`, per-sector face/edge points), and pulls
 /// the seed in through the valence-`s` extraordinary-centre stencil `apex = E −
 /// γ_s·F + γ_s·centre_0`. The even resample keeps this subdivided centre verbatim.
-fn adj_even_extraordinary_centre(vertex: Vec3, boundverts: &[Vec3], mids: &[Vec3], gamma_s: f32) -> Vec3 {
+fn adj_even_extraordinary_centre(
+    vertex: Vec3,
+    boundverts: &[Vec3],
+    mids: &[Vec3],
+    gamma_s: f32,
+) -> Vec3 {
     let sectors = boundverts.len();
     let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
     let centre_0 = centroid + adj_fullness(0.5, 2) * (vertex - centroid);
@@ -24132,4 +24736,3 @@ fn intersect_line_plane(
     let t = (plane_point - point).dot(plane_normal) / denominator;
     Some(point + direction * t)
 }
-

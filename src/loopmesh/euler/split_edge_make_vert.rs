@@ -50,28 +50,14 @@ impl LoopMesh {
         //    cycle, so it does not displace the anchor.
         let e_new = self.create_edge([tail_vertex, v_new], EdgeCreateFlags::NONE);
 
-        // 4) Split the radial cycle, walking it forward **from its radial
-        //    entry** — the last-attached loop (§8.1 step 4). The walk order is
-        //    the order the two halves are re-populated in, and each half's own
-        //    entry is left on whichever face the walk handled last, so starting
-        //    at the first-attached loop instead would leave both halves headed
-        //    by the wrong face. Snapshot first: the walk rebuilds the very
-        //    cycle it is reading.
-        let original_loops: Vec<LoopKey> = match self.edge_radial_last_attached(edge) {
-            Some(entry) => {
-                let mut loops = Vec::new();
-                let mut current = entry;
-                loop {
-                    loops.push(current);
-                    current = self.loop_radial_next(current);
-                    if current == entry {
-                        break;
-                    }
-                }
-                loops
-            }
-            None => Vec::new(),
-        };
+        // 4) Split the radial cycle, walking it in §6.2 order — forward from
+        //    the edge's radial entry (§8.1 step 4). The walk order is the order
+        //    the two halves are re-populated in, and each half's own entry is
+        //    left on whichever face the walk handled last. Snapshot first: this
+        //    rebuild re-appends half its loops to the very edge it is draining,
+        //    so an in-place walk could re-enter the cycle (§8.7 contrasts the
+        //    edge splice, which needs no snapshot for exactly that reason).
+        let original_loops: Vec<LoopKey> = self.edge_radial_iter(edge).collect();
 
         // Detach every loop from `edge`'s radial cycle in one shot — the
         // per-loop reattach below decides which of (edge, e_new) it belongs to.
@@ -256,7 +242,7 @@ mod tests {
         let (first_quad, second_quad, edge, tail) = two_quads_sharing_an_edge(&mut mesh);
 
         // Pre-split sanity: the shared edge's entry is the quad that adopted it last.
-        let entry = mesh.edge_radial_last_attached(edge).expect("radial-2 edge");
+        let entry = mesh.edge_radial_entry(edge).expect("radial-2 edge");
         assert_eq!(mesh.loop_face(entry), second_quad);
 
         let (v_new, e_new) = mesh.euler_split_edge_make_vert(tail, edge);
@@ -268,7 +254,7 @@ mod tests {
             "v_new's disk anchor is the retained half, not the fresh one"
         );
         for half in [edge, e_new] {
-            let head = mesh.edge_radial_last_attached(half).expect("radial-2 half");
+            let head = mesh.edge_radial_entry(half).expect("radial-2 half");
             assert_eq!(
                 mesh.loop_face(head),
                 first_quad,
@@ -301,7 +287,7 @@ mod tests {
 
         assert_eq!(mesh.vertices.get(v_new).disk_loop_start, Some(spine));
         for half in [spine, e_new] {
-            let head = mesh.edge_radial_last_attached(half).expect("radial-3 half");
+            let head = mesh.edge_radial_entry(half).expect("radial-3 half");
             assert_eq!(
                 mesh.loop_face(head),
                 pages[1],

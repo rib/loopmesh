@@ -479,12 +479,7 @@ impl SubdivideGeom {
     /// `original_half` is the input-edge handle that survives the split (the
     /// near-side half), `new_half` the freshly-created far-side half. Every rim
     /// midpoint is inner (§1), so the vert lands in `geom_inner.out` too.
-    fn record_split(
-        &mut self,
-        midpoint: VertexKey,
-        original_half: EdgeKey,
-        new_half: EdgeKey,
-    ) {
+    fn record_split(&mut self, midpoint: VertexKey, original_half: EdgeKey, new_half: EdgeKey) {
         self.verts.push(midpoint);
         self.split_verts.push(midpoint);
         self.inner_verts.push(midpoint);
@@ -869,7 +864,10 @@ impl LoopMesh {
     ) {
         // The inserted midpoint reads its own freshly-placed position; the two
         // endpoints read their pristine input positions captured in `ctx`.
-        scratch.insert(m, fractal_displace(self.vertex_position(m), offset, ctx, params));
+        scratch.insert(
+            m,
+            fractal_displace(self.vertex_position(m), offset, ctx, params),
+        );
         scratch.insert(ctx.va, fractal_displace(ctx.co_a, offset, ctx, params));
         scratch.insert(ctx.vb, fractal_displace(ctx.co_b, offset, ctx, params));
     }
@@ -1920,7 +1918,14 @@ impl LoopMesh {
         // ---- Pass three: apply the recorded §9.5 patterns, last-recorded-first
         // (§4.4 / §7.0.3(a)). ----
         for record in records.iter().rev() {
-            self.resplit_face_multicut(record, midpoint_layer, guard_layer, cuts, &params, &mut geom);
+            self.resplit_face_multicut(
+                record,
+                midpoint_layer,
+                guard_layer,
+                cuts,
+                &params,
+                &mut geom,
+            );
         }
 
         self.pop_vert_op_flag_layer(midpoint_layer);
@@ -2536,7 +2541,11 @@ fn tangent_frame(normal: Vec3) -> (Vec3, Vec3) {
         // Unit in-plane perpendicular to the xy-projection (`z = 0`).
         let base1 = Vec3::new(ny * inv_xy_len, -nx * inv_xy_len, 0.0);
         // The substituted closed form of `normal × base1`; length is |normal|.
-        let base2 = Vec3::new(nx * nz * inv_xy_len, ny * nz * inv_xy_len, -xy_proj_sq.sqrt());
+        let base2 = Vec3::new(
+            nx * nz * inv_xy_len,
+            ny * nz * inv_xy_len,
+            -xy_proj_sq.sqrt(),
+        );
         (base1, base2)
     } else {
         // Projection vanishes: `normal` points (nearly) along ±z.
@@ -2894,10 +2903,18 @@ mod tests {
         let e04 = mesh.create_edge([v0, v4], EdgeCreateFlags::NONE);
         let e42 = mesh.create_edge([v4, v2], EdgeCreateFlags::NONE);
 
-        mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
         // Wound v1 -> v0 so both shared edges are traversed opposite to A's,
         // keeping every radial cycle at length 2.
-        mesh.face_create(&[v1, v0, v4, v2], &[e01, e04, e42, e12], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[v1, v0, v4, v2],
+            &[e01, e04, e42, e12],
+            FaceCreateFlags::NONE,
+        );
         (mesh, [v0, v1, v2, v3, v4], e01)
     }
 
@@ -5065,7 +5082,10 @@ mod tests {
         let inner = geom.geom_inner();
         assert_eq!(inner.verts.len(), 1, "the rim midpoint is inner");
         assert_eq!(inner.verts[0], m, "the inner vert is the rim midpoint");
-        assert!(inner.edges.is_empty(), "§5.1 marks no connecting edge inner");
+        assert!(
+            inner.edges.is_empty(),
+            "§5.1 marks no connecting edge inner"
+        );
         assert!(inner.faces.is_empty(), "§5.1 marks no fragment face inner");
 
         // geom (union): split ∪ inner ∪ {one re-split-marked original face}.
@@ -5117,7 +5137,11 @@ mod tests {
         no_dup(inner.edges, "geom_inner.edges");
         // The grid fill marks all but one of its 4 fragments inner (the one that
         // keeps the original face's identity carries the re-split mark instead).
-        assert_eq!(inner.faces.len(), 3, "4 fragments minus 1 re-split original");
+        assert_eq!(
+            inner.faces.len(),
+            3,
+            "4 fragments minus 1 re-split original"
+        );
         no_dup(inner.faces, "geom_inner.faces");
         assert!(
             !inner.faces.contains(&face),
@@ -5300,10 +5324,18 @@ mod tests {
         // the midpoint moves only along the averaged endpoint normal (here +Z,
         // off the flat z = 0 quad). along_normal = 0.0 is the free 3-D jitter,
         // which also moves in the in-plane (x, y) directions.
-        let (_mn, _gn, normal_only) =
-            fractal_cut(SubdivideParams::default().fractal(1.0).along_normal(1.0).seed(1));
-        let (_mf, _gf, free_3d) =
-            fractal_cut(SubdivideParams::default().fractal(1.0).along_normal(0.0).seed(1));
+        let (_mn, _gn, normal_only) = fractal_cut(
+            SubdivideParams::default()
+                .fractal(1.0)
+                .along_normal(1.0)
+                .seed(1),
+        );
+        let (_mf, _gf, free_3d) = fractal_cut(
+            SubdivideParams::default()
+                .fractal(1.0)
+                .along_normal(0.0)
+                .seed(1),
+        );
 
         // normal-only: the chord midpoint (1,0,0) moves purely in z.
         assert!(
@@ -5550,11 +5582,7 @@ mod tests {
         let f = normal.x * normal.x + normal.y * normal.y; // 0.36 + 0.64 = 1.0
         let d = 1.0 / f.sqrt();
         let want_base1 = Vec3::new(normal.y * d, -normal.x * d, 0.0);
-        let want_base2 = Vec3::new(
-            normal.x * normal.z * d,
-            normal.y * normal.z * d,
-            -f.sqrt(),
-        );
+        let want_base2 = Vec3::new(normal.x * normal.z * d, normal.y * normal.z * d, -f.sqrt());
         assert!(base1.distance(want_base1) < 1e-6, "base1 closed form");
         assert!(base2.distance(want_base2) < 1e-6, "base2 closed form");
         // base1 is UNIT; base2 has length |normal| (NOT renormalised).
@@ -5570,13 +5598,25 @@ mod tests {
 
         // Degenerate +z: f <= EPSILON => base1 = (1,0,0), base2 = (0,1,0).
         let (b1, b2) = tangent_frame(Vec3::Z);
-        assert!(b1.distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-9, "+z base1 = +x");
-        assert!(b2.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9, "+z base2 = +y");
+        assert!(
+            b1.distance(Vec3::new(1.0, 0.0, 0.0)) < 1e-9,
+            "+z base1 = +x"
+        );
+        assert!(
+            b2.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9,
+            "+z base2 = +y"
+        );
 
         // Degenerate -z: the x-sign of base1 flips with nz < 0.
         let (b1n, b2n) = tangent_frame(Vec3::new(0.0, 0.0, -1.0));
-        assert!(b1n.distance(Vec3::new(-1.0, 0.0, 0.0)) < 1e-9, "-z base1 = -x");
-        assert!(b2n.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9, "-z base2 = +y");
+        assert!(
+            b1n.distance(Vec3::new(-1.0, 0.0, 0.0)) < 1e-9,
+            "-z base1 = -x"
+        );
+        assert!(
+            b2n.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9,
+            "-z base2 = +y"
+        );
     }
 
     #[test]

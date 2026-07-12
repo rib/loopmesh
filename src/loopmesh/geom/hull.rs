@@ -360,12 +360,7 @@ fn point_outside(points: &[DVec3], face: &WorkFace, index: usize) -> bool {
     orient(points[a], points[b], points[c], points[index]) < 0.0
 }
 
-fn assign_to_face(
-    points: &[DVec3],
-    faces: &[WorkFace],
-    index: usize,
-    outside: &mut [Vec<usize>],
-) {
+fn assign_to_face(points: &[DVec3], faces: &[WorkFace], index: usize, outside: &mut [Vec<usize>]) {
     for face_index in 0..faces.len() {
         if faces[face_index].alive && point_outside(points, &faces[face_index], index) {
             outside[face_index].push(index);
@@ -706,9 +701,7 @@ fn gift_wrap_2d(points: &[DVec3], apex: DVec3) -> Vec<usize> {
         .min_by(|&&a, &&b| {
             let pa = points[a];
             let pb = points[b];
-            (pa.x, pa.y, pa.z)
-                .partial_cmp(&(pb.x, pb.y, pb.z))
-                .unwrap()
+            (pa.x, pa.y, pa.z).partial_cmp(&(pb.x, pb.y, pb.z)).unwrap()
         })
         .unwrap();
 

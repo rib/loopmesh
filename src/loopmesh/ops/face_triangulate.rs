@@ -461,7 +461,8 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
         ];
         let face = create_face_from_verts(&mut mesh, &verts);
-        mesh.face_attribs_mut().set_f32(material, face.as_usize(), 7.0);
+        mesh.face_attribs_mut()
+            .set_f32(material, face.as_usize(), 7.0);
 
         mesh.face_triangulate(face, QuadMethod::Fixed, NgonMethod::EarClip);
 
@@ -517,7 +518,10 @@ mod tests {
         let mut expected_uv: HashMap<VertexKey, [f32; 2]> = HashMap::new();
         for (corner_index, source_loop) in mesh.face_loop_keys(face).into_iter().enumerate() {
             let source_vertex = mesh.loop_vertex(source_loop);
-            let value = [corner_index as f32 + 1.0, (corner_index as f32 + 1.0) * 10.0];
+            let value = [
+                corner_index as f32 + 1.0,
+                (corner_index as f32 + 1.0) * 10.0,
+            ];
             mesh.loop_attribs_mut()
                 .set_vec2(uv, source_loop.as_usize(), value);
             expected_uv.insert(source_vertex, value);

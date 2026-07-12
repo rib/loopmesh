@@ -642,7 +642,10 @@ mod tests {
                 .into_iter()
                 .find(|&w| pre.contains(&w) && mesh.vertex_position(w).distance(p) < 1e-6)
                 .expect("rail vert is coincident with an existing selection vert");
-            let expected = mesh.vertex_attribs().get_f32(cd, source.as_usize()).unwrap();
+            let expected = mesh
+                .vertex_attribs()
+                .get_f32(cd, source.as_usize())
+                .unwrap();
             let got = mesh.vertex_attribs().get_f32(cd, rv.as_usize()).unwrap();
             assert!(expected.abs() > 0.0, "source value is nonzero");
             assert!(
@@ -682,8 +685,7 @@ mod tests {
         ];
         let pre_verts: std::collections::HashSet<VertexKey> =
             mesh.vert_keys().into_iter().collect();
-        let pre_loops: std::collections::HashSet<LoopKey> =
-            mesh.loop_keys().into_iter().collect();
+        let pre_loops: std::collections::HashSet<LoopKey> = mesh.loop_keys().into_iter().collect();
 
         mesh.offset_edgeloops(&run, false);
 
@@ -785,7 +787,11 @@ mod tests {
         // 18V25E8F: +8 verts, +12 edges, +4 faces (3 quad rungs + 1 hexagon
         // split). This matches the cross-backend `ngon_offset_side_strip`
         // fixture's expected post-offset counts.
-        assert_eq!(counts(&mesh), (18, 25, 8), "V18 E25 F8 corrected Case-B chain");
+        assert_eq!(
+            counts(&mesh),
+            (18, 25, 8),
+            "V18 E25 F8 corrected Case-B chain"
+        );
 
         // A coincident rail vert exists at each interior run vert b and c (the
         // through-junctions the chord misreading stepped over). Each interior run

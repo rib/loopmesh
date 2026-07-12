@@ -171,8 +171,10 @@ impl LoopMesh {
             let bottom_pos: Vec<Vec3> = loop_a.iter().map(|&v| self.vertex_position(v)).collect();
             let top_pos: Vec<Vec3> = loop_b.iter().map(|&v| self.vertex_position(v)).collect();
             let left_pos: Vec<Vec3> = rail_left.iter().map(|&v| self.vertex_position(v)).collect();
-            let right_pos: Vec<Vec3> =
-                rail_right.iter().map(|&v| self.vertex_position(v)).collect();
+            let right_pos: Vec<Vec3> = rail_right
+                .iter()
+                .map(|&v| self.vertex_position(v))
+                .collect();
             return self.grid_assemble(
                 cols,
                 rows,
@@ -473,8 +475,7 @@ impl LoopMesh {
         members: &[VertexKey],
         target: usize,
     ) -> (Vec<Vec3>, Vec<VertexKey>) {
-        let real_positions: Vec<Vec3> =
-            members.iter().map(|&v| self.vertex_position(v)).collect();
+        let real_positions: Vec<Vec3> = members.iter().map(|&v| self.vertex_position(v)).collect();
         let count = members.len();
         if count == target {
             return (real_positions, members.to_vec());
@@ -494,7 +495,11 @@ impl LoopMesh {
                 if j + 1 < base.len() {
                     // Forward split of the segment ahead: the processed slot is
                     // the origin-ward endpoint, the neighbour is its follower.
-                    let survivor = if survive_processed { base[j] } else { base[j + 1] };
+                    let survivor = if survive_processed {
+                        base[j]
+                    } else {
+                        base[j + 1]
+                    };
                     next.push(base[j]);
                     next.push(survivor);
                 } else {
@@ -502,7 +507,11 @@ impl LoopMesh {
                     // segment behind it; the neighbour is its predecessor (the
                     // scaffold just emitted for the previous slot).
                     let predecessor = *next.last().unwrap();
-                    let survivor = if survive_processed { base[j] } else { predecessor };
+                    let survivor = if survive_processed {
+                        base[j]
+                    } else {
+                        predecessor
+                    };
                     next.push(survivor);
                     next.push(base[j]);
                 }
@@ -536,7 +545,11 @@ impl LoopMesh {
                     slots[position - 1]
                 }
             };
-            let insert_at = if index + 1 < current { position + 1 } else { position };
+            let insert_at = if index + 1 < current {
+                position + 1
+            } else {
+                position
+            };
             slots.insert(insert_at, survivor);
             survive_processed = !survive_processed;
             offset += 1;
@@ -576,7 +589,14 @@ impl LoopMesh {
                 let position = if use_interp_simple {
                     // §6.1 — reciprocal-distance convex partition of unity over
                     // the four boundary verts sharing this cell's column/row.
-                    grid_simple_blend(u, v, bottom_side[x], left_rail[y], top_side[x], right_rail[y])
+                    grid_simple_blend(
+                        u,
+                        v,
+                        bottom_side[x],
+                        left_rail[y],
+                        top_side[x],
+                        right_rail[y],
+                    )
                 } else {
                     // §5.3 — carry this column's bottom and top profile verts
                     // through their own row frame into the current row's frame,
@@ -784,7 +804,12 @@ fn grid_frame_transform(point: Vec3, src: [Vec3; 3], tar: [Vec3; 3]) -> Vec3 {
     let s = [project(src[0]), project(src[1]), project(src[2])];
 
     // Affine (un-clamped) barycentric weights in the source plane.
-    let w = grid_barycentric_2d(p.truncate(), s[0].truncate(), s[1].truncate(), s[2].truncate());
+    let w = grid_barycentric_2d(
+        p.truncate(),
+        s[0].truncate(),
+        s[1].truncate(),
+        s[2].truncate(),
+    );
     let in_plane = w[0] * tar[0] + w[1] * tar[1] + w[2] * tar[2];
 
     // Out-of-plane height, scaled by the linear size ratio of the triangles.
@@ -849,8 +874,7 @@ mod tests {
     /// diverge.
     fn rect_wire_ring(mesh: &mut LoopMesh, cols: usize, rows: usize, warp: f32) -> Vec<EdgeKey> {
         let on_perimeter = |x: usize, y: usize| x == 0 || x == cols - 1 || y == 0 || y == rows - 1;
-        let is_corner =
-            |x: usize, y: usize| (x == 0 || x == cols - 1) && (y == 0 || y == rows - 1);
+        let is_corner = |x: usize, y: usize| (x == 0 || x == cols - 1) && (y == 0 || y == rows - 1);
         let z = |x: usize, y: usize| -> f32 {
             // Bow the boundary: every non-corner boundary vertex is lifted to
             // `warp`, the four corners stay at z = 0. This is the GRID_FILL.md
@@ -919,7 +943,11 @@ mod tests {
                 "({cols}x{rows}) only the (cols-2)(rows-2) interior verts created",
             );
             for &face in result.faces() {
-                assert_eq!(mesh.face_len(face), 4, "({cols}x{rows}) every cell is a quad");
+                assert_eq!(
+                    mesh.face_len(face),
+                    4,
+                    "({cols}x{rows}) every cell is a quad"
+                );
             }
             mesh.validate_topology();
         }
@@ -1156,7 +1184,11 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &params);
         assert_eq!(result.faces().len(), 6);
         for &face in result.faces() {
-            assert_eq!(mesh.face_material_index(face), 2, "mat_nr stamped on the quad");
+            assert_eq!(
+                mesh.face_material_index(face),
+                2,
+                "mat_nr stamped on the quad"
+            );
             assert!(mesh.is_face_smooth(face), "use_smooth stamped on the quad");
         }
         mesh.validate_topology();
@@ -1169,7 +1201,11 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
         assert_eq!(result.faces().len(), 4);
         for &face in result.faces() {
-            assert_eq!(mesh.face_material_index(face), 0, "default mat_nr is slot 0");
+            assert_eq!(
+                mesh.face_material_index(face),
+                0,
+                "default mat_nr is slot 0"
+            );
             assert!(!mesh.is_face_smooth(face), "default quads are flat");
         }
         mesh.validate_topology();
@@ -1188,7 +1224,8 @@ mod tests {
             .collect();
         let mut side_edges = Vec::new();
         for x in 0..2 {
-            side_edges.push(mesh.create_edge([bottom[x], bottom[x + 1]], EdgeCreateFlags::NO_DUPLICATE));
+            side_edges
+                .push(mesh.create_edge([bottom[x], bottom[x + 1]], EdgeCreateFlags::NO_DUPLICATE));
             side_edges.push(mesh.create_edge([top[x], top[x + 1]], EdgeCreateFlags::NO_DUPLICATE));
         }
         let (v0, e0, f0) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
@@ -1468,10 +1505,22 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
 
         assert_eq!(result.faces().len(), 3, "fan of 3 faces");
-        assert_eq!(quad_tri_split(&mesh, &result), (2, 1), "2 quads + 1 triangle");
-        assert_eq!(mesh.vertex_count(), v0, "no scaffold vertex survives (V unchanged)");
+        assert_eq!(
+            quad_tri_split(&mesh, &result),
+            (2, 1),
+            "2 quads + 1 triangle"
+        );
+        assert_eq!(
+            mesh.vertex_count(),
+            v0,
+            "no scaffold vertex survives (V unchanged)"
+        );
         assert_eq!(mesh.face_count() - f0, 3, "F 0 -> 3");
-        assert_eq!(mesh.edge_count() - e0, 2, "two interior fan edges created (E 7 -> 9)");
+        assert_eq!(
+            mesh.edge_count() - e0,
+            2,
+            "two interior fan edges created (E 7 -> 9)"
+        );
 
         // The perimeter vertex set is exactly the input's — every scaffold collapsed.
         let mut after = std::collections::HashSet::new();
@@ -1498,8 +1547,16 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
 
         assert_eq!(result.faces().len(), 2, "fan of 2 faces");
-        assert_eq!(quad_tri_split(&mesh, &result), (1, 1), "1 quad + 1 triangle");
-        assert_eq!(mesh.vertex_count(), v0, "no scaffold vertex survives (V unchanged)");
+        assert_eq!(
+            quad_tri_split(&mesh, &result),
+            (1, 1),
+            "1 quad + 1 triangle"
+        );
+        assert_eq!(
+            mesh.vertex_count(),
+            v0,
+            "no scaffold vertex survives (V unchanged)"
+        );
         assert_eq!(mesh.face_count() - f0, 2, "F 0 -> 2");
 
         // §3.4 determinate collapse: the scaffold survives into the origin-ward
@@ -1529,10 +1586,7 @@ mod tests {
             max_y(triangle) < 1.5,
             "triangle degenerates the bottom (origin) cell, not the top",
         );
-        assert!(
-            max_y(quad) > 1.5,
-            "the quad spans up to the top side",
-        );
+        assert!(max_y(quad) > 1.5, "the quad spans up to the top side",);
 
         mesh.validate_topology();
     }
@@ -1598,7 +1652,11 @@ mod tests {
         // coincident-endpoint blend (1, 0.5, 0) — never the y = 1.0 an
         // even-subdivision (or mirror-opposite) placement would give.
         let (quads, tris, _interior, interior_pos) = forward;
-        assert_eq!((quads, tris), (3, 1), "2-vs-3 rail fill: 3 quads + 1 triangle");
+        assert_eq!(
+            (quads, tris),
+            (3, 1),
+            "2-vs-3 rail fill: 3 quads + 1 triangle"
+        );
         assert!(
             (interior_pos - Vec3::new(1.0, 0.5, 0.0)).length() < 1.0e-4,
             "interior vertex at the coincident-endpoint blend (1, 0.5, 0), got {interior_pos:?}",
@@ -1618,7 +1676,11 @@ mod tests {
         let side_edges = rect_wire_ring(&mut mesh, 3, 3, 0.0);
         let v0 = mesh.vertex_count();
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
-        assert_eq!(quad_tri_split(&mesh, &result), (4, 0), "4 quads, no triangles");
+        assert_eq!(
+            quad_tri_split(&mesh, &result),
+            (4, 0),
+            "4 quads, no triangles"
+        );
         assert_eq!(mesh.vertex_count() - v0, 1, "one interior vertex created");
         mesh.validate_topology();
     }
@@ -1630,7 +1692,11 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
         // faces.out is exactly the grid; the ring had no faces before.
         assert_eq!(result.faces().len(), 9);
-        assert_eq!(mesh.face_count(), 9, "no face exists beyond the reported grid");
+        assert_eq!(
+            mesh.face_count(),
+            9,
+            "no face exists beyond the reported grid"
+        );
         let unique: std::collections::HashSet<FaceKey> = result.faces().iter().copied().collect();
         assert_eq!(unique.len(), 9, "faces.out lists each new quad once");
         mesh.validate_topology();
@@ -1743,7 +1809,11 @@ mod tests {
         let result = mesh.grid_fill(&side_edges, &GridFillParams::default());
 
         assert_eq!(result.faces().len(), 5, "fan of 5 faces");
-        assert_eq!(quad_tri_split(&mesh, &result), (3, 2), "3 quads + 2 triangles");
+        assert_eq!(
+            quad_tri_split(&mesh, &result),
+            (3, 2),
+            "3 quads + 2 triangles"
+        );
 
         // The face carrying a given position, and whether it is a triangle.
         let face_at = |x: f32, y: f32| -> FaceKey {

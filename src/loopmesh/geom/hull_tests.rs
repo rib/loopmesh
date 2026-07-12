@@ -40,7 +40,10 @@ fn orient(a: DVec3, b: DVec3, c: DVec3, d: DVec3) -> f64 {
 /// point is on or inside every face plane.
 fn assert_hull_invariants(points: &[DVec3], topo: &HullTopology) {
     assert!(!topo.faces.is_empty(), "hull produced no faces");
-    assert!(topo.vertices.len() >= 4, "hull needs at least a tetrahedron");
+    assert!(
+        topo.vertices.len() >= 4,
+        "hull needs at least a tetrahedron"
+    );
 
     // The on-hull vertex set must be a subset of the input indices, sorted and
     // unique, and every face index must be on the hull.
@@ -49,7 +52,10 @@ fn assert_hull_invariants(points: &[DVec3], topo: &HullTopology) {
         "hull vertices not strictly ascending / unique"
     );
     for face in &topo.faces {
-        assert!(face.vertices.len() >= 3, "face has fewer than three vertices");
+        assert!(
+            face.vertices.len() >= 3,
+            "face has fewer than three vertices"
+        );
         for &index in &face.vertices {
             assert!(index < points.len(), "face references out-of-range index");
             assert!(
@@ -270,7 +276,10 @@ fn lower_dimensional_clouds_resolve_to_degenerate_hulls() {
 
     // A hull only fails to exist when fewer than two distinct points remain.
     let single = vec![DVec3::new(1.0, 1.0, 1.0), DVec3::new(1.0, 1.0, 1.0)];
-    assert!(convex_hull(&single).is_none(), "one distinct point has no hull");
+    assert!(
+        convex_hull(&single).is_none(),
+        "one distinct point has no hull"
+    );
     assert!(convex_hull(&[]).is_none(), "empty cloud has no hull");
 }
 
@@ -351,7 +360,11 @@ fn cube_merges_coplanar_faces() {
     let topo = convex_hull(&points).expect("cube has a hull");
 
     // Every corner is extreme → all eight inputs must be on the hull.
-    assert_eq!(topo.vertices, (0..8).collect::<Vec<_>>(), "every cube corner is on-hull");
+    assert_eq!(
+        topo.vertices,
+        (0..8).collect::<Vec<_>>(),
+        "every cube corner is on-hull"
+    );
 
     // Target contract: six coplanar-merged faces, not a triangle fan.
     assert_eq!(
@@ -472,13 +485,20 @@ fn cospherical_with_coplanar_subsets_merges_faces() {
 
     // Concretely: the base merges to exactly one octagonal face, plus eight
     // triangular side faces to the apex (nine faces total).
-    assert_eq!(topo.faces.len(), 9, "expected one octagon + eight side triangles");
+    assert_eq!(
+        topo.faces.len(),
+        9,
+        "expected one octagon + eight side triangles"
+    );
     let octagons = topo
         .faces
         .iter()
         .filter(|face| face.vertices.len() == 8)
         .count();
-    assert_eq!(octagons, 1, "the eight coplanar base points must form one octagon");
+    assert_eq!(
+        octagons, 1,
+        "the eight coplanar base points must form one octagon"
+    );
 
     assert_hull_invariants(&points, &topo);
 }
@@ -504,14 +524,20 @@ fn assert_facet_emission_is_deterministic(points: &[DVec3], topo: &HullTopology)
     }
 
     let again = convex_hull(points).expect("hull recomputes");
-    assert_eq!(again.vertices, topo.vertices, "on-hull set is a pure function of input");
+    assert_eq!(
+        again.vertices, topo.vertices,
+        "on-hull set is a pure function of input"
+    );
     assert_eq!(
         again.faces.len(),
         topo.faces.len(),
         "facet count is a pure function of input"
     );
     for (lhs, rhs) in topo.faces.iter().zip(&again.faces) {
-        assert_eq!(lhs.vertices, rhs.vertices, "each facet re-emits identically");
+        assert_eq!(
+            lhs.vertices, rhs.vertices,
+            "each facet re-emits identically"
+        );
     }
 }
 
@@ -550,9 +576,17 @@ fn bipyramid_facet_emission_is_deterministic() {
         DVec3::new(0.0, 0.0, -1.0),
     ];
     let topo = convex_hull(&points).expect("bipyramid has a hull");
-    assert_eq!(topo.faces.len(), 6, "triangular bipyramid has six triangular facets");
+    assert_eq!(
+        topo.faces.len(),
+        6,
+        "triangular bipyramid has six triangular facets"
+    );
     for face in &topo.faces {
-        assert_eq!(face.vertices.len(), 3, "every bipyramid facet is a triangle");
+        assert_eq!(
+            face.vertices.len(),
+            3,
+            "every bipyramid facet is a triangle"
+        );
     }
     assert_facet_emission_is_deterministic(&points, &topo);
     assert_hull_invariants(&points, &topo);

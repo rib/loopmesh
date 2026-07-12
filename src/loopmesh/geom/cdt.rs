@@ -16,9 +16,7 @@
 //! — a CDT reuses its input vertices, it never moves or re-coordinates them.
 
 use glam::DVec2;
-use spade::{
-    ConstrainedDelaunayTriangulation, HasPosition, InsertionError, Point2, Triangulation,
-};
+use spade::{ConstrainedDelaunayTriangulation, HasPosition, InsertionError, Point2, Triangulation};
 
 /// A planar polygon-with-constraints to triangulate.
 ///
@@ -247,7 +245,9 @@ fn collect(
         for index in triple {
             referenced[index] = true;
         }
-        triangulation.triangles.push(CdtTriangle { vertices: triple });
+        triangulation
+            .triangles
+            .push(CdtTriangle { vertices: triple });
     }
 
     for (index, &present) in referenced.iter().enumerate() {

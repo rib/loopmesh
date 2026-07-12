@@ -578,9 +578,7 @@ impl LoopMesh {
     /// quad winds: `edge.start → opposite-tri apex → edge.end → own-tri apex`.
     fn join_triangles_quad_corners(&self, edge: EdgeKey) -> [Vec3; 4] {
         let loop_a = self
-            .edges
-            .get(edge)
-            .radial_link
+            .edge_radial_entry(edge)
             .expect("manifold edge has a loop");
         let loop_op = self.loop_radial_next(loop_a);
 
@@ -731,14 +729,16 @@ impl LoopMesh {
         if self.edges.try_get(edge).is_none() {
             return None;
         }
+        // The walk is entry-seeded (§6.2), so `entry` is the edge's radial entry
+        // and `other` its successor. §8.4 keeps the entry's face as the survivor.
         let mut radial = self.radial_loops(edge);
-        let head = radial.next(self)?;
-        let second = radial.next(self)?;
+        let entry = radial.next(self)?;
+        let other = radial.next(self)?;
         if radial.next(self).is_some() {
             return None;
         }
-        let face_a = self.loops.get(head).face;
-        let face_b = self.loops.get(second).face;
+        let face_a = self.loops.get(entry).face;
+        let face_b = self.loops.get(other).face;
         if face_a == face_b {
             return None;
         }
@@ -1031,7 +1031,8 @@ impl LoopMesh {
     /// whose radial cycle has changed). Mirrors the graceful non-manifold path
     /// of [`Self::join_triangles_edge_other_face`].
     fn join_triangles_quad_corners_verts(&self, edge: EdgeKey) -> Option<[VertexKey; 4]> {
-        let loop_a = self.edges.try_get(edge).and_then(|e| e.radial_link)?;
+        self.edges.try_get(edge)?;
+        let loop_a = self.edge_radial_entry(edge)?;
         let loop_op = self.loop_radial_next(loop_a);
         Some([
             self.loops.get(loop_a).vertex,

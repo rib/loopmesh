@@ -136,8 +136,11 @@ impl LoopMesh {
                 // `use_normal_flip` — the flag is accepted but never acts on the
                 // winding, so flag-on output is identical to flag-off.
                 let [e_dup_v0, _e_dup_v1] = self.edge_vertices(e_dup);
-                let dup_first_loop = self.edges.get(e_dup).radial_link;
-                let edge_normal_flip = match dup_first_loop {
+                // The cap's loop is the only one on `e_dup` here, so head and
+                // entry coincide — but the pick is order-sensitive in principle,
+                // so it goes through the entry accessor (§6.2).
+                let dup_entry_loop = self.edge_radial_entry(e_dup);
+                let edge_normal_flip = match dup_entry_loop {
                     Some(l) => self.loops.get(l).vertex != e_dup_v0,
                     None => {
                         // The cap is always built before the walls, so the dup
@@ -431,7 +434,12 @@ mod tests {
                 .map(|&wf| {
                     mesh.face_vert_keys(wf)
                         .iter()
-                        .map(|&v| (pos_key(mesh.vertex_position(v)), dups.contains(&v.as_usize())))
+                        .map(|&v| {
+                            (
+                                pos_key(mesh.vertex_position(v)),
+                                dups.contains(&v.as_usize()),
+                            )
+                        })
                         .collect()
                 })
                 .collect()
@@ -481,10 +489,18 @@ mod tests {
         // identical to flag-off — not reversed). Corners are labelled
         // original/duplicate via the vert map so the assertion is
         // winding-sensitive even though the duplicate sits on top of its original.
-        let labelled = |mesh: &LoopMesh, wf: FaceKey, dups: &std::collections::HashSet<usize>| -> Vec<([u32; 3], bool)> {
+        let labelled = |mesh: &LoopMesh,
+                        wf: FaceKey,
+                        dups: &std::collections::HashSet<usize>|
+         -> Vec<([u32; 3], bool)> {
             mesh.face_vert_keys(wf)
                 .iter()
-                .map(|&v| (pos_key(mesh.vertex_position(v)), dups.contains(&v.as_usize())))
+                .map(|&v| {
+                    (
+                        pos_key(mesh.vertex_position(v)),
+                        dups.contains(&v.as_usize()),
+                    )
+                })
                 .collect()
         };
         let find_bottom_wall = |mesh: &LoopMesh, res: &ExtrudeResult| -> Vec<([u32; 3], bool)> {
@@ -515,15 +531,21 @@ mod tests {
 
         // §9.1: the wall is always [orig_a, orig_b, dup_b, dup_a] — two originals
         // then two duplicates — regardless of the flag.
-        let is_two_orig_two_dup = |w: &[([u32; 3], bool)]| -> bool {
-            !w[0].1 && !w[1].1 && w[2].1 && w[3].1
-        };
-        assert!(is_two_orig_two_dup(&flip_wall), "flag-on wall shape {flip_wall:?}");
-        assert!(is_two_orig_two_dup(&noflip_wall), "flag-off wall shape {noflip_wall:?}");
+        let is_two_orig_two_dup =
+            |w: &[([u32; 3], bool)]| -> bool { !w[0].1 && !w[1].1 && w[2].1 && w[3].1 };
+        assert!(
+            is_two_orig_two_dup(&flip_wall),
+            "flag-on wall shape {flip_wall:?}"
+        );
+        assert!(
+            is_two_orig_two_dup(&noflip_wall),
+            "flag-off wall shape {noflip_wall:?}"
+        );
 
         // §9.1: flag-on must be the SAME cycle as flag-off (the flag is a no-op).
         let n = flip_wall.len();
-        let identical = (0..n).any(|shift| (0..n).all(|i| flip_wall[i] == noflip_wall[(i + shift) % n]));
+        let identical =
+            (0..n).any(|shift| (0..n).all(|i| flip_wall[i] == noflip_wall[(i + shift) % n]));
         assert!(
             identical,
             "flag-on wall {flip_wall:?} must be identical to flag-off wall {noflip_wall:?}"

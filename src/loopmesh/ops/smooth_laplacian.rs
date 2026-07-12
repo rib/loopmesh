@@ -317,25 +317,23 @@ impl LoopMesh {
         // Boundary verts never own a cotangent row (the row gate), so they only
         // ever appear here as columns.
         {
-            let eligible = |slot: usize| {
-                !boundary[slot] && !zero_area[slot] && ring_area[slot] > 0.0
+            let eligible =
+                |slot: usize| !boundary[slot] && !zero_area[slot] && ring_area[slot] > 0.0;
+            let mut lay_cotangent = |i: VertexKey, j: VertexKey, cotangent: f64| {
+                let si = i.as_usize();
+                if !is_free[si] || !eligible(si) {
+                    return;
+                }
+                let coefficient = cotangent * scale[si];
+                lay_off_diagonal(
+                    &mut matrix_rows,
+                    &is_free,
+                    &free_index,
+                    free_index[si],
+                    j,
+                    coefficient,
+                );
             };
-            let mut lay_cotangent =
-                |i: VertexKey, j: VertexKey, cotangent: f64| {
-                    let si = i.as_usize();
-                    if !is_free[si] || !eligible(si) {
-                        return;
-                    }
-                    let coefficient = cotangent * scale[si];
-                    lay_off_diagonal(
-                        &mut matrix_rows,
-                        &is_free,
-                        &free_index,
-                        free_index[si],
-                        j,
-                        coefficient,
-                    );
-                };
             for &face in &region_face_list {
                 let start = self.face_first_loop(face);
                 let mut loop_key = start;
@@ -402,11 +400,8 @@ impl LoopMesh {
             Ok(factor) => factor,
             Err(_) => return, // §9 — solve failure: leave positions unchanged.
         };
-        let solution = match factor.solve_columns(&[
-            &normal_rhs[0],
-            &normal_rhs[1],
-            &normal_rhs[2],
-        ]) {
+        let solution = match factor.solve_columns(&[&normal_rhs[0], &normal_rhs[1], &normal_rhs[2]])
+        {
             Ok(solution) => solution,
             Err(_) => return,
         };
@@ -653,7 +648,10 @@ mod tests {
         let area = 3.0 * centre_ring_area(Vec3::new(0.0, 0.0, height));
         let expected_z = height as f64 / (1.0 + 2.0 / (4.0 * area));
         let result = mesh.vertex_position(centre);
-        assert!(result.x.abs() < 1e-5 && result.y.abs() < 1e-5, "flat axes fixed: {result:?}");
+        assert!(
+            result.x.abs() < 1e-5 && result.y.abs() < 1e-5,
+            "flat axes fixed: {result:?}"
+        );
         assert!(
             result.z > 0.0 && result.z < height,
             "z bump must shrink toward the plane: {}",
@@ -866,7 +864,11 @@ mod tests {
         let result = mesh.vertex_position(centre);
         assert!((result.y - 0.2).abs() < 1e-6, "y locked: {}", result.y);
         assert!((result.z - 1.0).abs() < 1e-6, "z locked: {}", result.z);
-        assert!(result.x > 0.0 && result.x < 0.3, "x relaxed inward: {}", result.x);
+        assert!(
+            result.x > 0.0 && result.x < 0.3,
+            "x relaxed inward: {}",
+            result.x
+        );
         mesh.validate_topology();
     }
 
@@ -896,7 +898,10 @@ mod tests {
         smoothed.smooth_laplacian(&ring2, &faces2, all_axes(0.0, 0.5));
         for &v in &ring2 {
             let radius = smoothed.vertex_position(v).length();
-            assert!(radius < 1.0 - 1e-4, "rim must contract inward: r = {radius}");
+            assert!(
+                radius < 1.0 - 1e-4,
+                "rim must contract inward: r = {radius}"
+            );
         }
         smoothed.validate_topology();
     }
@@ -935,7 +940,12 @@ mod tests {
         for i in 0..5 {
             for j in 0..5 {
                 mesh.face_create_verts(
-                    &[grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]],
+                    &[
+                        grid[i][j],
+                        grid[i + 1][j],
+                        grid[i + 1][j + 1],
+                        grid[i][j + 1],
+                    ],
                     FaceCreateFlags::NO_DUPLICATE,
                 );
             }

@@ -53,12 +53,16 @@ pub struct RadialLoopIterator<'a> {
 
 impl<'a> RadialLoopIterator<'a> {
     pub fn new(mesh: &'a LoopMesh, axis_edge: EdgeKey) -> Self {
-        let edge = &mesh.edges.get(axis_edge);
+        // §6.2: the radial traversal starts at the ENTRY, not at the stored
+        // head. Seeding from `radial_link` yields the same cycle rotated by
+        // one, and every consumer that takes the first element — or re-appends
+        // in walk order — inherits the rotation.
+        let entry = mesh.edge_radial_entry(axis_edge);
         RadialLoopIterator {
             mesh,
             axis_edge,
-            first_loop: edge.radial_link,
-            next_loop: edge.radial_link,
+            first_loop: entry,
+            next_loop: entry,
         }
     }
 }
@@ -194,7 +198,11 @@ impl MeshIter for DiskEdges {
     }
 }
 
-/// Cycle iterator over the loops on an edge's radial fan.
+/// Cycle iterator over the loops on an edge's radial fan, in the traversal
+/// order of
+/// [`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+/// §6.2: forward from the edge's **radial entry**
+/// ([`LoopMesh::edge_radial_entry`]), never from the stored head.
 pub struct RadialLoops {
     axis: EdgeKey,
     first: Option<LoopKey>,
@@ -203,7 +211,7 @@ pub struct RadialLoops {
 
 impl RadialLoops {
     pub(crate) fn new(mesh: &LoopMesh, e: EdgeKey) -> Self {
-        let start = mesh.edges.get(e).radial_link;
+        let start = mesh.edge_radial_entry(e);
         Self {
             axis: e,
             first: start,
@@ -291,7 +299,7 @@ impl VertFanLoops {
         };
 
         let entry = mesh
-            .edge_radial_last_attached(seed)
+            .edge_radial_entry(seed)
             .expect("a non-wire edge carries a radial entry");
         // Corner-adjust the seed's radial entry onto the hub: a loop's vertex is
         // the tail of its edge, so the entry sits either at the hub already or
@@ -346,7 +354,7 @@ impl MeshIter for VertFanLoops {
             self.group_edge = Some(next_edge);
             // A later group starts at its edge's radial entry — there is no
             // corner-adjust hop here; that happens only for the seed.
-            self.group_first = mesh.edge_radial_last_attached(next_edge);
+            self.group_first = mesh.edge_radial_entry(next_edge);
             self.next_loop = self.group_first;
         }
     }

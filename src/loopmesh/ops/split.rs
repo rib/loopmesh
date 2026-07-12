@@ -684,7 +684,10 @@ mod tests {
         );
 
         // §8.2: geom_out empty cross-mesh (the clone lives in dest).
-        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        assert!(
+            result.geom_out.is_empty(),
+            "geom.out empty cross-mesh (§8.2)"
+        );
         // Forward-only boundary map: every perimeter edge is a frontier, keyed by
         // the (now-deleted) source edge, valued at the live dest clone.
         assert_eq!(result.boundary_map.len(), 4, "four frontier edges (§8.2)");
@@ -715,9 +718,17 @@ mod tests {
         let result = src.split_into(&[centre.into()], false, &mut dest);
 
         // Source keeps the shared seam — only the face count drops.
-        assert_eq!(src.vertex_count(), v0, "shared seam verts kept (−0 V, §8.4)");
+        assert_eq!(
+            src.vertex_count(),
+            v0,
+            "shared seam verts kept (−0 V, §8.4)"
+        );
         assert_eq!(src.edge_count(), e0, "shared seam edges kept (−0 E, §8.4)");
-        assert_eq!(src.face_count(), f0 - 1, "only the centre face removed (−1 F, §8.4)");
+        assert_eq!(
+            src.face_count(),
+            f0 - 1,
+            "only the centre face removed (−1 F, §8.4)"
+        );
         assert!(
             src.faces.try_get(centre).is_none(),
             "centre original torn out of the source"
@@ -731,7 +742,10 @@ mod tests {
 
         // §8.2: geom_out empty; forward-only frontier map spans the two meshes
         // (source key survives the keep-alive, dest value is the clone).
-        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        assert!(
+            result.geom_out.is_empty(),
+            "geom.out empty cross-mesh (§8.2)"
+        );
         assert_eq!(result.boundary_map.len(), 4, "four shared frontier edges");
         for (&source_edge, &clone_edge) in result.boundary_map.iter() {
             assert!(
@@ -770,7 +784,10 @@ mod tests {
         // Source side: the widened sweep reaches the orphaned wire endpoints and
         // the loose vert (the §8.3 source-side divergence) — the whole isolated
         // selection is solely-owned, so the source empties entirely.
-        assert!(src.edges.try_get(wire).is_none(), "source wire swept (§8.3)");
+        assert!(
+            src.edges.try_get(wire).is_none(),
+            "source wire swept (§8.3)"
+        );
         assert!(
             src.vertices.try_get(wa).is_none(),
             "orphaned source wire endpoint swept (§8.3)"
@@ -812,10 +829,16 @@ mod tests {
             .filter(|&v| dest.iter_disk_edges(v).next().is_none())
             .count();
         assert_eq!(dest_wire_edges, 1, "clone wire edge stands in dest (§8.3)");
-        assert_eq!(dest_loose_verts, 1, "clone loose vert stands in dest (§8.3)");
+        assert_eq!(
+            dest_loose_verts, 1,
+            "clone loose vert stands in dest (§8.3)"
+        );
 
         // §8.2: geom_out empty cross-mesh; forward-only maps reach dest clones.
-        assert!(result.geom_out.is_empty(), "geom.out empty cross-mesh (§8.2)");
+        assert!(
+            result.geom_out.is_empty(),
+            "geom.out empty cross-mesh (§8.2)"
+        );
         for &clone_vert in result.isovert_map.values() {
             assert!(
                 dest.vertices.try_get(clone_vert).is_some(),

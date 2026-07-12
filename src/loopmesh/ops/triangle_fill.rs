@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use glam::{Vec2, Vec3};
 
 use crate::loopmesh::*;
-use crate::triangulate::{self, axis_dominant_basis, axis_dominant_basis_negated, beautify_polygon, ear_clip};
+use crate::triangulate::{
+    self, axis_dominant_basis, axis_dominant_basis_negated, beautify_polygon, ear_clip,
+};
 
 /// Order a vertex-key pair so the two orientations of an undirected edge hash to
 /// the same key — used to build the §6 beautify boundary-protection set.
@@ -692,20 +694,19 @@ impl LoopMesh {
         for &v in component_verts {
             remaining.insert(v, adjacency[&v].to_vec());
         }
-        let take_edge = |remaining: &mut HashMap<VertexKey, Vec<VertexKey>>,
-                         from: VertexKey,
-                         to: VertexKey| {
-            if let Some(slots) = remaining.get_mut(&from) {
-                if let Some(pos) = slots.iter().position(|&n| n == to) {
-                    slots.swap_remove(pos);
+        let take_edge =
+            |remaining: &mut HashMap<VertexKey, Vec<VertexKey>>, from: VertexKey, to: VertexKey| {
+                if let Some(slots) = remaining.get_mut(&from) {
+                    if let Some(pos) = slots.iter().position(|&n| n == to) {
+                        slots.swap_remove(pos);
+                    }
                 }
-            }
-            if let Some(slots) = remaining.get_mut(&to) {
-                if let Some(pos) = slots.iter().position(|&n| n == from) {
-                    slots.swap_remove(pos);
+                if let Some(slots) = remaining.get_mut(&to) {
+                    if let Some(pos) = slots.iter().position(|&n| n == from) {
+                        slots.swap_remove(pos);
+                    }
                 }
-            }
-        };
+            };
 
         let mut loops: Vec<Vec<VertexKey>> = Vec::new();
         for &start in component_verts {
@@ -930,19 +931,11 @@ impl LoopMesh {
     /// §4 winding vote: returns true if the whole fill should be flipped to
     /// agree with the existing surface across the shared boundary edges.
     /// Fires only when some input edge already carries exactly one face.
-    fn triangle_fill_winding_vote(
-        &self,
-        loop_verts: &[VertexKey],
-        tris: &[[u32; 3]],
-    ) -> bool {
+    fn triangle_fill_winding_vote(&self, loop_verts: &[VertexKey], tris: &[[u32; 3]]) -> bool {
         let mut tally: i32 = 0;
         for tri in tris {
             // Each directed corner pair (a→b) of the fill triangle.
-            for &(a, b) in &[
-                (tri[0], tri[1]),
-                (tri[1], tri[2]),
-                (tri[2], tri[0]),
-            ] {
+            for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
                 let va = loop_verts[a as usize];
                 let vb = loop_verts[b as usize];
                 let Some(edge) = self.query_edge_exists(va, vb) else {
@@ -1086,7 +1079,12 @@ mod tests {
             })
             .collect();
         (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect()
     }
 
@@ -1210,7 +1208,11 @@ mod tests {
             },
         );
         assert_eq!(result.faces().len(), 2, "quad → 2 triangles");
-        assert_eq!(result.edges().len(), 1, "quad fill has one interior diagonal");
+        assert_eq!(
+            result.edges().len(),
+            1,
+            "quad fill has one interior diagonal"
+        );
         let diagonal = result.edges()[0];
         let [a, b] = mesh.edge_vert_keys(diagonal);
         (quad, a, b, mesh)
@@ -1396,30 +1398,29 @@ mod tests {
         let v2 = mesh.create_vertex(Vec3::Y);
         let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NO_DUPLICATE);
         let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NO_DUPLICATE);
-        let result = mesh.triangle_fill(
-            &[e0, e1],
-            &TriangleFillParams::default(),
-        );
+        let result = mesh.triangle_fill(&[e0, e1], &TriangleFillParams::default());
         assert!(result.is_empty());
         assert_eq!(mesh.face_count(), 0);
     }
 
     /// Build a free wire ring of `n` verts on a circle of the given `radius`,
     /// centred at `center` in the z=0 plane, returning the ring edges.
-    fn wire_ring_at(
-        mesh: &mut LoopMesh,
-        n: usize,
-        center: Vec3,
-        radius: f32,
-    ) -> Vec<EdgeKey> {
+    fn wire_ring_at(mesh: &mut LoopMesh, n: usize, center: Vec3, radius: f32) -> Vec<EdgeKey> {
         let verts: Vec<VertexKey> = (0..n)
             .map(|i| {
                 let theta = (i as f32) * TAU / (n as f32);
-                mesh.create_vertex(center + Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0))
+                mesh.create_vertex(
+                    center + Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0),
+                )
             })
             .collect();
         (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect()
     }
 
@@ -1473,10 +1474,8 @@ mod tests {
         }
         // No fill triangle may have all three corners on the inner loop — that
         // would be a triangle inside the hole.
-        let inner_verts: std::collections::HashSet<VertexKey> = inner
-            .iter()
-            .flat_map(|&e| mesh.edge_vert_keys(e))
-            .collect();
+        let inner_verts: std::collections::HashSet<VertexKey> =
+            inner.iter().flat_map(|&e| mesh.edge_vert_keys(e)).collect();
         for face in mesh.face_keys() {
             let all_inner = mesh
                 .face_vert_keys(face)
@@ -1534,10 +1533,8 @@ mod tests {
 
         // No surviving face may have all corners on the inner loop — that would
         // mean the hole got covered.
-        let inner_verts: std::collections::HashSet<VertexKey> = inner
-            .iter()
-            .flat_map(|&e| mesh.edge_vert_keys(e))
-            .collect();
+        let inner_verts: std::collections::HashSet<VertexKey> =
+            inner.iter().flat_map(|&e| mesh.edge_vert_keys(e)).collect();
         for face in mesh.face_keys() {
             let all_inner = mesh
                 .face_vert_keys(face)
@@ -1549,9 +1546,11 @@ mod tests {
         // χ = V − E + F = 0 for a topological annulus (one face per side of the
         // band's loop, two boundary loops, hole empty). A filled hole would push
         // χ to 1.
-        let chi = mesh.vertex_count() as i64 - mesh.edge_count() as i64
-            + mesh.face_count() as i64;
-        assert_eq!(chi, 0, "dissolved annulus has Euler characteristic 0 (hole empty)");
+        let chi = mesh.vertex_count() as i64 - mesh.edge_count() as i64 + mesh.face_count() as i64;
+        assert_eq!(
+            chi, 0,
+            "dissolved annulus has Euler characteristic 0 (hole empty)"
+        );
 
         // The band dissolves as far as the manifold-join rule allows (§7/§8):
         // the §1.2.4 bridge survives, and so does the one ring-closing spoke
@@ -1559,8 +1558,16 @@ mod tests {
         // annular ring would fill the hole). The band ends up as two large
         // faces separated by bridge + spoke. 8 verts, 8 boundary + 2 surviving
         // interior = 10 edges, 2 faces (χ = 8 − 10 + 2 = 0).
-        assert_eq!(mesh.edge_count(), 10, "8 boundary edges + the bridge + the ring-closing spoke");
-        assert_eq!(mesh.face_count(), 2, "the band dissolves to two large n-gons, not one ring");
+        assert_eq!(
+            mesh.edge_count(),
+            10,
+            "8 boundary edges + the bridge + the ring-closing spoke"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            2,
+            "the band dissolves to two large n-gons, not one ring"
+        );
 
         mesh.validate_topology();
     }
@@ -1658,8 +1665,7 @@ mod tests {
         // so the hole stays empty, every boundary/hole-rim edge survives, and
         // the band is still a valid all-triangle fill.
         let mut mesh = LoopMesh::new();
-        let (outer, inner) =
-            rect_annulus(&mut mesh, Vec2::new(4.0, 4.0), Vec2::new(1.0, 1.0));
+        let (outer, inner) = rect_annulus(&mut mesh, Vec2::new(4.0, 4.0), Vec2::new(1.0, 1.0));
         let mut edges = outer.clone();
         edges.extend(inner.iter().copied());
 
@@ -1697,10 +1703,8 @@ mod tests {
         // triangle), and no fill edge connects two inner-loop vertices that are
         // not an original hole rim — that would be a diagonal rotated across the
         // hole.
-        let inner_verts: std::collections::HashSet<VertexKey> = inner
-            .iter()
-            .flat_map(|&e| mesh.edge_vert_keys(e))
-            .collect();
+        let inner_verts: std::collections::HashSet<VertexKey> =
+            inner.iter().flat_map(|&e| mesh.edge_vert_keys(e)).collect();
         for face in mesh.face_keys() {
             let all_inner = mesh
                 .face_vert_keys(face)
@@ -1841,4 +1845,3 @@ mod tests {
         assert_eq!(mesh.face_count(), 0);
     }
 }
-

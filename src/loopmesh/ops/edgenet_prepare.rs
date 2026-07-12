@@ -311,7 +311,11 @@ mod tests {
 
         assert_eq!(mesh.edge_count(), 1, "no bridge added for a lone edge");
         // §6.1 — a lone edge still reports its (unchanged) input in the slot.
-        assert_eq!(out.edges().len(), 1, "slot is the unchanged input, not empty");
+        assert_eq!(
+            out.edges().len(),
+            1,
+            "slot is the unchanged input, not empty"
+        );
         assert!(!out.is_empty());
         mesh.validate_topology();
     }
@@ -342,7 +346,11 @@ mod tests {
         let out = mesh.edgenet_prepare(&loop_edges);
 
         assert_eq!(mesh.edge_count(), 4, "already-closed loop gains no edge");
-        assert_eq!(out.edges().len(), 4, "slot reports the unchanged loop edges");
+        assert_eq!(
+            out.edges().len(),
+            4,
+            "slot reports the unchanged loop edges"
+        );
         mesh.validate_topology();
     }
 
@@ -357,9 +365,19 @@ mod tests {
 
         let out = mesh.edgenet_prepare(&net);
 
-        assert_eq!(mesh.edge_count(), 6, "two bridges added to the four chain edges");
-        assert!(mesh.query_edge_exists(top_left, bottom_left).is_some(), "left-to-left");
-        assert!(mesh.query_edge_exists(top_right, bottom_right).is_some(), "right-to-right");
+        assert_eq!(
+            mesh.edge_count(),
+            6,
+            "two bridges added to the four chain edges"
+        );
+        assert!(
+            mesh.query_edge_exists(top_left, bottom_left).is_some(),
+            "left-to-left"
+        );
+        assert!(
+            mesh.query_edge_exists(top_right, bottom_right).is_some(),
+            "right-to-right"
+        );
         assert!(
             mesh.query_edge_exists(top_left, bottom_right).is_none(),
             "the crossing diagonal is not created",
@@ -368,7 +386,11 @@ mod tests {
             mesh.query_edge_exists(top_right, bottom_left).is_none(),
             "the crossing diagonal is not created",
         );
-        assert_eq!(out.edges().len(), 6, "whole net = 4 chain edges + 2 bridges");
+        assert_eq!(
+            out.edges().len(),
+            6,
+            "whole net = 4 chain edges + 2 bridges"
+        );
         mesh.validate_topology();
     }
 
@@ -386,14 +408,23 @@ mod tests {
         let te0 = mesh.create_edge([top_right, top_mid], EdgeCreateFlags::NO_DUPLICATE);
         let te1 = mesh.create_edge([top_mid, top_left], EdgeCreateFlags::NO_DUPLICATE);
         let (bottom, bottom_left, bottom_right) = open_chain(&mut mesh, 2, 0.0);
-        let net: Vec<EdgeKey> = [te0, te1].into_iter().chain(bottom.iter().copied()).collect();
+        let net: Vec<EdgeKey> = [te0, te1]
+            .into_iter()
+            .chain(bottom.iter().copied())
+            .collect();
 
         let out = mesh.edgenet_prepare(&net);
 
         assert_eq!(mesh.edge_count(), 6, "exactly two bridges added");
         // Clean vertical ring: right-to-right and left-to-left.
-        assert!(mesh.query_edge_exists(top_right, bottom_right).is_some(), "vertical right");
-        assert!(mesh.query_edge_exists(top_left, bottom_left).is_some(), "vertical left");
+        assert!(
+            mesh.query_edge_exists(top_right, bottom_right).is_some(),
+            "vertical right"
+        );
+        assert!(
+            mesh.query_edge_exists(top_left, bottom_left).is_some(),
+            "vertical left"
+        );
         // The bowtie diagonals must NOT appear.
         assert!(
             mesh.query_edge_exists(top_right, bottom_left).is_none(),
@@ -425,7 +456,10 @@ mod tests {
         let out = mesh.edgenet_prepare(&net);
 
         assert_eq!(mesh.edge_count(), 3, "branch rejection creates nothing");
-        assert!(out.is_empty(), "a branch-rejected input reports an empty slot");
+        assert!(
+            out.is_empty(),
+            "a branch-rejected input reports an empty slot"
+        );
         mesh.validate_topology();
     }
 
@@ -471,9 +505,20 @@ mod tests {
 
         let out = mesh.edgenet_prepare(&[e01, e12]);
 
-        assert_eq!(mesh.edge_count(), 3, "no duplicate edge created for the reused bridge");
-        assert_eq!(out.edges().len(), 3, "slot = 2 input chain edges + reused bridge");
-        assert!(out.edges().contains(&e02), "the reused pre-existing bridge is reported");
+        assert_eq!(
+            mesh.edge_count(),
+            3,
+            "no duplicate edge created for the reused bridge"
+        );
+        assert_eq!(
+            out.edges().len(),
+            3,
+            "slot = 2 input chain edges + reused bridge"
+        );
+        assert!(
+            out.edges().contains(&e02),
+            "the reused pre-existing bridge is reported"
+        );
         mesh.validate_topology();
     }
 }

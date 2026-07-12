@@ -149,18 +149,20 @@ impl LoopMesh {
                 } else {
                     (after_axis, next_axis)
                 };
-                let quad: [VertexKey; 4] = [(false, false), (true, false), (true, true), (false, true)]
-                    .map(|(u_positive, v_positive)| {
-                        let index = corner_index(
-                            fixed_axis,
-                            fixed_positive,
-                            u_axis,
-                            u_positive,
-                            v_axis,
-                            v_positive,
-                        );
-                        corners[index]
-                    });
+                let quad: [VertexKey; 4] =
+                    [(false, false), (true, false), (true, true), (false, true)].map(
+                        |(u_positive, v_positive)| {
+                            let index = corner_index(
+                                fixed_axis,
+                                fixed_positive,
+                                u_axis,
+                                u_positive,
+                                v_axis,
+                                v_positive,
+                            );
+                            corners[index]
+                        },
+                    );
                 new_faces.push(self.face_create_verts(&quad, FaceCreateFlags::NONE));
             }
         }
@@ -443,8 +445,7 @@ mod tests {
             Vec3::new(11.0, 11.0, 0.0),
             Vec3::new(10.0, 11.0, 0.0),
         ];
-        let island_verts: Vec<VertexKey> =
-            corners.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let island_verts: Vec<VertexKey> = corners.iter().map(|&p| mesh.create_vertex(p)).collect();
         mesh.face_create_verts(&island_verts, FaceCreateFlags::NONE);
         let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!(before, (4, 4, 1));
@@ -551,7 +552,10 @@ mod tests {
                     assert_eq!(index, tl, "loop corner is one of the side's four");
                     [u0, v0 + TILE]
                 };
-                let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+                let got = mesh
+                    .loop_attribs()
+                    .get_vec2(uv, loop_key.as_usize())
+                    .unwrap();
                 assert!(
                     uv_near(got, want),
                     "side (axis {axis}, positive {positive}) corner {index} UV {got:?}, expected {want:?}"

@@ -124,15 +124,19 @@ impl LoopMesh {
             let (sin, cos) = (theta.sin(), theta.cos());
             let b = match bottom_apex_vert {
                 Some(apex) => apex,
-                None => self.create_vertex(
-                    matrix.transform_point3(Vec3::new(radius1 * sin, radius1 * cos, -half_depth)),
-                ),
+                None => self.create_vertex(matrix.transform_point3(Vec3::new(
+                    radius1 * sin,
+                    radius1 * cos,
+                    -half_depth,
+                ))),
             };
             let t = match top_apex_vert {
                 Some(apex) => apex,
-                None => self.create_vertex(
-                    matrix.transform_point3(Vec3::new(radius2 * sin, radius2 * cos, half_depth)),
-                ),
+                None => self.create_vertex(matrix.transform_point3(Vec3::new(
+                    radius2 * sin,
+                    radius2 * cos,
+                    half_depth,
+                ))),
             };
             bottom.push(b);
             top.push(t);
@@ -155,7 +159,12 @@ impl LoopMesh {
         for seg in 1..=segment_count {
             let prev = seg - 1;
             let cur = seg;
-            let corners = [bottom[prev], top[prev], top[cur % segment_count], bottom[cur % segment_count]];
+            let corners = [
+                bottom[prev],
+                top[prev],
+                top[cur % segment_count],
+                bottom[cur % segment_count],
+            ];
             if let Some(face) = self.cone_face_create(&corners, wall_min_corners) {
                 side_faces.push((face, prev, cur));
             }
@@ -172,8 +181,7 @@ impl LoopMesh {
                     // §7 — over a single-vertex ring this pinches to the doubled-
                     // spoke 2-gon (centre, b_0); `min_corners = 2` admits it.
                     for seg in 1..=segment_count {
-                        let corners =
-                            [centre, bottom[seg - 1], bottom[seg % segment_count]];
+                        let corners = [centre, bottom[seg - 1], bottom[seg % segment_count]];
                         if let Some(face) = self.cone_face_create(&corners, 2) {
                             bottom_cap_faces.push(face);
                         }
@@ -343,12 +351,12 @@ impl LoopMesh {
                 corner_uv.push((top[cur % segment_count], [u_cur, v_top]));
                 corner_uv.push((bottom[cur % segment_count], [u_cur, v_bottom]));
 
-                let loops: smallvec::SmallVec<[LoopKey; 4]> =
-                    self.iter_face_loops(face).collect();
+                let loops: smallvec::SmallVec<[LoopKey; 4]> = self.iter_face_loops(face).collect();
                 for loop_key in loops {
                     let vertex = self.loop_vertex(loop_key);
                     if let Some(&(_, uv)) = corner_uv.iter().find(|&&(v, _)| v == vertex) {
-                        self.loop_attribs_mut().set_vec2(uv_layer, loop_key.as_usize(), uv);
+                        self.loop_attribs_mut()
+                            .set_vec2(uv_layer, loop_key.as_usize(), uv);
                     }
                 }
             }
@@ -359,7 +367,13 @@ impl LoopMesh {
         // radius) offset to that cap's centre.
         let bottom_scale = UV_DISC_RADIUS / nonzero_radius(radius1, radius2);
         let top_scale = UV_DISC_RADIUS / nonzero_radius(radius2, radius1);
-        self.paint_cone_cap_disc(bottom_cap_faces, &inverse, bottom_scale, BOTTOM_CAP_CENTRE, uv_layer);
+        self.paint_cone_cap_disc(
+            bottom_cap_faces,
+            &inverse,
+            bottom_scale,
+            BOTTOM_CAP_CENTRE,
+            uv_layer,
+        );
         self.paint_cone_cap_disc(top_cap_faces, &inverse, top_scale, TOP_CAP_CENTRE, uv_layer);
 
         // §4 quirk — a cone's collapsed-end side faces route through the radial
@@ -395,7 +409,8 @@ impl LoopMesh {
                 let vertex = self.loop_vertex(loop_key);
                 let local = inverse.transform_point3(self.vertex_position(vertex));
                 let uv = [centre[0] + scale * local.x, centre[1] + scale * local.y];
-                self.loop_attribs_mut().set_vec2(uv_layer, loop_key.as_usize(), uv);
+                self.loop_attribs_mut()
+                    .set_vec2(uv_layer, loop_key.as_usize(), uv);
             }
         }
     }
@@ -463,7 +478,10 @@ mod tests {
             let normal = mesh.face_normal(face);
             let centroid: Vec3 = {
                 let verts = mesh.face_vert_keys(face);
-                let sum: Vec3 = verts.iter().map(|&v| mesh.vertex_position(v)).fold(Vec3::ZERO, |a, b| a + b);
+                let sum: Vec3 = verts
+                    .iter()
+                    .map(|&v| mesh.vertex_position(v))
+                    .fold(Vec3::ZERO, |a, b| a + b);
                 sum / verts.len() as f32
             };
             let radial = Vec3::new(centroid.x, centroid.y, 0.0);
@@ -554,9 +572,22 @@ mod tests {
         let h = depth / 2.0;
 
         let mut frustum = LoopMesh::new();
-        frustum.create_cone(false, false, n as i32, 2.0, 1.0, depth, Mat4::IDENTITY, false);
+        frustum.create_cone(
+            false,
+            false,
+            n as i32,
+            2.0,
+            1.0,
+            depth,
+            Mat4::IDENTITY,
+            false,
+        );
         assert_eq!(
-            (frustum.vertex_count(), frustum.edge_count(), frustum.face_count()),
+            (
+                frustum.vertex_count(),
+                frustum.edge_count(),
+                frustum.face_count()
+            ),
             (2 * n, 3 * n, n)
         );
         // Bottom ring at radius 2, top ring at radius 1.
@@ -565,7 +596,16 @@ mod tests {
 
         // A same-`radius1` cylinder has its top ring at radius 2, not 1.
         let mut cylinder = LoopMesh::new();
-        cylinder.create_cone(false, false, n as i32, 2.0, 2.0, depth, Mat4::IDENTITY, false);
+        cylinder.create_cone(
+            false,
+            false,
+            n as i32,
+            2.0,
+            2.0,
+            depth,
+            Mat4::IDENTITY,
+            false,
+        );
         assert!(!has_vertex_near(&cylinder, Vec3::new(0.0, 1.0, h)));
         frustum.validate_topology();
     }
@@ -581,7 +621,16 @@ mod tests {
         let depth = 2.0;
         let h = depth / 2.0;
 
-        cone.create_cone(false, false, n as i32, 0.0, 1.0, depth, Mat4::IDENTITY, false);
+        cone.create_cone(
+            false,
+            false,
+            n as i32,
+            0.0,
+            1.0,
+            depth,
+            Mat4::IDENTITY,
+            false,
+        );
 
         assert_eq!(
             (cone.vertex_count(), cone.edge_count(), cone.face_count()),
@@ -593,13 +642,26 @@ mod tests {
         assert!(has_vertex_near(&cone, Vec3::new(0.0, 0.0, -h)));
         // Every side face is a triangle (the collapsed-ring quad lost a corner).
         for face in cone.face_keys() {
-            assert_eq!(cone.face_vert_keys(face).len(), 3, "cone side faces are tris");
+            assert_eq!(
+                cone.face_vert_keys(face).len(),
+                3,
+                "cone side faces are tris"
+            );
         }
 
         // A regression that left the bottom ring uncollapsed would be a frustum:
         // 2n verts, not n + 1.
         let mut frustum = LoopMesh::new();
-        frustum.create_cone(false, false, n as i32, 1.0, 1.0, depth, Mat4::IDENTITY, false);
+        frustum.create_cone(
+            false,
+            false,
+            n as i32,
+            1.0,
+            1.0,
+            depth,
+            Mat4::IDENTITY,
+            false,
+        );
         assert_ne!(cone.vertex_count(), frustum.vertex_count());
         cone.validate_topology();
     }
@@ -613,7 +675,16 @@ mod tests {
         let n = 8usize;
         let depth = 2.0;
 
-        cone.create_cone(true, false, n as i32, 0.0, 1.0, depth, Mat4::IDENTITY, false);
+        cone.create_cone(
+            true,
+            false,
+            n as i32,
+            0.0,
+            1.0,
+            depth,
+            Mat4::IDENTITY,
+            false,
+        );
 
         assert_eq!(
             (cone.vertex_count(), cone.edge_count(), cone.face_count()),
@@ -625,7 +696,10 @@ mod tests {
         for face in cone.face_keys() {
             if cone.face_vert_keys(face).len() == n {
                 ngon_caps += 1;
-                assert!(cone.face_normal(face).z > 0.9, "the only cap is the top (+z)");
+                assert!(
+                    cone.face_normal(face).z > 0.9,
+                    "the only cap is the top (+z)"
+                );
             }
         }
         assert_eq!(ngon_caps, 1, "a cone caps only its open end");
@@ -746,8 +820,14 @@ mod tests {
         mesh.create_cone(true, true, n as i32, r, r, depth, matrix, false);
 
         // The two centres at the transformed axis points.
-        assert!(has_vertex_near(&mesh, matrix.transform_point3(Vec3::new(0.0, 0.0, -h))));
-        assert!(has_vertex_near(&mesh, matrix.transform_point3(Vec3::new(0.0, 0.0, h))));
+        assert!(has_vertex_near(
+            &mesh,
+            matrix.transform_point3(Vec3::new(0.0, 0.0, -h))
+        ));
+        assert!(has_vertex_near(
+            &mesh,
+            matrix.transform_point3(Vec3::new(0.0, 0.0, h))
+        ));
         // Bottom vertex 0's local (0, r, -h) maps through the matrix; the
         // untransformed position does not survive.
         let local0 = Vec3::new(0.0, r, -h);
@@ -852,8 +932,16 @@ mod tests {
             let expect_t = matrix.transform_point3(Vec3::new(r * sin, r * cos, h));
             let got_b = mesh.vertex_position(verts[2 + 2 * a]);
             let got_t = mesh.vertex_position(verts[2 + 2 * a + 1]);
-            assert!((got_b - expect_b).length() < EPS, "slot {} bottom", 2 + 2 * a);
-            assert!((got_t - expect_t).length() < EPS, "slot {} top", 2 + 2 * a + 1);
+            assert!(
+                (got_b - expect_b).length() < EPS,
+                "slot {} bottom",
+                2 + 2 * a
+            );
+            assert!(
+                (got_t - expect_t).length() < EPS,
+                "slot {} top",
+                2 + 2 * a + 1
+            );
         }
     }
 
@@ -888,7 +976,10 @@ mod tests {
         for face in mesh.face_keys() {
             let is_wall = mesh.face_vert_keys(face).len() == 4;
             for loop_key in mesh.face_loop_keys(face) {
-                let [u, v] = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+                let [u, v] = mesh
+                    .loop_attribs()
+                    .get_vec2(uv, loop_key.as_usize())
+                    .unwrap();
                 if is_wall {
                     assert!(v >= 0.5 - EPS, "wall UVs live in the top half: {v}");
                     if (v - 1.0).abs() < EPS {
@@ -908,8 +999,14 @@ mod tests {
                 }
             }
         }
-        assert!(saw_strip_top && saw_strip_bottom, "wall strip spans the top half");
-        assert!(saw_seam_right && saw_seam_left, "wall strip spans the u seam");
+        assert!(
+            saw_strip_top && saw_strip_bottom,
+            "wall strip spans the top half"
+        );
+        assert!(
+            saw_seam_right && saw_seam_left,
+            "wall strip spans the u seam"
+        );
         mesh.validate_topology();
     }
 

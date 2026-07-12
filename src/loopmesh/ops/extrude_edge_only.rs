@@ -1,5 +1,3 @@
-use smallvec::SmallVec;
-
 use crate::loopmesh::*;
 
 impl LoopMesh {
@@ -38,7 +36,7 @@ impl LoopMesh {
     /// parameter exposed: when set, each wall's winding is reversed
     /// (EXTRUDE.md §4.2 / §5). The default (`false`) winds each wall so its loop
     /// on the original edge runs in the original-edge direction implied by the
-    /// edge's first surround loop; flipping reverses that choice, so the wall's
+    /// edge's radial *entry* loop; flipping reverses that choice, so the wall's
     /// outward normal points the other way. Topology (counts, incidence) is
     /// identical either way — only the per-wall loop direction differs.
     pub fn extrude_edge_only_ex(
@@ -121,18 +119,23 @@ impl LoopMesh {
             vert_in_input[v1.as_usize()] = true;
         }
 
-        // ---- Phase 2: snapshot, per input edge, the source loop across it for
-        //               wall customdata and the winding cue. There are no input
-        //               faces, so the "other radial loop across e_old" is simply
-        //               the edge's first radial loop (a surround face). A faceless
-        //               wire edge has none — its wall CD defaults (§10). ----
+        // ---- Phase 2: snapshot, per input edge, the winding cue the wall is built
+        //               from. §5 reads the original edge's *first-loop* direction,
+        //               and the model's first loop is the edge's radial **entry**
+        //               (`RADIAL_EDGE_STRUCTURE.md` §6.2). At radial ≥ 2 the
+        //               candidate loops wind oppositely, so this pick decides the
+        //               wall's winding. A faceless wire edge has no entry and falls
+        //               back to an arbitrary-but-consistent direction (§10).
+        //
+        //               The wall's customdata *source* is a different pick — it is
+        //               read after the wall exists, in phase 4 (§4.3). ----
         struct EdgeSource {
-            // The two surround corner-loops on the original edge, keyed by the
-            // endpoint vertex each sits at. Empty for a faceless wire edge.
-            source_loop_at: SmallVec<[(VertexKey, LoopKey); 2]>,
-            // Winding cue: true when the edge's first surround loop runs from the
-            // edge's *second* endpoint, i.e. against the edge's stored v0->v1
-            // order. Faceless edges fall back to an arbitrary-but-consistent cue.
+            // Whether the original edge carries any loop at all. A faceless wire
+            // edge builds a wall with default-initialised loop CD (§10) and, when
+            // excluded, has its duplicate killed outright (§8.3).
+            has_surround_loop: bool,
+            // Winding cue: true when the entry loop runs from the edge's *second*
+            // endpoint, i.e. against the edge's stored v0->v1 order.
             edge_normal_flip: bool,
         }
         let mut edge_source: Vec<Option<EdgeSource>> = (0..edge_watermark).map(|_| None).collect();
@@ -142,25 +145,15 @@ impl LoopMesh {
             }
             let e = EdgeKey::from_usize(slot);
             let [v0, _v1] = self.edge_vertices(e);
-            let first_loop = self.edges.get(e).radial_link;
-            let (source_loop_at, edge_normal_flip) = match first_loop {
-                Some(l) => {
-                    let lref = self.loops.get(l);
-                    let v_here = lref.vertex;
-                    let l_next = lref.face_loop_links.next;
-                    let v_next = self.loops.get(l_next).vertex;
-                    let mut src: SmallVec<[(VertexKey, LoopKey); 2]> = SmallVec::new();
-                    src.push((v_here, l));
-                    src.push((v_next, l_next));
-                    // §5: orient as the surround face's loop on the edge. The loop
-                    // anchored at the edge's second endpoint means the surround
-                    // face traverses the edge against its stored order.
-                    (src, v_here != v0)
-                }
-                None => (SmallVec::new(), false),
+            let (has_surround_loop, edge_normal_flip) = match self.edge_radial_entry(e) {
+                // §5: orient as the entry face's loop on the edge. The loop anchored
+                // at the edge's second endpoint means that face traverses the edge
+                // against its stored order.
+                Some(l) => (true, self.loops.get(l).vertex != v0),
+                None => (false, false),
             };
             edge_source[slot] = Some(EdgeSource {
-                source_loop_at,
+                has_surround_loop,
                 edge_normal_flip,
             });
         }
@@ -234,7 +227,7 @@ impl LoopMesh {
             // empty disk. The original wire pair is untouched. These killed
             // duplicates are not recorded in the output maps below.
             if edge_excluded[slot] {
-                if source.source_loop_at.is_empty() {
+                if !source.has_surround_loop {
                     self.edge_kill(e_new);
                     edge_dup_killed[slot] = true;
                     for (endpoint_old, endpoint_dup) in [(v0_old, v0_new), (v1_old, v1_new)] {
@@ -287,20 +280,34 @@ impl LoopMesh {
             );
 
             // Wall loop customdata flows continuously across the wall from the
-            // surround face (§4.3): each of the four corners copies from the
-            // source loop sitting at the corner's *original* endpoint, so the
+            // source face (§4.3): each of the four corners copies from the source
+            // loop sitting at the corner's *original* endpoint, so the
             // duplicate-side corners take the same source as the original-side
-            // corners they sit above. For a faceless wire edge `source_loop_at`
-            // is empty and the wall loops keep their default-initialised CD.
-            if do_loop_cd && !source.source_loop_at.is_empty() {
-                let wall_source_at = |v: VertexKey| -> Option<LoopKey> {
-                    source
-                        .source_loop_at
-                        .iter()
-                        .find(|(sv, _)| *sv == v)
-                        .map(|(_, l)| *l)
-                };
+            // corners they sit above.
+            //
+            // §4.3 names the source as "the other loop across e_old, found by
+            // stepping once around e_old's radial cycle from the wall's own loop"
+            // — so it is the wall loop's radial **successor**, read once the wall
+            // has joined the cycle, and *not* the entry the winding cue read
+            // (§6.5's append splices the wall in right after the entry, so the two
+            // coincide only at radial 1). A faceless wire edge's wall is alone on
+            // the cycle: its successor is itself, there is no source, and the wall
+            // keeps its default-initialised CD (§10).
+            if do_loop_cd && source.has_surround_loop {
                 let wall_loop_a_old = self.faces.get(wall).first_edge_loop;
+                let source_loop = self.loop_radial_next(wall_loop_a_old);
+                let source_loop_next = self.loops.get(source_loop).face_loop_links.next;
+                let source_at_first = self.loops.get(source_loop).vertex;
+                let source_at_second = self.loops.get(source_loop_next).vertex;
+                let wall_source_at = |v: VertexKey| -> Option<LoopKey> {
+                    if v == source_at_first {
+                        Some(source_loop)
+                    } else if v == source_at_second {
+                        Some(source_loop_next)
+                    } else {
+                        None
+                    }
+                };
                 let wall_loop_b_old = self.loops.get(wall_loop_a_old).face_loop_links.next;
                 let wall_loop_b_new = self.loops.get(wall_loop_b_old).face_loop_links.next;
                 let wall_loop_a_new = self.loops.get(wall_loop_b_new).face_loop_links.next;
@@ -574,6 +581,130 @@ mod tests {
 
         mesh_default.validate_topology();
         mesh_flip.validate_topology();
+    }
+
+    #[test]
+    fn edge_only_radial_two_edge_winding_and_cd_read_different_loops() {
+        // A radial-≥2 input edge separates the wall's two order-sensitive reads.
+        // Two quads share the edge v1–v2; their loops on it wind oppositely.
+        //
+        //  - Winding (§5) reads the original edge's *first* loop — the radial
+        //    **entry** (RADIAL_EDGE_STRUCTURE.md §6.2), here the second-built
+        //    face's loop, since the append rule re-seats the entry onto each
+        //    newly attached loop.
+        //  - Customdata (§4.3) reads "the other loop across e_old, stepping once
+        //    around the radial cycle from the wall's own loop" — the wall's radial
+        //    **successor**. The append splices the wall in right after the entry,
+        //    so that successor is the *first*-built face's loop, not the entry's.
+        //
+        // At radial 1 the two picks name the same loop, which is why the
+        // difference is invisible until this fixture.
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v4 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v5 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let shared = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e14 = mesh.create_edge([v1, v4], EdgeCreateFlags::NONE);
+        let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
+        let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
+
+        // Built first: traverses the shared edge v1 -> v2.
+        let face_first = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, shared, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        // Built second: traverses the shared edge v2 -> v1 (opposite winding).
+        let face_second = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, shared],
+            FaceCreateFlags::NONE,
+        );
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+        // uv.x tags the source face, uv.y tags the source vertex column.
+        let vertex_marker = |v: VertexKey| -> f32 {
+            if v == v1 {
+                10.0
+            } else if v == v2 {
+                20.0
+            } else {
+                0.0
+            }
+        };
+        for (face, face_marker) in [(face_first, 1.0f32), (face_second, 2.0f32)] {
+            let loops: Vec<LoopKey> = mesh.iter_face_loops(face).collect();
+            for l in loops {
+                let value = [face_marker, vertex_marker(mesh.loop_vertex(l))];
+                mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), value);
+            }
+        }
+
+        let entry = mesh.edge_radial_entry(shared).expect("radial-2 edge");
+        assert_eq!(
+            mesh.loop_face(entry),
+            face_second,
+            "the append rule re-seats the entry onto the last-attached loop"
+        );
+
+        let result = mesh.extrude_edge_only(&[shared]);
+        assert_eq!(result.wall_faces.len(), 1);
+        let wall = result.wall_faces[0];
+
+        // Winding: the wall runs *opposite* the entry loop across the shared
+        // edge (the entry runs v2 -> v1, so the wall runs v1 -> v2). Reading the
+        // head instead would source the first-built face's loop, which runs
+        // v1 -> v2, and the wall would come out reversed.
+        let wall_loop_on_shared = mesh
+            .face_edge_share_loop(wall, shared)
+            .expect("wall sits on the original edge");
+        assert_eq!(mesh.loop_vertex(wall_loop_on_shared), v1);
+        assert_eq!(
+            mesh.loop_vertex(mesh.loop_next(wall_loop_on_shared)),
+            v2,
+            "wall winds opposite the entry face, not opposite the head face"
+        );
+
+        // Customdata: every wall corner sources from the wall's radial *successor*
+        // — the first-built face's loops (uv.x == 1.0) — column-for-column, so top
+        // and bottom of each column carry the same value.
+        let dup_of = |v: VertexKey| -> VertexKey {
+            result
+                .vert_map
+                .iter()
+                .find(|(src, _)| *src == v)
+                .map(|(_, d)| *d)
+                .expect("endpoint duplicated")
+        };
+        let (v1_dup, v2_dup) = (dup_of(v1), dup_of(v2));
+        for l in mesh.iter_face_loops(wall).collect::<Vec<_>>() {
+            let corner = mesh.loop_vertex(l);
+            let column = if corner == v1 || corner == v1_dup {
+                v1
+            } else {
+                v2
+            };
+            let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+            assert_eq!(
+                got,
+                [1.0, vertex_marker(column)],
+                "wall column CD comes from the wall loop's radial successor at that column"
+            );
+        }
+
+        mesh.validate_topology();
     }
 
     #[test]

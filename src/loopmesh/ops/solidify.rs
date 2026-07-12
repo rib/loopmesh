@@ -636,8 +636,16 @@ mod tests {
         let e45 = mesh.create_edge([v4, v5], EdgeCreateFlags::NONE);
         let e52 = mesh.create_edge([v5, v2], EdgeCreateFlags::NONE);
         // A: v0 v1 v2 v3 (normal +Z). B winds v1 v4 v5 v2 sharing edge e12.
-        let a = mesh.face_create(&[v0, v1, v2, v3], &[e01, e12, e23, e30], FaceCreateFlags::NONE);
-        let b = mesh.face_create(&[v1, v4, v5, v2], &[e14, e45, e52, e12], FaceCreateFlags::NONE);
+        let a = mesh.face_create(
+            &[v0, v1, v2, v3],
+            &[e01, e12, e23, e30],
+            FaceCreateFlags::NONE,
+        );
+        let b = mesh.face_create(
+            &[v1, v4, v5, v2],
+            &[e14, e45, e52, e12],
+            FaceCreateFlags::NONE,
+        );
 
         let result = mesh.solidify(&[a, b], 0.5);
 
@@ -854,10 +862,8 @@ mod tests {
         };
         let mut edges = [EdgeKey::from_usize(0); 4];
         for i in 0..4 {
-            edges[i] = mesh.create_edge(
-                [ring[i], ring[(i + 1) % 4]],
-                EdgeCreateFlags::NO_DUPLICATE,
-            );
+            edges[i] =
+                mesh.create_edge([ring[i], ring[(i + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE);
         }
         mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
     }

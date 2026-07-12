@@ -224,7 +224,10 @@ mod tests {
         assert_eq!(draw(1), draw(1));
         assert_ne!(draw(1), draw(2));
         for component in draw(7) {
-            assert!((0.0..1.0).contains(&component), "draw in [0,1): {component}");
+            assert!(
+                (0.0..1.0).contains(&component),
+                "draw in [0,1): {component}"
+            );
         }
     }
 

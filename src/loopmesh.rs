@@ -79,32 +79,27 @@ mod radial;
 
 pub use attributes::*;
 pub use geom::{convex_hull, ConvexHullProvider, HullFace, HullTopology, Quickhull};
-pub use math::{SparseCholesky, SparseSolveError};
 pub use iter::*;
+pub use math::{SparseCholesky, SparseSolveError};
 pub use mid::EdgeCollapseFlags;
 pub use ops::{
-    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult, BevelVmeshMethod, BisectGeom,
-    BisectParams,
-    BisectResult, BridgeLoopsParams, BridgeLoopsResult, CenterMode, ConnectVertsNonplanarOut,
-    ContextualCreateParams, ContextualCreateResult,
+    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect,
+    BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,
+    BevelVmeshMethod, BisectGeom, BisectParams, BisectResult, BridgeLoopsParams, BridgeLoopsResult,
+    CenterMode, ConnectVertsNonplanarOut, ContextualCreateParams, ContextualCreateResult,
     ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,
-    DissolveVertsParams,
-    DuplicateResult, EdgeloopFillParams, EdgeloopFillResult, EdgenetFillParams, EdgenetFillResult,
-    EdgenetPrepareResult,
-    ExtrudeVertIndivResult, FaceStrengthMode, GeomKey,
-    GridFillParams, GridFillResult,
-    HolesFillParams, HolesFillResult,
-    InsetIndividualParams, InsetIndividualResult,
-    InsetRegionParams, InsetRegionResult, JoinTrianglesParams, JoinTrianglesResult, MirrorParams,
-    MirrorResult, MixedSeed, NgonMethod, OffsetEdgeLoopsResult, ProfileShape, QuadCornerType,
-    QuadMethod, RegionExtendOptions, RingInterp,
-    RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothLaplacianParams, SmoothVertParams,
-    SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom, SubdivideParams,
-    SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult, TransformParams,
-    TranslateParams, TriangleFillParams, TriangleFillResult, WireframeResult, DELIMIT_MATERIAL,
-    DELIMIT_NORMAL, DELIMIT_SEAM,
-    DELIMIT_SHARP, DELIMIT_UV,
+    DissolveVertsParams, DuplicateResult, EdgeloopFillParams, EdgeloopFillResult,
+    EdgenetFillParams, EdgenetFillResult, EdgenetPrepareResult, ExtrudeVertIndivResult,
+    FaceStrengthMode, GeomKey, GridFillParams, GridFillResult, HolesFillParams, HolesFillResult,
+    InsetIndividualParams, InsetIndividualResult, InsetRegionParams, InsetRegionResult,
+    JoinTrianglesParams, JoinTrianglesResult, MirrorParams, MirrorResult, MixedSeed, NgonMethod,
+    OffsetEdgeLoopsResult, ProfileShape, QuadCornerType, QuadMethod, RegionExtendOptions,
+    RingInterp, RotateEdgesResult, RotateParams, ScaleParams, SmoothFalloff, SmoothLaplacianParams,
+    SmoothVertParams, SubdivideEdgeRingParams, SubdivideEdgeRingResult, SubdivideGeom,
+    SubdivideParams, SubdivideResult, SubdivideSlot, SymmetrizeDirection, SymmetrizeResult,
+    TransformParams, TranslateParams, TriangleFillParams, TriangleFillResult, WireframeResult,
+    DELIMIT_MATERIAL, DELIMIT_NORMAL, DELIMIT_SEAM, DELIMIT_SHARP, DELIMIT_UV,
 };
 
 // Shared fixtures for the per-operator unit tests that live in the `euler`,
@@ -284,7 +279,8 @@ impl Edge {
             .map(|i| self.vertices[(i == 0) as usize])
     }
 
-    /// like: bmesh_disk_edge_link_from_vert
+    /// The disk-cycle links this edge stores *for* `vert` — the edge's slot in
+    /// `vert`'s disk (§4.2). Panics when `vert` is not an endpoint.
     pub fn disk_loop_links_for_vert(&self, vert: VertexKey) -> DoubleLinks<EdgeKey> {
         match self.contains(vert) {
             Some(i) => self.vertex_disk_links[i],

@@ -163,9 +163,9 @@ impl LoopMesh {
     /// an edge spanning two originally-selected verts is itself non-ORIG and gets
     /// reported as a crossing edge (the §3.1 fill-in subtlety).
     fn grow_vert_edge_step(&self, v: VertexKey, marks: &mut Marks) {
-        let on_frontier = self.vertex_disk_iter(v).any(|e| {
-            !marks.is_orig(GeomKey::Edge(e)) && !self.edge_hidden(e)
-        });
+        let on_frontier = self
+            .vertex_disk_iter(v)
+            .any(|e| !marks.is_orig(GeomKey::Edge(e)) && !self.edge_hidden(e));
         if !on_frontier {
             return;
         }
@@ -184,9 +184,9 @@ impl LoopMesh {
     /// edges). Wire edges have no face, so they are picked up by a dedicated pass
     /// exactly like the edge step, ensuring a vertex still grows along a wire.
     fn grow_vert_face_step(&self, v: VertexKey, marks: &mut Marks) {
-        let on_frontier = self.vertex_disk_iter(v).any(|e| {
-            !marks.is_orig(GeomKey::Edge(e)) && !self.edge_hidden(e)
-        });
+        let on_frontier = self
+            .vertex_disk_iter(v)
+            .any(|e| !marks.is_orig(GeomKey::Edge(e)) && !self.edge_hidden(e));
         if !on_frontier {
             return;
         }
@@ -344,8 +344,7 @@ mod tests {
     /// edge dangling off the centre vert; the wire's tip vertex is lifted off the
     /// grid plane so the edge is unambiguously face-less. Returns the mesh, the 9
     /// lattice verts, the 4 faces, the wire edge, and its tip vert.
-    fn grid_3x3_wire_at_center(
-    ) -> (LoopMesh, Vec<VertexKey>, Vec<FaceKey>, EdgeKey, VertexKey) {
+    fn grid_3x3_wire_at_center() -> (LoopMesh, Vec<VertexKey>, Vec<FaceKey>, EdgeKey, VertexKey) {
         let (mut mesh, verts, faces) = vertex_lattice(3);
         let tip = mesh.create_vertex(Vec3::new(1.0, 1.0, 1.0));
         let wire = mesh.create_edge([verts[4], tip], EdgeCreateFlags::NO_DUPLICATE);
@@ -408,10 +407,9 @@ mod tests {
 
         // Grow from the centre vert: the hidden east edge and its far vert 5 are
         // skipped, so the ring shrinks to 3 edges + 3 far verts {1,3,7} (§2.3).
-        let grow = ring_set(&mesh.region_extend(
-            &[GeomKey::Vert(verts[4])],
-            RegionExtendOptions::default(),
-        ));
+        let grow = ring_set(
+            &mesh.region_extend(&[GeomKey::Vert(verts[4])], RegionExtendOptions::default()),
+        );
         assert!(
             !grow.contains(&GeomKey::Edge(east)),
             "grow skips the hidden edge"
@@ -440,10 +438,8 @@ mod tests {
         // Clearing the bit restores the full grow ring (8 elements).
         mesh.set_edge_hidden(east, false);
         assert!(!mesh.is_edge_hidden(east));
-        let grow_cleared = mesh.region_extend(
-            &[GeomKey::Vert(verts[4])],
-            RegionExtendOptions::default(),
-        );
+        let grow_cleared =
+            mesh.region_extend(&[GeomKey::Vert(verts[4])], RegionExtendOptions::default());
         assert_eq!(grow_cleared.len(), 8, "cleared bit restores the full ring");
     }
 
@@ -495,14 +491,23 @@ mod tests {
 
         // Every grid vert/edge and all four faces are flushed in via the face step.
         for &v in &verts {
-            assert!(set.contains(&GeomKey::Vert(v)), "grid vert flushed into ring");
+            assert!(
+                set.contains(&GeomKey::Vert(v)),
+                "grid vert flushed into ring"
+            );
         }
         for &f in &faces {
             assert!(set.contains(&GeomKey::Face(f)), "incident face ringed");
         }
         // The dedicated wire pass picks up the face-less wire and its tip (§4.1).
-        assert!(set.contains(&GeomKey::Edge(wire)), "wire edge added by wire pass");
-        assert!(set.contains(&GeomKey::Vert(tip)), "wire tip vert added by wire pass");
+        assert!(
+            set.contains(&GeomKey::Edge(wire)),
+            "wire edge added by wire pass"
+        );
+        assert!(
+            set.contains(&GeomKey::Vert(tip)),
+            "wire tip vert added by wire pass"
+        );
     }
 
     /// Contrast against [`vert_grow_face_step_rings_incident_faces_rims_and_wire`]:
@@ -532,10 +537,19 @@ mod tests {
         assert_eq!(face_count, 0, "edge step rings no faces");
 
         // The wire edge participates in the ordinary edge step too (§3.1).
-        assert!(set.contains(&GeomKey::Edge(wire)), "wire edge crossed by edge step");
-        assert!(set.contains(&GeomKey::Vert(tip)), "wire tip reached by edge step");
+        assert!(
+            set.contains(&GeomKey::Edge(wire)),
+            "wire edge crossed by edge step"
+        );
+        assert!(
+            set.contains(&GeomKey::Vert(tip)),
+            "wire tip reached by edge step"
+        );
         let far = vert_set(&mesh, &[1, 3, 5, 7], &verts);
-        assert!(far.is_subset(&set), "the four grid-edge far verts are reported");
+        assert!(
+            far.is_subset(&set),
+            "the four grid-edge far verts are reported"
+        );
 
         // The face step and edge step report genuinely different rings.
         let face_step = ring_set(&mesh.region_extend(
@@ -546,7 +560,10 @@ mod tests {
                 use_face_step: true,
             },
         ));
-        assert_ne!(set, face_step, "use_face_step genuinely changes the vert-mode ring");
+        assert_ne!(
+            set, face_step,
+            "use_face_step genuinely changes the vert-mode ring"
+        );
     }
 
     /// Face-mode grow, edge step (foundational): centre face of grid_3x3_faces.
@@ -565,10 +582,15 @@ mod tests {
             },
         );
         let set = ring_set(&ring);
-        let expected: HashSet<GeomKey> =
-            [1, 3, 5, 7].iter().map(|&i| GeomKey::Face(faces[i])).collect();
+        let expected: HashSet<GeomKey> = [1, 3, 5, 7]
+            .iter()
+            .map(|&i| GeomKey::Face(faces[i]))
+            .collect();
         assert_eq!(set, expected, "edge-step ring is the four orthogonal faces");
-        assert!(!set.contains(&GeomKey::Face(faces[4])), "seed face excluded");
+        assert!(
+            !set.contains(&GeomKey::Face(faces[4])),
+            "seed face excluded"
+        );
     }
 
     /// `use_face_step` face-mode contrast: the vertex step reaches all eight
@@ -589,7 +611,10 @@ mod tests {
             .filter(|&i| i != 4)
             .map(|i| GeomKey::Face(faces[i]))
             .collect();
-        assert_eq!(vertex_step, expected, "vertex step reaches all 8 neighbours");
+        assert_eq!(
+            vertex_step, expected,
+            "vertex step reaches all 8 neighbours"
+        );
         assert!(
             edge_step.is_subset(&vertex_step) && edge_step != vertex_step,
             "use_face_step genuinely changes the ring"
@@ -640,7 +665,17 @@ mod tests {
     fn face_shrink_block_inner_band_excludes_interior() {
         // dim = 6 vertex lattice → 5×5 face grid; face (r,c) is index r*5 + c.
         let (mesh, _verts, faces) = vertex_lattice(6);
-        let block_rc = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3)];
+        let block_rc = [
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (3, 3),
+        ];
         let idx = |r: usize, c: usize| r * 5 + c;
         let region: Vec<GeomKey> = block_rc
             .iter()
@@ -658,10 +693,19 @@ mod tests {
         let shrink_set = ring_set(&shrink);
 
         // The inner band is the 3×3 block minus the fully-interior centre (2,2).
-        let expected: HashSet<GeomKey> = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2), (3, 3)]
-            .iter()
-            .map(|&(r, c)| GeomKey::Face(faces[idx(r, c)]))
-            .collect();
+        let expected: HashSet<GeomKey> = [
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 1),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (3, 3),
+        ]
+        .iter()
+        .map(|&(r, c)| GeomKey::Face(faces[idx(r, c)]))
+        .collect();
         assert_eq!(shrink_set, expected, "inner boundary band of the block");
 
         // The interior face (2,2) = index 12 is excluded — all four of its
@@ -711,6 +755,9 @@ mod tests {
         let (mesh, verts, _faces) = vertex_lattice(3);
         let (v, e, f) = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         let _ = mesh.region_extend(&[GeomKey::Vert(verts[4])], RegionExtendOptions::default());
-        assert_eq!((mesh.vertex_count(), mesh.edge_count(), mesh.face_count()), (v, e, f));
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (v, e, f)
+        );
     }
 }

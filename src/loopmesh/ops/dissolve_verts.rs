@@ -531,15 +531,12 @@ impl LoopMesh {
     /// without displacing it, the disk's forward (`next`) walk visits the
     /// incident edges in creation order (§3.1, "Disk order is build order").
     ///
-    /// One build-convention twist fixes which radial side wins. §3.1 / §6.5
-    /// define `e.l` as the loop **appended last** to the edge's radial cycle
-    /// (the second-built of the two flanking faces). loopmesh's radial cycle
-    /// keeps the *first*-appended loop as the stored head (`edge.radial_link`)
-    /// and splices each later loop in immediately before it, so the
-    /// last-appended loop is the head's radial-`prev`. This is the same
-    /// last-attached convention [`Self::fan_first_loop`] implements
-    /// (RADIAL_EDGE_STRUCTURE.md §6.5); reading the head directly, or its
-    /// `next`, picks the first-built face and diverges.
+    /// One convention twist fixes which radial side wins. §3.1 / §6.5 define
+    /// `e.l` as the edge's radial **entry** ([`LoopMesh::edge_radial_entry`]),
+    /// which on a radial-2 spoke that has never lost a loop is the
+    /// *second*-built of the two flanking faces. Reading the stored head
+    /// (`edge.radial_link`) directly, or its `next`, picks the first-built face
+    /// and diverges.
     ///
     /// Returns `None` only when no incident edge qualifies (no radial-2 spoke),
     /// which the manifold-fan precondition rules out for callers.
@@ -552,7 +549,7 @@ impl LoopMesh {
                 continue;
             }
             // §6.5 `e.l` = the edge's radial entry = its last-attached loop.
-            let representative_loop = self.edge_radial_last_attached(edge)?;
+            let representative_loop = self.edge_radial_entry(edge)?;
             return Some(self.loops.get(representative_loop).face);
         }
         None
@@ -1091,11 +1088,10 @@ mod tests {
         }
 
         // Independently resolve the §3.1 winner: the face on `(v.e).l` — the
-        // last-appended radial loop of the centre's disk-head edge. This is the
-        // face `faces_join`'s survivor inherits its per-face customdata from.
+        // radial entry of the centre's disk-head edge. This is the face
+        // `faces_join`'s survivor inherits its per-face customdata from.
         let disk_head = mesh.vertices.get(centre).disk_loop_start.unwrap();
-        let radial_head = mesh.edges.get(disk_head).radial_link.unwrap();
-        let representative_loop = mesh.loops.get(radial_head).edge_radial_links.next;
+        let representative_loop = mesh.edge_radial_entry(disk_head).unwrap();
         let winner_face = mesh.loops.get(representative_loop).face;
 
         // §6.3 worked example: on `grid_3x3` the winner is fixture face 1

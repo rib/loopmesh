@@ -212,7 +212,11 @@ mod tests {
 
         assert_eq!(mesh.vertex_count(), 12);
         assert_eq!(mesh.face_count(), 6);
-        assert_eq!(mesh.edge_count(), 17, "interior edges shared, not duplicated");
+        assert_eq!(
+            mesh.edge_count(),
+            17,
+            "interior edges shared, not duplicated"
+        );
         assert_eq!(mesh.loop_count(), 4 * 6);
         for face in mesh.face_keys() {
             assert_eq!(mesh.face_vert_keys(face).len(), 4, "every face a quad");
@@ -278,7 +282,11 @@ mod tests {
         assert_eq!(clamped.face_count(), explicit.face_count());
         // 1×2 grid: 2·3 = 6 verts, 2 quads, 1·3 + 2·2 = 7 edges.
         assert_eq!(
-            (clamped.vertex_count(), clamped.edge_count(), clamped.face_count()),
+            (
+                clamped.vertex_count(),
+                clamped.edge_count(),
+                clamped.face_count()
+            ),
             (6, 7, 2)
         );
         // A negative count clamps the same way.
@@ -303,8 +311,7 @@ mod tests {
             Vec3::new(11.0, 11.0, 0.0),
             Vec3::new(10.0, 11.0, 0.0),
         ];
-        let island_verts: Vec<VertexKey> =
-            corners.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let island_verts: Vec<VertexKey> = corners.iter().map(|&p| mesh.create_vertex(p)).collect();
         mesh.face_create_verts(&island_verts, FaceCreateFlags::NONE);
         let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
         assert_eq!(before, (4, 4, 1));
@@ -450,12 +457,7 @@ mod tests {
             let u_hi = (cell_ix + 1.0) * du;
             let v_lo = cell_iy * dv;
             let v_hi = (cell_iy + 1.0) * dv;
-            let expected = [
-                [u_lo, v_lo],
-                [u_hi, v_lo],
-                [u_hi, v_hi],
-                [u_lo, v_hi],
-            ];
+            let expected = [[u_lo, v_lo], [u_hi, v_lo], [u_hi, v_hi], [u_lo, v_hi]];
             let corners = read_corner_uvs(&mesh, face, uv);
             for (i, want) in expected.iter().enumerate() {
                 assert!(

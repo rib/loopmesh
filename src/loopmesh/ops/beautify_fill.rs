@@ -324,19 +324,19 @@ impl LoopMesh {
                 let admit = self
                     .beautify_edge_cost(neighbour, &patch, options.method, options.use_restrict_tag)
                     .and_then(|cost| {
-                    if cost >= 0.0 {
-                        return None;
-                    }
-                    let sig = self.beautify_edge_signature(neighbour)?;
-                    let blocked = visited
-                        .get(&neighbour)
-                        .is_some_and(|states| states.contains(&sig.swapped()));
-                    if blocked {
-                        None
-                    } else {
-                        Some(cost)
-                    }
-                });
+                        if cost >= 0.0 {
+                            return None;
+                        }
+                        let sig = self.beautify_edge_signature(neighbour)?;
+                        let blocked = visited
+                            .get(&neighbour)
+                            .is_some_and(|states| states.contains(&sig.swapped()));
+                        if blocked {
+                            None
+                        } else {
+                            Some(cost)
+                        }
+                    });
                 match admit {
                     Some(cost) => {
                         active.insert(neighbour, cost);
@@ -697,11 +697,10 @@ mod tests {
 
         // Every reported edge is a live current diagonal (no stale keys): the
         // reported set is exactly {v1-v5, v2-v4, v2-v5}.
-        let expected: HashSet<(u32, u32)> =
-            [(v[1], v[5]), (v[2], v[4]), (v[2], v[5])]
-                .iter()
-                .map(|&(a, b)| sorted_pair(a, b))
-                .collect();
+        let expected: HashSet<(u32, u32)> = [(v[1], v[5]), (v[2], v[4]), (v[2], v[5])]
+            .iter()
+            .map(|&(a, b)| sorted_pair(a, b))
+            .collect();
         let reported: HashSet<(u32, u32)> = out
             .edges()
             .map(|&e| {
@@ -913,7 +912,10 @@ mod tests {
             },
         );
 
-        assert!(out.is_empty(), "degenerate candidate ⇒ never-rotate sentinel");
+        assert!(
+            out.is_empty(),
+            "degenerate candidate ⇒ never-rotate sentinel"
+        );
         assert!(
             mesh.query_edge_exists(v0, v2).is_some(),
             "the current diagonal {{0,2}} survives"
@@ -1023,7 +1025,11 @@ mod tests {
             },
         );
 
-        assert_eq!(out.edges().count(), 1, "tags ignored ⇒ rotation still fires");
+        assert_eq!(
+            out.edges().count(),
+            1,
+            "tags ignored ⇒ rotation still fires"
+        );
         assert!(
             mesh.query_edge_exists(v1, v3).is_some(),
             "the short diagonal {{1,3}} now exists"

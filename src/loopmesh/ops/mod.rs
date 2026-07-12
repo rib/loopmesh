@@ -86,12 +86,12 @@ mod weld_verts;
 mod wireframe;
 
 pub use beautify_fill::{BeautifyFillOptions, BeautifyFillResult, BeautifyMethod};
+/// Convention-neutral alias for [`BevelFaceStrengthMode`] (BEVEL.md §8.10.1).
+pub use bevel::BevelFaceStrengthMode as FaceStrengthMode;
 pub use bevel::{
     BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,
     BevelVmeshMethod,
 };
-/// Convention-neutral alias for [`BevelFaceStrengthMode`] (BEVEL.md §8.10.1).
-pub use bevel::BevelFaceStrengthMode as FaceStrengthMode;
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
 pub use bridge_loops::{BridgeLoopsParams, BridgeLoopsResult};
@@ -110,13 +110,13 @@ pub use duplicate::{DuplicateResult, GeomKey};
 pub use edgeloop_fill::{EdgeloopFillParams, EdgeloopFillResult};
 pub use edgenet_fill::{EdgenetFillParams, EdgenetFillResult};
 pub use edgenet_prepare::EdgenetPrepareResult;
-pub use face_attribute_fill::FaceAttributeFillResult;
-pub use grid_fill::{GridFillParams, GridFillResult};
-pub use holes_fill::{HolesFillParams, HolesFillResult};
 pub use extrude_mixed::ExtrudeMixedResult;
 pub use extrude_vert_indiv::ExtrudeVertIndivResult;
+pub use face_attribute_fill::FaceAttributeFillResult;
 pub use face_poke::{CenterMode, PokeResult};
 pub use face_triangulate::{NgonMethod, QuadMethod};
+pub use grid_fill::{GridFillParams, GridFillResult};
+pub use holes_fill::{HolesFillParams, HolesFillResult};
 pub use inset_individual::{InsetIndividualParams, InsetIndividualResult};
 pub use inset_region::{InsetRegionParams, InsetRegionResult};
 pub use join_triangles::{JoinTrianglesParams, JoinTrianglesResult};
@@ -137,6 +137,6 @@ pub use subdivide_edges::{
 };
 pub use symmetrize::{SymmetrizeDirection, SymmetrizeResult};
 pub use transform::TransformParams;
-pub use triangle_fill::{TriangleFillParams, TriangleFillResult};
 pub use translate::TranslateParams;
+pub use triangle_fill::{TriangleFillParams, TriangleFillResult};
 pub use wireframe::WireframeResult;

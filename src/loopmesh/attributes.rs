@@ -65,11 +65,9 @@ impl InterpPolicy {
     /// explicit opt-in to `Linear`; [`ElementAttributeDesc::color`] does that.)
     pub fn default_for(ty: AttrType) -> Self {
         match ty {
-            AttrType::F32
-            | AttrType::F64
-            | AttrType::Vec2
-            | AttrType::Vec3
-            | AttrType::Vec4 => InterpPolicy::Linear,
+            AttrType::F32 | AttrType::F64 | AttrType::Vec2 | AttrType::Vec3 | AttrType::Vec4 => {
+                InterpPolicy::Linear
+            }
             AttrType::I32 | AttrType::U32 => InterpPolicy::RoundedLinear,
             AttrType::Bool => InterpPolicy::Disjunction,
             AttrType::U8 | AttrType::Vec4U8 | AttrType::String => InterpPolicy::NoInterp,
@@ -1181,7 +1179,10 @@ impl ElementAttributes {
     ) {
         for step in plan {
             match *step {
-                RemapStep::Copy { dst, src: src_storage } => {
+                RemapStep::Copy {
+                    dst,
+                    src: src_storage,
+                } => {
                     apply_copy_cross(self, dst, dst_slot, src, src_storage, src_slot);
                 }
                 RemapStep::SetDefault { dst } => set_storage_default(self, dst, dst_slot),
@@ -1502,9 +1503,7 @@ fn blend_lanes<const N: usize>(
             }
             for lane in 0..N {
                 match policy {
-                    InterpPolicy::RoundedLinear => {
-                        sum[lane] = round_half_away_from_zero(sum[lane])
-                    }
+                    InterpPolicy::RoundedLinear => sum[lane] = round_half_away_from_zero(sum[lane]),
                     _ => sum[lane] /= weight_total,
                 }
             }
@@ -1650,9 +1649,9 @@ fn blend_bucket<T: BlendLanes<N>, const N: usize>(
     }
     let blended = blend_lanes(
         policy,
-        sources
-            .iter()
-            .filter_map(|&(weight, slot)| values.get(slot).map(|&value| (weight, value.to_lanes()))),
+        sources.iter().filter_map(|&(weight, slot)| {
+            values.get(slot).map(|&value| (weight, value.to_lanes()))
+        }),
     );
     if let Some(lanes) = blended {
         values[dst] = T::from_lanes(lanes);
@@ -1746,9 +1745,9 @@ fn apply_interp_from_snapshot(
         // A string layer's type defines no interpolation: a blend never reads
         // its sources and never writes its destination.
         (AttributeStorage::String(_), _) => {}
-        (storage, _) => unreachable!(
-            "snapshot layer's value variant does not match its storage {storage:?}"
-        ),
+        (storage, _) => {
+            unreachable!("snapshot layer's value variant does not match its storage {storage:?}")
+        }
     }
 }
 
@@ -2159,9 +2158,7 @@ mod tests {
             ))
             .unwrap();
         let name = mesh
-            .register_vertex_attribute(ElementAttributeDesc::string(AttributeKey::custom(
-                "v_name",
-            )))
+            .register_vertex_attribute(ElementAttributeDesc::string(AttributeKey::custom("v_name")))
             .unwrap();
 
         let doomed = mesh.create_vertex(Vec3::X);
@@ -2177,7 +2174,10 @@ mod tests {
             mesh.vertex_attribs().get_vec3(color, minted.as_usize()),
             Some([0.0; 3])
         );
-        assert_eq!(mesh.vertex_attribs().get_string(name, minted.as_usize()), None);
+        assert_eq!(
+            mesh.vertex_attribs().get_string(name, minted.as_usize()),
+            None
+        );
     }
 
     #[test]
@@ -2253,7 +2253,8 @@ mod tests {
         );
 
         assert_eq!(
-            mesh.face_attribs().get_vec3(f_color, minted_face.as_usize()),
+            mesh.face_attribs()
+                .get_vec3(f_color, minted_face.as_usize()),
             Some([0.0; 3])
         );
         for l in minted_loops {
@@ -2301,8 +2302,18 @@ mod tests {
 
     #[test]
     fn policy_defaults_follow_the_layer_type() {
-        for ty in [AttrType::F32, AttrType::F64, AttrType::Vec2, AttrType::Vec3, AttrType::Vec4] {
-            assert_eq!(InterpPolicy::default_for(ty), InterpPolicy::Linear, "{ty:?}");
+        for ty in [
+            AttrType::F32,
+            AttrType::F64,
+            AttrType::Vec2,
+            AttrType::Vec3,
+            AttrType::Vec4,
+        ] {
+            assert_eq!(
+                InterpPolicy::default_for(ty),
+                InterpPolicy::Linear,
+                "{ty:?}"
+            );
         }
         for ty in [AttrType::I32, AttrType::U32] {
             assert_eq!(
@@ -2316,7 +2327,11 @@ mod tests {
             InterpPolicy::Disjunction
         );
         for ty in [AttrType::U8, AttrType::Vec4U8, AttrType::String] {
-            assert_eq!(InterpPolicy::default_for(ty), InterpPolicy::NoInterp, "{ty:?}");
+            assert_eq!(
+                InterpPolicy::default_for(ty),
+                InterpPolicy::NoInterp,
+                "{ty:?}"
+            );
         }
     }
 
@@ -2332,7 +2347,8 @@ mod tests {
             ))
             .unwrap();
         for (v, value) in sources.iter().zip(values) {
-            mesh.vertex_attribs_mut().set_i32(layer, v.as_usize(), value);
+            mesh.vertex_attribs_mut()
+                .set_i32(layer, v.as_usize(), value);
         }
         let plan = [
             (weights[0], sources[0].as_usize()),
@@ -2340,7 +2356,9 @@ mod tests {
         ];
         mesh.vertex_attribs_mut()
             .interpolate_into(dst.as_usize(), &plan);
-        mesh.vertex_attribs().get_i32(layer, dst.as_usize()).unwrap()
+        mesh.vertex_attribs()
+            .get_i32(layer, dst.as_usize())
+            .unwrap()
     }
 
     #[test]
@@ -2460,8 +2478,10 @@ mod tests {
             .unwrap();
 
         let blend = |mesh: &mut LoopMesh, values: [u32; 2], weights: [f32; 2]| -> u32 {
-            mesh.vertex_attribs_mut().set_u32(id, a.as_usize(), values[0]);
-            mesh.vertex_attribs_mut().set_u32(id, b.as_usize(), values[1]);
+            mesh.vertex_attribs_mut()
+                .set_u32(id, a.as_usize(), values[0]);
+            mesh.vertex_attribs_mut()
+                .set_u32(id, b.as_usize(), values[1]);
             mesh.vertex_attribs_mut().interpolate_into(
                 dst.as_usize(),
                 &[(weights[0], a.as_usize()), (weights[1], b.as_usize())],
@@ -2472,7 +2492,10 @@ mod tests {
         assert_eq!(blend(&mut mesh, [100, 104], [0.875, 0.125]), 101);
         assert_eq!(blend(&mut mesh, [2, 3], [0.5, 0.5]), 3);
         // Wide accumulation: exact past 2^24, where an f32 lane would quantise.
-        assert_eq!(blend(&mut mesh, [4_000_000_001, 7], [1.0, 0.0]), 4_000_000_001);
+        assert_eq!(
+            blend(&mut mesh, [4_000_000_001, 7], [1.0, 0.0]),
+            4_000_000_001
+        );
         // A negative weight (mean-value coordinates produce them on concave
         // polygons) can drive the sum below zero; it saturates at the bound.
         assert_eq!(blend(&mut mesh, [10, 0], [-1.0, 2.0]), 0);
@@ -2513,14 +2536,21 @@ mod tests {
         }
         mesh.vertex_attribs_mut().set_f32(mask, dst.as_usize(), 1.0);
         mesh.vertex_attribs_mut().set_i32(id, dst.as_usize(), 1);
-        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), true);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, dst.as_usize(), true);
 
         mesh.vertex_attribs_mut()
             .interpolate_into(dst.as_usize(), &[(0.0, a.as_usize()), (0.0, b.as_usize())]);
 
-        assert_eq!(mesh.vertex_attribs().get_f32(mask, dst.as_usize()), Some(1.0));
+        assert_eq!(
+            mesh.vertex_attribs().get_f32(mask, dst.as_usize()),
+            Some(1.0)
+        );
         assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(1));
-        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2539,29 +2569,42 @@ mod tests {
 
         // A lone `true` at a tiny weight still dilates: blend-and-round would
         // give round(0.125) = 0 → false, which is the wrong reading.
-        mesh.vertex_attribs_mut().set_bool(flag, heavy.as_usize(), false);
-        mesh.vertex_attribs_mut().set_bool(flag, light.as_usize(), true);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, heavy.as_usize(), false);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, light.as_usize(), true);
         mesh.vertex_attribs_mut().interpolate_into(
             dst.as_usize(),
             &[(0.875, heavy.as_usize()), (0.125, light.as_usize())],
         );
-        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(true));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(true)
+        );
 
         // Symmetric: which source carries the majority weight is irrelevant.
-        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), false);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, dst.as_usize(), false);
         mesh.vertex_attribs_mut().interpolate_into(
             dst.as_usize(),
             &[(0.125, heavy.as_usize()), (0.875, light.as_usize())],
         );
-        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(true));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(true)
+        );
 
         // An all-false source set is the only way to get false back.
-        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), true);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, dst.as_usize(), true);
         mesh.vertex_attribs_mut().interpolate_into(
             dst.as_usize(),
             &[(0.5, heavy.as_usize()), (0.5, heavy.as_usize())],
         );
-        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(false)
+        );
 
         // Zero and negative weights contribute nothing, however true they are.
         mesh.vertex_attribs_mut()
@@ -2574,7 +2617,10 @@ mod tests {
                 (-0.25, light.as_usize()),
             ],
         );
-        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2600,9 +2646,14 @@ mod tests {
             ))
             .unwrap();
 
-        for (attr, values) in [(opaque, ([0, 0, 0, 0], [100, 100, 100, 100])), (color, ([0, 0, 0, 0], [100, 100, 100, 100]))] {
-            mesh.vertex_attribs_mut().set_vec4u8(attr, a.as_usize(), values.0);
-            mesh.vertex_attribs_mut().set_vec4u8(attr, b.as_usize(), values.1);
+        for (attr, values) in [
+            (opaque, ([0, 0, 0, 0], [100, 100, 100, 100])),
+            (color, ([0, 0, 0, 0], [100, 100, 100, 100])),
+        ] {
+            mesh.vertex_attribs_mut()
+                .set_vec4u8(attr, a.as_usize(), values.0);
+            mesh.vertex_attribs_mut()
+                .set_vec4u8(attr, b.as_usize(), values.1);
         }
         mesh.vertex_attribs_mut()
             .set_vec4u8(opaque, dst.as_usize(), [7, 7, 7, 7]);
@@ -2610,7 +2661,8 @@ mod tests {
             .set_vec4u8(color, dst.as_usize(), [7, 7, 7, 7]);
 
         let plan = [(0.5, a.as_usize()), (0.5, b.as_usize())];
-        mesh.vertex_attribs_mut().interpolate_into(dst.as_usize(), &plan);
+        mesh.vertex_attribs_mut()
+            .interpolate_into(dst.as_usize(), &plan);
 
         assert_eq!(
             mesh.vertex_attribs().get_vec4u8(opaque, dst.as_usize()),
@@ -2695,7 +2747,8 @@ mod tests {
             .unwrap();
         mesh.vertex_attribs_mut().set_i32(id, a.as_usize(), 2);
         mesh.vertex_attribs_mut().set_i32(id, b.as_usize(), 3);
-        mesh.vertex_attribs_mut().set_bool(flag, a.as_usize(), false);
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, a.as_usize(), false);
         mesh.vertex_attribs_mut().set_bool(flag, b.as_usize(), true);
 
         let snapshot = mesh
@@ -2705,8 +2758,11 @@ mod tests {
             .interpolate_from_snapshot(dst.as_usize(), &snapshot, &[0.5, 0.5]);
         assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(3));
 
-        mesh.vertex_attribs_mut()
-            .interpolate_from_snapshot(dst.as_usize(), &snapshot, &[0.875, 0.125]);
+        mesh.vertex_attribs_mut().interpolate_from_snapshot(
+            dst.as_usize(),
+            &snapshot,
+            &[0.875, 0.125],
+        );
         assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(2));
         assert_eq!(
             mesh.vertex_attribs().get_bool(flag, dst.as_usize()),

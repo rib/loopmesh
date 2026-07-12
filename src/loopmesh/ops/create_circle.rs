@@ -249,7 +249,11 @@ mod tests {
         );
         assert_eq!(mesh.loop_count(), n as usize);
         let face = mesh.face_keys()[0];
-        assert_eq!(mesh.face_vert_keys(face).len(), n as usize, "a single n-gon");
+        assert_eq!(
+            mesh.face_vert_keys(face).len(),
+            n as usize,
+            "a single n-gon"
+        );
         assert!(mesh.face_normal(face).z > 0.9, "cap faces +z");
         // Disc Euler relation V − E + F = 1.
         assert_eq!(
@@ -279,7 +283,11 @@ mod tests {
         );
         assert_eq!(mesh.loop_count(), 3 * nn);
         for face in mesh.face_keys() {
-            assert_eq!(mesh.face_vert_keys(face).len(), 3, "every fan face a triangle");
+            assert_eq!(
+                mesh.face_vert_keys(face).len(),
+                3,
+                "every fan face a triangle"
+            );
             assert!(mesh.face_normal(face).z > 0.9, "fan triangle faces +z");
         }
         // A surviving centre apex at the transformed origin.
@@ -465,7 +473,11 @@ mod tests {
         // n-gon cap — no surviving centre, the ring alone in angular order.
         let mut ngon = LoopMesh::new();
         let ngon_verts = ngon.create_circle(true, false, n as i32, r, matrix, false);
-        assert_eq!(ngon_verts.len(), n, "n-gon reports just the ring (no centre)");
+        assert_eq!(
+            ngon_verts.len(),
+            n,
+            "n-gon reports just the ring (no centre)"
+        );
         for a in 0..n {
             let got = ngon.vertex_position(ngon_verts[a]);
             let expected = ring_position(a);
@@ -521,16 +533,25 @@ mod tests {
         for loop_key in mesh.face_loop_keys(face) {
             let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
             let want = [0.5 + 0.5 * position.x / r, 0.5 + 0.5 * position.y / r];
-            let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+            let got = mesh
+                .loop_attribs()
+                .get_vec2(uv, loop_key.as_usize())
+                .unwrap();
             assert!(uv_near(got, want), "loop UV {got:?}, expected {want:?}");
             // Every rim corner sits on the inscribed r = 0.5 circle.
             let radial = ((got[0] - 0.5).powi(2) + (got[1] - 0.5).powi(2)).sqrt();
-            assert!((radial - 0.5).abs() < EPS, "rim UV off the r=0.5 circle: {got:?}");
+            assert!(
+                (radial - 0.5).abs() < EPS,
+                "rim UV off the r=0.5 circle: {got:?}"
+            );
             if uv_near(got, [0.5, 1.0]) {
                 saw_top = true;
             }
         }
-        assert!(saw_top, "vertex 0 at local (0,+r) should land at UV (0.5, 1.0)");
+        assert!(
+            saw_top,
+            "vertex 0 at local (0,+r) should land at UV (0.5, 1.0)"
+        );
         mesh.validate_topology();
     }
 
@@ -557,9 +578,13 @@ mod tests {
         let mut apex_corners = 0;
         for face in mesh.face_keys() {
             for loop_key in mesh.face_loop_keys(face) {
-                let local = inverse.transform_point3(mesh.vertex_position(mesh.loop_vertex(loop_key)));
+                let local =
+                    inverse.transform_point3(mesh.vertex_position(mesh.loop_vertex(loop_key)));
                 let want = [0.5 + 0.5 * local.x / r, 0.5 + 0.5 * local.y / r];
-                let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
+                let got = mesh
+                    .loop_attribs()
+                    .get_vec2(uv, loop_key.as_usize())
+                    .unwrap();
                 assert!(uv_near(got, want), "fan loop UV {got:?}, expected {want:?}");
                 if uv_near(got, [0.5, 0.5]) {
                     apex_corners += 1;
@@ -567,7 +592,10 @@ mod tests {
             }
         }
         // Each of the n triangles contributes one apex corner, all at (0.5, 0.5).
-        assert_eq!(apex_corners, n as usize, "every fan apex corner at the centre UV");
+        assert_eq!(
+            apex_corners, n as usize,
+            "every fan apex corner at the centre UV"
+        );
         mesh.validate_topology();
     }
 
@@ -610,8 +638,14 @@ mod tests {
 
         for face in mesh.face_keys() {
             for loop_key in mesh.face_loop_keys(face) {
-                let got = mesh.loop_attribs().get_vec2(uv, loop_key.as_usize()).unwrap();
-                assert!(uv_near(got, [0.0, 0.0]), "calc_uvs=false left a non-default UV {got:?}");
+                let got = mesh
+                    .loop_attribs()
+                    .get_vec2(uv, loop_key.as_usize())
+                    .unwrap();
+                assert!(
+                    uv_near(got, [0.0, 0.0]),
+                    "calc_uvs=false left a non-default UV {got:?}"
+                );
             }
         }
         mesh.validate_topology();

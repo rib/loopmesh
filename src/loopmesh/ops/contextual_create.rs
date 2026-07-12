@@ -254,7 +254,11 @@ impl LoopMesh {
         let normal = self.contextual_create_fit_plane_normal(verts, centroid);
 
         // In-plane orthonormal basis (axis_u, axis_w) for the angular sort.
-        let reference = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let reference = if normal.x.abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
         let mut axis_u = (reference - normal * reference.dot(normal)).normalize_or_zero();
         if axis_u.length_squared() < 1e-12 {
             axis_u = normal.any_orthonormal_vector();
@@ -372,9 +376,16 @@ mod tests {
         assert_eq!(mesh.vertex_count(), 2, "no vertex created");
         assert_eq!(mesh.edge_count(), 1, "exactly one edge created");
         assert_eq!(mesh.face_count(), 0, "the two-vert branch makes no face");
-        assert_eq!(out.edges().len(), 1, "the new edge is reported in edges.out");
+        assert_eq!(
+            out.edges().len(),
+            1,
+            "the new edge is reported in edges.out"
+        );
         assert!(out.faces().is_empty(), "faces.out stays empty");
-        assert!(mesh.query_edge_exists(a, b).is_some(), "the two verts are joined");
+        assert!(
+            mesh.query_edge_exists(a, b).is_some(),
+            "the two verts are joined"
+        );
         mesh.validate_topology();
     }
 
@@ -421,9 +432,19 @@ mod tests {
         ];
         let out = mesh.contextual_create(&geom, ContextualCreateParams::default());
 
-        assert_eq!(mesh.edge_count(), 5, "two closure edges added to the three chain edges");
-        assert!(mesh.query_edge_exists(v4, v0).is_some(), "free vert wired to one endpoint");
-        assert!(mesh.query_edge_exists(v4, v3).is_some(), "free vert wired to the other endpoint");
+        assert_eq!(
+            mesh.edge_count(),
+            5,
+            "two closure edges added to the three chain edges"
+        );
+        assert!(
+            mesh.query_edge_exists(v4, v0).is_some(),
+            "free vert wired to one endpoint"
+        );
+        assert!(
+            mesh.query_edge_exists(v4, v3).is_some(),
+            "free vert wired to the other endpoint"
+        );
         assert_eq!(out.faces().len(), 1, "the closed pentagon caps to one face");
         assert_eq!(mesh.face_len(out.faces()[0]), 5, "a pentagon cap");
         assert_eq!(mesh.face_count(), 1);
@@ -438,7 +459,10 @@ mod tests {
         let verts = ring_verts(&mut mesh, 5, 1.0);
         let loop_edges: Vec<EdgeKey> = (0..5)
             .map(|i| {
-                mesh.create_edge([verts[i], verts[(i + 1) % 5]], EdgeCreateFlags::NO_DUPLICATE)
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % 5]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
             })
             .collect();
         let geom: Vec<GeomKey> = loop_edges.iter().map(|&e| e.into()).collect();
@@ -449,7 +473,11 @@ mod tests {
         assert_eq!(mesh.vertex_count(), 5, "no vertex created");
         assert_eq!(mesh.edge_count(), 5, "no edge created (loop reused)");
         assert_eq!(mesh.face_count(), 1);
-        assert_eq!(mesh.face_len(out.faces()[0]), 5, "the cap spans all five corners");
+        assert_eq!(
+            mesh.face_len(out.faces()[0]),
+            5,
+            "the cap spans all five corners"
+        );
         mesh.validate_topology();
     }
 
@@ -475,9 +503,16 @@ mod tests {
 
         let out = mesh.contextual_create(&chain, ContextualCreateParams::default());
 
-        assert_eq!(out.faces().len(), 1, "the prepare-bridged chain caps to one face");
+        assert_eq!(
+            out.faces().len(),
+            1,
+            "the prepare-bridged chain caps to one face"
+        );
         assert_eq!(mesh.edge_count(), 4, "one bridge edge added by prepare");
-        assert!(mesh.query_edge_exists(v0, v3).is_some(), "the chain ends are bridged");
+        assert!(
+            mesh.query_edge_exists(v0, v3).is_some(),
+            "the chain ends are bridged"
+        );
         assert_eq!(mesh.face_len(out.faces()[0]), 4, "a quad cap");
         mesh.validate_topology();
     }
@@ -508,9 +543,16 @@ mod tests {
         let net_ring = build_two_quads(&mut net_mesh);
         let net = net_mesh.edgenet_fill(
             &net_ring,
-            &EdgenetFillParams { mat_nr: 0, use_smooth: false, sides: usize::MAX },
+            &EdgenetFillParams {
+                mat_nr: 0,
+                use_smooth: false,
+                sides: usize::MAX,
+            },
         );
-        assert!(net.is_empty(), "§6 edge-net fill declines on the overlapping ring");
+        assert!(
+            net.is_empty(),
+            "§6 edge-net fill declines on the overlapping ring"
+        );
 
         let mut loop_mesh = LoopMesh::new();
         let loop_ring = build_two_quads(&mut loop_mesh);
@@ -537,11 +579,23 @@ mod tests {
 
         let out = mesh.contextual_create(&geom, ContextualCreateParams::default());
 
-        assert_eq!(out.faces().len(), 1, "§8 edgeloop fill caps the ring with one n-gon");
-        assert_eq!(mesh.face_len(out.faces()[0]), 6, "the shadow cap spans the hexagon");
+        assert_eq!(
+            out.faces().len(),
+            1,
+            "§8 edgeloop fill caps the ring with one n-gon"
+        );
+        assert_eq!(
+            mesh.face_len(out.faces()[0]),
+            6,
+            "the shadow cap spans the hexagon"
+        );
         assert_eq!(mesh.vertex_count(), 6, "no vertex created");
         assert_eq!(mesh.edge_count(), 7, "no edge created (the ring is reused)");
-        assert_eq!(mesh.face_count(), 3, "the shadow n-gon is added over the two quads");
+        assert_eq!(
+            mesh.face_count(),
+            3,
+            "the shadow n-gon is added over the two quads"
+        );
         mesh.validate_topology();
     }
 
@@ -559,7 +613,11 @@ mod tests {
         assert!(out.is_empty(), "single-face dispatch is a no-op");
         assert_eq!(mesh.vertex_count(), 4, "mesh unchanged: verts");
         assert_eq!(mesh.edge_count(), 4, "mesh unchanged: edges");
-        assert_eq!(mesh.face_count(), 1, "mesh unchanged: the one face survives");
+        assert_eq!(
+            mesh.face_count(),
+            1,
+            "mesh unchanged: the one face survives"
+        );
         mesh.validate_topology();
     }
 
@@ -573,7 +631,10 @@ mod tests {
 
         let out = mesh.contextual_create(
             &geom,
-            ContextualCreateParams { mat_nr: 6, use_smooth: true },
+            ContextualCreateParams {
+                mat_nr: 6,
+                use_smooth: true,
+            },
         );
 
         assert_eq!(out.faces().len(), 1, "the cloud caps to one n-gon");
@@ -597,7 +658,10 @@ mod tests {
 
         let out = mesh.contextual_create(
             &geom,
-            ContextualCreateParams { mat_nr: 0, use_smooth: false },
+            ContextualCreateParams {
+                mat_nr: 0,
+                use_smooth: false,
+            },
         );
 
         assert_eq!(out.faces().len(), 1);

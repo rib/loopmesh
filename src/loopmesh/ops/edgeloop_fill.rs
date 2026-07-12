@@ -223,11 +223,18 @@ mod tests {
         let verts: Vec<VertexKey> = (0..n)
             .map(|i| {
                 let theta = (i as f32) * TAU / (n as f32);
-                mesh.create_vertex(center + Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0))
+                mesh.create_vertex(
+                    center + Vec3::new(radius * theta.cos(), radius * theta.sin(), 0.0),
+                )
             })
             .collect();
         (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect()
     }
 
@@ -241,9 +248,17 @@ mod tests {
             assert_eq!(mesh.vertex_count(), n, "no vertex created (n={n})");
             assert_eq!(mesh.edge_count(), n, "no edge created (n={n})");
             assert_eq!(mesh.face_count(), 1, "one n-gon (n={n})");
-            assert_eq!(result.faces().len(), 1, "faces.out reports the new n-gon (n={n})");
+            assert_eq!(
+                result.faces().len(),
+                1,
+                "faces.out reports the new n-gon (n={n})"
+            );
             let face = mesh.face_keys()[0];
-            assert_eq!(mesh.face_len(face), n, "the n-gon spans all corners (n={n})");
+            assert_eq!(
+                mesh.face_len(face),
+                n,
+                "the n-gon spans all corners (n={n})"
+            );
             mesh.validate_topology();
         }
     }
@@ -264,7 +279,12 @@ mod tests {
         let verts: Vec<VertexKey> = positions.iter().map(|&p| mesh.create_vertex(p)).collect();
         let n = verts.len();
         let edges: Vec<EdgeKey> = (0..n)
-            .map(|i| mesh.create_edge([verts[i], verts[(i + 1) % n]], EdgeCreateFlags::NO_DUPLICATE))
+            .map(|i| {
+                mesh.create_edge(
+                    [verts[i], verts[(i + 1) % n]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                )
+            })
             .collect();
 
         let result = mesh.edgeloop_fill(&edges, &EdgeloopFillParams::default());
@@ -273,7 +293,11 @@ mod tests {
         assert_eq!(mesh.edge_count(), n, "no edge created");
         assert_eq!(mesh.face_count(), 1, "concave loop caps to one n-gon");
         assert_eq!(result.faces().len(), 1);
-        assert_eq!(mesh.face_len(mesh.face_keys()[0]), n, "all six corners present");
+        assert_eq!(
+            mesh.face_len(mesh.face_keys()[0]),
+            n,
+            "all six corners present"
+        );
         mesh.validate_topology();
     }
 
@@ -281,7 +305,12 @@ mod tests {
     fn two_disjoint_loops_cap_to_two_ngons_in_one_call() {
         let mut mesh = LoopMesh::new();
         let mut edges = convex_wire_ring(&mut mesh, 4, 1.0, Vec3::new(-5.0, 0.0, 0.0));
-        edges.extend(convex_wire_ring(&mut mesh, 5, 1.0, Vec3::new(5.0, 0.0, 0.0)));
+        edges.extend(convex_wire_ring(
+            &mut mesh,
+            5,
+            1.0,
+            Vec3::new(5.0, 0.0, 0.0),
+        ));
 
         let result = mesh.edgeloop_fill(&edges, &EdgeloopFillParams::default());
 
@@ -291,7 +320,11 @@ mod tests {
         assert_eq!(result.faces().len(), 2, "faces.out reports both new n-gons");
         let mut arities: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
         arities.sort_unstable();
-        assert_eq!(arities, vec![4, 5], "the quad and the pentagon were each capped");
+        assert_eq!(
+            arities,
+            vec![4, 5],
+            "the quad and the pentagon were each capped"
+        );
         mesh.validate_topology();
     }
 
@@ -350,7 +383,10 @@ mod tests {
     fn use_smooth_stamps_smooth_flag_on_cap() {
         let mut mesh = LoopMesh::new();
         let edges = convex_wire_ring(&mut mesh, 6, 1.0, Vec3::ZERO);
-        let params = EdgeloopFillParams { use_smooth: true, ..Default::default() };
+        let params = EdgeloopFillParams {
+            use_smooth: true,
+            ..Default::default()
+        };
         let result = mesh.edgeloop_fill(&edges, &params);
 
         assert_eq!(result.faces().len(), 1, "one n-gon capped");

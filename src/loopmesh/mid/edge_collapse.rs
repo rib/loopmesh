@@ -103,15 +103,27 @@ impl LoopMesh {
         }
 
         // The faces on e_kill's radial are the faces that have v_kill as a
-        // corner. Any of these whose side count is exactly 3 will bottom out
-        // at a 2-gon once the corner is removed; record them so they can be
-        // reaped after the splice. (No allocation for the typical boundary /
-        // manifold fan radial of ≤ 2 loops.)
+        // corner — the faces this collapse *re-shapes*. Any of these whose side
+        // count is exactly 3 will bottom out at a 2-gon once the corner is
+        // removed, and is reaped after the splice; the rest survive one side
+        // shorter, and one of them may land coincident with an untouched
+        // neighbour (the doubled face the weld below resolves). (No allocation
+        // for the typical boundary / manifold fan radial of ≤ 2 loops.)
+        //
+        // `collapsed_faces` holds keys that may name *dead* faces by the time
+        // the weld consults them (the reap above kills the 2-gons). Membership
+        // stays a sound provenance test only because no face is *created*
+        // between this collection and the weld, so no key can be recycled onto
+        // a face this collapse did not re-shape.
+        let mut collapsed_faces: SmallVec<[FaceKey; 4]> = SmallVec::new();
         let degenerate_faces: SmallVec<[FaceKey; 4]> = {
             let mut out: SmallVec<[FaceKey; 4]> = SmallVec::new();
             let mut radial = self.radial_loops(e_kill);
             while let Some(l_kill) = radial.next(self) {
                 let face = self.loops.get(l_kill).face;
+                if !collapsed_faces.contains(&face) {
+                    collapsed_faces.push(face);
+                }
                 if self.faces.get(face).len <= 3 && !out.contains(&face) {
                     out.push(face);
                 }
@@ -200,7 +212,9 @@ impl LoopMesh {
         // onto one clean face rather than keeping the duplicate).
         let mut surviving = e_old;
         if flags.kill_duplicate_faces && self.edges.try_get(e_old).is_some() {
-            if let Some(welded) = self.weld_duplicate_edge_face(e_old, v_target, v_old) {
+            if let Some(welded) =
+                self.weld_duplicate_edge_face(e_old, v_target, v_old, &collapsed_faces)
+            {
                 surviving = welded;
             }
         }
@@ -215,11 +229,27 @@ impl LoopMesh {
     /// (`DISSOLVE_VERTS.md` §6.6 `kill_duplicate_faces`). Returns the surviving
     /// edge after the splice (the kept sibling), or `None` if no duplicate was
     /// found and `repointed` is left as-is.
+    ///
+    /// `collapsed_faces` are the faces this collapse re-shaped (those that had
+    /// the killed vert as a corner). It decides *which* twin of a doubled pair
+    /// dies: the one the collapse just re-shaped, not the untouched one.
+    ///
+    /// The guides fix this at the **outcome** level, not as a quoted rule:
+    /// `DISSOLVE_VERTS.md` §6.6 + §8's box and `UNSUBDIVIDE.md` §5.1.1 require
+    /// the degenerating fan to close onto a *single* clean face with **no**
+    /// surviving doubled face (the oracle-measured 4/4/1 counts). Neither twin
+    /// here is newly *constructed* — both pre-date the collapse; one merely lost
+    /// a corner — so the provenance tie-break below is an **inference** from
+    /// that required outcome, not a rule the guides state. It is the only
+    /// tie-break that is stable: the twins carry the same vertex set in
+    /// *opposite* windings, so picking by walk position would sometimes leave
+    /// the fold-back copy behind and block the neighbouring face-join.
     fn weld_duplicate_edge_face(
         &mut self,
         repointed: EdgeKey,
         va: VertexKey,
         vb: VertexKey,
+        collapsed_faces: &[FaceKey],
     ) -> Option<EdgeKey> {
         // Find a sibling edge spanning the same vertex pair as `repointed`.
         let sibling = {
@@ -272,7 +302,26 @@ impl LoopMesh {
                 let set_b: SmallVec<[VertexKey; 6]> =
                     self.face_vert_keys(face_b).into_iter().collect();
                 if set_a.len() == set_b.len() && set_a.iter().all(|v| set_b.contains(v)) {
-                    self.face_kill(face_b);
+                    // Provenance tie-break (see the doc comment): the twin this
+                    // collapse re-shaped dies; the untouched one lives.
+                    //
+                    // The both-in / neither-in fallback has no provenance to
+                    // separate the pair, so it degrades to the walk position —
+                    // which is exactly the rotation-sensitive pick the entry
+                    // convention exists to eliminate. No guide covers this
+                    // configuration and no test reaches it: treat it as latent
+                    // and unspecified, not as settled behaviour.
+                    let doomed = if collapsed_faces.contains(&face_b) {
+                        face_b
+                    } else if collapsed_faces.contains(&face_a) {
+                        face_a
+                    } else {
+                        face_b
+                    };
+                    self.face_kill(doomed);
+                    if doomed == face_a {
+                        break;
+                    }
                 }
             }
         }

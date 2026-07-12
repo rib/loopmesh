@@ -1004,22 +1004,22 @@ impl LoopMesh {
     /// so the merge keeps the §11 customdata winner. `None` for wire /
     /// boundary / self-radial / non-manifold edges.
     ///
-    /// Mirrors the dissolve-edges §3.1 survivor resolution: loopmesh's radial
-    /// cycle emits the first-built face's loop at the head, so the `e.l`
-    /// survivor is the head's radial-next (the second-built face), passed first.
+    /// Mirrors the dissolve-edges §3.1 survivor resolution: the `e.l` survivor
+    /// is the edge's radial **entry**, which the §6.2 radial traversal emits
+    /// first.
     fn dissolve_limit_edge_face_pair(&self, edge: EdgeKey) -> Option<(FaceKey, FaceKey)> {
         let mut radial = self.radial_loops(edge);
-        let head = radial.next(self)?;
-        let second = radial.next(self)?;
+        let entry = radial.next(self)?;
+        let other = radial.next(self)?;
         if radial.next(self).is_some() {
             return None;
         }
-        let head_face = self.loops.get(head).face;
-        let second_face = self.loops.get(second).face;
-        if head_face == second_face {
+        let entry_face = self.loops.get(entry).face;
+        let other_face = self.loops.get(other).face;
+        if entry_face == other_face {
             return None;
         }
-        Some((second_face, head_face))
+        Some((entry_face, other_face))
     }
 
     /// Count `v`'s incident edges, capped at 3 (edge-pair detection).

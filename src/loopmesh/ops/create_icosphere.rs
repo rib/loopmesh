@@ -151,7 +151,9 @@ impl LoopMesh {
                     subdivided_faces = geom.faces;
                 }
                 SubdivideResult::Unsupported => {
-                    panic!("spherical grid-fill subdivision is required for the icosphere refinement")
+                    panic!(
+                        "spherical grid-fill subdivision is required for the icosphere refinement"
+                    )
                 }
             }
         }
@@ -335,7 +337,11 @@ mod tests {
         let one = counts(1);
         assert_eq!(one, (12, 30, 20), "subdivisions = 1 → bare icosahedron");
         assert_eq!(counts(0), one, "subdivisions = 0 ≡ 1 (no subdivision)");
-        assert_eq!(counts(-3), one, "negative subdivisions ≡ 1 (no subdivision)");
+        assert_eq!(
+            counts(-3),
+            one,
+            "negative subdivisions ≡ 1 (no subdivision)"
+        );
         assert!(one.0 > 0, "the ≤ 1 guard is not a build-nothing no-op");
     }
 

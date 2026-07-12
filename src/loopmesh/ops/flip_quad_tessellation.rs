@@ -118,7 +118,10 @@ mod tests {
         mesh.flip_quad_tessellation(&[face]);
         let after = implied_diagonal(&mesh, face);
 
-        assert_ne!(before, after, "one flip moves the diagonal to the other pair");
+        assert_ne!(
+            before, after,
+            "one flip moves the diagonal to the other pair"
+        );
     }
 
     /// §5.1 — period of the start (4) vs period of the diagonal (2): two
