@@ -5,6 +5,7 @@
 //! and double-precision floats, 2/3/4-component float vectors, four-byte
 //! values, and strings.
 
+use crate::loopmesh::InterpPolicy;
 use std::borrow::Cow;
 
 /// The type of an element attribute. Each variant is a complete value type
@@ -75,16 +76,14 @@ impl AttrType {
         matches!(self, AttrType::String)
     }
 
-    /// True for types that default to a weighted (`Linear`) blend. The
-    /// float scalar / vector types. Integer, byte, bool, and string types
-    /// default to `Nearest` / `CopyFirst` instead — including `Vec4U8`,
-    /// which is opaque bytes by default; a caller treating it as a colour
-    /// can opt into `Linear` explicitly (the blend dispatch supports it).
+    /// True for types whose *default* interpolation policy is the plain
+    /// weighted blend. Derived from [`InterpPolicy::default_for`] rather than
+    /// restating the type→policy routing, which lives there alone.
+    ///
+    /// Note this is the type's default: a `Vec4U8` registered as a colour opts
+    /// into `Linear` and blends, while `AttrType::Vec4U8.is_math()` is `false`.
     pub fn is_math(self) -> bool {
-        matches!(
-            self,
-            AttrType::F32 | AttrType::F64 | AttrType::Vec2 | AttrType::Vec3 | AttrType::Vec4
-        )
+        matches!(InterpPolicy::default_for(self), InterpPolicy::Linear)
     }
 }
 

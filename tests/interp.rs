@@ -336,7 +336,7 @@ fn no_interp_policy_leaves_destination_unchanged() {
 }
 
 #[test]
-fn string_attribute_copy_first_on_edge_split() {
+fn string_attribute_is_not_interpolated_on_edge_split() {
     let mut mesh = LoopMesh::new();
     let v0 = mesh.create_vertex(Vec3::ZERO);
     let v1 = mesh.create_vertex(Vec3::X);
@@ -351,12 +351,14 @@ fn string_attribute_copy_first_on_edge_split() {
         .set_string(note, v1.as_usize(), Some("from-v1".to_string()));
 
     let (v_new, _) = mesh.edge_split(e, v0, 0.5);
-    // CopyFirst → sources[0] is v0 (the near endpoint at weight 1-fac).
+    // A string layer's type defines no interpolation (BMESH.md §10.1.4): the
+    // blend neither synthesises a value nor copies one from an endpoint, so the
+    // freshly minted vertex keeps its default (no string).
     let got = mesh
         .vertex_attribs()
         .get_string(note, v_new.as_usize())
         .map(|s| s.to_string());
-    assert_eq!(got.as_deref(), Some("from-v0"));
+    assert_eq!(got, None);
 }
 
 // ----- Loop-attribute interpolation -----

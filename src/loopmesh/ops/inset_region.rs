@@ -751,10 +751,10 @@ impl LoopMesh {
         // until every wall exists only means each tagged corner already carries
         // its full set of incident wall inner-edge loops when the pass runs.
         // Per INSET.md §6.3 the merge only applies when at least one loop
-        // layer is a *math* layer — one that blends fractionally
-        // (`InterpPolicy::Linear`). Non-math layers (integer-family, blended
-        // by a nearest/winner-take-one policy) must not be midpointed, so a
-        // mesh carrying only such layers skips the merge entirely.
+        // layer is a *math* layer — one whose type supports the pairwise
+        // average the merge performs (`InterpPolicy::Linear`). Integer and
+        // boolean layers are interpolable but not math, so a mesh carrying
+        // only such layers skips the merge entirely.
         if params.use_interpolate && do_loop_interp && self.has_loop_math_layer() {
             self.inset_merge_corner_loops(face_tag, &wall_side_edges);
         }
@@ -1169,9 +1169,10 @@ impl LoopMesh {
     /// INSET.md §6.2 far-loop write — overlay the tagged inset face's *pre-move*
     /// customdata at one snapshot corner onto a wall loop. A one-hot weight on
     /// the named corner reproduces that corner's snapshot value exactly for
-    /// every interpolable layer (math layers re-normalise to a copy; integer /
-    /// nearest layers pick the winning corner). NoInterp layers are left as the
-    /// caller seeded them (the live tagged value, which §7 never moved).
+    /// every interpolable layer — the weighted sum re-normalises to a copy, the
+    /// integer round-trip is exact on it, and the disjunction sees only that one
+    /// positively-weighted source. NoInterp layers are left as the caller seeded
+    /// them (the live tagged value, which §7 never moved).
     fn write_premove_corner(
         &mut self,
         dst: LoopKey,
@@ -1547,11 +1548,11 @@ impl LoopMesh {
         result
     }
 
-    /// INSET.md §6.3 corner-merge gate — true iff at least one registered
-    /// loop layer blends fractionally (a "math" layer). A layer is a math
-    /// layer when its interpolation policy is the fractional weighted blend
-    /// (`InterpPolicy::Linear`); integer-family layers use a
-    /// nearest/winner-take-one policy and must not trigger the corner merge.
+    /// INSET.md §6.3 corner-merge gate — true iff at least one registered loop
+    /// layer is a "math" layer: one whose type supports the pairwise add and
+    /// scalar multiply the merge's average needs (`InterpPolicy::Linear`). The
+    /// integer and boolean families are interpolable (BMESH.md §10.1.4) but not
+    /// math, and must not trigger the corner merge.
     fn has_loop_math_layer(&self) -> bool {
         self.loop_attribs
             .iter_descriptors()
@@ -2148,17 +2149,17 @@ mod tests {
 
     #[test]
     fn corner_merge_skipped_for_nonmath_integer_loop_layer() {
-        // §6.3 gate: a loop layer whose interpolation is the integer-family
-        // nearest/winner-take-one policy is NOT a math layer, so the corner
-        // merge must not fire. Each tagged corner keeps the per-wall §6.2
-        // value copied from its own seam side; without a math layer there is
-        // nothing to midpoint, so the two walls meeting at a corner keep the
-        // distinct integer values they inherited rather than being equalised.
+        // §6.3 gate: an integer loop layer is interpolable (it blends and
+        // rounds, BMESH.md §10.1.4) but is NOT a *math* layer — it does not
+        // support the pairwise-average arithmetic the merge needs — so the
+        // corner merge must not fire. Each tagged corner keeps the per-wall
+        // §6.2 value it inherited rather than being equalised with its
+        // neighbour's.
         let mut mesh = LoopMesh::new();
         let faces = make_grid_3x3_faces(&mut mesh);
         let centre = faces[4];
 
-        // Integer loop layer → default policy Nearest (non-math).
+        // Integer loop layer → blend-and-round policy (interpolable, non-math).
         let tag = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("region"),
@@ -2167,14 +2168,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             mesh.loop_attribs().descriptor(tag).unwrap().interp,
-            InterpPolicy::Nearest,
+            InterpPolicy::RoundedLinear,
             "integer loop layer should default to a non-math policy"
         );
 
         // Give each face a distinct integer id on all its loops, so the
         // centre face's seam loops differ per side. The corner merge — if it
         // wrongly ran — would average them toward a single value at the
-        // shared corner; the Nearest-policy gate must leave them untouched.
+        // shared corner; the non-math gate must leave them untouched.
         let face_keys: Vec<FaceKey> = mesh.face_keys();
         for (fi, &f) in face_keys.iter().enumerate() {
             let loops: Vec<LoopKey> = {
@@ -2214,9 +2215,8 @@ mod tests {
         mesh.validate_topology();
 
         // The inset (shrunken) centre face's corner ids are untouched: the
-        // §6.3 merge was gated off, and §7 re-interpolation routes the
-        // integer layer through the nearest policy, which on this uniform
-        // per-face layer reproduces the face's own id exactly.
+        // §6.3 merge was gated off, and §7's blend-and-round of a layer whose
+        // sources all hold the same id reproduces that id exactly.
         for &l in &centre_loops {
             let got = mesh.loop_attribs().get_i32(tag, l.as_usize()).unwrap();
             assert_eq!(
@@ -2419,7 +2419,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             mesh.loop_attribs().descriptor(region).unwrap().interp,
-            InterpPolicy::Nearest,
+            InterpPolicy::RoundedLinear,
             "integer loop layer should default to a non-math policy"
         );
 

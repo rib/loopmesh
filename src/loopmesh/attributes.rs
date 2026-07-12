@@ -18,40 +18,61 @@ pub(crate) enum AttributeStorage {
     String(usize),
 }
 
-/// How an attribute is blended when a mid-level op creates a new element
-/// from a weighted set of source elements.
+/// How an attribute is blended when a mid-level op creates a new element from
+/// a weighted set of source elements. The policy is a property of the layer's
+/// *type*, not of whether its values look numeric
+/// (`radial-mesh-guides/BMESH.md` §10.1.4).
 ///
-/// Default per kind:
-/// - numeric float → [`Linear`](Self::Linear)
-/// - numeric integer / byte → [`Nearest`](Self::Nearest)
-/// - string → [`CopyFirst`](Self::CopyFirst) (the only sane default)
+/// There is deliberately **no** nearest / dominant-source policy: a blend never
+/// picks a winning source. Where a source value survives unchanged it is
+/// because of an identity (all sources agree, or an exact short-circuit), not
+/// because anything elected one.
 ///
 /// Override via [`ElementAttributeDesc::with_interp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterpPolicy {
-    /// Weighted sum of source values, normalised by total weight.
+    /// Weighted sum of source values, normalised by total weight. The float
+    /// scalar / vector family (UVs, colours, masks, generic float layers).
     Linear,
-    /// Source with the largest weight wins. Ties resolved by first-encountered.
-    Nearest,
-    /// Always pick `sources[0]`. Lossy; the only viable default for strings
-    /// and "ID-like" attributes.
-    CopyFirst,
-    /// Leave the destination's default-init value untouched. Useful for
-    /// attributes that have no defensible interpolation rule.
+    /// Weighted sum accumulated in floating point, then rounded **half away
+    /// from zero** (`0.5 → 1`, `-0.5 → -1`). The 32-bit integer family.
+    ///
+    /// The sum is **not** renormalised by its own weight total: §10.1.4 hands
+    /// the layer a weight vector that already partitions unity, and dividing by
+    /// a re-accumulated total would perturb the sum by a few ulp — enough to
+    /// knock a blend that lands exactly on a half off the tie the rounding rule
+    /// exists to resolve.
+    RoundedLinear,
+    /// Logical OR: the result is `true` iff *any* source carrying a strictly
+    /// positive weight is `true`. The boolean family. Note this is not a
+    /// blend-and-round — a lone `true` at weight `0.125` still yields `true`.
+    Disjunction,
+    /// The layer's type defines no interpolation: the blend neither synthesises
+    /// a value nor copies one from a source, so whatever the destination slot
+    /// already holds survives. Strings, the byte / byte-vector types, opaque
+    /// ids.
     NoInterp,
 }
 
 impl InterpPolicy {
-    /// Default policy for a given attribute type: weighted `Linear` for the
-    /// math types (float / vector / byte-color), `Nearest` for the integer /
-    /// bool types, `CopyFirst` for strings.
+    /// Default policy for a given attribute type, per `BMESH.md` §10.1.4:
+    /// [`Linear`](Self::Linear) for the float family,
+    /// [`RoundedLinear`](Self::RoundedLinear) for the 32-bit integer family,
+    /// [`Disjunction`](Self::Disjunction) for booleans, and
+    /// [`NoInterp`](Self::NoInterp) for everything else — the byte and
+    /// byte-vector types and strings, whose types define no interpolation at
+    /// all. (A `Vec4U8` used as a *byte colour* is the one type that wants an
+    /// explicit opt-in to `Linear`; [`ElementAttributeDesc::color`] does that.)
     pub fn default_for(ty: AttrType) -> Self {
-        if ty.is_string() {
-            InterpPolicy::CopyFirst
-        } else if ty.is_math() {
-            InterpPolicy::Linear
-        } else {
-            InterpPolicy::Nearest
+        match ty {
+            AttrType::F32
+            | AttrType::F64
+            | AttrType::Vec2
+            | AttrType::Vec3
+            | AttrType::Vec4 => InterpPolicy::Linear,
+            AttrType::I32 | AttrType::U32 => InterpPolicy::RoundedLinear,
+            AttrType::Bool => InterpPolicy::Disjunction,
+            AttrType::U8 | AttrType::Vec4U8 | AttrType::String => InterpPolicy::NoInterp,
         }
     }
 }
@@ -85,8 +106,8 @@ impl ElementAttributeDesc {
         }
     }
 
-    /// Build a string attribute descriptor. Interp policy defaults to
-    /// [`InterpPolicy::CopyFirst`].
+    /// Build a string attribute descriptor. A string layer's type defines no
+    /// interpolation, so the policy defaults to [`InterpPolicy::NoInterp`].
     pub fn string(key: impl Into<AttributeKey>) -> Self {
         Self {
             key: key.into(),
@@ -123,8 +144,15 @@ impl ElementAttributeDesc {
 
     /// Convenience: a colour layer of the given `ty` (role
     /// [`AttrRole::Color`]). `ty` must be `Vec3` / `Vec4` / `Vec4U8`.
+    ///
+    /// Colours blend linearly whatever their storage width, so a `Vec4U8`
+    /// colour layer opts into [`InterpPolicy::Linear`] here — the bare
+    /// [`numeric`](Self::numeric) `Vec4U8` layer is an opaque byte vector and
+    /// keeps the type's [`NoInterp`](InterpPolicy::NoInterp) default.
     pub fn color(key: impl Into<AttributeKey>, ty: AttrType) -> Self {
-        Self::numeric(key, ty).with_role(AttrRole::Color)
+        Self::numeric(key, ty)
+            .with_role(AttrRole::Color)
+            .with_interp(InterpPolicy::Linear)
     }
 }
 
@@ -409,6 +437,33 @@ impl ElementAttributes {
         };
         match storage {
             AttributeStorage::I32(b) => match self.attributes_i32.get_mut(b) {
+                Some(v) if slot < v.len() => {
+                    v[slot] = value;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    pub fn get_u32(&self, attr: ElementAttributeKey, slot: usize) -> Option<u32> {
+        match self.attributes.get(attr.as_usize())?.storage {
+            AttributeStorage::U32(b) => self
+                .attributes_u32
+                .get(b)
+                .and_then(|v| v.get(slot).copied()),
+            _ => None,
+        }
+    }
+
+    pub fn set_u32(&mut self, attr: ElementAttributeKey, slot: usize, value: u32) -> bool {
+        let storage = match self.attributes.get(attr.as_usize()) {
+            Some(d) => d.storage,
+            None => return false,
+        };
+        match storage {
+            AttributeStorage::U32(b) => match self.attributes_u32.get_mut(b) {
                 Some(v) if slot < v.len() => {
                     v[slot] = value;
                     true
@@ -776,9 +831,10 @@ impl ElementAttributes {
     ///   "the same value" differ only in their low float bits, so a byte
     ///   compare would spuriously call them unequal; the tolerant compare is
     ///   what the merge gate and the propagation value-match both need.
-    /// - **Every other layer** (nearest-policy integers, strings, copy-first)
-    ///   compares **exactly** — a nearest-policy integer has no intermediate
-    ///   value, so its equality is bitwise.
+    /// - **Every other layer** (the integer / boolean / no-interp families)
+    ///   compares **exactly** — an integer layer's blend is rounded back onto
+    ///   the lattice and a boolean's is a disjunction, so neither carries a
+    ///   near-miss intermediate and their equality is exact.
     ///
     /// Returns `true` only if *all* layers agree under their respective
     /// predicate.
@@ -873,13 +929,20 @@ impl ElementAttributes {
     /// descriptor's [`InterpPolicy`]:
     ///
     /// - [`Linear`](InterpPolicy::Linear) — weighted sum, normalised by the
-    ///   total weight. Zero total weight leaves the destination unchanged.
-    /// - [`Nearest`](InterpPolicy::Nearest) — copy from the source with the
-    ///   largest weight (first wins on ties).
-    /// - [`CopyFirst`](InterpPolicy::CopyFirst) — copy from `sources[0]`.
+    ///   total weight.
+    /// - [`RoundedLinear`](InterpPolicy::RoundedLinear) — weighted sum
+    ///   accumulated in floating point, rounded half away from zero, *not*
+    ///   renormalised.
+    /// - [`Disjunction`](InterpPolicy::Disjunction) — true iff any
+    ///   strictly-positive-weight source is true.
     /// - [`NoInterp`](InterpPolicy::NoInterp) — leave destination untouched.
     ///
-    /// Empty `sources` is a no-op.
+    /// Empty `sources` is a no-op. A source set whose weights total zero is
+    /// deliberately **asymmetric** across the policies (§10.1.4): the two
+    /// weighted-sum policies have nothing to write and leave the destination
+    /// untouched, whereas the disjunction is defined over the sources that carry
+    /// *strictly positive* weight — of which there are none — and so writes
+    /// `false`.
     pub fn interpolate_into(&mut self, dst_slot: usize, sources: &[(f32, usize)]) {
         if sources.is_empty() {
             return;
@@ -909,7 +972,7 @@ impl ElementAttributes {
     /// sources (inset's `use_interpolate` rebake reads a face's *original*
     /// corner values to recompute the *same* corners' values; see
     /// `radial-mesh-guides/operators/INSET.md` §4.5/§7).
-    pub fn snapshot_slots(&self, slots: &[usize]) -> SlotSnapshot {
+    pub(crate) fn snapshot_slots(&self, slots: &[usize]) -> SlotSnapshot {
         let mut layers = Vec::with_capacity(self.attributes.len());
         for (_, desc) in self.attributes.iter() {
             let values = match desc.storage {
@@ -961,8 +1024,14 @@ impl ElementAttributes {
     /// [`InterpPolicy`] — the fixed-arity blend-descriptor handoff of
     /// `radial-mesh-guides/BMESH.md` §10.1.4. The weights are taken as already
     /// normalised to a partition of unity; `Linear` layers re-normalise by
-    /// their own weight total for robustness.
-    pub fn interpolate_from_snapshot(
+    /// their own weight total for robustness, `RoundedLinear` layers do not
+    /// (see [`InterpPolicy::RoundedLinear`]).
+    ///
+    /// Crate-internal: a snapshot carries no domain marker, so it is only sound
+    /// against the same [`ElementAttributes`] it was captured from (or one with
+    /// an identical layer layout). Keeping it out of the public surface is what
+    /// makes that an invariant rather than a caller-triggerable panic.
+    pub(crate) fn interpolate_from_snapshot(
         &mut self,
         dst_slot: usize,
         snapshot: &SlotSnapshot,
@@ -1231,17 +1300,18 @@ fn set_storage_default(attrs: &mut ElementAttributes, storage: AttributeStorage,
 /// slots, captured by [`ElementAttributes::snapshot_slots`]. Used as a
 /// resample source that is immune to in-place writes on the slots it was
 /// captured from.
-pub struct SlotSnapshot {
+pub(crate) struct SlotSnapshot {
     layers: Vec<(AttributeStorage, InterpPolicy, SnapshotValues)>,
 }
 
 impl SlotSnapshot {
     /// Number of captured slots (snapshot corners).
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.layers.first().map_or(0, |(_, _, v)| v.len())
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -1297,16 +1367,319 @@ fn gather<T: Copy + Default>(bucket: &[T], slots: &[usize]) -> Vec<T> {
         .collect()
 }
 
-/// Index of the snapshot corner carrying the largest weight (first wins on
-/// ties); `None` when every weight is non-positive and no source qualifies.
-fn nearest_snapshot_index(weights: &[f32]) -> Option<usize> {
-    let mut best: Option<(f32, usize)> = None;
-    for (i, &w) in weights.iter().enumerate() {
-        if best.map_or(true, |(bw, _)| w > bw) {
-            best = Some((w, i));
+/// The rounding rule the integer family's blend uses (`BMESH.md` §10.1.4):
+/// half **away from zero** (`0.5 → 1`, `-0.5 → -1`) — not half-to-even, not
+/// truncation. `f32::round` already is this rule; the wrapper pins the choice
+/// so it cannot drift silently.
+#[inline]
+fn round_half_away_from_zero(value: f32) -> f32 {
+    value.round()
+}
+
+/// A bucket value viewed as `N` `f32` lanes, so one blend kernel serves the
+/// float, byte and boolean storages. `from_lanes` is where a byte bucket
+/// re-quantises (rounding half away from zero, saturating on overflow) and where
+/// a boolean bucket collapses back to a bit. The 32-bit integer storages are
+/// *not* here: they go through [`WideLane`], because `f32` cannot hold them
+/// exactly.
+trait BlendLanes<const N: usize>: Copy {
+    fn to_lanes(self) -> [f32; N];
+    fn from_lanes(lanes: [f32; N]) -> Self;
+}
+
+impl BlendLanes<1> for f32 {
+    #[inline]
+    fn to_lanes(self) -> [f32; 1] {
+        [self]
+    }
+    #[inline]
+    fn from_lanes(lanes: [f32; 1]) -> Self {
+        lanes[0]
+    }
+}
+
+impl<const N: usize> BlendLanes<N> for [f32; N] {
+    #[inline]
+    fn to_lanes(self) -> [f32; N] {
+        self
+    }
+    #[inline]
+    fn from_lanes(lanes: [f32; N]) -> Self {
+        lanes
+    }
+}
+
+impl BlendLanes<1> for u8 {
+    #[inline]
+    fn to_lanes(self) -> [f32; 1] {
+        [self as f32]
+    }
+    #[inline]
+    fn from_lanes(lanes: [f32; 1]) -> Self {
+        round_half_away_from_zero(lanes[0]) as u8
+    }
+}
+
+impl BlendLanes<4> for [u8; 4] {
+    #[inline]
+    fn to_lanes(self) -> [f32; 4] {
+        [
+            self[0] as f32,
+            self[1] as f32,
+            self[2] as f32,
+            self[3] as f32,
+        ]
+    }
+    #[inline]
+    fn from_lanes(lanes: [f32; 4]) -> Self {
+        let mut out = [0u8; 4];
+        for lane in 0..4 {
+            out[lane] = round_half_away_from_zero(lanes[lane]) as u8;
+        }
+        out
+    }
+}
+
+impl BlendLanes<1> for bool {
+    #[inline]
+    fn to_lanes(self) -> [f32; 1] {
+        [if self { 1.0 } else { 0.0 }]
+    }
+    #[inline]
+    fn from_lanes(lanes: [f32; 1]) -> Self {
+        lanes[0] != 0.0
+    }
+}
+
+/// A boolean layer's blend is the disjunction whatever numeric-flavoured policy
+/// its descriptor happens to carry; only `NoInterp` opts out (§10.1.4). Booleans
+/// are dilated by interpolation, never averaged.
+#[inline]
+fn boolean_policy(policy: InterpPolicy) -> InterpPolicy {
+    match policy {
+        InterpPolicy::NoInterp => InterpPolicy::NoInterp,
+        _ => InterpPolicy::Disjunction,
+    }
+}
+
+/// The blend kernel (§10.1.4). `None` means "write nothing to the destination":
+/// either the policy defines no interpolation, or no source carried weight.
+#[inline]
+fn blend_lanes<const N: usize>(
+    policy: InterpPolicy,
+    sources: impl Iterator<Item = (f32, [f32; N])>,
+) -> Option<[f32; N]> {
+    match policy {
+        InterpPolicy::NoInterp => None,
+        InterpPolicy::Disjunction => {
+            let mut out = [0.0_f32; N];
+            let mut saw_source = false;
+            for (weight, lanes) in sources {
+                saw_source = true;
+                // Zero and negative weights contribute nothing; a mean-value
+                // solve on a concave polygon can hand us either.
+                if weight > 0.0 {
+                    for lane in 0..N {
+                        if lanes[lane] != 0.0 {
+                            out[lane] = 1.0;
+                        }
+                    }
+                }
+            }
+            saw_source.then_some(out)
+        }
+        InterpPolicy::Linear | InterpPolicy::RoundedLinear => {
+            let mut sum = [0.0_f32; N];
+            let mut weight_total = 0.0_f32;
+            for (weight, lanes) in sources {
+                for lane in 0..N {
+                    sum[lane] += weight * lanes[lane];
+                }
+                weight_total += weight;
+            }
+            if weight_total == 0.0 {
+                return None;
+            }
+            for lane in 0..N {
+                match policy {
+                    InterpPolicy::RoundedLinear => {
+                        sum[lane] = round_half_away_from_zero(sum[lane])
+                    }
+                    _ => sum[lane] /= weight_total,
+                }
+            }
+            Some(sum)
         }
     }
-    best.map(|(_, i)| i)
+}
+
+/// The wide (`f64`-accumulating) blend kernel. Kept apart from [`blend_lanes`]
+/// so the double-precision layer *and* the 32-bit integer layers accumulate
+/// wider than their sources: an `f32` accumulator quantises above 2²⁴, which
+/// would make even a one-hot weight vector a lossy "copy".
+#[inline]
+fn blend_wide(policy: InterpPolicy, sources: impl Iterator<Item = (f32, f64)>) -> Option<f64> {
+    match policy {
+        InterpPolicy::NoInterp => None,
+        InterpPolicy::Disjunction => {
+            let mut out = 0.0_f64;
+            let mut saw_source = false;
+            for (weight, value) in sources {
+                saw_source = true;
+                if weight > 0.0 && value != 0.0 {
+                    out = 1.0;
+                }
+            }
+            saw_source.then_some(out)
+        }
+        InterpPolicy::Linear | InterpPolicy::RoundedLinear => {
+            let mut sum = 0.0_f64;
+            let mut weight_total = 0.0_f64;
+            for (weight, value) in sources {
+                sum += weight as f64 * value;
+                weight_total += weight as f64;
+            }
+            if weight_total == 0.0 {
+                return None;
+            }
+            Some(match policy {
+                InterpPolicy::RoundedLinear => sum.round(),
+                _ => sum / weight_total,
+            })
+        }
+    }
+}
+
+/// A bucket value blended through the wide kernel: the `f64` layer (itself) and
+/// the 32-bit integer layers, whose magnitudes outrun `f32`'s exact range.
+/// `from_wide` is where an integer bucket re-quantises — rounding half away from
+/// zero, saturating on overflow.
+trait WideLane: Copy {
+    fn to_wide(self) -> f64;
+    fn from_wide(value: f64) -> Self;
+}
+
+impl WideLane for f64 {
+    #[inline]
+    fn to_wide(self) -> f64 {
+        self
+    }
+    #[inline]
+    fn from_wide(value: f64) -> Self {
+        value
+    }
+}
+
+impl WideLane for i32 {
+    #[inline]
+    fn to_wide(self) -> f64 {
+        self as f64
+    }
+    #[inline]
+    fn from_wide(value: f64) -> Self {
+        // Float→int `as` saturates at the type's bounds, which is the wanted
+        // behaviour for a blend that overshot the lattice.
+        value.round() as i32
+    }
+}
+
+impl WideLane for u32 {
+    #[inline]
+    fn to_wide(self) -> f64 {
+        self as f64
+    }
+    #[inline]
+    fn from_wide(value: f64) -> Self {
+        value.round() as u32
+    }
+}
+
+/// Blend live bucket slots through the wide kernel.
+fn blend_bucket_wide<T: WideLane>(
+    values: &mut [T],
+    dst: usize,
+    sources: &[(f32, usize)],
+    policy: InterpPolicy,
+) {
+    if dst >= values.len() {
+        return;
+    }
+    let blended = blend_wide(
+        policy,
+        sources
+            .iter()
+            .filter_map(|&(weight, slot)| values.get(slot).map(|&value| (weight, value.to_wide()))),
+    );
+    if let Some(value) = blended {
+        values[dst] = T::from_wide(value);
+    }
+}
+
+/// Blend detached snapshot corners through the wide kernel.
+fn blend_bucket_wide_from_snapshot<T: WideLane>(
+    values: &mut [T],
+    dst: usize,
+    sources: &[T],
+    weights: &[f32],
+    policy: InterpPolicy,
+) {
+    if dst >= values.len() {
+        return;
+    }
+    let blended = blend_wide(
+        policy,
+        weights
+            .iter()
+            .zip(sources)
+            .map(|(&weight, &value)| (weight, value.to_wide())),
+    );
+    if let Some(value) = blended {
+        values[dst] = T::from_wide(value);
+    }
+}
+
+/// Blend live bucket slots (`sources` = weight + slot) into `dst`.
+fn blend_bucket<T: BlendLanes<N>, const N: usize>(
+    values: &mut [T],
+    dst: usize,
+    sources: &[(f32, usize)],
+    policy: InterpPolicy,
+) {
+    if dst >= values.len() {
+        return;
+    }
+    let blended = blend_lanes(
+        policy,
+        sources
+            .iter()
+            .filter_map(|&(weight, slot)| values.get(slot).map(|&value| (weight, value.to_lanes()))),
+    );
+    if let Some(lanes) = blended {
+        values[dst] = T::from_lanes(lanes);
+    }
+}
+
+/// Blend detached snapshot corners into `dst`, one weight per captured corner.
+fn blend_bucket_from_snapshot<T: BlendLanes<N>, const N: usize>(
+    values: &mut [T],
+    dst: usize,
+    sources: &[T],
+    weights: &[f32],
+    policy: InterpPolicy,
+) {
+    if dst >= values.len() {
+        return;
+    }
+    let blended = blend_lanes(
+        policy,
+        weights
+            .iter()
+            .zip(sources)
+            .map(|(&weight, &value)| (weight, value.to_lanes())),
+    );
+    if let Some(lanes) = blended {
+        values[dst] = T::from_lanes(lanes);
+    }
 }
 
 /// Snapshot-source analogue of [`apply_interp`]: blend the captured corner
@@ -1319,237 +1692,64 @@ fn apply_interp_from_snapshot(
     values: &SnapshotValues,
     weights: &[f32],
 ) {
-    macro_rules! linear_vecn {
-        ($bucket:expr, $src:expr, $lanes:expr, $zero:expr) => {{
-            if let Some(out) = $bucket.get_mut(dst) {
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = $zero;
-                        let mut wsum = 0.0_f32;
-                        for (i, &w) in weights.iter().enumerate() {
-                            if let Some(val) = $src.get(i) {
-                                for lane in 0..$lanes {
-                                    sum[lane] += w * val[lane];
-                                }
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            for lane in 0..$lanes {
-                                sum[lane] /= wsum;
-                            }
-                            *out = sum;
-                        }
-                    }
-                    InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
-                        let idx = match policy {
-                            InterpPolicy::CopyFirst => 0,
-                            _ => match nearest_snapshot_index(weights) {
-                                Some(i) => i,
-                                None => return,
-                            },
-                        };
-                        if let Some(val) = $src.get(idx) {
-                            *out = *val;
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
-            }
-        }};
-    }
-
-    macro_rules! pick_int {
-        ($bucket:expr, $src:expr) => {{
-            if let Some(out) = $bucket.get_mut(dst) {
-                let idx = match policy {
-                    InterpPolicy::CopyFirst => 0,
-                    InterpPolicy::NoInterp => return,
-                    // Integer attributes never produce a fractional blend
-                    // (§10.1.4); Linear routes to highest-weight like Nearest.
-                    _ => match nearest_snapshot_index(weights) {
-                        Some(i) => i,
-                        None => return,
-                    },
-                };
-                if let Some(val) = $src.get(idx) {
-                    *out = *val;
-                }
-            }
-        }};
-    }
-
     match (storage, values) {
         (AttributeStorage::F32(b), SnapshotValues::F32(src)) => {
             if let Some(v) = attrs.attributes_f32.get_mut(b) {
-                if let Some(out) = v.get_mut(dst) {
-                    match policy {
-                        InterpPolicy::Linear => {
-                            let mut sum = 0.0_f32;
-                            let mut wsum = 0.0_f32;
-                            for (i, &w) in weights.iter().enumerate() {
-                                if let Some(&val) = src.get(i) {
-                                    sum += w * val;
-                                    wsum += w;
-                                }
-                            }
-                            if wsum != 0.0 {
-                                *out = sum / wsum;
-                            }
-                        }
-                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
-                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
-                                0
-                            } else {
-                                match nearest_snapshot_index(weights) {
-                                    Some(i) => i,
-                                    None => return,
-                                }
-                            };
-                            if let Some(&val) = src.get(idx) {
-                                *out = val;
-                            }
-                        }
-                        InterpPolicy::NoInterp => {}
-                    }
-                }
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
             }
         }
         (AttributeStorage::Vec2(b), SnapshotValues::Vec2(src)) => {
             if let Some(v) = attrs.attributes_vec2.get_mut(b) {
-                linear_vecn!(v, src, 2, [0.0_f32; 2]);
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
             }
         }
         (AttributeStorage::Vec3(b), SnapshotValues::Vec3(src)) => {
             if let Some(v) = attrs.attributes_vec3.get_mut(b) {
-                linear_vecn!(v, src, 3, [0.0_f32; 3]);
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
             }
         }
         (AttributeStorage::Vec4(b), SnapshotValues::Vec4(src)) => {
             if let Some(v) = attrs.attributes_vec4.get_mut(b) {
-                linear_vecn!(v, src, 4, [0.0_f32; 4]);
-            }
-        }
-        (AttributeStorage::U8(b), SnapshotValues::U8(src)) => {
-            if let Some(v) = attrs.attributes_u8.get_mut(b) {
-                pick_int!(v, src);
-            }
-        }
-        (AttributeStorage::I32(b), SnapshotValues::I32(src)) => {
-            if let Some(v) = attrs.attributes_i32.get_mut(b) {
-                pick_int!(v, src);
-            }
-        }
-        (AttributeStorage::U32(b), SnapshotValues::U32(src)) => {
-            if let Some(v) = attrs.attributes_u32.get_mut(b) {
-                pick_int!(v, src);
-            }
-        }
-        (AttributeStorage::String(b), SnapshotValues::String(src)) => {
-            if let Some(v) = attrs.attributes_string.get_mut(b) {
-                if let Some(out) = v.get_mut(dst) {
-                    let idx = match policy {
-                        InterpPolicy::CopyFirst | InterpPolicy::Linear => 0,
-                        InterpPolicy::Nearest => match nearest_snapshot_index(weights) {
-                            Some(i) => i,
-                            None => return,
-                        },
-                        InterpPolicy::NoInterp => return,
-                    };
-                    *out = src.get(idx).cloned().flatten();
-                }
-            }
-        }
-        (AttributeStorage::Bool(b), SnapshotValues::Bool(src)) => {
-            if let Some(v) = attrs.attributes_bool.get_mut(b) {
-                pick_int!(v, src);
-            }
-        }
-        (AttributeStorage::F64(b), SnapshotValues::F64(src)) => {
-            if let Some(v) = attrs.attributes_f64.get_mut(b) {
-                if let Some(out) = v.get_mut(dst) {
-                    match policy {
-                        InterpPolicy::Linear => {
-                            let mut sum = 0.0_f64;
-                            let mut wsum = 0.0_f64;
-                            for (i, &w) in weights.iter().enumerate() {
-                                if let Some(&val) = src.get(i) {
-                                    sum += w as f64 * val;
-                                    wsum += w as f64;
-                                }
-                            }
-                            if wsum != 0.0 {
-                                *out = sum / wsum;
-                            }
-                        }
-                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
-                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
-                                0
-                            } else {
-                                match nearest_snapshot_index(weights) {
-                                    Some(i) => i,
-                                    None => return,
-                                }
-                            };
-                            if let Some(&val) = src.get(idx) {
-                                *out = val;
-                            }
-                        }
-                        InterpPolicy::NoInterp => {}
-                    }
-                }
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
             }
         }
         (AttributeStorage::Vec4U8(b), SnapshotValues::Vec4U8(src)) => {
             if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
-                if let Some(out) = v.get_mut(dst) {
-                    match policy {
-                        InterpPolicy::Linear => {
-                            let mut sum = [0.0_f32; 4];
-                            let mut wsum = 0.0_f32;
-                            for (i, &w) in weights.iter().enumerate() {
-                                if let Some(val) = src.get(i) {
-                                    for lane in 0..4 {
-                                        sum[lane] += w * val[lane] as f32;
-                                    }
-                                    wsum += w;
-                                }
-                            }
-                            if wsum != 0.0 {
-                                *out = round_vec4u8(sum, wsum);
-                            }
-                        }
-                        InterpPolicy::Nearest | InterpPolicy::CopyFirst => {
-                            let idx = if matches!(policy, InterpPolicy::CopyFirst) {
-                                0
-                            } else {
-                                match nearest_snapshot_index(weights) {
-                                    Some(i) => i,
-                                    None => return,
-                                }
-                            };
-                            if let Some(&val) = src.get(idx) {
-                                *out = val;
-                            }
-                        }
-                        InterpPolicy::NoInterp => {}
-                    }
-                }
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
             }
         }
-        _ => {}
+        (AttributeStorage::U8(b), SnapshotValues::U8(src)) => {
+            if let Some(v) = attrs.attributes_u8.get_mut(b) {
+                blend_bucket_from_snapshot(v, dst, src, weights, policy);
+            }
+        }
+        (AttributeStorage::I32(b), SnapshotValues::I32(src)) => {
+            if let Some(v) = attrs.attributes_i32.get_mut(b) {
+                blend_bucket_wide_from_snapshot(v, dst, src, weights, policy);
+            }
+        }
+        (AttributeStorage::U32(b), SnapshotValues::U32(src)) => {
+            if let Some(v) = attrs.attributes_u32.get_mut(b) {
+                blend_bucket_wide_from_snapshot(v, dst, src, weights, policy);
+            }
+        }
+        (AttributeStorage::Bool(b), SnapshotValues::Bool(src)) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                blend_bucket_from_snapshot(v, dst, src, weights, boolean_policy(policy));
+            }
+        }
+        (AttributeStorage::F64(b), SnapshotValues::F64(src)) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                blend_bucket_wide_from_snapshot(v, dst, src, weights, policy);
+            }
+        }
+        // A string layer's type defines no interpolation: a blend never reads
+        // its sources and never writes its destination.
+        (AttributeStorage::String(_), _) => {}
+        (storage, _) => unreachable!(
+            "snapshot layer's value variant does not match its storage {storage:?}"
+        ),
     }
-}
-
-/// Round a weighted f32 accumulator (divided by `wsum`) back to `[u8; 4]`,
-/// clamping each lane into `0..=255`. Used for the explicit-`Linear` blend
-/// of a `Vec4U8` layer.
-fn round_vec4u8(sum: [f32; 4], wsum: f32) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for lane in 0..4 {
-        out[lane] = (sum[lane] / wsum).round().clamp(0.0, 255.0) as u8;
-    }
-    out
 }
 
 /// Per-attribute dispatch for [`ElementAttributes::interpolate_into`].
@@ -1563,275 +1763,55 @@ fn apply_interp(
     match storage {
         AttributeStorage::F32(b) => {
             if let Some(v) = attrs.attributes_f32.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = 0.0_f32;
-                        let mut wsum = 0.0_f32;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                sum += w * val;
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = sum / wsum;
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::Vec2(b) => {
             if let Some(v) = attrs.attributes_vec2.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = [0.0_f32; 2];
-                        let mut wsum = 0.0_f32;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                sum[0] += w * val[0];
-                                sum[1] += w * val[1];
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = [sum[0] / wsum, sum[1] / wsum];
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::Vec3(b) => {
             if let Some(v) = attrs.attributes_vec3.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = [0.0_f32; 3];
-                        let mut wsum = 0.0_f32;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                sum[0] += w * val[0];
-                                sum[1] += w * val[1];
-                                sum[2] += w * val[2];
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = [sum[0] / wsum, sum[1] / wsum, sum[2] / wsum];
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::Vec4(b) => {
             if let Some(v) = attrs.attributes_vec4.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = [0.0_f32; 4];
-                        let mut wsum = 0.0_f32;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                sum[0] += w * val[0];
-                                sum[1] += w * val[1];
-                                sum[2] += w * val[2];
-                                sum[3] += w * val[3];
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = [sum[0] / wsum, sum[1] / wsum, sum[2] / wsum, sum[3] / wsum];
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
-            }
-        }
-        AttributeStorage::F64(b) => {
-            if let Some(v) = attrs.attributes_f64.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = 0.0_f64;
-                        let mut wsum = 0.0_f64;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                sum += w as f64 * val;
-                                wsum += w as f64;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = sum / wsum;
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::Vec4U8(b) => {
             if let Some(v) = attrs.attributes_vec4u8.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    InterpPolicy::Linear => {
-                        let mut sum = [0.0_f32; 4];
-                        let mut wsum = 0.0_f32;
-                        for &(w, s) in sources {
-                            if let Some(&val) = v.get(s) {
-                                for lane in 0..4 {
-                                    sum[lane] += w * val[lane] as f32;
-                                }
-                                wsum += w;
-                            }
-                        }
-                        if wsum != 0.0 {
-                            v[dst] = round_vec4u8(sum, wsum);
-                        }
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
-            }
-        }
-        AttributeStorage::Bool(b) => {
-            if let Some(v) = attrs.attributes_bool.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    // Bool has no fractional blend; Linear degenerates to Nearest.
-                    InterpPolicy::Nearest | InterpPolicy::Linear => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::CopyFirst => {
-                        let s = sources[0].1;
-                        if s < v.len() {
-                            v[dst] = v[s];
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::U8(b) => {
             if let Some(v) = attrs.attributes_u8.get_mut(b) {
-                interp_integer(v, dst, sources, policy, |a, b| a.wrapping_add(b), 0);
+                blend_bucket(v, dst, sources, policy);
             }
         }
         AttributeStorage::I32(b) => {
             if let Some(v) = attrs.attributes_i32.get_mut(b) {
-                interp_integer(v, dst, sources, policy, |a, b| a.wrapping_add(b), 0);
+                blend_bucket_wide(v, dst, sources, policy);
             }
         }
         AttributeStorage::U32(b) => {
             if let Some(v) = attrs.attributes_u32.get_mut(b) {
-                interp_integer(v, dst, sources, policy, |a, b| a.wrapping_add(b), 0);
+                blend_bucket_wide(v, dst, sources, policy);
             }
         }
-        AttributeStorage::String(b) => {
-            if let Some(v) = attrs.attributes_string.get_mut(b) {
-                if dst >= v.len() {
-                    return;
-                }
-                match policy {
-                    // For strings only CopyFirst / Nearest / NoInterp make
-                    // sense; Linear collapses to "use the highest-weight"
-                    // (no defensible "weighted blend" exists for strings).
-                    InterpPolicy::CopyFirst | InterpPolicy::Linear => {
-                        let s = sources[0].1;
-                        v[dst] = v.get(s).cloned().unwrap_or(None);
-                    }
-                    InterpPolicy::Nearest => {
-                        if let Some(s) = nearest_source(sources, v.len()) {
-                            v[dst] = v[s].clone();
-                        }
-                    }
-                    InterpPolicy::NoInterp => {}
-                }
+        AttributeStorage::Bool(b) => {
+            if let Some(v) = attrs.attributes_bool.get_mut(b) {
+                blend_bucket(v, dst, sources, boolean_policy(policy));
             }
         }
+        AttributeStorage::F64(b) => {
+            if let Some(v) = attrs.attributes_f64.get_mut(b) {
+                blend_bucket_wide(v, dst, sources, policy);
+            }
+        }
+        AttributeStorage::String(_) => {}
     }
 }
 
@@ -1993,57 +1973,6 @@ fn apply_copy(attrs: &mut ElementAttributes, dst: usize, src: usize, storage: At
                 }
             }
         }
-    }
-}
-
-/// Pick the source slot with the largest weight; ties go to the
-/// first-encountered. Returns `None` if no source is in-range.
-fn nearest_source(sources: &[(f32, usize)], len: usize) -> Option<usize> {
-    let mut best: Option<(f32, usize)> = None;
-    for &(w, s) in sources {
-        if s >= len {
-            continue;
-        }
-        if best.map_or(true, |(bw, _)| w > bw) {
-            best = Some((w, s));
-        }
-    }
-    best.map(|(_, s)| s)
-}
-
-/// Linear/Nearest/CopyFirst dispatch for integer buckets where "Linear"
-/// degenerates to "weighted sum, rounded by integer truncation". `acc`
-/// adds source contributions; `zero` is the additive identity. Used for
-/// `u8`, `i32`, `u32`.
-fn interp_integer<T: Copy>(
-    v: &mut [T],
-    dst: usize,
-    sources: &[(f32, usize)],
-    policy: InterpPolicy,
-    _acc: impl Fn(T, T) -> T,
-    _zero: T,
-) where
-    T: From<u8>,
-{
-    if dst >= v.len() {
-        return;
-    }
-    match policy {
-        InterpPolicy::Nearest | InterpPolicy::Linear => {
-            // Per default, integer attributes are Nearest. We also route
-            // Linear here so callers that explicitly set Linear on an int
-            // attribute get a defensible behaviour (highest-weight wins).
-            if let Some(s) = nearest_source(sources, v.len()) {
-                v[dst] = v[s];
-            }
-        }
-        InterpPolicy::CopyFirst => {
-            let s = sources[0].1;
-            if s < v.len() {
-                v[dst] = v[s];
-            }
-        }
-        InterpPolicy::NoInterp => {}
     }
 }
 
@@ -2365,6 +2294,454 @@ mod tests {
         assert_eq!(
             mesh.loop_attribs().get_vec2(uv, doomed.as_usize()),
             Some([0.0; 2])
+        );
+    }
+
+    // ----- BMESH.md §10.1.4: the per-layer-type interpolation policy -----
+
+    #[test]
+    fn policy_defaults_follow_the_layer_type() {
+        for ty in [AttrType::F32, AttrType::F64, AttrType::Vec2, AttrType::Vec3, AttrType::Vec4] {
+            assert_eq!(InterpPolicy::default_for(ty), InterpPolicy::Linear, "{ty:?}");
+        }
+        for ty in [AttrType::I32, AttrType::U32] {
+            assert_eq!(
+                InterpPolicy::default_for(ty),
+                InterpPolicy::RoundedLinear,
+                "{ty:?}"
+            );
+        }
+        assert_eq!(
+            InterpPolicy::default_for(AttrType::Bool),
+            InterpPolicy::Disjunction
+        );
+        for ty in [AttrType::U8, AttrType::Vec4U8, AttrType::String] {
+            assert_eq!(InterpPolicy::default_for(ty), InterpPolicy::NoInterp, "{ty:?}");
+        }
+    }
+
+    /// Three vertices carrying `values`, blended into a fourth by `weights`.
+    fn blend_i32_into_fresh_vertex(values: [i32; 2], weights: [f32; 2]) -> i32 {
+        let mut mesh = LoopMesh::new();
+        let sources = [mesh.create_vertex(Vec3::ZERO), mesh.create_vertex(Vec3::X)];
+        let dst = mesh.create_vertex(Vec3::Y);
+        let layer = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        for (v, value) in sources.iter().zip(values) {
+            mesh.vertex_attribs_mut().set_i32(layer, v.as_usize(), value);
+        }
+        let plan = [
+            (weights[0], sources[0].as_usize()),
+            (weights[1], sources[1].as_usize()),
+        ];
+        mesh.vertex_attribs_mut()
+            .interpolate_into(dst.as_usize(), &plan);
+        mesh.vertex_attribs().get_i32(layer, dst.as_usize()).unwrap()
+    }
+
+    #[test]
+    fn i32_layer_blends_then_rounds_half_away_from_zero() {
+        // The blend is a float accumulation, so it can land off the lattice —
+        // it is not a copy of the dominant source.
+        assert_eq!(blend_i32_into_fresh_vertex([100, 104], [0.875, 0.125]), 101);
+        assert_eq!(blend_i32_into_fresh_vertex([100, 101], [0.875, 0.125]), 100);
+
+        // Exact halves round AWAY from zero, in both signs — not to even, not
+        // toward zero.
+        assert_eq!(blend_i32_into_fresh_vertex([2, 3], [0.5, 0.5]), 3);
+        assert_eq!(blend_i32_into_fresh_vertex([7, 8], [0.5, 0.5]), 8);
+        assert_eq!(blend_i32_into_fresh_vertex([-2, -3], [0.5, 0.5]), -3);
+        assert_eq!(blend_i32_into_fresh_vertex([0, -1], [0.5, 0.5]), -1);
+        // Half-to-even would give 4 here; away-from-zero gives 5.
+        assert_eq!(blend_i32_into_fresh_vertex([4, 5], [0.5, 0.5]), 5);
+        // A whole-number blend is untouched by the rounding.
+        assert_eq!(blend_i32_into_fresh_vertex([10, 10], [0.5, 0.5]), 10);
+    }
+
+    #[test]
+    fn i32_blend_does_not_renormalise_a_near_unity_weight_vector() {
+        // §10.1.4's integer rule is "weighted sum, then round" — no division by
+        // the re-accumulated weight total. The mean-value solve hands us weights
+        // that sum to 1.0 only to within a few ulp, and the *only* place that
+        // slop is observable is at an exact half — precisely the tie the
+        // rounding rule exists to break.
+        let mut mesh = LoopMesh::new();
+        let low = mesh.create_vertex(Vec3::ZERO);
+        let high = mesh.create_vertex(Vec3::X);
+        let ballast = mesh.create_vertex(Vec3::Y);
+        let dst = mesh.create_vertex(Vec3::Z);
+        let id = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        mesh.vertex_attribs_mut().set_i32(id, low.as_usize(), 2);
+        mesh.vertex_attribs_mut().set_i32(id, high.as_usize(), 3);
+        // A zero-valued source at a tiny weight: it moves the weight total off
+        // 1.0 without moving the weighted sum off the exact 2.5.
+        mesh.vertex_attribs_mut().set_i32(id, ballast.as_usize(), 0);
+
+        let slop = 2.0e-7_f32;
+        let weight_total = 0.5 + 0.5 + slop;
+        assert_ne!(weight_total, 1.0, "the test needs a non-unity weight total");
+        assert_eq!(
+            (2.5_f32 / weight_total).round() as i32,
+            2,
+            "a renormalising kernel would round this blend down; that is the bug \
+             this test pins"
+        );
+
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[
+                (0.5, low.as_usize()),
+                (0.5, high.as_usize()),
+                (slop, ballast.as_usize()),
+            ],
+        );
+        assert_eq!(
+            mesh.vertex_attribs().get_i32(id, dst.as_usize()),
+            Some(3),
+            "the raw weighted sum is exactly 2.5, which rounds away from zero to 3"
+        );
+    }
+
+    #[test]
+    fn i32_blend_accumulates_wider_than_f32() {
+        // An f32 accumulator quantises above 2^24, which would make even a
+        // one-hot weight vector a lossy copy — the premove-corner overlay of
+        // INSET.md §6.2 depends on that copy being exact.
+        assert_eq!(
+            blend_i32_into_fresh_vertex([2_000_000_001, 7], [1.0, 0.0]),
+            2_000_000_001
+        );
+        assert_eq!(
+            blend_i32_into_fresh_vertex([-2_000_000_001, 7], [1.0, 0.0]),
+            -2_000_000_001
+        );
+        // And a genuine blend of two large sources lands between them, rather
+        // than on the nearest float-representable multiple of 128.
+        assert_eq!(
+            blend_i32_into_fresh_vertex([2_000_000_000, 2_000_000_002], [0.5, 0.5]),
+            2_000_000_001
+        );
+    }
+
+    #[test]
+    fn integer_blend_saturates_instead_of_wrapping() {
+        // A weight vector that does not partition unity can push the sum off the
+        // type's lattice; the re-quantisation clamps rather than wraps.
+        assert_eq!(
+            blend_i32_into_fresh_vertex([i32::MAX, i32::MAX], [1.0, 1.0]),
+            i32::MAX
+        );
+        assert_eq!(
+            blend_i32_into_fresh_vertex([i32::MIN, i32::MIN], [1.0, 1.0]),
+            i32::MIN
+        );
+    }
+
+    #[test]
+    fn u32_layer_blends_and_rounds_like_its_signed_sibling() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let id = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::U32,
+            ))
+            .unwrap();
+
+        let blend = |mesh: &mut LoopMesh, values: [u32; 2], weights: [f32; 2]| -> u32 {
+            mesh.vertex_attribs_mut().set_u32(id, a.as_usize(), values[0]);
+            mesh.vertex_attribs_mut().set_u32(id, b.as_usize(), values[1]);
+            mesh.vertex_attribs_mut().interpolate_into(
+                dst.as_usize(),
+                &[(weights[0], a.as_usize()), (weights[1], b.as_usize())],
+            );
+            mesh.vertex_attribs().get_u32(id, dst.as_usize()).unwrap()
+        };
+
+        assert_eq!(blend(&mut mesh, [100, 104], [0.875, 0.125]), 101);
+        assert_eq!(blend(&mut mesh, [2, 3], [0.5, 0.5]), 3);
+        // Wide accumulation: exact past 2^24, where an f32 lane would quantise.
+        assert_eq!(blend(&mut mesh, [4_000_000_001, 7], [1.0, 0.0]), 4_000_000_001);
+        // A negative weight (mean-value coordinates produce them on concave
+        // polygons) can drive the sum below zero; it saturates at the bound.
+        assert_eq!(blend(&mut mesh, [10, 0], [-1.0, 2.0]), 0);
+    }
+
+    #[test]
+    fn zero_total_weight_is_asymmetric_across_the_policies() {
+        // Deliberate, and §10.1.4-derived: the two weighted-sum policies have
+        // nothing to write and leave the destination alone, while the
+        // disjunction is defined over the strictly-positive-weight sources — of
+        // which there are none — and so writes `false`.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let mask = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("mask"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        let id = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        let flag = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("flag"),
+                AttrType::Bool,
+            ))
+            .unwrap();
+        for v in [a, b] {
+            mesh.vertex_attribs_mut().set_f32(mask, v.as_usize(), 9.0);
+            mesh.vertex_attribs_mut().set_i32(id, v.as_usize(), 9);
+            mesh.vertex_attribs_mut().set_bool(flag, v.as_usize(), true);
+        }
+        mesh.vertex_attribs_mut().set_f32(mask, dst.as_usize(), 1.0);
+        mesh.vertex_attribs_mut().set_i32(id, dst.as_usize(), 1);
+        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), true);
+
+        mesh.vertex_attribs_mut()
+            .interpolate_into(dst.as_usize(), &[(0.0, a.as_usize()), (0.0, b.as_usize())]);
+
+        assert_eq!(mesh.vertex_attribs().get_f32(mask, dst.as_usize()), Some(1.0));
+        assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(1));
+        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+    }
+
+    #[test]
+    fn bool_layer_blends_by_disjunction_not_by_rounding() {
+        let mut mesh = LoopMesh::new();
+        let heavy = mesh.create_vertex(Vec3::ZERO);
+        let light = mesh.create_vertex(Vec3::X);
+        let zero_weight = mesh.create_vertex(Vec3::Y);
+        let dst = mesh.create_vertex(Vec3::Z);
+        let flag = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("flag"),
+                AttrType::Bool,
+            ))
+            .unwrap();
+
+        // A lone `true` at a tiny weight still dilates: blend-and-round would
+        // give round(0.125) = 0 → false, which is the wrong reading.
+        mesh.vertex_attribs_mut().set_bool(flag, heavy.as_usize(), false);
+        mesh.vertex_attribs_mut().set_bool(flag, light.as_usize(), true);
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[(0.875, heavy.as_usize()), (0.125, light.as_usize())],
+        );
+        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(true));
+
+        // Symmetric: which source carries the majority weight is irrelevant.
+        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), false);
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[(0.125, heavy.as_usize()), (0.875, light.as_usize())],
+        );
+        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(true));
+
+        // An all-false source set is the only way to get false back.
+        mesh.vertex_attribs_mut().set_bool(flag, dst.as_usize(), true);
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[(0.5, heavy.as_usize()), (0.5, heavy.as_usize())],
+        );
+        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+
+        // Zero and negative weights contribute nothing, however true they are.
+        mesh.vertex_attribs_mut()
+            .set_bool(flag, zero_weight.as_usize(), true);
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[
+                (1.0, heavy.as_usize()),
+                (0.0, zero_weight.as_usize()),
+                (-0.25, light.as_usize()),
+            ],
+        );
+        assert_eq!(mesh.vertex_attribs().get_bool(flag, dst.as_usize()), Some(false));
+    }
+
+    #[test]
+    fn byte_vector_layer_is_not_interpolated() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+
+        // A bare Vec4U8 is an opaque byte vector: its type defines no
+        // interpolation, so the blend leaves whatever the destination holds.
+        let opaque = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("opaque"),
+                AttrType::Vec4U8,
+            ))
+            .unwrap();
+        // The same storage under a colour role *does* blend.
+        let color = mesh
+            .register_vertex_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("color"),
+                AttrType::Vec4U8,
+            ))
+            .unwrap();
+
+        for (attr, values) in [(opaque, ([0, 0, 0, 0], [100, 100, 100, 100])), (color, ([0, 0, 0, 0], [100, 100, 100, 100]))] {
+            mesh.vertex_attribs_mut().set_vec4u8(attr, a.as_usize(), values.0);
+            mesh.vertex_attribs_mut().set_vec4u8(attr, b.as_usize(), values.1);
+        }
+        mesh.vertex_attribs_mut()
+            .set_vec4u8(opaque, dst.as_usize(), [7, 7, 7, 7]);
+        mesh.vertex_attribs_mut()
+            .set_vec4u8(color, dst.as_usize(), [7, 7, 7, 7]);
+
+        let plan = [(0.5, a.as_usize()), (0.5, b.as_usize())];
+        mesh.vertex_attribs_mut().interpolate_into(dst.as_usize(), &plan);
+
+        assert_eq!(
+            mesh.vertex_attribs().get_vec4u8(opaque, dst.as_usize()),
+            Some([7, 7, 7, 7]),
+            "an opaque byte-vector layer must survive the blend untouched"
+        );
+        assert_eq!(
+            mesh.vertex_attribs().get_vec4u8(color, dst.as_usize()),
+            Some([50, 50, 50, 50]),
+            "a byte colour layer opts into the weighted sum"
+        );
+    }
+
+    #[test]
+    fn float_layer_still_blends_linearly() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let mask = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("mask"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        mesh.vertex_attribs_mut().set_f32(mask, a.as_usize(), 100.0);
+        mesh.vertex_attribs_mut().set_f32(mask, b.as_usize(), 104.0);
+        mesh.vertex_attribs_mut().interpolate_into(
+            dst.as_usize(),
+            &[(0.875, a.as_usize()), (0.125, b.as_usize())],
+        );
+        // No rounding on the float family: the fractional value survives.
+        let got = mesh.vertex_attribs().get_f32(mask, dst.as_usize()).unwrap();
+        assert!((got - 100.5).abs() < 1e-5, "got {got}");
+    }
+
+    #[test]
+    fn string_layer_is_not_interpolated() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let note = mesh
+            .register_vertex_attribute(ElementAttributeDesc::string(AttributeKey::custom("note")))
+            .unwrap();
+        mesh.vertex_attribs_mut()
+            .set_string(note, a.as_usize(), Some("from-a".to_string()));
+        mesh.vertex_attribs_mut()
+            .set_string(note, b.as_usize(), Some("from-b".to_string()));
+        mesh.vertex_attribs_mut()
+            .set_string(note, dst.as_usize(), Some("seeded".to_string()));
+
+        mesh.vertex_attribs_mut()
+            .interpolate_into(dst.as_usize(), &[(0.9, a.as_usize()), (0.1, b.as_usize())]);
+
+        assert_eq!(
+            mesh.vertex_attribs().get_string(note, dst.as_usize()),
+            Some("seeded"),
+            "a string layer's blend must neither synthesise nor copy a value"
+        );
+    }
+
+    #[test]
+    fn snapshot_blend_applies_the_same_policies() {
+        // The snapshot path (the resample of §10.1) must agree with the live
+        // path — the bevel / inset rebakes go through it.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let id = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        let flag = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("flag"),
+                AttrType::Bool,
+            ))
+            .unwrap();
+        mesh.vertex_attribs_mut().set_i32(id, a.as_usize(), 2);
+        mesh.vertex_attribs_mut().set_i32(id, b.as_usize(), 3);
+        mesh.vertex_attribs_mut().set_bool(flag, a.as_usize(), false);
+        mesh.vertex_attribs_mut().set_bool(flag, b.as_usize(), true);
+
+        let snapshot = mesh
+            .vertex_attribs()
+            .snapshot_slots(&[a.as_usize(), b.as_usize()]);
+        mesh.vertex_attribs_mut()
+            .interpolate_from_snapshot(dst.as_usize(), &snapshot, &[0.5, 0.5]);
+        assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(3));
+
+        mesh.vertex_attribs_mut()
+            .interpolate_from_snapshot(dst.as_usize(), &snapshot, &[0.875, 0.125]);
+        assert_eq!(mesh.vertex_attribs().get_i32(id, dst.as_usize()), Some(2));
+        assert_eq!(
+            mesh.vertex_attribs().get_bool(flag, dst.as_usize()),
+            Some(true),
+            "the 0.125-weight `true` still dilates through the snapshot path"
+        );
+    }
+
+    #[test]
+    fn snapshot_one_hot_weight_copies_a_large_integer_exactly() {
+        // The premove-corner overlay (INSET.md §6.2) is a one-hot snapshot
+        // blend, and it claims to reproduce the captured corner exactly. That
+        // holds for an integer only because the accumulator is wider than f32.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        let dst = mesh.create_vertex(Vec3::Y);
+        let id = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("id"),
+                AttrType::I32,
+            ))
+            .unwrap();
+        mesh.vertex_attribs_mut()
+            .set_i32(id, a.as_usize(), 2_000_000_001);
+        mesh.vertex_attribs_mut().set_i32(id, b.as_usize(), -5);
+
+        let snapshot = mesh
+            .vertex_attribs()
+            .snapshot_slots(&[a.as_usize(), b.as_usize()]);
+        mesh.vertex_attribs_mut()
+            .interpolate_from_snapshot(dst.as_usize(), &snapshot, &[1.0, 0.0]);
+        assert_eq!(
+            mesh.vertex_attribs().get_i32(id, dst.as_usize()),
+            Some(2_000_000_001)
         );
     }
 }
