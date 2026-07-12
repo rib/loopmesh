@@ -109,6 +109,41 @@ impl LoopMesh {
 
         Some(f1)
     }
+
+    /// Seat `face` as the radial **entry** of every radial-≤2 edge on its
+    /// perimeter — i.e. make it the *newest* face incident to those edges, the
+    /// state a join that minted a fresh union face would have left behind
+    /// (`RADIAL_EDGE_STRUCTURE.md` §6.2/§6.5's append rule, and the entry-reseat
+    /// rule of `DISSOLVE_VERTS.md` §6.3). [`Self::euler_join_face_kill_edge`]
+    /// preserves `f1`'s handle instead, so its survivor is *not* re-seated; a
+    /// caller whose donor rule reads the entry as a face-age channel across
+    /// successive joins calls this after each one.
+    ///
+    /// This is **not** folded into the join itself: doing so is only correct for
+    /// callers that model the join as a fresh-face creation, and at least one
+    /// pairwise-join consumer is pinned to the opposite reading (see the
+    /// `dissolve_verts` row 52 notes in the parity dashboard). Applying it is
+    /// the caller's decision, and belongs with the caller's donor rule.
+    ///
+    /// Scoped to radial-≤2 edges, the bound §6.3 attaches to the rule itself: on
+    /// a longer cycle an append lands the new loop at a cyclic position a
+    /// re-seat cannot reproduce, so those entries are left alone rather than
+    /// half-modelled.
+    pub(crate) fn face_reseat_perimeter_radial_entries(&mut self, face: FaceKey) {
+        let first = self.faces.get(face).first_edge_loop;
+        let perimeter: smallvec::SmallVec<[LoopKey; 8]> =
+            self.face_loop_iter(first).collect::<smallvec::SmallVec<_>>();
+        for l in perimeter {
+            let perimeter_edge = self.loops.get(l).edge;
+            let radial_next = self.loop_radial_next(l);
+            if self.loop_radial_next(radial_next) != l {
+                continue;
+            }
+            // Head-anchored storage: entry == head.prev, so seating the entry on
+            // `l` means pointing the head at `l`'s radial successor.
+            self.edges.get_mut(perimeter_edge).radial_link = Some(radial_next);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -168,5 +203,83 @@ mod tests {
             assert_eq!(radial.len(), 1);
             assert_eq!(radial[0], face);
         }
+    }
+
+    /// The join preserves `f1`'s handle, so it leaves the perimeter's radial
+    /// entries where they were; `face_reseat_perimeter_radial_entries` is what
+    /// makes the merged face the newest face on its own perimeter, the state a
+    /// fresh-union-face join would have left (`RADIAL_EDGE_STRUCTURE.md`
+    /// §6.2/§6.5, `DISSOLVE_VERTS.md` §6.3).
+    ///
+    /// The discriminating edge is a perimeter edge shared with a face *outside*
+    /// the join: its pristine entry names that outside face, and only the
+    /// re-seat moves it onto the merged one — which is what makes the entry a
+    /// persistent age channel a later surgery can read.
+    #[test]
+    fn test_face_reseat_perimeter_radial_entries_ages_the_merged_face() {
+        let mut mesh = LoopMesh::new();
+        let bottom: Vec<VertexKey> = (0..4)
+            .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
+            .collect();
+        let top: Vec<VertexKey> = (0..4)
+            .map(|i| mesh.create_vertex(Vec3::new(i as f32, 1.0, 0.0)))
+            .collect();
+        let strip: Vec<FaceKey> = (0..3)
+            .map(|i| {
+                let ring = [bottom[i], bottom[i + 1], top[i + 1], top[i]];
+                let edges: Vec<EdgeKey> = (0..4)
+                    .map(|k| {
+                        mesh.create_edge(
+                            [ring[k], ring[(k + 1) % 4]],
+                            EdgeCreateFlags::NO_DUPLICATE,
+                        )
+                    })
+                    .collect();
+                mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+            })
+            .collect();
+        let seam_ab = mesh
+            .face_edge_keys(strip[0])
+            .into_iter()
+            .find(|&e| mesh.edge_face_keys(e).contains(&strip[1]))
+            .expect("f0 and f1 share a seam");
+        let seam_bc = mesh
+            .face_edge_keys(strip[1])
+            .into_iter()
+            .find(|&e| mesh.edge_face_keys(e).contains(&strip[2]))
+            .expect("f1 and f2 share a seam");
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
+            strip[2],
+            "pristine entry is the last face attached to the seam"
+        );
+
+        let merged = mesh
+            .euler_join_face_kill_edge(strip[0], strip[1], seam_ab)
+            .expect("radial-2 seam joins");
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
+            strip[2],
+            "the bare join leaves the entry put — it reuses f1's handle"
+        );
+
+        mesh.face_reseat_perimeter_radial_entries(merged);
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
+            merged,
+            "the merged face is now the newest face on the outward seam"
+        );
+        for l in mesh.face_loop_keys(merged) {
+            let e = mesh.loop_edge(l);
+            assert_eq!(
+                mesh.loop_face(mesh.edge_radial_entry(e).unwrap()),
+                merged,
+                "every perimeter edge of the merged face enters on its loop"
+            );
+        }
+        mesh.validate_topology();
     }
 }
