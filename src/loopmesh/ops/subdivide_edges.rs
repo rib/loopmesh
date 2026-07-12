@@ -4,6 +4,21 @@ use smallvec::SmallVec;
 use super::fractal_noise;
 use crate::loopmesh::*;
 
+/// §4.3.1 — the flat-corner guard's collinearity tolerance: two cut edges
+/// sharing a vertex are collinear there when `|cos θ| > 1 - FLAT_CORNER_COS_EPS`
+/// (about half a degree either side of straight).
+const FLAT_CORNER_COS_EPS: f32 = 5.0e-5;
+
+/// Bit on the guard's transient edge op-flag layer: this edge is in the
+/// operator's input set (§4.1's cut-edge count is read through it).
+const CUT_EDGE: u8 = 0;
+
+/// Bits on the guard's face op-flag layer. `FACE_SEEN` dedupes the candidate
+/// walk (a face is reachable from each of its cut edges); `FLAT_CORNER` carries
+/// the §4.3.1 verdict, read back by the per-face dispatch.
+const FACE_SEEN: u8 = 0;
+const FLAT_CORNER: u8 = 1;
+
 /// Strategy for the quad-with-two-adjacent-cut-edges re-split
 /// ([`SUBDIVIDE_EDGES.md`](../../../../radial-mesh-guides/operators/SUBDIVIDE_EDGES.md)
 /// §5.2). Only [`QuadCornerType::StraightCut`] is part of the core single-cut
@@ -557,6 +572,10 @@ impl LoopMesh {
         // is off, leaving the core untouched.
         let fractal_offset = self.fractal_offset(&params);
 
+        // §4.3.1 — the flat-corner guard reads the *input* edge directions, so it
+        // must be decided before phase one rewrites the cut edges.
+        let guard_layer = self.push_flat_corner_guard(edges);
+
         // A vert op-flag layer tags the freshly-inserted midpoints so phase two
         // can tell original corners from inserted midpoints when it walks a
         // face's loop cycle (§3.1 / §4.1).
@@ -621,9 +640,17 @@ impl LoopMesh {
 
         // ---- Phase two: per-face pattern dispatch (§4) ----
         for face in touched_faces {
-            self.resplit_face(face, midpoint_layer, MIDPOINT, &params, &mut geom);
+            self.resplit_face(
+                face,
+                midpoint_layer,
+                MIDPOINT,
+                guard_layer,
+                &params,
+                &mut geom,
+            );
         }
 
+        self.pop_face_op_flag_layer(guard_layer);
         self.pop_vert_op_flag_layer(midpoint_layer);
         SubdivideResult::Ran(geom)
     }
@@ -781,15 +808,107 @@ impl LoopMesh {
         scratch.insert(ctx.vb, fractal_displace(ctx.co_b, offset, ctx, params));
     }
 
+    /// §4.3.1 — the flat-corner guard. Decide, for every face a cut edge
+    /// touches, whether its generic two-edge fallback (§7.1) is suppressed:
+    /// exactly two of the face's edges are in the input set, those two edges
+    /// **share a vertex**, and they are **collinear** there. Such a face is
+    /// treated as having no cut edges at all — it is not re-split, contributes
+    /// no re-split mark to `geom.out`, and keeps its inserted midpoints as flat
+    /// rim corners.
+    ///
+    /// The verdict is written into the `FLAT_CORNER` bit of a face op-flag
+    /// layer, returned for the dispatch to read back and the caller to pop. It is
+    /// taken on the *input* geometry, before any cut is inserted, which is what
+    /// makes it independent of `cuts` (§9.5.3.5).
+    fn push_flat_corner_guard(&mut self, edges: &[EdgeKey]) -> crate::op_flags::FaceOpFlagLayer {
+        let cut_layer = self.push_edge_op_flag_layer();
+        for &edge in edges {
+            self.edge_op_flag_set(cut_layer, edge, CUT_EDGE);
+        }
+
+        let guard_layer = self.push_face_op_flag_layer();
+        for &edge in edges {
+            let mut radial = self.radial_loops(edge);
+            while let Some(l) = radial.next(self) {
+                let face = self.loops.get(l).face;
+                if self.face_op_flag_test(guard_layer, face, FACE_SEEN) {
+                    continue;
+                }
+                self.face_op_flag_set(guard_layer, face, FACE_SEEN);
+                if let Some([a, b]) = self.face_cut_edge_pair(face, cut_layer) {
+                    if self.cut_edges_form_flat_corner(a, b) {
+                        self.face_op_flag_set(guard_layer, face, FLAT_CORNER);
+                    }
+                }
+            }
+        }
+
+        self.pop_edge_op_flag_layer(cut_layer);
+        guard_layer
+    }
+
+    /// The face's two cut edges (§4.1), or `None` unless it has **exactly** two.
+    /// Only the two-cut faces can reach the fallback, so any other count leaves
+    /// the guard with nothing to decide.
+    fn face_cut_edge_pair(
+        &self,
+        face: FaceKey,
+        cut_layer: crate::op_flags::EdgeOpFlagLayer,
+    ) -> Option<[EdgeKey; 2]> {
+        let mut cut_edges: SmallVec<[EdgeKey; 2]> = SmallVec::new();
+        let mut it = self.face_loops(face);
+        while let Some(l) = it.next(self) {
+            let edge = self.loops.get(l).edge;
+            if edge.is_null() {
+                continue;
+            }
+            if self.edge_op_flag_test(cut_layer, edge, CUT_EDGE) {
+                if cut_edges.len() == 2 {
+                    return None;
+                }
+                cut_edges.push(edge);
+            }
+        }
+        (cut_edges.len() == 2).then(|| [cut_edges[0], cut_edges[1]])
+    }
+
+    /// True when `a` and `b` share a vertex and are collinear there, to within
+    /// the §4.3.1 tolerance. The cosine is taken **unsigned**, so this catches
+    /// both the ~180° straight corner (the edges continue each other) and the
+    /// ~0° spike (they fold back onto one another).
+    fn cut_edges_form_flat_corner(&self, a: EdgeKey, b: EdgeKey) -> bool {
+        let [a0, a1] = self.edge_vert_keys(a);
+        let [b0, b1] = self.edge_vert_keys(b);
+        let shares_vertex = a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1;
+        if !shares_vertex {
+            return false;
+        }
+        // Orientation is irrelevant to an unsigned cosine, so the raw edge
+        // directions serve without re-rooting them at the shared vertex.
+        let u = self.vertex_position(a1) - self.vertex_position(a0);
+        let w = self.vertex_position(b1) - self.vertex_position(b0);
+        let (u_len, w_len) = (u.length(), w.length());
+        if u_len == 0.0 || w_len == 0.0 {
+            return false;
+        }
+        let cos = (u / u_len).dot(w / w_len);
+        cos.abs() > 1.0 - FLAT_CORNER_COS_EPS
+    }
+
     /// Dispatch and apply the §5 / §6 re-split pattern for one touched face.
     fn resplit_face(
         &mut self,
         face: FaceKey,
         layer: crate::op_flags::VertOpFlagLayer,
         midpoint_flag: u8,
+        guard_layer: crate::op_flags::FaceOpFlagLayer,
         params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
+        // §4.3.1 — the guard's verdict, decided on the input geometry before the
+        // cuts landed. Consulted only on the fallback rows below.
+        let flat_corner = self.face_op_flag_test(guard_layer, face, FLAT_CORNER);
+
         // Walk the loop cycle once, recording each corner's vert and whether it
         // is a freshly-inserted midpoint, in cyclic order (§4.1).
         let mut ring: SmallVec<[(VertexKey, bool); 12]> = SmallVec::new();
@@ -823,9 +942,16 @@ impl LoopMesh {
             }
             (3, 2) => {
                 // §6.2 — triangle, two edges cut. A single shared-corner cut
-                // peels a small triangle and leaves a quad. Always fires (no
-                // gating flag — it is neither a one-cut nor an all-cut case).
-                self.tri_two_cut(face, &ring, geom);
+                // peels a small triangle and leaves a quad. No gating flag — it
+                // is neither a one-cut nor an all-cut case — but it is a §4.1
+                // *fallback* row (the two-edge strip wearing a template's
+                // clothes), so the §4.3.1 guard applies. Its two cut edges
+                // always share a corner, so the guard is genuinely reachable
+                // here: a degenerate triangle whose two cut edges are collinear
+                // at that corner is left flat.
+                if !flat_corner {
+                    self.tri_two_cut(face, &ring, geom);
+                }
             }
             (3, 3) => {
                 if params.use_grid_fill {
@@ -849,17 +975,27 @@ impl LoopMesh {
                 }
             }
             (4, 2) if Self::quad_two_cut_is_opposite(&ring) => {
-                // §5.2 opposite case — the straight loop cut. Always fires
-                // (no strategy choice, no gating flag).
+                // §5.2 opposite case — the straight loop cut. This is a §4.1
+                // fallback row too, so the §4.3.1 guard formally covers it and no
+                // gating flag or strategy choice can decline it — but the guard
+                // can never trip: it needs the two cut edges to *share a vertex*,
+                // and opposite quad edges never do. The check is therefore
+                // vacuous here and left out rather than written as dead code.
                 self.quad_two_opposite_cut(face, &ring, geom);
             }
             (4, 2) => {
                 // §5.2 adjacent case. The strategy chooses the interior
                 // geometry laid down once the two rim midpoints exist; all four
                 // share the §5.2.1 shared-corner anchor and far corner `v3`.
+                //
+                // STRAIGHT_CUT is the *absence* of a corner template, so it is
+                // the fallback and the §4.3.1 flat-corner guard bites it. The
+                // three real templates re-split even across a straight corner.
                 match params.quad_corner_type {
                     QuadCornerType::StraightCut => {
-                        self.quad_two_adjacent_straight_cut(face, &ring, geom)
+                        if !flat_corner {
+                            self.quad_two_adjacent_straight_cut(face, &ring, geom)
+                        }
                     }
                     QuadCornerType::InnerVert => {
                         self.quad_two_adjacent_inner_vert(face, &ring, params, geom)
@@ -1396,6 +1532,11 @@ impl LoopMesh {
         // vert. `None` when fractal is off.
         let fractal_offset = self.fractal_offset(&params);
 
+        // §9.5.3.5 — the flat-corner guard is `cuts`-independent: it reads the
+        // *input* edge directions, so it is taken exactly as at `cuts = 1`,
+        // before phase one rewrites the cut edges.
+        let guard_layer = self.push_flat_corner_guard(edges);
+
         let midpoint_layer = self.push_vert_op_flag_layer();
         const MIDPOINT: u8 = 1;
 
@@ -1474,10 +1615,19 @@ impl LoopMesh {
 
         // Phase two: per-face §9.5 lattice fill.
         for face in touched_faces {
-            self.resplit_face_multicut(face, midpoint_layer, MIDPOINT, cuts, &params, &mut geom);
+            self.resplit_face_multicut(
+                face,
+                midpoint_layer,
+                MIDPOINT,
+                guard_layer,
+                cuts,
+                &params,
+                &mut geom,
+            );
         }
 
         self.pop_vert_op_flag_layer(midpoint_layer);
+        self.pop_face_op_flag_layer(guard_layer);
         SubdivideResult::Ran(geom)
     }
 
@@ -1530,10 +1680,15 @@ impl LoopMesh {
         face: FaceKey,
         layer: crate::op_flags::VertOpFlagLayer,
         midpoint_flag: u8,
+        guard_layer: crate::op_flags::FaceOpFlagLayer,
         cuts: u32,
         params: &SubdivideParams,
         geom: &mut SubdivideGeom,
     ) {
+        // §4.3.1 / §9.5.3.5 — the same verdict as at `cuts = 1`, and consulted on
+        // the same rows: the fallbacks only.
+        let flat_corner = self.face_op_flag_test(guard_layer, face, FLAT_CORNER);
+
         let (corners, sides) = self.multicut_corners_and_sides(face, layer, midpoint_flag);
         let corner_count = corners.len();
         let cut_sides = sides.iter().filter(|s| !s.is_empty()).count();
@@ -1569,13 +1724,31 @@ impl LoopMesh {
                     self.tri_one_edge_fan(face, &corners, &sides, geom);
                 }
             }
-            // Two distinct gaps still hide here, each tracked as its own parity
-            // row. (a) The generic two-edge strip (§9.5.3.3 / §7.1) — the
-            // two-opposite-edge quad, the STRAIGHT_CUT two-adjacent quad, the
-            // two-edge triangle, and any n-gon with two cut edges — which zips
-            // the two runs into N connects and N+1 fragments. (b) The three-edge
-            // quad template (§9.5.3.4). Until both land, these faces keep their
-            // §3.3 rim cut verts and are left un-re-split (flat corners).
+            (_, 2) => {
+                // §9.5.3.3 / §7.1 — the fallback rows at `cuts = N`: the generic
+                // two-edge strip (two-opposite-edge quad, STRAIGHT_CUT
+                // two-adjacent quad, two-edge triangle, two-edge n-gon), which
+                // zips the two runs into N connects and N+1 fragments. The strip
+                // surgery is its own parity row and is not implemented yet, so
+                // both the guarded and the unguarded face come out flat today.
+                //
+                // The guard is wired now because it is *not* the strip's
+                // business: §9.5.3.5 pins it as `cuts`-independent, so a face it
+                // suppresses at `cuts = 1` must be suppressed at every N, and
+                // the strip must land already-guarded rather than laying connects
+                // across a straight corner.
+                //
+                // When the §5.2 `quad_corner_type` templates gain their multi-cut
+                // arms they belong *above* this row — a template is never guarded
+                // (§4.3).
+                if flat_corner {
+                    return;
+                }
+            }
+            // The three-edge quad template (§9.5.3.4) is still a gap, as is any
+            // remaining template-less cut count — an n-gon with one, three, or
+            // more cut edges is never re-split at any N (§4.3). These faces keep
+            // their §3.3 rim cut verts and stay flat-cornered.
             _ => {}
         }
     }
@@ -2542,6 +2715,268 @@ mod tests {
         assert!(
             !mesh.face_vert_keys(pent).contains(&v1),
             "pentagon excludes the shared corner v1"
+        );
+    }
+
+    /// A quad with a **straight** (180°) rim corner at `v1`: `(0,0)`, `(1,0)`,
+    /// `(2,0)`, `(1,1)`. The two edges flanking `v1` are collinear, so cutting
+    /// both takes the §4.3.1 flat-corner guard's branch.
+    fn flat_corner_quad(mesh: &mut LoopMesh) -> FaceKey {
+        create_face_from_verts(
+            mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn flat_corner_guard_suppresses_two_adjacent_fallback() {
+        // §4.3.1 — the two cut edges share the straight corner v1 and are
+        // collinear there, so the STRAIGHT_CUT fallback is suppressed: the two
+        // midpoints land on the rim (§3) but no corner cut is laid. One
+        // flat-cornered hexagon: V 6 / E 6 / F 1, and no re-split mark.
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let [v0, v1, v2] = [fv[0], fv[1], fv[2]];
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e12 = mesh.query_edge_exists(v1, v2).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+
+        assert_eq!(
+            counts(&mesh),
+            (6, 6, 1),
+            "flat corner: midpoints inserted, face left flat"
+        );
+        let m01 = find_vert_at(&mesh, Vec3::new(0.5, 0.0, 0.0));
+        let m12 = find_vert_at(&mesh, Vec3::new(1.5, 0.0, 0.0));
+        assert!(
+            mesh.query_edge_exists(m01, m12).is_none(),
+            "no connecting cut across the straight corner"
+        );
+        assert!(
+            geom.geom().faces.is_empty(),
+            "a guarded face contributes no re-split mark"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_does_not_bite_opposite_cut_edges() {
+        // §4.3.1 contrast — the same fixture with two *opposite* edges cut. They
+        // share no vertex, so the guard cannot apply and the strip fires:
+        // V 6 / E 7 / F 2.
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let [v0, v1, v2, v3] = [fv[0], fv[1], fv[2], fv[3]];
+        let e01 = mesh.query_edge_exists(v0, v1).unwrap();
+        let e23 = mesh.query_edge_exists(v2, v3).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e23], SubdivideParams::default());
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(
+            counts(&mesh),
+            (6, 7, 2),
+            "opposite cut edges share no vertex: the strip fires"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_spares_the_corner_templates() {
+        // §4.3.1 — the guard is consulted only on the fallback path. The same
+        // flat-cornered quad under INNERVERT matches a template and re-splits
+        // normally: V 7 / E 9 / F 3, as on a square quad.
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let res = mesh.subdivide_edges(
+            &[e01, e12],
+            SubdivideParams::default().quad_corner_type(QuadCornerType::InnerVert),
+        );
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(
+            counts(&mesh),
+            (7, 9, 3),
+            "a template row re-splits across a straight corner"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_catches_the_spike_corner() {
+        // §4.3.1 — the cosine is unsigned, so a ~0° spike corner (the two cut
+        // edges folding back onto one another) is guarded exactly like the ~180°
+        // straight corner. Here the corner at v1 folds back along the x axis.
+        let mut mesh = LoopMesh::new();
+        let face = create_face_from_verts(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.5, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        );
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(
+            counts(&mesh),
+            (6, 6, 1),
+            "spike corner is guarded like the straight corner"
+        );
+    }
+
+    /// A quad whose corner at `v1` deviates from straight by `off_straight`
+    /// radians: `(0,0)`, `(1,0)`, `v1 + (cos θ, sin θ)`, `(1,1)`. At `θ = 0` this
+    /// is exactly [`flat_corner_quad`]; the two edges flanking `v1` have an
+    /// unsigned cosine of `cos θ`, so `θ` is precisely the guard's input.
+    fn near_flat_corner_quad(mesh: &mut LoopMesh, off_straight: f32) -> FaceKey {
+        create_face_from_verts(
+            mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0 + off_straight.cos(), off_straight.sin(), 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        )
+    }
+
+    /// Cut the two edges flanking the near-straight corner `v1` and report the
+    /// post-op counts.
+    fn cut_near_flat_corner(off_straight_degrees: f32) -> (usize, usize, usize) {
+        let mut mesh = LoopMesh::new();
+        let face = near_flat_corner_quad(&mut mesh, off_straight_degrees.to_radians());
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+        mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        counts(&mesh)
+    }
+
+    #[test]
+    fn flat_corner_guard_tolerance_brackets_half_a_degree() {
+        // §4.3.1 — the threshold is |cos θ| > 1 − 5·10⁻⁵, i.e. collinear to
+        // within ~0.57°. Bracket it: a corner 0.1° off straight is *inside* the
+        // tolerance and guarded (left flat, V 6 / E 6 / F 1); one 5° off is
+        // outside it and re-splits through the STRAIGHT_CUT fallback
+        // (V 6 / E 7 / F 2). A tolerance wrong by orders of magnitude — or one
+        // stated in radians — fails one of the two.
+        assert_eq!(
+            cut_near_flat_corner(0.1),
+            (6, 6, 1),
+            "0.1° off straight is within the collinearity tolerance: guarded"
+        );
+        assert_eq!(
+            cut_near_flat_corner(5.0),
+            (6, 7, 2),
+            "5° off straight is a real corner: the fallback fires"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_ignores_a_zero_length_cut_edge() {
+        // §4.3.1 — a zero-length cut edge has no direction, so no cosine can be
+        // taken and the guard declines to fire (its early return). The face is
+        // template-less with two cut edges, so the fallback runs as normal: the
+        // corner cut lands and the quad becomes two fragments (V 6 / E 7 / F 2).
+        // Here `v1` and `v2` are coincident, so `{v1, v2}` is degenerate.
+        let mut mesh = LoopMesh::new();
+        let face = create_face_from_verts(
+            &mut mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+        );
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(
+            counts(&mesh),
+            (6, 7, 2),
+            "a degenerate cut edge is not collinear with anything: unguarded"
+        );
+        assert_eq!(
+            geom.geom().faces.len(),
+            1,
+            "the fallback fired, so the face carries its re-split mark"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_is_cuts_independent() {
+        // §9.5.3.5 — the guard reads the *input* edge directions, so its verdict
+        // is the same at every N: the flat-cornered quad under STRAIGHT_CUT is
+        // left un-re-split at `cuts = 2` exactly as at `cuts = 1`. Rim: 4 corners
+        // + 2 runs of 2 midpoints = V 8; each cut edge becomes 3 segments, so
+        // E 8; the face is never re-split, so F 1 and no re-split mark.
+        //
+        // (The multi-cut two-edge strip that this suppresses is a separate parity
+        // row and does not exist yet, so an *unguarded* two-adjacent quad also
+        // comes out flat today — this pins the guard's verdict now so the strip
+        // lands already-guarded.)
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01, e12], SubdivideParams::default().cuts(2));
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("expected Ran"),
+        };
+        assert_eq!(
+            counts(&mesh),
+            (8, 8, 1),
+            "guarded at cuts = 2, as at cuts = 1"
+        );
+        assert!(
+            geom.geom().faces.is_empty(),
+            "a guarded face contributes no re-split mark at any N"
+        );
+    }
+
+    #[test]
+    fn flat_corner_guard_spares_the_multicut_templates() {
+        // §4.3.1 / §9.5.3.5 — threading the guard through the multi-cut dispatch
+        // must not reach the template rows. The same flat-cornered quad with all
+        // four edges cut at `cuts = 2` is a fully-cut face — a template, never
+        // guarded — so it grid-fills as usual: a 4x4 lattice, V 16 / E 24 / F 9.
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let edges = mesh.face_edge_keys(face);
+
+        let res = mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(2));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(
+            counts(&mesh),
+            (16, 24, 9),
+            "a template row grid-fills across a straight corner at cuts = 2"
         );
     }
 
