@@ -272,21 +272,69 @@ impl LoopMesh {
     }
 
     pub fn create_vertex(&mut self, position: Vec3) -> VertexKey {
+        self.create_vertex_inner(position, None)
+    }
+
+    /// Create a vertex **from an example** (`radial-mesh-guides/BMESH.md` §13):
+    /// the new vertex's whole per-vertex attribute block is a *copy of the
+    /// example's* rather than the layer defaults, and the copy reaches past the
+    /// block — it also carries the example's cached normal and **all its header
+    /// flags except the selection bit**, so the new vertex comes out unselected
+    /// but otherwise flagged exactly as the example was, **tag included**.
+    ///
+    /// The tag riding along has teeth: an operator whose end-of-run sweep or
+    /// output harvest keys on the tag must put every element it mints from an
+    /// example into the tag state that sweep expects — see [`Self::set_vert_tag`].
+    /// The copy is of the whole header word, so the two *scratch* tag bits
+    /// ([`ElementFlags::TAG1`] / [`ElementFlags::TAG2`], which the op-flag pool
+    /// docs offer as free transient bits) ride along too: an operator marking with
+    /// them while minting from examples inherits its own marks on the new elements.
+    ///
+    /// `example` must still be **live**: the block is read through the example's
+    /// slot at mint time, so a killed (or since-recycled) key names the wrong data.
+    /// An operator that kills its examples must mint before the kill, or capture
+    /// their blocks first.
+    ///
+    /// This is the initialisation, not a post-mint patch: an operator that needs
+    /// the example's block (bevel mints every new vertex from the beveled corner)
+    /// cannot reach the same result by defaulting first and copying after without
+    /// duplicating the layer walk.
+    pub fn create_vertex_from_example(&mut self, position: Vec3, example: VertexKey) -> VertexKey {
+        self.create_vertex_inner(position, Some(example))
+    }
+
+    fn create_vertex_inner(&mut self, position: Vec3, example: Option<VertexKey>) -> VertexKey {
+        let (eflags, normal) = match example {
+            Some(source) => {
+                let source_vertex = self.vertices.get(source);
+                (
+                    source_vertex.eflags & !ElementFlags::SELECTED,
+                    source_vertex.normal,
+                )
+            }
+            None => (ElementFlags::NONE, Vec3::ZERO),
+        };
+
         self.flags |= LoopMeshFlags::VERTICES_INDEX_DIRTY;
         let entry = self.vertices.vacant_entry();
         let vi = VertexKey::from_usize(entry.key());
         entry.insert(Vertex {
-            eflags: ElementFlags::NONE,
+            eflags,
             key: vi,
             index: 0,
             position,
-            normal: Vec3::ZERO,
+            normal,
             disk_loop_start: None,
         });
 
         let key_watermark = self.vertices.key_watermark();
         self.vertex_attribs.mint_slot(vi.as_usize(), key_watermark);
         self.op_flags.mint_vert_slot(vi.as_usize(), key_watermark);
+
+        if let Some(source) = example {
+            self.vertex_attribs
+                .copy_into(vi.as_usize(), source.as_usize());
+        }
 
         vi
     }
