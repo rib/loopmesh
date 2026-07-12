@@ -1,16 +1,77 @@
 use crate::loopmesh::*;
 
 impl LoopMesh {
-    /// Joins N faces into one by repeatedly killing edges shared between
-    /// pairs of remaining faces. Returns the surviving face, or `None` if
+    /// The **composed, loop-minting** face join
+    /// (`RADIAL_EDGE_STRUCTURE.md` §9), specialised to a manifold pair sharing
+    /// `edge`. This — not the raw Euler join
+    /// ([`LoopMesh::euler_join_face_kill_edge`]) — is the merge every
+    /// dissolve-family operator and `edge_rotate` are built on: it constructs
+    /// the union, so every edge of the union's perimeter takes the union's loop
+    /// as its radial **entry**, and the donor rules that read the entry as a
+    /// face-age channel depend on it. The union keeps `donor`'s handle and
+    /// per-face attributes (§9 seeds the union from the caller's first face).
+    pub fn faces_join_pair(
+        &mut self,
+        donor: FaceKey,
+        absorbed: FaceKey,
+        edge: EdgeKey,
+    ) -> Option<FaceKey> {
+        let union = self.euler_join_face_kill_edge(donor, absorbed, edge)?;
+        self.face_seat_perimeter_as_constructed(union);
+        Some(union)
+    }
+
+    /// Bring `face`'s radial cycles to the state a *constructed* union leaves
+    /// them in: the union's fresh loop appended to each perimeter edge (landing
+    /// immediately after that edge's pre-merge entry, and becoming the entry),
+    /// followed by the removal of the source face's loop from that same cycle
+    /// (`RADIAL_EDGE_STRUCTURE.md` §6.5's append + removal rules, §9).
+    ///
+    /// Since this crate's joins re-use a source loop as the union's loop rather
+    /// than minting a fresh one, "append the union's loop, then remove the
+    /// source's" collapses to: **move that one loop to just after the pre-merge
+    /// entry, and seat the entry on it**. The re-splice is skipped when the loop
+    /// already *is* the entry — there, appending after it and then deleting it
+    /// leaves the fresh loop in exactly the slot the source loop already
+    /// occupies, so any churn would rotate the cycle where the reference does
+    /// not (invisible below radial 3, wrong above it).
+    ///
+    /// Call this **once per union**, over the union's *final* perimeter. Seating
+    /// each intermediate union of an n-way merge would leave loops in slots the
+    /// reference never occupies (§9's "mint once").
+    pub(crate) fn face_seat_perimeter_as_constructed(&mut self, face: FaceKey) {
+        // Only radial links are touched, never the face-loop cycle being walked,
+        // so the cursor is stable and the walk allocation-free.
+        let first = self.faces.get(face).first_edge_loop;
+        let mut cursor = first;
+        loop {
+            let next = self.loops.get(cursor).face_loop_links.next;
+            let perimeter_edge = self.loops.get(cursor).edge;
+            if !perimeter_edge.is_null() && self.edge_radial_entry(perimeter_edge) != Some(cursor) {
+                self.face_loop_disconnect_edge(cursor);
+                self.face_loop_connect_edge(perimeter_edge, cursor);
+            }
+            cursor = next;
+            if cursor == first {
+                break;
+            }
+        }
+    }
+
+    /// Joins N faces into one. Returns the surviving face, or `None` if
     /// the input faces are not transitively connected by shared edges.
     ///
-    /// This is the iterative-JFKE form. For multi-cycle regions where some
-    /// interior shared edges become same-face filaments after the pairwise
-    /// joins (e.g. a 2x2 block of quads sharing a centre vertex), the
-    /// trailing cleanup below removes those filament edges and any vertex
-    /// whose entire incident-edge set was interior to the merged region,
-    /// matching the many-input semantics described in
+    /// The union is a **construction** (`RADIAL_EDGE_STRUCTURE.md` §9): the
+    /// topology is reached by pairwise re-splices, but the union is seated on
+    /// its perimeter exactly **once**, over the *final* perimeter — never once
+    /// per intermediate merge, which would park loops in slots the reference
+    /// never occupies on any perimeter edge kept alive at radial ≥ 3.
+    ///
+    /// For multi-cycle regions where some interior shared edges become same-face
+    /// filaments after the pairwise joins (e.g. a 2x2 block of quads sharing a
+    /// centre vertex), the trailing cleanup below removes those filament edges
+    /// and any vertex whose entire incident-edge set was interior to the merged
+    /// region, matching the many-input semantics described in
     /// `radial-mesh-guides/operators/DISSOLVE_FACES.md` §4.1 steps 2 + 4.
     pub fn faces_join(&mut self, faces: &[FaceKey]) -> Option<FaceKey> {
         if faces.is_empty() {
@@ -130,11 +191,17 @@ impl LoopMesh {
             return None;
         };
 
-        // §4.1 step 2 (residual): pairwise JFKE leaves an interior shared
+        // §4.1 step 2 (residual): pairwise re-splicing leaves an interior shared
         // edge behind whenever two input faces share more than one edge —
         // the second-and-later shared edges become "filaments" with both
         // radial loops on the surviving merged face. Sweep them out.
         self.faces_join_dissolve_same_face_filaments(survivor);
+
+        // The union is a *constructed* face, and it is constructed ONCE
+        // (`RADIAL_EDGE_STRUCTURE.md` §9): seat it on its final perimeter here,
+        // after the filaments are gone and before any face kill downstream —
+        // whose forward re-seat of an entry depends on the union's slot.
+        self.face_seat_perimeter_as_constructed(survivor);
 
         // §4.1 step 4: kill verts whose entire incident-edge set was
         // interior. After steps above, such a vert has empty disk. Any
@@ -391,6 +458,9 @@ impl LoopMesh {
 
         self.remove_face_slab_entry(fb);
 
+        // Like the Euler primitive this path stands in for, the splice is
+        // loop-preserving: no radial entry moves here. The union is seated on
+        // its perimeter once, by `faces_join`, after the last pair is merged.
         Some(fa)
     }
 
@@ -949,6 +1019,306 @@ mod tests {
         );
         // Sanity: both produced a 6-corner map.
         assert_eq!(contiguous.len(), 6, "merged hexagon has 6 distinct corners");
+    }
+
+    /// The union face must be aged on its own perimeter whichever pairwise path
+    /// the merge took. The natural manifold case routes through the Euler
+    /// primitive (which re-seats); the same-direction case routes through the
+    /// local reverse-cycle splice, and it must re-seat too — otherwise "is the
+    /// union the entry of its perimeter edges?" would depend on the winding of
+    /// the input, and the entry is the dissolve family's face-age channel
+    /// (`DISSOLVE_VERTS.md` §6.3's entry-reseat rule).
+    #[test]
+    fn faces_join_same_direction_path_ages_the_union_on_its_perimeter() {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+            (0.0, 2.0),
+            (1.0, 2.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+        .collect();
+
+        let mk = |mesh: &mut LoopMesh, ring: [usize; 4]| {
+            let verts: Vec<VertexKey> = ring.iter().map(|&i| v[i]).collect();
+            let edges: Vec<EdgeKey> = (0..4)
+                .map(|k| {
+                    mesh.create_edge(
+                        [verts[k], verts[(k + 1) % 4]],
+                        EdgeCreateFlags::NO_DUPLICATE,
+                    )
+                })
+                .collect();
+            mesh.face_create(&verts, &edges, FaceCreateFlags::NONE)
+        };
+
+        let f_left = mk(&mut mesh, [0, 1, 2, 3]);
+        // Same-direction (non-contiguous) across the shared edge {v1, v2}: both
+        // quads' loops on it start at v1, so the merge takes the splice path.
+        let f_right = mk(&mut mesh, [1, 2, 5, 4]);
+        // A face outside the join, on what will be a perimeter edge of the union.
+        let f_above = mk(&mut mesh, [3, 2, 7, 6]);
+
+        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge");
+        let l_left = mesh.face_edge_share_loop(f_left, shared).unwrap();
+        let l_right = mesh.face_edge_share_loop(f_right, shared).unwrap();
+        assert_eq!(
+            mesh.loop_vertex(l_left),
+            mesh.loop_vertex(l_right),
+            "fixture must exercise the same-direction merge path"
+        );
+
+        let outward = mesh.query_edge_exists(v[2], v[3]).expect("outward edge");
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(outward).unwrap()),
+            f_above,
+            "pristine entry is the last face attached to the outward edge"
+        );
+
+        let merged = mesh
+            .faces_join(&[f_left, f_right])
+            .expect("same-direction pair merges");
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(outward).unwrap()),
+            merged,
+            "the union is the newest face on the outward edge, as on the Euler path"
+        );
+        for l in mesh.face_loop_keys(merged) {
+            let e = mesh.loop_edge(l);
+            assert_eq!(
+                mesh.loop_face(mesh.edge_radial_entry(e).unwrap()),
+                merged,
+                "every perimeter edge of the union enters on its loop"
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// `RADIAL_EDGE_STRUCTURE.md` §6.5's discriminating trace, at n = 2. A spine
+    /// edge carries four faces attached `X, A, Y, Z` — the merged-away source `A`
+    /// sits in the **middle**, which is what separates "append the union after
+    /// the pre-merge entry" (the reference) from "seat the union in the dead
+    /// source's slot" (the rule that does not exist). Merging `A` with `B` across
+    /// a *different* edge leaves the spine on the union's perimeter, and the
+    /// resulting traversal must be `U, X, Y, Z` — not `U, Y, Z, X`.
+    #[test]
+    fn faces_join_seats_the_union_where_an_append_would_not_in_the_dead_slot() {
+        let mut mesh = LoopMesh::new();
+        // The spine edge {s0, s1}, and the four faces hanging off it.
+        let s0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let s1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+
+        let mut fin = |mesh: &mut LoopMesh, x: f32, z: f32| -> FaceKey {
+            let a = mesh.create_vertex(Vec3::new(x, 0.0, z));
+            let b = mesh.create_vertex(Vec3::new(x, 1.0, z));
+            let ring = [s0, a, b, s1];
+            let edges: Vec<EdgeKey> = (0..4)
+                .map(|k| {
+                    mesh.create_edge([ring[k], ring[(k + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
+                })
+                .collect();
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+        };
+
+        let face_x = fin(&mut mesh, 1.0, 1.0);
+        // `A` is attached second — in the middle of the radial cycle.
+        let face_a = fin(&mut mesh, 1.0, 0.0);
+        let face_y = fin(&mut mesh, 1.0, 2.0);
+        let face_z = fin(&mut mesh, 1.0, 3.0);
+
+        let spine = mesh.query_edge_exists(s0, s1).expect("spine edge");
+        assert_eq!(
+            mesh.edge_face_keys(spine),
+            vec![face_z, face_x, face_a, face_y],
+            "pristine traversal from the entry: Z, X, A, Y"
+        );
+
+        // `B`: a quad glued to `A` along A's far edge (the one opposite the
+        // spine), so the merge crosses an edge that is *not* the spine.
+        let a_far = mesh
+            .face_edge_keys(face_a)
+            .into_iter()
+            .find(|&e| {
+                mesh.edge_face_keys(e).len() == 1
+                    && mesh
+                        .edge_vert_keys(e)
+                        .iter()
+                        .all(|&v| mesh.vertex_position(v).x == 1.0)
+            })
+            .expect("A's far edge");
+        let [f0, f1] = mesh.edge_vert_keys(a_far);
+        let b0 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let b1 = mesh.create_vertex(Vec3::new(2.0, 1.0, 0.0));
+        // Wind B so its loop on the shared edge opposes A's.
+        let ring = if mesh.vertex_position(f0).y == 0.0 {
+            [f1, f0, b0, b1]
+        } else {
+            [f0, f1, b0, b1]
+        };
+        let edges: Vec<EdgeKey> = (0..4)
+            .map(|k| mesh.create_edge([ring[k], ring[(k + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE))
+            .collect();
+        let face_b = mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+
+        let union = mesh
+            .faces_join(&[face_a, face_b])
+            .expect("A and B share exactly one edge");
+
+        assert_eq!(
+            mesh.edge_face_keys(spine),
+            vec![union, face_x, face_y, face_z],
+            "the union lands where an append lands — after the pre-merge entry Z — \
+             not in A's dead slot (which would read U, Y, Z, X)"
+        );
+        mesh.validate_topology();
+    }
+
+    /// §9's "mint once": an n ≥ 3 merge must seat the union on the **final**
+    /// perimeter only. The chord `c` here is shared by two region faces *and*
+    /// two out-of-region fins, so it survives the merge (radial 4 → 2) but is
+    /// **interior** to the union — the reference never seats it. A merge that
+    /// re-seats each intermediate union parks a region loop on `c`'s entry, and
+    /// its later removal then pushes the entry forward off the loop the
+    /// reference leaves it on.
+    #[test]
+    fn faces_join_never_seats_an_edge_interior_to_the_final_union() {
+        let mut mesh = LoopMesh::new();
+        // Chord {c0, c1}; quads B and C flank it, fins P and Q also use it.
+        let c0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let c1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+
+        let mut quad = |mesh: &mut LoopMesh, ring: [VertexKey; 4]| -> FaceKey {
+            let edges: Vec<EdgeKey> = (0..4)
+                .map(|k| {
+                    mesh.create_edge([ring[k], ring[(k + 1) % 4]], EdgeCreateFlags::NO_DUPLICATE)
+                })
+                .collect();
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+        };
+
+        // B, on the -x side. Attached to the chord first.
+        let b0 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let b1 = mesh.create_vertex(Vec3::new(-1.0, 1.0, 0.0));
+        let face_b = quad(&mut mesh, [b0, c0, c1, b1]);
+        // Fin P, out of the region.
+        let p0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let p1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+        let fin_p = quad(&mut mesh, [c0, p0, p1, c1]);
+        // C, on the +x side (opposite winding across the chord to B).
+        let d0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let d1 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let face_c = quad(&mut mesh, [c1, c0, d0, d1]);
+        // Fin Q, out of the region — attached last, so it is the chord's entry.
+        let q0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 2.0));
+        let q1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 2.0));
+        let fin_q = quad(&mut mesh, [c0, q0, q1, c1]);
+        // A, glued to B's far edge — the third region face, so the merge is n = 3.
+        let a0 = mesh.create_vertex(Vec3::new(-2.0, 0.0, 0.0));
+        let a1 = mesh.create_vertex(Vec3::new(-2.0, 1.0, 0.0));
+        let face_a = quad(&mut mesh, [a0, b0, b1, a1]);
+
+        let chord = mesh.query_edge_exists(c0, c1).expect("chord");
+        assert_eq!(
+            mesh.edge_face_keys(chord),
+            vec![fin_q, face_b, fin_p, face_c],
+            "pristine traversal from the entry: Q, B, P, C"
+        );
+
+        mesh.faces_join(&[face_a, face_b, face_c])
+            .expect("A-B-C is edge-connected");
+
+        assert_eq!(
+            mesh.edge_face_keys(chord),
+            vec![fin_q, fin_p],
+            "the chord is interior to the union: it never takes the union's loop, \
+             it merely loses B's and C's — and the survivors keep their order, \
+             read from the untouched entry Q"
+        );
+        mesh.validate_topology();
+    }
+
+    /// The consequence the dissolve family's customdata flow rests on
+    /// (`DISSOLVE_VERTS.md` §6.3): a *chain* of composed joins, each taking its
+    /// donor from the entry face of the edge it joins across, carries the
+    /// **first** join's per-face block to the end — after the first join the
+    /// running union is the entry of every surviving perimeter edge, so it is
+    /// its own donor from then on.
+    #[test]
+    fn faces_join_pair_chain_carries_the_first_donors_face_cd() {
+        let mut mesh = LoopMesh::new();
+        let strip: Vec<FaceKey> = {
+            let bottom: Vec<VertexKey> = (0..=3)
+                .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
+                .collect();
+            let top: Vec<VertexKey> = (0..=3)
+                .map(|i| mesh.create_vertex(Vec3::new(i as f32, 1.0, 0.0)))
+                .collect();
+            (0..3)
+                .map(|i| {
+                    let ring = [bottom[i], bottom[i + 1], top[i + 1], top[i]];
+                    let edges: Vec<EdgeKey> = (0..4)
+                        .map(|k| {
+                            mesh.create_edge(
+                                [ring[k], ring[(k + 1) % 4]],
+                                EdgeCreateFlags::NO_DUPLICATE,
+                            )
+                        })
+                        .collect();
+                    mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+                })
+                .collect()
+        };
+        let tag = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("face_tag"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        for (i, &face) in strip.iter().enumerate() {
+            mesh.face_attribs_mut()
+                .set_vec3(tag, face.as_usize(), [i as f32, 0.0, 0.0]);
+        }
+        let seam = |mesh: &LoopMesh, a: FaceKey, b: FaceKey| {
+            mesh.face_edge_keys(a)
+                .into_iter()
+                .find(|&e| mesh.edge_face_keys(e).contains(&b))
+                .expect("the two faces share a seam")
+        };
+        let seam_ab = seam(&mesh, strip[0], strip[1]);
+        let seam_bc = seam(&mesh, strip[1], strip[2]);
+
+        let donor = mesh.loop_face(mesh.edge_radial_entry(seam_ab).unwrap());
+        assert_eq!(donor, strip[1], "pristine entry is the later-built face");
+        let running = mesh
+            .faces_join_pair(donor, strip[0], seam_ab)
+            .expect("first seam joins");
+
+        let donor = mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap());
+        assert_eq!(
+            donor, running,
+            "the running union is the newest face on the next seam"
+        );
+        let final_face = mesh
+            .faces_join_pair(donor, strip[2], seam_bc)
+            .expect("second seam joins");
+
+        assert_eq!(mesh.face_count(), 1);
+        assert_eq!(
+            mesh.face_attribs()
+                .get_vec3(tag, final_face.as_usize())
+                .expect("tagged")[0]
+                .round() as usize,
+            1,
+            "the chain ends on the first join's donor, not the pristine f2"
+        );
+        mesh.validate_topology();
     }
 
     /// Negative case for §4.2: joining two adjacent quads on a 3x3 grid

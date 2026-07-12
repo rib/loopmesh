@@ -8,6 +8,20 @@ impl LoopMesh {
     /// Preconditions: `f1 != f2`, `edge` is 2-manifold (radial length 2),
     /// both faces share exactly one edge (`edge`), and the shared edge's
     /// loops have opposite winding directions (the normal manifold case).
+    ///
+    /// **This is the raw Euler join: a pure re-splice.** It appends no fresh
+    /// loop to any surviving edge — `f2`'s loops are re-stamped onto `f1` *in
+    /// place* — so **no perimeter edge's radial entry moves**, in pointer or in
+    /// cyclic position (`RADIAL_EDGE_STRUCTURE.md` §8.4, and §6.5's
+    /// entry-motion discriminant: entries are never *set*, only appended-onto
+    /// and re-seated-forward).
+    ///
+    /// Callers that want the *composed* face join — the one that constructs the
+    /// union and therefore does re-seat every perimeter entry onto it — must
+    /// call [`LoopMesh::faces_join_pair`] / [`LoopMesh::faces_join`] instead.
+    /// The two primitives reach the same topology with **different** radial
+    /// entries, observable at radial ≥ 3, so the choice is not an
+    /// implementation detail (`RADIAL_EDGE_STRUCTURE.md` §8.4, §9).
     pub fn euler_join_face_kill_edge(
         &mut self,
         f1: FaceKey,
@@ -109,41 +123,6 @@ impl LoopMesh {
 
         Some(f1)
     }
-
-    /// Seat `face` as the radial **entry** of every radial-≤2 edge on its
-    /// perimeter — i.e. make it the *newest* face incident to those edges, the
-    /// state a join that minted a fresh union face would have left behind
-    /// (`RADIAL_EDGE_STRUCTURE.md` §6.2/§6.5's append rule, and the entry-reseat
-    /// rule of `DISSOLVE_VERTS.md` §6.3). [`Self::euler_join_face_kill_edge`]
-    /// preserves `f1`'s handle instead, so its survivor is *not* re-seated; a
-    /// caller whose donor rule reads the entry as a face-age channel across
-    /// successive joins calls this after each one.
-    ///
-    /// This is **not** folded into the join itself: doing so is only correct for
-    /// callers that model the join as a fresh-face creation, and at least one
-    /// pairwise-join consumer is pinned to the opposite reading (see the
-    /// `dissolve_verts` row 52 notes in the parity dashboard). Applying it is
-    /// the caller's decision, and belongs with the caller's donor rule.
-    ///
-    /// Scoped to radial-≤2 edges, the bound §6.3 attaches to the rule itself: on
-    /// a longer cycle an append lands the new loop at a cyclic position a
-    /// re-seat cannot reproduce, so those entries are left alone rather than
-    /// half-modelled.
-    pub(crate) fn face_reseat_perimeter_radial_entries(&mut self, face: FaceKey) {
-        let first = self.faces.get(face).first_edge_loop;
-        let perimeter: smallvec::SmallVec<[LoopKey; 8]> =
-            self.face_loop_iter(first).collect::<smallvec::SmallVec<_>>();
-        for l in perimeter {
-            let perimeter_edge = self.loops.get(l).edge;
-            let radial_next = self.loop_radial_next(l);
-            if self.loop_radial_next(radial_next) != l {
-                continue;
-            }
-            // Head-anchored storage: entry == head.prev, so seating the entry on
-            // `l` means pointing the head at `l`'s radial successor.
-            self.edges.get_mut(perimeter_edge).radial_link = Some(radial_next);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -205,26 +184,142 @@ mod tests {
         }
     }
 
-    /// The join preserves `f1`'s handle, so it leaves the perimeter's radial
-    /// entries where they were; `face_reseat_perimeter_radial_entries` is what
-    /// makes the merged face the newest face on its own perimeter, the state a
-    /// fresh-union-face join would have left (`RADIAL_EDGE_STRUCTURE.md`
-    /// §6.2/§6.5, `DISSOLVE_VERTS.md` §6.3).
+    /// The raw Euler join is *loop-preserving*: it appends no fresh loop to any
+    /// surviving edge, so no perimeter entry moves
+    /// (`RADIAL_EDGE_STRUCTURE.md` §8.4, §6.5's "there is no third rule").
     ///
     /// The discriminating edge is a perimeter edge shared with a face *outside*
-    /// the join: its pristine entry names that outside face, and only the
-    /// re-seat moves it onto the merged one — which is what makes the entry a
-    /// persistent age channel a later surgery can read.
+    /// the join: its pristine entry names that outside face, and the join must
+    /// leave it there. (The *composed* join —
+    /// [`LoopMesh::faces_join_pair`] — is the one that seats the union.)
     #[test]
-    fn test_face_reseat_perimeter_radial_entries_ages_the_merged_face() {
+    fn test_join_face_kill_edge_moves_no_perimeter_radial_entry() {
         let mut mesh = LoopMesh::new();
-        let bottom: Vec<VertexKey> = (0..4)
+        let strip = build_quad_strip(&mut mesh, 3);
+        let seam_ab = shared_seam(&mesh, strip[0], strip[1]);
+        let seam_bc = shared_seam(&mesh, strip[1], strip[2]);
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
+            strip[2],
+            "pristine entry is the last face attached to the seam"
+        );
+
+        mesh.euler_join_face_kill_edge(strip[0], strip[1], seam_ab)
+            .expect("radial-2 seam joins");
+
+        assert_eq!(
+            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
+            strip[2],
+            "the raw Euler join re-splices in place: the outward seam's entry is untouched"
+        );
+        mesh.validate_topology();
+    }
+
+    /// The radial-≥3 reading of the same rule, where the three candidate join
+    /// flavours part company (`RADIAL_EDGE_STRUCTURE.md` §6.5's discriminating
+    /// trace). The absorbed face's loop is re-stamped onto the survivor **in its
+    /// slot**: the cycle's order and entry are bit-for-bit what they were, and
+    /// only the loop's owning face changed beneath them.
+    #[test]
+    fn test_join_face_kill_edge_leaves_radial_three_cycle_in_place() {
+        let mut mesh = LoopMesh::new();
+        let (strip, seam, rim, fins) = build_strip_with_rim_fins(&mut mesh);
+
+        assert_eq!(
+            mesh.edge_face_keys(rim),
+            vec![fins[1], strip[1], fins[0]],
+            "pristine radial-3 cycle, walked from its entry (the last fin appended)"
+        );
+
+        let merged = mesh
+            .euler_join_face_kill_edge(strip[0], strip[1], seam)
+            .expect("radial-2 seam joins");
+
+        assert_eq!(
+            mesh.edge_face_keys(rim),
+            vec![fins[1], merged, fins[0]],
+            "no fresh loop reached `rim`, so nothing on it moved — the absorbed \
+             face's loop simply now names the survivor"
+        );
+        mesh.validate_topology();
+    }
+
+    /// A quad strip of `quads` faces, with two fins attached to the far rim edge
+    /// of the last quad so that rim sits at radial 3 while staying on the union's
+    /// perimeter. Returns `(strip, seam(strip0,strip1), rim, fins)`.
+    fn build_strip_with_rim_fins(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<FaceKey>, EdgeKey, EdgeKey, Vec<FaceKey>) {
+        let strip = build_quad_strip(mesh, 2);
+        let seam = shared_seam(mesh, strip[0], strip[1]);
+
+        let rim = mesh
+            .face_edge_keys(strip[1])
+            .into_iter()
+            .find(|&e| {
+                mesh.edge_face_keys(e).len() == 1
+                    && mesh
+                        .edge_vert_keys(e)
+                        .iter()
+                        .all(|&v| mesh.vertex_position(v).x == 2.0)
+            })
+            .expect("far rim edge of the second quad");
+        let [rim_a, rim_b] = mesh.edge_vert_keys(rim);
+
+        let fins: Vec<FaceKey> = [1.0_f32, 2.0]
+            .into_iter()
+            .map(|z| {
+                let a = mesh.create_vertex(Vec3::new(3.0, 0.0, z));
+                let b = mesh.create_vertex(Vec3::new(3.0, 1.0, z));
+                let ring = [rim_a, a, b, rim_b];
+                let edges: Vec<EdgeKey> = (0..4)
+                    .map(|k| {
+                        mesh.create_edge(
+                            [ring[k], ring[(k + 1) % 4]],
+                            EdgeCreateFlags::NO_DUPLICATE,
+                        )
+                    })
+                    .collect();
+                mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
+            })
+            .collect();
+
+        (strip, seam, rim, fins)
+    }
+
+    /// The composed join's counterpart to the test above, kept here so the two
+    /// flavours can be read side by side: routed through
+    /// [`LoopMesh::faces_join_pair`] the same merge *does* seat the union on the
+    /// radial-3 rim, where an appended fresh loop would land — immediately after
+    /// the pre-merge entry, with the two fins keeping their relative order
+    /// (`RADIAL_EDGE_STRUCTURE.md` §6.5 case (a), §9).
+    #[test]
+    fn test_faces_join_pair_seats_the_union_on_a_radial_three_perimeter_edge() {
+        let mut mesh = LoopMesh::new();
+        let (strip, seam, rim, fins) = build_strip_with_rim_fins(&mut mesh);
+
+        let merged = mesh
+            .faces_join_pair(strip[0], strip[1], seam)
+            .expect("radial-2 seam joins");
+
+        assert_eq!(
+            mesh.edge_face_keys(rim),
+            vec![merged, fins[0], fins[1]],
+            "the union enters where an appended fresh loop would: at the entry, \
+             behind the two fins in their unchanged relative order"
+        );
+        mesh.validate_topology();
+    }
+
+    fn build_quad_strip(mesh: &mut LoopMesh, quads: usize) -> Vec<FaceKey> {
+        let bottom: Vec<VertexKey> = (0..=quads)
             .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
             .collect();
-        let top: Vec<VertexKey> = (0..4)
+        let top: Vec<VertexKey> = (0..=quads)
             .map(|i| mesh.create_vertex(Vec3::new(i as f32, 1.0, 0.0)))
             .collect();
-        let strip: Vec<FaceKey> = (0..3)
+        (0..quads)
             .map(|i| {
                 let ring = [bottom[i], bottom[i + 1], top[i + 1], top[i]];
                 let edges: Vec<EdgeKey> = (0..4)
@@ -237,49 +332,13 @@ mod tests {
                     .collect();
                 mesh.face_create(&ring, &edges, FaceCreateFlags::NONE)
             })
-            .collect();
-        let seam_ab = mesh
-            .face_edge_keys(strip[0])
+            .collect()
+    }
+
+    fn shared_seam(mesh: &LoopMesh, a: FaceKey, b: FaceKey) -> EdgeKey {
+        mesh.face_edge_keys(a)
             .into_iter()
-            .find(|&e| mesh.edge_face_keys(e).contains(&strip[1]))
-            .expect("f0 and f1 share a seam");
-        let seam_bc = mesh
-            .face_edge_keys(strip[1])
-            .into_iter()
-            .find(|&e| mesh.edge_face_keys(e).contains(&strip[2]))
-            .expect("f1 and f2 share a seam");
-
-        assert_eq!(
-            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
-            strip[2],
-            "pristine entry is the last face attached to the seam"
-        );
-
-        let merged = mesh
-            .euler_join_face_kill_edge(strip[0], strip[1], seam_ab)
-            .expect("radial-2 seam joins");
-
-        assert_eq!(
-            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
-            strip[2],
-            "the bare join leaves the entry put — it reuses f1's handle"
-        );
-
-        mesh.face_reseat_perimeter_radial_entries(merged);
-
-        assert_eq!(
-            mesh.loop_face(mesh.edge_radial_entry(seam_bc).unwrap()),
-            merged,
-            "the merged face is now the newest face on the outward seam"
-        );
-        for l in mesh.face_loop_keys(merged) {
-            let e = mesh.loop_edge(l);
-            assert_eq!(
-                mesh.loop_face(mesh.edge_radial_entry(e).unwrap()),
-                merged,
-                "every perimeter edge of the merged face enters on its loop"
-            );
-        }
-        mesh.validate_topology();
+            .find(|&e| mesh.edge_face_keys(e).contains(&b))
+            .expect("the two faces share a seam")
     }
 }

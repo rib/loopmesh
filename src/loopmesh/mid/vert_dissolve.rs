@@ -148,12 +148,9 @@ impl LoopMesh {
                 }
                 let f0 = self.loops.get(l0).face;
                 let f1 = self.loops.get(l1).face;
-                if f0 != f1 {
-                    if let Some(joined) = self.euler_join_face_kill_edge(f0, f1, e) {
-                        self.face_reseat_perimeter_radial_entries(joined);
-                        merged = true;
-                        break;
-                    }
+                if f0 != f1 && self.faces_join_pair(f0, f1, e).is_some() {
+                    merged = true;
+                    break;
                 }
             }
             if !merged {
@@ -195,9 +192,7 @@ impl LoopMesh {
             let f0 = self.loops.get(l0).face;
             let f1 = self.loops.get(l1).face;
             if f0 != f1 {
-                if let Some(joined) = self.euler_join_face_kill_edge(f0, f1, surviving_edge) {
-                    self.face_reseat_perimeter_radial_entries(joined);
-                }
+                self.faces_join_pair(f0, f1, surviving_edge);
             }
         }
         true
@@ -252,11 +247,12 @@ impl LoopMesh {
     /// post-collapse one. The entry of the surviving edge is re-read *after* the
     /// collapse, never cached across it (§6.3, bound 3).
     ///
-    /// Each join is followed by [`Self::face_reseat_perimeter_radial_entries`],
-    /// which is what keeps that reading true: the merged face has to become the
-    /// newest face on the edges it kept, or the next join — in this call **or a
-    /// later one over an overlapping fan** — would score it as pristine and
-    /// tie-break on a stale build-order entry.
+    /// The reading stays true across joins because the merge used here is the
+    /// *composed* (loop-minting) join, whose constructed union enters every
+    /// perimeter edge it kept on its own loop — including across *calls*, which
+    /// the overlapping fans of a repeated coarsening rely on: a merged face that
+    /// a later fan re-joins must still score as the newest face on its own
+    /// perimeter, not as pristine.
     fn vert_dissolve_halves_schedule(
         &mut self,
         v: VertexKey,
@@ -280,10 +276,9 @@ impl LoopMesh {
             let Some((spoke, (donor, absorbed))) = next_spoke else {
                 break;
             };
-            let Some(joined) = self.euler_join_face_kill_edge(donor, absorbed, spoke) else {
+            if self.faces_join_pair(donor, absorbed, spoke).is_none() {
                 return false;
-            };
-            self.face_reseat_perimeter_radial_entries(joined);
+            }
         }
 
         let Some(surviving_edge) = self.vert_collapse_edge(base_spoke, v) else {
@@ -296,9 +291,7 @@ impl LoopMesh {
         // The final join: both halves sit on the surviving edge, so its entry
         // names the half that finished merging last.
         if let Some((donor, absorbed)) = self.spoke_face_pair(surviving_edge) {
-            if let Some(joined) = self.euler_join_face_kill_edge(donor, absorbed, surviving_edge) {
-                self.face_reseat_perimeter_radial_entries(joined);
-            }
+            self.faces_join_pair(donor, absorbed, surviving_edge);
         }
         true
     }
@@ -426,7 +419,11 @@ mod tests {
         for &i in build_order {
             faces[i] = Some(face_from_ring(mesh, &[apex, rim[i], rim[i + 1]]));
         }
-        (apex, rim, faces.into_iter().map(|f| f.expect("built")).collect())
+        (
+            apex,
+            rim,
+            faces.into_iter().map(|f| f.expect("built")).collect(),
+        )
     }
 
     fn tag_faces(mesh: &mut LoopMesh, faces: &[FaceKey]) -> ElementAttributeKey {

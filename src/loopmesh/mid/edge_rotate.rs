@@ -36,8 +36,13 @@ impl LoopMesh {
             return None;
         }
 
-        // Join then split.
-        let merged = self.euler_join_face_kill_edge(f_a, f_b, edge)?;
+        // Join then split. The join is the *composed* one
+        // (`RADIAL_EDGE_STRUCTURE.md` §9's "Face join"), not the raw Euler
+        // primitive: the merged face is a construction, so the surviving
+        // perimeter edges take its loop as their radial entry. Substituting the
+        // Euler join reaches the same topology with different radial entries —
+        // observable at radial ≥ 3.
+        let merged = self.faces_join_pair(f_a, f_b, edge)?;
         let (_new_face, new_edge) = self.face_split(merged, corner_a, corner_b)?;
         Some(new_edge)
     }

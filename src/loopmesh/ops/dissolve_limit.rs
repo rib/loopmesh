@@ -1,4 +1,3 @@
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 use crate::loopmesh::*;
@@ -79,117 +78,154 @@ pub enum DissolveLimitResult {
     Unsupported,
 }
 
-/// One queued candidate in the edge or vert priority heap. The heap is
-/// ordered ascending by `cost` (cheapest popped first). `input_index` is the
-/// candidate's slot in the input array — the §5.3 "tagged-pointer" indirection
-/// loopmesh resolves through the `generation` / `still_pending` side tables
-/// rather than a settable `elem_index`. `generation` discards stale entries
-/// left behind by a re-score (`BinaryHeap` has no in-place decrease-key).
-#[derive(Copy, Clone)]
-struct HeapCandidate {
-    cost: f32,
-    input_index: u32,
-    generation: u32,
-}
-
-impl PartialEq for HeapCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for HeapCandidate {}
-impl PartialOrd for HeapCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // `BinaryHeap` is a max-heap; invert so the lowest cost pops first.
-        // The input index breaks cost ties deterministically (the heap
-        // tie-breaker `DISSOLVE_LIMIT.md` §11 leaves to the implementation).
-        other
-            .cost
-            .total_cmp(&self.cost)
-            .then(other.input_index.cmp(&self.input_index))
-    }
-}
-
-/// A live-but-supplanted heap entry guard: a `generation` table lets a
-/// re-score push a fresh entry and lazily skip the stale one on pop.
+/// The operator's priority queue: an **indexed array binary min-heap** with the
+/// three tie conventions of `DISSOLVE_LIMIT.md` §5.5.1, plus the §5.3
+/// `heap_table[input_slot] -> node` indirection so a re-score is an in-place
+/// update.
+///
+/// The conventions are the specification, not an implementation detail. Exactly
+/// tied costs are this operator's *normal* regime (every coplanar face pair
+/// scores −1.0 bit-exactly), the tied pop order is observable through the
+/// per-face customdata donation chain, and §5.5.2/§5.5.3 establish that **no
+/// comparator over a total order can express it** — a four-way tie pops
+/// `3, 0, 1, 2`, which is not sorted under any fixed key. So the array layout
+/// has to be reproduced directly:
+///
+/// 1. **Insertion promotes ties.** Sift-up stops only on a *strictly* cheaper
+///    parent, so a newly inserted node that ties everything climbs to the root.
+/// 2. **Extraction does not sink ties.** Sift-down descends only into a
+///    *strictly* cheaper child, so the hoisted tail node stays at the root under
+///    a full tie.
+/// 3. **A re-score to an unchanged value is a no-op.** It must not touch the
+///    array — which is also why a lazy-deletion heap (re-pushing a duplicate
+///    entry on re-score) cannot be used here, whatever its comparator.
 struct PriorityHeap {
-    heap: BinaryHeap<HeapCandidate>,
-    /// Per-input-index latest generation. A popped entry whose generation is
-    /// behind this value is stale and skipped.
-    generation: Vec<u32>,
-    /// Per-input-index live cost, mirrored so the §6.2-step-5 reopening can
-    /// test "was this previously `COST_INVALID`" without popping.
+    /// The heap array. Each element is an input slot; the ordering key is
+    /// `cost[slot]`.
+    tree: Vec<u32>,
+    /// Per-input-slot cost, live for removed slots too so the §6.2-step-5
+    /// reopening can ask "was this demoted to `COST_INVALID`?".
     cost: Vec<f32>,
-    /// Per-input-index liveness (the guide's null `heap_table[i]` slot).
-    active: Vec<bool>,
+    /// Per-input-slot position in `tree` — the §5.3 `heap_table`. `None` is the
+    /// guide's nulled slot: the candidate is no longer in the heap.
+    position: Vec<Option<u32>>,
 }
 
 impl PriorityHeap {
     fn with_capacity(len: usize) -> Self {
         Self {
-            heap: BinaryHeap::new(),
-            generation: vec![0; len],
+            tree: Vec::with_capacity(len),
             cost: vec![COST_INVALID; len],
-            active: vec![false; len],
+            position: vec![None; len],
         }
     }
 
-    /// Seed input index `i` at `cost`.
-    fn insert(&mut self, input_index: usize, cost: f32) {
-        let generation = self.generation[input_index] + 1;
-        self.generation[input_index] = generation;
-        self.cost[input_index] = cost;
-        self.active[input_index] = true;
-        self.heap.push(HeapCandidate {
-            cost,
-            input_index: input_index as u32,
-            generation,
-        });
+    fn cost_at(&self, node: usize) -> f32 {
+        self.cost[self.tree[node] as usize]
     }
 
-    /// Re-score input index `i` (the §5.2-step-4 / §6.2-step-4 update). Stale
-    /// entries for `i` are discarded lazily by their behind-generation tag.
+    fn swap_nodes(&mut self, a: usize, b: usize) {
+        self.tree.swap(a, b);
+        self.position[self.tree[a] as usize] = Some(a as u32);
+        self.position[self.tree[b] as usize] = Some(b as u32);
+    }
+
+    /// Convention 1 — climb while the parent is not *strictly* cheaper, so an
+    /// exact tie swaps.
+    fn sift_up(&mut self, mut node: usize) {
+        while node > 0 {
+            let parent = (node - 1) / 2;
+            if self.cost_at(parent) < self.cost_at(node) {
+                break;
+            }
+            self.swap_nodes(parent, node);
+            node = parent;
+        }
+    }
+
+    /// Convention 2 — descend only into a *strictly* cheaper child, so an exact
+    /// tie stays put.
+    fn sift_down(&mut self, mut node: usize) {
+        loop {
+            let left = node * 2 + 1;
+            let right = left + 1;
+            let mut cheapest = node;
+            if left < self.tree.len() && self.cost_at(left) < self.cost_at(cheapest) {
+                cheapest = left;
+            }
+            if right < self.tree.len() && self.cost_at(right) < self.cost_at(cheapest) {
+                cheapest = right;
+            }
+            if cheapest == node {
+                return;
+            }
+            self.swap_nodes(node, cheapest);
+            node = cheapest;
+        }
+    }
+
+    /// Seed input slot `i` at `cost` (appended at the tail, then sifted up).
+    fn insert(&mut self, input_index: usize, cost: f32) {
+        self.cost[input_index] = cost;
+        let node = self.tree.len();
+        self.tree.push(input_index as u32);
+        self.position[input_index] = Some(node as u32);
+        self.sift_up(node);
+    }
+
+    /// Re-score input slot `i` in place (the §5.2-step-4 / §6.2-step-4 update).
+    /// An unchanged cost touches nothing (convention 3); a slot already out of
+    /// the heap is ignored (its `heap_table` entry is null).
     fn update_cost(&mut self, input_index: usize, cost: f32) {
-        if !self.active[input_index] {
+        let Some(node) = self.position[input_index] else {
+            return;
+        };
+        let previous = self.cost[input_index];
+        if cost == previous {
             return;
         }
-        let generation = self.generation[input_index] + 1;
-        self.generation[input_index] = generation;
         self.cost[input_index] = cost;
-        self.heap.push(HeapCandidate {
-            cost,
-            input_index: input_index as u32,
-            generation,
-        });
-    }
-
-    /// Mark input index `i` consumed (its `heap_table` slot nulled, §5.3).
-    fn deactivate(&mut self, input_index: usize) {
-        self.active[input_index] = false;
-    }
-
-    /// Pop the live cheapest candidate whose cost is strictly below
-    /// `threshold`, or `None` once the cheapest live candidate meets/exceeds
-    /// it (the §5.2 / §6.2 step-1 pop gate).
-    fn pop_below(&mut self, threshold: f32) -> Option<usize> {
-        while let Some(top) = self.heap.peek().copied() {
-            let i = top.input_index as usize;
-            if !self.active[i] || self.generation[i] != top.generation {
-                self.heap.pop();
-                continue;
-            }
-            if !(top.cost < threshold) {
-                return None;
-            }
-            self.heap.pop();
-            return Some(i);
+        if cost < previous {
+            self.sift_up(node as usize);
+        } else {
+            self.sift_down(node as usize);
         }
-        None
+    }
+
+    /// Take input slot `i` out of the heap (its §5.3 `heap_table` slot nulled).
+    /// The node is hoisted unconditionally to the root along its parent chain,
+    /// then the root is extracted the way §5.5.1's convention 2 requires: the
+    /// array's tail moves into the root slot and sifts down.
+    fn remove(&mut self, input_index: usize) {
+        let Some(node) = self.position[input_index] else {
+            return;
+        };
+        let mut node = node as usize;
+        while node > 0 {
+            let parent = (node - 1) / 2;
+            self.swap_nodes(parent, node);
+            node = parent;
+        }
+        let tail = self.tree.pop().expect("the removed node is in the array");
+        self.position[input_index] = None;
+        if tail != input_index as u32 {
+            self.tree[0] = tail;
+            self.position[tail as usize] = Some(0);
+            self.sift_down(0);
+        }
+    }
+
+    /// The §5.2 / §6.2 step-1 gate: the root candidate, if its cost is strictly
+    /// below `threshold`. The pass *peeks* — it never pops — so a candidate that
+    /// fails its merge stays in the array at its own position and is demoted
+    /// there via [`Self::update_cost`].
+    fn peek_below(&self, threshold: f32) -> Option<usize> {
+        let slot = *self.tree.first()? as usize;
+        if self.cost[slot] < threshold {
+            Some(slot)
+        } else {
+            None
+        }
     }
 
     fn current_cost(&self, input_index: usize) -> f32 {
@@ -354,10 +390,10 @@ impl LoopMesh {
         let region_tag = self.push_face_op_flag_layer();
         const REGION_BIT: u8 = 0;
 
-        while let Some(i) = heap.pop_below(edge_threshold) {
+        while let Some(i) = heap.peek_below(edge_threshold) {
             let edge = edges[i];
             if self.edges.try_get(edge).is_none() {
-                heap.deactivate(i);
+                heap.remove(i);
                 continue;
             }
             // §5.2 step 2 — re-verify manifoldness against the current topology.
@@ -375,7 +411,7 @@ impl LoopMesh {
                 Some(f_new) => {
                     // §5.2 step 4 — consume this edge, refresh the merged
                     // normal, emit to region.out, and re-score the perimeter.
-                    heap.deactivate(i);
+                    heap.remove(i);
                     index_of.remove(&edge);
                     self.face_normal_update(f_new);
                     self.face_op_flag_set(region_tag, f_new, REGION_BIT);
@@ -489,13 +525,13 @@ impl LoopMesh {
             heap.insert(i, cost);
         }
 
-        while let Some(i) = heap.pop_below(angle_limit) {
+        while let Some(i) = heap.peek_below(angle_limit) {
             let Some(v) = vert_input[i] else {
-                heap.deactivate(i);
+                heap.remove(i);
                 continue;
             };
             if self.vertices.try_get(v).is_none() {
-                heap.deactivate(i);
+                heap.remove(i);
                 continue;
             }
 
@@ -514,7 +550,7 @@ impl LoopMesh {
 
             match collapsed {
                 Some(e_new) => {
-                    heap.deactivate(i);
+                    heap.remove(i);
                     index_of.remove(&v);
 
                     // §6.2 step 4 — re-score the surviving edge's endpoints.
@@ -1184,6 +1220,73 @@ mod tests {
             (v0, e0, f0)
         );
         mesh.validate_topology();
+    }
+
+    /// §5.5.4 — the donor fingerprint. On a flat `n`-quad strip every candidate
+    /// edge scores −1.0 bit-exactly, so the whole heap is tied and the surviving
+    /// face's per-face customdata reads the tied pop order back out: each merge
+    /// donates from the popped edge's radial entry, and the entry-reseat rule
+    /// carries the running union forward as its own donor.
+    ///
+    /// The table is the guide's oracle-confirmed one. Reverse-input-index would
+    /// answer `f_{n−1}` at every row — it agrees only up to a three-way tie
+    /// (§5.5.2's trap), and `n = 5` (a four-way tie) is the first row that
+    /// separates them. Ascending-index would answer `f_1` at every row, which
+    /// `n = 3` separates. Only the whole family pins the heap.
+    #[test]
+    fn equal_cost_pop_order_matches_the_heap_donor_fingerprint() {
+        // (quads `n`, surviving donor face index) — the tie size is `m = n − 1`.
+        const DONOR_FINGERPRINT: [(usize, usize); 8] =
+            [(2, 1), (3, 2), (4, 3), (5, 1), (6, 1), (7, 6), (8, 5), (9, 1)];
+
+        for (quads, expected_donor) in DONOR_FINGERPRINT {
+            let mut mesh = LoopMesh::new();
+            let (_verts, edges, _interior_verts) = build_coplanar_strip(&mut mesh, quads);
+            let tag = mesh
+                .register_face_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("face_tag"),
+                    AttrType::Vec3,
+                ))
+                .expect("face tag layer registers");
+            for face in mesh.face_keys() {
+                let index = strip_quad_index(&mesh, face);
+                mesh.face_attribs_mut()
+                    .set_vec3(tag, face.as_usize(), [index as f32, 0.0, 0.0]);
+            }
+
+            let params = DissolveLimitParams {
+                angle_limit: FRAC_PI_2,
+                use_dissolve_boundaries: false,
+                delimit: 0,
+            };
+            // Empty vert set: the edge pass alone decides the donation chain.
+            mesh.dissolve_limit(&edges, &[], &params);
+
+            assert_eq!(mesh.face_count(), 1, "n = {quads}: the strip merges to one");
+            let survivor = mesh.face_keys()[0];
+            let donor = mesh
+                .face_attribs()
+                .get_vec3(tag, survivor.as_usize())
+                .expect("survivor carries a tag")[0]
+                .round() as usize;
+            assert_eq!(
+                donor, expected_donor,
+                "n = {quads} (m = {}): the surviving customdata must name f_{expected_donor}",
+                quads - 1
+            );
+            mesh.validate_topology();
+        }
+    }
+
+    /// The index of a `build_coplanar_strip` quad, read off its centroid: quad
+    /// `i` spans x ∈ [i, i+1].
+    fn strip_quad_index(mesh: &LoopMesh, face: FaceKey) -> usize {
+        let verts = mesh.face_vert_keys(face);
+        let sum: f32 = verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v).x)
+            .sum::<f32>();
+        (sum / verts.len() as f32).floor() as usize
     }
 
     #[test]
