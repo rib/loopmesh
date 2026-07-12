@@ -1569,9 +1569,13 @@ impl LoopMesh {
                     self.tri_one_edge_fan(face, &corners, &sides, geom);
                 }
             }
-            // Other multi-cut configurations (partial quad two/three-edge,
-            // triangle two-edge, n-gons) are §9.5.3 / §4.3 generic-fan cases
-            // not yet pinned at multi-cut; leave the flat-cornered face.
+            // Two distinct gaps still hide here, each tracked as its own parity
+            // row. (a) The generic two-edge strip (§9.5.3.3 / §7.1) — the
+            // two-opposite-edge quad, the STRAIGHT_CUT two-adjacent quad, the
+            // two-edge triangle, and any n-gon with two cut edges — which zips
+            // the two runs into N connects and N+1 fragments. (b) The three-edge
+            // quad template (§9.5.3.4). Until both land, these faces keep their
+            // §3.3 rim cut verts and are left un-re-split (flat corners).
             _ => {}
         }
     }
@@ -1792,10 +1796,13 @@ impl LoopMesh {
         }
     }
 
-    /// §9.5.3 — one-edge quad fan. The single cut edge `corners[0]->corners[1]`
-    /// carries `N` midpoints; each connects into the interior toward the two
-    /// opposite corners (the lower half toward `v3`, the upper half toward
-    /// `v2`), fanning the quad into `N + 1` fragments.
+    /// §9.5.3.1 — one-edge quad fan (the half-split two-hub fan). The single cut
+    /// edge `v0->v1` carries the `N` cut verts `m_1..m_N`; each connects to the
+    /// hub on its own half of the cut edge — `v3` (the corner adjacent to `v0`)
+    /// when `2i <= N + 1`, `v2` (adjacent to `v1`) when `2i >= N + 1`. The two
+    /// tests deliberately overlap on the median vert (`2i == N + 1`, which exists
+    /// iff `N` is odd), which therefore double-hubs. Fragments are hence
+    /// `N + 1 + [N odd]`, not `N + 1`: 3/3/5/5/7 at `N = 1..5`.
     fn quad_one_edge_fan(
         &mut self,
         face: FaceKey,
@@ -1816,13 +1823,19 @@ impl LoopMesh {
         let run = &sides[cut];
         let _ = (v0, v1);
 
-        // Lower half (parameter < 0.5) fans to v3; upper half to v2.
-        let split = (n + 1) / 2;
-        for i in 0..n {
-            let m = run[i];
-            let target = if i < split { v3 } else { v2 };
-            let sub = self.face_with_both(m, target);
-            self.face_split(sub, m, target);
+        // §9.5.3.1 half-split rule. `position` is 1-based along the run from v0
+        // toward v1; the `<=` / `>=` pair is not a partition — it overlaps on the
+        // median (2*position == n + 1), which lays *both* connects.
+        for (zero_based, &m) in run.iter().enumerate() {
+            let position = zero_based + 1;
+            if 2 * position <= n + 1 {
+                let sub = self.face_with_both(m, v3);
+                self.face_split(sub, m, v3);
+            }
+            if 2 * position >= n + 1 {
+                let sub = self.face_with_both(m, v2);
+                self.face_split(sub, m, v2);
+            }
         }
         // §1 / §5.1 Output-slot note: the one-edge fan is non-grid — its
         // connecting edges and fragments are *not* inner; only the rim midpoints
@@ -1831,9 +1844,10 @@ impl LoopMesh {
         geom.record_resplit_face(face);
     }
 
-    /// §9.5.3 — one-edge triangle fan. The single cut edge `corners[0]->
-    /// corners[1]` carries `N` midpoints; each connects to the opposite apex
-    /// `corners[2]`, fanning the triangle into `N + 1` triangles.
+    /// §9.5.3.2 — one-edge triangle fan (single-hub). The apex is the only corner
+    /// off the cut edge, so there is no hub choice and no median tie-break: every
+    /// one of the `N` cut verts connects to it, giving `N + 1` triangles. This is
+    /// the fan whose count genuinely is `N + 1` — unlike the quad's (§9.5.3.1).
     fn tri_one_edge_fan(
         &mut self,
         face: FaceKey,
@@ -3324,6 +3338,141 @@ mod tests {
                     .into_iter()
                     .any(|vk| mesh.vertex_position(vk).distance(Vec3::new(x, 0.0, 0.0)) < 1e-5),
                 "rim midpoint at t along the cut edge ({x}, 0)"
+            );
+        }
+    }
+
+    /// Run the §9.5.3.1 fan on a lone quad with only `{v0,v1}` cut, and report
+    /// `(V, E, F)`, the sorted fragment-shape multiset, and the run of cut verts
+    /// in `v0 -> v1` order alongside the two hubs.
+    fn quad_one_edge_fan_at(
+        cuts: u32,
+    ) -> (
+        LoopMesh,
+        (usize, usize, usize),
+        Vec<usize>,
+        Vec<VertexKey>,
+        VertexKey,
+        VertexKey,
+    ) {
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let (v2, v3) = (fv[2], fv[3]);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(cuts));
+        assert!(matches!(res, SubdivideResult::Ran(_)), "cuts={cuts}");
+
+        let n = cuts as usize;
+        let run: Vec<VertexKey> = (1..=n)
+            .map(|i| {
+                let x = 2.0 * i as f32 / (n as f32 + 1.0);
+                find_vert_at(&mesh, Vec3::new(x, 0.0, 0.0))
+            })
+            .collect();
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        let vef = counts(&mesh);
+        (mesh, vef, shapes, run, v2, v3)
+    }
+
+    #[test]
+    fn multicut_quad_one_edge_fan_half_split_n1_to_n5() {
+        // §9.5.3.1 — the fan's fragment count is N + 1 + [N odd] = 2*ceil(N/2)+1,
+        // and the middle fragment is a quad exactly when N is even. Counts alone
+        // do not discriminate a wrong hub assignment, so the connect edges
+        // themselves are pinned below.
+        let expected: [((usize, usize, usize), &[usize]); 5] = [
+            ((5, 7, 3), &[3, 3, 3]),
+            ((6, 8, 3), &[3, 3, 4]),
+            ((7, 11, 5), &[3, 3, 3, 3, 3]),
+            ((8, 12, 5), &[3, 3, 3, 3, 4]),
+            ((9, 15, 7), &[3, 3, 3, 3, 3, 3, 3]),
+        ];
+        for (index, (want_counts, want_shapes)) in expected.iter().enumerate() {
+            let n = index + 1;
+            let (mesh, got_counts, got_shapes, run, v2, v3) = quad_one_edge_fan_at(n as u32);
+            assert_eq!(got_counts, *want_counts, "V/E/F at cuts={n}");
+            assert_eq!(got_shapes, *want_shapes, "fragment shapes at cuts={n}");
+
+            // The half-split rule, edge by edge: m_i hubs on v3 iff 2i <= n+1 and
+            // on v2 iff 2i >= n+1 — the median (odd n) doing both.
+            for (zero_based, &m) in run.iter().enumerate() {
+                let position = zero_based + 1;
+                assert_eq!(
+                    mesh.query_edge_exists(m, v3).is_some(),
+                    2 * position <= n + 1,
+                    "cuts={n}: m_{position} -> v3 connect"
+                );
+                assert_eq!(
+                    mesh.query_edge_exists(m, v2).is_some(),
+                    2 * position >= n + 1,
+                    "cuts={n}: m_{position} -> v2 connect"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multicut_quad_one_edge_fan_odd_median_double_hubs() {
+        // §9.5.3.1 at N = 3 — the discriminating row. The median m_2 lays two
+        // connects, giving the middle triangle {m_2, v2, v3}; the single-hub
+        // reading would give V 7 / E 10 / F 4 and a middle quad instead.
+        let (mesh, got_counts, shapes, run, v2, v3) = quad_one_edge_fan_at(3);
+        assert_eq!(got_counts, (7, 11, 5), "N=3 fan is 5 fragments, 11 edges");
+        assert_eq!(shapes, vec![3, 3, 3, 3, 3], "odd N fans to all triangles");
+
+        let median = run[1];
+        assert!(
+            mesh.query_edge_exists(median, v3).is_some()
+                && mesh.query_edge_exists(median, v2).is_some(),
+            "the median cut vert connects to BOTH hubs"
+        );
+        // ... and the middle triangle {m_2, v2, v3} closes on the uncut rim edge.
+        assert!(mesh.query_edge_exists(v3, v2).is_some(), "uncut rim edge");
+    }
+
+    #[test]
+    fn multicut_quad_one_edge_fan_even_middle_quad() {
+        // §9.5.3.1 at N = 4 — no median, so nothing crosses the middle span and
+        // the fragment between m_2's and m_3's strokes is left whole as a quad.
+        let (mesh, got_counts, shapes, run, v2, v3) = quad_one_edge_fan_at(4);
+        assert_eq!(got_counts, (8, 12, 5), "N=4 fan is 5 fragments, 12 edges");
+        assert_eq!(shapes, vec![3, 3, 3, 3, 4], "even N leaves a middle quad");
+        for (zero_based, &m) in run.iter().enumerate() {
+            let hubs_on_v3 = mesh.query_edge_exists(m, v3).is_some();
+            let hubs_on_v2 = mesh.query_edge_exists(m, v2).is_some();
+            assert!(
+                hubs_on_v3 ^ hubs_on_v2,
+                "even N: m_{} hubs on exactly one corner",
+                zero_based + 1
+            );
+        }
+    }
+
+    #[test]
+    fn multicut_tri_one_edge_fan_is_single_hub_n3() {
+        // §9.5.3.2 — the triangle fan has no hub choice and no median tie-break:
+        // N + 1 fragments for every N. V 6 / E 9 / F 4 at N = 3. This is the
+        // contrast that must NOT be "fixed" to match the quad's §9.5.3.1 rule.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let apex = fv[2];
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+        let res = mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(3));
+        assert!(matches!(res, SubdivideResult::Ran(_)));
+        assert_eq!(counts(&mesh), (6, 9, 4), "tri fan cuts=3 is N+1 fragments");
+        for f in mesh.face_keys() {
+            assert_eq!(mesh.face_len(f), 3, "tri fan fragments are triangles");
+        }
+        for i in 1..=3 {
+            let m = find_vert_at(&mesh, Vec3::new(2.0 * i as f32 / 4.0, 0.0, 0.0));
+            assert!(
+                mesh.query_edge_exists(m, apex).is_some(),
+                "cut vert {i} spokes to the apex"
             );
         }
     }
