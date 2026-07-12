@@ -1025,17 +1025,61 @@ impl LoopMesh {
         (verts, start)
     }
 
-    /// The sub-face of the just-split region that contains both `a` and `b`.
-    /// After [`Self::face_split`] keeps the input face as one half and returns
-    /// the other, the next split must target whichever half still holds the
-    /// pair it connects.
-    fn face_with_both(&self, a: VertexKey, b: VertexKey) -> FaceKey {
-        for f in self.vert_face_keys(a) {
-            if self.face_vert_keys(f).contains(&b) {
-                return f;
+    /// §7.0 — the face a template connect targets: the one with the **fewest
+    /// corners** among all faces carrying both endpoints in their loop cycle.
+    ///
+    /// Within one face's re-split this is exact — as the face is carved up, the
+    /// fragment still holding both endpoints is always the smallest that does —
+    /// which is what makes each pattern's pair list order-insensitive. Across
+    /// faces it is a heuristic: two distinct faces can share two edges and both
+    /// carry the pair (manifold-legal, §7.1), and then the smallest simply wins,
+    /// with no appeal to which face the template was dispatched for. Ties fall to
+    /// the first minimum in disk/radial order; the rule offers no tiebreak.
+    ///
+    /// `None` when no face carries both — such a connect is a silent no-op.
+    fn smallest_face_with_both(&self, a: VertexKey, b: VertexKey) -> Option<FaceKey> {
+        let mut best: Option<(FaceKey, usize)> = None;
+        for edge in self.vertex_disk_iter(a) {
+            for radial_loop in self.edge_radial_iter(edge) {
+                let candidate = self.loops.get(radial_loop).face;
+                let corners = self.face_len(candidate);
+                // The O(1) size test comes first so a candidate that cannot beat
+                // the incumbent never pays for the membership walk — and so a tie
+                // leaves the incumbent standing (first minimum wins).
+                if best.is_some_and(|(_, best_corners)| corners >= best_corners) {
+                    continue;
+                }
+                if self.face_has_vert(candidate, b) {
+                    best = Some((candidate, corners));
+                }
             }
         }
-        panic!("subdivide_edges: no face shares the split pair");
+        best.map(|(face, _)| face)
+    }
+
+    fn face_has_vert(&self, face: FaceKey, v: VertexKey) -> bool {
+        let mut it = self.face_loops(face);
+        while let Some(l) = it.next(self) {
+            if self.loops.get(l).vertex == v {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// §7.0 — lay one template connect. Every pair in the §5 / §6 / §9.5 pattern
+    /// lists is laid through here: it is resolved to its target face by
+    /// [`Self::smallest_face_with_both`] and split there. A pair no face carries
+    /// creates no edge and splits no fragment.
+    ///
+    /// The §7.1 two-edge fallback rows (`tri_two_cut`, `quad_two_opposite_cut`,
+    /// `quad_two_adjacent_straight_cut`) deliberately do **not** use this
+    /// primitive — they split the parent face handle directly. §7.1 states a
+    /// dropped-connect precondition for those rows; it is not checked here, and
+    /// enforcing it is still an open matrix row.
+    fn template_connect(&mut self, a: VertexKey, b: VertexKey) -> Option<(FaceKey, EdgeKey)> {
+        let target = self.smallest_face_with_both(a, b)?;
+        self.face_split(target, a, b)
     }
 
     /// §6.1 — triangle, one edge cut. Cycle is `v0, m, v1, v2`; connect the
@@ -1048,7 +1092,7 @@ impl LoopMesh {
         // §1 / §6.1 Output-slot note: the apex-connect edge and the fragment
         // faces are *not* inner; only the rim midpoint (recorded in §3) is.
         // geom.out gets the single re-split mark for the original face.
-        if self.face_split(face, m, apex).is_some() {
+        if self.template_connect(m, apex).is_some() {
             geom.record_resplit_face(face);
         }
     }
@@ -1105,26 +1149,30 @@ impl LoopMesh {
         let (m01, m12, m20) = (v[0], v[2], v[4]);
 
         // m01 -> m12 peels the corner triangle {m01, v1, m12}.
-        let f1 = self.face_with_both(m01, m12);
-        let (corner_a, inner_a) = self.face_split(f1, m01, m12).expect("m01-m12 split");
+        let peel_a = self.template_connect(m01, m12);
         // m12 -> m20 peels {m12, v2, m20} from the remaining pentagon.
-        let f2 = self.face_with_both(m12, m20);
-        let (corner_b, inner_b) = self.face_split(f2, m12, m20).expect("m12-m20 split");
+        let peel_b = self.template_connect(m12, m20);
         // m20 -> m01 closes the centre triangle, peeling {m20, v0, m01}.
-        let f3 = self.face_with_both(m20, m01);
-        let (corner_c, inner_c) = self.face_split(f3, m20, m01).expect("m20-m01 split");
+        let peel_c = self.template_connect(m20, m01);
+
+        // §7.0 — a pair no face carries is a silent no-op, so a connect that
+        // resolved to nothing contributes no fragment and no inner edge. The
+        // re-split mark follows the same rule: it is earned by work actually
+        // laid inside this face's re-split, not by having been dispatched.
+        let peels = [peel_a, peel_b, peel_c];
+        if peels.iter().all(Option::is_none) {
+            return;
+        }
 
         // §1 / §6.3 Output-slot note: this is a grid-style fill — its three
         // connecting edges and its new fragment faces are inner. The original
         // `face` keeps its identity (the re-split mark), so it goes to geom.out
         // only; the three peeled corner fragments are inner faces.
         geom.record_resplit_face(face);
-        geom.record_inner_face(corner_a);
-        geom.record_inner_face(corner_b);
-        geom.record_inner_face(corner_c);
-        geom.record_inner_edge(inner_a);
-        geom.record_inner_edge(inner_b);
-        geom.record_inner_edge(inner_c);
+        for (corner, inner) in peels.into_iter().flatten() {
+            geom.record_inner_face(corner);
+            geom.record_inner_edge(inner);
+        }
     }
 
     /// §5.1 — quad, one edge cut. Cycle is `v0, m, v1, v2, v3`; connect `m` into
@@ -1140,16 +1188,21 @@ impl LoopMesh {
         // v = [m, v1, v2, v3, v0]. The cut edge was {v0, v1}; the two interior
         // targets are v3 = v[3] and v2 = v[2].
         let (m, v2, v3) = (v[0], v[2], v[3]);
-        // m -> v3 peels {v0, m, v3}.
-        self.face_split(face, m, v3).expect("m-v3 split");
-        // m -> v2 splits the remaining quad {m, v1, v2, v3}.
-        let f2 = self.face_with_both(m, v2);
-        self.face_split(f2, m, v2).expect("m-v2 split");
+        // m -> v3 peels {v0, m, v3}; m -> v2 splits the remaining quad
+        // {m, v1, v2, v3}. Both go through the §7.0 primitive: neither pair is
+        // guaranteed to be carried by `face` alone (a neighbour sharing two edges
+        // can carry it too, §7.1), and the fewest-corners rule decides.
+        let peeled = self.template_connect(m, v3).is_some();
+        let split = self.template_connect(m, v2).is_some();
 
         // §1 / §5.1 Output-slot note: the two connecting edges (m→v3, m→v2) and
         // the three fragments are *not* inner; only the rim midpoint (recorded
-        // in §3) is. geom.out gets the single re-split mark for `face`.
-        geom.record_resplit_face(face);
+        // in §3) is. geom.out gets the single re-split mark for `face` — but
+        // only if a connect landed here at all: §7.0 can resolve both pairs into
+        // a neighbour (or nowhere), and an unsplit face is not a re-split face.
+        if peeled || split {
+            geom.record_resplit_face(face);
+        }
     }
 
     /// §5.2 — discriminate the two-cut quad's sub-case. After the §3 midpoint
@@ -1296,7 +1349,14 @@ impl LoopMesh {
         //    note: INNERVERT is non-grid for edges/faces — its connecting edges
         //    and fragments are *not* inner; only its three verts (the two rim
         //    midpoints + `c`) are. So geom.out gets the single re-split mark.
-        let (_new_face, corner_cut_edge) = self.face_split(face, m01, m12).expect("m01-m12 split");
+        //    The dispatched face carries both midpoints, so §7.0 always finds
+        //    *a* carrier here; `None` would mean the ring we were handed does
+        //    not describe a real face, and there is then no cut edge to hang the
+        //    inner vert on.
+        let Some((_new_face, corner_cut_edge)) = self.template_connect(m01, m12) else {
+            debug_assert!(false, "the dispatched face carries both rim midpoints");
+            return;
+        };
         geom.record_resplit_face(face);
 
         // 2. Inner vert c at the midpoint of the m01-m12 cut. The edge_split
@@ -1312,8 +1372,10 @@ impl LoopMesh {
         geom.record_inner_vert(c);
 
         // 3. Spoke c -> v3, splitting the pentagon into the two filling quads.
-        let pent = self.face_with_both(c, v3);
-        self.face_split(pent, c, v3).expect("c-v3 spoke");
+        //    §7.0 can have routed the corner cut into a neighbour, in which case
+        //    `c` sits there and no face need carry {c, v3} at all — a no-op, not
+        //    an error.
+        self.template_connect(c, v3);
     }
 
     /// §5.2.3 — quad, two **adjacent** edges cut, `PATH`. Lay the `m01`→`m12`
@@ -1332,15 +1394,18 @@ impl LoopMesh {
         // 1. Corner cut m01 -> m12. §1 / §5.2 Output-slot note: PATH is
         //    non-grid — its two cuts and three fragments are *not* inner; only
         //    the two rim midpoints (recorded in §3) are.
-        self.face_split(face, m01, m12).expect("m01-m12 split");
+        let corner_cut = self.template_connect(m01, m12).is_some();
 
         // 2. Chained v0 -> v2 cut across the pentagon {v0, m01, m12, v2, v3},
         //    splitting it into the central quad {v0, m01, m12, v2} and the far-
-        //    corner triangle {v0, v2, v3}.
-        let pent = self.face_with_both(v0, v2);
-        self.face_split(pent, v0, v2).expect("v0-v2 chained cut");
+        //    corner triangle {v0, v2, v3}. Chained: if §7.0 routed the corner cut
+        //    into a neighbour, the pentagon this cut wants may never exist, and
+        //    the pair then resolves elsewhere or nowhere (a no-op, §7.0).
+        let chained = self.template_connect(v0, v2).is_some();
 
-        geom.record_resplit_face(face);
+        if corner_cut || chained {
+            geom.record_resplit_face(face);
+        }
     }
 
     /// §5.2.4 — quad, two **adjacent** edges cut, `FAN`. Spoke both rim
@@ -1358,17 +1423,18 @@ impl LoopMesh {
         let [m01, _v1, m12, _v2, v3, _v0] = Self::adjacent_two_cut_corners(ring);
 
         // 1. First spoke m01 -> v3, carving the triangle {v3, v0, m01}.
-        let f1 = self.face_with_both(m01, v3);
-        self.face_split(f1, m01, v3).expect("m01-v3 spoke");
+        let first = self.template_connect(m01, v3).is_some();
         // 2. Second spoke m12 -> v3, carving the triangle {v3, m12, v2}, leaving
         //    the central quad {v3, m01, v1, m12} between the two spokes.
-        let f2 = self.face_with_both(m12, v3);
-        self.face_split(f2, m12, v3).expect("m12-v3 spoke");
+        let second = self.template_connect(m12, v3).is_some();
 
         // §1 / §5.2 Output-slot note: FAN is non-grid — the two spokes and the
         // three fragments are *not* inner; only the two rim midpoints (recorded
-        // in §3) are.
-        geom.record_resplit_face(face);
+        // in §3) are. The re-split mark is earned only if a spoke actually landed
+        // (§7.0 resolves each pair independently, and may resolve neither).
+        if first || second {
+            geom.record_resplit_face(face);
+        }
     }
 
     /// §5.3 — quad, three edges cut. Three of the four edges carry a midpoint
@@ -1411,20 +1477,21 @@ impl LoopMesh {
         let m23 = ring[(middle + 2) % n].0; // end midpoint leading m12
 
         // m12 -> m01 peels the corner triangle {m01, v1, m12}.
-        let f1 = self.face_with_both(m12, m01);
-        self.face_split(f1, m12, m01).expect("m12-m01 split");
+        let peel_a = self.template_connect(m12, m01).is_some();
         // m12 -> m23 peels the corner triangle {m12, v2, m23}.
-        let f2 = self.face_with_both(m12, m23);
-        self.face_split(f2, m12, m23).expect("m12-m23 split");
+        let peel_b = self.template_connect(m12, m23).is_some();
         // m01 -> m23 splits the remaining pentagon {v0, m01, m12, m23, v3} into
         // the centre triangle {m01, m12, m23} and the quad {v0, m01, m23, v3}.
-        let f3 = self.face_with_both(m01, m23);
-        self.face_split(f3, m01, m23).expect("m01-m23 split");
+        // Each pair is routed by §7.0 in its own right; one resolving into a
+        // neighbour (or nowhere) does not stop the others.
+        let diagonal = self.template_connect(m01, m23).is_some();
 
         // §1 — the three-edge quad is *not* a grid fill (§1 lists §5.3 among the
         // non-grid patterns): its three connecting edges and four fragments are
         // not inner; only the three rim midpoints (recorded in §3) are.
-        geom.record_resplit_face(face);
+        if peel_a || peel_b || diagonal {
+            geom.record_resplit_face(face);
+        }
     }
 
     /// §5.4 — quad, all four edges cut. Cycle is
@@ -1446,7 +1513,13 @@ impl LoopMesh {
         // Cut the octagon m01 -> m23 across, then split that diagonal at its
         // midpoint to introduce the centre vert c. The diagonal joins two
         // opposite rim midpoints, so its midpoint is the quad centroid.
-        let (_hex_b, diag) = self.face_split(face, m01, m23).expect("m01-m23 split");
+        // The dispatched face carries both opposite midpoints, so §7.0 always
+        // finds *a* carrier; without a diagonal there is no centre vert and no
+        // grid, so bail rather than fabricate one.
+        let Some((_hex_b, diag)) = self.template_connect(m01, m23) else {
+            debug_assert!(false, "the dispatched face carries both opposite midpoints");
+            return;
+        };
         let mids = self.edge_split_n(diag, m01, 1);
         let c = mids[0];
 
@@ -1477,11 +1550,13 @@ impl LoopMesh {
         self.maybe_sphere_project(c, params);
 
         // Connect the remaining two rim midpoints to c, finishing the four
-        // spokes (m01-c and m23-c already exist as the halved diagonal).
-        let f_m12 = self.face_with_both(c, m12);
-        self.face_split(f_m12, c, m12).expect("c-m12 split");
-        let f_m30 = self.face_with_both(c, m30);
-        self.face_split(f_m30, c, m30).expect("c-m30 split");
+        // spokes (m01-c and m23-c already exist as the halved diagonal). If §7.0
+        // routed the diagonal into a neighbour, `c` was born there and these
+        // pairs may have no carrier — a no-op, not an error (§7.0). The inner
+        // slots below are read back off `c`'s actual incidence, so they stay
+        // truthful either way.
+        self.template_connect(c, m12);
+        self.template_connect(c, m30);
 
         // §1 / §5.4 Output-slot note: this grid fill marks its interior
         // geometry inner — `c`, the four "plus" spokes, and the new fragment
@@ -1999,22 +2074,24 @@ impl LoopMesh {
         // §9.5.3.1 half-split rule. `position` is 1-based along the run from v0
         // toward v1; the `<=` / `>=` pair is not a partition — it overlaps on the
         // median (2*position == n + 1), which lays *both* connects.
+        let mut laid_any = false;
         for (zero_based, &m) in run.iter().enumerate() {
             let position = zero_based + 1;
             if 2 * position <= n + 1 {
-                let sub = self.face_with_both(m, v3);
-                self.face_split(sub, m, v3);
+                laid_any |= self.template_connect(m, v3).is_some();
             }
             if 2 * position >= n + 1 {
-                let sub = self.face_with_both(m, v2);
-                self.face_split(sub, m, v2);
+                laid_any |= self.template_connect(m, v2).is_some();
             }
         }
         // §1 / §5.1 Output-slot note: the one-edge fan is non-grid — its
         // connecting edges and fragments are *not* inner; only the rim midpoints
         // (recorded in §3) are. geom.out gets the single re-split mark for
-        // `face`, which survives as one fan fragment.
-        geom.record_resplit_face(face);
+        // `face`, which survives as one fan fragment — but only if some spoke was
+        // laid; §7.0 may route every pair elsewhere, leaving `face` unsplit.
+        if laid_any {
+            geom.record_resplit_face(face);
+        }
     }
 
     /// §9.5.3.2 — one-edge triangle fan (single-hub). The apex is the only corner
@@ -2035,14 +2112,17 @@ impl LoopMesh {
         let apex = corners[(cut + 2) % 3];
         let run = sides[cut].clone();
 
+        let mut laid_any = false;
         for m in run {
-            let sub = self.face_with_both(m, apex);
-            self.face_split(sub, m, apex);
+            laid_any |= self.template_connect(m, apex).is_some();
         }
         // §1 / §6.1 Output-slot note: the one-edge tri fan is non-grid — its
         // apex-connect edges and fragments are *not* inner; only the rim
-        // midpoints (recorded in §3) are. geom.out gets the single re-split mark.
-        geom.record_resplit_face(face);
+        // midpoints (recorded in §3) are. geom.out gets the single re-split mark,
+        // earned only if some apex spoke actually landed (§7.0).
+        if laid_any {
+            geom.record_resplit_face(face);
+        }
     }
 }
 
@@ -2405,6 +2485,74 @@ mod tests {
     /// face in the mesh is one of that face's fragments.
     fn resplit_fragments(mesh: &LoopMesh, _geom: &SubdivideGeom) -> Vec<FaceKey> {
         mesh.face_keys()
+    }
+
+    /// §7.0 / §7.1 — a quad `(a, b, c, d)` and a pentagon `(a, b, c, e, f)`
+    /// sharing **two** edges (`{a,b}` and `{b,c}`), closing around the valence-2
+    /// vertex `b` like the corner of a pillow. Edge- and vertex-manifold, and the
+    /// one shape where a template connect's endpoint pair is carried by a face
+    /// *other* than the one the template was dispatched for. Returns
+    /// `(mesh, [a, b, c, d, e, f], e_ab, e_bc)`.
+    fn quad_pentagon_shared_two_edges() -> (LoopMesh, [VertexKey; 6], EdgeKey, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let e = mesh.create_vertex(Vec3::new(1.5, 0.5, 1.0));
+        let f = mesh.create_vertex(Vec3::new(-0.5, -0.5, 1.0));
+
+        let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+        let e_bc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e_cd = mesh.create_edge([c, d], EdgeCreateFlags::NONE);
+        let e_da = mesh.create_edge([d, a], EdgeCreateFlags::NONE);
+        let e_af = mesh.create_edge([a, f], EdgeCreateFlags::NONE);
+        let e_fe = mesh.create_edge([f, e], EdgeCreateFlags::NONE);
+        let e_ec = mesh.create_edge([e, c], EdgeCreateFlags::NONE);
+
+        mesh.face_create(
+            &[a, b, c, d],
+            &[e_ab, e_bc, e_cd, e_da],
+            FaceCreateFlags::NONE,
+        );
+        // Wound c -> b -> a so both shared edges are traversed opposite to the
+        // quad, keeping every radial cycle at length 2.
+        mesh.face_create(
+            &[c, b, a, f, e],
+            &[e_bc, e_ab, e_af, e_fe, e_ec],
+            FaceCreateFlags::NONE,
+        );
+        (mesh, [a, b, c, d, e, f], e_ab, e_bc)
+    }
+
+    /// §7.0 / §7.1 — a quad `(a, b, c, d)` and a triangle `(a, b, c)` sharing
+    /// **two** edges (`{a,b}` and `{b,c}`). Like the pillow above, but the
+    /// neighbour is *strictly smaller* than the parent on both sides, so the
+    /// fewest-corners rule would pull each face's shared-corner cut into the
+    /// other one — which is exactly what the §7.1 fallback rows must not do.
+    /// Returns `(mesh, [a, b, c, d], e_ab, e_bc)`.
+    fn quad_triangle_shared_two_edges() -> (LoopMesh, [VertexKey; 4], EdgeKey, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+
+        let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+        let e_bc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e_cd = mesh.create_edge([c, d], EdgeCreateFlags::NONE);
+        let e_da = mesh.create_edge([d, a], EdgeCreateFlags::NONE);
+        let e_ca = mesh.create_edge([c, a], EdgeCreateFlags::NONE);
+
+        mesh.face_create(
+            &[a, b, c, d],
+            &[e_ab, e_bc, e_cd, e_da],
+            FaceCreateFlags::NONE,
+        );
+        // Wound c -> b -> a so both shared edges are traversed opposite to the
+        // quad, keeping every radial cycle at length 2.
+        mesh.face_create(&[c, b, a], &[e_bc, e_ab, e_ca], FaceCreateFlags::NONE);
+        (mesh, [a, b, c, d], e_ab, e_bc)
     }
 
     /// A dihedral fold of two quads hinged about the edge `{v1, v2}` (§9.1.5).
@@ -5068,5 +5216,184 @@ mod tests {
         let (b1n, b2n) = tangent_frame(Vec3::new(0.0, 0.0, -1.0));
         assert!(b1n.distance(Vec3::new(-1.0, 0.0, 0.0)) < 1e-9, "-z base1 = -x");
         assert!(b2n.distance(Vec3::new(0.0, 1.0, 0.0)) < 1e-9, "-z base2 = +y");
+    }
+
+    #[test]
+    fn connect_targeting_picks_the_fewest_corners_face() {
+        // §7.0 — the primitive itself. `a` and `c` are carried by *both* faces of
+        // the pillow; the 4-corner quad beats the 5-corner pentagon regardless of
+        // disk order. A pair no face carries resolves to nothing, and laying it is
+        // a silent no-op rather than an error.
+        let (mut mesh, [a, _b, c, d, e, _f], _e_ab, _e_bc) = quad_pentagon_shared_two_edges();
+
+        let target = mesh
+            .smallest_face_with_both(a, c)
+            .expect("both faces carry the pair");
+        assert_eq!(mesh.face_len(target), 4, "the quad wins on corner count");
+
+        assert!(
+            mesh.smallest_face_with_both(d, e).is_none(),
+            "no face carries a quad-only and a pentagon-only corner"
+        );
+        let before = counts(&mesh);
+        assert!(mesh.template_connect(d, e).is_none(), "untargeted connect");
+        assert_eq!(
+            counts(&mesh),
+            before,
+            "the no-op creates no edge, no fragment"
+        );
+    }
+
+    #[test]
+    fn shared_two_edges_single_cut_template_targets_smaller_face() {
+        // §7.0 — cut only the shared edge {a, b}. The quad takes the §5.1 one-edge
+        // template; its second connect `m — c` is carried by the quad fragment
+        // {m, b, c, d} (4 corners) *and* by the pentagon (6 corners after the cut).
+        // Fewest corners wins, so both connects stay inside the quad and the
+        // pentagon is left flat (it has one cut edge and no template).
+        // V 6->7, E 7->10, F 2->4.
+        let (mut mesh, [_a, b, c, _d, _e, _f], e_ab, _e_bc) = quad_pentagon_shared_two_edges();
+
+        let res = mesh.subdivide_edges(&[e_ab], SubdivideParams::default());
+        let geom = match res {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+        assert_eq!(
+            counts(&mesh),
+            (7, 10, 4),
+            "the quad splits in three; the pentagon does not split"
+        );
+
+        let m = geom.verts[0];
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(
+            shapes,
+            vec![3, 3, 3, 6],
+            "three quad fragments + the intact 6-ring pentagon"
+        );
+
+        // The discriminator: `m — c` must separate two *quad* fragments. Targeting
+        // the first face carrying the pair instead lays it inside the pentagon,
+        // which then re-enters the dispatch as a 4-corner ring and over-splits.
+        let mc = mesh
+            .query_edge_exists(m, c)
+            .expect("the m - c connect was laid");
+        let mut radial: Vec<usize> = mesh
+            .edge_face_keys(mc)
+            .iter()
+            .map(|&f| mesh.face_len(f))
+            .collect();
+        radial.sort_unstable();
+        assert_eq!(
+            radial,
+            vec![3, 3],
+            "m - c splits the quad, not the pentagon"
+        );
+
+        let pentagon = mesh
+            .face_keys()
+            .into_iter()
+            .find(|&f| mesh.face_len(f) == 6)
+            .expect("the pentagon survives");
+        let pentagon_verts = mesh.face_vert_keys(pentagon);
+        assert!(
+            pentagon_verts.contains(&m) && pentagon_verts.contains(&b),
+            "the pentagon keeps the shared cut's midpoint on its rim, un-connected"
+        );
+    }
+
+    #[test]
+    fn two_edge_fallback_splits_its_own_face_not_a_smaller_neighbour() {
+        // §7.1 — both faces of this pillow are two-edge fallback rows (§5.2.1 for
+        // the quad, §6.2 for the triangle) and both carry the same `m_ab - m_bc`
+        // pair. Whichever is re-split second faces a strictly smaller carrier: a
+        // fragment of the first. The fallback splits the parent face handle it was
+        // dispatched for, so each parent lays its own diagonal; routing these
+        // through the §7.0 fewest-corners primitive would drag the second cut into
+        // the first face's fragments instead.
+        let (mut mesh, _corners, e_ab, e_bc) = quad_triangle_shared_two_edges();
+
+        let geom = match mesh.subdivide_edges(&[e_ab, e_bc], SubdivideParams::default()) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(
+            counts(&mesh),
+            (6, 9, 4),
+            "both parents split, each laying its own diagonal"
+        );
+
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(
+            shapes,
+            vec![3, 3, 4, 5],
+            "quad -> corner tri + pentagon; triangle -> corner tri + quad"
+        );
+
+        // The discriminator: two *distinct* edges span the midpoint pair, one
+        // interior to each parent. A §7.0-routed fallback would lay at most one.
+        let (m_ab, m_bc) = (geom.verts[0], geom.verts[1]);
+        let mut diagonals = 0;
+        let mut disk = mesh.disk_edges(m_ab);
+        while let Some(edge) = disk.next(&mesh) {
+            if mesh.edge_vert_keys(edge).contains(&m_bc) {
+                diagonals += 1;
+            }
+        }
+        assert_eq!(diagonals, 2, "each fallback cut its own face");
+
+        assert_eq!(
+            geom.faces.len(),
+            2,
+            "geom.out: one re-split mark per parent, not per fragment"
+        );
+    }
+
+    #[test]
+    fn template_connect_no_op_leaves_the_resplit_mark_unearned() {
+        // §7.0 / §1 — a connect that resolves to no carrier lays nothing, so the
+        // face it was dispatched for is not a re-split face and must contribute no
+        // `geom.out` mark. Drive the §5.1 template on a lone quad whose two
+        // interior pairs have been rendered uncarried by handing it a ring of
+        // corners no face holds.
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+        let e_bc = mesh.create_edge([b, c], EdgeCreateFlags::NONE);
+        let e_cd = mesh.create_edge([c, d], EdgeCreateFlags::NONE);
+        let e_da = mesh.create_edge([d, a], EdgeCreateFlags::NONE);
+        let face = mesh.face_create(
+            &[a, b, c, d],
+            &[e_ab, e_bc, e_cd, e_da],
+            FaceCreateFlags::NONE,
+        );
+
+        // Two loose verts no face carries: every §5.1 connect off them is a no-op.
+        let loose_m = mesh.create_vertex(Vec3::new(0.5, 0.0, 0.0));
+        let loose_far = mesh.create_vertex(Vec3::new(0.5, 2.0, 0.0));
+        let ring = [
+            (loose_m, true),
+            (b, false),
+            (loose_far, false),
+            (d, false),
+            (a, false),
+        ];
+
+        let before = counts(&mesh);
+        let mut geom = SubdivideGeom::default();
+        mesh.quad_one_cut(face, &ring, &mut geom);
+
+        assert_eq!(counts(&mesh), before, "an uncarried pair creates no geometry");
+        assert!(
+            geom.faces.is_empty(),
+            "a face nothing was laid in earns no re-split mark"
+        );
     }
 }
