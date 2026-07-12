@@ -241,6 +241,9 @@ impl LoopMesh {
                         if self.vertex_disk_iter(endpoint_dup).next().is_none() {
                             self.vertex_kill(endpoint_dup);
                             vert_dup_killed[endpoint_old.as_usize()] = true;
+                            // The ledger's entry for this endpoint now names a dead
+                            // vertex; drop it so no later pass reuses it.
+                            ledger.forget_dup(endpoint_old);
                         }
                     }
                 }

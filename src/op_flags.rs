@@ -102,7 +102,7 @@ macro_rules! impl_element_ops {
         $clear_fn:ident,                 // vert_clear
         $test_fn:ident,                  // vert_test
         $clear_all_fn:ident,             // vert_clear_all
-        $grow_fn:ident,                  // grow_vert_layers
+        $mint_fn:ident,                  // mint_vert_slot
         $active_count_fn:ident,          // active_vert_count
     ) => {
         impl OpFlagPool {
@@ -157,15 +157,39 @@ macro_rules! impl_element_ops {
                 self.$layers_field[layer.idx()].fill(0);
             }
 
-            /// Extend every active layer's storage to `new_watermark` if
-            /// shorter. Called from `LoopMesh::create_*` after the slab
-            /// inserts a new slot.
-            pub(crate) fn $grow_fn(&mut self, new_watermark: usize) {
+            /// Prepare `slot` for a freshly minted element: extend every active
+            /// layer's storage to `key_watermark` if shorter, then zero the new
+            /// element's word in each active layer. Called from `LoopMesh`'s
+            /// element-creation sites.
+            ///
+            /// The zeroing is what makes "a created element carries no op flags"
+            /// true for a **recycled** slab key, whose word is already in range
+            /// (so the resize is a no-op) and still holds the dead element's
+            /// bits. O(active layers), which is 0 outside an op.
+            ///
+            /// Argument order matches `ElementAttributes::mint_slot`: the two are
+            /// called back-to-back at every creation site with the same pair, and
+            /// a transposition here would zero an unrelated element's flag word.
+            /// The `debug_assert` is what turns that transposition into a failing
+            /// test rather than silent corruption — and it is also what licenses
+            /// the unchecked `v[slot]` below.
+            pub(crate) fn $mint_fn(&mut self, slot: usize, key_watermark: usize) {
+                debug_assert!(
+                    slot < key_watermark,
+                    concat!(
+                        stringify!($mint_fn),
+                        ": slot {} is not below the post-creation key watermark {} \
+                         (arguments transposed?)"
+                    ),
+                    slot,
+                    key_watermark,
+                );
                 for &li in &self.$active_field {
                     let v = &mut self.$layers_field[li as usize];
-                    if v.len() < new_watermark {
-                        v.resize(new_watermark, 0);
+                    if v.len() < key_watermark {
+                        v.resize(key_watermark, 0);
                     }
+                    v[slot] = 0;
                 }
             }
 
@@ -189,7 +213,7 @@ impl_element_ops!(
     vert_clear,
     vert_test,
     vert_clear_all,
-    grow_vert_layers,
+    mint_vert_slot,
     active_vert_count,
 );
 
@@ -205,7 +229,7 @@ impl_element_ops!(
     edge_clear,
     edge_test,
     edge_clear_all,
-    grow_edge_layers,
+    mint_edge_slot,
     active_edge_count,
 );
 
@@ -221,7 +245,7 @@ impl_element_ops!(
     face_clear,
     face_test,
     face_clear_all,
-    grow_face_layers,
+    mint_face_slot,
     active_face_count,
 );
 
@@ -237,7 +261,7 @@ impl_element_ops!(
     loop_clear,
     loop_test,
     loop_clear_all,
-    grow_loop_layers,
+    mint_loop_slot,
     active_loop_count,
 );
 
@@ -313,19 +337,34 @@ mod tests {
     }
 
     #[test]
-    fn grow_extends_active_layers_only() {
+    fn mint_extends_active_layers_only() {
         let mut pool = OpFlagPool::default();
-        let _a = pool.push_vert(2);
+        let a = pool.push_vert(2);
         // Push a second layer then immediately pop — it becomes inactive but
         // still exists in storage.
         let b = pool.push_vert(2);
         pool.pop_vert(b);
 
-        pool.grow_vert_layers(8);
+        pool.mint_vert_slot(7, 8);
         // Active layer grew.
         assert_eq!(pool.vert_layers[0].len(), 8);
         // Popped (inactive) layer stayed at its original length.
         assert_eq!(pool.vert_layers[1].len(), 2);
+        pool.pop_vert(a);
+    }
+
+    #[test]
+    fn mint_zeroes_a_recycled_slot() {
+        let mut pool = OpFlagPool::default();
+        let layer = pool.push_vert(4);
+        pool.vert_set(layer, 2, 5);
+        assert!(pool.vert_test(layer, 2, 5));
+
+        // Slot 2's element is killed and a new one is minted into the same slot:
+        // the watermark is unchanged, so only the explicit zeroing clears it.
+        pool.mint_vert_slot(2, 4);
+        assert!(!pool.vert_test(layer, 2, 5));
+        pool.pop_vert(layer);
     }
 
     #[test]

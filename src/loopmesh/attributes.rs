@@ -140,9 +140,14 @@ impl ElementAttributeKey {
 /// Element attributes mirror the slab layout for the corresponding
 /// element type. The descriptor `Slab` carries the public-facing key and
 /// kind; the typed buckets carry the actual values, one slot per element-
-/// slab key. Vacant element slots have undefined values in each bucket
-/// (mirrors the parallel-Vec storage that was here before nub-mesh
-/// integration).
+/// slab key.
+///
+/// A **vacant** element slot's buckets are not scrubbed on removal — they still
+/// hold the dead element's values. That is invisible to callers because the slot
+/// is default-stamped on the way back *in*: every element-creation site goes
+/// through [`mint_slot`](Self::mint_slot), so a live element's attribute block
+/// reads as the layer defaults from the moment it exists, whether its slab key
+/// is fresh or recycled (`BMESH.md` §13).
 #[derive(Default)]
 pub struct ElementAttributes {
     attributes: Slab<ElementAttributeDesc>,
@@ -160,10 +165,46 @@ pub struct ElementAttributes {
 }
 
 impl ElementAttributes {
+    /// Prepare `slot`'s storage for a **freshly minted element**: grow every
+    /// bucket to `key_watermark`, then stamp each layer's default onto `slot`.
+    ///
+    /// This is the whole of `BMESH.md` §13's "creation ... default-initialises
+    /// the attribute block": a created element reads as the layer default on
+    /// every layer of its domain, *unconditionally*. The grow alone would only
+    /// achieve that for a **fresh** slab key — a recycled key's bucket slots are
+    /// already in range, so the resize is a no-op there and the slot would still
+    /// hold the dead element's values. Callers that mean to inherit data write it
+    /// explicitly after the mint, so the reset never destroys wanted state.
+    ///
+    /// Cost is O(the layer slab's capacity on this domain); zero-layer domains
+    /// return without touching memory.
+    ///
+    /// Argument order matches `OpFlagPool`'s `mint_*_slot`: the two are called
+    /// back-to-back at every creation site with the same pair, and a
+    /// transposition here would default-stamp a **live** element's attribute
+    /// block. The `debug_assert` is what turns that transposition into a failing
+    /// test rather than silent data loss.
+    pub(crate) fn mint_slot(&mut self, slot: usize, key_watermark: usize) {
+        debug_assert!(
+            slot < key_watermark,
+            "mint_slot: slot {slot} is not below the post-creation key watermark \
+             {key_watermark} (arguments transposed?)"
+        );
+        if self.attributes.is_empty() {
+            return;
+        }
+        self.grow_all(key_watermark);
+        self.clear_slot(slot);
+    }
+
     /// Resize every bucket to `key_watermark`, default-filling new slots, so
     /// every registered layer keeps one slot per live element after the slab
     /// grows. The single place that must enumerate every bucket type.
-    pub(crate) fn grow_all(&mut self, key_watermark: usize) {
+    ///
+    /// Private on purpose: growing is *not* sufficient at an element-creation
+    /// site (see [`mint_slot`](Self::mint_slot)), and a mint path that reached
+    /// for `grow_all` would silently reintroduce the recycled-slot hazard.
+    fn grow_all(&mut self, key_watermark: usize) {
         for v in &mut self.attributes_bool {
             v.resize(key_watermark, false);
         }
@@ -935,6 +976,68 @@ impl ElementAttributes {
         }
     }
 
+    /// Write a [`SlotSnapshot`]'s captured slot `index` verbatim onto
+    /// `dst_slot`: the 1:1 [`copy_into`](Self::copy_into) with a **detached**
+    /// source, so it outlives the element it was captured from. Every layer is
+    /// written, [`NoInterp`](InterpPolicy::NoInterp) included — this is a block
+    /// copy, not a blend.
+    ///
+    /// The primitive a *rebuild* needs: an op that kills an element and
+    /// re-creates it over a new cycle must capture the block **before** the kill,
+    /// because the freed slot is default-stamped the moment the replacement
+    /// recycles it ([`mint_slot`](Self::mint_slot)).
+    pub(crate) fn restore_slot(&mut self, dst_slot: usize, snapshot: &SlotSnapshot, index: usize) {
+        for (storage, _, values) in &snapshot.layers {
+            match (*storage, values) {
+                (AttributeStorage::Bool(b), SnapshotValues::Bool(src)) => {
+                    write_slot(self.attributes_bool.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::U8(b), SnapshotValues::U8(src)) => {
+                    write_slot(self.attributes_u8.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::I32(b), SnapshotValues::I32(src)) => {
+                    write_slot(self.attributes_i32.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::U32(b), SnapshotValues::U32(src)) => {
+                    write_slot(self.attributes_u32.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::F32(b), SnapshotValues::F32(src)) => {
+                    write_slot(self.attributes_f32.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::F64(b), SnapshotValues::F64(src)) => {
+                    write_slot(self.attributes_f64.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::Vec2(b), SnapshotValues::Vec2(src)) => {
+                    write_slot(self.attributes_vec2.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::Vec3(b), SnapshotValues::Vec3(src)) => {
+                    write_slot(self.attributes_vec3.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::Vec4(b), SnapshotValues::Vec4(src)) => {
+                    write_slot(self.attributes_vec4.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::Vec4U8(b), SnapshotValues::Vec4U8(src)) => {
+                    write_slot(self.attributes_vec4u8.get_mut(b), dst_slot, src.get(index))
+                }
+                (AttributeStorage::String(b), SnapshotValues::String(src)) => {
+                    if let Some(bucket) = self.attributes_string.get_mut(b) {
+                        if let Some(out) = bucket.get_mut(dst_slot) {
+                            *out = src.get(index).cloned().flatten();
+                        }
+                    }
+                }
+                // A snapshot layer's `SnapshotValues` variant is chosen from its
+                // own `AttributeStorage` at capture, so the pair is always
+                // matched. Panicking beats a silent no-op: a future storage kind
+                // that forgets its arm here would otherwise present as
+                // "attributes mysteriously not restored".
+                (storage, _) => unreachable!(
+                    "snapshot layer's value variant does not match its storage {storage:?}"
+                ),
+            }
+        }
+    }
+
     /// 1:1 attribute copy: every attribute's `dst_slot` receives `src_slot`'s
     /// value. Useful for ops that duplicate an element without blending
     /// (e.g. `euler_vert_separate`, `face_split` inheriting the source
@@ -960,12 +1063,12 @@ impl ElementAttributes {
     ///   source → clone).
     /// - A destination-only layer with no matching source → a
     ///   [`SetDefault`](RemapStep::SetDefault) step: the clone receives the
-    ///   layer type's default, written **explicitly**. This must not be left to
-    ///   the freshly-created element's slot already holding a default — a clone
-    ///   minted into a *recycled* slab slot inherits whatever stale value that
-    ///   slot last carried (creation's grow is a resize no-op for a recycled
-    ///   key, and removal never resets the attribute buckets), so the default
-    ///   has to be stamped on.
+    ///   layer type's default, written **explicitly**. Element creation already
+    ///   guarantees that ([`mint_slot`](Self::mint_slot)), so the step is
+    ///   belt-and-braces on a *freshly minted* clone — but the plan is also
+    ///   replayed onto destinations the caller supplies, and it is the step that
+    ///   makes the plan self-contained rather than dependent on how its
+    ///   destination was obtained.
     ///
     /// A source-only layer (no matching destination layer) is never visited —
     /// the walk is over destination layers — so it is simply dropped. Build
@@ -999,8 +1102,7 @@ impl ElementAttributes {
     ///   `src_slot`. A copy, never an interpolation — duplicate has exactly one
     ///   source per clone, so only the *offsets* differ from §4's verbatim copy.
     /// - [`SetDefault`](RemapStep::SetDefault) → write the destination-only
-    ///   layer's type default onto the clone, overwriting any stale value the
-    ///   recycled slot may carry.
+    ///   layer's type default onto the clone.
     pub(crate) fn apply_remap_from(
         &mut self,
         plan: &RemapPlan,
@@ -1018,14 +1120,22 @@ impl ElementAttributes {
         }
     }
 
-    /// Reset every attribute's `slot` to its default-init value. Used when
-    /// recycling a slab slot whose previous attribute values are no longer
-    /// meaningful.
+    /// Reset every attribute's `slot` to its default-init value. The
+    /// default-initialise behaviour of `BMESH.md` §10, applied to one element's
+    /// whole attribute block; [`mint_slot`](Self::mint_slot) is its caller at
+    /// element creation.
+    ///
+    /// Indexed rather than iterated so the descriptor borrow is released per
+    /// layer: this is on the mint path and must not allocate a plan buffer.
+    /// The sweep is over the descriptor slab's **capacity**, not its live count,
+    /// so a domain that has removed layers pays for the vacant slots too — a
+    /// non-issue while layer removal is rare and capacity stays within a few of
+    /// the live count.
     pub fn clear_slot(&mut self, slot: usize) {
-        let plan: SmallVec<[AttributeStorage; 8]> =
-            self.attributes.iter().map(|(_, d)| d.storage).collect();
-
-        for storage in plan {
+        for index in 0..self.attributes.capacity() {
+            let Some(storage) = self.attributes.get(index).map(|desc| desc.storage) else {
+                continue;
+            };
             set_storage_default(self, storage, slot);
         }
     }
@@ -1164,6 +1274,16 @@ impl SnapshotValues {
             SnapshotValues::Vec4(v) => v.len(),
             SnapshotValues::Vec4U8(v) => v.len(),
             SnapshotValues::String(v) => v.len(),
+        }
+    }
+}
+
+/// Write one captured value into a bucket slot, tolerating a missing bucket or
+/// an out-of-range slot. Helper for [`ElementAttributes::restore_slot`].
+fn write_slot<T: Copy>(bucket: Option<&mut Vec<T>>, slot: usize, value: Option<&T>) {
+    if let (Some(bucket), Some(value)) = (bucket, value) {
+        if let Some(out) = bucket.get_mut(slot) {
+            *out = *value;
         }
     }
 }
@@ -2078,5 +2198,173 @@ mod tests {
         let bogus = ElementAttributeKey(9999);
         assert!(!mesh.vertex_attribs_mut().set_i32(bogus, v0.as_usize(), 1));
         assert_eq!(mesh.vertex_attribs().get_i32(bogus, v0.as_usize()), None);
+    }
+
+    // ---- Mint-time default-initialisation (BMESH.md §13 / §10) ----
+    //
+    // Every test below kills an element so its slab key is freed, mints a
+    // replacement that recycles that key, and asserts the new element reads as
+    // the layer default. Each *asserts the recycling itself* — without that the
+    // test would silently degenerate into checking a fresh key, which the plain
+    // grow already handled.
+
+    /// A triangle, returned as (verts, edges, face).
+    fn triangle(mesh: &mut LoopMesh) -> ([VertexKey; 3], [EdgeKey; 3], FaceKey) {
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let v2 = mesh.create_vertex(Vec3::Y);
+        let e0 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e1 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e2 = mesh.create_edge([v2, v0], EdgeCreateFlags::NONE);
+        let f = mesh.face_create(&[v0, v1, v2], &[e0, e1, e2], FaceCreateFlags::NONE);
+        ([v0, v1, v2], [e0, e1, e2], f)
+    }
+
+    #[test]
+    fn minted_vertex_in_recycled_slot_reads_defaults() {
+        let mut mesh = LoopMesh::new();
+        let color = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("v_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let name = mesh
+            .register_vertex_attribute(ElementAttributeDesc::string(AttributeKey::custom(
+                "v_name",
+            )))
+            .unwrap();
+
+        let doomed = mesh.create_vertex(Vec3::X);
+        mesh.vertex_attribs_mut()
+            .set_vec3(color, doomed.as_usize(), [0.4, 0.5, 0.6]);
+        mesh.vertex_attribs_mut()
+            .set_string(name, doomed.as_usize(), Some("doomed".to_string()));
+        mesh.vertex_kill(doomed);
+
+        let minted = mesh.create_vertex(Vec3::Y);
+        assert_eq!(minted, doomed, "the mint must recycle the freed slab key");
+        assert_eq!(
+            mesh.vertex_attribs().get_vec3(color, minted.as_usize()),
+            Some([0.0; 3])
+        );
+        assert_eq!(mesh.vertex_attribs().get_string(name, minted.as_usize()), None);
+    }
+
+    #[test]
+    fn minted_edge_in_recycled_slot_reads_defaults() {
+        let mut mesh = LoopMesh::new();
+        let seam = mesh
+            .register_edge_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("e_seam"),
+                AttrType::Bool,
+            ))
+            .unwrap();
+
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::X);
+        let v2 = mesh.create_vertex(Vec3::Y);
+
+        let doomed = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        // The crease layer is an ordinary named per-edge F32 layer, registered
+        // on first write — a built-in in name only, so it must obey the same
+        // mint-time default as any custom layer.
+        mesh.set_edge_crease(doomed, 0.75);
+        mesh.edge_attribs_mut()
+            .set_bool(seam, doomed.as_usize(), true);
+        mesh.edge_kill(doomed);
+
+        let minted = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        assert_eq!(minted, doomed, "the mint must recycle the freed slab key");
+        assert_eq!(mesh.edge_crease(minted), 0.0);
+        assert_eq!(
+            mesh.edge_attribs().get_bool(seam, minted.as_usize()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn minted_face_and_loops_in_recycled_slots_read_defaults() {
+        let mut mesh = LoopMesh::new();
+        let f_color = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("f_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .unwrap();
+
+        let (verts, edges, doomed_face) = triangle(&mut mesh);
+        let doomed_loops: Vec<LoopKey> = mesh.iter_face_loops(doomed_face).collect();
+        mesh.face_attribs_mut()
+            .set_vec3(f_color, doomed_face.as_usize(), [0.9, 0.1, 0.2]);
+        for (i, l) in doomed_loops.iter().enumerate() {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [i as f32, 1.0]);
+        }
+
+        // Kills the face and its three loops; the verts and edges survive, so
+        // the rebuilt face lands on exactly the freed face / loop keys.
+        mesh.face_kill(doomed_face);
+
+        let minted_face = mesh.face_create(&verts, &edges, FaceCreateFlags::NONE);
+        assert_eq!(
+            minted_face, doomed_face,
+            "the mint must recycle the freed face key"
+        );
+        let minted_loops: Vec<LoopKey> = mesh.iter_face_loops(minted_face).collect();
+        let mut recycled: Vec<LoopKey> = minted_loops.clone();
+        recycled.retain(|l| doomed_loops.contains(l));
+        assert_eq!(
+            recycled.len(),
+            doomed_loops.len(),
+            "the mint must recycle every freed loop key"
+        );
+
+        assert_eq!(
+            mesh.face_attribs().get_vec3(f_color, minted_face.as_usize()),
+            Some([0.0; 3])
+        );
+        for l in minted_loops {
+            assert_eq!(
+                mesh.loop_attribs().get_vec2(uv, l.as_usize()),
+                Some([0.0; 2]),
+                "loop {l:?} inherited a dead corner's UV"
+            );
+        }
+    }
+
+    /// The single-loop mint path (`create_loop`) is separate from `face_create`'s
+    /// inlined first-loop mint; pin it independently.
+    #[test]
+    fn minted_loop_in_recycled_slot_reads_defaults() {
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .unwrap();
+
+        // `host` stays alive so the re-minted loops have a face to name; only
+        // `doomed_face`'s loops are freed.
+        let (verts, _, host) = triangle(&mut mesh);
+        let (_, _, doomed_face) = triangle(&mut mesh);
+        let doomed_loops: Vec<LoopKey> = mesh.iter_face_loops(doomed_face).collect();
+        let doomed = doomed_loops[2];
+        mesh.loop_attribs_mut()
+            .set_vec2(uv, doomed.as_usize(), [3.0, 4.0]);
+
+        mesh.face_kill(doomed_face);
+        // create_loop yields a loop that is not yet spliced into any cycle, so
+        // `host` is untouched; all we exercise is the mint.
+        let minted: Vec<LoopKey> = verts.iter().map(|&v| mesh.create_loop(v, host)).collect();
+        assert!(
+            minted.contains(&doomed),
+            "the mints must recycle the freed loop keys"
+        );
+        assert_eq!(
+            mesh.loop_attribs().get_vec2(uv, doomed.as_usize()),
+            Some([0.0; 2])
+        );
     }
 }

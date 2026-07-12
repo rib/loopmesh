@@ -285,8 +285,8 @@ impl LoopMesh {
         });
 
         let key_watermark = self.vertices.key_watermark();
-        self.vertex_attribs.grow_all(key_watermark);
-        self.op_flags.grow_vert_layers(key_watermark);
+        self.vertex_attribs.mint_slot(vi.as_usize(), key_watermark);
+        self.op_flags.mint_vert_slot(vi.as_usize(), key_watermark);
 
         vi
     }
@@ -359,8 +359,8 @@ impl LoopMesh {
         });
 
         let key_watermark = self.edges.key_watermark();
-        self.edge_attribs.grow_all(key_watermark);
-        self.op_flags.grow_edge_layers(key_watermark);
+        self.edge_attribs.mint_slot(edge.as_usize(), key_watermark);
+        self.op_flags.mint_edge_slot(edge.as_usize(), key_watermark);
 
         self.vertex_disk_append_edge(vertices[0], edge);
         self.vertex_disk_append_edge(vertices[1], edge);
@@ -425,8 +425,8 @@ impl LoopMesh {
         new_entry.insert(loop_data);
 
         let key_watermark = self.loops.key_watermark();
-        self.loop_attribs.grow_all(key_watermark);
-        self.op_flags.grow_loop_layers(key_watermark);
+        self.loop_attribs.mint_slot(loopi.as_usize(), key_watermark);
+        self.op_flags.mint_loop_slot(loopi.as_usize(), key_watermark);
 
         loopi
     }
@@ -593,8 +593,10 @@ impl LoopMesh {
         ));
 
         let key_watermark = self.loops.key_watermark();
-        self.loop_attribs.grow_all(key_watermark);
-        self.op_flags.grow_loop_layers(key_watermark);
+        self.loop_attribs
+            .mint_slot(first_edge_loop.as_usize(), key_watermark);
+        self.op_flags
+            .mint_loop_slot(first_edge_loop.as_usize(), key_watermark);
 
         new_face_entry.insert(Face {
             eflags: ElementFlags::NONE,
@@ -606,8 +608,8 @@ impl LoopMesh {
         });
 
         let key_watermark = self.faces.key_watermark();
-        self.face_attribs.grow_all(key_watermark);
-        self.op_flags.grow_face_layers(key_watermark);
+        self.face_attribs.mint_slot(face.as_usize(), key_watermark);
+        self.op_flags.mint_face_slot(face.as_usize(), key_watermark);
 
         // Finish initializing the face edge loop
         self.face_loop_connect_edge(edges[0], first_edge_loop);
@@ -736,8 +738,8 @@ impl LoopMesh {
             normal: Vec3::ZERO,
         });
         let key_watermark = self.faces.key_watermark();
-        self.face_attribs.grow_all(key_watermark);
-        self.op_flags.grow_face_layers(key_watermark);
+        self.face_attribs.mint_slot(key.as_usize(), key_watermark);
+        self.op_flags.mint_face_slot(key.as_usize(), key_watermark);
         key
     }
 

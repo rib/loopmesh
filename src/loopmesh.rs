@@ -526,9 +526,20 @@ pub struct ExtrudeResult {
 /// the two passes' walls to meet at that single duplicate, sharing one
 /// vertical edge. Passing this ledger between the passes lets a later pass
 /// reuse an earlier pass's duplicate (and its vertical edge) instead of
-/// minting a parallel one. Slab-indexed by the source vertex's slot, sized to
-/// the watermark captured before any pass runs (duplicates created during a
-/// pass always land at higher slots, so they never need a ledger entry).
+/// minting a parallel one.
+///
+/// Slab-indexed by the *source* vertex's slot, sized to the watermark captured
+/// before any pass runs. A slab-indexed side table survives its element's death
+/// and can be read back by whatever later recycles the freed key, so the index
+/// domain is deliberately narrow: it holds **only originals that the caller
+/// named and that are live throughout** — the region pass's surviving
+/// `vert_map` sources (it drops the interior originals it deletes) and the
+/// endpoints of the routed input edges (a live edge keeps its endpoints alive).
+/// A duplicate is only ever a ledger *value*, never a key, so a duplicate that
+/// recycles a freed slot cannot collide with an entry. The debug assertion in
+/// [`record_dup`](Self::record_dup) is the tripwire if a future pass widens that
+/// domain: two different elements claiming one ledger slot is exactly the
+/// recycled-key hazard.
 #[derive(Debug)]
 pub(crate) struct ExtrudeVertDupLedger {
     dup: Vec<Option<VertexKey>>,
@@ -556,7 +567,22 @@ impl ExtrudeVertDupLedger {
 
     pub(crate) fn record_dup(&mut self, source: VertexKey, dup: VertexKey) {
         if self.in_range(source) {
+            debug_assert!(
+                self.dup[source.as_usize()].map_or(true, |existing| existing == dup),
+                "two different duplicates claim ledger slot {source} — the source key was \
+                 recycled under the ledger",
+            );
             self.dup[source.as_usize()] = Some(dup);
+        }
+    }
+
+    /// Drop `source`'s entries. The §8.3 wire-boundary kill destroys a duplicate
+    /// the ledger has already recorded; leaving the entry would offer a later
+    /// pass a dead vertex to "reuse".
+    pub(crate) fn forget_dup(&mut self, source: VertexKey) {
+        if self.in_range(source) {
+            self.dup[source.as_usize()] = None;
+            self.side_edge[source.as_usize()] = EdgeKey::NULL;
         }
     }
 

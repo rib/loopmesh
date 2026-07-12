@@ -5553,11 +5553,18 @@ impl LoopMesh {
 
         self.repoint_unbeveled_legs(endpoints, beveled, substitutions, &rebuilds);
 
-        for (face, new_cycle) in rebuilds {
+        // Capture every rebuilt face's block in one snapshot, before any kill:
+        // a rebuilt face may recycle a killed face's slab slot, and a minted
+        // element's attribute block is default-stamped, so the dead face's slot
+        // is no longer a source once the loop below is under way.
+        let carried_slots: Vec<usize> = rebuilds.iter().map(|(f, _)| f.as_usize()).collect();
+        let carried = self.face_attribs.snapshot_slots(&carried_slots);
+
+        for (index, (face, new_cycle)) in rebuilds.into_iter().enumerate() {
             self.face_kill(face);
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
             self.face_attribs
-                .copy_into(new_face.as_usize(), face.as_usize());
+                .restore_slot(new_face.as_usize(), &carried, index);
         }
     }
 
@@ -6546,11 +6553,18 @@ impl LoopMesh {
         // minting it fresh, leaving only the chamfer edges newly minted.
         self.repoint_incident_edges(corners);
 
-        for (face, new_cycle) in rebuilds {
+        // Capture every rebuilt face's block in one snapshot, before any kill:
+        // a rebuilt face may recycle a killed face's slab slot, and a minted
+        // element's attribute block is default-stamped, so the dead face's slot
+        // is no longer a source once the loop below is under way.
+        let carried_slots: Vec<usize> = rebuilds.iter().map(|(f, _)| f.as_usize()).collect();
+        let carried = self.face_attribs.snapshot_slots(&carried_slots);
+
+        for (index, (face, new_cycle)) in rebuilds.into_iter().enumerate() {
             self.face_kill(face);
             let new_face = self.face_create_verts(&new_cycle, FaceCreateFlags::NONE);
             self.face_attribs
-                .copy_into(new_face.as_usize(), face.as_usize());
+                .restore_slot(new_face.as_usize(), &carried, index);
         }
 
         // §6.5.1: copy each owning (outgoing) edge's per-edge CD onto the chamfer
@@ -20653,6 +20667,101 @@ mod tests {
             (p == rim[1] && q == rim[2]) || (p == rim[2] && q == rim[1]),
             "and its original endpoints",
         );
+    }
+
+    // ---- Per-face customdata across the face rebuild ----
+
+    /// Which of the cube's six axis-aligned planes every vert of `face` sits in,
+    /// if any. A rebuilt original face keeps this signature — its new corners are
+    /// ring / strip verts slid *along the cube's own edges*, which lie in the same
+    /// planes — while every face the bevel mints (cap, chamfer strip) spans a
+    /// corner or an edge and so belongs to none of them.
+    fn cube_plane_of(mesh: &LoopMesh, face: FaceKey) -> Option<usize> {
+        let verts = mesh.face_vert_keys(face);
+        (0..6).find(|&plane| {
+            let axis = plane / 2;
+            let sign = if plane % 2 == 0 { 1.0 } else { -1.0 };
+            verts
+                .iter()
+                .all(|&v| (mesh.vertex_position(v)[axis] - sign).abs() < 1.0e-4)
+        })
+    }
+
+    fn plane_tint(plane: usize) -> [f32; 3] {
+        [plane as f32 + 1.0, 0.25, 0.5]
+    }
+
+    /// Both restitch paths (BEVEL.md §6.1's vertex-bevel rebuild and §7.4's
+    /// consumed-endpoint rebuild) kill each affected face and re-create it over its
+    /// new cycle. The replacement routinely lands on the dead face's *recycled* slab
+    /// key, whose attribute block is default-stamped at mint — so a face's own
+    /// customdata survives only because the block is captured before the kill and
+    /// written back after. Tint every cube face by its plane, bevel, and require
+    /// every surviving original to still read its own tint.
+    fn assert_bevel_carries_face_cd(affect: BevelAffect, geom: impl Fn(&LoopMesh) -> Vec<GeomKey>) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = mesh
+            .register_face_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("f_tint"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        for face in mesh.face_keys() {
+            let plane = cube_plane_of(&mesh, face).expect("a cube face lies in an axis plane");
+            mesh.face_attribs_mut()
+                .set_vec3(tint, face.as_usize(), plane_tint(plane));
+        }
+        let faces_before = mesh.face_count();
+
+        let geom = geom(&mesh);
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                affect,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert!(!result.faces.is_empty(), "the bevel built no new faces");
+        assert!(mesh.face_count() > faces_before);
+
+        // The rebuild really did recycle: it killed faces and the replacements
+        // landed back in the freed keys, leaving the key space dense. Without a
+        // recycle every restored face would be a fresh key whose block no mint had
+        // stamped, and the assertions below would pass even with no restore at all.
+        let live: Vec<usize> = mesh.face_keys().iter().map(|f| f.as_usize()).collect();
+        assert_eq!(
+            live.iter().max().copied().expect("faces exist") + 1,
+            live.len(),
+            "face keys are not dense — no killed face's key was recycled, so this \
+             test cannot observe the restore it exists to pin",
+        );
+
+        for face in mesh.face_keys() {
+            let expected = cube_plane_of(&mesh, face).map_or([0.0; 3], plane_tint);
+            assert_eq!(
+                mesh.face_attribs().get_vec3(tint, face.as_usize()),
+                Some(expected),
+                "face {face:?} lost its per-face customdata across the rebuild",
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_bevel_carries_per_face_customdata_across_rebuild() {
+        assert_bevel_carries_face_cd(BevelAffect::Vertices, |mesh| {
+            vec![vert_at(mesh, Vec3::new(1.0, 1.0, 1.0)).into()]
+        });
+    }
+
+    #[test]
+    fn edge_bevel_carries_per_face_customdata_across_restitch() {
+        assert_bevel_carries_face_cd(BevelAffect::Edges, |mesh| {
+            let corner = vert_at(mesh, Vec3::new(1.0, 1.0, 1.0));
+            vec![mesh.vert_edge_keys(corner)[0].into()]
+        });
     }
 }
 
