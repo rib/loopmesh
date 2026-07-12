@@ -227,6 +227,133 @@ impl MeshIter for RadialLoops {
     }
 }
 
+/// Cycle iterator over a vertex's **face-corner fan**
+/// ([`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+/// §6.5): the loop of every incident face whose vertex is the hub, each face
+/// yielded exactly once, in the order that section pins.
+///
+/// The order is **observable**, so this is not interchangeable with a
+/// disk-major / radial-minor walk filtered on the corner vertex. Two things
+/// separate them, and a consumer that keeps a running best-so-far under a strict
+/// comparison (subdivide's fewest-corners carrier search) can see both:
+///
+/// - the fan groups faces by their **corner edge** at the hub — the edge the
+///   face traverses *away* from the hub, the one carrying the face's only loop
+///   whose vertex is the hub. A face has exactly one, so it is reached once, not
+///   once per incident edge; no de-duplication is needed or performed.
+/// - the group sequence starts at the **first face's** corner edge, not at the
+///   disk-seed edge: the seed's radial entry may sit at the far endpoint, and
+///   corner-adjusting it onto the hub can land on the face's *other* edge. The
+///   seed edge's own group is then reached last, on the disk wrap.
+pub struct VertFanLoops {
+    hub: VertexKey,
+    /// The first face's corner edge — where the group sequence starts and, on
+    /// the disk wrap, ends. `None` for a hub with no incident face.
+    start_edge: Option<EdgeKey>,
+    /// The corner edge whose radial group is currently draining.
+    group_edge: Option<EdgeKey>,
+    /// The loop the current group's radial walk began at (the wrap sentinel).
+    group_first: Option<LoopKey>,
+    /// The next loop to examine in the current group's radial walk.
+    next_loop: Option<LoopKey>,
+}
+
+impl VertFanLoops {
+    pub(crate) fn new(mesh: &LoopMesh, v: VertexKey) -> Self {
+        let empty = Self {
+            hub: v,
+            start_edge: None,
+            group_edge: None,
+            group_first: None,
+            next_loop: None,
+        };
+        let Some(anchor) = mesh.vertices.get(v).disk_loop_start else {
+            return empty;
+        };
+
+        // The seed is the first non-wire edge walking the disk forward from its
+        // anchor (the first-attached edge).
+        let mut seed = None;
+        let mut edge = anchor;
+        loop {
+            if mesh.edges.get(edge).radial_link.is_some() {
+                seed = Some(edge);
+                break;
+            }
+            let next = mesh.edges.get(edge).disk_loop_links_for_vert(v).next;
+            if next == anchor {
+                break;
+            }
+            edge = next;
+        }
+        let Some(seed) = seed else {
+            return empty;
+        };
+
+        let entry = mesh
+            .edges
+            .get(seed)
+            .radial_link
+            .expect("a non-wire edge carries a radial entry");
+        // Corner-adjust the seed's radial entry onto the hub: a loop's vertex is
+        // the tail of its edge, so the entry sits either at the hub already or
+        // exactly one corner before it.
+        let first = if mesh.loops.get(entry).vertex == v {
+            entry
+        } else {
+            mesh.loops.get(entry).face_loop_links.next
+        };
+        debug_assert_eq!(
+            mesh.loops.get(first).vertex,
+            v,
+            "the corner-adjust hop lands on the hub"
+        );
+        let corner_edge = mesh.loops.get(first).edge;
+
+        Self {
+            hub: v,
+            start_edge: Some(corner_edge),
+            group_edge: Some(corner_edge),
+            group_first: Some(first),
+            next_loop: Some(first),
+        }
+    }
+}
+
+impl MeshIter for VertFanLoops {
+    type Item = LoopKey;
+    fn next(&mut self, mesh: &LoopMesh) -> Option<LoopKey> {
+        loop {
+            // Drain the current corner edge's radial group, skipping the loops
+            // whose vertex is the far endpoint — those belong to faces whose
+            // corner at the hub lives on some other edge, and are yielded there.
+            while let Some(current) = self.next_loop {
+                let next = mesh.loops.get(current).edge_radial_links.next;
+                self.next_loop = (Some(next) != self.group_first).then_some(next);
+                if mesh.loops.get(current).vertex == self.hub {
+                    return Some(current);
+                }
+            }
+
+            let group = self.group_edge?;
+            let next_edge = mesh
+                .edges
+                .get(group)
+                .disk_loop_links_for_vert(self.hub)
+                .next;
+            if Some(next_edge) == self.start_edge {
+                self.group_edge = None;
+                return None;
+            }
+            self.group_edge = Some(next_edge);
+            // A later group starts at its edge's radial entry — there is no
+            // corner-adjust hop here; that happens only for the seed.
+            self.group_first = mesh.edges.get(next_edge).radial_link;
+            self.next_loop = self.group_first;
+        }
+    }
+}
+
 /// Cycle iterator over the loops of a face (forward winding).
 pub struct FaceLoops {
     first: Option<LoopKey>,
@@ -710,6 +837,13 @@ impl LoopMesh {
     /// Lending iterator over the loops in `e`'s radial cycle.
     pub fn radial_loops(&self, e: EdgeKey) -> RadialLoops {
         RadialLoops::new(self, e)
+    }
+
+    /// Lending iterator over `v`'s face-corner fan (§6.5): one loop per incident
+    /// face, in corner-edge-major / radial-minor order. Order-sensitive; see
+    /// [`VertFanLoops`].
+    pub fn vert_fan_loops(&self, v: VertexKey) -> VertFanLoops {
+        VertFanLoops::new(self, v)
     }
 
     /// Lending iterator over the loops in `f`'s perimeter cycle (forward).
