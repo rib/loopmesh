@@ -164,18 +164,21 @@ pub struct BevelOptions<'a> {
     /// self-overlaps (BEVEL.md §4.4). A global, uniform pre-pass on the resolved
     /// slide distances; it changes no topology, only the slide magnitudes.
     pub clamp_overlap: bool,
-    /// Material slot stamped on every face the bevel **creates** (BEVEL.md §6.6).
-    /// A leaf, per-face parameter that changes no topology and no placement:
+    /// Material slot **overridden** on every face the bevel creates (BEVEL.md §6.6).
+    /// A leaf, per-face parameter that changes no topology and no placement.
     ///
-    /// - `material >= 0` — stamp that slot uniformly on every new bevel face
-    ///   (cap, strip quad, junction patch).
-    /// - `material < 0` (canonically `-1`) — each new face inherits the material
-    ///   of a representative adjacent original face chosen per new face (the cap
-    ///   from an incident face of `v`, a strip from a flanking face, a patch from
-    ///   a junction-adjacent face, §6.6.1).
+    /// Not a two-regime switch: every new face is minted in two independent stages.
+    /// Stage 1 copies the *whole* per-face attribute block of a representative
+    /// original face whenever the fill supplies one (§6.6.1) — **unconditionally on
+    /// `material`** — or lands on the layer defaults when it supplies none (§6.6.1.3).
+    /// Stage 2 then, and only when `material >= 0`, overwrites the **material-slot
+    /// field alone**; every other per-face layer keeps whatever stage 1 left there.
     ///
-    /// Surviving re-stitched / re-pointed original faces are never re-materialised
-    /// by either regime (§6.6.2). Defaults to `-1` (inherit).
+    /// So a donor-fed face at `material = 3` carries slot `3` *and the donor's other
+    /// layers*; a template-less one carries slot `3` over a default block.
+    ///
+    /// Surviving re-stitched / re-pointed original faces are never re-materialised at
+    /// any value (§6.6.2). Defaults to `-1` (no stamp: the inherited slot survives).
     pub material: i32,
     /// Propagate the **seam** edge flag across a multi-edge junction's bridging
     /// segments (BEVEL.md §6.7 / §6.7.4). A leaf, flag-only parameter that changes
@@ -315,10 +318,11 @@ pub struct BevelResult {
     pub faces: Vec<FaceKey>,
 }
 
-/// A new bevel face's **representative original face** (BEVEL.md §6.6.1): under
-/// `material < 0` the face inherits that donor's *whole* per-face attribute block —
-/// every per-face layer, of which the material slot is one field — not the material
-/// slot alone.
+/// A new bevel face's **representative original face** (BEVEL.md §6.6.1): the face
+/// inherits that donor's *whole* per-face attribute block — every per-face layer, of
+/// which the material slot is one field — not the material slot alone. The inherit is
+/// stage 1 of §6.6 and runs at **every** value of `material`; an explicit slot only
+/// overwrites the one field afterwards.
 ///
 /// A handle into the run's one [`TemplateBank`], not an owned copy: a captured block
 /// costs one buffer per registered layer, and a bevel has one donor per beveled corner
@@ -329,8 +333,8 @@ struct FaceTemplate {
     donor: Option<usize>,
 }
 
-/// Every `material < 0` donor block of one bevel run (BEVEL.md §6.6.1), captured in a
-/// single batched snapshot.
+/// Every donor block of one bevel run (BEVEL.md §6.6.1), captured in a single batched
+/// snapshot.
 ///
 /// Donors are **registered** while the mesh is still pristine, and the whole set is
 /// captured by [`seal`](Self::seal) before the first face kill: the re-stitch kills and
@@ -340,36 +344,28 @@ struct FaceTemplate {
 /// capture-before-kill discipline `restitch_consumed_endpoints` uses to carry a rebuilt
 /// face's own block across its rebuild.
 ///
-/// Under `material >= 0` the explicit stamp overrides every new face's slot and no donor
-/// block is ever read (§6.6 regime 1), so the bank registers nothing and captures
-/// nothing — a stamping bevel does not pay the inherit's per-layer capture.
+/// The bank is **not** gated on `material`: the stage-1 inherit runs at every value of
+/// the parameter, and an explicit slot overwrites one field of the inherited block rather
+/// than replacing it (§6.6). A donor query skipped under `material >= 0` would give the
+/// new face the right slot over the wrong block.
 #[derive(Default)]
 struct TemplateBank {
-    inherit: bool,
     donor_slots: Vec<usize>,
     blocks: Option<SlotSnapshot>,
 }
 
 impl TemplateBank {
-    fn new(material: i32) -> Self {
-        Self {
-            inherit: material < 0,
-            donor_slots: Vec::new(),
-            blocks: None,
-        }
-    }
-
     /// Register one new-face site's donor against the pristine mesh, returning the handle
     /// the faces built there read their block back through.
     fn register(&mut self, donor: Option<FaceKey>) -> FaceTemplate {
         match donor {
-            Some(face) if self.inherit => {
+            Some(face) => {
                 self.donor_slots.push(face.as_usize());
                 FaceTemplate {
                     donor: Some(self.donor_slots.len() - 1),
                 }
             }
-            _ => FaceTemplate::default(),
+            None => FaceTemplate::default(),
         }
     }
 
@@ -411,10 +407,10 @@ struct BeveledCorner {
     ring_vert_for_edge: Vec<(EdgeKey, VertexKey)>,
     incident_faces: Vec<FaceKey>,
     interior_fan: bool,
-    /// The representative incident face the cap's `material < 0` inherit copies its
-    /// whole attribute block from (BEVEL.md §6.6.1: the cap inherits an incident face
-    /// of `v`). Captured against the pristine mesh in `place_ring_verts` before those
-    /// faces are killed and rebuilt, so it survives the surgery.
+    /// The representative incident face the cap's stage-1 inherit copies its whole
+    /// attribute block from (BEVEL.md §6.6.1: the cap inherits an incident face of `v`,
+    /// whatever `material` is). Captured against the pristine mesh in `place_ring_verts`
+    /// before those faces are killed and rebuilt, so it survives the surgery.
     representative: FaceTemplate,
 }
 
@@ -592,8 +588,8 @@ impl LoopMesh {
         };
 
         // §6.6.1: one bank for the whole run — every cap's donor block captured in a
-        // single snapshot, and only when `material < 0` can read it.
-        let mut templates = TemplateBank::new(options.material);
+        // single snapshot, and read back at every value of `material`.
+        let mut templates = TemplateBank::default();
         let corners = self.place_ring_verts(&frames, clamp_factor, &mut templates, &mut result);
         templates.seal(self);
 
@@ -607,8 +603,8 @@ impl LoopMesh {
         for corner in &corners {
             if corner.interior_fan {
                 if let Some(cap) = self.build_cap_face(&corner.ring_vert_for_edge) {
-                    // §6.6: the cap is a new face — stamp `material` (>= 0) or inherit
-                    // the representative incident face's whole block (< 0).
+                    // §6.6: the cap is a new face — inherit the representative incident
+                    // face's whole block, then stamp `material` over the slot if >= 0.
                     self.assign_bevel_face_attributes(
                         cap.face,
                         options.material,
@@ -725,7 +721,7 @@ impl LoopMesh {
             // registered and sealed up front, before the *first* edge's re-stitch — a
             // per-edge bank would re-capture every registered layer once per edge, and
             // the later edges' donors are still pristine at this point anyway.
-            let mut templates = TemplateBank::new(material);
+            let mut templates = TemplateBank::default();
             let strip_templates: Vec<FaceTemplate> = beveled
                 .iter()
                 .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -748,8 +744,9 @@ impl LoopMesh {
     }
 
     /// The flanking original face a beveled edge's strip inherits its whole per-face
-    /// block from under `material < 0` (BEVEL.md §6.6.1: the strip takes the material of
-    /// the surface it bridges — `fL` here). `None` on a wire edge.
+    /// block from (BEVEL.md §6.6.1: the strip takes the material of the surface it
+    /// bridges — `fL` here). The inherit is stage 1 and runs at every value of
+    /// `material`. `None` on a wire edge.
     fn edge_flanking_face(&self, edge: EdgeKey) -> Option<FaceKey> {
         self.edge_loop_keys(edge)
             .first()
@@ -1029,13 +1026,13 @@ impl LoopMesh {
             return;
         }
 
-        // §6.6.1: register the `-1` inherit source of each new face against the pristine
+        // §6.6.1: register the stage-1 inherit source of each new face against the pristine
         // mesh. A strip's donor is one of its beveled edge's two flanking faces; a
         // junction patch's donor is a face incident to that junction vertex (which the
         // surgery consumes, so by phase 4 it names no adjacent face at all). Each strip's
         // handle rides its edge's slot in this vec; each patch's rides the patch itself.
         // The bank is sealed once phase 1 has registered them all, before the re-stitch.
-        let mut templates = TemplateBank::new(material);
+        let mut templates = TemplateBank::default();
         let strip_templates: Vec<FaceTemplate> = beveled_manifold
             .iter()
             .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -1167,7 +1164,8 @@ impl LoopMesh {
         );
 
         // Phase 3: one strip quad per beveled edge over its four near/far corner
-        // verts (§7.1 item 2). §6.6: stamp / inherit each new strip's material.
+        // verts (§7.1 item 2). §6.6: each new strip inherits its donor's whole block,
+        // then takes the `material` stamp over the slot if >= 0.
         for (&edge, &representative) in beveled_manifold.iter().zip(&strip_templates) {
             self.build_junction_strip(
                 edge,
@@ -1185,8 +1183,8 @@ impl LoopMesh {
         }
 
         // Phase 4: cap each `s ≥ 3` junction with one flat patch face over its
-        // boundvert ring (§7.6.3). `s == 2` adds no patch. §6.6: stamp / inherit
-        // each new patch's material from a junction-adjacent original face.
+        // boundvert ring (§7.6.3). `s == 2` adds no patch. §6.6: each new patch inherits
+        // a junction-adjacent original's whole block, then takes the stamp over the slot.
         for patch in &junction_patches {
             if patch.boundverts.len() >= 3 {
                 self.build_patch_face(
@@ -1275,11 +1273,11 @@ impl LoopMesh {
         }
         let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
 
-        // §6.6.1, as in the single-segment path: each strip's `-1` inherit copies the
+        // §6.6.1, as in the single-segment path: each strip's stage-1 inherit copies the
         // whole block of a flanking face of its beveled edge. Phase 1 registers the
         // remaining donors (junction fills, miter rings, terminal fans) as it walks the
         // pristine endpoints; the bank is sealed once, before the re-stitch.
-        let mut templates = TemplateBank::new(material);
+        let mut templates = TemplateBank::default();
         let strip_templates: Vec<FaceTemplate> = beveled_manifold
             .iter()
             .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -1478,7 +1476,6 @@ impl LoopMesh {
                         segments,
                         options.profile,
                         material,
-                        &templates,
                         result,
                     );
                 }
@@ -1675,7 +1672,10 @@ impl LoopMesh {
         }
 
         // §6.6.1: the fill's inherit source, registered while the junction still has its
-        // faces — the re-stitch consumes the vertex.
+        // faces — the re-stitch consumes the vertex. Registered unconditionally, even
+        // though the CUTOFF fill (§6.6.1.3) never reads it: gating on `vmesh_method` would
+        // re-introduce a *conditional* donor capture — the bug class this bank exists to
+        // kill — to save one `usize` and one gathered value per layer per junction.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
 
         junction_cuts.push(JunctionCut {
@@ -2491,7 +2491,13 @@ impl LoopMesh {
     /// face per sector spanning its chain plus two bottom corner verts, the corner
     /// ring closed by a bottom face — or collapsed to a single apex when the corner
     /// verts coincide (the `s = 3` case, §8.3.4).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// This is the operator's one **template-less** fill (§6.6.1.3): neither the cut
+    /// faces nor the bottom face are handed a representative, so both land on the
+    /// per-face layer defaults (slot `0`) even though the junction's originals are
+    /// right there — the §6.6 stamp still applies on top. The junction's registered
+    /// donor exists (the ADJ fill at the same junction uses it) and is deliberately
+    /// not read here.
     fn build_cutoff_fill(
         &mut self,
         cut: &JunctionCut,
@@ -2499,7 +2505,6 @@ impl LoopMesh {
         segments: u32,
         profile: f32,
         material: i32,
-        templates: &TemplateBank,
         result: &mut BevelResult,
     ) {
         let count = cut.boundverts.len();
@@ -2507,7 +2512,7 @@ impl LoopMesh {
         if count < 3 {
             return;
         }
-        let representative = templates.resolve(cut.representative);
+        let representative = FaceTemplateRef::default();
 
         // Per boundvert, its down-pushed corner-vert position (§8.3.3). The push
         // is binary in the profile: full cell diagonal for a curved profile, zero
@@ -6556,7 +6561,7 @@ impl LoopMesh {
             let incident_faces = self.vert_face_keys(frame.vertex);
             let interior_fan = self.is_interior_fan(frame.vertex, &incident_edges, &incident_faces);
 
-            // §6.6.1: the cap's `-1` inherit source is a representative incident face of
+            // §6.6.1: the cap's stage-1 inherit donor is a representative incident face of
             // `v`. Registered now, against the pristine mesh — the bank is sealed before
             // the incident faces are killed / rebuilt.
             let representative = templates.register(incident_faces.first().copied());
@@ -6898,20 +6903,24 @@ impl LoopMesh {
         edges
     }
 
-    /// Assign the per-face attributes of one **new** bevel face (BEVEL.md §6.6).
+    /// Assign the per-face attributes of one **new** bevel face (BEVEL.md §6.6), in the
+    /// two independent stages the parameter is actually defined by:
     ///
-    /// - `material >= 0`: stamp that slot uniformly and touch nothing else (§6.6
-    ///   regime 1 — the explicit slot overrides every new face's material, and the
-    ///   inherit does not run, so no block copy can clobber the stamp).
-    /// - `material < 0`: copy `representative`'s **whole per-face attribute block**
-    ///   onto the new face (§6.6.1) — every per-face layer, with the material slot
-    ///   riding along as one field of it. The representative is a per-new-face
-    ///   choice (cap ← incident face of `v`, strip ← flanking face, patch / fill ←
-    ///   junction-adjacent face), captured pristine by the caller before the
-    ///   adjacent originals are killed / rebuilt.
+    /// 1. **Inherit**, whatever `material` is: copy `representative`'s **whole per-face
+    ///    attribute block** onto the new face (§6.6.1) — every per-face layer, with the
+    ///    material slot riding along as one field of it. The representative is a
+    ///    per-new-face choice (cap ← incident face of `v`, strip ← flanking face, patch /
+    ///    fill ← junction-adjacent face), captured pristine by the caller before the
+    ///    adjacent originals are killed / rebuilt. A fill that supplies **no**
+    ///    representative mints template-less and keeps the layer defaults (§6.6.1.3 — the
+    ///    cutoff fill).
+    /// 2. **Stamp**, iff `material >= 0`: overwrite the material-slot field *alone*. The
+    ///    rest of the inherited block stands. This is why the inherit above cannot be
+    ///    skipped under an explicit slot — that would give the right slot over a default
+    ///    block.
     ///
     /// Surviving re-stitched faces are never routed here, so they keep their own
-    /// block (§6.6.2).
+    /// block and are never re-materialised (§6.6.2).
     ///
     /// This is also the single chokepoint every **new** bevel face flows through,
     /// so it doubles as the §8.10.1 provenance recorder: while a face-strength pass
@@ -6925,10 +6934,11 @@ impl LoopMesh {
         representative: FaceTemplateRef<'_>,
         kind: BevelNewFaceKind,
     ) {
+        if let Some((blocks, donor)) = representative.block {
+            self.face_attribs.restore_slot(face.as_usize(), blocks, donor);
+        }
         if material >= 0 {
             self.set_face_material_index(face, material);
-        } else if let Some((blocks, donor)) = representative.block {
-            self.face_attribs.restore_slot(face.as_usize(), blocks, donor);
         }
 
         if kind == BevelNewFaceKind::Cap {
@@ -7356,7 +7366,7 @@ fn reconciled_offset(
 
 /// One junction vertex's ordered boundvert ring (BEVEL.md §7.6.1), capped by the
 /// patch face when `s ≥ 3` (§7.6.3). `vertex` is the junction the patch is built
-/// around, used to look up its `-1` inherit material source (§6.6.1).
+/// around, used to look up its stage-1 inherit donor (§6.6.1).
 struct JunctionPatch {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
@@ -7366,10 +7376,10 @@ struct JunctionPatch {
     /// this maps each junction bridging segment to the beveled edge it bridges,
     /// for the §6.7.4 seam / sharp bridging.
     opening_edges: Vec<EdgeKey>,
-    /// The `material < 0` inherit source for this junction's patch face (BEVEL.md
-    /// §6.6.1): a face incident to the junction vertex, registered while the ring is
-    /// placed — the vertex is consumed by the re-stitch, so by patch time it names no
-    /// adjacent face at all.
+    /// The stage-1 inherit donor for this junction's patch face (BEVEL.md §6.6.1, read
+    /// at every value of `material`): a face incident to the junction vertex, registered
+    /// while the ring is placed — the vertex is consumed by the re-stitch, so by patch
+    /// time it names no adjacent face at all.
     representative: FaceTemplate,
 }
 
@@ -7498,10 +7508,10 @@ struct JunctionCut {
     /// spans, for the §6.7.5.3 multi-segment seam / sharp bridging.
     opening_edges: Vec<EdgeKey>,
     outward: Vec3,
-    /// The `material < 0` inherit source for this junction's new fill faces (BEVEL.md
-    /// §6.6.1): the whole per-face block of a face incident to the junction vertex,
-    /// captured while the ring is placed — the vertex is consumed by the re-stitch, so
-    /// by fill time it names no adjacent face at all.
+    /// The stage-1 inherit donor for this junction's new fill faces (BEVEL.md §6.6.1,
+    /// read at every value of `material`): the whole per-face block of a face incident to
+    /// the junction vertex, captured while the ring is placed — the vertex is consumed by
+    /// the re-stitch, so by fill time it names no adjacent face at all.
     representative: FaceTemplate,
 }
 
@@ -7551,7 +7561,8 @@ struct CrossWeld {
 /// then one `leg_vert` per unbeveled leg not adjacent to E, and is triangulated as
 /// a fan from the first leg vert. Built for both fill methods — the terminal fan is
 /// vmesh-independent (gated on "terminal", not `vmesh_method`). `representative` is
-/// the §6.6.1 material inherit source captured from a terminal-incident face.
+/// the §6.6.1 stage-1 inherit donor captured from a terminal-incident face, read at
+/// every value of `material`.
 struct TerminalFan {
     boundary: Vec<VertexKey>,
     leg_verts: Vec<VertexKey>,
@@ -7598,8 +7609,9 @@ struct MiterRingJunction {
     /// frame), so this is `0.5` today — carried rather than re-asserted as a literal at the
     /// fill, so widening the miter gate cannot silently leave the cap's fullness behind.
     profile: f32,
-    /// The `material < 0` inherit source for this junction's fill faces (BEVEL.md
-    /// §6.6.1), captured pristine for the same reason [`JunctionCut`]'s is.
+    /// The stage-1 inherit donor for this junction's fill faces (BEVEL.md §6.6.1, read at
+    /// every value of `material`), captured pristine for the same reason [`JunctionCut`]'s
+    /// is.
     representative: FaceTemplate,
 }
 
@@ -17118,8 +17130,9 @@ mod tests {
         result.faces[0]
     }
 
-    /// BEVEL.md §6.6 regime 1: `material >= 0` stamps that slot uniformly on the
-    /// new cap, while the surviving re-stitched faces keep their own slot (§6.6.2).
+    /// BEVEL.md §6.6 stage 2: `material >= 0` stamps that slot uniformly on the new cap
+    /// (over the block stage 1 inherited), while the surviving re-stitched faces keep
+    /// their own slot (§6.6.2).
     #[test]
     fn material_explicit_stamps_new_cap_and_leaves_survivors() {
         let mut mesh = LoopMesh::new();
@@ -17184,12 +17197,11 @@ mod tests {
         assert_eq!(new_slots, vec![5], "new faces all carry the stamped slot 5");
     }
 
-    /// BEVEL.md §6.6 regime 2 / §6.6.1: `material < 0` makes the new cap inherit a
-    /// representative *incident face of `v`*'s slot — never a global default and
-    /// never slot 0 unless an adjacent face genuinely uses slot 0. Decorating
-    /// every cube face with a distinct non-zero slot makes the inherit source
-    /// observable: the cap's slot is one of vert 0's incident faces' decorated
-    /// slots.
+    /// BEVEL.md §6.6.1 (stage 1) with no stage-2 stamp: at `material < 0` the cap's slot
+    /// is whatever it inherited from a representative *incident face of `v`* — never a
+    /// global default and never slot 0 unless an adjacent face genuinely uses slot 0.
+    /// Decorating every cube face with a distinct non-zero slot makes the donor
+    /// observable: the cap's slot is one of vert 0's incident faces' decorated slots.
     #[test]
     fn material_inherit_takes_adjacent_face_slot() {
         let mut mesh = LoopMesh::new();
@@ -17262,9 +17274,9 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// The default `BevelOptions.material` is `-1` (inherit): a default-options
-    /// bevel of a uniformly slot-2 cube leaves the cap at slot 2, confirming the
-    /// inherit regime is the default and matches the explicit `-1` path.
+    /// The default `BevelOptions.material` is `-1` (no stage-2 stamp): a default-options
+    /// bevel of a uniformly slot-2 cube leaves the cap at the inherited slot 2,
+    /// confirming the no-stamp path is the default and matches the explicit `-1` path.
     #[test]
     fn material_default_is_inherit() {
         let mut mesh = LoopMesh::new();
@@ -20986,6 +20998,44 @@ mod tests {
         }
     }
 
+    /// The per-face block a **template-less** mint lands on (BEVEL.md §6.6.1.3): the layer
+    /// defaults, material slot `0` included. `tint_and_slot_faces` starts its slots at 1,
+    /// so no original carries this block and it is the unambiguous fingerprint of a face
+    /// the fill handed no donor.
+    const TEMPLATE_LESS_BLOCK: (i32, [f32; 3]) = (0, [0.0, 0.0, 0.0]);
+
+    /// Every new face carries either one donor's **whole** block (§6.6.1, stage 1) or —
+    /// for the fills that supply no donor at all (§6.6.1.3) — the layer defaults; exactly
+    /// `template_less` of them are the latter. Which donor wins is disk-anchor-dependent
+    /// (§6.6.1.2), so donor **membership** is what is pinned, not equality.
+    fn assert_new_face_blocks(
+        mesh: &LoopMesh,
+        tint: ElementAttributeKey,
+        new_faces: &[FaceKey],
+        donors: &[(i32, [f32; 3])],
+        template_less: usize,
+        site: &str,
+    ) {
+        assert!(!new_faces.is_empty(), "{site}: the bevel built no new face");
+        let mut defaults = 0;
+        for (&face, block) in new_faces.iter().zip(face_blocks(mesh, tint, new_faces)) {
+            if block == TEMPLATE_LESS_BLOCK {
+                defaults += 1;
+                continue;
+            }
+            assert!(
+                donors.contains(&block),
+                "{site}: new face {face:?} carries {block:?}, which is neither a donor's whole \
+                 block {donors:?} nor the layer default {TEMPLATE_LESS_BLOCK:?}",
+            );
+        }
+        assert_eq!(
+            defaults, template_less,
+            "{site}: {defaults} new face(s) landed on the layer default, expected \
+             {template_less} template-less mint(s) (§6.6.1.3)",
+        );
+    }
+
     /// The beveled solid is still closed. A junction whose fill face never got built reads
     /// here as a hole, so this is what keeps the donor assertions non-vacuous at the fill
     /// sites: it proves the fill faces are in `result.faces` at all.
@@ -21016,9 +21066,11 @@ mod tests {
         (spokes, donors)
     }
 
-    /// BEVEL.md §6.6.1: under `material < 0` the vertex-bevel **cap** inherits the
-    /// *whole* per-face attribute block of a representative incident face of `v` — not
-    /// the material slot alone. Which incident face wins is disk-anchor-dependent
+    /// BEVEL.md §6.6.1: the vertex-bevel **cap** inherits the *whole* per-face attribute
+    /// block of a representative incident face of `v` — not the material slot alone. The
+    /// inherit is stage 1 and runs at every `material`; `material < 0` is used here only
+    /// so no stage-2 stamp masks the inherited slot. Which incident face wins is
+    /// disk-anchor-dependent
     /// (§6.6.1.2), so what is pinned is the contract: the cap's block is *some* incident
     /// original's, taken coherently (slot and custom layer from the same donor), and
     /// never the layer default.
@@ -21115,16 +21167,24 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §6.6 regime 1: an explicit `material >= 0` still stamps every new face
-    /// uniformly — the §6.6.1 block copy is the `< 0` inherit's mechanism and must not
-    /// run under it, so it can never overwrite the stamped slot with a donor's.
+    /// BEVEL.md §6.6, both stages at once: an explicit `material >= 0` overwrites the
+    /// **slot field alone** of an inherited block. The stamp is not an alternative to the
+    /// inherit — the inherit runs first, unconditionally — so every new face comes out
+    /// carrying the stamped slot *over its donor's other layers*, never over a default
+    /// block.
     #[test]
-    fn face_cd_explicit_material_stamp_survives_the_block_copy() {
+    fn face_cd_explicit_material_overwrites_the_slot_of_an_inherited_block() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        tint_and_slot_faces(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
 
         let corner = vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
+        let candidate_tints: Vec<[f32; 3]> = mesh
+            .vert_face_keys(corner)
+            .iter()
+            .map(|&face| mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap())
+            .collect();
+
         let result = mesh.bevel(
             &[corner.into()],
             BevelOptions {
@@ -21134,11 +21194,120 @@ mod tests {
             },
         );
 
-        for &face in &result.faces {
+        for (&face, (slot, value)) in result
+            .faces
+            .iter()
+            .zip(face_blocks(&mesh, tint, &result.faces))
+        {
             assert_eq!(
-                mesh.face_material_index(face),
-                3,
-                "an explicit material stamps every new face, donor slots notwithstanding",
+                slot, 3,
+                "stage 2 stamps the slot of every new face, donor slots notwithstanding",
+            );
+            assert!(
+                candidate_tints.contains(&value),
+                "new face {face:?} carries tint {value:?}: the stamp replaced the whole \
+                 inherited block instead of its slot field — stage 1 must run at every \
+                 value of `material` (§6.6). Candidates: {candidate_tints:?}",
+            );
+        }
+    }
+
+    /// BEVEL.md §6.6.2 invariant #1 — the sharpest test of the two-stage rule: bevel the
+    /// same input at `material = -1` and at `material = k >= 0`; the new faces' per-face
+    /// blocks must agree on **every layer except the slot**. A "stamp instead of inherit"
+    /// implementation zeroes the non-slot layers under `k` and fails here, while passing
+    /// any slot-only check.
+    ///
+    /// Run over the vertex cap, an edge strip + junction fill (donor-fed), and the cutoff
+    /// fill (template-less — whose non-slot layers are the *defaults* under both signs,
+    /// which is still agreement).
+    #[test]
+    fn face_cd_non_slot_layers_are_material_independent() {
+        fn new_face_tints(
+            spokes: fn(&LoopMesh) -> Vec<GeomKey>,
+            options: BevelOptions<'static>,
+        ) -> Vec<[u32; 3]> {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let tint = tint_and_slot_faces(&mut mesh);
+            let input = spokes(&mesh);
+            let result = mesh.bevel(&input, options);
+            mesh.validate_topology();
+            let mut tints: Vec<[u32; 3]> = result
+                .faces
+                .iter()
+                .map(|&face| {
+                    let value = mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap();
+                    [
+                        value[0].to_bits(),
+                        value[1].to_bits(),
+                        value[2].to_bits(),
+                    ]
+                })
+                .collect();
+            tints.sort_unstable();
+            tints
+        }
+
+        let corner_vert: fn(&LoopMesh) -> Vec<GeomKey> =
+            |mesh| vec![vert_at(mesh, Vec3::new(1.0, 1.0, 1.0)).into()];
+        let corner_spokes: fn(&LoopMesh) -> Vec<GeomKey> = |mesh| {
+            mesh.vert_edge_keys(vert_at(mesh, Vec3::new(1.0, 1.0, 1.0)))
+                .into_iter()
+                .map(GeomKey::from)
+                .collect()
+        };
+
+        let cases: [(&str, fn(&LoopMesh) -> Vec<GeomKey>, BevelOptions<'static>); 3] = [
+            (
+                "vertex cap",
+                corner_vert,
+                BevelOptions {
+                    offset: 0.25,
+                    ..Default::default()
+                },
+            ),
+            (
+                "edge strips + junction patch",
+                corner_spokes,
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            ),
+            (
+                "cutoff fill",
+                corner_spokes,
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments: 2,
+                    vmesh_method: BevelVmeshMethod::Cutoff,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (site, spokes, options) in cases {
+            let inherited = new_face_tints(
+                spokes,
+                BevelOptions {
+                    material: -1,
+                    ..options
+                },
+            );
+            let stamped = new_face_tints(
+                spokes,
+                BevelOptions {
+                    material: 6,
+                    ..options
+                },
+            );
+            assert_eq!(
+                inherited, stamped,
+                "{site}: the new faces' non-slot per-face layers must not depend on \
+                 `material` (§6.6.2 invariant #1)",
             );
         }
     }
@@ -21178,10 +21347,17 @@ mod tests {
         assert_new_faces_inherit_from(&mesh, tint, &result.faces, &donors, "s = 3 junction");
     }
 
-    /// BEVEL.md §6.6.3 over the multi-segment **cutoff fill** (§8.3.2 / §8.3.4): the value
-    /// rule is unchanged by `segments`, only the set of new faces it applies to grows.
+    /// BEVEL.md §6.6.1.3: the **cutoff fill is the one fill that supplies no donor**, so
+    /// its cut faces mint template-less — the layer defaults, slot `0` — while every other
+    /// new face of the same junction (the strips, whose donor is the flanking face) still
+    /// inherits a whole block. The junction's originals are right there and the ADJ fill
+    /// at the same corner uses them; the cutoff fill simply does not pass one.
+    ///
+    /// The cube corner's three cut faces are the whole template-less set here: the curved
+    /// default profile pushes the three corner verts onto one apex (§8.3.4), so no bottom
+    /// face is built. `face_cd_cutoff_bottom_face_is_template_less_too` covers the bottom.
     #[test]
-    fn face_cd_cutoff_fill_inherits_whole_block_of_a_junction_face() {
+    fn face_cd_cutoff_cut_faces_are_template_less() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let tint = tint_and_slot_faces(&mut mesh);
@@ -21200,7 +21376,86 @@ mod tests {
         );
         mesh.validate_topology();
         assert_no_boundary_edges(&mesh, "cutoff fill");
-        assert_new_faces_inherit_from(&mesh, tint, &result.faces, &donors, "cutoff fill");
+        assert_new_face_blocks(&mesh, tint, &result.faces, &donors, 3, "cutoff fill");
+    }
+
+    /// BEVEL.md §6.6.1.3: the cutoff fill's **bottom face** over the corner ring is
+    /// template-less as well, not just the cut faces. A valence-4 junction does not
+    /// collapse (§8.3.4 is a 3-way rule), so its ring is closed by a real bottom face:
+    /// four sectors but **five** default-block new faces is what proves the bottom face is
+    /// among them.
+    #[test]
+    fn face_cd_cutoff_bottom_face_is_template_less_too() {
+        let mut mesh = LoopMesh::new();
+        let (top, rim, _bottom) = square_bipyramid(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let donors = face_blocks(&mesh, tint, &mesh.face_keys());
+
+        let spokes: Vec<GeomKey> = rim
+            .iter()
+            .map(|&r| mesh.query_edge_exists(top, r).expect("top spoke").into())
+            .collect();
+        let result = mesh.bevel(
+            &spokes,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert_no_boundary_edges(&mesh, "cutoff apex");
+        assert_new_face_blocks(&mesh, tint, &result.faces, &donors, 5, "cutoff apex");
+    }
+
+    /// BEVEL.md §6.6.1.3's bottom row: stage 2 still runs on a template-less face. Under
+    /// `material >= 0` the cutoff fill's faces come out at the stamped slot over a
+    /// **default** block — the cutoff does not "ignore `material`" — while the donor-fed
+    /// faces of the same run come out at the stamped slot over their **donor's** block.
+    #[test]
+    fn face_cd_template_less_fill_takes_the_stamp_over_a_default_block() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (spokes, donors) = cube_corner_junction(&mesh, tint);
+        let donor_tints: Vec<[f32; 3]> = donors.iter().map(|&(_, tint)| tint).collect();
+
+        let result = mesh.bevel(
+            &spokes,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                material: 7,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let mut template_less = 0;
+        for (&face, (slot, value)) in result
+            .faces
+            .iter()
+            .zip(face_blocks(&mesh, tint, &result.faces))
+        {
+            assert_eq!(slot, 7, "stage 2 stamps every new face's slot, face {face:?}");
+            if value == TEMPLATE_LESS_BLOCK.1 {
+                template_less += 1;
+            } else {
+                assert!(
+                    donor_tints.contains(&value),
+                    "donor-fed face {face:?} kept a foreign tint {value:?} under the stamp",
+                );
+            }
+        }
+        assert_eq!(
+            template_less, 3,
+            "the three cut faces carry the stamped slot over a *default* block (§6.6.1.3)",
+        );
     }
 
     /// BEVEL.md §6.6.3 over the **[V-ADJ] fill** (§8.5): the `segments = 2` cube-corner
@@ -21265,7 +21520,13 @@ mod tests {
             mesh.validate_topology();
             let site = format!("apex fill + terminal fans, {vmesh_method:?}");
             assert_no_boundary_edges(&mesh, &site);
-            assert_new_faces_inherit_from(&mesh, tint, &result.faces, &donors, &site);
+            // The cutoff apex mints its four cut faces and its bottom face template-less
+            // (§6.6.1.3); every other new face of either run — fans included — inherits.
+            let template_less = match vmesh_method {
+                BevelVmeshMethod::Cutoff => 5,
+                BevelVmeshMethod::Adj => 0,
+            };
+            assert_new_face_blocks(&mesh, tint, &result.faces, &donors, template_less, &site);
         }
     }
 
