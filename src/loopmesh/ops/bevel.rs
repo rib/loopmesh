@@ -5032,9 +5032,18 @@ impl LoopMesh {
             // beveled edge's direction with the nearest in-between leg's direction,
             // oriented by the adjacent face. The perpendicular is then oriented into
             // the sector by the face centroid.
-            let first_leg = between_edges
-                .first()
-                .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
+            //
+            // `g_k`'s leg is the disk edge *next* after it — which is the other edge of
+            // `face_first` at `v`, not simply the sector's first recorded in-between
+            // edge: at an open fan's gap-crossing sector the disk walk leaves the ring
+            // through a boundary leg that no later corner re-reports, so the recorded
+            // list starts one edge late and would pair `g_k` with an edge from a
+            // different face's corner entirely.
+            let first_leg = self
+                .walk_corner(face_first, vertex, edge_first)
+                .and_then(|(next_edge, _)| {
+                    self.edge_direction_from(next_edge, vertex, vertex_position)
+                });
             let last_leg = between_edges
                 .last()
                 .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
@@ -5086,26 +5095,50 @@ impl LoopMesh {
                 );
                 (face_normal, face_normal, perp_first, perp_second)
             } else {
-                let normal = orient_normal(edge_span, face_normal);
+                // The §7.6.2 sign-fix reference is the sector's first face read **in the
+                // walk's sense**, not its raw Newell normal. The two perpendiculars below
+                // are the pure right-of-`g_k` / left-of-`g_(k+1)` rotations about the
+                // sector normal, so they are only "into the sector" when the sweep from
+                // `dir_first` to `dir_second` is the *positive* sweep about it — and the
+                // corner ring's chaining direction is arbitrary, so sign-fixing against
+                // the raw face normal inverts both perpendiculars (and hence
+                // point-reflects the meet through `v`) whenever the ring happens to run
+                // against the faces' winding.
+                let reference = self
+                    .walk_corner(face_first, vertex, edge_first)
+                    .map_or(face_normal, |(_, walk_normal)| walk_normal);
+                let normal = orient_normal(edge_span, reference);
                 let perp_first = normal.cross(dir_first).normalize_or_zero();
                 let perp_second = dir_second.cross(normal).normalize_or_zero();
                 (normal, normal, perp_first, perp_second)
             }
         };
 
-        // The disk-order edge directions the §7.6.2 in-wedge test bounds each
-        // forward face by: `g_k`, then each in-between leg in disk order, then
-        // `g_(k+1)`. A degenerate leg (no direction) is kept as a zero placeholder
-        // so the list stays index-aligned with `between_faces`.
-        let mut bound_dirs = Vec::with_capacity(between_edges.len() + 2);
-        bound_dirs.push(dir_first);
-        for &leg in &between_edges {
-            let leg_dir = self
-                .edge_direction_from(leg, vertex, vertex_position)
-                .unwrap_or(Vec3::ZERO);
-            bound_dirs.push(leg_dir);
+        // The §7.6.2 face-drop walk, in disk order: the walk edges are `g_k` then each
+        // in-between leg, and `faces[i]` is the face just forward of walk edge `i`. Each
+        // candidate carries the angular wedge that face occupies at `v` — bounded by the
+        // face's *own* two edges at `v`, which is what the walk edge's disk-successor is
+        // for an interior face, and the only defensible reading for the face that flanks
+        // an open fan's gap (where the sector's edge list skips the boundary leg the walk
+        // never visits) — plus that face's normal read in the walk's sense.
+        let walk_edges = std::iter::once(edge_first).chain(between_edges.iter().copied());
+        let mut drop_candidates = Vec::with_capacity(faces.len());
+        for (&face, walk_edge) in faces.iter().zip(walk_edges) {
+            let (Some(dir_walk), Some((next_edge, normal))) = (
+                self.edge_direction_from(walk_edge, vertex, vertex_position),
+                self.walk_corner(face, vertex, walk_edge),
+            ) else {
+                continue;
+            };
+            let Some(dir_next) = self.edge_direction_from(next_edge, vertex, vertex_position) else {
+                continue;
+            };
+            drop_candidates.push(DropCandidate {
+                dir_walk,
+                dir_next,
+                normal,
+            });
         }
-        bound_dirs.push(dir_second);
 
         Some(SectorLayout {
             dir_first,
@@ -5114,11 +5147,34 @@ impl LoopMesh {
             perp_second,
             normal_first,
             normal_second,
-            between_faces: faces,
-            between_edges,
-            bound_dirs,
+            drop_candidates,
             non_planar: has_out_of_plane,
         })
+    }
+
+    /// The disk walk crosses `face` from `walk_edge` to the face's **other** edge at
+    /// `vertex`; return that edge together with `face`'s normal **oriented to the walk's
+    /// sense**. A face's interior at `vertex` sweeps positively (about its own normal)
+    /// from the corner's outgoing edge to its incoming one, so a walk that enters by the
+    /// incoming edge crosses the corner the other way round and must read the normal
+    /// flipped. Both the §7.6.2 sign-fix and the in-wedge signed sweeps are measured in
+    /// the walk's sense, and the corner ring's chaining direction is not canonical — so
+    /// taking the raw normal makes them depend on mesh build order.
+    fn walk_corner(
+        &self,
+        face: FaceKey,
+        vertex: VertexKey,
+        walk_edge: EdgeKey,
+    ) -> Option<(EdgeKey, Vec3)> {
+        let (incoming, outgoing) = self.face_corner_edges(face, vertex)?;
+        let normal = self.face_plane_normal(face);
+        if walk_edge == outgoing {
+            Some((incoming, normal))
+        } else if walk_edge == incoming {
+            Some((outgoing, -normal))
+        } else {
+            None
+        }
     }
 
     /// The unit in-plane perpendicular to `direction` (in the plane of `normal`)
@@ -5200,53 +5256,31 @@ impl LoopMesh {
         }
         // Walk the sector's edges in disk order starting at the flanking beveled edge
         // `g_k` itself (not the first in-between leg), advancing up to — but not
-        // including — `g_(k+1)`. The forward face of `g_k` is `between_faces[0]`, of
-        // in-between leg `i` is `between_faces[i + 1]`, so the walk's forward faces
-        // are exactly `between_faces` in order. The projection plane is anchored at
-        // `v` (not the face's own supporting plane), oriented by the face normal; on
-        // a non-planar sector face those differ by up to the offset itself.
+        // including — `g_(k+1)`, and take the face just forward of each. The projection
+        // plane is anchored at `v` (not the face's own supporting plane), oriented by
+        // the face normal; on a warped sector face those two planes differ by up to the
+        // offset itself.
         //
-        // The in-wedge bounds are the walk edge currently being tested and the next
-        // edge after it *in disk order* (`bound_dirs[i]` and `bound_dirs[i + 1]`),
-        // not an arbitrary winding-order pair off the face: the two orders can be a
-        // swap, and a swapped pair measures the *reflex* wedge, so every projection
-        // would test in-wedge and the walk would accept its first face
-        // unconditionally. For a three-petal case-3 sector that mis-accepts a face
-        // whose true wedge the drop sweeps far past (§7.6.2 worked example: the first
-        // face sweeps ~142° past its ~95° wedge and must be rejected; the second
-        // drops in-wedge at ~50° ≤ ~85°), lifting the boundvert ~offset off the base
-        // plane. Taking the disk-order pair rejects the first and accepts the second.
-        for (index, &face) in layout.between_faces.iter().enumerate() {
-            let normal = self.face_plane_normal(face);
+        // The in-wedge bounds are the walk edge being tested and the face's other edge
+        // at `v` — the pair that actually bounds that face's wedge — with the *raw*
+        // edge directions, not their projections into the drop plane: `point_in_wedge`
+        // orients its signed sweeps by the (walk-sense) face normal, so the small
+        // out-of-plane tilt of the bounds on a warped face is already absorbed by the
+        // angular measure, and projecting first would shift the near-boundary two-petal
+        // verdict off the wedge boundary its midpoint hugs.
+        for candidate in &layout.drop_candidates {
+            let normal = candidate.normal;
             let projected = midpoint - normal * (midpoint - vertex_position).dot(normal);
             let to_projected = projected - vertex_position;
             if to_projected.length() <= f32::EPSILON {
                 continue;
             }
-            let dir_projected = to_projected.normalize();
-            // The in-wedge bounds are the *raw* disk-order edge directions from `v`
-            // (§7.6.2 face-drop step): the walk edge being tested and the next disk
-            // edge that shares the forward face, with no projection into the drop
-            // plane. `point_in_wedge` orients its signed sweeps by the face normal, so
-            // the small out-of-plane tilt of the bounds on a non-planar sector face is
-            // absorbed by the normal-oriented angular measure — projecting the bounds
-            // into the plane first would shift the near-boundary two-petal verdict off
-            // the wedge boundary its midpoint hugs.
-            //
-            // The positional `[index]`/`[index + 1]` reads are in range for a manifold
-            // fan (the dedup rules keep `between_faces.len() <= between_edges.len() + 1`
-            // while `bound_dirs.len() == between_edges.len() + 2`); a non-manifold disk
-            // with a non-consecutively-recurring leg edge could over-run, so guard the
-            // pair and `continue`, mirroring the degenerate-leg continue just below.
-            let (Some(&dir_one), Some(&dir_two)) =
-                (layout.bound_dirs.get(index), layout.bound_dirs.get(index + 1))
-            else {
-                continue;
-            };
-            if dir_one == Vec3::ZERO || dir_two == Vec3::ZERO {
-                continue;
-            }
-            if point_in_wedge(dir_one, dir_two, dir_projected, normal) {
+            if point_in_wedge(
+                candidate.dir_walk,
+                candidate.dir_next,
+                to_projected.normalize(),
+                normal,
+            ) {
                 return projected;
             }
         }
@@ -7618,18 +7652,23 @@ struct SectorLayout {
     perp_second: Vec3,
     normal_first: Vec3,
     normal_second: Vec3,
-    between_faces: Vec<FaceKey>,
-    between_edges: Vec<EdgeKey>,
-    /// The sector's edge directions from `v` in disk order: `[g_k, leg_0, …,
-    /// leg_{m-1}, g_(k+1)]` (length `between_edges.len() + 2`). Aligned with
-    /// `between_faces` so the forward face `between_faces[i]` is bounded at `v` by
-    /// `bound_dirs[i]` (its walk edge) and `bound_dirs[i + 1]` (the next disk edge)
-    /// — the §7.6.2 in-wedge pair. A zero entry marks a degenerate leg direction.
-    bound_dirs: Vec<Vec3>,
+    /// The §7.6.2 face-drop walk, in disk order (one entry per sector face, starting
+    /// at the face just forward of `g_k`).
+    drop_candidates: Vec<DropCandidate>,
     /// Whether this is a §7.6.2 **case 3** (non-planar) sector: at least one
     /// in-between leg is out-of-plane, so each offset line carries its own local
     /// normal. The face-drop step runs only for these sectors.
     non_planar: bool,
+}
+
+/// One stop of the §7.6.2 face-drop walk: a sector face, the angular wedge it occupies
+/// at the junction vertex (swept from the walk edge `dir_walk` to the face's other edge
+/// `dir_next`), and its normal oriented to the walk's sense so the in-wedge sweeps and
+/// the wedge itself are measured with the same handedness.
+struct DropCandidate {
+    dir_walk: Vec3,
+    dir_next: Vec3,
+    normal: Vec3,
 }
 
 /// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
@@ -8611,6 +8650,141 @@ mod tests {
                 "no chain vert may land on a rival `mid`",
             );
         }
+    }
+
+    /// A 3×3 quad grid whose centre vertex is lifted to `z = 0.6`, so all four incident
+    /// quads are **warped** (three corners in `z = 0`, one lifted). Beveling the centre's
+    /// `+x` and `+y` spokes makes it an `s == 2` junction with a single-face sector (the
+    /// `+x+y` quad, §7.6.2 case 1) and a two-absorbed-leg sector wrapping the other three
+    /// quads (§7.6.2 case 3).
+    ///
+    /// `rotate_first_face` rotates the first quad's vertex cycle to start at the centre.
+    /// That is the *same* mesh — same faces, same winding, same normals — but it swaps
+    /// which of the centre's two edges that face reports first, which reverses the
+    /// direction the corner ring chains in. Every §7.6.2 quantity must be invariant to it.
+    fn lifted_centre_grid(rotate_first_face: bool) -> (LoopMesh, Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let verts: Vec<VertexKey> = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.6],
+            [2.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [2.0, 2.0, 0.0],
+        ]
+        .into_iter()
+        .map(|[x, y, z]| mesh.create_vertex(Vec3::new(x, y, z)))
+        .collect();
+        let first: &[usize] = if rotate_first_face {
+            &[4, 3, 0, 1]
+        } else {
+            &[0, 1, 4, 3]
+        };
+        for cycle in [first, &[1, 2, 5, 4], &[3, 4, 7, 6], &[4, 5, 8, 7]] {
+            let corners: Vec<VertexKey> = cycle.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&corners, FaceCreateFlags::NONE);
+        }
+        (mesh, verts)
+    }
+
+    /// Bevel the lifted grid's `+x` / `+y` spokes at `offset = 0.2`, one segment.
+    fn bevel_lifted_centre_grid(rotate_first_face: bool) -> (LoopMesh, BevelResult) {
+        let (mut mesh, verts) = lifted_centre_grid(rotate_first_face);
+        let geom: Vec<GeomKey> = [5, 7]
+            .into_iter()
+            .map(|far| {
+                mesh.query_edge_exists(verts[4], verts[far])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// The §7.6.2 case-1 sector normal is the **edge-span cross product**, sign-fixed
+    /// against the sector face's normal — and that sign fix has to be read in the corner
+    /// ring's *walk* sense, because the ring's chaining direction is not canonical. Get it
+    /// wrong on a **warped** face (where the face's Newell normal tilts off the edge-span
+    /// plane, so the centroid-oriented fallback is not taken) and both offset-line
+    /// perpendiculars invert, which point-reflects the boundvert through the junction.
+    ///
+    /// The single-face sector of the lifted grid pins it: the meet belongs at
+    /// `v + (0.178, 0.178, −0.213)`, *inside* the sector's quad, never at its reflection.
+    #[test]
+    fn warped_face_sector_meet_is_not_reflected_through_the_junction() {
+        let junction = Vec3::new(1.0, 1.0, 0.6);
+        let meet = Vec3::new(1.1778424, 1.1778424, 0.3865892);
+        let reflection = junction - (meet - junction);
+
+        for rotate_first_face in [false, true] {
+            let (mesh, result) = bevel_lifted_centre_grid(rotate_first_face);
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, meet),
+                1,
+                "the single-face sector's boundvert is the edge-span meet, inside its quad",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, reflection),
+                0,
+                "no boundvert may land on the point reflection of the meet through `v`",
+            );
+        }
+    }
+
+    /// The §7.6.2 face-drop runs on a **case-3** sector: its provisional meet floats off
+    /// the surface and must be projected onto the `v`-anchored plane of the first sector
+    /// face whose wedge it lands in. The lifted grid's two-absorbed-leg sector pins it —
+    /// the walk's *first* face is rejected (its drop sweeps ~53° past its own wedge) and
+    /// the middle face accepted, which pulls the boundvert down off the junction's own
+    /// height. Leaving the provisional meet in place keeps `v`'s `z` and floats the
+    /// boundvert above the surface.
+    #[test]
+    fn warped_face_case3_sector_meet_drops_onto_the_middle_face() {
+        let dropped = Vec3::new(0.8492861, 0.8492861, 0.5095717);
+        let provisional = Vec3::new(0.8221542, 0.8221542, 0.6);
+
+        for rotate_first_face in [false, true] {
+            let (mesh, result) = bevel_lifted_centre_grid(rotate_first_face);
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, dropped),
+                1,
+                "the case-3 boundvert drops onto the middle face's `v`-anchored plane",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, provisional),
+                0,
+                "no boundvert may keep the un-dropped provisional meet (at `v`'s own height)",
+            );
+        }
+    }
+
+    /// Both §7.6.2 signed quantities — the case-1 sign fix and the face-drop's in-wedge
+    /// sweeps — are measured in the corner ring's walk sense, so neither may depend on
+    /// which way the ring happens to chain. Rotating one face's vertex cycle leaves the
+    /// mesh identical but reverses that direction; the bevel must not move.
+    #[test]
+    fn warped_face_junction_placement_is_invariant_to_the_ring_walk_direction() {
+        let (forward, _) = bevel_lifted_centre_grid(false);
+        let (reversed, _) = bevel_lifted_centre_grid(true);
+        assert_eq!(counts(&forward), counts(&reversed));
+        assert!(
+            positions_multiset_eq(&forward, &reversed, 1.0e-5),
+            "the warped junction's boundverts must not depend on the ring's chaining direction",
+        );
     }
 
     /// BEVEL.md §8.2.2.1: tier 1 is **unconditional**, so a *mixed* sector — one of the
