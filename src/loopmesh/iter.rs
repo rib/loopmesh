@@ -291,9 +291,7 @@ impl VertFanLoops {
         };
 
         let entry = mesh
-            .edges
-            .get(seed)
-            .radial_link
+            .edge_radial_last_attached(seed)
             .expect("a non-wire edge carries a radial entry");
         // Corner-adjust the seed's radial entry onto the hub: a loop's vertex is
         // the tail of its edge, so the entry sits either at the hub already or
@@ -348,7 +346,7 @@ impl MeshIter for VertFanLoops {
             self.group_edge = Some(next_edge);
             // A later group starts at its edge's radial entry — there is no
             // corner-adjust hop here; that happens only for the seed.
-            self.group_first = mesh.edges.get(next_edge).radial_link;
+            self.group_first = mesh.edge_radial_last_attached(next_edge);
             self.next_loop = self.group_first;
         }
     }
@@ -896,5 +894,89 @@ impl LoopMesh {
     pub fn iter_face_loops_reverse<'a>(&'a self, f: FaceKey) -> impl Iterator<Item = LoopKey> + 'a {
         let mut it = FaceLoopsReverse::new(self, f);
         std::iter::from_fn(move || it.next(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A non-manifold "book" of `n` triangular pages hinged on the spine edge
+    /// `v0–v1`: page `i` is wound `[v0, v1, tip_i]`, so every page adopts the
+    /// spine and its radial cycle has valence `n`.
+    fn build_book(mesh: &mut LoopMesh, n: usize) -> (VertexKey, VertexKey, Vec<FaceKey>) {
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let faces = (0..n)
+            .map(|i| {
+                let tip = mesh.create_vertex(Vec3::new(1.0 + i as f32, 0.5, 0.0));
+                mesh.face_create_verts(&[v0, v1, tip], FaceCreateFlags::NONE)
+            })
+            .collect();
+        (v0, v1, faces)
+    }
+
+    fn fan_faces(mesh: &LoopMesh, v: VertexKey) -> Vec<FaceKey> {
+        let mut fan = mesh.vert_fan_loops(v);
+        let mut faces = Vec::new();
+        while let Some(l) = fan.next(mesh) {
+            assert_eq!(mesh.loop_vertex(l), v, "every fan loop is a corner at v");
+            faces.push(mesh.loop_face(l));
+        }
+        faces
+    }
+
+    /// RADIAL_EDGE_STRUCTURE.md §6.5 worked example B — the `book(n)` spine pair
+    /// discriminates the radial pick. Both spine verts share *every* page, yet:
+    ///
+    /// - `v0` anchors on its private spoke `v0–tip0` (face 0's closing edge,
+    ///   radial length 1) → build-face 0, whatever the pick.
+    /// - `v1` anchors on the **spine**, adopted by all `n` pages, so its first
+    ///   corner is the spine's **last-attached** page — build-face `n-1`.
+    ///
+    /// A fan that read the *first*-attached loop would answer build-face 0 at
+    /// `v1` too. This is the pin for that half of the radial-anchor pair; it
+    /// fails on its own if the fan's radial pick regresses to the stored head.
+    #[test]
+    fn vert_fan_first_loop_book_spine_pair_is_last_attached() {
+        let n = 5usize;
+        let mut mesh = LoopMesh::new();
+        let (v0, v1, faces) = build_book(&mut mesh, n);
+
+        assert_eq!(fan_faces(&mesh, v0)[0], faces[0]);
+        assert_eq!(
+            fan_faces(&mesh, v1)[0],
+            faces[n - 1],
+            "the spine's radial pick is its last-attached page, not its first"
+        );
+    }
+
+    /// The fan yields each incident face exactly once — once *per face*, not
+    /// once per (face, incident-edge) pair (§6.5, "Composing the fan").
+    #[test]
+    fn vert_fan_yields_each_incident_face_once() {
+        let n = 4usize;
+        let mut mesh = LoopMesh::new();
+        let (v0, v1, faces) = build_book(&mut mesh, n);
+
+        for hub in [v0, v1] {
+            let fanned = fan_faces(&mesh, hub);
+            assert_eq!(fanned.len(), n, "one corner per incident face");
+            let mut seen: Vec<usize> = fanned.iter().map(|f| f.as_usize()).collect();
+            seen.sort_unstable();
+            let mut expected: Vec<usize> = faces.iter().map(|f| f.as_usize()).collect();
+            expected.sort_unstable();
+            assert_eq!(seen, expected);
+        }
+    }
+
+    /// A vertex with no incident face fans empty (a lone wire endpoint).
+    #[test]
+    fn vert_fan_of_wire_endpoint_is_empty() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::X);
+        mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+        assert!(fan_faces(&mesh, a).is_empty());
     }
 }

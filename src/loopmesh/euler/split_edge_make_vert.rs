@@ -25,18 +25,17 @@ impl LoopMesh {
             .expect("edge must have two distinct endpoints");
         let tv_pos = self.vertices.get(tail_vertex).position;
 
-        // 1) Create the new vertex.
+        // 1) Create the new vertex. Its disk is empty.
         let v_new = self.create_vertex(tv_pos);
 
-        // 2) Create the new edge tail_vertex <-> v_new. create_edge appends
-        //    it to both endpoints' disk cycles — exactly the final state we
-        //    want for e_new, so no further disk manipulation is needed for it.
-        let e_new = self.create_edge([tail_vertex, v_new], EdgeCreateFlags::NONE);
-
-        // 3) Migrate `edge`'s endpoint from tail_vertex to v_new:
+        // 2) Migrate `edge`'s endpoint from tail_vertex to v_new *before* the
+        //    fresh half exists, so the retained half reaches the still-empty
+        //    disk first and becomes v_new's **disk anchor** (§8.1 steps 2-3).
+        //    The anchor is contractual — it seeds v_new's fan (§6.5), so a
+        //    caller that ties on "first in the fan" reads this choice back.
         //      a) remove edge from tail_vertex's disk
         //      b) overwrite the endpoint slot
-        //      c) append edge to v_new's disk
+        //      c) append edge to v_new's (empty) disk
         self.vertex_disk_remove_edge(tail_vertex, edge);
         let slot = if self.edges.get(edge).vertices[0] == tail_vertex {
             0
@@ -46,12 +45,32 @@ impl LoopMesh {
         self.edges.get_mut(edge).vertices[slot] = v_new;
         self.vertex_disk_append_edge(v_new, edge);
 
-        // 4) Split the radial cycle. Snapshot the loops first to make the
-        //    walk independent of in-place radial mutations below.
-        let original_loops: Vec<LoopKey> = if self.edges.get(edge).radial_link.is_some() {
-            self.edge_radial_iter(edge).collect()
-        } else {
-            Vec::new()
+        // 3) Only now create tail_vertex <-> v_new. create_edge appends it to
+        //    both endpoints' disks; in v_new's it joins an already-anchored
+        //    cycle, so it does not displace the anchor.
+        let e_new = self.create_edge([tail_vertex, v_new], EdgeCreateFlags::NONE);
+
+        // 4) Split the radial cycle, walking it forward **from its radial
+        //    entry** — the last-attached loop (§8.1 step 4). The walk order is
+        //    the order the two halves are re-populated in, and each half's own
+        //    entry is left on whichever face the walk handled last, so starting
+        //    at the first-attached loop instead would leave both halves headed
+        //    by the wrong face. Snapshot first: the walk rebuilds the very
+        //    cycle it is reading.
+        let original_loops: Vec<LoopKey> = match self.edge_radial_last_attached(edge) {
+            Some(entry) => {
+                let mut loops = Vec::new();
+                let mut current = entry;
+                loop {
+                    loops.push(current);
+                    current = self.loop_radial_next(current);
+                    if current == entry {
+                        break;
+                    }
+                }
+                loops
+            }
+            None => Vec::new(),
         };
 
         // Detach every loop from `edge`'s radial cycle in one shot — the
@@ -191,6 +210,105 @@ mod tests {
             assert_eq!(radial.len(), 1);
             assert_eq!(radial[0], face);
         }
+    }
+
+    /// Two quads sharing one edge, built in a known order so the shared edge's
+    /// radial attachment order is `[first_quad, second_quad]`.
+    fn two_quads_sharing_an_edge(mesh: &mut LoopMesh) -> (FaceKey, FaceKey, EdgeKey, VertexKey) {
+        let v: Vec<VertexKey> = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .map(|p| mesh.create_vertex(p))
+        .collect();
+
+        let first = mesh.face_create_verts(&[v[0], v[1], v[2], v[3]], FaceCreateFlags::NONE);
+        let second = mesh.face_create_verts(&[v[1], v[4], v[5], v[2]], FaceCreateFlags::NONE);
+        let shared = mesh.query_edge_exists(v[1], v[2]).expect("shared edge");
+        (first, second, shared, v[2])
+    }
+
+    fn fan_first_face(mesh: &LoopMesh, v: VertexKey) -> FaceKey {
+        let mut fan = mesh.vert_fan_loops(v);
+        let first = fan.next(mesh).expect("non-empty fan");
+        mesh.loop_face(first)
+    }
+
+    /// RADIAL_EDGE_STRUCTURE.md §8.1's cycle-head contract, manifold arm.
+    ///
+    /// The retained half must reach `v_new`'s empty disk **before** the fresh
+    /// half exists (steps 2-3), so `v_new`'s disk anchor is `edge`; and the
+    /// radial rebuild must walk the pre-split cycle forward **from its radial
+    /// entry** (step 4), so each half ends up headed by the face the walk
+    /// handled last — for a radial-2 edge, the face attached to it **first**.
+    /// Composing the two: `v_new`'s fan opens on that first-attached face.
+    ///
+    /// Each assertion is falsified on its own by exactly one half of the
+    /// radial-anchor pair, so the two cannot silently cancel back into place.
+    #[test]
+    fn semv_seats_v_new_anchor_on_retained_half_and_heads_both_halves_with_first_attached_face() {
+        let mut mesh = LoopMesh::new();
+        let (first_quad, second_quad, edge, tail) = two_quads_sharing_an_edge(&mut mesh);
+
+        // Pre-split sanity: the shared edge's entry is the quad that adopted it last.
+        let entry = mesh.edge_radial_last_attached(edge).expect("radial-2 edge");
+        assert_eq!(mesh.loop_face(entry), second_quad);
+
+        let (v_new, e_new) = mesh.euler_split_edge_make_vert(tail, edge);
+        mesh.validate_topology();
+
+        assert_eq!(
+            mesh.vertices.get(v_new).disk_loop_start,
+            Some(edge),
+            "v_new's disk anchor is the retained half, not the fresh one"
+        );
+        for half in [edge, e_new] {
+            let head = mesh.edge_radial_last_attached(half).expect("radial-2 half");
+            assert_eq!(
+                mesh.loop_face(head),
+                first_quad,
+                "a split half is headed by the face attached first to the original edge"
+            );
+        }
+        assert_eq!(fan_first_face(&mesh, v_new), first_quad);
+    }
+
+    /// §8.1's cycle-head contract, non-manifold arm — the case the radial-2
+    /// coincidence cannot cover. Three pages share the spine, attached in build
+    /// order. The rebuild walks forward from the entry (the **last**-attached
+    /// page), i.e. `p2, p0, p1`, so it finishes on `p1` and both halves are
+    /// headed by the page attached **second-to-last**.
+    #[test]
+    fn semv_nonmanifold_split_heads_both_halves_with_second_to_last_attached_face() {
+        let mut mesh = LoopMesh::new();
+        let spine_a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let spine_b = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let pages: Vec<FaceKey> = (0..3)
+            .map(|i| {
+                let tip = mesh.create_vertex(Vec3::new(1.0 + i as f32, 0.5, 0.0));
+                mesh.face_create_verts(&[spine_a, spine_b, tip], FaceCreateFlags::NONE)
+            })
+            .collect();
+        let spine = mesh.query_edge_exists(spine_a, spine_b).expect("spine");
+
+        let (v_new, e_new) = mesh.euler_split_edge_make_vert(spine_b, spine);
+        mesh.validate_topology();
+
+        assert_eq!(mesh.vertices.get(v_new).disk_loop_start, Some(spine));
+        for half in [spine, e_new] {
+            let head = mesh.edge_radial_last_attached(half).expect("radial-3 half");
+            assert_eq!(
+                mesh.loop_face(head),
+                pages[1],
+                "the rebuild ends on the page attached second-to-last"
+            );
+        }
+        assert_eq!(fan_first_face(&mesh, v_new), pages[1]);
     }
 
     /// Splitting the same edge twice should give the same topology shape (hexagon).

@@ -551,9 +551,8 @@ impl LoopMesh {
             if self.edge_radial_count_capped(edge, 2) != 2 {
                 continue;
             }
-            let radial_head = self.edges.get(edge).radial_link?;
-            // §6.5 `e.l` = last-attached radial loop = the head's radial-`prev`.
-            let representative_loop = self.loop_radial_prev(radial_head);
+            // §6.5 `e.l` = the edge's radial entry = its last-attached loop.
+            let representative_loop = self.edge_radial_last_attached(edge)?;
             return Some(self.loops.get(representative_loop).face);
         }
         None

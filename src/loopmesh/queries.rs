@@ -353,6 +353,26 @@ impl LoopMesh {
         self.loops.get(l).edge_radial_links.prev
     }
 
+    /// The loop **last attached** to `edge`'s radial cycle — the *radial entry*
+    /// of [`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+    /// §6.5, and the only radial pick an order-sensitive consumer may use: the
+    /// fan's first corner, and the start of the radial walk an edge-splitting
+    /// rebuild must follow (§8.1 step 4), are both defined off it.
+    ///
+    /// The disk and the radial cycle use **opposite** entry conventions, and
+    /// this crate's storage mirrors the disk one on both: `radial_link` stays
+    /// pinned to the loop attached **first**, with each later loop spliced in
+    /// immediately *before* it. Forward (`next`) order is therefore attachment
+    /// order, and the last-attached loop is the stored head's radial-`prev` —
+    /// exactly the translation §6.5's "Implementation asymmetry" box mandates
+    /// for a layout like this one. Reading `radial_link` directly picks the
+    /// **first**-attached face and lands the wrong corner on any edge that two
+    /// or more faces adopted; every such read must go through here instead.
+    pub fn edge_radial_last_attached(&self, edge: EdgeKey) -> Option<LoopKey> {
+        let first_attached = self.edges.get(edge).radial_link?;
+        Some(self.loop_radial_prev(first_attached))
+    }
+
     pub fn vertex_disk_print_links(&self, vertex: VertexKey) {
         let v = &self.vertices.get(vertex);
         let start = v.disk_loop_start;

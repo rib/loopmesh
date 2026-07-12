@@ -637,12 +637,9 @@ impl LoopMesh {
     /// `vertex` is isolated).
     fn fan_first_loop(&self, vertex: VertexKey) -> Option<LoopKey> {
         for edge in self.vertex_disk_iter(vertex) {
-            let Some(radial_entry) = self.edges.get(edge).radial_link else {
+            let Some(last_attached) = self.edge_radial_last_attached(edge) else {
                 continue; // wire edge — skip in disk insertion order.
             };
-            // §6.5 radial entry == last-attached loop == radial-prev of the
-            // first-attached `radial_link` pointer this crate keeps.
-            let last_attached = self.loop_radial_prev(radial_entry);
             return Some(if self.loop_vertex(last_attached) == vertex {
                 last_attached
             } else {
