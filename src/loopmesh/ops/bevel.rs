@@ -715,7 +715,13 @@ impl LoopMesh {
         // §6.6.1: one bank for the whole run — every cap's donor block captured in a
         // single snapshot, and read back at every value of `material`.
         let mut templates = TemplateBank::default();
-        let corners = self.place_ring_verts(&frames, clamp_factor, &mut templates, &mut result);
+        let corners = self.place_ring_verts(
+            &frames,
+            clamp_factor,
+            options.segments,
+            &mut templates,
+            &mut result,
+        );
         templates.seal(self);
 
         // §5.2.1 fact (a): the per-corner attribute blend's donors are the incident
@@ -923,16 +929,26 @@ impl LoopMesh {
                 .iter()
                 .map(|&edge| templates.register(self.edge_flanking_face(edge)))
                 .collect();
-            // §6.6.1: a valence-≥4 terminal's endpoint fill (§7.5) inherits from a face
-            // of the ring's first boundvert — one of the faces the endpoint's own
-            // consumption kills. Registered for **both** endpoints of every edge, whatever
-            // their valence: a donor capture gated on the shape of the corner is the bug
-            // class this bank exists to kill.
+            // §6.6.1: a valence-≥4 terminal's endpoint fill (§7.5) is a ring-spanning fill —
+            // it inherits from the rep face of the ring's first boundvert, or from
+            // §6.6.1.4's tie-break winner when the corner carries a seam leg. Either way the
+            // donor is one of the faces the endpoint's own consumption kills. Registered for
+            // **both** endpoints of every edge, whatever their valence: a donor capture
+            // gated on the shape of the corner is the bug class this bank exists to kill.
+            // Membership as a set: the donor's candidate gate asks it once per leg of every
+            // beveled corner, so a linear scan here would multiply the edge set into the
+            // per-corner path.
+            let beveled_set: HashSet<EdgeKey> = beveled.iter().copied().collect();
             let terminal_templates: Vec<[FaceTemplate; 2]> = beveled
                 .iter()
                 .map(|&edge| {
                     self.edge_vert_keys(edge).map(|endpoint| {
-                        templates.register(self.vert_face_keys(endpoint).first().copied())
+                        templates.register(self.ring_spanning_donor(
+                            endpoint,
+                            &|leg| beveled_set.contains(&leg),
+                            options.affect,
+                            options.segments,
+                        ))
                     })
                 })
                 .collect();
@@ -1444,7 +1460,11 @@ impl LoopMesh {
             .map(|&edge| templates.register(self.edge_flanking_face(edge)))
             .collect();
 
-        let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
+        // A set, not a scan: §6.6.1.4's candidate gate asks this once per leg of every
+        // beveled corner, so a linear membership test multiplies the whole edge set into
+        // the per-corner path.
+        let beveled_set: HashSet<EdgeKey> = beveled_manifold.iter().copied().collect();
+        let is_beveled = |edge: EdgeKey| beveled_set.contains(&edge);
 
         // The original endpoints to consume: every endpoint of a beveled edge.
         let mut endpoints: Vec<VertexKey> = Vec::new();
@@ -1506,6 +1526,8 @@ impl LoopMesh {
                 self.place_junction_boundverts(
                     endpoint,
                     &is_beveled,
+                    options.affect,
+                    options.segments,
                     offset,
                     options.loop_slide,
                     &mut templates,
@@ -1548,7 +1570,9 @@ impl LoopMesh {
             if !junctions.contains(&endpoint) {
                 self.place_terminal_strip_verts(
                     endpoint,
-                    &beveled_manifold,
+                    &beveled_set,
+                    options.affect,
+                    options.segments,
                     offset,
                     &reconciled,
                     &mut templates,
@@ -1751,7 +1775,11 @@ impl LoopMesh {
         if beveled_manifold.is_empty() {
             return;
         }
-        let is_beveled = |edge: EdgeKey| beveled_manifold.contains(&edge);
+        // A set, not a scan: §6.6.1.4's candidate gate asks this once per leg of every
+        // beveled corner, so a linear membership test multiplies the whole edge set into
+        // the per-corner path.
+        let beveled_set: HashSet<EdgeKey> = beveled_manifold.iter().copied().collect();
+        let is_beveled = |edge: EdgeKey| beveled_set.contains(&edge);
 
         // §6.6.1, as in the single-segment path: each strip's stage-1 inherit copies the
         // whole block of a flanking face of its beveled edge. Phase 1 registers the
@@ -1809,6 +1837,7 @@ impl LoopMesh {
                     && self.build_junction_inner_miter(
                         endpoint,
                         &is_beveled,
+                        options.affect,
                         offset,
                         segments,
                         profile,
@@ -1834,6 +1863,7 @@ impl LoopMesh {
                     && self.build_junction_outer_miter(
                         endpoint,
                         &is_beveled,
+                        options.affect,
                         offset,
                         segments,
                         profile,
@@ -1848,6 +1878,7 @@ impl LoopMesh {
                     self.build_junction_chains(
                         endpoint,
                         &is_beveled,
+                        options.affect,
                         offset,
                         segments,
                         profile,
@@ -1863,7 +1894,8 @@ impl LoopMesh {
             } else {
                 self.build_terminal_chains(
                     endpoint,
-                    &beveled_manifold,
+                    &beveled_set,
+                    options.affect,
                     offset,
                     segments,
                     profile,
@@ -2101,6 +2133,7 @@ impl LoopMesh {
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
         offset: f32,
         segments: u32,
         profile: f32,
@@ -2189,6 +2222,11 @@ impl LoopMesh {
         // re-introduce a *conditional* donor capture — the bug class this bank exists to
         // kill — to save one `usize` and one gathered value per layer per junction.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        // §6.6.1: the odd-`segments` centre n-gon of the [V-ADJ] grid (§8.5) is the fourth
+        // ring-spanning fill family — the tie-break reaches it at a seam-carrying junction
+        // exactly as it reaches the cap, the patch and the terminal fill.
+        let central_representative =
+            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
 
         junction_cuts.push(JunctionCut {
             vertex,
@@ -2196,6 +2234,7 @@ impl LoopMesh {
             opening_edges,
             outward,
             representative,
+            central_representative,
         });
     }
 
@@ -2415,7 +2454,8 @@ impl LoopMesh {
     fn build_terminal_chains(
         &mut self,
         vertex: VertexKey,
-        beveled: &[EdgeKey],
+        beveled: &HashSet<EdgeKey>,
+        affect: BevelAffect,
         offset: f32,
         segments: u32,
         profile: f32,
@@ -2521,10 +2561,15 @@ impl LoopMesh {
             // verts. The original terminal vertex is consumed — every incident face
             // re-stitches off it.
 
-            // A face incident to the (about-to-be-consumed) terminal supplies the §6.6.1
-            // inherit source for the fill's new faces; registered now, before the re-stitch
-            // strips the terminal of its faces.
-            let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+            // The fill is ring-spanning, so §6.6.1's rep of the ring's first boundvert
+            // donates — displaced by §6.6.1.4's tie-break when the terminal carries a seam
+            // leg. Registered now, before the re-stitch strips the terminal of its faces.
+            let representative = templates.register(self.ring_spanning_donor(
+                vertex,
+                &|leg| beveled.contains(&leg),
+                affect,
+                segments,
+            ));
 
             // The fill ring walks the legs in **rotational** order (§8.3.0.2's
             // leg-numbering convention): `leg₁` is the non-flanking leg following `end`
@@ -3491,6 +3536,7 @@ impl LoopMesh {
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
         offset: f32,
         segments: u32,
         profile: f32,
@@ -3776,8 +3822,11 @@ impl LoopMesh {
             .collect();
 
         // §6.6.1: the mitered fill's inherit source, registered while the junction still
-        // has its faces — the re-stitch consumes the vertex.
+        // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
+        // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        let central_representative =
+            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -3789,6 +3838,7 @@ impl LoopMesh {
             segments,
             profile,
             representative,
+            central_representative,
         });
         true
     }
@@ -3822,6 +3872,7 @@ impl LoopMesh {
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
         offset: f32,
         segments: u32,
         profile: f32,
@@ -4233,8 +4284,11 @@ impl LoopMesh {
         };
 
         // §6.6.1: the mitered fill's inherit source, registered while the junction still
-        // has its faces — the re-stitch consumes the vertex.
+        // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
+        // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        let central_representative =
+            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -4246,6 +4300,7 @@ impl LoopMesh {
             segments,
             profile,
             representative,
+            central_representative,
         });
         true
     }
@@ -4433,6 +4488,7 @@ impl LoopMesh {
             return;
         }
         let representative = templates.resolve(omj.representative);
+        let central_representative = templates.resolve(omj.central_representative);
         // The arc forces the circular profile, so this fill is never the flat cap.
         // §8.9.5.3: feed the centre stencil the raw coarse control-net mids (populated
         // at `segments = 2`), so the resampled arc-flanking rim mids never skew the apex.
@@ -4451,6 +4507,7 @@ impl LoopMesh {
             raw_coarse_mids,
             material,
             representative,
+            central_representative,
             result,
         );
     }
@@ -4477,6 +4534,7 @@ impl LoopMesh {
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
         representative: FaceTemplateRef<'_>,
+        central_representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
     ) {
         let sectors = chain_of.len();
@@ -4558,6 +4616,7 @@ impl LoopMesh {
                 },
                 material,
                 representative,
+                central_representative,
                 result,
             );
             return;
@@ -4598,6 +4657,7 @@ impl LoopMesh {
             },
             material,
             representative,
+            central_representative,
             result,
         );
     }
@@ -4729,6 +4789,7 @@ impl LoopMesh {
         let axis = adj_interior_axis(&profiles, segments, 2 * net.half as u32);
 
         let representative = templates.resolve(cut.representative);
+        let central_representative = templates.resolve(cut.central_representative);
         self.emit_adj_grid(
             sectors,
             seg,
@@ -4745,6 +4806,7 @@ impl LoopMesh {
             },
             material,
             representative,
+            central_representative,
             result,
         );
     }
@@ -4843,6 +4905,7 @@ impl LoopMesh {
         // tabulated fullness seed and relaxes.
         let flat = profile_to_exponent(profile) == 1.0;
         let representative = templates.resolve(cut.representative);
+        let central_representative = templates.resolve(cut.central_representative);
         self.emit_general_adj_fill(
             cut.vertex,
             &chain_of,
@@ -4853,6 +4916,7 @@ impl LoopMesh {
             None,
             material,
             representative,
+            central_representative,
             result,
         );
     }
@@ -4874,6 +4938,7 @@ impl LoopMesh {
         interior: &AdjInterior<'_>,
         material: i32,
         representative: FaceTemplateRef<'_>,
+        central_representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
     ) {
         let anchor = interior.anchor();
@@ -4973,7 +5038,10 @@ impl LoopMesh {
                 i, half, half, half, seg, sectors, even, chain_of, interior, &mut grid, result,
             ));
         }
-        self.emit_patch_face(&central, anchor, material, representative, result);
+        // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
+        // its corners span the whole boundvert ring — so it takes the ring-spanning donor,
+        // not the sector-positional one the rest of the grid carries.
+        self.emit_patch_face(&central, anchor, material, central_representative, result);
     }
 
     /// Resolve the adjacency-grid vert at sub-patch index `(i, j, k)` (BEVEL.md
@@ -5216,6 +5284,8 @@ impl LoopMesh {
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
+        segments: u32,
         offset: f32,
         loop_slide: bool,
         templates: &mut TemplateBank,
@@ -5329,9 +5399,12 @@ impl LoopMesh {
             }
         }
 
-        // §6.6.1: the patch's inherit source, registered while the junction still has its
+        // §6.6.1: the patch is a ring-spanning fill, so its inherit source is the ring's
+        // first boundvert's rep — or §6.6.1.4's tie-break winner over the beveled legs when
+        // the junction carries a seam leg. Registered while the junction still has its
         // faces — the re-stitch consumes the vertex.
-        let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        let representative =
+            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
 
         junction_patches.push(JunctionPatch {
             vertex,
@@ -5351,7 +5424,9 @@ impl LoopMesh {
     fn place_terminal_strip_verts(
         &mut self,
         vertex: VertexKey,
-        beveled: &[EdgeKey],
+        beveled: &HashSet<EdgeKey>,
+        affect: BevelAffect,
+        segments: u32,
         offset: f32,
         reconciled: &[ReconciledOffset],
         templates: &mut TemplateBank,
@@ -5378,11 +5453,18 @@ impl LoopMesh {
         let face_left = radial_faces[0];
         let face_right = radial_faces[1];
 
-        // §6.6.1: the endpoint fill's inherit source, registered while the terminal still
-        // has its faces — the re-stitch consumes the vertex. Registered whatever the
-        // valence: a donor capture gated on the shape of the corner is the bug class the
-        // bank exists to kill.
-        let fan_template = templates.register(self.vert_face_keys(vertex).first().copied());
+        // §6.6.1: the endpoint fill is a ring-spanning fill — the rep of the ring's first
+        // boundvert, or §6.6.1.4's tie-break winner over every leg when the corner carries
+        // a seam leg (a terminal has one beveled leg, so every leg is a candidate).
+        // Registered while the terminal still has its faces — the re-stitch consumes the
+        // vertex — and whatever the valence: a donor capture gated on the shape of the
+        // corner is the bug class the bank exists to kill.
+        let fan_template = templates.register(self.ring_spanning_donor(
+            vertex,
+            &|leg| beveled.contains(&leg),
+            affect,
+            segments,
+        ));
 
         // The caller planned every terminal of the edge set before the first mint, so a
         // decline here is a broken invariant, not an input shape — and taking it as one
@@ -7515,14 +7597,202 @@ impl LoopMesh {
     /// ring-spanning cap fill gives corner `i` when `v` is not seam-carrying
     /// (§5.2.1.1). `None` on the first leg of an open fan, where no face arrives.
     fn arriving_face(&self, vertex: VertexKey, edge: EdgeKey) -> Option<FaceKey> {
-        self.vert_face_keys(vertex).into_iter().find(|&face| {
-            let cycle = self.face_vert_keys(face);
-            let Some(index) = cycle.iter().position(|&w| w == vertex) else {
-                return false;
+        // A radial loop of `edge` carries its face's traversal of the edge, running from
+        // the loop's own vertex to the next one — so the face arrives at `vertex` exactly
+        // when the loop's successor sits on it. Read off the radial cycle rather than off
+        // the corner's face list: this runs once per leg on every beveled corner, and the
+        // face-list form allocated twice per incident face to say the same thing.
+        self.iter_radial_loops(edge)
+            .find(|&l| self.loop_vertex(self.loop_next(l)) == vertex)
+            .map(|l| self.loop_face(l))
+    }
+
+    /// The face whose winding **departs** from `vertex` along `edge` — `next_face` of
+    /// BEVEL.md §6.6.1's fan primitive, and the mirror of
+    /// [`arriving_face`](Self::arriving_face). `None` on the last leg of an open fan,
+    /// where no face departs.
+    fn departing_face(&self, vertex: VertexKey, edge: EdgeKey) -> Option<FaceKey> {
+        self.iter_radial_loops(edge)
+            .find(|&l| self.loop_vertex(l) == vertex)
+            .map(|l| self.loop_face(l))
+    }
+
+    /// The corner's positional donor (BEVEL.md §6.6.1): the representative face of the
+    /// ring's first boundvert, which the fan anchor picks — the first incident face the
+    /// corner's disk walk reaches (§6.6.1.2's known non-invariance).
+    fn first_incident_face(&self, vertex: VertexKey) -> Option<FaceKey> {
+        self.iter_disk_edges(vertex)
+            .find_map(|edge| self.iter_radial_loops(edge).next())
+            .map(|l| self.loop_face(l))
+    }
+
+    /// The stage-1 donor of a **ring-spanning** fill at corner `vertex` — the vertex cap
+    /// (BEVEL.md §5), the junction patch (§7.6.3) and the terminal / endpoint fill (§7.5),
+    /// the row family whose donor §6.6.1 pins to the representative face of the ring's
+    /// *first* boundvert. Two regimes:
+    ///
+    /// - **Seam-free corner** — every leg's fan walk resolves both flanking faces. The
+    ///   donor is §6.6.1's positional pick, which reads the corner's fan anchor and carries
+    ///   §6.6.1.2's documented non-invariance. Nothing here can improve on it.
+    /// - **Seam-carrying corner** — §6.6.1.4 condition (1): some leg's fan walk resolves
+    ///   **no arriving face or no departing face**. That is an interpolation seam
+    ///   *unconditionally*, purely topologically, with no customdata layer consulted — so
+    ///   it fires on the plainest untextured mesh, and **every** mesh-boundary leg (and
+    ///   every wire leg, and every leg heading a restarted fan at a non-manifold corner)
+    ///   satisfies it. The positional pick is then displaced by the deterministic tie-break
+    ///   over a positionally-named candidate set, and the fan anchor drops out of the
+    ///   picture entirely.
+    ///
+    /// §6.6.1.4's **condition (2)** — two flanking faces disagreeing on an interpolable
+    /// loop layer, the UV-island seam — is **not implemented**: a corner seamed only that
+    /// way still takes the positional pick, exactly as it did before this rule existed.
+    ///
+    /// **The override declines wholesale when key 1 of the tie-break is live.** Key 1 —
+    /// the interpolation-component id (§6.6.1.4.1) — is live exactly when a UV-class
+    /// (float2) loop layer is present **and** `segments` is odd, and it is *not* an
+    /// isomorphism invariant: it reads a mesh-wide component partition numbered in face
+    /// enumeration order. Keys 2–4 are then arbitrary with respect to it, so a tie-break
+    /// run without key 1 is **not** a safe substitute for the positional pick in that
+    /// regime — it is merely a different arbitrary answer. So in that regime this returns
+    /// the positional donor unchanged: exact wherever key 1 is provably inert, explicitly
+    /// declined where it is live. (The same UV-class presence also arms §6.6.1.4's
+    /// `degenerate_uv_image` candidate filter, which is not implemented either; at an
+    /// **even** `segments` UV-carrying mesh the tie-break below therefore still runs, and
+    /// can keep a candidate whose UV image of the corner collapses.)
+    fn ring_spanning_donor(
+        &self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
+        segments: u32,
+    ) -> Option<FaceKey> {
+        let positional = self.first_incident_face(vertex);
+
+        // §6.6.1.4 condition (1): a leg whose fan walk resolves no arriving face or no
+        // departing face is an interpolation seam, unconditionally and purely
+        // topologically. The seam-free corner — the common one — keeps the positional pick,
+        // so this pass runs before a single candidate is built and allocates nothing.
+        let seam_carrying = self.iter_disk_edges(vertex).any(|leg| {
+            self.arriving_face(vertex, leg).is_none() || self.departing_face(vertex, leg).is_none()
+        });
+        if !seam_carrying {
+            return positional;
+        }
+
+        if segments % 2 == 1 && self.active_uv_loop_layer().is_some() {
+            return positional;
+        }
+
+        // §6.6.1.4's candidate set: every leg contributes when the corner carries exactly
+        // one beveled leg (an edge bevel's terminal) or when a vertex bevel runs at odd
+        // `segments`; otherwise only the beveled legs do (an edge bevel's junction).
+        let beveled_leg_count = self
+            .iter_disk_edges(vertex)
+            .filter(|&leg| is_beveled(leg))
+            .count();
+        let every_leg =
+            beveled_leg_count == 1 || (affect == BevelAffect::Vertices && segments % 2 == 1);
+
+        let mut candidates: Vec<FaceKey> = Vec::new();
+        for leg in self.iter_disk_edges(vertex) {
+            if !every_leg && !is_beveled(leg) {
+                continue;
+            }
+            // Each leg first reduces its own two flanking faces to one, by the very same
+            // tie-break — this is where `prev_face` stops being privileged. A wire leg
+            // reduces to nothing and contributes no candidate.
+            let winner = match (
+                self.arriving_face(vertex, leg),
+                self.departing_face(vertex, leg),
+            ) {
+                (Some(arriving), Some(departing)) => {
+                    if self.donor_precedes(departing, arriving) {
+                        Some(departing)
+                    } else {
+                        Some(arriving)
+                    }
+                }
+                (Some(face), None) | (None, Some(face)) => Some(face),
+                (None, None) => None,
             };
-            let previous = cycle[(index + cycle.len() - 1) % cycle.len()];
-            self.query_edge_exists(previous, vertex) == Some(edge)
+            if let Some(winner) = winner {
+                if !candidates.contains(&winner) {
+                    candidates.push(winner);
+                }
+            }
+        }
+
+        self.donor_tie_break(&candidates).or(positional)
+    }
+
+    /// BEVEL.md §6.6.1.4's deterministic tie-break: the smallest candidate on the first key
+    /// that separates it, and on a total tie the earliest in the order the set was built.
+    fn donor_tie_break(&self, candidates: &[FaceKey]) -> Option<FaceKey> {
+        candidates.iter().copied().reduce(|best, candidate| {
+            if self.donor_precedes(candidate, best) {
+                candidate
+            } else {
+                best
+            }
         })
+    }
+
+    /// Does `candidate` beat `best` on BEVEL.md §6.6.1.4's key chain? A total tie answers
+    /// `false`, which keeps the earlier candidate — the guide's own last resort.
+    ///
+    /// **Key 1 — the interpolation-layer component id (§6.6.1.4.1) — is not implemented**,
+    /// and the caller does not run this chain where it would be live: a UV-class loop layer
+    /// with odd `segments` declines the whole override
+    /// ([`ring_spanning_donor`](Self::ring_spanning_donor)). Everywhere this chain *does*
+    /// run, key 1 ties for every candidate and omitting it is exact.
+    fn donor_precedes(&self, candidate: FaceKey, best: FaceKey) -> bool {
+        // Key 2: selected beats unselected. This reads the face's **own** header flag, not
+        // its membership in the operator's input geometry.
+        let candidate_selected = self.face_flags(candidate).contains(ElementFlags::SELECTED);
+        let best_selected = self.face_flags(best).contains(ElementFlags::SELECTED);
+        if candidate_selected != best_selected {
+            return candidate_selected;
+        }
+
+        // Key 3: lowest material slot — at a material-straddling seam the *smaller* slot
+        // number donates.
+        let candidate_slot = self.face_material_index(candidate);
+        let best_slot = self.face_material_index(best);
+        if candidate_slot != best_slot {
+            return candidate_slot < best_slot;
+        }
+
+        // Key 4: lowest bounding-box-centre z, then x, then y. Compared by `total_cmp`, not
+        // by `<`: §6.6.1.4's global-argmin corollary rests on the key chain being a *total*
+        // order, and a partial float compare loses totality the moment a coordinate is NaN
+        // — the per-leg reduce would stop being a minimum and the argmin argument with it.
+        let candidate_center = self.face_bounding_box_center(candidate);
+        let best_center = self.face_bounding_box_center(best);
+        for (candidate_axis, best_axis) in [
+            (candidate_center.z, best_center.z),
+            (candidate_center.x, best_center.x),
+            (candidate_center.y, best_center.y),
+        ] {
+            match candidate_axis.total_cmp(&best_axis) {
+                std::cmp::Ordering::Less => return true,
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        false
+    }
+
+    /// The midpoint of a face's axis-aligned extent — key 4 of BEVEL.md §6.6.1.4's
+    /// tie-break, which is the bounding-box centre and *not* the area centroid.
+    fn face_bounding_box_center(&self, face: FaceKey) -> Vec3 {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for vertex in self.face_vert_keys(face) {
+            let position = self.vertex_position(vertex);
+            min = min.min(position);
+            max = max.max(position);
+        }
+        (min + max) * 0.5
     }
 
     /// A face's centroid (mean of its corner positions), used to orient the
@@ -7653,6 +7923,7 @@ impl LoopMesh {
         &mut self,
         frames: &[BevelFrame],
         clamp_factor: f32,
+        segments: u32,
         templates: &mut TemplateBank,
         result: &mut BevelResult,
     ) -> Vec<BeveledCorner> {
@@ -7660,10 +7931,18 @@ impl LoopMesh {
         for frame in frames {
             let incident_faces = self.vert_face_keys(frame.vertex);
 
-            // §6.6.1: the cap's stage-1 inherit donor is a representative incident face of
-            // `v`. Registered now, against the pristine mesh — the bank is sealed before
-            // the incident faces are killed / rebuilt.
-            let representative = templates.register(incident_faces.first().copied());
+            // §6.6.1: the cap is a ring-spanning fill, so its stage-1 inherit donor is the
+            // positional representative of the ring's first boundvert — displaced by
+            // §6.6.1.4's tie-break at a seam-carrying corner, which every corner touching
+            // the mesh boundary is. No leg is beveled in vertex mode. Registered now,
+            // against the pristine mesh — the bank is sealed before the incident faces are
+            // killed / rebuilt.
+            let representative = templates.register(self.ring_spanning_donor(
+                frame.vertex,
+                &|_| false,
+                BevelAffect::Vertices,
+                segments,
+            ));
 
             let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
                 Vec::with_capacity(frame.placements.len());
@@ -8935,6 +9214,12 @@ struct JunctionCut {
     /// the junction vertex, captured while the ring is placed — the vertex is consumed by
     /// the re-stitch, so by fill time it names no adjacent face at all.
     representative: FaceTemplate,
+    /// The donor of the **odd-`segments` centre n-gon** alone (BEVEL.md §8.5.5.5(e)). That
+    /// one face of the grid is a **ring-spanning** fill — its corners are the whole
+    /// boundvert ring — so §6.6.1 pins it to the ring's first boundvert's rep, displaced by
+    /// §6.6.1.4's tie-break at a seam-carrying corner. Every other grid face is per-sector
+    /// and keeps `representative`.
+    central_representative: FaceTemplate,
 }
 
 impl JunctionCut {
@@ -9118,6 +9403,10 @@ struct MiterRingJunction {
     /// every value of `material`), captured pristine for the same reason [`JunctionCut`]'s
     /// is.
     representative: FaceTemplate,
+    /// The donor of the miter cap's **odd-`segments` centre n-gon** — the same
+    /// ring-spanning fill [`JunctionCut::central_representative`] carries, over the miter's
+    /// enlarged ring.
+    central_representative: FaceTemplate,
 }
 
 impl MiterRingJunction {
@@ -17590,6 +17879,7 @@ mod tests {
             opening_edges: Vec::new(),
             outward: Vec3::ZERO,
             representative: FaceTemplate::default(),
+            central_representative: FaceTemplate::default(),
         };
 
         // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
@@ -25576,6 +25866,354 @@ mod tests {
             candidates.contains(&inherited),
             "the cap must carry one incident original's whole block {candidates:?}, got \
              {inherited:?} (the layer default would be (0, [0,0,0]))",
+        );
+    }
+
+    // ---- The interpolation-seam override on the ring-spanning fills (§6.6.1.4) ----
+
+    /// The half-disc fan's `k`-th triangle, found by its rim pair rather than by creation
+    /// order, so a decoration keyed on it says nothing about how the mesh was built.
+    fn open_fan_face(mesh: &LoopMesh, centre: VertexKey, rim: &[VertexKey], k: usize) -> FaceKey {
+        mesh.vert_face_keys(centre)
+            .into_iter()
+            .find(|&face| {
+                let verts = mesh.face_vert_keys(face);
+                verts.contains(&rim[k]) && verts.contains(&rim[k + 1])
+            })
+            .expect("the fan's k-th triangle")
+    }
+
+    /// BEVEL.md §6.6.1.4 condition (1): a leg whose fan walk resolves **no arriving face or
+    /// no departing face** is an interpolation seam *unconditionally* — no customdata layer
+    /// is consulted, so it fires on the plainest untextured mesh — and every mesh-boundary
+    /// leg satisfies it. The open fan's apex therefore does **not** take §6.6.1's positional
+    /// donor for its ring-spanning terminal fill: it takes the tie-break winner, which here
+    /// (no UV layer ⇒ key 1 inert; nothing selected ⇒ key 2 tied) is the **lowest material
+    /// slot** among the candidates.
+    ///
+    /// The candidate set is every leg's own reduce, so the winner can be — and at some
+    /// rotations is — an **end face of the fan that does not flank the beveled spoke at
+    /// all**. Rotating the decoration moves the winner across all three faces, which is
+    /// what no positional rule (and no beveled-leg-flanks-only rule) can follow.
+    #[test]
+    fn face_cd_open_fan_apex_fill_takes_the_seam_tie_break_donor_not_the_positional_one() {
+        const SLOTS: [i32; 3] = [1, 5, 3];
+
+        for rotation in 0..3 {
+            let (mut mesh, centre, rim) = open_planar_fan(4, 0);
+            for k in 0..3 {
+                let face = open_fan_face(&mesh, centre, &rim, k);
+                mesh.set_face_material_index(face, SLOTS[(k + rotation) % 3]);
+            }
+            let beveled = mesh
+                .query_edge_exists(centre, rim[2])
+                .expect("an interior spoke of the open fan");
+
+            let result = mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            let fill = *result
+                .faces
+                .iter()
+                .find(|&&face| mesh.face_vert_keys(face).len() == 3)
+                .expect("the valence-4 apex mints one triangular terminal fill");
+            assert_eq!(
+                mesh.face_material_index(fill),
+                1,
+                "rotation {rotation}: the apex's two boundary legs seam it, so the fill's \
+                 donor is the tie-break's lowest-slot incident face — not the positional pick",
+            );
+        }
+    }
+
+    /// The vertex-bevel **cap** at a boundary corner is a ring-spanning fill too, and the
+    /// corner's two boundary legs seam it (§6.6.1.4 condition (1)), so its donor is the
+    /// tie-break winner over *every* leg's reduce — the lowest-slot incident face. Swapping
+    /// the two quads' slots moves the donor from one to the other; a positional pick would
+    /// stay on the same quad.
+    #[test]
+    fn face_cd_boundary_corner_cap_takes_the_seam_tie_break_donor_not_the_positional_one() {
+        for swapped in [false, true] {
+            let (mut mesh, _shared) = two_quad_strip();
+            let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+            let left = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+            for face in mesh.vert_face_keys(corner) {
+                let is_left = mesh.face_vert_keys(face).contains(&left);
+                let slot = match (is_left, swapped) {
+                    (true, false) | (false, true) => 5,
+                    _ => 2,
+                };
+                mesh.set_face_material_index(face, slot);
+            }
+
+            let result = mesh.bevel(
+                &[corner.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(result.faces.len(), 1, "the corner mints exactly its cap");
+            assert_eq!(
+                mesh.face_material_index(result.faces[0]),
+                2,
+                "swapped = {swapped}: the boundary corner is seamed, so the cap's donor is \
+                 the lower-slot quad whichever side it sits on",
+            );
+        }
+    }
+
+    /// The seam test of §6.6.1.4 condition (1) is about the **fan walk**, not about the
+    /// mesh boundary: a **wire** leg resolves neither an arriving nor a departing face, so
+    /// it seams a corner whose face fan is otherwise closed and fully interior. The cap's
+    /// donor there is the tie-break winner (lowest slot), not the positional pick — which
+    /// an implementation that shortcut condition (1) to "is this corner on the mesh
+    /// boundary?" would get wrong.
+    #[test]
+    fn face_cd_wire_leg_seams_a_closed_fan_and_routes_the_cap_through_the_tie_break() {
+        let (mut mesh, centre, _rim) = planar_fan(4);
+        let incident = mesh.vert_face_keys(centre);
+        for (index, &face) in incident.iter().enumerate() {
+            mesh.set_face_material_index(face, [7, 1, 4, 6][index]);
+        }
+        let tip = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        mesh.create_edge([centre, tip], EdgeCreateFlags::NONE);
+
+        let result = mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.2,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result.faces.len(), 1, "the wired corner mints exactly its cap");
+        assert_eq!(
+            mesh.face_material_index(result.faces[0]),
+            1,
+            "the wire leg seams an interior closed fan, so the cap takes the tie-break's \
+             lowest-slot incident face and not the positional pick (slot 7)",
+        );
+    }
+
+    /// The converse, and the guard against applying the override wholesale: a **seam-free**
+    /// interior corner keeps §6.6.1's positional donor (§6.6.1.2's fan-anchor pick). The
+    /// decoration puts the lowest slot somewhere other than the positional face, so a cap
+    /// that ran the tie-break here would come out at slot 1 instead.
+    #[test]
+    fn face_cd_seam_free_interior_corner_keeps_the_positional_donor() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, 1.0, 1.0));
+        let incident = mesh.vert_face_keys(corner);
+        for (index, &face) in incident.iter().enumerate() {
+            mesh.set_face_material_index(face, [7, 1, 4][index]);
+        }
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let cap = *result
+            .faces
+            .iter()
+            .find(|&&face| mesh.face_vert_keys(face).len() == 3)
+            .expect("the closed-fan corner is capped by one triangle");
+        assert_eq!(
+            mesh.face_material_index(cap),
+            7,
+            "no leg of a cube corner is a seam, so the cap keeps the positional donor",
+        );
+    }
+
+    /// BEVEL.md §6.6.1.4's candidate-set construction has two arms, and this pins the one a
+    /// naive "every incident leg" implementation gets wrong: with **more than one beveled
+    /// leg** at the corner, only the **beveled** legs contribute a candidate, so a face that
+    /// flanks no beveled leg is genuinely excluded — even when it carries the corner's
+    /// globally lowest slot. (§6.6.1.4's "where the collapse stops": the global-argmin
+    /// corollary holds on the `all_legs` arm only.)
+    ///
+    /// The fixture is an open fan's boundary apex — seamed by condition (1), so the override
+    /// fires — with **three** interior spokes beveled. Three is the smallest beveled-leg
+    /// count that exhibits the arm at all: at two the junction ring carries two boundverts
+    /// and welds (§8.3.0.3), minting no ring-spanning fill whose donor could be read.
+    #[test]
+    fn face_cd_boundary_junction_tie_break_ranges_over_the_beveled_legs_only() {
+        // Fan faces `f_k` span `rim[k] → rim[k+1]`; legs `L_0` and `L_5` are the boundary
+        // ends. Beveling `L_1..L_3` leaves `f_4` flanking unbeveled legs only, and `f_4`
+        // holds the corner's lowest slot.
+        const SLOTS: [i32; 5] = [3, 5, 4, 6, 0];
+
+        let (mut mesh, centre, rim) = open_planar_fan(6, 0);
+        for k in 0..5 {
+            let face = open_fan_face(&mesh, centre, &rim, k);
+            mesh.set_face_material_index(face, SLOTS[k]);
+        }
+        let beveled: Vec<GeomKey> = (1..=3)
+            .map(|k| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("an interior spoke of the open fan")
+                    .into()
+            })
+            .collect();
+
+        let result = mesh.bevel(
+            &beveled,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let patch = *result
+            .faces
+            .iter()
+            .find(|&&face| mesh.face_vert_keys(face).len() == 3)
+            .expect("a three-boundvert junction ring is capped by one patch triangle");
+        assert_eq!(
+            mesh.face_material_index(patch),
+            3,
+            "the candidate set is the three beveled legs' reduces — slots 3 and 4 — so the \
+             patch takes slot 3; slot 0 belongs to the face flanking only unbeveled legs and \
+             must not donate",
+        );
+    }
+
+    /// The **fourth** ring-spanning fill family of §6.6.1: the odd-`segments` [V-ADJ] centre
+    /// n-gon (§8.5.5.5(e)). Its corners span the whole boundvert ring, so — unlike every
+    /// other face of the grid, which is per-sector — it goes through §6.6.1.4's tie-break at
+    /// a seam-carrying junction instead of taking the positional rep.
+    ///
+    /// The decoration is chosen against the corner's *own* positional face, so the assertion
+    /// separates all three answers: the positional pick (highest slot), the beveled-legs
+    /// tie-break (the winner), and the all-legs tie-break (the unbeveled-only face's slot 0).
+    #[test]
+    fn face_cd_boundary_junction_adj_centre_ngon_takes_the_seam_tie_break_donor() {
+        let (mut mesh, centre, rim) = open_planar_fan(6, 0);
+
+        // The face §6.6.1's positional rule would hand the fill — decorated *away* from the
+        // tie-break winner so the two picks cannot be confused.
+        let positional = mesh.vert_face_keys(centre)[0];
+        for k in 0..5 {
+            let face = open_fan_face(&mesh, centre, &rim, k);
+            let slot = if face == positional {
+                9
+            } else if k == 4 {
+                0 // flanks unbeveled legs only: a candidate on the all-legs arm alone
+            } else {
+                (k as i32) + 1
+            };
+            mesh.set_face_material_index(face, slot);
+        }
+        let expected = (1..=3)
+            .flat_map(|k| {
+                let leg = mesh
+                    .query_edge_exists(centre, rim[k])
+                    .expect("an interior spoke of the open fan");
+                mesh.edge_face_keys(leg)
+            })
+            .map(|face| mesh.face_material_index(face))
+            .min()
+            .expect("the beveled legs have flanking faces");
+
+        let beveled: Vec<GeomKey> = (1..=3)
+            .map(|k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+            .collect();
+        let result = mesh.bevel(
+            &beveled,
+            BevelOptions {
+                offset: 0.2,
+                segments: 3,
+                affect: BevelAffect::Edges,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let centre_ngon: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| mesh.face_vert_keys(face).len() == 3)
+            .collect();
+        assert_eq!(
+            centre_ngon.len(),
+            1,
+            "a three-sector ring at odd `segments` closes on exactly one centre triangle",
+        );
+        assert_eq!(
+            mesh.face_material_index(centre_ngon[0]),
+            expected,
+            "the centre n-gon is ring-spanning, so it takes the tie-break winner over the \
+             beveled legs — not the positional rep (slot 9) the rest of the grid carries, and \
+             not the unbeveled-only face (slot 0)",
+        );
+    }
+
+    /// The **declined** regime of the override. Key 1 of §6.6.1.4's tie-break — the
+    /// interpolation-component id (§6.6.1.4.1) — is live exactly when a UV-class loop layer
+    /// is present *and* `segments` is odd, and it is not an isomorphism invariant, so keys
+    /// 2–4 are arbitrary with respect to it. loopmesh does not compute the partition, and
+    /// running the rest of the chain there would be a *different* arbitrary answer rather
+    /// than a safer one — so it declines the override wholesale and keeps §6.6.1's positional
+    /// donor.
+    ///
+    /// Observable form: on the boundary corner whose *untextured* cap follows the lower slot
+    /// whichever quad holds it, adding a UV layer must make the cap follow the **same quad**
+    /// in both decorations — so the two runs come out on *different* slots.
+    #[test]
+    fn face_cd_uv_layer_at_odd_segments_declines_the_ring_spanning_override() {
+        let mut slots = Vec::new();
+        for swapped in [false, true] {
+            let (mut mesh, _shared) = two_quad_strip();
+            mesh.register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+                .expect("Vec2 is a supported loop attribute format");
+
+            let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+            let left = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+            for face in mesh.vert_face_keys(corner) {
+                let is_left = mesh.face_vert_keys(face).contains(&left);
+                let slot = match (is_left, swapped) {
+                    (true, false) | (false, true) => 5,
+                    _ => 2,
+                };
+                mesh.set_face_material_index(face, slot);
+            }
+
+            let result = mesh.bevel(
+                &[corner.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            assert_eq!(result.faces.len(), 1, "the corner mints exactly its cap");
+            slots.push(mesh.face_material_index(result.faces[0]));
+        }
+        assert_ne!(
+            slots[0], slots[1],
+            "with a UV layer present at odd `segments` the override is declined, so the cap \
+             stays on the positional quad and tracks that quad's slot — a lower-slot pick in \
+             both runs would mean the tie-break ran where key 1 is live",
         );
     }
 
