@@ -1403,7 +1403,10 @@ impl LoopMesh {
         geom: &mut SubdivideGeom,
     ) {
         let Some(runs) = Self::two_cut_runs(rim) else {
-            debug_assert!(false, "the strip fires only on a face with two cut-vert runs");
+            debug_assert!(
+                false,
+                "the strip fires only on a face with two cut-vert runs"
+            );
             return;
         };
         debug_assert_eq!(
@@ -1432,7 +1435,10 @@ impl LoopMesh {
                 // dropped pairs, but still holding every remaining pair as a
                 // diagonal. A refusal here means the retention convention or the
                 // argument order broke.
-                debug_assert!(false, "the parent's inner band holds every remaining pair non-adjacent");
+                debug_assert!(
+                    false,
+                    "the parent's inner band holds every remaining pair non-adjacent"
+                );
                 return;
             };
             // §1 rule 3 / §7.1 / §9.5.3.3 Output-slot note: the strip is the
@@ -2206,10 +2212,12 @@ impl LoopMesh {
                     self.tri_one_edge_fan(&corners, &sides);
                 }
             }
-            // The three-edge quad template (§9.5.3.4) is still a gap, as is any
-            // remaining template-less cut count — an n-gon with one, three, or
-            // more cut edges is never re-split at any N (§4.3). These faces keep
-            // their §3.3 rim cut verts and stay flat-cornered.
+            (4, 3) => {
+                self.quad_three_edge_template(&corners, &sides, n);
+            }
+            // Every remaining template-less cut count — an n-gon with one, three,
+            // or more cut edges — is never re-split at any N (§4.3). These faces
+            // keep their §3.3 rim cut verts and stay flat.
             _ => {}
         }
     }
@@ -2477,6 +2485,79 @@ impl LoopMesh {
             if 2 * position >= n + 1 {
                 self.template_connect(m, v2);
             }
+        }
+    }
+
+    /// §9.5.3.4 — three-edge quad, the dedicated template at `cuts = N`. `corners`
+    /// is the quad's four corners in loop order and `sides[k]` the cut-vert run on
+    /// `corners[k] -> corners[k+1]`; exactly one side is empty (the uncut edge).
+    /// Naming the uncut edge `{v3, v0}`, the three runs are `a` (on `{v0,v1}`),
+    /// `b` (the **middle** run, on `{v1,v2}`, the edge flanked by the other two)
+    /// and `c` (on `{v2,v3}`), each in loop order.
+    ///
+    /// Two passes, both laying ordinary §7.0 connects:
+    ///
+    /// - **fanned pass** — each middle-run vert connects outside-in into a
+    ///   *flanking run*, indexed antiparallel: `b_j -> a_{N+1-j}` when
+    ///   `2j <= N + 1`, `b_j -> c_{N+1-j}` when `2j >= N + 1`;
+    /// - **strip pass** — the two flanking runs zip to each other from the uncut
+    ///   edge inward: `a_p -> c_{N+1-p}` for `p = 1 ..= N/2 + 1`, stopping at the
+    ///   innermost pair the fanned pass has not already walled off.
+    ///
+    /// The `<= / >=` pair is not a partition: it overlaps on `2j = N + 1`, the
+    /// median of an odd run, which therefore connects into *both* flanking runs.
+    /// Hence `connects = N + [N odd] + N/2 + 1` and `fragments = connects + 1`
+    /// (4/5/7/8/10 at `N = 1..5`), with the median contributing a triangle at odd
+    /// `N` where even `N` has a middle quad.
+    ///
+    /// This borrows the *shape* of §9.5.3.1's half-split rule — the same
+    /// `2*index <= / >= N+1` test, the same median double-connect — but **not its
+    /// rule**: the targets here are moving verts of the two flanking runs, not the
+    /// quad's far corners. Nothing in this template connects to a corner. Hubbing
+    /// on corners instead reproduces the V/E/F table exactly and still lays the
+    /// wrong edges, so the fragment set is the only thing that pins it.
+    ///
+    /// §1 Output-slot note: a template, not a grid fill — its connecting edges and
+    /// its fragments are not inner; only the `3N` rim cut verts (recorded in §3)
+    /// are, and the face's re-split mark was stamped by the dispatch scan.
+    fn quad_three_edge_template(
+        &mut self,
+        corners: &[VertexKey],
+        sides: &[Vec<VertexKey>],
+        n: usize,
+    ) {
+        let uncut = sides
+            .iter()
+            .position(|side| side.is_empty())
+            .expect("the three-edge quad has exactly one uncut side");
+        // The uncut side runs corners[uncut] -> corners[uncut + 1], i.e. {v3, v0}.
+        let run_a = &sides[(uncut + 1) % 4]; // v0 -> v1
+        let run_b = &sides[(uncut + 2) % 4]; // v1 -> v2, the middle run
+        let run_c = &sides[(uncut + 3) % 4]; // v2 -> v3
+        debug_assert!(
+            run_a.len() == n && run_b.len() == n && run_c.len() == n,
+            "the abandonment census already pinned every run at `cuts` long"
+        );
+
+        // Pass one, ascending j: the middle run fans outside-in into the flanking
+        // runs. Both arms fire on an odd N's median (2j == n + 1), the a-side
+        // connect before the c-side one.
+        for j in 1..=n {
+            let middle = run_b[j - 1];
+            if 2 * j <= n + 1 {
+                self.template_connect(middle, run_a[n - j]);
+            }
+            if 2 * j >= n + 1 {
+                self.template_connect(middle, run_c[n - j]);
+            }
+        }
+
+        // Pass two, ascending p: the flanking runs zip to each other, from the
+        // uncut edge inward. It stops at `n / 2 + 1` rather than `n` — pass one has
+        // already separated every later pair, so those connects would find no
+        // carrier and no-op anyway (§7.0).
+        for p in 1..=(n / 2 + 1) {
+            self.template_connect(run_a[p - 1], run_c[n - p]);
         }
     }
 
@@ -4575,6 +4656,190 @@ mod tests {
                 zero_based + 1
             );
         }
+    }
+
+    /// Run the §9.5.3.4 three-edge quad template on a lone quad with `{v0,v1}`,
+    /// `{v1,v2}` and `{v2,v3}` cut (the uncut edge is `{v3,v0}`), and report
+    /// `(V, E, F)`, the sorted fragment-shape multiset, the four corners, and the
+    /// three cut-vert runs `a` / `b` / `c`, each in loop order.
+    #[allow(clippy::type_complexity)]
+    fn quad_three_edge_template_at(
+        cuts: u32,
+    ) -> (
+        LoopMesh,
+        (usize, usize, usize),
+        Vec<usize>,
+        [VertexKey; 4],
+        [Vec<VertexKey>; 3],
+    ) {
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let [v0, v1, v2, v3] = [fv[0], fv[1], fv[2], fv[3]];
+        let cut_edges = [
+            mesh.query_edge_exists(v0, v1).unwrap(),
+            mesh.query_edge_exists(v1, v2).unwrap(),
+            mesh.query_edge_exists(v2, v3).unwrap(),
+        ];
+
+        let res = mesh.subdivide_edges(&cut_edges, SubdivideParams::default().cuts(cuts));
+        assert!(matches!(res, SubdivideResult::Ran(_)), "cuts={cuts}");
+
+        // The quad is [(0,0), (2,0), (2,2), (0,2)], so the runs sit at
+        // t = i/(N+1) along each cut edge.
+        let n = cuts as usize;
+        let at = |i: usize| 2.0 * i as f32 / (n as f32 + 1.0);
+        let run_a = (1..=n)
+            .map(|i| find_vert_at(&mesh, Vec3::new(at(i), 0.0, 0.0)))
+            .collect();
+        let run_b = (1..=n)
+            .map(|i| find_vert_at(&mesh, Vec3::new(2.0, at(i), 0.0)))
+            .collect();
+        let run_c = (1..=n)
+            .map(|i| find_vert_at(&mesh, Vec3::new(2.0 - at(i), 2.0, 0.0)))
+            .collect();
+
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        let vef = counts(&mesh);
+        (mesh, vef, shapes, [v0, v1, v2, v3], [run_a, run_b, run_c])
+    }
+
+    /// The mesh's faces as a sorted multiset of sorted corner-key sets — the pin
+    /// that a V/E/F match cannot fake (§9.5.3.4).
+    fn fragment_sets(mesh: &LoopMesh) -> Vec<Vec<usize>> {
+        let mut fragments: Vec<Vec<usize>> = mesh
+            .face_keys()
+            .iter()
+            .map(|&f| {
+                let mut ring: Vec<usize> = mesh
+                    .face_vert_keys(f)
+                    .iter()
+                    .map(|v| v.as_usize())
+                    .collect();
+                ring.sort_unstable();
+                ring
+            })
+            .collect();
+        fragments.sort();
+        fragments
+    }
+
+    fn expect_fragments(mesh: &LoopMesh, want: &[Vec<VertexKey>]) {
+        let mut expected: Vec<Vec<usize>> = want
+            .iter()
+            .map(|ring| {
+                let mut ring: Vec<usize> = ring.iter().map(|v| v.as_usize()).collect();
+                ring.sort_unstable();
+                ring
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(fragment_sets(mesh), expected, "fragment corner sets");
+    }
+
+    #[test]
+    fn multicut_quad_three_edges_closed_form_n2_to_n5() {
+        // §9.5.3.4 — connects = N + [N odd] + N/2 + 1, fragments = connects + 1,
+        // V = 4 + 3N, E = 3N + 4 + connects. The shape column alternates: odd N
+        // adds the median triangle to the two corner triangles, even N a middle
+        // quad, and every other fragment is a quad.
+        let expected: [((usize, usize, usize), &[usize]); 4] = [
+            ((10, 14, 5), &[3, 3, 4, 4, 4]),
+            ((13, 19, 7), &[3, 3, 3, 4, 4, 4, 4]),
+            ((16, 23, 8), &[3, 3, 4, 4, 4, 4, 4, 4]),
+            ((19, 28, 10), &[3, 3, 3, 4, 4, 4, 4, 4, 4, 4]),
+        ];
+        for (index, (want_counts, want_shapes)) in expected.iter().enumerate() {
+            let n = index + 2;
+            let (_mesh, got_counts, got_shapes, _corners, _runs) =
+                quad_three_edge_template_at(n as u32);
+            assert_eq!(got_counts, *want_counts, "V/E/F at cuts={n}");
+            assert_eq!(got_shapes, *want_shapes, "fragment shapes at cuts={n}");
+        }
+    }
+
+    #[test]
+    fn multicut_quad_three_edges_cuts2_fragment_set() {
+        // §9.5.3.4 at N = 2 (even — no median double-connect). Pass one is
+        // b_1 -> a_2 and b_2 -> c_1; pass two is a_1 -> c_2 and a_2 -> c_1. The
+        // V/E/F row alone cannot catch a corner-hubbed mis-transplant of
+        // §9.5.3.1, so pin the connects and the five fragments themselves.
+        let (mesh, got_counts, shapes, [v0, v1, v2, v3], [a, b, c]) =
+            quad_three_edge_template_at(2);
+        assert_eq!(got_counts, (10, 14, 5));
+        assert_eq!(shapes, vec![3, 3, 4, 4, 4], "2 tris + 3 quads");
+
+        for (from, to, want) in [
+            (b[0], a[1], true),  // pass 1, the v1-half peel
+            (b[1], c[0], true),  // pass 1, the v2-half peel
+            (a[0], c[1], true),  // pass 2, outermost band
+            (a[1], c[0], true),  // pass 2, innermost band
+            (b[0], a[0], false), // the un-antiparallel reading
+            (b[1], c[1], false),
+            (a[0], c[0], false),
+        ] {
+            assert_eq!(
+                mesh.query_edge_exists(from, to).is_some(),
+                want,
+                "connect {:?} -> {:?}",
+                from,
+                to
+            );
+        }
+        // Nothing in this template connects to a corner: the middle run's verts
+        // reach the corners only through the rim.
+        for &m in &b {
+            for &corner in &[v0, v3] {
+                assert!(
+                    mesh.query_edge_exists(m, corner).is_none(),
+                    "the middle run never hubs on a far corner"
+                );
+            }
+        }
+
+        expect_fragments(
+            &mesh,
+            &[
+                vec![v0, a[0], c[1], v3],     // the quad against the uncut edge
+                vec![a[0], a[1], c[0], c[1]], // the strip-pass band
+                vec![a[1], v1, b[0]],         // the v1 corner triangle
+                vec![a[1], b[0], b[1], c[0]], // the middle quad (even N)
+                vec![b[1], v2, c[0]],         // the v2 corner triangle
+            ],
+        );
+    }
+
+    #[test]
+    fn multicut_quad_three_edges_cuts3_median_double_connect() {
+        // §9.5.3.4 at N = 3 (odd) — the median b_2 (2j = 4 = N + 1) fires *both*
+        // pass-one arms, connecting into each flanking run, and the fragment it
+        // carves off is the median triangle {a_2, b_2, c_2}. Drop either connect
+        // and the count falls to 6 fragments.
+        let (mesh, got_counts, shapes, [v0, v1, v2, v3], [a, b, c]) =
+            quad_three_edge_template_at(3);
+        assert_eq!(got_counts, (13, 19, 7), "N=3 is 6 connects, 7 fragments");
+        assert_eq!(shapes, vec![3, 3, 3, 4, 4, 4, 4], "3 tris + 4 quads");
+
+        let median = b[1];
+        assert!(
+            mesh.query_edge_exists(median, a[1]).is_some()
+                && mesh.query_edge_exists(median, c[1]).is_some(),
+            "the median middle-run vert connects into BOTH flanking runs"
+        );
+
+        expect_fragments(
+            &mesh,
+            &[
+                vec![v0, a[0], c[2], v3],
+                vec![a[0], a[1], c[1], c[2]], // strip-pass band, p = 1
+                vec![a[2], v1, b[0]],
+                vec![a[1], a[2], b[0], b[1]], // a-side fan band, j = 1
+                vec![a[1], b[1], c[1]],       // the median triangle
+                vec![b[1], b[2], c[0], c[1]], // c-side fan band, j = 2
+                vec![b[2], v2, c[0]],
+            ],
+        );
     }
 
     #[test]
@@ -6747,7 +7012,11 @@ mod tests {
             _ => panic!("subdivide ran"),
         };
 
-        assert_eq!(counts(&mesh), (7, 8, 2), "pentagon, two cut edges: N + 1 = 2");
+        assert_eq!(
+            counts(&mesh),
+            (7, 8, 2),
+            "pentagon, two cut edges: N + 1 = 2"
+        );
 
         let m01 = find_vert_at(&mesh, Vec3::new(1.0, 0.0, 0.0));
         let m23 = find_vert_at(&mesh, Vec3::new(2.0, 2.5, 0.0));
@@ -6758,7 +7027,11 @@ mod tests {
 
         let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
         shapes.sort_unstable();
-        assert_eq!(shapes, vec![4, 5], "the connect bands the rim into 4-gon + 5-gon");
+        assert_eq!(
+            shapes,
+            vec![4, 5],
+            "the connect bands the rim into 4-gon + 5-gon"
+        );
 
         // §7.1 output-slot note — the fallback is the one non-grid path that
         // inner-marks a connecting edge.
@@ -6935,11 +7208,11 @@ mod tests {
             let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
             let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
 
-            let geom = match mesh.subdivide_edges(&[e01, e23], SubdivideParams::default().cuts(cuts))
-            {
-                SubdivideResult::Ran(g) => g,
-                _ => panic!("subdivide ran"),
-            };
+            let geom =
+                match mesh.subdivide_edges(&[e01, e23], SubdivideParams::default().cuts(cuts)) {
+                    SubdivideResult::Ran(g) => g,
+                    _ => panic!("subdivide ran"),
+                };
 
             assert_eq!(
                 counts(&mesh),
@@ -7044,7 +7317,10 @@ mod tests {
         let straight = |mesh: &mut LoopMesh, edges: &[EdgeKey], face: FaceKey| -> bool {
             let (guard_layer, cut_layer, touched) = mesh.push_flat_corner_guard(edges);
             let verdict = mesh.face_op_flag_test(guard_layer, face, FLAT_CORNER);
-            assert!(touched.contains(&face), "the guard enumerates the cut faces");
+            assert!(
+                touched.contains(&face),
+                "the guard enumerates the cut faces"
+            );
             mesh.pop_edge_op_flag_layer(cut_layer);
             mesh.pop_face_op_flag_layer(guard_layer);
             verdict
@@ -7078,5 +7354,4 @@ mod tests {
             "5° off straight is outside the collinearity tolerance"
         );
     }
-
 }
