@@ -838,6 +838,23 @@ impl LoopMesh {
                 })
                 .collect();
             templates.seal(self);
+
+            // §8.3.0.4 phases D / E: the wire post-pass and the loose-vertex free are
+            // **global**, so both are hoisted out of the per-edge build below. A wire can
+            // span two beveled vertices of two *different* edges of this same set (the
+            // edges are isolated; the wire between them is not), and a per-edge free would
+            // consume the first before the second's ring existed — destroying it.
+            let mut endpoints: Vec<VertexKey> = Vec::new();
+            for &edge in &beveled {
+                for endpoint in self.edge_vert_keys(edge) {
+                    if !endpoints.contains(&endpoint) {
+                        endpoints.push(endpoint);
+                    }
+                }
+            }
+            let wire_spokes = self.snapshot_wire_spokes(&endpoints);
+
+            let mut rings = BevelRings::for_spokes(&wire_spokes);
             for ((&edge, &strip_template), &fan_templates) in beveled
                 .iter()
                 .zip(&strip_templates)
@@ -850,8 +867,16 @@ impl LoopMesh {
                     &templates,
                     strip_template,
                     fan_templates,
+                    &mut rings,
                     &mut result,
                 );
+            }
+
+            self.reattach_wire_spokes(&wire_spokes, &rings);
+            for &endpoint in &endpoints {
+                if self.vertex_is_loose(endpoint) {
+                    self.free_loose_vertex(endpoint);
+                }
             }
             return result;
         }
@@ -948,6 +973,7 @@ impl LoopMesh {
         templates: &TemplateBank,
         strip_template: FaceTemplate,
         fan_templates: [FaceTemplate; 2],
+        rings: &mut BevelRings,
         result: &mut BevelResult,
     ) {
         let representative = templates.resolve(strip_template);
@@ -1001,6 +1027,7 @@ impl LoopMesh {
             fan_templates[0],
             &mut substitutions,
             &mut terminal_fills,
+            rings,
             result,
         ) else {
             return;
@@ -1015,6 +1042,7 @@ impl LoopMesh {
             fan_templates[1],
             &mut substitutions,
             &mut terminal_fills,
+            rings,
             result,
         ) else {
             return;
@@ -1107,16 +1135,9 @@ impl LoopMesh {
         // endpoint appears in no strip vert's blend.
         self.blend_restitched_originals(&rebuilt, &donors);
 
-        // §7.1 item 5 / §6.3: both endpoints are now loose. Free them. Gated on
-        // looseness rather than asserted: a face the placement pass declined to
-        // substitute (a corner it could not resolve on a malformed fan) is never
-        // rebuilt and so still holds its endpoint — an input shape, not a broken
-        // invariant, so it must not fire the free's assert.
-        for endpoint in [a, b] {
-            if self.vertex_is_loose(endpoint) {
-                self.free_loose_vertex(endpoint);
-            }
-        }
+        // §7.1 item 5 / §6.3: both endpoints are now loose, but the free is the caller's
+        // (§8.3.0.4 phase E) — it may not begin until the wire post-pass has run for
+        // **every** beveled vertex of the whole call, not just this edge's two.
     }
 
     /// Mint one new bevel vertex **from the beveled corner it belongs to**
@@ -1169,6 +1190,120 @@ impl LoopMesh {
     fn vertex_is_loose(&self, vertex: VertexKey) -> bool {
         self.iter_disk_edges(vertex)
             .all(|edge| self.edge_radial_iter(edge).next().is_none())
+    }
+
+    /// Every **wire** spoke hanging off a beveled vertex (BEVEL.md §7.2.1 / §8.3.0.4),
+    /// read off the **pristine** mesh: an incident edge with no faces at all. Read here
+    /// and not at the post-pass, because by then the beveled edge itself is radial-empty
+    /// too — the two are only distinguishable while the mesh still stands.
+    fn snapshot_wire_spokes(&self, endpoints: &[VertexKey]) -> Vec<WireSpoke> {
+        let mut spokes: Vec<WireSpoke> = Vec::new();
+        for &vertex in endpoints {
+            for wire in self.iter_disk_edges(vertex) {
+                if self.edge_radial_iter(wire).next().is_some() {
+                    continue;
+                }
+                let [a, b] = self.edge_vert_keys(wire);
+                let far = if a == vertex { b } else { a };
+                spokes.push(WireSpoke { vertex, wire, far });
+            }
+        }
+        spokes
+    }
+
+    /// Re-attach every wire spoke of the run (BEVEL.md §8.3.0.4) — **phase D**: after every
+    /// beveled vertex's ring is final, and before *any* of them is freed. Both halves of
+    /// that ordering are load-bearing. A wire whose far end is beveled too has to land on
+    /// **its** ring, which only exists once every ring does; and the free that follows kills
+    /// the wire along with the vertex it hangs off, so a wire not re-created by then is
+    /// silently destroyed — which is what a per-vertex pass does to a both-ends-beveled wire.
+    ///
+    /// The candidate set is the ring's **boundverts**, never the ring's whole vertex set: a
+    /// profile chain's interior rung can sit strictly nearer the wire's tip than any
+    /// boundvert (it lands on the consumed vertex's own old position at `segments = 2`) and
+    /// is still not a candidate. That is what makes the rule `segments`-independent.
+    ///
+    /// The wire is visited **once per beveled endpoint**, each visit scanning the candidate
+    /// product with **its own** ring outermost and keeping the first *strictly* smaller
+    /// distance — so a tie goes to the earlier boundvert in ring order. Two visits that
+    /// select the same pair collapse onto one edge; two visits that break an exact tie
+    /// differently legitimately mint two. Dedup at the *visit*, never per wire.
+    ///
+    /// The re-created edge carries the original wire's whole per-edge block, so this is
+    /// observationally a re-point: same endpoints-but-one, same attributes. It stays out of
+    /// [`BevelResult`] — it bounds no minted bevel face, and it is not new (§8.3.0.4).
+    ///
+    /// The gate on both ends is **consumption**, not ring-existence. A ring is recorded for
+    /// every beveled vertex, but a beveled vertex only *loses* its wire if phase E frees it,
+    /// and phase E frees only the endpoints the strip build actually left loose — an endpoint
+    /// still incident to unbeveled faces is kept, and its wire with it. Re-pointing there
+    /// would double the wire (the original still hangs off the surviving vertex); treating a
+    /// surviving *far* end as beveled is worse, since it moves the wire off a vertex that was
+    /// never going to lose it. At phase D the re-stitch has run, so looseness is readable.
+    fn reattach_wire_spokes(&mut self, spokes: &[WireSpoke], rings: &BevelRings) {
+        let consumed_ring = |mesh: &Self, vertex: VertexKey| {
+            rings.of(vertex).filter(|_| mesh.vertex_is_loose(vertex))
+        };
+        // The pairs this pass has already chosen. Tracked as endpoints rather than as edge
+        // keys, and never probed against the mesh: an edge that already joins the chosen
+        // pair may be surviving geometry (a strip rail running parallel to the wire), and
+        // folding the wire into it would both lose the wire's attributes and let the far
+        // end's visit mint a duplicate.
+        let mut minted: Vec<[VertexKey; 2]> = Vec::new();
+
+        for spoke in spokes {
+            let Some(ring) = consumed_ring(self, spoke.vertex) else {
+                continue;
+            };
+            let (near_vert, far_vert) = match consumed_ring(self, spoke.far) {
+                Some(far_ring) => {
+                    let mut best: Option<(f32, VertexKey, VertexKey)> = None;
+                    for &near in &ring.boundverts {
+                        for &far in &far_ring.boundverts {
+                            let distance = (self.vertex_position(near) - self.vertex_position(far))
+                                .length_squared();
+                            if best.is_none_or(|(shortest, _, _)| distance < shortest) {
+                                best = Some((distance, near, far));
+                            }
+                        }
+                    }
+                    let (_, near, far) = best.expect("a recorded ring carries a boundvert");
+                    (near, far)
+                }
+                None => {
+                    let tip = self.vertex_position(spoke.far);
+                    let mut best: Option<(f32, VertexKey)> = None;
+                    for &near in &ring.boundverts {
+                        let distance = (self.vertex_position(near) - tip).length_squared();
+                        if best.is_none_or(|(shortest, _)| distance < shortest) {
+                            best = Some((distance, near));
+                        }
+                    }
+                    let (_, near) = best.expect("a recorded ring carries a boundvert");
+                    (near, spoke.far)
+                }
+            };
+
+            // The far end's own visit may have chosen this very pair already (the ordinary
+            // case, where the pair argmin is strict and both visits agree): collapse the two
+            // visits onto one edge. When the two visits break an exact tie differently the
+            // pairs differ, nothing collapses, and the wire is legitimately minted twice.
+            if minted
+                .iter()
+                .any(|&[a, b]| (a, b) == (near_vert, far_vert) || (a, b) == (far_vert, near_vert))
+            {
+                continue;
+            }
+            let reattached = self.create_edge([near_vert, far_vert], EdgeCreateFlags::NONE);
+            // The re-created edge *is* the wire: same header word, same per-edge block —
+            // crease, bevel weight, seam, sharp, every custom layer. A default-valued mint
+            // here is a per-edge-customdata divergence (§7.7) that a topology-only
+            // comparison would not see.
+            self.edges.get_mut(reattached).eflags = self.edges.get(spoke.wire).eflags;
+            self.edge_attribs
+                .copy_into(reattached.as_usize(), spoke.wire.as_usize());
+            minted.push([near_vert, far_vert]);
+        }
     }
 
     /// Edge bevel where two or more beveled edges meet at one or more **junction**
@@ -1256,6 +1391,12 @@ impl LoopMesh {
         let mut junction_patches: Vec<JunctionPatch> = Vec::new();
         let mut reconciled: Vec<ReconciledOffset> = Vec::new();
 
+        // §7.2.1 / §8.3.0.4: every face-less spoke of every consumed endpoint, read while
+        // the mesh still stands — the beveled edges are radial-empty too by the time the
+        // post-pass runs, so the wires are only identifiable now.
+        let wire_spokes = self.snapshot_wire_spokes(&endpoints);
+        let mut rings = BevelRings::for_spokes(&wire_spokes);
+
         // §7.6.4 / §8.8.4: place every junction first, so a firing `loop_slide` slide
         // records its reconciled per-side offsets, then place the terminals which read
         // them — the width-pass ripple reaches the far ends of the flanking edges
@@ -1315,9 +1456,16 @@ impl LoopMesh {
                     &mut corner_vert,
                     &mut substitutions,
                     &mut terminal_fills,
+                    &mut rings,
                     result,
                 );
             }
+        }
+
+        // §8.3.0.4: a junction's ring is its sector boundverts, `B_0` first — the head the
+        // post-pass's strict-`<` scan starts from.
+        for patch in &junction_patches {
+            rings.record(patch.vertex, || patch.boundverts.clone());
         }
 
         // §6.6.1: every donor is registered; capture them all in one snapshot while the
@@ -1446,7 +1594,14 @@ impl LoopMesh {
             }
         }
 
-        // Phase 5: every consumed endpoint is now loose. Free each (§5.1.1).
+        // Phase D (§8.3.0.4): every ring is final, and no endpoint has been freed yet —
+        // the one window in which a wire spoke can be re-pointed onto the ring of the
+        // vertex it hung off (and, when its far end was beveled too, onto that ring as
+        // well). Runs before phase 5 below, which would otherwise take the wire with it.
+        self.reattach_wire_spokes(&wire_spokes, &rings);
+
+        // Phase 5 (§8.3.0.4 phase E): every consumed endpoint is now loose. Free each
+        // (§5.1.1).
         for &endpoint in &endpoints {
             self.free_loose_vertex(endpoint);
         }
@@ -1529,6 +1684,10 @@ impl LoopMesh {
         let mut miter_ring_junctions: Vec<MiterRingJunction> = Vec::new();
         let mut terminal_fills: Vec<TerminalFill> = Vec::new();
         let mut cross_welds: Vec<CrossWeld> = Vec::new();
+
+        // §7.2.1 / §8.3.0.4: the face-less spokes of every consumed endpoint, read pristine.
+        let wire_spokes = self.snapshot_wire_spokes(&endpoints);
+        let mut rings = BevelRings::for_spokes(&wire_spokes);
 
         // §8.2.2.1.1: the chord-fraction resample is a property of the [V-ADJ] cap's
         // *boundary emission*, so it fires on every ring-edge chain of a junction the
@@ -1613,9 +1772,21 @@ impl LoopMesh {
                     &mut chains,
                     &mut face_subst,
                     &mut terminal_fills,
+                    &mut rings,
                     result,
                 );
             }
+        }
+
+        // §8.3.0.4: each junction's ring is its sector boundverts (a mitered junction's is
+        // its enlarged ring's). The chains' *interior* rungs are ring verts but not
+        // boundverts, so they are not candidates — which is what makes the wire's landing
+        // independent of `segments`.
+        for cut in &junction_cuts {
+            rings.record(cut.vertex, || cut.boundverts.clone());
+        }
+        for miter in &miter_ring_junctions {
+            rings.record(miter.vertex, || miter.boundverts.clone());
         }
 
         // §6.6.1: phase 1 has registered every donor — strips, junction fills, miter
@@ -1804,10 +1975,17 @@ impl LoopMesh {
         // once they land) must not overwrite them.
         self.blend_restitched_originals(&rebuilt, &donors);
 
-        // Phase 5: free each consumed endpoint that the strip build actually left
-        // loose (§5.1.1). On a closed solid a terminal endpoint can remain incident
-        // to unbeveled faces (its disk still carries live radial faces) — that vert
-        // is kept, matching the reference operator, rather than force-freed.
+        // Phase D (§8.3.0.4): re-point every wire spoke onto the finished ring of the
+        // vertex it hangs off — after every ring is final, before any endpoint is freed.
+        // The attachment set is the ring's boundverts, so this is the same pass at every
+        // `segments`: the extra profile rungs a larger `segments` mints are ring verts, not
+        // boundverts, and never candidates.
+        self.reattach_wire_spokes(&wire_spokes, &rings);
+
+        // Phase 5 (§8.3.0.4 phase E): free each consumed endpoint that the strip build
+        // actually left loose (§5.1.1). On a closed solid a terminal endpoint can remain
+        // incident to unbeveled faces (its disk still carries live radial faces) — that
+        // vert is kept, matching the reference operator, rather than force-freed.
         for &endpoint in &endpoints {
             if self.vertex_is_loose(endpoint) {
                 self.free_loose_vertex(endpoint);
@@ -2045,7 +2223,13 @@ impl LoopMesh {
         interior: &[VertexKey],
         is_beveled: &dyn Fn(EdgeKey) -> bool,
     ) -> Option<CrossWeld> {
-        if self.iter_disk_edges(vertex).count() != 4 {
+        // §7.2.1: "valence 4" is the *face-bearing* count — a wire spoke on the junction's
+        // disk is no more a leg here than it is in the layout.
+        let faced = self
+            .iter_disk_edges(vertex)
+            .filter(|&spoke| self.edge_radial_iter(spoke).next().is_some())
+            .count();
+        if faced != 4 {
             return None;
         }
         let disk = self.walk_disk_edges(vertex);
@@ -2140,6 +2324,7 @@ impl LoopMesh {
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
         terminal_fills: &mut Vec<TerminalFill>,
+        rings: &mut BevelRings,
         result: &mut BevelResult,
     ) {
         let edge = self
@@ -2270,6 +2455,20 @@ impl LoopMesh {
                 leg_near.push((leg, leg_vert));
             }
 
+            // §8.3.0.4: the boundverts, in ring order — the two flanking rungs (`start`
+            // first, in the disk's sense) then the leg verts. The chain's *interior* rungs
+            // are ring verts but not boundverts, so they are deliberately absent: a wire
+            // spoke never attaches to one, however much nearer the tip it lies.
+            rings.record(vertex, || {
+                let mut boundverts = if starts_left {
+                    vec![strip_left, strip_right]
+                } else {
+                    vec![strip_right, strip_left]
+                };
+                boundverts.extend_from_slice(&leg_verts);
+                boundverts
+            });
+
             // Every incident face other than E's two radial faces (already collapsed
             // to their flanking boundvert) re-stitches its corner onto the near verts
             // of its two flanking legs, ordered so the leg shared with `prev` comes
@@ -2319,6 +2518,16 @@ impl LoopMesh {
                 representative,
             });
         } else {
+            // A two-boundvert terminal still has a ring, and a wire spoke on its disk still
+            // has to land on it (§8.3.0.4).
+            rings.record(vertex, || {
+                if starts_left {
+                    vec![strip_left, strip_right]
+                } else {
+                    vec![strip_right, strip_left]
+                }
+            });
+
             // §8.3.0.1 valence-3 through-strip: no fill face — the surviving third
             // face(s) absorb the full chain run, ordered so the strip vert sharing
             // the incoming leg sits next to `prev` (§7.4).
@@ -5050,6 +5259,7 @@ impl LoopMesh {
         corner_vert: &mut Vec<CornerVert>,
         substitutions: &mut Vec<FaceSubstitution>,
         terminal_fills: &mut Vec<TerminalFill>,
+        rings: &mut BevelRings,
         result: &mut BevelResult,
     ) {
         // The single beveled edge at this terminal endpoint.
@@ -5090,6 +5300,7 @@ impl LoopMesh {
                 fan_template,
                 substitutions,
                 terminal_fills,
+                rings,
                 result,
             )
             .expect("the up-front terminal plan admitted this endpoint's close");
@@ -5145,6 +5356,7 @@ impl LoopMesh {
         fan_template: FaceTemplate,
         substitutions: &mut Vec<FaceSubstitution>,
         terminal_fills: &mut Vec<TerminalFill>,
+        rings: &mut BevelRings,
         result: &mut BevelResult,
     ) -> Option<(VertexKey, VertexKey)> {
         let vertex_position = self.vertex_position(vertex);
@@ -5230,6 +5442,16 @@ impl LoopMesh {
             set_face_substitution(substitutions, vertex, face, run);
         }
 
+        // §8.3.0.4: the ring's boundverts, in ring order — `start`, `end`, then the leg
+        // verts as the disk walk reaches them. Recorded whatever the valence (a
+        // two-boundvert terminal has a ring even though it has no fill), because a wire
+        // spoke on this disk must land on it.
+        rings.record(vertex, || {
+            let mut boundverts = vec![strip_start, strip_end];
+            boundverts.extend_from_slice(&leg_verts);
+            boundverts
+        });
+
         if !leg_verts.is_empty() {
             // §8.3.0.2 at `segments = 1`: the fill ring is `E`'s two flanking rungs (the
             // whole through-chain when there are no interior profile samples) plus one leg
@@ -5267,18 +5489,26 @@ impl LoopMesh {
     /// — the `segments = 1` close and the multi-segment chain build alike — takes its
     /// ordering from here.
     ///
-    /// `None` only when there is no layout at all: valence < 3 (nothing for the strip verts
-    /// to meet against), a non-manifold or zero-length `E`, an open fan whose `E` sits at
-    /// an arc end and so has a leg on one side only, or a disk the corner ring does not
-    /// cover (a wire spoke among the legs — the ring walks faces, so it never reaches one).
-    /// That last case is a **known over-tight decline**, not a real absence of a layout: see
-    /// the guard's own note below.
+    /// The valence the layout counts is the **face-bearing** one (BEVEL.md §7.2.1): the
+    /// incident spokes carrying at least one face. A radial-1 boundary spoke is a full leg;
+    /// a radial-0 **wire** spoke is not on the disk at all — no leg, no near-corner vert,
+    /// no sector, and it does not raise `n`. The wire's whole interaction with the bevel is
+    /// the §8.3.0.4 post-pass, which re-points it onto the finished ring.
+    ///
+    /// `None` only when there is no layout at all: face-bearing valence < 3 (nothing for the
+    /// strip verts to meet against), a non-manifold or zero-length `E`, an open fan whose
+    /// `E` sits at an arc end and so has a leg on one side only, or a faced disk the corner
+    /// ring does not cover (a malformed fan).
     fn terminal_leg_layout(&self, vertex: VertexKey, edge: EdgeKey) -> Option<TerminalLegs> {
         let vertex_position = self.vertex_position(vertex);
         // A terminal meets its strip verts against the two legs flanking `E`, so a
-        // valence-2 endpoint has no close; a zero-length `E` has no offset line; a
+        // face-bearing valence of 2 has no close; a zero-length `E` has no offset line; a
         // non-manifold `E` has no two-sided strip to close onto.
-        let valence = self.iter_disk_edges(vertex).count();
+        let faced: Vec<EdgeKey> = self
+            .iter_disk_edges(vertex)
+            .filter(|&spoke| self.edge_radial_iter(spoke).next().is_some())
+            .collect();
+        let valence = faced.len();
         if valence < 3 || self.edge_loop_keys(edge).len() != 2 {
             return None;
         }
@@ -5293,25 +5523,16 @@ impl LoopMesh {
                 disk.push(last.outgoing_edge);
             }
         }
-        // The ring is a walk over *face corners*, so it reaches only the legs that bound a
-        // face here: a wire spoke (or any leg the ring cannot arrive on) is on the disk but
-        // off the ring. The close lays a near-corner vert on every leg it *sees* and then
-        // consumes the endpoint, so a leg the layout never listed would get no vert, be
-        // covered by no substitution, and — being radial-empty — be silently destroyed with
-        // the endpoint.
-        //
-        // Declining the whole edge here is **known over-tight**: a face-less spoke should be
-        // carried as a leg the fill does not span (it has no face corner, so widening the
-        // ring walk is not the fix), and the terminal should close around it with the spoke
-        // left inert. Declining is the safe hold that prevents the wire being destroyed,
-        // until that layout lands.
+        // The ring is a walk over *face corners*, so it reaches exactly the faced spokes —
+        // which is the whole disk the layout is denominated on (§7.2.1). A faced spoke the
+        // ring still cannot arrive on means a fan the walk could not chain, and there is no
+        // layout to take. Widening the walk is never the fix: a wire has no face corner to
+        // reach, and it is legitimately not among the legs.
         if disk.len() != valence {
             return None;
         }
         let closed = corners.len() == valence
-            && self
-                .iter_disk_edges(vertex)
-                .all(|leg| self.edge_loop_keys(leg).len() == 2);
+            && faced.iter().all(|&leg| self.edge_loop_keys(leg).len() == 2);
 
         let count = disk.len();
         let seat = disk.iter().position(|&e| e == edge)?;
@@ -8302,6 +8523,66 @@ struct TerminalFill {
     boundary: Vec<VertexKey>,
     leg_verts: Vec<VertexKey>,
     representative: FaceTemplate,
+}
+
+/// One beveled vertex's ring **boundverts**, in ring order (BEVEL.md §8.3.0.4 point 1):
+/// `[start, end, leg₁ … leg_(n−3)]` at a terminal, `[B_0 … B_(s−1)]` at a junction. The
+/// only candidates a wire spoke may re-attach to — the ring's *other* verts (a profile
+/// chain's interior rungs, a fill's interior) are not boundverts and are never candidates,
+/// however much nearer the wire's tip one of them may lie.
+struct BevelRing {
+    vertex: VertexKey,
+    boundverts: Vec<VertexKey>,
+}
+
+/// Collects the [`BevelRing`]s the §8.3.0.4 post-pass reads — and collects **nothing**
+/// when the run carries no wire spoke at all, which is the overwhelmingly common case. A
+/// ring's boundvert list is pure post-pass input: recording one per beveled vertex on a
+/// wire-free bevel spends a heap allocation per beveled vertex (and a clone per junction)
+/// on data nothing ever reads. The `wire_spokes` snapshot is taken before the first mint
+/// on every driver, so the answer is known before any ring is built.
+#[derive(Default)]
+struct BevelRings {
+    wanted: bool,
+    rings: Vec<BevelRing>,
+}
+
+impl BevelRings {
+    fn for_spokes(spokes: &[WireSpoke]) -> Self {
+        Self {
+            wanted: !spokes.is_empty(),
+            rings: Vec::new(),
+        }
+    }
+
+    /// Record one beveled vertex's ring boundverts, in ring order (the post-pass's scan
+    /// origin is the ring's head: `start` at a terminal, `B_0` at a junction). The
+    /// boundverts are built by the closure only when a wire spoke exists to read them.
+    fn record(&mut self, vertex: VertexKey, boundverts: impl FnOnce() -> Vec<VertexKey>) {
+        if self.wanted {
+            self.rings.push(BevelRing {
+                vertex,
+                boundverts: boundverts(),
+            });
+        }
+    }
+
+    /// The recorded ring of a beveled vertex, if it has one with any boundvert on it.
+    fn of(&self, vertex: VertexKey) -> Option<&BevelRing> {
+        self.rings
+            .iter()
+            .find(|ring| ring.vertex == vertex && !ring.boundverts.is_empty())
+    }
+}
+
+/// A **wire** spoke on a beveled vertex's disk (BEVEL.md §7.2.1): a face-less incident
+/// edge. Inert during layout — it is not a leg, takes no boundvert, and does not raise the
+/// valence — but not untouched, because the vertex it hangs off is consumed. Captured
+/// pristine; consumed by the §8.3.0.4 post-pass.
+struct WireSpoke {
+    vertex: VertexKey,
+    wire: EdgeKey,
+    far: VertexKey,
 }
 
 /// One terminal endpoint's legs in **rotational disk order** (BEVEL.md §7.5 / §8.3.0.1),
@@ -22050,52 +22331,105 @@ mod tests {
         }
     }
 
-    /// A wire spoke on the terminal is a leg the **corner ring cannot see** — the ring walks
-    /// face corners, and a radial-empty edge bounds none. The close would lay its near-corner
-    /// verts on the legs it *can* see (an arc of three, here) and then consume the endpoint,
-    /// destroying the wire edge with it and recording a fill over a sector no substitution
-    /// opened. So the layout demands the ring cover the whole disk, and this terminal has no
-    /// close at all: the edge is declined whole, at every `segments`, and the wire survives.
-    /// The decline is a hold, not the right answer — see the test below.
-    fn wire_spoke_open_fan() -> (LoopMesh, VertexKey, EdgeKey, EdgeKey) {
+    /// A wire spoke on a terminal's disk: a face-less leg the **corner ring cannot see** —
+    /// the ring walks face corners, and a radial-empty edge bounds none. That is *correct*
+    /// (BEVEL.md §7.2.1): the wire is not on the bevel disk at all, so the ring covers the
+    /// whole of it. The centre's **face-bearing** valence is 3 here (an arc of three faced
+    /// spokes) and the wire is inert during layout; §8.3.0.4's post-pass re-points it.
+    fn wire_spoke_open_fan() -> (LoopMesh, VertexKey, EdgeKey, VertexKey) {
         let (mut mesh, centre, rim) = open_planar_fan(3, 0);
-        let wire_end = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
-        let wire = mesh.create_edge([centre, wire_end], EdgeCreateFlags::NONE);
+        let tip = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        mesh.create_edge([centre, tip], EdgeCreateFlags::NONE);
         let beveled = mesh
             .query_edge_exists(centre, rim[1])
             .expect("the arc's middle spoke — the one with a leg on both sides");
-        (mesh, centre, beveled, wire)
+        (mesh, centre, beveled, tip)
     }
 
-    /// **Known divergence, pinned as-is.** The reference behaviour is to *bevel* this shape:
-    /// a face-less spoke on the terminal's disk is treated as **inert**, the edge closes
-    /// around it exactly as it would with the spoke absent, and the wire's far tip is left
-    /// untouched (on a 3×3 grid with a wire at the centre, beveling the centre-adjacent edge
-    /// takes 10/13/4 → 13/18/6 at `segments = 1`, 15/22/8 at 2, 17/26/10 at 3).
+    /// A 3×3 **vertex** grid patch — 9 V / 12 E / 4 quads — translated by `origin`, so two of
+    /// them fit disjointly in one mesh. Returns its `(1,1,0)` centre (an interior valence-4
+    /// vertex) and the centre's `+x` edge, whose far endpoint is a valence-3 boundary vertex:
+    /// a terminal at both ends.
+    fn grid_3x3(mesh: &mut LoopMesh, origin: Vec3) -> (VertexKey, EdgeKey) {
+        let verts: Vec<Vec<VertexKey>> = (0..3)
+            .map(|i| {
+                (0..3)
+                    .map(|j| mesh.create_vertex(origin + Vec3::new(i as f32, j as f32, 0.0)))
+                    .collect()
+            })
+            .collect();
+        for i in 0..2 {
+            for j in 0..2 {
+                mesh.face_create_verts(
+                    &[
+                        verts[i][j],
+                        verts[i + 1][j],
+                        verts[i + 1][j + 1],
+                        verts[i][j + 1],
+                    ],
+                    FaceCreateFlags::NONE,
+                );
+            }
+        }
+        let beveled = mesh
+            .query_edge_exists(verts[1][1], verts[2][1])
+            .expect("the centre's +x edge");
+        (verts[1][1], beveled)
+    }
+
+    /// The same patch with a face-less **wire** spoke off its centre out to `tip`:
+    /// 10 V / 13 E / 4 F. Returns the centre, the wire's far tip, and the beveled edge.
+    fn grid_3x3_with_wire(mesh: &mut LoopMesh, tip: Vec3) -> (VertexKey, VertexKey, EdgeKey) {
+        let (centre, beveled) = grid_3x3(mesh, Vec3::ZERO);
+        let tip = mesh.create_vertex(tip);
+        mesh.create_edge([centre, tip], EdgeCreateFlags::NONE);
+        (centre, tip, beveled)
+    }
+
+    /// The far ends of every face-less edge still incident to `tip` — the re-attached wire
+    /// (BEVEL.md §8.3.0.4), read back off the result.
+    fn wire_landings(mesh: &LoopMesh, tip: VertexKey) -> Vec<Vec3> {
+        mesh.iter_disk_edges(tip)
+            .filter(|&edge| mesh.edge_radial_iter(edge).next().is_none())
+            .map(|edge| {
+                let [a, b] = mesh.edge_vert_keys(edge);
+                mesh.vertex_position(if a == tip { b } else { a })
+            })
+            .collect()
+    }
+
+    fn face_size_multiset(mesh: &LoopMesh) -> Vec<usize> {
+        let mut sizes: Vec<usize> = mesh
+            .face_keys()
+            .into_iter()
+            .map(|face| mesh.face_vert_keys(face).len())
+            .collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    /// BEVEL.md §7.2.1: a wire spoke does not disqualify the terminal — it is **inert**, and
+    /// the edge bevels exactly as it would with the spoke absent. §8.3.0.4: the wire is not
+    /// *untouched*, though, because the centre it hangs off is consumed — the post-pass
+    /// re-points it onto the ring before the loose-vertex free would have swept it away.
     ///
-    /// loopmesh instead **declines the edge whole** — `terminal_leg_layout` cannot carry a
-    /// leg with no face corner, and its `disk.len() == valence` guard is the safe hold until
-    /// the layout can. So the returned patch is pristine and the counts are unchanged, which
-    /// is *not* parity.
-    ///
-    /// The load-bearing half of this pin is therefore the last assertion: **the wire edge
-    /// survives**. Before the guard, the close swept the wire away with the endpoint —
-    /// silently destroying mesh the user never selected, which is strictly worse than
-    /// doing nothing. That must not regress, whatever fixes the decline.
+    /// The load-bearing assertion is the last one: **the wire survives**, still face-less,
+    /// still on its own far tip, now hanging off a ring vertex. Destroying it silently —
+    /// mesh the caller never selected — is the failure mode this fixture has always guarded.
     #[test]
-    fn edge_bevel_terminal_with_a_wire_spoke_declines_for_now_and_never_destroys_the_wire() {
+    fn edge_bevel_terminal_with_a_wire_spoke_bevels_around_it_and_never_destroys_the_wire() {
         for segments in [1, 2] {
-            let (mut mesh, centre, beveled, wire) = wire_spoke_open_fan();
+            let (mut mesh, centre, beveled, tip) = wire_spoke_open_fan();
             let before = counts(&mesh);
             assert_eq!(mesh.iter_disk_edges(centre).count(), 4);
             assert_eq!(
                 mesh.vertex_corner_ring(centre).len(),
                 2,
-                "the ring sees two sectors — three of the four legs",
+                "the ring sees two sectors — the three faced spokes; the wire is not on it",
             );
             assert!(
-                !mesh.terminal_close_admits(centre, beveled),
-                "the disk the ring cannot cover has no close",
+                mesh.terminal_close_admits(centre, beveled),
+                "the face-bearing valence is 3, so the terminal closes around the wire",
             );
 
             let result = mesh.bevel(
@@ -22110,15 +22444,510 @@ mod tests {
             mesh.validate_topology();
 
             assert!(
-                result.verts.is_empty() && result.faces.is_empty(),
-                "the declined edge minted nothing — no stranded verts, no orphan rungs",
+                !result.verts.is_empty() && !result.faces.is_empty(),
+                "the edge is beveled, not declined",
             );
-            assert_eq!(counts(&mesh), before, "and the mesh is untouched");
             assert!(
-                mesh.edge_keys().contains(&wire),
-                "the wire spoke is not swept away with the terminal",
+                !mesh.vert_keys().contains(&centre),
+                "the centre is consumed"
+            );
+            assert_ne!(counts(&mesh), before);
+
+            let landings = wire_landings(&mesh, tip);
+            assert_eq!(
+                landings.len(),
+                1,
+                "the wire spoke survives as exactly one face-less edge off its own tip",
+            );
+            assert!(
+                result
+                    .verts
+                    .iter()
+                    .any(|&vertex| mesh.vertex_position(vertex) == landings[0]),
+                "and it hangs off a vertex of the new ring, not off the consumed centre",
             );
         }
+    }
+
+    /// BEVEL.md §8.3.0.4's worked oracle: bevel the centre's `+x` edge of the 3×3 grid whose
+    /// centre carries a wire. The wire raises no valence (§7.2.1), so the near terminal reads
+    /// as **face-bearing valence 4** — three boundverts, a fanned fill — and the whole answer
+    /// is the wire-free grid's answer **plus one vertex and one edge** (the untouched tip and
+    /// the re-pointed wire): `10/13/4 → 13/18/6` at `segments = 1`, with face sizes
+    /// `[3, 4, 4, 4, 5, 5]`; `15/22/8` at 2; `17/26/10` at 3.
+    ///
+    /// Had the wire been counted as a leg, the centre would read valence 5 → four boundverts
+    /// → the fill switches from a fan to a whole n-gon and the ring gains a vert: 14 V and a
+    /// quad where the oracle has a triangle. The counts are the observable signature of the
+    /// wire having stayed out of the layout.
+    #[test]
+    fn edge_bevel_wire_spoke_is_inert_and_costs_exactly_one_vert_and_one_edge() {
+        for (segments, expected) in [(1, (13, 18, 6)), (2, (15, 22, 8)), (3, (17, 26, 10))] {
+            let mut mesh = LoopMesh::new();
+            // Off-axis, leaning out over the −x leg: the §8.3.0.4 argmin discriminates.
+            let (_, tip, beveled) = grid_3x3_with_wire(&mut mesh, Vec3::new(0.4, 1.0, 1.0));
+            assert_eq!(
+                counts(&mesh),
+                (10, 13, 4),
+                "the pristine grid plus its wire"
+            );
+
+            mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert_eq!(counts(&mesh), expected, "at segments = {segments}");
+            assert_eq!(
+                wire_landings(&mesh, tip).len(),
+                1,
+                "the wire is conserved — neither destroyed nor doubled",
+            );
+            if segments == 1 {
+                assert_eq!(
+                    face_size_multiset(&mesh),
+                    vec![3, 4, 4, 4, 5, 5],
+                    "the fan triangle, the strip quad, E's two radial quads, two pentagons",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.3.0.4 point 2: the wire lands on the boundvert **geometrically nearest**
+    /// its far tip — and the same ring hands it to a different boundvert when the tip leans
+    /// the other way. A discriminating (off-axis) tip, so no rounding decides anything.
+    ///
+    /// Point 4: the answer is `segments`-independent. A larger `segments` moves no boundvert
+    /// and adds no candidate — only profile rungs, which are not boundverts.
+    #[test]
+    fn edge_bevel_wire_spoke_lands_on_the_nearest_boundvert_and_leans_with_the_tip() {
+        let leaning_over_the_leg = (Vec3::new(0.4, 1.0, 1.0), Vec3::new(0.75, 1.0, 0.0));
+        let leaning_over_the_flank = (Vec3::new(1.0, 1.6, 1.0), Vec3::new(1.0, 1.25, 0.0));
+
+        for (tip, expected) in [leaning_over_the_leg, leaning_over_the_flank] {
+            for segments in [1, 2, 3] {
+                let mut mesh = LoopMesh::new();
+                let (_, tip, beveled) = grid_3x3_with_wire(&mut mesh, tip);
+
+                mesh.bevel(
+                    &[beveled.into()],
+                    BevelOptions {
+                        offset: 0.25,
+                        segments,
+                        affect: BevelAffect::Edges,
+                        ..Default::default()
+                    },
+                );
+                mesh.validate_topology();
+
+                let landings = wire_landings(&mesh, tip);
+                assert_eq!(landings.len(), 1);
+                assert!(
+                    (landings[0] - expected).length() < 1.0e-5,
+                    "at segments = {segments} the wire wanted {expected}, landed on {}",
+                    landings[0],
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.3.0.4 point 1, the sharp one: the candidate set is the ring's
+    /// **boundverts**, not the ring. At `segments = 2` the profile chain's interior rung —
+    /// the "peak" — lands on the midpoint of the `start`–`end` chord, which on this flat grid
+    /// is exactly where the consumed centre used to be: distance² **1.0** from an on-axis tip
+    /// against **1.0625** for every boundvert. The strictly nearer vertex is *on the ring*,
+    /// and the wire still goes to a boundvert.
+    ///
+    /// The tie itself is not asserted (three boundverts equidistant; the winner is decided by
+    /// rounding, §8.3.0.4's warning) — only that the landing is one of the three, and never
+    /// the peak.
+    #[test]
+    fn edge_bevel_wire_spoke_on_axis_never_lands_on_the_nearer_chain_rung() {
+        let mut mesh = LoopMesh::new();
+        let (_, tip, beveled) = grid_3x3_with_wire(&mut mesh, Vec3::new(1.0, 1.0, 1.0));
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let landings = wire_landings(&mesh, tip);
+        assert_eq!(landings.len(), 1);
+        let peak = Vec3::new(1.0, 1.0, 0.0);
+        assert!(
+            (landings[0] - peak).length() > 1.0e-5,
+            "the wire landed on the chain rung at the consumed centre's own position",
+        );
+        let boundverts = [
+            Vec3::new(1.0, 0.75, 0.0),
+            Vec3::new(1.0, 1.25, 0.0),
+            Vec3::new(0.75, 1.0, 0.0),
+        ];
+        assert!(
+            boundverts
+                .iter()
+                .any(|&boundvert| (landings[0] - boundvert).length() < 1.0e-5),
+            "the wire landed off the boundvert set entirely: {}",
+            landings[0],
+        );
+    }
+
+    /// BEVEL.md §7.6.1.1: the wire is absent from a **junction's** disk on exactly the same
+    /// terms — it bounds no sector, is absorbed into none, takes no boundvert, and does not
+    /// raise `s`. Bevel the grid centre's `+x` **and** `−x` edges, making the wire-carrying
+    /// centre a two-sector junction, and the §8.3.0.4 identity holds there too: the answer is
+    /// the wire-free mesh's answer plus the tip and the one re-pointed wire edge
+    /// (`+1 V / +1 E / +0 F`), with the wire hanging off a boundvert of the junction's ring.
+    #[test]
+    fn edge_bevel_wire_spoke_on_a_junction_disk_is_inert_and_re_points_onto_the_ring() {
+        for segments in [1, 2] {
+            let options = BevelOptions {
+                offset: 0.25,
+                segments,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            };
+
+            let mut wire_free = LoopMesh::new();
+            let (centre, plus_x) = grid_3x3(&mut wire_free, Vec3::ZERO);
+            let minus_x = wire_free
+                .query_edge_exists(centre, vert_at(&wire_free, Vec3::new(0.0, 1.0, 0.0)))
+                .expect("the centre's −x edge");
+            wire_free.bevel(&[plus_x.into(), minus_x.into()], options.clone());
+            let (verts, edges, faces) = counts(&wire_free);
+
+            let mut mesh = LoopMesh::new();
+            let (centre, tip, plus_x) = grid_3x3_with_wire(&mut mesh, Vec3::new(1.0, 1.6, 1.0));
+            let minus_x = mesh
+                .query_edge_exists(centre, vert_at(&mesh, Vec3::new(0.0, 1.0, 0.0)))
+                .expect("the centre's −x edge");
+            let result = mesh.bevel(&[plus_x.into(), minus_x.into()], options);
+            mesh.validate_topology();
+
+            assert_eq!(
+                counts(&mesh),
+                (verts + 1, edges + 1, faces),
+                "the junction bevels as if the wire were not there, at segments = {segments}",
+            );
+            let landings = wire_landings(&mesh, tip);
+            assert_eq!(
+                landings.len(),
+                1,
+                "the wire survives the junction's consumption"
+            );
+            assert!(
+                result
+                    .verts
+                    .iter()
+                    .any(|&vertex| mesh.vertex_position(vertex) == landings[0]),
+                "and lands on a vertex of the junction's ring",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.3.0.4's phase order, which is the whole reason the post-pass is a
+    /// **global** phase: both ends of the wire are beveled vertices, so both are consumed.
+    /// Interleave the pass per vertex and the first of the two sees no ring at the far end,
+    /// attaches the wire to a vertex about to be freed, and silently destroys it.
+    ///
+    /// Two disjoint 3×3 grids joined only by a wire between their centres (18/25/8), one edge
+    /// beveled at each centre: **24/35/12** — exactly twice the wire-free single-grid answer
+    /// (12/17/6 each) plus the one conserved wire edge. Get the order wrong and the edge count
+    /// drops to 34 with the wire gone.
+    #[test]
+    fn edge_bevel_wire_spoke_with_both_ends_beveled_is_conserved_by_the_global_post_pass() {
+        let mut mesh = LoopMesh::new();
+        let (near_centre, first) = grid_3x3(&mut mesh, Vec3::ZERO);
+        let (far_centre, second) = grid_3x3(&mut mesh, Vec3::new(3.0, 0.0, 0.0));
+        let wire = mesh.create_edge([near_centre, far_centre], EdgeCreateFlags::NONE);
+        assert_eq!(
+            counts(&mesh),
+            (18, 25, 8),
+            "two grids joined only by the wire"
+        );
+        assert_eq!(mesh.edge_radial_iter(wire).count(), 0);
+
+        mesh.bevel(
+            &[first.into(), second.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (24, 35, 12));
+        let wires: Vec<EdgeKey> = mesh
+            .edge_keys()
+            .into_iter()
+            .filter(|&edge| mesh.edge_radial_iter(edge).next().is_none())
+            .collect();
+        assert_eq!(
+            wires.len(),
+            1,
+            "the wire is conserved as exactly one face-less edge, spanning the two rings",
+        );
+        for endpoint in mesh.edge_vert_keys(wires[0]) {
+            assert!(
+                !mesh.vert_face_keys(endpoint).is_empty(),
+                "each end of the re-pointed wire is a live ring vertex",
+            );
+        }
+    }
+
+    /// Every face-less edge of the mesh, as an unordered pair of its endpoints' positions.
+    fn wire_edge_spans(mesh: &LoopMesh) -> Vec<[Vec3; 2]> {
+        mesh.edge_keys()
+            .into_iter()
+            .filter(|&edge| mesh.edge_radial_iter(edge).next().is_none())
+            .map(|edge| mesh.edge_vert_keys(edge).map(|v| mesh.vertex_position(v)))
+            .collect()
+    }
+
+    fn spans_contain(spans: &[[Vec3; 2]], wanted: [Vec3; 2]) -> bool {
+        spans.iter().any(|&[a, b]| {
+            let matches = |p: Vec3, q: Vec3| (p - q).length() < 1.0e-4;
+            (matches(a, wanted[0]) && matches(b, wanted[1]))
+                || (matches(a, wanted[1]) && matches(b, wanted[0]))
+        })
+    }
+
+    /// BEVEL.md §8.3.0.4's opening sentence, read as a *gate*: the post-pass exists because
+    /// the vertex the wire hangs off is **consumed**. A recorded ring is not that condition —
+    /// every beveled vertex gets one, but phase E frees only the endpoints the strip build
+    /// left loose, and a beveled vertex still incident to unbeveled faces is **kept**, wire
+    /// and all. Gate on the ring instead of on consumption and a surviving *near* end gets a
+    /// second copy of its wire (the original still hangs off it, `+1 E`), while a surviving
+    /// *far* end is worse: the wire is re-pointed onto that vertex's ring, and the vertex
+    /// itself — which was never going to lose it — is left wireless.
+    ///
+    /// Built white-box, because the two conditions only come apart on a mesh the edge-mode
+    /// planner does not currently admit: it declines any endpoint whose fan it cannot close
+    /// whole, so every endpoint it *does* build is re-stitched off every incident face and
+    /// ends up loose. The state the gate guards is therefore constructed here directly —
+    /// `kept` carries a ring and a live face, `gone` carries a ring and nothing else.
+    #[test]
+    fn wire_post_pass_gates_on_consumption_not_on_a_recorded_ring() {
+        let mut mesh = LoopMesh::new();
+        let quad: Vec<VertexKey> = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .map(|position| mesh.create_vertex(position))
+        .collect();
+        mesh.face_create_verts(&quad, FaceCreateFlags::NONE);
+        let kept = quad[0];
+
+        // `gone` is consumed (loose, and its whole ring is minted); `kept` is not (its quad
+        // survives), yet both carry a ring, as both would after a bevel that kept one of them.
+        let gone = mesh.create_vertex(Vec3::new(0.0, 0.0, 5.0));
+        let near_boundvert = mesh.create_vertex(Vec3::new(0.5, 0.0, 4.5));
+        let far_boundvert = mesh.create_vertex(Vec3::new(-0.5, 0.0, 5.0));
+        let tip = mesh.create_vertex(Vec3::new(0.0, 0.0, -5.0));
+        let spanning_wire = mesh.create_edge([gone, kept], EdgeCreateFlags::NONE);
+        let kept_wire = mesh.create_edge([kept, tip], EdgeCreateFlags::NONE);
+
+        let spokes = mesh.snapshot_wire_spokes(&[gone, kept]);
+        assert_eq!(spokes.len(), 3, "the spanning wire is visited from both ends");
+        let rings = BevelRings {
+            wanted: true,
+            rings: vec![
+                BevelRing {
+                    vertex: gone,
+                    boundverts: vec![near_boundvert, far_boundvert],
+                },
+                BevelRing {
+                    vertex: kept,
+                    boundverts: vec![quad[1], quad[3]],
+                },
+            ],
+        };
+
+        let before = counts(&mesh);
+        mesh.reattach_wire_spokes(&spokes, &rings);
+        mesh.validate_topology();
+
+        let (verts, edges, faces) = before;
+        assert_eq!(
+            counts(&mesh),
+            (verts, edges + 1, faces),
+            "exactly one wire is re-pointed — `kept`'s own wire is not re-created, and the \
+             spanning wire is not minted twice",
+        );
+        assert!(
+            mesh.query_edge_exists(near_boundvert, kept).is_some(),
+            "the spanning wire lands on `gone`'s nearest boundvert at the consumed end, and \
+             on `kept` **itself** at the surviving end — not on `kept`'s ring",
+        );
+        for boundvert in [quad[1], quad[3]] {
+            assert!(
+                mesh.query_edge_exists(near_boundvert, boundvert).is_none()
+                    && mesh.query_edge_exists(far_boundvert, boundvert).is_none(),
+                "no wire was laid onto the surviving vertex's ring",
+            );
+        }
+        assert!(
+            mesh.query_edge_exists(kept, tip) == Some(kept_wire)
+                && mesh.iter_disk_edges(tip).count() == 1,
+            "the wire hanging off the surviving vertex is left exactly as it was",
+        );
+        assert!(
+            mesh.edge_keys().contains(&spanning_wire),
+            "the original is still on the doomed vertex, to die with it in phase E",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.4 point 3, the measured case: the wire is visited **once per beveled
+    /// endpoint**, each visit scanning the boundvert product with **its own** ring outermost.
+    /// When two candidate pairs tie *exactly* and differ in **both** elements, the two visits
+    /// break the tie toward different pairs, nothing dedups, and the wire is re-created
+    /// **twice** — `+1 E` over the ordinary case.
+    ///
+    /// The guide's fixture: two grids at a pure-`x` shift, centres `(1,1,0)` and `(4,1,0)`,
+    /// beveled **towards each other** (`+x` and `−x`), so the rings are mirror images across
+    /// the wire's midpoint. Two flank↔flank pairs attain `d² = 9` exactly. Contrast the
+    /// *translate*-symmetric arrangement (both centres beveled `+x`, the test above): its tied
+    /// pairs **share** their far element, so both visits break toward the same near boundvert
+    /// and the wire collapses to one edge. Only in-crate can this be pinned: a per-wire dedup
+    /// would emit one edge here and no cross-backend comparison would name which pairs.
+    #[test]
+    fn edge_bevel_wire_spoke_tie_across_both_elements_re_creates_the_wire_twice() {
+        let mut mesh = LoopMesh::new();
+        let (near_centre, toward_far) = grid_3x3(&mut mesh, Vec3::ZERO);
+        let (far_centre, _) = grid_3x3(&mut mesh, Vec3::new(3.0, 0.0, 0.0));
+        let toward_near = mesh
+            .query_edge_exists(far_centre, vert_at(&mesh, Vec3::new(3.0, 1.0, 0.0)))
+            .expect("the far centre's −x edge, pointing back at the near grid");
+        mesh.create_edge([near_centre, far_centre], EdgeCreateFlags::NONE);
+
+        mesh.bevel(
+            &[toward_far.into(), toward_near.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let spans = wire_edge_spans(&mesh);
+        assert_eq!(
+            spans.len(),
+            2,
+            "the tie is across both elements, so each visit takes its own pair: two wires",
+        );
+        assert!(
+            spans_contain(
+                &spans,
+                [Vec3::new(1.0, 0.75, 0.0), Vec3::new(4.0, 0.75, 0.0)]
+            ),
+            "one visit took the −y flank pair: {spans:?}",
+        );
+        assert!(
+            spans_contain(
+                &spans,
+                [Vec3::new(1.0, 1.25, 0.0), Vec3::new(4.0, 1.25, 0.0)]
+            ),
+            "the other took the +y flank pair: {spans:?}",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.4 point 3's *other* pin: with both ends beveled the rule is a closest
+    /// **pair** argmin over the full boundvert product — not the cheaper per-end argmin, which
+    /// asks each end for the boundvert nearest the far endpoint's **old** position. The two
+    /// agree whenever the rings are small against the wire, which is every ordinary fixture;
+    /// they part company when a ring's radius is comparable to the wire's length.
+    ///
+    /// The guide's discriminating fixture: centres `(1,1,0)` and `(1.5,1.6,0)`, `offset = 0.4`,
+    /// beveled `+x` and `+y` (so the rings are not translates and nothing ties). The closest
+    /// pair is `(1.0,1.4,0) ↔ (1.1,1.6,0)` at `d² = 0.05`; the per-end rule would land the far
+    /// end on the *leg* vert `(1.5,1.2,0)` at `d² = 0.29`.
+    #[test]
+    fn edge_bevel_wire_spoke_takes_the_closest_boundvert_pair_not_the_per_end_argmin() {
+        let mut mesh = LoopMesh::new();
+        let (near_centre, along_x) = grid_3x3(&mut mesh, Vec3::ZERO);
+        let (far_centre, _) = grid_3x3(&mut mesh, Vec3::new(0.5, 0.6, 0.0));
+        let along_y = mesh
+            .query_edge_exists(far_centre, vert_at(&mesh, Vec3::new(1.5, 2.6, 0.0)))
+            .expect("the far centre's +y edge");
+        mesh.create_edge([near_centre, far_centre], EdgeCreateFlags::NONE);
+
+        mesh.bevel(
+            &[along_x.into(), along_y.into()],
+            BevelOptions {
+                offset: 0.4,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let spans = wire_edge_spans(&mesh);
+        assert_eq!(spans.len(), 1, "the pair argmin is strict: one wire");
+        assert!(
+            spans_contain(&spans, [Vec3::new(1.0, 1.4, 0.0), Vec3::new(1.1, 1.6, 0.0)]),
+            "the wire took the closest pair, not the per-end argmin (which would have landed \
+             on the far ring's leg vert at (1.5, 1.2, 0)): {spans:?}",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.4's re-point framing: the re-created wire **is** the wire — it carries
+    /// the original's whole per-edge block (crease, seam, sharp, every custom layer), not the
+    /// layer defaults of a fresh mint. A default-valued re-create is a per-edge-customdata
+    /// divergence, not a topological one, so it passes every count and every position check
+    /// this file makes and shows up only here.
+    #[test]
+    fn edge_bevel_wire_spoke_carries_its_per_edge_block_across_the_re_point() {
+        let mut mesh = LoopMesh::new();
+        let (centre, tip, beveled) = grid_3x3_with_wire(&mut mesh, Vec3::new(0.4, 1.0, 1.0));
+        let wire = mesh
+            .query_edge_exists(centre, tip)
+            .expect("the centre's wire spoke");
+
+        let tint = tint_every_edge(&mut mesh);
+        let wire_tint = tint_of(&mesh, tint, wire);
+        mesh.set_edge_seam(wire, true);
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let re_pointed: Vec<EdgeKey> = mesh
+            .iter_disk_edges(tip)
+            .filter(|&edge| mesh.edge_radial_iter(edge).next().is_none())
+            .collect();
+        assert_eq!(re_pointed.len(), 1);
+        assert_eq!(
+            tint_of(&mesh, tint, re_pointed[0]),
+            wire_tint,
+            "the re-pointed wire kept its own custom layer value, not the layer default",
+        );
+        assert!(
+            mesh.edge_seam(re_pointed[0]),
+            "and its seam bit rode along with it",
+        );
     }
 
     /// The smallest mesh that carries the same corner — a `2 × 2` quad grid with one corner
@@ -22581,6 +23410,7 @@ mod tests {
         templates.seal(&mesh);
 
         let mut result = BevelResult::default();
+        let mut rings = BevelRings::default();
         mesh.bevel_single_edge(
             edge,
             0.25,
@@ -22588,6 +23418,7 @@ mod tests {
             &templates,
             strip_template,
             fan_templates,
+            &mut rings,
             &mut result,
         );
         mesh.validate_topology();
