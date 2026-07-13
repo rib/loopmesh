@@ -490,9 +490,8 @@ impl LoopMesh {
             return false;
         };
 
-        if self.face_corners_adjacent(merged, v_target_base, v_target_next) {
-            return false;
-        }
+        // SFME enforces the non-adjacency precondition itself (§8.3); its
+        // refusal is this route's `false`.
         let Some((_fragment, diagonal)) = self.face_split(merged, v_target_base, v_target_next)
         else {
             return false;
@@ -508,27 +507,6 @@ impl LoopMesh {
         let disk: smallvec::SmallVec<[EdgeKey; 8]> = collect_iter::<_, 8>(self, self.disk_edges(v));
         let at = disk.iter().position(|&e| e == spoke)?;
         (disk.len() > 1).then(|| disk[(at + 1) % disk.len()])
-    }
-
-    /// Whether `a` and `b` are consecutive corners of `face` — the SFME's
-    /// non-adjacency precondition (§6.6, §8.3), which is the whole of the
-    /// helper's return value on the face-joining route.
-    fn face_corners_adjacent(&self, face: FaceKey, a: VertexKey, b: VertexKey) -> bool {
-        if a == b {
-            return true;
-        }
-        let mut loops = self.face_loops(face);
-        while let Some(l) = loops.next(self) {
-            let here = self.loops.get(l).vertex;
-            let there = self
-                .loops
-                .get(self.loops.get(l).face_loop_links.next)
-                .vertex;
-            if (here == a && there == b) || (here == b && there == a) {
-                return true;
-            }
-        }
-        false
     }
 
     /// The distinct faces flanking `spoke` — none (wire), one (boundary), or

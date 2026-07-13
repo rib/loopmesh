@@ -1304,22 +1304,6 @@ impl LoopMesh {
         false
     }
 
-    /// §7.0.2 — does `face` hold `a` and `b` as **consecutive** corners of its
-    /// loop cycle, in either direction? Such a pair is already joined by one of
-    /// the face's edges, so there is no diagonal to split along.
-    fn face_holds_pair_adjacent(&self, face: FaceKey, a: VertexKey, b: VertexKey) -> bool {
-        let mut it = self.face_loops(face);
-        while let Some(l) = it.next(self) {
-            if self.loops.get(l).vertex != a {
-                continue;
-            }
-            let next = self.loops.get(self.loop_next(l)).vertex;
-            let prev = self.loops.get(self.loop_prev(l)).vertex;
-            return next == b || prev == b;
-        }
-        false
-    }
-
     /// §7.0 — lay one template connect. Every pair in the §5 / §6 / §9.5 pattern
     /// lists is laid through here: it is resolved to a carrier by
     /// [`Self::smallest_face_with_both`] (§7.0.1) and split there.
@@ -1329,8 +1313,9 @@ impl LoopMesh {
     ///
     /// - **No carrier.** No face at all holds both endpoints.
     /// - **Unsplittable carrier.** The fewest-corners carrier holds the endpoints
-    ///   as adjacent corners, so the split would carve off a degenerate 2-gon.
-    ///   There is **no retry** on the next-smallest carrier — selection is
+    ///   as adjacent corners, so the split would carve off a degenerate 2-gon —
+    ///   the SFME primitive itself refuses (RADIAL_EDGE_STRUCTURE.md §8.3) and its
+    ///   `None` is this no-op. There is **no retry** on the next-smallest carrier — selection is
     ///   adjacency-blind by design (§7.0.1), and a connect dies here even when a
     ///   larger carrier holds the pair on a perfectly good diagonal. Re-targeting
     ///   would lay an edge the operator does not lay.
@@ -1345,9 +1330,6 @@ impl LoopMesh {
     /// template's carrier ends up seeing fragments §7.1 would never have minted.
     fn template_connect(&mut self, a: VertexKey, b: VertexKey) -> Option<(FaceKey, EdgeKey)> {
         let target = self.smallest_face_with_both(a, b)?;
-        if self.face_holds_pair_adjacent(target, a, b) {
-            return None;
-        }
         self.face_split(target, a, b)
     }
 

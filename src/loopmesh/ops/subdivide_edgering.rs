@@ -1292,14 +1292,17 @@ impl LoopMesh {
     ) {
         let mut remaining = face;
         for (&m_a, &m_b) in levels_a.iter().zip(levels_b.iter()) {
-            // face_split returns None only when a corner is absent from the
-            // face — an invariant violation here, since every level vert was
-            // inserted onto this quad's rim in phase one (§6.1.1). Guard it so
-            // an unexpected None surfaces rather than silently dropping a row.
+            // face_split refuses (RADIAL_EDGE_STRUCTURE.md §8.3) on a coincident
+            // pair, an absent corner, or a cycle-adjacent corner pair. All three
+            // are invariant violations here: `m_a`/`m_b` are distinct verts
+            // inserted onto *opposite* rungs of this quad's rim in phase one
+            // (§6.1.1), so they are corners of `remaining` and are always
+            // separated by at least one rail corner on its cycle. Assert on every
+            // refusal cause rather than silently dropping a row.
             let split = self.face_split(remaining, m_a, m_b);
             debug_assert!(
                 split.is_some(),
-                "level cross-cut corner missing from strip quad"
+                "level cross-cut corners must be distinct, present, and non-adjacent on the strip quad"
             );
             let Some((new_face, _new_edge)) = split else {
                 return;

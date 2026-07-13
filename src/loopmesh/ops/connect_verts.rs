@@ -295,9 +295,19 @@ impl LoopMesh {
             // must adopt it (SFME edge-reuse variant) rather than allocate a
             // duplicate. Only this path can produce a duplicate sub-face.
             let reuse_existing_edge = self.query_edge_exists(a, b).is_some();
+            // Unreachable-by-argument, so this is an internal invariant guard,
+            // not error handling: `find_sub_face_with_pair` proved both corners
+            // live on `working`, §4's chord generation drops perimeter-adjacent
+            // pairs, and a cut never makes a surviving chord's endpoints adjacent
+            // — which exhausts §8.3's refusal causes. What *should* happen if a
+            // per-face split ever did fail is still open (CONNECT_VERTS.md §6.4
+            // vs. the reference's recoverable per-face abort); it is being
+            // decided under FOLLOWUPS `connect_verts:null-lookup-error-contract`.
+            // Panicking keeps that question open rather than silently answering
+            // it with a skip.
             let (new_face, new_edge) = self
                 .face_split_reusing(working, a, b, reuse_existing_edge)
-                .expect("connect_verts: face_split failed on a filtered chord");
+                .expect("chord endpoints are non-adjacent corners of the working sub-face");
             edges_out.insert(new_edge);
             sub_faces.push(new_face);
             if reuse_existing_edge {

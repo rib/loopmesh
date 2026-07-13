@@ -139,9 +139,11 @@ impl LoopMesh {
             return None;
         }
 
-        let (new_face, new_edge) = self
-            .face_split(face, corner_a, corner_b)
-            .expect("connect_verts_nonplanar: face_split failed on a legal diagonal");
+        // §3.2's candidate scan already excludes adjacent corner pairs, so the
+        // SFME precondition (RADIAL_EDGE_STRUCTURE.md §8.3) holds on every
+        // diagonal reaching here; a refusal is still read as "leave this face
+        // whole" rather than a panic.
+        let (new_face, new_edge) = self.face_split(face, corner_a, corner_b)?;
         Some((face, new_face, new_edge))
     }
 
