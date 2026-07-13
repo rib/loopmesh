@@ -1236,8 +1236,16 @@ mod tests {
     #[test]
     fn equal_cost_pop_order_matches_the_heap_donor_fingerprint() {
         // (quads `n`, surviving donor face index) — the tie size is `m = n − 1`.
-        const DONOR_FINGERPRINT: [(usize, usize); 8] =
-            [(2, 1), (3, 2), (4, 3), (5, 1), (6, 1), (7, 6), (8, 5), (9, 1)];
+        const DONOR_FINGERPRINT: [(usize, usize); 8] = [
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (5, 1),
+            (6, 1),
+            (7, 6),
+            (8, 5),
+            (9, 1),
+        ];
 
         for (quads, expected_donor) in DONOR_FINGERPRINT {
             let mut mesh = LoopMesh::new();
@@ -1270,7 +1278,8 @@ mod tests {
                 .expect("survivor carries a tag")[0]
                 .round() as usize;
             assert_eq!(
-                donor, expected_donor,
+                donor,
+                expected_donor,
                 "n = {quads} (m = {}): the surviving customdata must name f_{expected_donor}",
                 quads - 1
             );

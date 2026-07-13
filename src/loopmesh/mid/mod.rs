@@ -14,3 +14,5 @@ mod edge_split;
 mod face_split;
 mod faces_join;
 mod vert_dissolve;
+
+pub use faces_join::FacesJoinOutcome;

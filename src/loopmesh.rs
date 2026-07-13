@@ -81,7 +81,7 @@ pub use attributes::*;
 pub use geom::{convex_hull, ConvexHullProvider, HullFace, HullTopology, Quickhull};
 pub use iter::*;
 pub use math::{SparseCholesky, SparseSolveError};
-pub use mid::EdgeCollapseFlags;
+pub use mid::{EdgeCollapseFlags, FacesJoinOutcome};
 pub use ops::{
     Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect,
     BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,

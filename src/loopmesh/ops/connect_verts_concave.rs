@@ -191,10 +191,11 @@ impl LoopMesh {
             return false;
         }
 
-        // JFKE — fuse the two triangles, killing the diagonal.
-        self.faces_join(&[face_a, face_b])
-            .expect("connect_verts_concave: faces_join failed on a radial-2 interior diagonal");
-        true
+        // Fuse the two triangles, killing the diagonal. The merge primitive has
+        // its own refusals (an over-shared edge elsewhere on the pair, a union
+        // boundary that will not chain); on any of them the diagonal is simply
+        // kept, like every other refusal in this sweep.
+        self.faces_join(&[face_a, face_b]).is_some()
     }
 
     /// §4.3 — would fusing the two triangles across `diagonal` keep the merged

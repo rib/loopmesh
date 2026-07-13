@@ -1,5 +1,15 @@
 use crate::loopmesh::*;
 
+/// What [`LoopMesh::faces_join_report_double`] hands back: the union the join
+/// minted, plus the pre-existing face it coincides with, if any
+/// (`DISSOLVE_FACES.md` §4.2). Both faces are alive on return — resolving the
+/// overlap belongs to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FacesJoinOutcome {
+    pub union: FaceKey,
+    pub double: Option<FaceKey>,
+}
+
 impl LoopMesh {
     /// The **composed, loop-minting** face join
     /// (`RADIAL_EDGE_STRUCTURE.md` §9), specialised to a manifold pair sharing
@@ -58,180 +68,354 @@ impl LoopMesh {
         }
     }
 
-    /// Joins N faces into one. Returns the surviving face, or `None` if
-    /// the input faces are not transitively connected by shared edges.
+    /// The **many-input** face join
+    /// (`DISSOLVE_FACES.md` §4.1): merge a connected region of faces into one
+    /// fresh union face laid over the region's boundary. Returns the merge
+    /// result, or `None` if the region is rejected (§4.3).
     ///
-    /// The union is a **construction** (`RADIAL_EDGE_STRUCTURE.md` §9): the
-    /// topology is reached by pairwise re-splices, but the union is seated on
-    /// its perimeter exactly **once**, over the *final* perimeter — never once
-    /// per intermediate merge, which would park loops in slots the reference
-    /// never occupies on any perimeter edge kept alive at radial ≥ 3.
+    /// The join **never deletes an input face directly** (§4.1.2). It collects
+    /// two kill-sets — interior edges nobody outside the region uses, and
+    /// vertices buried entirely inside the region — constructs the union over
+    /// the region's *boundary* edges, and then kills the two sets. Input faces
+    /// die only as **collateral** of those kills, so an input face incident to
+    /// neither a collected edge nor a collected vertex **survives** the join,
+    /// overlapped by the union (§4.1.4). Callers that do not want the survivors
+    /// must sweep them themselves — [`LoopMesh::dissolve_faces`] does, in its §5
+    /// cleanup pass.
     ///
-    /// For multi-cycle regions where some interior shared edges become same-face
-    /// filaments after the pairwise joins (e.g. a 2x2 block of quads sharing a
-    /// centre vertex), the trailing cleanup below removes those filament edges
-    /// and any vertex whose entire incident-edge set was interior to the merged
-    /// region, matching the many-input semantics described in
-    /// `radial-mesh-guides/operators/DISSOLVE_FACES.md` §4.1 steps 2 + 4.
+    /// Constructing over the boundary — rather than chaining pairwise splices
+    /// through the interior edges — is load-bearing, not a style choice (§9.1):
+    /// a pairwise splice across a **kept-alive** interior edge necessarily
+    /// consumes both its faces, and yields a *smaller* union than the region's
+    /// boundary. It is also what mints the union exactly once, so every
+    /// perimeter edge takes the union's loop as its radial entry and no
+    /// region-interior edge ever does (`RADIAL_EDGE_STRUCTURE.md` §9).
     pub fn faces_join(&mut self, faces: &[FaceKey]) -> Option<FaceKey> {
-        if faces.is_empty() {
-            return None;
-        }
-        if faces.len() == 1 {
-            return Some(faces[0]);
+        if faces.len() < 2 {
+            return faces.first().copied();
         }
 
-        // Snapshot every vert on any input face's perimeter. After the merge
-        // surgery any of these whose entire incident-edge set was interior
-        // to the region will be a degree-zero orphan — the §4.1-step-4 kill
-        // candidates.
-        let mut interior_vert_candidates: smallvec::SmallVec<[VertexKey; 16]> =
-            smallvec::SmallVec::new();
-        for &face in faces {
-            for vertex in self.face_vert_keys(face) {
-                if !interior_vert_candidates.contains(&vertex) {
-                    interior_vert_candidates.push(vertex);
-                }
-            }
-        }
+        let (union, double, plan) = self.faces_join_build(faces, CallingForm::Resolve)?;
 
-        let mut remaining: Vec<FaceKey> = faces.to_vec();
-        // O(1) membership backing for `remaining`. The §10 complexity
-        // contract requires the per-radial-loop "is this face still in the
-        // region?" test to be constant-time; a linear scan of `remaining`
-        // would make the region merge O(n² · R). The set is kept in step
-        // with `remaining` on every removal.
-        let mut remaining_set: std::collections::HashSet<FaceKey> =
-            remaining.iter().copied().collect();
-
-        let survivor = 'outer: loop {
-            if remaining.len() == 1 {
-                break 'outer remaining[0];
+        // §4.2 — the *resolving* calling form: a pre-existing face carrying the
+        // union's corner cycle wins, and the fresh union is killed before the
+        // cascade ever runs. Callers that need to see the double instead reach
+        // for [`LoopMesh::faces_join_report_double`].
+        let result = match double {
+            Some(shadow) => {
+                self.face_kill(union);
+                shadow
             }
-            // Find any edge shared by two `remaining` faces. The total
-            // radial length may exceed 2 — the §3.3 / §4.1 step 2 contract
-            // is that an interior edge has *exactly two* of `remaining`
-            // on its radial; additional radial loops belong to faces
-            // outside the input region and the edge survives the merge
-            // with those loops still attached. See
-            // `radial-mesh-guides/operators/DISSOLVE_FACES.md` §3.3 / §4.1
-            // step 2.
-            for &fa in &remaining {
-                let edges: smallvec::SmallVec<[EdgeKey; 8]> =
-                    collect_iter::<_, 8>(self, FaceLoops::new(self, fa))
-                        .into_iter()
-                        .map(|l| self.loops.get(l).edge)
-                        .filter(|e| !e.is_null())
-                        .collect();
-                for &e in &edges {
-                    let mut other: Option<FaceKey> = None;
-                    let mut radial_len = 0usize;
-                    let mut remaining_on_radial = 0usize;
-                    let mut rl = self.radial_loops(e);
-                    while let Some(rloop) = rl.next(self) {
-                        radial_len += 1;
-                        let rface = self.loops.get(rloop).face;
-                        if remaining_set.contains(&rface) {
-                            remaining_on_radial += 1;
-                            if rface != fa && other.is_none() {
-                                other = Some(rface);
-                            }
-                        }
-                    }
-                    // §3.3: skip edges that aren't a "two of remaining"
-                    // crossing — either fa is the sole `remaining` face on
-                    // the radial (boundary edge of the region) or three+
-                    // `remaining` faces share it. The latter never reaches
-                    // here through the dissolve-faces walker (its §3.3
-                    // "exactly 2 input faces" gate pre-partitions such
-                    // spines into separate regions); it is the §4.3
-                    // defensive backstop for direct callers.
-                    if remaining_on_radial != 2 {
-                        continue;
-                    }
-                    let Some(other_face) = other else { continue };
-                    if other_face == fa {
-                        continue;
-                    }
-                    if let Some(j) = remaining.iter().position(|&f| f == other_face) {
-                        // §4.1 step 2: when the radial is exactly length 2
-                        // (the standard manifold case) the merge kills the
-                        // edge. When the radial is longer the edge survives
-                        // with the out-of-region loops still on it.
-                        //
-                        // The strict manifold Euler primitive only accepts
-                        // the opposite-direction (geometrically natural)
-                        // winding at the shared edge. The §4.1.5
-                        // same-direction (non-contiguous) winding is
-                        // reconciled by the local reverse-cycle splice in
-                        // `faces_join_merge_pair`, which produces the same
-                        // merged n-gon either way. Route the natural case
-                        // through the Euler primitive (it is exercised by
-                        // other operators and kept strict); route the
-                        // same-direction case — and every keep-edge case —
-                        // through the reconciling splice.
-                        let same_direction = {
-                            let l_fa = self.face_edge_share_loop(fa, e)?;
-                            let l_other = self.face_edge_share_loop(other_face, e)?;
-                            self.loops.get(l_fa).vertex == self.loops.get(l_other).vertex
-                        };
-                        if radial_len == 2 && !same_direction {
-                            self.euler_join_face_kill_edge(fa, other_face, e)?;
-                        } else {
-                            let kill_edge = radial_len == 2;
-                            self.faces_join_merge_pair(fa, other_face, e, kill_edge)?;
-                        }
-                        remaining.swap_remove(j);
-                        remaining_set.remove(&other_face);
-                        continue 'outer;
-                    }
-                }
-            }
-            // No more shared edges available — the input wasn't fully connected.
-            return None;
+            None => union,
         };
 
-        // §4.1 step 2 (residual): pairwise re-splicing leaves an interior shared
-        // edge behind whenever two input faces share more than one edge —
-        // the second-and-later shared edges become "filaments" with both
-        // radial loops on the surviving merged face. Sweep them out.
-        self.faces_join_dissolve_same_face_filaments(survivor);
+        self.faces_join_apply_cascade(plan);
+        Some(result)
+    }
 
-        // The union is a *constructed* face, and it is constructed ONCE
-        // (`RADIAL_EDGE_STRUCTURE.md` §9): seat it on its final perimeter here,
-        // after the filaments are gone and before any face kill downstream —
-        // whose forward re-seat of an entry depends on the union's slot.
-        self.face_seat_perimeter_as_constructed(survivor);
+    /// The **many-input** face join in its §4.2 *report-the-double* calling form:
+    /// the primitive keeps both faces and hands the caller the freshly-minted
+    /// union alongside any pre-existing face whose corner cycle coincides with
+    /// it. Resolving the overlap is then the caller's job — as is knowing that
+    /// there *was* one, which is what [`LoopMesh::dissolve_faces`] needs for its
+    /// §5 survivor arithmetic.
+    ///
+    /// The classification, the kill-sets, the cascade and the §4.1.4 survivors
+    /// are exactly [`LoopMesh::faces_join`]'s. The one divergence is the §4.1.5
+    /// per-loop transfer: this form always runs it, because the union it hands
+    /// back is **alive**, and a live face owes the caller initialised per-corner
+    /// data even when a double exists (§9's `reusing` fork).
+    pub fn faces_join_report_double(&mut self, faces: &[FaceKey]) -> Option<FacesJoinOutcome> {
+        if faces.len() < 2 {
+            return faces.first().copied().map(|union| FacesJoinOutcome {
+                union,
+                double: None,
+            });
+        }
 
-        // §4.1 step 4: kill verts whose entire incident-edge set was
-        // interior. After steps above, such a vert has empty disk. Any
-        // candidate that retains at least one edge (boundary or external)
-        // keeps a non-empty disk and must NOT be killed.
-        for vertex in interior_vert_candidates {
-            let Some(vertex_data) = self.vertices.try_get(vertex) else {
-                continue;
-            };
-            if vertex_data.disk_loop_start.is_none() {
-                self.vertex_kill(vertex);
+        let (union, double, plan) = self.faces_join_build(faces, CallingForm::Report)?;
+        self.faces_join_apply_cascade(plan);
+        Some(FacesJoinOutcome { union, double })
+    }
+
+    /// §4.1.2 steps 1 + 2 — classify, chain the boundary, mint the union, run the
+    /// §4.2 coincident-face probe. The cascade is *not* applied: the plan comes
+    /// back un-executed so each calling form can settle the double before or
+    /// after it, as its contract requires.
+    fn faces_join_build(
+        &mut self,
+        faces: &[FaceKey],
+        form: CallingForm,
+    ) -> Option<(FaceKey, Option<FaceKey>, FacesJoinPlan)> {
+        let region: std::collections::HashSet<FaceKey> = faces.iter().copied().collect();
+
+        let plan = self.faces_join_collect(faces, &region)?;
+        let (ring_verts, ring_edges) = self.faces_join_chain_boundary(&plan)?;
+
+        // §4.1.2 step 2 — construct. Every perimeter edge gains a freshly-minted
+        // loop appended after its pre-merge entry, which is what seats the union
+        // as each perimeter edge's entry; the source loops leave those cycles
+        // later, in the cascade (`RADIAL_EDGE_STRUCTURE.md` §6.5's append +
+        // removal rules).
+        let union = self.face_create(&ring_verts, &ring_edges, FaceCreateFlags::NONE);
+        let seed_face = faces[0];
+        self.face_attribs
+            .copy_into(union.as_usize(), seed_face.as_usize());
+        let seed_eflags = self.faces.get(seed_face).eflags;
+        self.faces.get_mut(union).eflags = seed_eflags;
+        self.face_normal_update(union);
+
+        let double = self.faces_join_find_coincident_face(union);
+        // §9's `reusing` fork: the per-loop transfer is skipped only where the
+        // pre-existing face is *adopted* as the merge result — it already carries
+        // its own per-corner data, and the union it displaces is about to die.
+        // The mere existence of a double does not skip it: under the report form
+        // the union stays alive, and a live face with uninitialised corners is a
+        // live face with wrong corners.
+        let reusing = double.is_some() && form == CallingForm::Resolve;
+        if !reusing {
+            self.faces_join_transfer_boundary_loop_attrs(union, &region);
+        }
+
+        Some((union, double, plan))
+    }
+
+    /// §4.1.2 steps 3 + 4 — the cascade, and the only thing in the join that
+    /// deletes an input face. The two kill-sets partition the dying-edge set
+    /// (§7), so no edge is killed twice: an interior edge with a buried endpoint
+    /// is never collected, and dies inside that vertex's disk instead.
+    ///
+    /// The union is never collateral here: it is built over the region's
+    /// *boundary* edges, and neither kill-set can touch one (a boundary edge
+    /// carries an out-of-region face or nothing at all, so it is never a
+    /// collected interior edge, and its endpoints are never region-enclosed).
+    fn faces_join_apply_cascade(&mut self, plan: FacesJoinPlan) {
+        for edge in plan.kill_edges {
+            self.edge_kill(edge);
+        }
+        for vertex in plan.kill_verts {
+            self.vertex_kill(vertex);
+        }
+    }
+
+    /// §4.1.2 step 1 + §4.1.1 + §4.1.3 — classify every edge of every input face
+    /// by its **region count** (input faces on its radial, never the radial's
+    /// total length) and route the interior ones into the two kill-sets.
+    /// Modifies nothing. `None` means the region carries an **over-shared** edge
+    /// and the join declines (§4.3).
+    fn faces_join_collect(
+        &self,
+        faces: &[FaceKey],
+        region: &std::collections::HashSet<FaceKey>,
+    ) -> Option<FacesJoinPlan> {
+        let mut plan = FacesJoinPlan::default();
+
+        for &face in faces {
+            let mut face_loops = FaceLoops::new(self, face);
+            while let Some(loop_key) = face_loops.next(self) {
+                let edge = self.loops.get(loop_key).edge;
+                if edge.is_null() {
+                    continue;
+                }
+
+                let mut region_count = 0usize;
+                let mut total_count = 0usize;
+                let mut radial = self.radial_loops(edge);
+                while let Some(radial_loop) = radial.next(self) {
+                    total_count += 1;
+                    if region.contains(&self.loops.get(radial_loop).face) {
+                        region_count += 1;
+                    }
+                }
+
+                if region_count >= 3 {
+                    return None;
+                }
+
+                if region_count == 1 {
+                    if plan.boundary.insert(edge) {
+                        // The union's winding is seeded from the first boundary
+                        // edge of the first input face that has one: the union
+                        // sits where its source face sat, so it must traverse
+                        // that edge the same way the source loop does.
+                        if plan.winding_seed.is_none() {
+                            plan.winding_seed = Some((edge, self.loops.get(loop_key).vertex));
+                        }
+                    }
+                    continue;
+                }
+
+                let [v0, v1] = self.edges.get(edge).vertices;
+                let enclosed_0 = self.vertex_is_region_enclosed(v0, region);
+                let enclosed_1 = self.vertex_is_region_enclosed(v1, region);
+
+                if !enclosed_0 && !enclosed_1 {
+                    // Keep-alive (§4.1.3): an out-of-region face is on this edge
+                    // too, so killing it would take that face down. Collect
+                    // nothing — the join steps *around* such an edge, and the two
+                    // input faces on it are consumed only if some *other* edge or
+                    // vertex of theirs is collected.
+                    if total_count <= 2 && !plan.kill_edges.contains(&edge) {
+                        plan.kill_edges.push(edge);
+                    }
+                } else {
+                    // The buried vertex dies instead of the edge; its kill takes
+                    // the whole disk, so collecting the edge as well would be a
+                    // double kill.
+                    if enclosed_0 && !plan.kill_verts.contains(&v0) {
+                        plan.kill_verts.push(v0);
+                    }
+                    if enclosed_1 && !plan.kill_verts.contains(&v1) {
+                        plan.kill_verts.push(v1);
+                    }
+                }
             }
         }
 
-        // §4.2 double-face detection: a pre-existing face whose perimeter
-        // coincides with the merged face's perimeter wins; the merge
-        // result is killed and the pre-existing face is returned as the
-        // survivor (its customdata is preserved). The merged face's
-        // perimeter is, by construction, a simple cycle of boundary
-        // edges shared with at most one other face on each edge's
-        // radial cycle. Any face that shares *every* edge of the merged
-        // perimeter must appear on the radial of every such edge — so
-        // checking the radial cycle of a single perimeter edge is
-        // sufficient to enumerate the candidates.
-        if let Some(shadow) = self.faces_join_find_coincident_face(survivor) {
-            self.face_kill(survivor);
-            return Some(shadow);
+        Some(plan)
+    }
+
+    /// §4.1.3 — "buried in the region with no line of sight out": at least one
+    /// incident edge, no wire or boundary edge in the disk, and every face on
+    /// every disk edge's radial in the input set.
+    fn vertex_is_region_enclosed(
+        &self,
+        vertex: VertexKey,
+        region: &std::collections::HashSet<FaceKey>,
+    ) -> bool {
+        let mut disk = self.disk_edges(vertex);
+        let mut has_edge = false;
+        while let Some(edge) = disk.next(self) {
+            has_edge = true;
+            let mut radial_len = 0usize;
+            let mut radial = self.radial_loops(edge);
+            while let Some(radial_loop) = radial.next(self) {
+                radial_len += 1;
+                if !region.contains(&self.loops.get(radial_loop).face) {
+                    return false;
+                }
+            }
+            if radial_len < 2 {
+                return false;
+            }
+        }
+        has_edge
+    }
+
+    /// §4.1.2 step 2 / §4.3 — sort the boundary edge set into the single simple
+    /// cycle the union face is built on, wound as the region's source faces are.
+    /// `None` when the boundary forks at a vertex, splits into more than one
+    /// cycle (a disconnected region, or a union that would need a hole), or is
+    /// empty (a region with no boundary at all).
+    fn faces_join_chain_boundary(
+        &self,
+        plan: &FacesJoinPlan,
+    ) -> Option<(
+        smallvec::SmallVec<[VertexKey; 16]>,
+        smallvec::SmallVec<[EdgeKey; 16]>,
+    )> {
+        let (start_edge, start_vertex) = plan.winding_seed?;
+
+        let mut ring_verts: smallvec::SmallVec<[VertexKey; 16]> = smallvec::SmallVec::new();
+        let mut ring_edges: smallvec::SmallVec<[EdgeKey; 16]> = smallvec::SmallVec::new();
+
+        let mut edge = start_edge;
+        let mut vertex = start_vertex;
+        loop {
+            if !self.vertex_has_exactly_two_boundary_edges(vertex, &plan.boundary) {
+                return None;
+            }
+            ring_verts.push(vertex);
+            ring_edges.push(edge);
+            if ring_edges.len() > plan.boundary.len() {
+                return None;
+            }
+
+            let next_vertex = self.edges.get(edge).other_vertex(vertex)?;
+            if next_vertex == start_vertex {
+                break;
+            }
+            edge = self.vertex_other_boundary_edge(next_vertex, edge, &plan.boundary)?;
+            vertex = next_vertex;
         }
 
-        Some(survivor)
+        // A short ring closed a *sub*-cycle: the region's boundary is not a
+        // single simple cycle, so there is no n-gon to build (§4.3).
+        if ring_edges.len() != plan.boundary.len() {
+            return None;
+        }
+
+        Some((ring_verts, ring_edges))
+    }
+
+    fn vertex_has_exactly_two_boundary_edges(
+        &self,
+        vertex: VertexKey,
+        boundary: &std::collections::HashSet<EdgeKey>,
+    ) -> bool {
+        let mut disk = self.disk_edges(vertex);
+        let mut count = 0usize;
+        while let Some(edge) = disk.next(self) {
+            if boundary.contains(&edge) {
+                count += 1;
+                if count > 2 {
+                    return false;
+                }
+            }
+        }
+        count == 2
+    }
+
+    fn vertex_other_boundary_edge(
+        &self,
+        vertex: VertexKey,
+        exclude: EdgeKey,
+        boundary: &std::collections::HashSet<EdgeKey>,
+    ) -> Option<EdgeKey> {
+        let mut disk = self.disk_edges(vertex);
+        while let Some(edge) = disk.next(self) {
+            if edge != exclude && boundary.contains(&edge) {
+                return Some(edge);
+            }
+        }
+        None
+    }
+
+    /// §4.1.4 / §4.1.5 — each boundary loop of the fresh union takes the per-loop
+    /// customdata of its *source* loop: the one input-face loop on that boundary
+    /// edge (unambiguous, since a boundary edge carries exactly one input face).
+    /// The two loops may sit at either end of the shared edge, so the per-corner
+    /// routing test picks the source corner that shares the union loop's vertex.
+    fn faces_join_transfer_boundary_loop_attrs(
+        &mut self,
+        union: FaceKey,
+        region: &std::collections::HashSet<FaceKey>,
+    ) {
+        let union_loops = collect_iter::<_, 16>(self, FaceLoops::new(self, union));
+        for union_loop in union_loops {
+            let edge = self.loops.get(union_loop).edge;
+            if edge.is_null() {
+                continue;
+            }
+
+            let mut source: Option<LoopKey> = None;
+            let mut radial = self.radial_loops(edge);
+            while let Some(radial_loop) = radial.next(self) {
+                if region.contains(&self.loops.get(radial_loop).face) {
+                    source = Some(radial_loop);
+                    break;
+                }
+            }
+            let Some(source) = source else { continue };
+
+            let corner = if self.loops.get(source).vertex == self.loops.get(union_loop).vertex {
+                source
+            } else {
+                self.loops.get(source).face_loop_links.next
+            };
+            self.loop_attribs
+                .copy_into(union_loop.as_usize(), corner.as_usize());
+        }
     }
 
     /// Search the radial cycle of `merged`'s first perimeter edge for a
@@ -270,307 +454,30 @@ impl LoopMesh {
         }
         None
     }
+}
 
-    /// §4.1.5 / §4.1 step 2 — pairwise merge along a shared edge,
-    /// reconciling the cross-face winding so it works in both the
-    /// opposite-direction (natural) and same-direction (non-contiguous)
-    /// cases. The two doomed loops belong to `fa` and `fb`.
-    ///
-    /// This is *not* a thin wrapper around the manifold Euler primitive
-    /// `euler_join_face_kill_edge`: it differs in two load-bearing ways.
-    /// (a) It performs a **local** winding alignment at the splice
-    /// (§4.1.5): in the same-direction case it threads `fb`'s non-spine
-    /// loops into the merged cycle in reverse, flipping each loop onto
-    /// the far endpoint of its own (unchanged) edge — it never reverses
-    /// `fb` as a whole, so `fb`'s other edges' radial cycles are left
-    /// untouched even when `fb` carries a second non-manifold edge. The
-    /// merged n-gon, its winding (determined by the surviving boundary
-    /// loops) and its per-corner loop attributes are identical to the
-    /// opposite-direction case — the same-direction handling is purely a
-    /// surgery-scheduling concern (§4.1.5).
-    /// (b) When `kill_edge` is set (the manifold radial-length-2 case)
-    /// `edge` is removed from its endpoints' disks and freed; otherwise
-    /// (the keep-alive case) it survives, carrying its remaining
-    /// out-of-region radial loops.
-    fn faces_join_merge_pair(
-        &mut self,
-        fa: FaceKey,
-        fb: FaceKey,
-        edge: EdgeKey,
-        kill_edge: bool,
-    ) -> Option<FaceKey> {
-        if fa == fb {
-            return None;
-        }
+/// Which of §4.2's two calling forms the join is running under. The fork is
+/// observable only when a double exists: `Resolve` *adopts* the pre-existing
+/// face (and so skips §4.1.5's per-loop transfer into the doomed union), while
+/// `Report` keeps the union alive and hands the overlap to the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallingForm {
+    Resolve,
+    Report,
+}
 
-        let l_fa = self.face_edge_share_loop(fa, edge)?;
-        let l_fb = self.face_edge_share_loop(fb, edge)?;
-
-        // §4.1.5 winding test: the two spine loops walk the shared edge
-        // in the same direction iff their start verts coincide. The
-        // splice connectivity below branches on this — there is no
-        // face-wide reversal, so the test is read once and never
-        // invalidated by a topology mutation.
-        let same_direction = self.loops.get(l_fa).vertex == self.loops.get(l_fb).vertex;
-
-        // §4.2 backstop: a merge that would carry duplicate verts into
-        // the union (other than the two endpoints of `edge`) is the
-        // "shared two-edges" failure mode described in
-        // `DISSOLVE_FACES.md` §4.4. We accept the standard guard from
-        // the manifold primitive — refuse if more than two verts are
-        // shared between the two faces.
-        let fa_verts: smallvec::SmallVec<[VertexKey; 8]> = {
-            let face_loops_first = self.faces.get(fa).first_edge_loop;
-            self.face_loop_iter(face_loops_first)
-                .filter(|&l| l != l_fa)
-                .map(|l| self.loops.get(l).vertex)
-                .collect()
-        };
-        let fb_verts: smallvec::SmallVec<[VertexKey; 8]> = {
-            let face_loops_first = self.faces.get(fb).first_edge_loop;
-            self.face_loop_iter(face_loops_first)
-                .filter(|&l| l != l_fb)
-                .map(|l| self.loops.get(l).vertex)
-                .collect()
-        };
-        let mut shared_excluding_edge = 0usize;
-        for v in &fb_verts {
-            if fa_verts.contains(v) {
-                shared_excluding_edge += 1;
-            }
-        }
-        if shared_excluding_edge > 2 {
-            return None;
-        }
-
-        let l_fa_prev = self.loops.get(l_fa).face_loop_links.prev;
-        let l_fa_next = self.loops.get(l_fa).face_loop_links.next;
-        let l_fb_prev = self.loops.get(l_fb).face_loop_links.prev;
-        let l_fb_next = self.loops.get(l_fb).face_loop_links.next;
-
-        if !same_direction {
-            // Opposite-direction (manifold-natural) case: fb's non-spine
-            // loops already mesh with fa's in forward order. Stitch the
-            // two open chains around the doomed spine loops — the same
-            // four-pointer splice the manifold primitive uses.
-            self.loops.get_mut(l_fa_prev).face_loop_links.next = l_fb_next;
-            self.loops.get_mut(l_fb_next).face_loop_links.prev = l_fa_prev;
-            self.loops.get_mut(l_fa_next).face_loop_links.prev = l_fb_prev;
-            self.loops.get_mut(l_fb_prev).face_loop_links.next = l_fa_next;
-        } else {
-            // Same-direction case (§4.1.5): the two cycles do not mesh
-            // directly. Reverse *only* fb's open chain locally — flip
-            // each fb non-spine loop onto the far endpoint of its own
-            // edge and swap its face-loop links — then stitch the
-            // reversed chain between fa's `prev`/`next`. The far endpoint
-            // is well-defined: each loop's edge has exactly two endpoints
-            // and `loop.vertex` is one of them. No radial cycle is
-            // touched, so fb's other edges keep their loops intact.
-            let fb_chain: smallvec::SmallVec<[LoopKey; 8]> = {
-                let mut chain: smallvec::SmallVec<[LoopKey; 8]> = smallvec::SmallVec::new();
-                let mut cursor = l_fb_next;
-                while cursor != l_fb {
-                    chain.push(cursor);
-                    cursor = self.loops.get(cursor).face_loop_links.next;
-                }
-                chain
-            };
-
-            // §4.1.5 per-corner attribute routing. Reversing the chain moves
-            // each fb loop from its near endpoint to its edge's far endpoint
-            // — i.e. onto the corner that, in fb's source cycle, was held by
-            // its *next* loop. Per-loop attributes are keyed to the corner
-            // (identified by vertex), so each reversed loop must inherit the
-            // attributes of the source loop that originally sat at its new
-            // vertex: its forward neighbour in fb's cycle (the spine loop
-            // l_fb for the chain's tail). The forward-order copy is safe —
-            // each destination slot is read as a source before it is itself
-            // overwritten.
-            for window_index in 0..fb_chain.len() {
-                let dst = fb_chain[window_index];
-                let src = if window_index + 1 < fb_chain.len() {
-                    fb_chain[window_index + 1]
-                } else {
-                    l_fb
-                };
-                self.loop_attribs.copy_into(dst.as_usize(), src.as_usize());
-            }
-
-            for &l in &fb_chain {
-                let loop_edge = self.loops.get(l).edge;
-                let near = self.loops.get(l).vertex;
-                let far = self
-                    .edges
-                    .get(loop_edge)
-                    .other_vertex(near)
-                    .expect("loop vertex must lie on its own edge");
-                self.loops.get_mut(l).vertex = far;
-                let links = self.loops.get(l).face_loop_links;
-                self.loops.get_mut(l).face_loop_links = DoubleLinks {
-                    next: links.prev,
-                    prev: links.next,
-                };
-            }
-
-            // After the per-loop swap the reversed chain runs
-            // `l_fb_prev -> ... -> l_fb_next`. Wire it between fa's
-            // neighbours of the spine loop.
-            self.loops.get_mut(l_fa_prev).face_loop_links.next = l_fb_prev;
-            self.loops.get_mut(l_fb_prev).face_loop_links.prev = l_fa_prev;
-            self.loops.get_mut(l_fa_next).face_loop_links.prev = l_fb_next;
-            self.loops.get_mut(l_fb_next).face_loop_links.next = l_fa_next;
-        }
-
-        if self.faces.get(fa).first_edge_loop == l_fa {
-            self.faces.get_mut(fa).first_edge_loop = l_fa_next;
-        }
-
-        // Drop both spine loops from `edge`'s radial cycle — `edge`
-        // survives because its radial still carries the out-of-region
-        // loops (§4.1 step 2 keep-alive contract).
-        self.face_loop_disconnect_edge(l_fa);
-        self.face_loop_disconnect_edge(l_fb);
-
-        // Re-stamp the merged cycle's face pointers onto `fa`.
-        let new_first = self.faces.get(fa).first_edge_loop;
-        let merged_loops: smallvec::SmallVec<[LoopKey; 8]> =
-            self.face_loop_iter(new_first).collect();
-        for &l in &merged_loops {
-            self.loops.get_mut(l).face = fa;
-        }
-        self.faces.get_mut(fa).len = merged_loops.len() as u32;
-
-        self.remove_loop_slab_entry(l_fa);
-        self.remove_loop_slab_entry(l_fb);
-
-        if kill_edge {
-            // Manifold radial-length-2 case: the edge's radial cycle is
-            // now empty. Remove it from its endpoints' disks and free its
-            // slab — the §4.1 step 2 manifold sub-case.
-            let edge_verts = self.edges.get(edge).vertices;
-            self.vertex_disk_remove_edge(edge_verts[0], edge);
-            self.vertex_disk_remove_edge(edge_verts[1], edge);
-            self.remove_edge_slab_entry(edge);
-        }
-        // Keep-alive case: deliberately do NOT remove `edge` from its
-        // endpoints' disks or free its slab — the edge survives with the
-        // out-of-region radial loops still on it.
-
-        self.remove_face_slab_entry(fb);
-
-        // Like the Euler primitive this path stands in for, the splice is
-        // loop-preserving: no radial entry moves here. The union is seated on
-        // its perimeter once, by `faces_join`, after the last pair is merged.
-        Some(fa)
-    }
-
-    /// Walk `face`'s loop cycle and kill every edge whose radial cycle has
-    /// length 2 and *both* loops belong to `face`. Such an edge is a same-
-    /// face filament — a residual interior shared edge that pairwise JFKE
-    /// could not remove. Killing it splices its two loops out of the face
-    /// cycle and frees the edge from its endpoints' disks.
-    fn faces_join_dissolve_same_face_filaments(&mut self, face: FaceKey) {
-        loop {
-            let scan_edges: smallvec::SmallVec<[(LoopKey, EdgeKey); 16]> =
-                collect_iter::<_, 16>(self, FaceLoops::new(self, face))
-                    .into_iter()
-                    .map(|l| (l, self.loops.get(l).edge))
-                    .filter(|(_, e)| !e.is_null())
-                    .collect();
-
-            let mut filament: Option<(LoopKey, LoopKey, EdgeKey)> = None;
-            for (loopi, edge) in scan_edges {
-                let mut radial = self.radial_loops(edge);
-                let r0 = match radial.next(self) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                let r1 = match radial.next(self) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                if radial.next(self).is_some() {
-                    continue;
-                }
-                let f0 = self.loops.get(r0).face;
-                let f1 = self.loops.get(r1).face;
-                if f0 == face && f1 == face {
-                    // Both radial loops belong to `face` — this is a same-
-                    // face filament. `loopi` is one of (r0, r1); the other
-                    // is its radial partner on `face`.
-                    let other = if r0 == loopi { r1 } else { r0 };
-                    filament = Some((loopi, other, edge));
-                    break;
-                }
-            }
-
-            let Some((l_a, l_b, edge)) = filament else {
-                return;
-            };
-            self.faces_join_kill_filament_edge(face, l_a, l_b, edge);
-        }
-    }
-
-    /// Splice the pair `(l_a, l_b)` out of `face`'s loop cycle, then kill
-    /// the loops and the edge. Both loops must be on `face`, share `edge`,
-    /// and be each other's radial partners (the only two loops on `edge`).
-    fn faces_join_kill_filament_edge(
-        &mut self,
-        face: FaceKey,
-        l_a: LoopKey,
-        l_b: LoopKey,
-        edge: EdgeKey,
-    ) {
-        let l_a_prev = self.loops.get(l_a).face_loop_links.prev;
-        let l_a_next = self.loops.get(l_a).face_loop_links.next;
-        let l_b_prev = self.loops.get(l_b).face_loop_links.prev;
-        let l_b_next = self.loops.get(l_b).face_loop_links.next;
-
-        // The two filament loops may sit adjacent on the face cycle (the
-        // "spur off the perimeter" case — `l_a` immediately followed by
-        // `l_b` or vice versa) or non-adjacent (the cycle pinches across
-        // the filament and the splice yields two sub-cycles). The two
-        // cases need different splice connectivity.
-        if l_a_next == l_b {
-            // ... l_a_prev -> l_a -> l_b -> l_b_next ...
-            self.loops.get_mut(l_a_prev).face_loop_links.next = l_b_next;
-            self.loops.get_mut(l_b_next).face_loop_links.prev = l_a_prev;
-        } else if l_b_next == l_a {
-            self.loops.get_mut(l_b_prev).face_loop_links.next = l_a_next;
-            self.loops.get_mut(l_a_next).face_loop_links.prev = l_b_prev;
-        } else {
-            self.loops.get_mut(l_a_prev).face_loop_links.next = l_a_next;
-            self.loops.get_mut(l_a_next).face_loop_links.prev = l_a_prev;
-            self.loops.get_mut(l_b_prev).face_loop_links.next = l_b_next;
-            self.loops.get_mut(l_b_next).face_loop_links.prev = l_b_prev;
-        }
-        self.faces.get_mut(face).len = self.faces.get(face).len.saturating_sub(2);
-
-        // Re-anchor `first_edge_loop` if it pointed at a doomed loop. A
-        // surviving neighbour of the spliced pair is the safest anchor;
-        // `l_a_prev` is always live in the spur case and the non-adjacent
-        // case alike.
-        let anchor = self.faces.get(face).first_edge_loop;
-        if anchor == l_a || anchor == l_b {
-            let new_anchor = if l_a_prev != l_a && l_a_prev != l_b {
-                l_a_prev
-            } else {
-                l_b_prev
-            };
-            self.faces.get_mut(face).first_edge_loop = new_anchor;
-        }
-
-        self.face_loop_disconnect_edge(l_a);
-        self.face_loop_disconnect_edge(l_b);
-
-        self.remove_loop_slab_entry(l_a);
-        self.remove_loop_slab_entry(l_b);
-
-        let edge_verts = self.edges.get(edge).vertices;
-        self.vertex_disk_remove_edge(edge_verts[0], edge);
-        self.vertex_disk_remove_edge(edge_verts[1], edge);
-        self.remove_edge_slab_entry(edge);
-    }
+/// The §4.1.2-step-1 collection: what the join decided to build the union over,
+/// and what it decided to kill. Nothing in it has been applied to the mesh yet.
+#[derive(Default)]
+struct FacesJoinPlan {
+    /// Edges with exactly one input face on their radial (§4.1.1) — the union's
+    /// perimeter.
+    boundary: std::collections::HashSet<EdgeKey>,
+    /// The boundary edge the union's winding is read off, and the vertex its
+    /// source loop starts at.
+    winding_seed: Option<(EdgeKey, VertexKey)>,
+    kill_edges: smallvec::SmallVec<[EdgeKey; 8]>,
+    kill_verts: smallvec::SmallVec<[VertexKey; 4]>,
 }
 
 /// True iff `cycle_a` and `cycle_b` are the same cyclic vertex sequence
@@ -805,6 +712,109 @@ mod tests {
         assert!(!live_faces.contains(&f_left));
         assert!(!live_faces.contains(&f_right));
         assert!(live_faces.contains(&f_shadow));
+
+        mesh.validate_topology();
+    }
+
+    /// §9's `reusing` fork, on the side that only the **report** form reaches:
+    /// a double exists, but the fresh union is handed back **alive**, so §4.1.5's
+    /// per-loop transfer must still have run over it. Skipping it on the mere
+    /// existence of a double would return a live face whose corners carry the
+    /// attribute store's zero-fill instead of the source loops' values.
+    #[test]
+    fn faces_join_report_double_initialises_the_live_unions_corner_attrs() {
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .expect("uv layer registers");
+
+        let (verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
+        let vert_index = |key: VertexKey| verts.iter().position(|&k| k == key).unwrap() as f32;
+
+        // Source corners carry (face_id, vertex_index); the shadow's own corners
+        // carry a sentinel, so adopting *its* data would be visible too.
+        for (face_id, face) in [(1.0_f32, f_left), (2.0_f32, f_right), (9.0_f32, f_shadow)] {
+            for loop_key in mesh.face_loop_keys(face) {
+                let tagged_vert = vert_index(mesh.loop_vertex(loop_key));
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, loop_key.as_usize(), [face_id, tagged_vert]);
+            }
+        }
+
+        let outcome = mesh
+            .faces_join_report_double(&[f_left, f_right])
+            .expect("the two-quad region joins");
+
+        assert_eq!(
+            outcome.double,
+            Some(f_shadow),
+            "the pre-existing hexagon coincides with the union's corner cycle"
+        );
+        assert!(
+            mesh.face_keys().contains(&outcome.union),
+            "the report form keeps the fresh union alive — resolving it is the caller's job"
+        );
+
+        for loop_key in mesh.face_loop_keys(outcome.union) {
+            let tag = mesh
+                .loop_attribs()
+                .get_vec2(uv, loop_key.as_usize())
+                .unwrap();
+            assert!(
+                tag[0] == 1.0 || tag[0] == 2.0,
+                "every corner of the reported union carries its source loop's data, \
+                 not the store's zero-fill ({tag:?}) and not the double's sentinel"
+            );
+            assert_eq!(
+                tag[1],
+                vert_index(mesh.loop_vertex(loop_key)),
+                "the transfer routed each source corner to the union corner on its own vertex"
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// The `reusing` side of the same fork: under the **resolving** form the
+    /// pre-existing face is adopted as the merge result, and it keeps the
+    /// per-corner data it already had — the join must not overwrite it with the
+    /// source loops'.
+    #[test]
+    fn faces_join_resolving_form_leaves_the_adopted_doubles_corner_attrs_alone() {
+        let mut mesh = LoopMesh::new();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .expect("uv layer registers");
+
+        let (_verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
+        for (face_id, face) in [(1.0_f32, f_left), (2.0_f32, f_right), (9.0_f32, f_shadow)] {
+            for loop_key in mesh.face_loop_keys(face) {
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, loop_key.as_usize(), [face_id, 0.0]);
+            }
+        }
+
+        let survivor = mesh
+            .faces_join(&[f_left, f_right])
+            .expect("the two-quad region joins");
+        assert_eq!(survivor, f_shadow);
+
+        for loop_key in mesh.face_loop_keys(survivor) {
+            let tag = mesh
+                .loop_attribs()
+                .get_vec2(uv, loop_key.as_usize())
+                .unwrap();
+            assert_eq!(
+                tag[0], 9.0,
+                "the adopted face is the merge result customdata and all — no transfer runs into it"
+            );
+        }
 
         mesh.validate_topology();
     }
@@ -1180,13 +1190,14 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §9's "mint once": an n ≥ 3 merge must seat the union on the **final**
-    /// perimeter only. The chord `c` here is shared by two region faces *and*
-    /// two out-of-region fins, so it survives the merge (radial 4 → 2) but is
-    /// **interior** to the union — the reference never seats it. A merge that
-    /// re-seats each intermediate union parks a region loop on `c`'s entry, and
-    /// its later removal then pushes the entry forward off the loop the
-    /// reference leaves it on.
+    /// §9's "mint once": the union is constructed over the region's boundary, so
+    /// a region-**interior** edge never takes the union's loop at all. The chord
+    /// `c` here is shared by two region faces *and* two out-of-region fins, so
+    /// it is a §4.1.3 **keep-alive** edge: nothing is collected for it, and the
+    /// entry it carried before the merge is never disturbed. `C` — whose only
+    /// interior edge is that chord — is therefore incident to no collected edge
+    /// and no collected vertex, and **survives** the join (§4.1.4), keeping its
+    /// loop on the chord.
     #[test]
     fn faces_join_never_seats_an_edge_interior_to_the_final_union() {
         let mut mesh = LoopMesh::new();
@@ -1231,15 +1242,24 @@ mod tests {
             "pristine traversal from the entry: Q, B, P, C"
         );
 
-        mesh.faces_join(&[face_a, face_b, face_c])
+        let union = mesh
+            .faces_join(&[face_a, face_b, face_c])
             .expect("A-B-C is edge-connected");
 
         assert_eq!(
             mesh.edge_face_keys(chord),
-            vec![fin_q, fin_p],
-            "the chord is interior to the union: it never takes the union's loop, \
-             it merely loses B's and C's — and the survivors keep their order, \
-             read from the untouched entry Q"
+            vec![fin_q, fin_p, face_c],
+            "the chord is interior to the union: it never takes the union's loop. \
+             It merely loses B's (B cascade-died on the A-B seam); C survives, and \
+             the survivors keep their order, read from the untouched entry Q"
+        );
+        assert!(
+            mesh.face_keys().contains(&face_c),
+            "C's only interior edge is the keep-alive chord, so no kill reaches it (§4.1.4)"
+        );
+        assert!(
+            mesh.face_edge_keys(union).iter().all(|&e| e != chord),
+            "the union spans the region's boundary, and the chord is not on it"
         );
         mesh.validate_topology();
     }
@@ -1321,6 +1341,151 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// §4.1.4's worked fixture — a row of three quads whose two interior edges
+    /// are one genuinely manifold edge (`{1,4}`) and one radial-4 chord
+    /// (`{2,3}`, also carrying two out-of-region fins). Returns
+    /// `(verts, [f0, f1, f2, fin_a, fin_b])`; `f2` is the survivor-to-be.
+    fn build_quad_row_with_nonmanifold_chord(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<VertexKey>, [FaceKey; 5]) {
+        let v: Vec<VertexKey> = [
+            (0.0, 0.0, 0.0),  // 0
+            (1.0, 0.0, 0.0),  // 1
+            (2.0, 0.0, 0.0),  // 2
+            (2.0, 1.0, 0.0),  // 3
+            (1.0, 1.0, 0.0),  // 4
+            (0.0, 1.0, 0.0),  // 5
+            (3.0, 0.0, 0.0),  // 6
+            (3.0, 1.0, 0.0),  // 7
+            (2.0, 0.0, 1.0),  // 8
+            (2.0, 1.0, 1.0),  // 9
+            (2.0, 0.0, -1.0), // 10
+            (2.0, 1.0, -1.0), // 11
+        ]
+        .into_iter()
+        .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+        .collect();
+
+        let mut quad = |mesh: &mut LoopMesh, ring: [usize; 4]| -> FaceKey {
+            let verts: Vec<VertexKey> = ring.iter().map(|&i| v[i]).collect();
+            mesh.face_create_verts(&verts, FaceCreateFlags::NONE)
+        };
+
+        let f0 = quad(mesh, [0, 1, 4, 5]);
+        let f1 = quad(mesh, [1, 2, 3, 4]);
+        let f2 = quad(mesh, [2, 6, 7, 3]);
+        let fin_a = quad(mesh, [2, 3, 9, 8]);
+        let fin_b = quad(mesh, [3, 2, 10, 11]);
+
+        (v, [f0, f1, f2, fin_a, fin_b])
+    }
+
+    /// §4.1.4 — the join deletes input faces only by **cascade**, so a region
+    /// face whose only interior edge is a kept-alive non-manifold chord sits on
+    /// no collected edge and no collected vertex, and **survives**. The union is
+    /// still built over the *whole* region's boundary, so it is laid across the
+    /// survivor's territory.
+    #[test]
+    fn faces_join_leaves_the_face_whose_only_interior_edge_is_kept_alive() {
+        let mut mesh = LoopMesh::new();
+        let (v, [f0, f1, f2, fin_a, fin_b]) = build_quad_row_with_nonmanifold_chord(&mut mesh);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 16, 5)
+        );
+        let chord = mesh.query_edge_exists(v[2], v[3]).expect("chord");
+        assert_eq!(mesh.edge_face_keys(chord).len(), 4, "the chord is radial-4");
+
+        let union = mesh
+            .faces_join(&[f0, f1, f2])
+            .expect("the row is edge-connected and has no over-shared edge");
+
+        // Only `{1,4}` is collected: it is the sole interior edge with no buried
+        // endpoint AND a total face count of 2. The chord is kept alive.
+        assert!(
+            mesh.query_edge_exists(v[1], v[4]).is_none(),
+            "the manifold interior edge is killed"
+        );
+        assert!(
+            mesh.query_edge_exists(v[2], v[3]).is_some(),
+            "the chord is kept alive — killing it would take the fins down too"
+        );
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(
+            !live.contains(&f0) && !live.contains(&f1),
+            "both cascade-die on {{1,4}}"
+        );
+        assert!(
+            live.contains(&f2),
+            "f2 sits on no collected edge or vertex — it survives"
+        );
+        assert!(live.contains(&fin_a) && live.contains(&fin_b));
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 15, 4),
+            "§4.1.4: -1 F (two cascade-killed, one union minted), -1 E, 0 V"
+        );
+
+        // The union spans the whole region's boundary — including the survivor's
+        // territory, which it overlaps.
+        let perimeter = mesh.face_vert_keys(union);
+        assert_eq!(perimeter.len(), 8, "the union is the row-spanning octagon");
+        let expected: std::collections::HashSet<VertexKey> = v[0..8].iter().copied().collect();
+        let got: std::collections::HashSet<VertexKey> = perimeter.iter().copied().collect();
+        assert_eq!(got, expected);
+
+        mesh.validate_topology();
+    }
+
+    /// §4.4 — the vertex channel, on the smallest fixture that isolates it. A
+    /// quad and a triangle sharing **two** adjacent edges bury the pinch vertex
+    /// between them: `kill_edges` is **empty**, `kill_verts = { pinch }`, and
+    /// both shared edges die inside the pinch's disk, cascading into both input
+    /// faces. The discriminating assertion is the **vertex count**: an edge-only
+    /// join reaches the same face and edge counts but strands the pinch as a
+    /// loose vertex.
+    #[test]
+    fn faces_join_consumes_the_pinch_vertex_buried_between_two_shared_edges() {
+        let mut mesh = LoopMesh::new();
+        let v: Vec<VertexKey> = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (1.0, 1.0)]
+            .into_iter()
+            .map(|(x, y)| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+            .collect();
+
+        // Quad (0,1,2,3) and triangle (2,1,0) share {0,1} and {1,2}; vertex 1's
+        // whole disk is exactly those two edges.
+        let quad = mesh.face_create_verts(&[v[0], v[1], v[2], v[3]], FaceCreateFlags::NONE);
+        let triangle = mesh.face_create_verts(&[v[2], v[1], v[0]], FaceCreateFlags::NONE);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (4, 5, 2)
+        );
+
+        let union = mesh
+            .faces_join(&[quad, triangle])
+            .expect("the pinch region merges through the vertex channel");
+
+        assert!(
+            mesh.vertices.try_get(v[1]).is_none(),
+            "the buried pinch vertex is collected and killed with its whole disk"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (3, 3, 1),
+            "an edge-only join would land on 3 E / 1 F but strand the pinch: 4 V, not 3"
+        );
+
+        let perimeter = mesh.face_vert_keys(union);
+        assert_eq!(perimeter.len(), 3, "the union is the triangle 0-2-3");
+        assert!(!perimeter.contains(&v[1]));
+
+        mesh.validate_topology();
+    }
+
     /// Negative case for §4.2: joining two adjacent quads on a 3x3 grid
     /// has no pre-existing coincident face. The detection must NOT
     /// trigger; the merge result itself is returned as the survivor.
@@ -1333,14 +1498,17 @@ mod tests {
             .faces_join(&[faces[0], faces[1]])
             .expect("two-quad merge");
 
-        // The survivor must be a brand-new face (the JFKE chain keeps
-        // face[0]'s slot alive as the survivor; either way it is NOT some
-        // *other* pre-existing face).
+        // The union is a freshly *constructed* face (§4.1.2 step 2) — not a
+        // recycled input handle, and not some other pre-existing face either.
         let live_faces: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
         assert!(live_faces.contains(&survivor));
-        assert_eq!(
-            survivor, faces[0],
-            "JFKE preserves the first input's face slot"
+        assert!(
+            !faces.contains(&survivor),
+            "the union is a fresh face, never one of the inputs"
+        );
+        assert!(
+            !live_faces.contains(&faces[0]) && !live_faces.contains(&faces[1]),
+            "both inputs cascade-died on the manifold interior edge"
         );
 
         mesh.validate_topology();

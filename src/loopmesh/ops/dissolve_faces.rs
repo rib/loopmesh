@@ -44,12 +44,12 @@ impl LoopMesh {
     ///    `region.out`).
     ///
     /// Supports the default-parameter manifold-region path and the optional
-    /// `use_verts` post-pass (§6). The §4.2 double-face detection runs
-    /// inside `faces_join`: when the merge's perimeter coincides with a
-    /// pre-existing face's perimeter, the primitive returns that
-    /// pre-existing face as the survivor and the merge result is killed.
-    /// `DissolveFacesResult.region` therefore naturally carries the
-    /// pre-existing face on that path.
+    /// `use_verts` post-pass (§6). The merge is invoked in the §4.2
+    /// report-the-double form: when the union's perimeter coincides with a
+    /// pre-existing face's, the primitive keeps both and names the double,
+    /// and *this* operator kills the fresh union and reports the pre-existing
+    /// face in `region.out`. Knowing the double is not a formality — §5's
+    /// survivor detector prices it into the expected face count.
     pub fn dissolve_faces(
         &mut self,
         faces: &[FaceKey],
@@ -86,6 +86,13 @@ impl LoopMesh {
             // step never re-seeds a face already pulled into another
             // region's BFS.
             let visited = self.push_face_op_flag_layer();
+            // §5 — the survivor mark. Set on every face of every region that
+            // is actually opened (size ≥ 2; singletons never enter a region
+            // and so are never marked, per §3.1's no-op guarantee), then
+            // cleared on the union of each successful merge and on every input
+            // face of a failed one.
+            let orig = self.push_face_op_flag_layer();
+            let mut has_survivors = false;
 
             // Stable input-iteration order — the §11 customdata identity
             // rule ("first face in walker-emit order wins") depends on it.
@@ -98,15 +105,74 @@ impl LoopMesh {
                     // §3.1 — singletons are skipped silently.
                     continue;
                 }
-                // §4 — the many-input merge primitive does the rest.
-                if let Some(merged) = self.faces_join(&region) {
-                    result.region.push(merged);
+                for &face in &region {
+                    self.face_op_flag_set(orig, face, 0);
                 }
-                // Failed merges (§4.3) leave the region's input faces
-                // intact; we contribute nothing to `region.out` for that
-                // region.
+
+                // §4 — the many-input merge primitive does the rest, in its §4.2
+                // report-the-double calling form: it hands back both faces and
+                // this operator settles the overlap.
+                let face_count_before = self.face_count();
+                match self.faces_join_report_double(&region) {
+                    Some(outcome) => {
+                        // §4.2 — the operator's half of the double: kill the fresh
+                        // union, adopt the pre-existing face, report *that* one.
+                        let (surviving, doubles) = match outcome.double {
+                            Some(shadow) => {
+                                self.face_kill(outcome.union);
+                                (shadow, 1)
+                            }
+                            None => (outcome.union, 0),
+                        };
+
+                        // §5 — the mark comes off the region's *result*, whichever
+                        // face that turned out to be. On the double path that is
+                        // the adopted pre-existing face, which may itself be a
+                        // still-marked §4.1.4 survivor of an earlier region: once
+                        // it is this region's merge result it is a live output, and
+                        // the mop-up must spare it. (On the plain path the mint
+                        // carries no mark anyway — a recycled slot's op flags are
+                        // zeroed at creation — so the clear is a guard there.)
+                        self.face_op_flag_clear(orig, surviving, 0);
+                        result.region.push(surviving);
+
+                        // §5's survivor detector. The expectation is the naive
+                        // "`n` faces in, one union out" (−(n − 1)), less one more
+                        // for a double (whose union we just killed). The join only
+                        // ever *adds* the union and *removes* input faces of this
+                        // region, so an overshoot means it left survivors standing
+                        // (§4.1.4) and the mop-up has work to do. Subtracting the
+                        // double from the *expectation* — rather than reading it
+                        // as a survivor's opposite — is what keeps the detector
+                        // exact: it fires on one survivor whether or not the region
+                        // also doubled.
+                        let expected_face_count = face_count_before - (region.len() - 1) - doubles;
+                        if self.face_count() > expected_face_count {
+                            has_survivors = true;
+                        }
+                    }
+                    None => {
+                        // Failed merges (§4.3) leave the region's input faces
+                        // intact — unmark them so the mop-up spares them — and
+                        // contribute nothing to `region.out`.
+                        for &face in &region {
+                            self.face_op_flag_clear(orig, face, 0);
+                        }
+                    }
+                }
             }
 
+            // §5 — the mop-up runs once, *after every region*, never inside
+            // the region loop. A survivor of region A is alive precisely
+            // because it sits on a keep-alive chord, and later regions
+            // classify that chord by counting the faces *currently* on it:
+            // killing the survivor early would shorten the chord's radial and
+            // flip it from keep-alive to killable for region B.
+            if has_survivors {
+                self.dissolve_faces_kill_marked_survivors(orig);
+            }
+
+            self.pop_face_op_flag_layer(orig);
             self.pop_face_op_flag_layer(visited);
             self.pop_face_op_flag_layer(in_input);
         }
@@ -123,6 +189,35 @@ impl LoopMesh {
         }
 
         result
+    }
+
+    /// §5 — delete the input faces the joins left alive. Sweeping *live* faces
+    /// and testing the mark is the only sound liveness probe here: a face key
+    /// is a bare slab index, so a key held from before a join may name a slot
+    /// that has since been freed or handed to a fresh face. A recycled slot
+    /// carries no op flags (creation zeroes them), so the mark can only be
+    /// true for a face that was walked into a successful region and never
+    /// died — exactly the §4.1.4 survivors.
+    ///
+    /// The removal is a **faces**-context delete (§5.2, `DELETE.md` §4.2), not a
+    /// faces-only kill. A survivor's keep-alive interior edges were spared by
+    /// its own region's join on the strength of faces *outside that region* —
+    /// a guarantee that expires the moment those faces are themselves consumed
+    /// by another region. Whether such an edge outlives the *operator* is
+    /// therefore decided here, by whether any face at all is still on it: the
+    /// delete dooms the survivors' boundary, un-dooms whatever a surviving face
+    /// or a surviving edge still holds, and sweeps the rest. That is what stops
+    /// an emptied chord from standing as a wire edge (and an emptied vert as a
+    /// loose point).
+    fn dissolve_faces_kill_marked_survivors(&mut self, marked: crate::op_flags::FaceOpFlagLayer) {
+        let mut survivors: SmallVec<[FaceKey; 4]> = SmallVec::new();
+        let mut iter = MeshFaces::default();
+        while let Some(face) = iter.next(self) {
+            if self.face_op_flag_test(marked, face, 0) {
+                survivors.push(face);
+            }
+        }
+        self.delete(survivors.as_slice(), DeleteContext::Faces);
     }
 
     /// §6.1 predicate — true iff `v` has exactly two incident edges.
@@ -1027,6 +1122,443 @@ mod tests {
         assert_eq!(mesh.vertex_count(), v0_count, "mesh unchanged");
         assert_eq!(mesh.edge_count(), e0_count, "mesh unchanged");
         assert_eq!(mesh.face_count(), f0_count, "mesh unchanged");
+        mesh.validate_topology();
+    }
+
+    /// §4.1.4's row-of-three fixture: three quads in a row whose two interior
+    /// edges are one genuinely manifold edge (`{1,4}`) and one radial-4 chord
+    /// (`{2,3}`, which two out-of-region fins also use). Returns
+    /// `(verts[12], [f0, f1, f2, fin_a, fin_b])`; `f2` is the survivor-to-be —
+    /// its only interior edge is the kept-alive chord, so no kill reaches it.
+    ///
+    /// The region's boundary ring is the octagon `[0, 1, 2, 6, 7, 3, 4, 5]`.
+    /// Counts: 12 V, 16 E, 5 F.
+    fn build_quad_row_with_nonmanifold_chord(
+        mesh: &mut LoopMesh,
+    ) -> (Vec<VertexKey>, [FaceKey; 5]) {
+        let coords: [(f32, f32, f32); 12] = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (3.0, 0.0, 0.0),
+            (3.0, 1.0, 0.0),
+            (2.0, 0.0, 1.0),
+            (2.0, 1.0, 1.0),
+            (2.0, 0.0, -1.0),
+            (2.0, 1.0, -1.0),
+        ];
+        let v: Vec<VertexKey> = coords
+            .into_iter()
+            .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+            .collect();
+        let mut quad = |mesh: &mut LoopMesh, ring: [usize; 4]| -> FaceKey {
+            let verts: Vec<VertexKey> = ring.iter().map(|&i| v[i]).collect();
+            mesh.face_create_verts(&verts, FaceCreateFlags::NONE)
+        };
+        let f0 = quad(mesh, [0, 1, 4, 5]);
+        let f1 = quad(mesh, [1, 2, 3, 4]);
+        let f2 = quad(mesh, [2, 6, 7, 3]);
+        let fin_a = quad(mesh, [2, 3, 9, 8]);
+        let fin_b = quad(mesh, [3, 2, 10, 11]);
+
+        (v, [f0, f1, f2, fin_a, fin_b])
+    }
+
+    /// §5 — the join-survivor mop-up, on §4.1.4's row-of-three fixture. The join
+    /// leaves `f2` alive (its only interior edge is the kept-alive radial-4
+    /// chord) and the union overlapping it; the operator's cleanup pass deletes
+    /// that survivor, so the *operator*'s face delta is the naive `-(n-1)` even
+    /// though the primitive's underneath it is not. The chord and the survivor's
+    /// boundary edges are untouched by the delete — it kills the face only.
+    #[test]
+    fn dissolve_faces_deletes_the_join_survivor_of_a_kept_alive_chord() {
+        let mut mesh = LoopMesh::new();
+        let (v, [f0, f1, f2, fin_a, fin_b]) = build_quad_row_with_nonmanifold_chord(&mut mesh);
+        assert_eq!(mesh.face_count(), 5);
+
+        let result = mesh.dissolve_faces(&[f0, f1, f2], DissolveFacesOptions::default());
+
+        assert_eq!(result.region.len(), 1, "one region, one merge");
+        let union = result.region[0];
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(
+            !live.contains(&f2),
+            "§5 deletes the join's survivor, which the union overlapped"
+        );
+        assert!(
+            live.contains(&fin_a) && live.contains(&fin_b),
+            "the fins are untouched"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 15, 3),
+            "the operator's delta is the naive -(n-1) F: union + the two fins"
+        );
+        assert_eq!(
+            mesh.face_vert_keys(union).len(),
+            8,
+            "the union is still the row-spanning octagon"
+        );
+
+        // The mop-up's faces-context delete (§5.2) sweeps only what the survivor
+        // solely owned, and it owned nothing solely: its boundary edges are on the
+        // union's perimeter, and the chord still carries both fins — so the sweep
+        // un-dooms every one of them and the delete takes the face alone. Contrast
+        // the multi-region fixture below, where the chord *is* emptied and swept.
+        let chord = mesh
+            .query_edge_exists(v[2], v[3])
+            .expect("the chord survives — the fins are still on it");
+        assert_eq!(
+            mesh.edge_face_keys(chord).len(),
+            2,
+            "only the fins remain on it"
+        );
+        assert!(mesh.query_edge_exists(v[6], v[7]).is_some());
+
+        mesh.validate_topology();
+    }
+
+    /// §5's detector, on the one input that separates "expected = naive" from
+    /// "expected = naive − d": a region that leaves **both** a §4.1.4 survivor
+    /// and a §4.2 double.
+    ///
+    /// §4.1.4's row-of-three, plus a pre-existing octagon laid over the region's
+    /// boundary ring. The ring edges each still carry exactly one input face, so
+    /// classification is untouched — `{1,4}` is collected, the chord is kept
+    /// alive, `f2` survives — and the union the join mints coincides with the
+    /// octagon, so the join reports it as a double and the operator adopts it.
+    ///
+    /// One survivor (`s = 1`) and one double (`d = 1`) cancel out against the
+    /// *naive* `−(n − 1)` count: the mesh lands exactly where "n in, 1 out"
+    /// predicts, and a detector that compares against the naive count alone sees
+    /// no mismatch, never fires, and leaves `f2` standing under the adopted
+    /// octagon. Pricing the double into the expectation restores the signal.
+    #[test]
+    fn dissolve_faces_survivor_and_double_in_the_same_region() {
+        let mut mesh = LoopMesh::new();
+        let (v, [f0, f1, f2, fin_a, fin_b]) = build_quad_row_with_nonmanifold_chord(&mut mesh);
+
+        let ring: Vec<VertexKey> = [0, 1, 2, 6, 7, 3, 4, 5].iter().map(|&i| v[i]).collect();
+        let octagon = mesh.face_create_verts(&ring, FaceCreateFlags::NONE);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 16, 6),
+            "the octagon reuses the eight ring edges — it adds a face and nothing else"
+        );
+
+        let result = mesh.dissolve_faces(&[f0, f1, f2], DissolveFacesOptions::default());
+
+        assert_eq!(result.region.len(), 1, "one region, one merge");
+        assert_eq!(
+            result.region[0], octagon,
+            "§4.2: the fresh union dies and the pre-existing octagon is reported"
+        );
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert_eq!(
+            live,
+            [octagon, fin_a, fin_b].into_iter().collect(),
+            "the double's survivor is mopped up too — nothing overlaps the adopted octagon"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 15, 3),
+            "-1 E ({{1,4}}); -3 F: the three inputs go, the adopted octagon stays"
+        );
+
+        // Same as the survivor-only case: the survivor solely owned nothing, so
+        // the §5.2 sweep un-dooms its whole boundary and the delete takes the
+        // face alone.
+        let chord = mesh
+            .query_edge_exists(v[2], v[3])
+            .expect("the chord survives — the fins still need it");
+        assert_eq!(
+            mesh.edge_face_keys(chord).len(),
+            2,
+            "only the fins remain on it"
+        );
+        assert_eq!(
+            mesh.face_vert_keys(octagon).len(),
+            8,
+            "the adopted octagon keeps its own perimeter"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// §5 — the mop-up is a *single pass after every region*, not a per-region
+    /// one. Two regions share a chord; region A leaves a survivor on it
+    /// (§4.1.4), and region B classifies the same chord by the faces then on
+    /// it. With A's survivor still standing the chord carries three faces
+    /// (survivor + B's two) → total > 2 → keep-alive (§4.1.3), so B leaves it
+    /// in place. Kill the survivor before B runs and the chord drops to two
+    /// faces → B collects it into `kill_edges` and destroys an edge the
+    /// reference keeps.
+    ///
+    /// Fixture (topology; coordinates are only there to make the mesh legal):
+    ///
+    /// - Three quads `fa0`, `fa1`, `fs` fan around a centre vert `c`, tiling a
+    ///   hexagon. `fa0`/`fa1` share spoke `{c,d}` (genuinely manifold → killed
+    ///   → both die). `fa1`/`fs` share spoke `{c,b}`, which an out-of-input
+    ///   triangle `x` also uses → keep-alive → crossable by the walker (input
+    ///   count 2) but collected by nobody. `fs`/`fa0` share the **chord**
+    ///   `{c,a}`.
+    /// - Two quads `g0`, `g1` also sit on that chord and additionally share
+    ///   the manifold edge `{a,s}` with each other — that edge is what makes
+    ///   them a region of their own (the chord itself carries four input faces,
+    ///   so the §3.3 "exactly two" gate refuses to cross it).
+    ///
+    /// So `fs` is region A's survivor: both its interior edges are keep-alive.
+    #[test]
+    fn dissolve_faces_survivor_of_one_region_survives_until_all_regions_done() {
+        let mut mesh = LoopMesh::new();
+        let coords: [(f32, f32, f32); 11] = [
+            (0.0, 0.0, 0.0),     // 0: c — hexagon centre
+            (1.0, 0.0, 0.0),     // 1: a — chord endpoint
+            (0.5, 0.866, 0.0),   // 2: p
+            (-0.5, 0.866, 0.0),  // 3: b
+            (-1.0, 0.0, 0.0),    // 4: q
+            (-0.5, -0.866, 0.0), // 5: d
+            (0.5, -0.866, 0.0),  // 6: r
+            (-0.25, 0.433, 1.0), // 7: x — apex of the out-of-input triangle
+            (1.5, -1.0, 0.0),    // 8: s
+            (0.5, -1.2, 1.0),    // 9: t
+            (0.5, -1.2, -1.0),   // 10: u
+        ];
+        let v: Vec<VertexKey> = coords
+            .into_iter()
+            .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+            .collect();
+        let (c, a, p, b, q, d, r, x, s, t, u) = (
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10],
+        );
+        let mut face = |mesh: &mut LoopMesh, ring: &[VertexKey]| -> FaceKey {
+            mesh.face_create_verts(ring, FaceCreateFlags::NONE)
+        };
+        let fs = face(&mut mesh, &[c, a, p, b]);
+        let fa1 = face(&mut mesh, &[c, b, q, d]);
+        let fa0 = face(&mut mesh, &[c, d, r, a]);
+        let f_out = face(&mut mesh, &[b, c, x]);
+        let g0 = face(&mut mesh, &[c, a, s, t]);
+        let g1 = face(&mut mesh, &[a, c, u, s]);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (11, 16, 6)
+        );
+        let chord = mesh
+            .query_edge_exists(c, a)
+            .expect("the shared chord {c,a} exists");
+        assert_eq!(
+            mesh.edge_face_keys(chord).len(),
+            4,
+            "the chord carries both of region A's faces and both of region B's"
+        );
+
+        let result = mesh.dissolve_faces(&[fa0, fa1, fs, g0, g1], DissolveFacesOptions::default());
+
+        assert_eq!(result.region.len(), 2, "two regions, two successful merges");
+
+        // Identify the live faces positively: the two unions plus the
+        // out-of-input triangle, and nothing else. (Comparing against the dead
+        // input keys would be unsound — a union minted after a kill can be
+        // handed the dead face's recycled slot.)
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        let expected_live: std::collections::HashSet<FaceKey> =
+            [result.region[0], result.region[1], f_out]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            live, expected_live,
+            "region A's survivor is mopped up — but only after region B ran"
+        );
+        assert_eq!(
+            mesh.face_vert_keys(f_out).len(),
+            3,
+            "the out-of-input triangle is untouched"
+        );
+
+        // The load-bearing assertion: region B saw a three-face chord (A's
+        // survivor plus its own two) and left it alone as keep-alive. A
+        // per-region mop-up would have shortened it to two, B would have
+        // collected it into `kill_edges`, and its cascade would have run
+        // through it — a different classification, and a different union
+        // perimeter in the general case.
+        //
+        // The chord nevertheless does not outlive the operator: once the
+        // survivor — its last remaining face — is deleted, the §5 faces-context
+        // sweep (§5.2) takes the emptied edge with it rather than leaving a
+        // wire edge behind. Its endpoints live: `c` still sits on region B's
+        // union and the spoke to the triangle, `a` on the hexagon rim.
+        assert!(
+            mesh.query_edge_exists(c, a).is_none(),
+            "the chord is emptied by the survivor's deletion and swept with it"
+        );
+        assert!(
+            mesh.query_edge_exists(c, b).is_some(),
+            "the keep-alive spoke keeps the out-of-input triangle on it, so it stays"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (11, 13, 3),
+            "-3 E: {{c,d}} (region A's join), {{a,s}} (region B's join), and the \
+             chord (§5's sweep). No vert dies. -3 F: 5 input faces → 2 unions"
+        );
+
+        let hexagon = result.region[0];
+        assert_eq!(
+            mesh.face_vert_keys(hexagon).len(),
+            6,
+            "region A's union spans the whole hexagon rim"
+        );
+        assert_eq!(
+            mesh.face_vert_keys(result.region[1]).len(),
+            4,
+            "region B's union is the quad on its four boundary edges"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// §5.2's second corollary: the survivor's deletion can orphan a **vertex**,
+    /// and the faces-context sweep takes it too. Same mechanism as the orphaned
+    /// chord — no extra machinery — but it needs a hub whose *entire* disk either
+    /// dies in a join or empties out with the survivor.
+    ///
+    /// Fixture. `w` is the hub of a three-triangle wheel with rim `c, g, a`:
+    /// `fs = (w,a,c)`, `m1 = (w,c,g)`, `m2 = (w,g,a)`. Region A also takes the
+    /// quad `m0 = (a,c,g,z)` hanging off the rim.
+    ///
+    /// - `{w,c}` and `{w,a}` are **chords**: each carries two of region A's faces
+    ///   *and* two faces of a two-quad region of its own (B on `{w,c}`, C on
+    ///   `{w,a}`) — four input faces, so the §3.3 gate refuses to cross them and
+    ///   both classify keep-alive for every region that sees them.
+    /// - `{a,c}` is the crossable keep-alive spoke that pulls `fs` into region A
+    ///   (`fs` + `m0` in the input, plus the out-of-input triangle `t_out`).
+    /// - `{c,g}` and `{w,g}` are genuinely manifold interior edges of region A →
+    ///   collected → their cascade takes `m0`, `m1`, `m2`. `fs`, whose every edge
+    ///   is keep-alive, survives (§4.1.4).
+    /// - Regions B and C are each a pinch pair sharing a manifold edge **at `w`**
+    ///   (`{w,s_b}`, `{w,s_c}`), so their joins kill those and neither union has
+    ///   `w` on its perimeter.
+    ///
+    /// So when §5 deletes `fs`, both chords are emptied — and they were `w`'s last
+    /// two edges. A faces-only kill would leave two wire edges *and* a loose point.
+    #[test]
+    fn dissolve_faces_survivor_deletion_orphans_a_vert_which_is_swept_too() {
+        let mut mesh = LoopMesh::new();
+        let coords: [(f32, f32, f32); 12] = [
+            (0.0, 0.0, 0.0),     // 0: w — the wheel hub
+            (1.0, 0.0, 0.0),     // 1: c
+            (-0.5, 0.866, 0.0),  // 2: g
+            (-0.5, -0.866, 0.0), // 3: a
+            (-0.2, 0.0, 1.5),    // 4: z
+            (0.5, -0.5, -1.0),   // 5: x  — apex of the out-of-input triangle
+            (0.8, 0.9, 1.2),     // 6: s_b
+            (1.2, 0.2, 1.0),     // 7: t_b
+            (1.2, 0.2, -1.0),    // 8: u_b
+            (-1.0, -1.2, 1.0),   // 9: s_c
+            (-0.8, -0.6, 1.2),   // 10: t_c
+            (-0.8, -0.6, -1.2),  // 11: u_c
+        ];
+        let v: Vec<VertexKey> = coords
+            .into_iter()
+            .map(|(x, y, z)| mesh.create_vertex(Vec3::new(x, y, z)))
+            .collect();
+        let (w, c, g, a, z, x, s_b, t_b, u_b, s_c, t_c, u_c) = (
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+        );
+        let mut face = |mesh: &mut LoopMesh, ring: &[VertexKey]| -> FaceKey {
+            mesh.face_create_verts(ring, FaceCreateFlags::NONE)
+        };
+        let fs = face(&mut mesh, &[w, a, c]);
+        let m0 = face(&mut mesh, &[a, c, g, z]);
+        let m1 = face(&mut mesh, &[w, c, g]);
+        let m2 = face(&mut mesh, &[w, g, a]);
+        let t_out = face(&mut mesh, &[a, c, x]);
+        let b0 = face(&mut mesh, &[c, w, s_b, t_b]);
+        let b1 = face(&mut mesh, &[w, c, u_b, s_b]);
+        let c0 = face(&mut mesh, &[a, w, s_c, t_c]);
+        let c1 = face(&mut mesh, &[w, a, u_c, s_c]);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 20, 9)
+        );
+        let chord_wc = mesh.query_edge_exists(w, c).expect("chord {w,c}");
+        let chord_wa = mesh.query_edge_exists(w, a).expect("chord {w,a}");
+        assert_eq!(
+            mesh.edge_face_keys(chord_wc).len(),
+            4,
+            "{{w,c}} is radial-4"
+        );
+        assert_eq!(
+            mesh.edge_face_keys(chord_wa).len(),
+            4,
+            "{{w,a}} is radial-4"
+        );
+        assert_eq!(
+            mesh.vert_edge_keys(w).len(),
+            5,
+            "w's disk: the two chords, the wheel spoke {{w,g}}, and B's and C's \
+             own manifold edges"
+        );
+
+        let result = mesh.dissolve_faces(
+            &[fs, m0, m1, m2, b0, b1, c0, c1],
+            DissolveFacesOptions::default(),
+        );
+
+        assert_eq!(result.region.len(), 3, "regions A, B and C each merge");
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        let expected_live: std::collections::HashSet<FaceKey> =
+            [result.region[0], result.region[1], result.region[2], t_out]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            live, expected_live,
+            "three unions plus the out-of-input triangle; region A's survivor is mopped up"
+        );
+
+        // The sweep's two halves: the emptied chords go, and w — whose last two
+        // edges they were — goes with them. (w is dead, so probe it only through
+        // the live-key listings; a disk walk from a freed vert is not a query,
+        // it is a use-after-free.)
+        let live_verts: std::collections::HashSet<VertexKey> =
+            mesh.vert_keys().into_iter().collect();
+        assert!(
+            !live_verts.contains(&w),
+            "w is left with an empty disk by the chord sweep, so the vert sweep takes it"
+        );
+        assert!(
+            live_verts.contains(&c) && live_verts.contains(&a),
+            "the chords' other endpoints keep other edges and survive"
+        );
+        for edge in mesh.edge_keys() {
+            let [e0, e1] = mesh.edge_vert_keys(edge);
+            assert!(
+                e0 != w && e1 != w,
+                "no edge may still reference w — both chords were swept"
+            );
+        }
+        assert!(
+            mesh.query_edge_exists(a, c).is_some(),
+            "the survivor's third edge keeps the out-of-input triangle on it and stays"
+        );
+
+        // -6 E: {c,g} and {w,g} (region A's join), {w,s_b} (B's), {w,s_c} (C's),
+        // and the two swept chords. -1 V: w. -5 F: 8 input faces → 3 unions.
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (11, 14, 4)
+        );
+
         mesh.validate_topology();
     }
 }
