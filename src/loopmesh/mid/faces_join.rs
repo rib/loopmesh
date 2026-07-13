@@ -132,11 +132,7 @@ impl LoopMesh {
     /// [`LoopMesh::faces_join`] with the §4.1.6 `delete` axis exposed. See
     /// [`FacesJoinDelete`] for what the axis actually selects — it is *not*
     /// "delete the input faces or not".
-    pub fn faces_join_ex(
-        &mut self,
-        faces: &[FaceKey],
-        delete: FacesJoinDelete,
-    ) -> Option<FaceKey> {
+    pub fn faces_join_ex(&mut self, faces: &[FaceKey], delete: FacesJoinDelete) -> Option<FaceKey> {
         // §4.1.6's arity guard, ahead of the mode fork: an empty array is a
         // caller error, and a one-face array is an identity no-op that mints no
         // union and kills nothing — in *either* mode — handing the input handle
@@ -1729,7 +1725,10 @@ mod tests {
                 (9, 12, 4),
                 "nothing was killed and nothing was minted ({delete:?})"
             );
-            assert!(mesh.faces_join_ex(&[], delete).is_none(), "empty is rejected");
+            assert!(
+                mesh.faces_join_ex(&[], delete).is_none(),
+                "empty is rejected"
+            );
 
             mesh.validate_topology();
         }

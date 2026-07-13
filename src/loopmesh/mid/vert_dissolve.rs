@@ -15,7 +15,9 @@ impl LoopMesh {
     ///
     /// A vertex whose shape is **unsupported** (non-manifold disk, wire/face
     /// mix, three or more boundary spokes, a fan with no interior spoke, a fan
-    /// pinched by a face that uses one spoke twice) is refused before any
+    /// pinched by a face that uses one spoke twice, a fan whose faces are not
+    /// consistently wound, or a *multi-fan* — faces at `v` that no chain of
+    /// interior spokes connects) is refused before any
     /// mutation: `false`, mesh unchanged. Every *other* `false` is
     /// **destructive** — the fan has already been merged, wholly or down to the
     /// two faces hinged on the reserved keep spoke (§6.7's `R` table).
@@ -96,14 +98,138 @@ impl LoopMesh {
             .iter()
             .zip(&radial_counts)
             .any(|(&e, &count)| count == 2 && self.spoke_face_pair(e).is_none());
-        if no_non_manifold_no_wire && boundary_spokes <= 2 && has_interior_edge && !has_pinched_spoke
+        if no_non_manifold_no_wire
+            && boundary_spokes <= 2
+            && has_interior_edge
+            && !has_pinched_spoke
+            && self.vert_fan_walk_covers_disk(v, &edges)
         {
             return self.vert_dissolve_manifold_disk(v);
         }
 
         // Anything else (pure-boundary fan with no shared edges, non-manifold
-        // edges, wire/face mix, bowtie): refuse.
+        // edges, wire/face mix, bowtie, multi-fan): refuse.
         false
+    }
+
+    /// §3's connectivity clause, decided by §3.1's **fan walk**: from the disk
+    /// anchor's radial entry, step face-to-face across `v`'s interior spokes and
+    /// require the walk to reach **every** face incident at `v` and **every**
+    /// spoke of `v`'s disk.
+    ///
+    /// The spoke *counts* alone are connectivity-blind. A closed fan plus a lone
+    /// face touching `v` at `v` only satisfies every count clause (all radial in
+    /// {1, 2}, two boundary spokes, an interior spoke present, nothing pinched)
+    /// and is still a multi-fan, which the disk-dissolve schedule must refuse —
+    /// otherwise it merges a *disconnected* region and the "refused before any
+    /// mutation" contract breaks.
+    ///
+    /// A fully-interior fan closes back on its first loop; a boundary fan is an
+    /// open chain, so the walk runs both ways out of the start face and stops at
+    /// each boundary spoke. Both are single fans, and both cover their disk.
+    ///
+    /// **Winding is part of the predicate, by decision.** The step across an
+    /// interior spoke maps to the far face's corner at `v` assuming the spoke's
+    /// two loops run in *opposite* directions — i.e. the fan is consistently
+    /// wound. A fan that is not (a neighbour flipped relative to its peers) has
+    /// no consistent join order for its spokes: every pairwise merge across a
+    /// spoke would meet the shared edge in the same direction, which is not a
+    /// join the disk-dissolve schedule can consume. The walk therefore fails to
+    /// cover such a fan and `vert_dissolve` refuses it, untouched, rather than
+    /// stalling half-way through a destructive merge. This is a refusal §3 does
+    /// not name; it is chosen here, not emergent.
+    fn vert_fan_walk_covers_disk(&self, v: VertexKey, disk: &[EdgeKey]) -> bool {
+        let Some(start_loop) = disk
+            .iter()
+            .find_map(|&spoke| self.edge_radial_entry(spoke))
+            .and_then(|entry| self.loop_at_vertex(entry, v))
+        else {
+            return false;
+        };
+
+        let mut walked_faces: smallvec::SmallVec<[FaceKey; 8]> = smallvec::SmallVec::new();
+        let mut walked_spokes: smallvec::SmallVec<[EdgeKey; 8]> = smallvec::SmallVec::new();
+        let mut record = |mesh: &Self, l: LoopKey| {
+            let face = mesh.loop_face(l);
+            if !walked_faces.contains(&face) {
+                walked_faces.push(face);
+            }
+            for spoke in [mesh.loop_edge(l), mesh.loop_edge(mesh.loop_prev(l))] {
+                if !walked_spokes.contains(&spoke) {
+                    walked_spokes.push(spoke);
+                }
+            }
+        };
+
+        // Forward: cross the spoke that *enters* v in this face (the prev loop's
+        // edge), as §3.1's walk does.
+        let mut closed = false;
+        let mut current = start_loop;
+        for _ in 0..=disk.len() {
+            record(self, current);
+            let Some(next) = self.fan_step_across(self.loop_prev(current), v) else {
+                break;
+            };
+            if next == start_loop {
+                closed = true;
+                break;
+            }
+            current = next;
+        }
+
+        // Open (boundary) fan: the forward sweep ran off one outline edge, so the
+        // rest of the chain hangs off the start face's other spoke.
+        if !closed {
+            let mut current = start_loop;
+            for _ in 0..=disk.len() {
+                let Some(next) = self.fan_step_across(current, v) else {
+                    break;
+                };
+                if next == start_loop {
+                    break;
+                }
+                current = next;
+                record(self, current);
+            }
+        }
+
+        let mut faces_at_vert = smallvec::SmallVec::<[FaceKey; 8]>::new();
+        for &spoke in disk {
+            for face in self.spoke_faces(spoke) {
+                if !faces_at_vert.contains(&face) {
+                    faces_at_vert.push(face);
+                }
+            }
+        }
+
+        faces_at_vert.iter().all(|face| walked_faces.contains(face))
+            && disk.iter().all(|spoke| walked_spokes.contains(spoke))
+    }
+
+    /// Cross the spoke `spoke_loop` sits on, into the face on its other side, and
+    /// come back holding *that* face's corner at `v`. `None` when the spoke is a
+    /// boundary (nothing on the far side), is radial-≥3, or flanks the same face
+    /// twice — none of which the fan walk can step over.
+    fn fan_step_across(&self, spoke_loop: LoopKey, v: VertexKey) -> Option<LoopKey> {
+        let across = self.loop_radial_next(spoke_loop);
+        if across == spoke_loop || self.loop_radial_next(across) != spoke_loop {
+            return None;
+        }
+        if self.loop_face(across) == self.loop_face(spoke_loop) {
+            return None;
+        }
+        self.loop_at_vertex(across, v)
+    }
+
+    /// The corner at `v` of `l`'s face, given a loop of that face that lies on an
+    /// edge incident at `v` — `l` itself when it starts at `v`, otherwise its
+    /// successor (which does, since the two span the edge).
+    fn loop_at_vertex(&self, l: LoopKey, v: VertexKey) -> Option<LoopKey> {
+        if self.loop_vertex(l) == v {
+            return Some(l);
+        }
+        let next = self.loop_next(l);
+        (self.loop_vertex(next) == v).then_some(next)
     }
 
     /// Inner: dissolve a vertex whose incident edges are all boundary
@@ -394,7 +520,10 @@ impl LoopMesh {
         let mut loops = self.face_loops(face);
         while let Some(l) = loops.next(self) {
             let here = self.loops.get(l).vertex;
-            let there = self.loops.get(self.loops.get(l).face_loop_links.next).vertex;
+            let there = self
+                .loops
+                .get(self.loops.get(l).face_loop_links.next)
+                .vertex;
             if (here == a && there == b) || (here == b && there == a) {
                 return true;
             }
@@ -767,7 +896,11 @@ mod tests {
                 k + 2,
                 "k = {k}: apex and rim all survive"
             );
-            assert_eq!(mesh.edge_count(), k + 2, "k = {k}: every interior spoke went");
+            assert_eq!(
+                mesh.edge_count(),
+                k + 2,
+                "k = {k}: every interior spoke went"
+            );
             assert_eq!(
                 disk_valence(&mesh, apex),
                 2,
@@ -928,6 +1061,221 @@ mod tests {
             8,
             "half B ({{f5, f8}}, donor f8) completes last"
         );
+        mesh.validate_topology();
+    }
+
+    /// Attach a triangle that meets `v` at `v` alone (its other two verts are
+    /// fresh), turning `v`'s disk into a **multi-fan**: the counts still read
+    /// like a boundary fan (radial 1 or 2 everywhere, two boundary spokes, an
+    /// interior spoke present, nothing pinched), but no chain of interior spokes
+    /// bridges the loose triangle to the rest.
+    fn attach_loose_triangle(mesh: &mut LoopMesh, v: VertexKey) -> FaceKey {
+        let a = mesh.create_vertex(Vec3::new(5.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(5.0, 1.0, 0.0));
+        face_from_ring(mesh, &[v, a, b])
+    }
+
+    /// §3 / §3.1 — the manifold-fan predicate is not a count: a closed fan plus a
+    /// triangle touching the apex at the apex only passes every count clause and
+    /// is still a multi-fan. The fan walk refuses it, and refuses it **before any
+    /// mutation** — whichever of the two sub-fans the disk anchor happens to sit
+    /// in (build the loose triangle after the fan, and before it).
+    #[test]
+    fn vert_dissolve_multi_fan_is_refused_before_any_mutation() {
+        for loose_first in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let apex = if loose_first {
+                let apex = mesh.create_vertex(Vec3::ZERO);
+                attach_loose_triangle(&mut mesh, apex);
+                let rim: Vec<VertexKey> = (0..3)
+                    .map(|i| {
+                        let theta = std::f32::consts::TAU * (i as f32) / 3.0;
+                        mesh.create_vertex(Vec3::new(theta.cos(), theta.sin(), 0.0))
+                    })
+                    .collect();
+                for i in 0..3 {
+                    face_from_ring(&mut mesh, &[apex, rim[i], rim[(i + 1) % 3]]);
+                }
+                apex
+            } else {
+                let (apex, _faces) = build_disk_fan(&mut mesh, 3);
+                attach_loose_triangle(&mut mesh, apex);
+                apex
+            };
+
+            let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+            assert_eq!(before, (6, 9, 4));
+            assert_eq!(disk_valence(&mesh, apex), 5);
+
+            assert!(
+                !mesh.vert_dissolve(apex),
+                "loose_first = {loose_first}: a multi-fan is not a manifold fan"
+            );
+
+            assert_eq!(
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                before,
+                "loose_first = {loose_first}: refusal is before any mutation"
+            );
+            assert_eq!(disk_valence(&mesh, apex), 5);
+            mesh.validate_topology();
+        }
+    }
+
+    /// Attach a closed `n`-triangle cone to an existing apex `v`, its rim lifted
+    /// to `z` so the two cones of a double cone are distinguishable. Same ring
+    /// order as `build_disk_fan`, so every spoke it adds is interior.
+    fn attach_closed_cone(mesh: &mut LoopMesh, v: VertexKey, n: usize, z: f32) -> Vec<FaceKey> {
+        let rim: Vec<VertexKey> = (0..n)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * (i as f32) / (n as f32);
+                mesh.create_vertex(Vec3::new(theta.cos(), theta.sin(), z))
+            })
+            .collect();
+        (0..n)
+            .map(|i| face_from_ring(mesh, &[v, rim[i], rim[(i + 1) % n]]))
+            .collect()
+    }
+
+    /// §3 / §3.1 — the **all-interior** multi-fan: two closed cones meeting only
+    /// at the apex (the pinch vertex / double cone). Unlike the loose-triangle
+    /// multi-fan, this shape passes every count clause *vacuously* — every spoke
+    /// is radial-2, there are **zero** boundary spokes, an interior spoke exists,
+    /// nothing is pinched — so the fan walk is the only thing refusing it: it
+    /// closes on the cone holding the disk anchor and never reaches the other.
+    /// Built in both cone orders, so the anchor lands once in each cone.
+    #[test]
+    fn vert_dissolve_double_cone_is_refused_before_any_mutation() {
+        for upper_first in [false, true] {
+            let mut mesh = LoopMesh::new();
+            let apex = mesh.create_vertex(Vec3::ZERO);
+            let (first_z, second_z) = if upper_first {
+                (1.0, -1.0)
+            } else {
+                (-1.0, 1.0)
+            };
+            attach_closed_cone(&mut mesh, apex, 3, first_z);
+            attach_closed_cone(&mut mesh, apex, 3, second_z);
+
+            let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+            assert_eq!(before, (7, 12, 6));
+            assert_eq!(disk_valence(&mesh, apex), 6);
+            // The vacuity that makes this the walk's own test case: no count
+            // clause objects to it.
+            let disk = collect_iter::<_, 8>(&mesh, mesh.disk_edges(apex));
+            for &spoke in disk.iter() {
+                assert_eq!(
+                    mesh.edge_radial_len_capped(spoke, 3),
+                    2,
+                    "upper_first = {upper_first}: every spoke of a double cone is interior"
+                );
+                assert!(mesh.spoke_face_pair(spoke).is_some(), "and none is pinched");
+            }
+            assert!(
+                !mesh.vert_fan_walk_covers_disk(apex, &disk),
+                "upper_first = {upper_first}: the walk covers one cone, not the disk"
+            );
+
+            assert!(
+                !mesh.vert_dissolve(apex),
+                "upper_first = {upper_first}: a double cone is not a manifold fan"
+            );
+
+            assert_eq!(
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                before,
+                "upper_first = {upper_first}: refusal is before any mutation"
+            );
+            assert_eq!(disk_valence(&mesh, apex), 6);
+            mesh.validate_topology();
+        }
+    }
+
+    /// The other side of the same guard: the shapes §3 *does* call manifold fans
+    /// must still walk their whole disk — a fully-interior fan (the walk closes),
+    /// a boundary fan (the walk is open and sweeps both ways out of the start
+    /// face), and the n-gon fan.
+    #[test]
+    fn vert_fan_walk_covers_the_disk_of_every_supported_fan() {
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_disk_fan(&mut mesh, 5);
+        let disk = collect_iter::<_, 8>(&mesh, mesh.disk_edges(apex));
+        assert!(mesh.vert_fan_walk_covers_disk(apex, &disk), "interior fan");
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_disk_fan(&mut mesh, 4);
+        let disk = collect_iter::<_, 8>(&mesh, mesh.disk_edges(apex));
+        assert!(mesh.vert_fan_walk_covers_disk(apex, &disk), "boundary fan");
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_disk_fan_boundary_anchor(&mut mesh, 4);
+        let disk = collect_iter::<_, 8>(&mesh, mesh.disk_edges(apex));
+        assert!(
+            mesh.vert_fan_walk_covers_disk(apex, &disk),
+            "boundary fan whose anchor is an outline spoke — the walk starts on a \
+             boundary-most face and only the reverse sweep covers it"
+        );
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_quad_fan(&mut mesh, 3);
+        let disk = collect_iter::<_, 8>(&mesh, mesh.disk_edges(apex));
+        assert!(mesh.vert_fan_walk_covers_disk(apex, &disk), "n-gon fan");
+    }
+
+    /// §3's other two non-manifold shapes stay no-ops, and stay no-ops for the
+    /// count clauses' own reasons (a bowtie has four boundary spokes; a T-junction
+    /// has a radial-3 spoke) — the fan walk must not have made either reachable.
+    #[test]
+    fn vert_dissolve_bowtie_and_t_junction_stay_no_ops() {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::ZERO);
+        attach_loose_triangle(&mut mesh, apex);
+        attach_loose_triangle(&mut mesh, apex);
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+        assert!(!mesh.vert_dissolve(apex), "bowtie");
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
+        mesh.validate_topology();
+
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::ZERO);
+        let far = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        for i in 0..3 {
+            let wing = mesh.create_vertex(Vec3::new(0.5, 1.0, i as f32));
+            face_from_ring(&mut mesh, &[apex, far, wing]);
+        }
+        let before = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+        assert!(!mesh.vert_dissolve(apex), "T-junction / book spine");
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            before
+        );
+        mesh.validate_topology();
+    }
+
+    /// §3's edge-pair class: a 2-valence corner of a single face collapses through
+    /// JEKV, and never reaches the fan walk at all.
+    #[test]
+    fn vert_dissolve_edge_pair_on_a_face_boundary_collapses() {
+        let mut mesh = LoopMesh::new();
+        let ring: Vec<VertexKey> = [
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .map(|p| mesh.create_vertex(p))
+        .collect();
+        face_from_ring(&mut mesh, &ring);
+
+        assert!(mesh.vert_dissolve(ring[1]));
+
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.edge_count(), 3);
+        assert_eq!(mesh.face_count(), 1);
         mesh.validate_topology();
     }
 
