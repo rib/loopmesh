@@ -5,17 +5,20 @@ impl LoopMesh {
     /// collapsing the surrounding degree-2 chain, or merging its surrounding
     /// face fan and collapsing.
     ///
-    /// Returns `true` on success. An **unsupported** vertex (non-manifold or
-    /// wire/face-mixed disk, pure-boundary fan with no interior spoke, a fan
-    /// pinched by a face that uses one spoke twice) is refused before any
-    /// mutation: `false`, mesh unchanged.
+    /// **The return value is not "was the vertex removed"** (`DISSOLVE_VERTS.md`
+    /// §6.7). On a fan it is the post-merge *split-target adjacency* query of
+    /// §6.6, which is orthogonal to whether `v` survived: a boundary fan whose
+    /// first face is an n-gon merges into one face, leaves `v` standing as a
+    /// 2-valence corner, and still answers `true`; a boundary fan whose first
+    /// face is a triangle reaches the same end state and answers `false`. A
+    /// caller that needs to know whether `v` is gone must re-check `v`.
     ///
-    /// A vertex that *is* supported but whose surgery fails part-way through —
-    /// a join or the final collapse rejecting a shape the pre-classification
-    /// admits — returns `false` with the mesh **partially merged**. That is
-    /// deliberate: the fan surgery is destructive-on-false in this shape
-    /// (`DISSOLVE_VERTS.md` §6.7's UNCHARACTERISED box), so a caller must not
-    /// read `false` as "nothing happened".
+    /// A vertex whose shape is **unsupported** (non-manifold disk, wire/face
+    /// mix, three or more boundary spokes, a fan with no interior spoke, a fan
+    /// pinched by a face that uses one spoke twice) is refused before any
+    /// mutation: `false`, mesh unchanged. Every *other* `false` is
+    /// **destructive** — the fan has already been merged, wholly or down to the
+    /// two faces hinged on the reserved keep spoke (§6.7's `R` table).
     pub fn vert_dissolve(&mut self, v: VertexKey) -> bool {
         // Snapshot v's disk edges + per-edge radial counts in a single walk,
         // off the heap for typical valences.
@@ -74,15 +77,16 @@ impl LoopMesh {
             }
         }
 
-        // The "disk dissolve" algorithm works for any vertex whose disk
-        // contains only boundary (radial=1) and interior (radial=2) edges,
-        // as long as at least one interior edge is present to fold the
-        // surrounding fan down to a degree-2 boundary collapse. This
-        // includes:
-        //   - the pure manifold-interior case (all radial=2)
-        //   - the mixed boundary-fan case (vertex sits on the open edge of
-        //     a strip of faces; some edges boundary, some interior).
+        // The disk-dissolve schedule (§6.7) is the manifold-fan branch, and the
+        // manifold-vert predicate admits boundary spokes: every spoke is
+        // boundary (radial-1) or interior (radial-2), at most two are boundary,
+        // and at least one is interior (a fan with no interior spoke is a
+        // bowtie — nothing bridges its faces). That covers
+        //   - the fully-interior fan (all radial-2), and
+        //   - the boundary fan (two boundary spokes bounding an open chain of
+        //     faces), whose outcome §6.7 indexes by `R`, not by face count.
         let no_non_manifold_no_wire = radial_counts.iter().all(|&c| c == 1 || c == 2);
+        let boundary_spokes = radial_counts.iter().filter(|&&c| c == 1).count();
         let has_interior_edge = radial_counts.iter().any(|&c| c == 2);
         // A radial-2 spoke whose two loops belong to the *same* face pinches the
         // fan: no join can consume it, so the merge walk would stall half-way and
@@ -92,7 +96,8 @@ impl LoopMesh {
             .iter()
             .zip(&radial_counts)
             .any(|(&e, &count)| count == 2 && self.spoke_face_pair(e).is_none());
-        if no_non_manifold_no_wire && has_interior_edge && !has_pinched_spoke {
+        if no_non_manifold_no_wire && boundary_spokes <= 2 && has_interior_edge && !has_pinched_spoke
+        {
             return self.vert_dissolve_manifold_disk(v);
         }
 
@@ -105,22 +110,22 @@ impl LoopMesh {
     /// (radial-1) or interior (radial-2). Caller must have verified the
     /// manifold precondition.
     ///
-    /// A fully-interior fan with a reservable *keep* spoke runs the helper's
-    /// **halves schedule** (`DISSOLVE_VERTS.md` §6.7): two spokes are held out
-    /// of the merge, cutting the face ring into two arcs that are merged
-    /// independently and joined last. That schedule — not §6.3's single
-    /// running-survivor chain — is what fixes the merged n-gon's per-face
-    /// customdata donor for this entry point.
+    /// A fan with a reservable *keep* spoke runs the helper's **reserved-spoke
+    /// schedule** (`DISSOLVE_VERTS.md` §6.7): `base` (the disk anchor) and
+    /// `keep` are held out of the merge scan, and what the collapse then finds
+    /// at `v` decides the outcome. On a fully-interior fan the two reserved
+    /// spokes cut the face ring into two arcs (the *halves*) that merge
+    /// independently and are joined last — that schedule, not §6.3's single
+    /// running-survivor chain, is what fixes the merged n-gon's donor for this
+    /// entry point. On a **boundary** fan the spokes form an open chain rather
+    /// than a ring, and the outcome is indexed by `R` — how many of the two
+    /// reserved spokes are boundary spokes — never by the face count.
     ///
-    /// Everything else (the no-keep low-valence branch, and **every** boundary
-    /// fan, whatever its disk order) keeps the plain "join any radial-2 spoke
-    /// until degree-2, then collapse" walk. That walk fully dissolves a `k ≥ 3`
-    /// boundary fan, where §6.7 records the reference as partially merging and
-    /// reporting failure — an open divergence on an UNCHARACTERISED row, not a
-    /// claim of parity.
+    /// A vertex with no keep spoke (every spoke shares a face with the anchor)
+    /// takes §6.7's low-valence branch: join across the anchor, then collapse.
     fn vert_dissolve_manifold_disk(&mut self, v: VertexKey) -> bool {
         if let Some((base_spoke, keep_spoke)) = self.vert_dissolve_reserved_spokes(v) {
-            return self.vert_dissolve_halves_schedule(v, base_spoke, keep_spoke);
+            return self.vert_dissolve_reserved_schedule(v, base_spoke, keep_spoke);
         }
 
         loop {
@@ -198,54 +203,48 @@ impl LoopMesh {
         true
     }
 
-    /// The two spokes the helper reserves on a fully-interior fan
-    /// (`DISSOLVE_VERTS.md` §6.7): the **base** (`v`'s disk anchor) and the
-    /// **keep** — the first spoke *in disk order* forward from the anchor that
-    /// shares no face with it. Disk order is attachment order, not the
-    /// geometric ring order, so the keep spoke is read off the disk cycle and
-    /// never inferred from the fan's shape.
+    /// The two spokes the helper reserves (`DISSOLVE_VERTS.md` §6.7): the
+    /// **base** (`v`'s disk anchor) and the **keep** — the first spoke *in disk
+    /// order* forward from the anchor that shares no face with it. Disk order is
+    /// attachment order, not the geometric ring order, so the keep spoke is read
+    /// off the disk cycle and never inferred from the fan's shape.
     ///
-    /// `None` unless the **whole disk** is the fully-interior fan §6.7 derives
-    /// the halves model for: every spoke radial-2 between two distinct faces.
-    /// A boundary (radial-1) spoke is never joined by the merge scan, so it
-    /// would still stand at `v` when the collapse runs and the schedule is not
-    /// well-formed — that verdict is a property of the fan, so it must be
-    /// decided over the whole disk and not fall out of where the keep search
-    /// happens to stop. Also `None` when no keep spoke exists (every spoke
-    /// shares a face with the anchor — §6.7's low-valence / no-keep branch).
-    /// Both fall back to the plain merge-then-collapse walk.
+    /// A boundary spoke is an ordinary candidate for either role: whether it
+    /// lands in one is what §6.7's `R` counts, and `R` — not the fan's face
+    /// count — is what decides the boundary fan's outcome. The one build order
+    /// that reserves *both* boundary spokes dissolves the fan cleanly at any
+    /// `k`, so a search that skipped radial-1 spokes could never reach it.
+    ///
+    /// `None` when no keep spoke exists (every spoke shares a face with the
+    /// anchor — §6.7's low-valence / no-keep branch).
     fn vert_dissolve_reserved_spokes(&self, v: VertexKey) -> Option<(EdgeKey, EdgeKey)> {
-        let mut spokes: smallvec::SmallVec<[(EdgeKey, FaceKey, FaceKey); 8]> =
-            smallvec::SmallVec::new();
         let mut disk = self.disk_edges(v);
+        let base_spoke = disk.next(self)?;
+        let base_faces = self.spoke_faces(base_spoke);
         while let Some(spoke) = disk.next(self) {
-            let (face_a, face_b) = self.spoke_face_pair(spoke)?;
-            spokes.push((spoke, face_a, face_b));
+            let faces = self.spoke_faces(spoke);
+            if !faces.is_empty() && !faces.iter().any(|face| base_faces.contains(face)) {
+                return Some((base_spoke, spoke));
+            }
         }
-
-        let &(base_spoke, base_face_a, base_face_b) = spokes.first()?;
-        spokes
-            .iter()
-            .skip(1)
-            .find(|&&(_, face_a, face_b)| {
-                let shares_face_with_base = face_a == base_face_a
-                    || face_a == base_face_b
-                    || face_b == base_face_a
-                    || face_b == base_face_b;
-                !shares_face_with_base
-            })
-            .map(|&(keep_spoke, _, _)| (base_spoke, keep_spoke))
+        None
     }
 
-    /// §6.7 — merge the fan's two halves, collapse `v` along the base spoke,
-    /// then join the halves across the surviving edge.
+    /// §6.7 — the reserved-spoke schedule: merge every unreserved interior
+    /// spoke's faces, then collapse `v` along the base spoke.
+    ///
+    /// Step 1's scan restarts from the anchor after every join and can only fire
+    /// on a radial-2 spoke, so a boundary spoke is never consumed — it is still
+    /// standing at `v` when the collapse runs *unless it was reserved*. That is
+    /// the whole of `R`: the collapse is handed a 2-valence `v` only when both
+    /// boundary spokes were reserved, and what it does with a `v` of any other
+    /// valence depends on which of its two routes step 2 selects.
     ///
     /// The donor of every pairwise join is the **most recently created** of the
     /// two faces flanking the joined spoke, and that face is exactly the one the
     /// spoke's radial **entry** names (§6.3's entry-reseat rule) — so the donor
-    /// is read straight off the entry, both for the fan's joins and for the
-    /// post-collapse one. The entry of the surviving edge is re-read *after* the
-    /// collapse, never cached across it (§6.3, bound 3).
+    /// is read straight off the entry. The entry of any edge is re-read *after*
+    /// each surgery, never cached across one (§6.3, bound 3).
     ///
     /// The reading stays true across joins because the merge used here is the
     /// *composed* (loop-minting) join, whose constructed union enters every
@@ -253,7 +252,7 @@ impl LoopMesh {
     /// the overlapping fans of a repeated coarsening rely on: a merged face that
     /// a later fan re-joins must still score as the newest face on its own
     /// perimeter, not as pristine.
-    fn vert_dissolve_halves_schedule(
+    fn vert_dissolve_reserved_schedule(
         &mut self,
         v: VertexKey,
         base_spoke: EdgeKey,
@@ -281,6 +280,21 @@ impl LoopMesh {
             }
         }
 
+        // Step 2 — the collapse's two routes are mutually exclusive and are
+        // selected by one bit: is the base spoke a boundary edge? (§6.6, §6.7.)
+        if self.edge_radial_len_capped(base_spoke, 2) == 1 {
+            return self.vert_dissolve_collapse_plain(v, base_spoke);
+        }
+        self.vert_dissolve_collapse_joining(v, base_spoke)
+    }
+
+    /// §6.7 step 2, **base is a boundary edge** → the plain join-edge-kill-vert
+    /// route (§6.6). Its precondition *is* a 2-valence `v`, so it fires only
+    /// when both boundary spokes were reserved (`R = 2`) and refuses otherwise —
+    /// leaving the fan merged down to the two faces hinged on the interior keep
+    /// spoke, `v` standing at valence 3, and a `false` that a caller must not
+    /// read as "nothing happened".
+    fn vert_dissolve_collapse_plain(&mut self, v: VertexKey, base_spoke: EdgeKey) -> bool {
         let Some(surviving_edge) = self.vert_collapse_edge(base_spoke, v) else {
             return false;
         };
@@ -288,12 +302,130 @@ impl LoopMesh {
             return true;
         }
 
-        // The final join: both halves sit on the surviving edge, so its entry
-        // names the half that finished merging last.
+        // Step 3's join. On a boundary fan the surviving edge carries a single
+        // face and this does not fire; on an interior fan it is the join that
+        // re-merges the two halves, and the surviving edge's entry names the
+        // half that finished merging last.
         if let Some((donor, absorbed)) = self.spoke_face_pair(surviving_edge) {
             self.faces_join_pair(donor, absorbed, surviving_edge);
         }
         true
+    }
+
+    /// §6.7 step 2, **base is interior** → the face-joining route (§6.6): merge
+    /// *every* face still incident at `v` into one, then re-split the union
+    /// between the far endpoints of `base` and of `base`'s disk successor.
+    ///
+    /// The merge has no valence precondition. It swallows the whole fan, and it
+    /// orphans `v` only if **every** spoke of `v` was interior to the union — so
+    /// on an interior fan `v` dies, while on a boundary fan its unjoined
+    /// boundary spokes sit on the union's outline and `v` **survives** as a
+    /// 2-valence corner. Either way the fan is now one face, and that is
+    /// unconditional: nothing below can change it.
+    ///
+    /// What the re-split decides is therefore only the **return value**. It is an
+    /// SFME, whose two target corners must not already be adjacent on the union's
+    /// loop cycle; when they are, the split refuses and so does this route — over
+    /// a mesh it has already merged. Both answers reach the same end state (the
+    /// split-then-rejoin is a donor-neutral round trip), which is why the boolean
+    /// says nothing about whether `v` is gone.
+    fn vert_dissolve_collapse_joining(&mut self, v: VertexKey, base_spoke: EdgeKey) -> bool {
+        // Both split targets come off the pre-merge disk — the merge destroys it.
+        let Some(v_target_base) = self.edges.get(base_spoke).other_vertex(v) else {
+            return false;
+        };
+        let Some(successor_spoke) = self.vert_disk_successor(v, base_spoke) else {
+            return false;
+        };
+        let Some(v_target_next) = self.edges.get(successor_spoke).other_vertex(v) else {
+            return false;
+        };
+
+        // The n-input merge's donor is its first face, and the vert's face
+        // iteration is seeded from the disk anchor — so the donor reads as the
+        // radial entry face of the base spoke, which after step 1's scan is the
+        // scan survivor sitting on it, not an original fan face (§6.7).
+        let Some(entry_loop) = self.edge_radial_entry(base_spoke) else {
+            return false;
+        };
+        let mut fan_faces: smallvec::SmallVec<[FaceKey; 8]> =
+            smallvec::SmallVec::from_slice(&[self.loop_face(entry_loop)]);
+        let mut disk = self.disk_edges(v);
+        while let Some(spoke) = disk.next(self) {
+            let mut radial = self.radial_loops(spoke);
+            while let Some(l) = radial.next(self) {
+                let face = self.loops.get(l).face;
+                if !fan_faces.contains(&face) {
+                    fan_faces.push(face);
+                }
+            }
+        }
+        let Some(merged) = self.faces_join_ex(&fan_faces, FacesJoinDelete::Yes) else {
+            return false;
+        };
+
+        if self.face_corners_adjacent(merged, v_target_base, v_target_next) {
+            return false;
+        }
+        let Some((_fragment, diagonal)) = self.face_split(merged, v_target_base, v_target_next)
+        else {
+            return false;
+        };
+        if let Some((donor, absorbed)) = self.spoke_face_pair(diagonal) {
+            self.faces_join_pair(donor, absorbed, diagonal);
+        }
+        true
+    }
+
+    /// The spoke immediately after `spoke` in `v`'s disk cycle.
+    fn vert_disk_successor(&self, v: VertexKey, spoke: EdgeKey) -> Option<EdgeKey> {
+        let disk: smallvec::SmallVec<[EdgeKey; 8]> = collect_iter::<_, 8>(self, self.disk_edges(v));
+        let at = disk.iter().position(|&e| e == spoke)?;
+        (disk.len() > 1).then(|| disk[(at + 1) % disk.len()])
+    }
+
+    /// Whether `a` and `b` are consecutive corners of `face` — the SFME's
+    /// non-adjacency precondition (§6.6, §8.3), which is the whole of the
+    /// helper's return value on the face-joining route.
+    fn face_corners_adjacent(&self, face: FaceKey, a: VertexKey, b: VertexKey) -> bool {
+        if a == b {
+            return true;
+        }
+        let mut loops = self.face_loops(face);
+        while let Some(l) = loops.next(self) {
+            let here = self.loops.get(l).vertex;
+            let there = self.loops.get(self.loops.get(l).face_loop_links.next).vertex;
+            if (here == a && there == b) || (here == b && there == a) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The distinct faces flanking `spoke` — none (wire), one (boundary), or
+    /// two (interior). A radial-2 spoke both of whose loops belong to the same
+    /// face yields that face once.
+    fn spoke_faces(&self, spoke: EdgeKey) -> smallvec::SmallVec<[FaceKey; 2]> {
+        let mut faces: smallvec::SmallVec<[FaceKey; 2]> = smallvec::SmallVec::new();
+        let mut radial = self.radial_loops(spoke);
+        while let Some(l) = radial.next(self) {
+            let face = self.loops.get(l).face;
+            if !faces.contains(&face) {
+                faces.push(face);
+            }
+        }
+        faces
+    }
+
+    /// `spoke`'s radial length, stopped at `cap`: wire (0), boundary (1),
+    /// interior (2) without walking a non-manifold fan out.
+    fn edge_radial_len_capped(&self, spoke: EdgeKey, cap: usize) -> usize {
+        let mut radial = self.radial_loops(spoke);
+        let mut count = 0usize;
+        while count < cap && radial.next(self).is_some() {
+            count += 1;
+        }
+        count
     }
 
     /// The two distinct faces flanking a radial-2 `spoke`, the edge's radial
@@ -400,30 +532,90 @@ mod tests {
         (verts, faces)
     }
 
-    /// An **open** `n`-triangle fan — apex plus rim `r0 ..= rn`, faces
-    /// `f_i = [apex, r_i, r_{i+1}]` — with the faces built in `build_order`,
-    /// so a caller can choose which spokes attach at the apex first.
-    fn build_open_disk_fan(
-        mesh: &mut LoopMesh,
-        n: usize,
-        build_order: &[usize],
-    ) -> (VertexKey, Vec<VertexKey>, Vec<FaceKey>) {
+    /// The rim of an open `k`-face fan: apex plus rim verts `r0 ..= rk`, laid
+    /// out on a half-circle. No faces yet — each `open_*_fan` fixture below adds
+    /// them in the build order its `R` arm needs.
+    fn build_open_fan_rim(mesh: &mut LoopMesh, k: usize) -> (VertexKey, Vec<VertexKey>) {
         let apex = mesh.create_vertex(Vec3::ZERO);
-        let rim: Vec<VertexKey> = (0..=n)
+        let rim = (0..=k)
             .map(|i| {
-                let theta = std::f32::consts::PI * (i as f32) / (n as f32);
+                let theta = std::f32::consts::PI * (i as f32) / (k as f32);
                 mesh.create_vertex(Vec3::new(theta.cos(), theta.sin(), 0.0))
             })
             .collect();
-        let mut faces: Vec<Option<FaceKey>> = vec![None; n];
-        for &i in build_order {
-            faces[i] = Some(face_from_ring(mesh, &[apex, rim[i], rim[i + 1]]));
+        (apex, rim)
+    }
+
+    /// §6.7's `open_disk_fan(k)`: an open `k`-triangle fan, faces
+    /// `f_i = [apex, r_i, r_{i+1}]` built in index order. The apex is each ring's
+    /// **seam**, so its anchor is `f0`'s closing edge `{r1, apex}` — an
+    /// **interior** spoke. Faces come back in build order.
+    fn build_open_disk_fan(mesh: &mut LoopMesh, k: usize) -> (VertexKey, Vec<FaceKey>) {
+        let (apex, rim) = build_open_fan_rim(mesh, k);
+        let faces = (0..k)
+            .map(|i| face_from_ring(mesh, &[apex, rim[i], rim[i + 1]]))
+            .collect();
+        (apex, faces)
+    }
+
+    /// §6.7's `open_disk_fan_boundary_anchor(k)`: the same half-disc, but `f0` is
+    /// *listed* `[r0, r1, apex]` — same winding, apex merely last in the ring, so
+    /// by §3.1's last row the apex's anchor becomes `f0`'s closing edge
+    /// `{apex, r0}`: the fan's **outermost**, boundary spoke. Faces in build order.
+    fn build_open_disk_fan_boundary_anchor(
+        mesh: &mut LoopMesh,
+        k: usize,
+    ) -> (VertexKey, Vec<FaceKey>) {
+        let (apex, rim) = build_open_fan_rim(mesh, k);
+        let mut faces = vec![face_from_ring(mesh, &[rim[0], rim[1], apex])];
+        for i in 1..k {
+            faces.push(face_from_ring(mesh, &[apex, rim[i], rim[i + 1]]));
         }
-        (
-            apex,
-            rim,
-            faces.into_iter().map(|f| f.expect("built")).collect(),
-        )
+        (apex, faces)
+    }
+
+    /// §6.7's `open_disk_fan_end_faces_first(k)`: the near end face apex-last (so
+    /// the anchor is the near boundary spoke), then the **far** end face — whose
+    /// closing edge is the far boundary spoke — then the middle faces. The keep
+    /// search therefore reaches the far boundary spoke first: `R = 2`. Faces come
+    /// back in build order (`f0` near end, `f1` far end, `f2 …` the middles
+    /// inwards from the near end).
+    fn build_open_disk_fan_end_faces_first(
+        mesh: &mut LoopMesh,
+        k: usize,
+    ) -> (VertexKey, Vec<FaceKey>) {
+        let (apex, rim) = build_open_fan_rim(mesh, k);
+        let mut faces = vec![
+            face_from_ring(mesh, &[rim[0], rim[1], apex]),
+            face_from_ring(mesh, &[apex, rim[k - 1], rim[k]]),
+        ];
+        for i in 1..k - 1 {
+            faces.push(face_from_ring(mesh, &[apex, rim[i], rim[i + 1]]));
+        }
+        (apex, faces)
+    }
+
+    /// §6.7's `open_quad_fan(k)`: `k` quads round an apex,
+    /// `f_i = [apex, r_i, o_i, r_{i+1}]`. The apex's anchor is again `f0`'s
+    /// closing edge (interior) — but `f0` is an **n-gon**, so its other verts
+    /// separate the two split targets on the merged outline. Faces in build order.
+    fn build_open_quad_fan(mesh: &mut LoopMesh, k: usize) -> (VertexKey, Vec<FaceKey>) {
+        let (apex, rim) = build_open_fan_rim(mesh, k);
+        let outer: Vec<VertexKey> = (0..k)
+            .map(|i| {
+                let theta = std::f32::consts::PI * (i as f32 + 0.5) / (k as f32);
+                mesh.create_vertex(Vec3::new(2.0 * theta.cos(), 2.0 * theta.sin(), 0.0))
+            })
+            .collect();
+        let faces = (0..k)
+            .map(|i| face_from_ring(mesh, &[apex, rim[i], outer[i], rim[i + 1]]))
+            .collect();
+        (apex, faces)
+    }
+
+    /// `v`'s valence.
+    fn disk_valence(mesh: &LoopMesh, v: VertexKey) -> usize {
+        collect_iter::<_, 8>(mesh, mesh.disk_edges(v)).len()
     }
 
     fn tag_faces(mesh: &mut LoopMesh, faces: &[FaceKey]) -> ElementAttributeKey {
@@ -549,37 +741,147 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §6.7's halves model is derived for the **fully-interior** fan, so the
-    /// classification must be a property of the whole disk — not of wherever
-    /// the keep search happens to stop. A boundary fan built so that its two
-    /// boundary spokes attach *last* puts a keep candidate in front of them in
-    /// disk order; reserving on it would run the halves schedule over a fan
-    /// whose boundary spokes no join can consume.
-    ///
-    /// Apex disk order here is `s2, s1, s3, s4, s5, s0` (`s_i = {apex, rim_i}`,
-    /// attachment order), with `s0`/`s5` the boundary spokes: a keep search that
-    /// stops at the first radial-1 spoke it *meets* would reserve `s2`/`s4` and
-    /// never see them.
-    ///
-    /// The fallback walk then dissolves the fan outright. That is loopmesh's
-    /// long-standing behaviour on a `k ≥ 3` boundary fan and it is **not** a
-    /// parity claim: §6.7 records the reference as merging the fan and then
-    /// *failing* there, and marks the case UNCHARACTERISED.
+    /// §6.7's `R` rule, arm `R = 0` / `R = 1` with **`base` interior** — the
+    /// disk anchor is `f0`'s closing edge, an interior spoke. The collapse takes
+    /// the face-joining route, so the whole `k`-face fan merges into one face
+    /// (`k + 2` corners, this fan being all-triangles) and the apex **survives**
+    /// as a 2-valence corner. `f0` is a triangle, so its third edge still joins
+    /// the two split targets on the merged outline: they are adjacent, the SFME
+    /// refuses, and the helper returns **false** — over a mesh it has already
+    /// merged. Donor is fixture face 2 at every `k` (§6.7's trace).
     #[test]
-    fn vert_dissolve_reserved_spokes_refuses_boundary_fan_whatever_the_disk_order() {
-        let mut mesh = LoopMesh::new();
-        let (apex, _rim, _faces) = build_open_disk_fan(&mut mesh, 5, &[1, 2, 3, 4, 0]);
+    fn vert_dissolve_helper_boundary_fan_base_interior_merges_all_and_returns_false() {
+        for k in 3..=5 {
+            let mut mesh = LoopMesh::new();
+            let (apex, faces) = build_open_disk_fan(&mut mesh, k);
+            let tag = tag_faces(&mut mesh, &faces);
 
-        assert!(
-            mesh.vert_dissolve_reserved_spokes(apex).is_none(),
-            "a boundary fan never enters the halves schedule"
-        );
+            assert!(
+                !mesh.vert_dissolve(apex),
+                "k = {k}: the split targets are adjacent, so the SFME refuses"
+            );
+
+            assert_eq!(mesh.face_count(), 1, "k = {k}: the whole fan merged");
+            assert_eq!(
+                mesh.vertex_count(),
+                k + 2,
+                "k = {k}: apex and rim all survive"
+            );
+            assert_eq!(mesh.edge_count(), k + 2, "k = {k}: every interior spoke went");
+            assert_eq!(
+                disk_valence(&mesh, apex),
+                2,
+                "k = {k}: the apex is left a 2-valence corner of the merged face"
+            );
+            assert_eq!(merged_face_donor_index(&mesh, tag, k + 2), 2);
+            mesh.validate_topology();
+        }
+    }
+
+    /// §6.7's `R = 1` arm with **`base` boundary**: the same half-disc listed so
+    /// the anchor is the outermost spoke. `keep` is interior, so the scan stalls
+    /// the fan at **two faces** hinged across it, and the collapse's plain route
+    /// — whose precondition is a 2-valence vert — refuses the 3-valence apex.
+    /// **false**, with the fan already half-merged. Same fan, same `k`, different
+    /// disk order, entirely different partial mesh from the arm above.
+    #[test]
+    fn vert_dissolve_helper_boundary_fan_base_boundary_keep_interior_stalls_at_two_faces() {
+        for k in 3..=4 {
+            let mut mesh = LoopMesh::new();
+            let (apex, _faces) = build_open_disk_fan_boundary_anchor(&mut mesh, k);
+
+            assert!(
+                !mesh.vert_dissolve(apex),
+                "k = {k}: the plain collapse route refuses a 3-valence vert"
+            );
+
+            assert_eq!(mesh.face_count(), 2, "k = {k}: stalled on the keep hinge");
+            assert_eq!(mesh.vertex_count(), k + 2);
+            assert_eq!(mesh.edge_count(), 2 * k + 1 - (k - 2));
+            assert_eq!(
+                disk_valence(&mesh, apex),
+                3,
+                "k = {k}: base, keep and the unreserved boundary spoke stand"
+            );
+            mesh.validate_topology();
+        }
+    }
+
+    /// §6.7's `R = 2` arm: build the two **end** faces first and the keep search
+    /// reserves the far boundary spoke, so every unreserved spoke is interior,
+    /// the scan consumes them all, and the apex is genuinely 2-valence when the
+    /// plain collapse route runs. Clean dissolve, **true** — at any `k`, which is
+    /// what shows the rule is indexed by `R` and not by the face count.
+    #[test]
+    fn vert_dissolve_helper_boundary_fan_both_reserved_boundary_dissolves_cleanly() {
+        for (k, donor) in [(3usize, 2usize), (4, 3)] {
+            let mut mesh = LoopMesh::new();
+            let (apex, faces) = build_open_disk_fan_end_faces_first(&mut mesh, k);
+            let tag = tag_faces(&mut mesh, &faces);
+
+            assert!(mesh.vert_dissolve(apex), "k = {k}: R = 2 dissolves cleanly");
+
+            assert_eq!(mesh.face_count(), 1);
+            assert_eq!(mesh.vertex_count(), k + 1, "k = {k}: the apex is gone");
+            assert_eq!(mesh.edge_count(), k + 1);
+            assert_eq!(merged_face_donor_index(&mesh, tag, k + 1), donor);
+            mesh.validate_topology();
+        }
+    }
+
+    /// §6.7 — the return value is **orthogonal to vert removal**. `open_quad_fan`
+    /// has an interior anchor like the triangle fan above, so the fan merges whole
+    /// and the apex survives; but `f0` is a quad, so `outer_0` separates the two
+    /// split targets on the merged outline, the SFME fires, and the helper returns
+    /// **true with the apex still in the mesh**. The union is an octagon —
+    /// `Σ nᵢ − 2(k−1) = 8`, not the `k + 2` a triangle fan would give.
+    #[test]
+    fn vert_dissolve_helper_boundary_fan_ngon_first_face_returns_true_without_removing_the_vert() {
+        let mut mesh = LoopMesh::new();
+        let (apex, faces) = build_open_quad_fan(&mut mesh, 3);
+        let tag = tag_faces(&mut mesh, &faces);
 
         assert!(mesh.vert_dissolve(apex));
+
+        assert!(
+            mesh.vertices.try_get(apex).is_some(),
+            "true does not mean the vertex was dissolved"
+        );
+        assert_eq!(disk_valence(&mesh, apex), 2);
         assert_eq!(mesh.face_count(), 1);
-        assert_eq!(mesh.vertex_count(), 6, "the apex is gone; the rim survives");
-        assert_eq!(mesh.edge_count(), 6);
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.edge_count(), 8);
+        assert_eq!(merged_face_donor_index(&mesh, tag, 8), 2);
         mesh.validate_topology();
+    }
+
+    /// The reserved spokes are what `R` counts, so pin them: a boundary spoke is
+    /// an ordinary candidate for either role, and which one it lands in is fixed
+    /// by **disk order** (attachment order), not by the fan's geometry.
+    #[test]
+    fn vert_dissolve_helper_boundary_fan_reserved_spokes_follow_the_disk_order() {
+        let is_boundary = |mesh: &LoopMesh, e: EdgeKey| mesh.edge_radial_len_capped(e, 2) == 1;
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_disk_fan(&mut mesh, 4);
+        let (base, keep) = mesh.vert_dissolve_reserved_spokes(apex).expect("reserved");
+        assert!(!is_boundary(&mesh, base), "anchor is f0's closing edge");
+        assert!(!is_boundary(&mesh, keep), "R = 0 at k = 4");
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_disk_fan_boundary_anchor(&mut mesh, 4);
+        let (base, keep) = mesh.vert_dissolve_reserved_spokes(apex).expect("reserved");
+        assert!(is_boundary(&mesh, base), "the apex is f0's last ring vert");
+        assert!(!is_boundary(&mesh, keep), "R = 1, base boundary");
+
+        let mut mesh = LoopMesh::new();
+        let (apex, _faces) = build_open_disk_fan_end_faces_first(&mut mesh, 4);
+        let (base, keep) = mesh.vert_dissolve_reserved_spokes(apex).expect("reserved");
+        assert!(is_boundary(&mesh, base));
+        assert!(
+            is_boundary(&mesh, keep),
+            "R = 2: the far boundary spoke attached before the keep search reached it"
+        );
     }
 
     /// The donor's age channel is the stored radial **entry**, and it has to
