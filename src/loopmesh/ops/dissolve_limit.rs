@@ -402,10 +402,17 @@ impl LoopMesh {
                 continue;
             };
 
-            // §5.2 step 3 — merge via the n==2 `faces_join` form. The survivor
-            // (the `e.l` face) is passed first so it keeps its identity and CD
-            // (§11), matching the dissolve-edges merge.
-            let merged = self.faces_join(&[survivor, other]);
+            // §5.2 step 3 — merge via the n==2 `faces_join` form, in the
+            // **non-deleting** mode. The survivor (the `e.l` face) is passed
+            // first so it keeps its identity and CD (§11), matching the
+            // dissolve-edges merge. The mode is deliberate: the join kills the
+            // two flanking faces by name and reaps nothing else, so `e` is left
+            // wire and a vertex buried between two shared edges keeps its
+            // face-less disk — and the pass's own tables (the heap-table
+            // indirection, the vert-pass input array) still name those elements,
+            // so a cascade firing inside the primitive would free them mid-loop.
+            // §5.4's mesh-wide cleanup is what sweeps the debris.
+            let merged = self.faces_join_ex(&[survivor, other], FacesJoinDelete::No);
 
             match merged {
                 Some(f_new) => {
@@ -2458,6 +2465,89 @@ mod tests {
             mesh.query_edge_exists(verts[3], verts[5]).is_some(),
             "weld edge (ear-prev)–(ear-next) replaces the arms through c"
         );
+        mesh.validate_topology();
+    }
+
+    /// §5.2 / §5.4 — the **pinch**: two coplanar quads sharing *two* edges, with
+    /// the vertex `v` between them buried (its entire disk is those two shared
+    /// edges). The edge pass merges across the first shared edge in the
+    /// non-deleting mode, which kills both faces by name and reaps nothing — so
+    /// `v` is left holding two wire edges, and the *second* shared edge, now
+    /// face-less, takes `COST_INVALID` and is never popped. §5.4's mesh-wide
+    /// cleanup is what removes all three: both edges (wire, and not wire on
+    /// entry), and then `v`, isolated by their removal.
+    #[test]
+    fn dissolve_limit_pinch_vertex_is_reaped_by_the_cleanup() {
+        let mut mesh = LoopMesh::new();
+        let p = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let q = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let r = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let s = mesh.create_vertex(Vec3::new(1.0, -1.0, 0.0));
+
+        let e_pv = mesh.create_edge([p, v], EdgeCreateFlags::NO_DUPLICATE);
+        let e_vq = mesh.create_edge([v, q], EdgeCreateFlags::NO_DUPLICATE);
+        let e_qr = mesh.create_edge([q, r], EdgeCreateFlags::NO_DUPLICATE);
+        let e_rp = mesh.create_edge([r, p], EdgeCreateFlags::NO_DUPLICATE);
+        let e_ps = mesh.create_edge([p, s], EdgeCreateFlags::NO_DUPLICATE);
+        let e_sq = mesh.create_edge([s, q], EdgeCreateFlags::NO_DUPLICATE);
+
+        mesh.face_create(&[p, v, q, r], &[e_pv, e_vq, e_qr, e_rp], FaceCreateFlags::NONE);
+        mesh.face_create(&[q, v, p, s], &[e_vq, e_pv, e_ps, e_sq], FaceCreateFlags::NONE);
+
+        let result = mesh.dissolve_limit(
+            &[e_pv, e_vq],
+            &[],
+            &DissolveLimitParams {
+                angle_limit: 0.1,
+                ..DissolveLimitParams::default()
+            },
+        );
+        assert!(matches!(result, DissolveLimitResult::Ran { .. }));
+
+        assert!(mesh.edges.try_get(e_pv).is_none(), "the merged-across edge is swept");
+        assert!(
+            mesh.edges.try_get(e_vq).is_none(),
+            "the pinch's other shared edge went wire in the same merge and is swept too"
+        );
+        assert!(
+            mesh.vertices.try_get(v).is_none(),
+            "the buried vert is reaped by the §5.4 cleanup once its disk emptied"
+        );
+        assert_eq!(mesh.vertex_count(), 4, "only the four outer corners remain");
+        assert_eq!(mesh.edge_count(), 4, "the diamond's perimeter");
+        assert_eq!(mesh.face_count(), 1, "the two quads merged");
+        mesh.validate_topology();
+    }
+
+    /// §5.4's `wire_on_entry` guard, which the non-deleting merge leans on: the
+    /// cleanup reaps only edges that went wire *because of a merge*. A wire edge
+    /// the caller left standing before the operator ran must survive, along with
+    /// its far end.
+    #[test]
+    fn dissolve_limit_cleanup_spares_an_edge_that_was_wire_on_entry() {
+        let mut mesh = LoopMesh::new();
+        let (verts, interior_edges, _interior_verts) = build_coplanar_strip(&mut mesh, 2);
+        let seam = interior_edges[0];
+
+        let stub_end = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let stub = mesh.create_edge([verts[0], stub_end], EdgeCreateFlags::NO_DUPLICATE);
+
+        mesh.dissolve_limit(
+            &interior_edges,
+            &[],
+            &DissolveLimitParams {
+                angle_limit: 0.1,
+                ..DissolveLimitParams::default()
+            },
+        );
+
+        assert!(mesh.edges.try_get(seam).is_none(), "the coplanar seam dissolves");
+        assert!(
+            mesh.edges.try_get(stub).is_some(),
+            "an edge that was wire on entry is not the cleanup's business"
+        );
+        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so its far end lives");
         mesh.validate_topology();
     }
 }

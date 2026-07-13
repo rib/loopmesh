@@ -153,6 +153,38 @@ impl LoopMesh {
             }
         };
 
+        // §6.1 — the garbage-collect bits. Seeded over the *full perimeter of
+        // both flanking faces* of every input edge that has a face pair, which
+        // is what makes the §6.5 sweeps a superset of everything the §6.4
+        // merges can orphan: the merge kills its two faces by name and reaps
+        // nothing else, so the dissolved edge (and, in the §4.4 pinch, the
+        // vertex buried between two shared edges) is left standing as debris
+        // for the sweeps. Seeded before the merges because it must read the
+        // pre-merge perimeters.
+        let gc_vert = self.push_vert_op_flag_layer();
+        let gc_edge = self.push_edge_op_flag_layer();
+        const GC_BIT: u8 = 0;
+        for &edge in edges {
+            if self.edges.try_get(edge).is_none() {
+                continue;
+            }
+            let EdgeClass::ManifoldPair { face_a, face_b } = self.dissolve_edges_classify(edge)
+            else {
+                continue;
+            };
+            for face in [face_a, face_b] {
+                let mut face_loops = self.face_loops(face);
+                while let Some(loop_key) = face_loops.next(self) {
+                    let corner_vert = self.loops.get(loop_key).vertex;
+                    let corner_edge = self.loops.get(loop_key).edge;
+                    self.vert_op_flag_set(gc_vert, corner_vert, GC_BIT);
+                    if !corner_edge.is_null() {
+                        self.edge_op_flag_set(gc_edge, corner_edge, GC_BIT);
+                    }
+                }
+            }
+        }
+
         // §6.1 — the `EDGE_TAG` (input-set membership) bit is needed by either
         // pre-/post-pass: the §6.3 pre-pass counts each vert's *untagged*
         // edges, and the §5.1 candidate marking counts each vert's *tagged*
@@ -248,14 +280,58 @@ impl LoopMesh {
             }
             match self.dissolve_edges_classify(edge) {
                 EdgeClass::ManifoldPair { face_a, face_b } => {
-                    // n==2 `faces_join` is the JFKE merge of §3.1 / §6.4:
-                    // it finds the shared edge, kills it and its two loops,
-                    // and splices the two perimeters into one face.
-                    let _ = self.faces_join(&[face_a, face_b]);
+                    // §6.4 — the n==2 `faces_join` merge, in the **non-deleting**
+                    // mode the section pins: both flanking faces are killed by
+                    // name (so no §4.1.4 survivor can appear behind the
+                    // operator's back, whatever the pair's shape), and the
+                    // dissolved edge is left standing as a wire edge inside the
+                    // merged face for §6.5's sweep to reap. The operator, not
+                    // the primitive, decides when its flagged elements go.
+                    let _ = self.faces_join_ex(&[face_a, face_b], FacesJoinDelete::No);
                 }
                 EdgeClass::NoOp => {}
             }
         }
+
+        // §6.5 sub-step 1 — GC the orphaned edges: every GC-flagged edge whose
+        // radial cycle went empty in the merges. This is what actually destroys
+        // each dissolved input edge, plus any perimeter edge a "fin"-like
+        // configuration left wire.
+        let mut edge_iter = MeshEdges::default();
+        let mut wire_gc: SmallVec<[EdgeKey; 16]> = SmallVec::new();
+        while let Some(edge) = edge_iter.next(self) {
+            if self.edge_op_flag_test(gc_edge, edge, GC_BIT)
+                && self.edges.get(edge).radial_link.is_none()
+            {
+                wire_gc.push(edge);
+            }
+        }
+        for edge in wire_gc {
+            if self.edges.try_get(edge).is_some() {
+                self.edge_kill(edge);
+            }
+        }
+
+        // §6.5 sub-step 2 — GC the orphaned verts: every GC-flagged vert whose
+        // disk went empty. It runs *after* sub-step 1 because the §4.4 pinch
+        // buries its vertex between the two shared edges — the vert only turns
+        // disk-empty once those two wire edges have been reaped.
+        let mut vert_iter = MeshVerts::default();
+        let mut isolated_gc: SmallVec<[VertexKey; 16]> = SmallVec::new();
+        while let Some(vertex) = vert_iter.next(self) {
+            if self.vert_op_flag_test(gc_vert, vertex, GC_BIT)
+                && self.vertices.get(vertex).disk_loop_start.is_none()
+            {
+                isolated_gc.push(vertex);
+            }
+        }
+        for vertex in isolated_gc {
+            if self.vertices.try_get(vertex).is_some() {
+                self.vertex_kill(vertex);
+            }
+        }
+
+        self.pop_edge_op_flag_layer(gc_edge);
 
         // §6.5 sub-step 3 — collapse the marked candidates that are still
         // edge-pairs after the merges, gating each on the §5.2 blended angle
@@ -265,6 +341,8 @@ impl LoopMesh {
             self.pop_vert_op_flag_layer(chain_target);
             self.pop_vert_op_flag_layer(marked);
         }
+
+        self.pop_vert_op_flag_layer(gc_vert);
 
         DissolveEdgesResult::Ran
     }
@@ -1926,6 +2004,85 @@ mod tests {
             (v0, e0, f0)
         );
         assert_eq!(count_triangles(&mesh), 0, "no slices on empty input");
+        mesh.validate_topology();
+    }
+
+    /// The **pinch** (`DISSOLVE_FACES.md` §4.4): two coplanar quads sharing
+    /// *two* edges, with the vertex `v` between them buried — its entire disk is
+    /// those two shared edges. Both are dissolved, and the merged face is the
+    /// diamond on the four outer corners.
+    ///
+    /// This is the shape that separates the two join modes, and it is the one the
+    /// §6.5 sweeps must handle in the stated order. The §6.4 merge kills the two
+    /// faces by name and reaps nothing, so `v` is left holding two wire edges:
+    /// sub-step 1 reaps the wire edges (both are GC-flagged — phase 1 seeds both
+    /// full face perimeters), and only *then* does `v` read as disk-empty for
+    /// sub-step 2. Sweeping verts first would leave `v` standing forever.
+    #[test]
+    fn dissolve_edges_pinch_vertex_is_reaped_by_the_gc_sweeps() {
+        let mut mesh = LoopMesh::new();
+        let p = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let q = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let r = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let s = mesh.create_vertex(Vec3::new(1.0, -1.0, 0.0));
+
+        let e_pv = mesh.create_edge([p, v], EdgeCreateFlags::NO_DUPLICATE);
+        let e_vq = mesh.create_edge([v, q], EdgeCreateFlags::NO_DUPLICATE);
+        let e_qr = mesh.create_edge([q, r], EdgeCreateFlags::NO_DUPLICATE);
+        let e_rp = mesh.create_edge([r, p], EdgeCreateFlags::NO_DUPLICATE);
+        let e_ps = mesh.create_edge([p, s], EdgeCreateFlags::NO_DUPLICATE);
+        let e_sq = mesh.create_edge([s, q], EdgeCreateFlags::NO_DUPLICATE);
+
+        mesh.face_create(&[p, v, q, r], &[e_pv, e_vq, e_qr, e_rp], FaceCreateFlags::NONE);
+        mesh.face_create(&[q, v, p, s], &[e_vq, e_pv, e_ps, e_sq], FaceCreateFlags::NONE);
+
+        assert_eq!(
+            mesh.vertex_disk_count_edges_capped(v, 3),
+            2,
+            "fixture: v is buried between the two shared edges"
+        );
+
+        mesh.dissolve_edges(&[e_pv], &DissolveEdgesParams::default());
+
+        assert!(mesh.edges.try_get(e_pv).is_none(), "the dissolved edge is swept");
+        assert!(
+            mesh.edges.try_get(e_vq).is_none(),
+            "the pinch's *other* shared edge went wire in the same merge and is swept too"
+        );
+        assert!(
+            mesh.vertices.try_get(v).is_none(),
+            "the buried vert is reaped by sub-step 2, once its disk emptied"
+        );
+        assert_eq!(mesh.vertex_count(), 4, "only the four outer corners remain");
+        assert_eq!(mesh.edge_count(), 4, "the diamond's perimeter");
+        assert_eq!(mesh.face_count(), 1, "the two quads merged");
+        mesh.validate_topology();
+    }
+
+    /// §6.1's conservativeness: the sweeps may only delete what the operator
+    /// flagged. A pre-existing wire edge hangs off a perimeter vert of a flanking
+    /// face — it is on no face perimeter, so it never gets the GC bit, and the
+    /// sub-step-1 sweep must walk past it despite it being wire.
+    #[test]
+    fn dissolve_edges_gc_sweep_spares_an_unflagged_pre_existing_wire_edge() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_face_grid_2x2(&mut mesh);
+
+        let stub_end = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let stub = mesh.create_edge([verts[0], stub_end], EdgeCreateFlags::NO_DUPLICATE);
+
+        let shared = mesh
+            .query_edge_exists(verts[1], verts[4])
+            .expect("the vertical interior edge of the bottom quad pair");
+        mesh.dissolve_edges(&[shared], &DissolveEdgesParams::default());
+
+        assert!(mesh.edges.try_get(shared).is_none(), "the input edge dissolves");
+        assert!(
+            mesh.edges.try_get(stub).is_some(),
+            "an unflagged pre-existing wire edge survives the §6.5 sweep"
+        );
+        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so does its far end");
         mesh.validate_topology();
     }
 }

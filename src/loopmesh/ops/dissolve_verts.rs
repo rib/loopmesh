@@ -63,11 +63,12 @@ impl LoopMesh {
     /// - **Edge-pair on a face boundary** — phase 2 snapshot (§6.2) + phase 4
     ///   `vert_collapse_edge` (§6.4).
     /// - **Manifold interior fan** — phase 3 fan merge (§6.3): the fan's faces
-    ///   are joined into one via the n-input `faces_join` primitive, which
-    ///   kills the spoke edges and the interior-only hub vertex as part of the
-    ///   merge. (§6.5 blesses the n-input form as producing the identical
-    ///   canonical mesh as the per-edge join-pair loop; the per-edge form is a
-    ///   performance-only variant tracked separately.)
+    ///   are joined into one via the n-input `faces_join` primitive in its
+    ///   non-deleting mode, which kills the fan's faces and leaves the spent
+    ///   spokes and the hub vertex `v` behind as wire debris; phase 4's GC
+    ///   sweeps (§6.4) reap them. (§6.5 blesses the n-input form as producing
+    ///   the identical canonical mesh as the per-edge join-pair loop; the
+    ///   per-edge form is a performance-only variant tracked separately.)
     /// - **Manifold boundary fan** (one or more interior radial-2 spokes plus
     ///   two boundary radial-1 spokes) — phase 3 fuses the interior spokes,
     ///   demoting the corner to a 2-valence edge-pair on the boundary, then
@@ -426,25 +427,37 @@ impl LoopMesh {
 
     /// Classify `v` per `DISSOLVE_VERTS.md` §3. Reads `v`'s disk + per-edge
     /// radial counts in a single pass; no mutation.
+    ///
+    /// **Wire spokes are transparent to the face-bearing classes.** Phase 1
+    /// kills every wire edge at every input vert, so a wire spoke seen from
+    /// phase 3 is always *this phase's own debris*: §6.3's non-deleting joins
+    /// retire each spent spoke to a wire edge, and an input vert that shares a
+    /// face with an already-merged input vert inherits one of those wires in
+    /// its disk. The reference is unaffected because its phase 3 does not
+    /// classify at all — it simply offers every spoke to the loop-pair test,
+    /// and a wire spoke fails it (§3, "the set-input form does not classify by
+    /// `BM_vert_is_manifold`"). Letting a wire poison the fan verdict here
+    /// would silently no-op every input vert downstream of the first.
     fn classify_dissolve_vert(&self, v: VertexKey) -> VertClass {
         let edges: SmallVec<[EdgeKey; 8]> = collect_iter::<_, 8>(self, self.disk_edges(v));
         if edges.is_empty() {
             return VertClass::Isolated;
         }
 
-        let mut has_wire = false;
+        let mut faceful: SmallVec<[EdgeKey; 8]> = SmallVec::new();
         let mut has_interior = false;
         let mut has_non_manifold = false;
         for &edge in &edges {
             match self.edge_radial_count_capped(edge, 3) {
-                0 => has_wire = true,
+                0 => continue,
                 1 => {}
                 2 => has_interior = true,
                 _ => has_non_manifold = true,
             }
+            faceful.push(edge);
         }
 
-        if !has_interior && !has_non_manifold && has_wire {
+        if faceful.is_empty() {
             // Every incident edge is wire.
             return VertClass::WireOnly;
         }
@@ -452,9 +465,9 @@ impl LoopMesh {
         // Edge-pair on a face boundary: exactly two edges bounding a single
         // face. (Caught here for completeness; the actual collapse is driven
         // by the phase-2 snapshot.)
-        if edges.len() == 2 && !has_wire && !has_non_manifold {
+        if edges.len() == 2 && faceful.len() == 2 && !has_non_manifold {
             let mut faces: SmallVec<[FaceKey; 2]> = SmallVec::new();
-            for &edge in &edges {
+            for &edge in &faceful {
                 let mut radial = self.radial_loops(edge);
                 while let Some(loop_key) = radial.next(self) {
                     let face = self.loops.get(loop_key).face;
@@ -468,9 +481,9 @@ impl LoopMesh {
             }
         }
 
-        // Manifold interior fan: no wire, no non-manifold radial, at least one
-        // interior edge to fold the fan down.
-        if !has_wire && !has_non_manifold && has_interior {
+        // Manifold interior fan: no non-manifold radial among the face-bearing
+        // spokes, and at least one interior spoke to fold the fan down.
+        if !has_non_manifold && has_interior {
             return VertClass::ManifoldFan;
         }
 
@@ -480,16 +493,24 @@ impl LoopMesh {
     /// §6.3 — merge the manifold fan around `v` into one face. Collects the
     /// fan's faces (every face incident at `v`, which for a manifold interior
     /// vert is a single topologically-connected fan) and delegates to the
-    /// n-input `faces_join` primitive. `faces_join` kills the interior spoke
-    /// edges and the now-orphaned hub vertex `v` as part of the merge.
+    /// n-input `faces_join` primitive in its **non-deleting** mode.
     ///
-    /// The merged face's per-face customdata winner is pinned by §6.3 / §6.5 /
-    /// §11: it is the face on `(v.e).l` — the representative radial loop of
-    /// `v`'s representative disk edge. `faces_join` seeds its survivor from
-    /// `faces[0]` (§6.5), so the fan array is anchored to put that face first
-    /// rather than whatever a raw disk-then-radial walk yields. See
-    /// [`Self::dissolve_verts_fan_anchor_face`] for how `(v.e).l` is resolved
-    /// against loopmesh's build conventions.
+    /// The mode is the one §6.3 pins: the join kills the fan's faces **by
+    /// name** and removes nothing else, so each spent spoke is left standing as
+    /// a wire edge and `v` keeps its (now face-less) disk. Reaping them is
+    /// §6.4's job — phase 4 sweeps the GC-flagged edges whose radial went empty
+    /// and then the GC-flagged verts whose disk went empty, and `v` itself goes
+    /// out through that second sweep. Nothing here may rely on the join's
+    /// deleting cascade: its kill-sets are a *subset* of what the operator
+    /// flagged in §6.1, and leaning on them would make the operator's
+    /// correctness contingent on the fan gate rather than on its own sweeps.
+    ///
+    /// The fan is merged with **one** n-input call where §6.3 chains pairwise
+    /// joins; §6.5 blesses the two as producing the same canonical mesh, but
+    /// only the n-input form's donor rule applies — it seeds from `faces[0]`,
+    /// so the array is anchored to put §6.3's donor first rather than whatever
+    /// a raw disk-then-radial walk yields. See
+    /// [`Self::dissolve_verts_fan_anchor_face`] for how that face is resolved.
     fn dissolve_verts_merge_fan(&mut self, v: VertexKey) {
         let anchor = self.dissolve_verts_fan_anchor_face(v);
 
@@ -510,7 +531,7 @@ impl LoopMesh {
         if fan_faces.len() < 2 {
             return;
         }
-        let _ = self.faces_join(&fan_faces);
+        let _ = self.faces_join_ex(&fan_faces, FacesJoinDelete::No);
     }
 
     /// Resolve the merged-face customdata winner for `v`'s fan: the face on
@@ -2288,6 +2309,97 @@ mod tests {
             tri_count, 1,
             "the corner's quad lost one corner → one triangle"
         );
+        mesh.validate_topology();
+    }
+
+    /// §6.3 / §6.4 — the fan merge runs in the join's **non-deleting** mode, so
+    /// the join itself reaps nothing: it kills the fan's four quads by name and
+    /// leaves all four spokes standing as wire edges with `v` still holding
+    /// them. Everything that disappears here disappears through phase 4's
+    /// sweeps — the GC-flagged edges whose radial went empty, then the
+    /// GC-flagged vert whose disk went empty. Pin both halves: the spokes are
+    /// individually gone, and so is the hub.
+    #[test]
+    fn dissolve_verts_gc_sweeps_reap_the_fans_spokes_and_the_hub() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+
+        let hub = verts[5];
+        let spokes: Vec<EdgeKey> = collect_iter::<_, 8>(&mesh, mesh.disk_edges(hub)).to_vec();
+        assert_eq!(spokes.len(), 4, "the grid centre is a four-spoke interior fan");
+
+        mesh.dissolve_verts(&[hub]);
+
+        for spoke in spokes {
+            assert!(
+                mesh.edges.try_get(spoke).is_none(),
+                "every interior spoke is swept by §6.4's wire-edge GC — the join left it wire"
+            );
+        }
+        assert!(
+            mesh.vertices.try_get(hub).is_none(),
+            "the hub goes out through §6.4's isolated-vert GC, not through the join"
+        );
+        assert_eq!(mesh.face_count(), 6, "4 quads → 1 octagon, 5 quads untouched");
+        mesh.validate_topology();
+    }
+
+    /// The case the non-deleting mode makes newly reachable, and the reason the
+    /// §3 classification has to see through a wire spoke: **two adjacent input
+    /// verts**. Dissolving `verts[5]` leaves its four spokes wire — one of which
+    /// is `{5, 6}`, incident at the *second* input vert. Phase 3 must still
+    /// recognise `verts[6]` as a fan (the reference's phase 3 does, because it
+    /// classifies nothing and simply skips the loop-pair-less wire spoke) and
+    /// merge it. The six quads of the grid's bottom two rows therefore end up as
+    /// one 10-gon.
+    #[test]
+    fn dissolve_verts_adjacent_input_verts_both_merge_across_the_wire_debris() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+
+        mesh.dissolve_verts(&[verts[5], verts[6]]);
+
+        assert!(mesh.vertices.try_get(verts[5]).is_none(), "first hub gone");
+        assert!(
+            mesh.vertices.try_get(verts[6]).is_none(),
+            "the second hub must dissolve too — the first fan's wire debris is not a \
+             non-manifold spoke"
+        );
+        assert_eq!(mesh.vertex_count(), 14, "16 − 2 hubs");
+        assert_eq!(mesh.edge_count(), 17, "24 − 7 spokes (the two disks, shared edge once)");
+        assert_eq!(mesh.face_count(), 4, "the bottom two rows' 6 quads → 1; 3 quads untouched");
+
+        let mut widest = 0usize;
+        let mut face_iter = MeshFaces::default();
+        while let Some(f) = face_iter.next(&mesh) {
+            widest = widest.max(mesh.face_len(f));
+        }
+        assert_eq!(widest, 10, "the merged 3x2 block's perimeter is a 10-gon");
+        mesh.validate_topology();
+    }
+
+    /// §6.1's conservativeness, which the sweeps now lean on much harder: phase
+    /// 4 may only delete what the operator *itself* flagged. A pre-existing wire
+    /// edge hanging off a **perimeter** vert of the fan carries no loop, so it is
+    /// on no face perimeter and never gets the GC bit — the wire-edge sweep must
+    /// walk straight past it even though it is wire and adjacent to the surgery.
+    #[test]
+    fn dissolve_verts_gc_sweep_spares_an_unflagged_pre_existing_wire_edge() {
+        let mut mesh = LoopMesh::new();
+        let (verts, _faces) = build_grid_3x3(&mut mesh);
+
+        // A wire stub off verts[1], which is a perimeter corner of the fan.
+        let stub_end = mesh.create_vertex(Vec3::new(1.0, -1.0, 0.0));
+        let stub = mesh.create_edge([verts[1], stub_end], EdgeCreateFlags::NO_DUPLICATE);
+
+        mesh.dissolve_verts(&[verts[5]]);
+
+        assert!(
+            mesh.edges.try_get(stub).is_some(),
+            "an unflagged pre-existing wire edge survives the §6.4 sweep"
+        );
+        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so does its far end");
+        assert!(mesh.vertices.try_get(verts[5]).is_none(), "the hub still dissolves");
         mesh.validate_topology();
     }
 }
