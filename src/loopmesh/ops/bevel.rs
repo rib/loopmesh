@@ -353,9 +353,27 @@ struct FaceTemplate {
 struct TemplateBank {
     donor_slots: Vec<usize>,
     blocks: Option<SlotSnapshot>,
+    components: Option<InterpComponents>,
 }
 
 impl TemplateBank {
+    /// The bank for one bevel run, carrying §6.6.1.4.1's interpolation-component partition
+    /// when key 1 of the ring-spanning tie-break is **live** (a UV-class loop layer present
+    /// *and* `segments` odd) and nothing at all otherwise. The partition is a mesh-wide
+    /// flood fill, so it is built here — once, against the pristine mesh, before any
+    /// surgery — rather than per beveled corner.
+    fn new(mesh: &LoopMesh, segments: u32) -> Self {
+        Self {
+            components: InterpComponents::live(mesh, segments)
+                .then(|| InterpComponents::build(mesh)),
+            ..Self::default()
+        }
+    }
+
+    fn interp_components(&self) -> Option<&InterpComponents> {
+        self.components.as_ref()
+    }
+
     /// Register one new-face site's donor against the pristine mesh, returning the handle
     /// the faces built there read their block back through.
     fn register(&mut self, donor: Option<FaceKey>) -> FaceTemplate {
@@ -387,6 +405,89 @@ impl TemplateBank {
         FaceTemplateRef {
             block: self.blocks.as_ref().zip(template.donor),
         }
+    }
+}
+
+/// A face the partition never labelled — either it did not exist when the partition was
+/// built, or no partition covers it.
+const NO_COMPONENT: u32 = u32::MAX;
+
+/// The mesh-wide interpolation-component partition of BEVEL.md §6.6.1.4.1 — its
+/// equivalence **relation** only, never its ids.
+///
+/// Two faces share a component when a chain of **loop-contiguous** edges joins them: the
+/// negation of §6.6.1.4's seam condition (2), read across the mesh's **UV-class** (float2)
+/// loop layers alone. Colour layers are deliberately not consulted: a colour-only
+/// discontinuity does seam an edge (so the override fires) but leaves key 1 *tied*, and a
+/// partition that split on it would decline where the reference reduces.
+///
+/// The labels this stores are flood-fill order, which is **not** §6.6.1.4.1's
+/// construction-order numbering (face-enumeration seeds plus the top/bottom label swaps).
+/// That numbering is not an isomorphism invariant and is not implemented here, so the
+/// labels are only ever compared for **equality**, never ordered. Equality is all key 1
+/// needs to be *decided*: candidates that all sit in one component tie on key 1 whatever
+/// its id is, and the tie-break falls through to keys 2–4 exactly as on an untextured mesh.
+/// A candidate set that genuinely straddles components is the only case that needs the
+/// numbering, and it is the only case the donor declines on.
+struct InterpComponents {
+    component_of: Vec<u32>,
+}
+
+impl InterpComponents {
+    /// Key 1 exists only when a UV-class loop layer is present **and** `segments` is odd
+    /// (§6.6.1.4). In every other configuration it is a constant, ties for every candidate,
+    /// and no partition is built at all.
+    fn live(mesh: &LoopMesh, segments: u32) -> bool {
+        segments % 2 == 1 && mesh.active_uv_loop_layer().is_some()
+    }
+
+    fn build(mesh: &LoopMesh) -> Self {
+        let uv_layers = mesh.uv_class_loop_layers();
+        let mut component_of = vec![NO_COMPONENT; mesh.face_slot_count()];
+        let mut next_component: u32 = 0;
+        let mut pending: Vec<FaceKey> = Vec::new();
+
+        for seed in mesh.face_keys() {
+            if component_of[seed.as_usize()] != NO_COMPONENT {
+                continue;
+            }
+            component_of[seed.as_usize()] = next_component;
+            pending.push(seed);
+            while let Some(face) = pending.pop() {
+                for loop_key in mesh.iter_face_loops(face) {
+                    let edge = mesh.loop_edge(loop_key);
+                    let Some(across) = mesh.interp_contiguous_neighbor(face, edge, &uv_layers)
+                    else {
+                        continue;
+                    };
+                    if component_of[across.as_usize()] == NO_COMPONENT {
+                        component_of[across.as_usize()] = next_component;
+                        pending.push(across);
+                    }
+                }
+            }
+            next_component += 1;
+        }
+
+        Self { component_of }
+    }
+
+    /// Do all of `faces` sit in one component — i.e. does key 1 **tie** across them? A face
+    /// the partition never saw (one minted after the build) has no known component, so the
+    /// answer is `false`: the caller must not assume a tie it cannot demonstrate.
+    fn all_share_component(&self, faces: &[FaceKey]) -> bool {
+        let mut shared: Option<u32> = None;
+        for &face in faces {
+            match self.component_of.get(face.as_usize()).copied() {
+                Some(component) if component != NO_COMPONENT => {
+                    if *shared.get_or_insert(component) != component {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -714,7 +815,7 @@ impl LoopMesh {
 
         // §6.6.1: one bank for the whole run — every cap's donor block captured in a
         // single snapshot, and read back at every value of `material`.
-        let mut templates = TemplateBank::default();
+        let mut templates = TemplateBank::new(self, options.segments);
         let corners = self.place_ring_verts(
             &frames,
             clamp_factor,
@@ -924,7 +1025,7 @@ impl LoopMesh {
             // registered and sealed up front, before the *first* edge's re-stitch — a
             // per-edge bank would re-capture every registered layer once per edge, and
             // the later edges' donors are still pristine at this point anyway.
-            let mut templates = TemplateBank::default();
+            let mut templates = TemplateBank::new(self, options.segments);
             let strip_templates: Vec<FaceTemplate> = beveled
                 .iter()
                 .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -948,6 +1049,7 @@ impl LoopMesh {
                             &|leg| beveled_set.contains(&leg),
                             options.affect,
                             options.segments,
+                            templates.interp_components(),
                         ))
                     })
                 })
@@ -1454,7 +1556,7 @@ impl LoopMesh {
         // surgery consumes, so by phase 4 it names no adjacent face at all). Each strip's
         // handle rides its edge's slot in this vec; each patch's rides the patch itself.
         // The bank is sealed once phase 1 has registered them all, before the re-stitch.
-        let mut templates = TemplateBank::default();
+        let mut templates = TemplateBank::new(self, options.segments);
         let strip_templates: Vec<FaceTemplate> = beveled_manifold
             .iter()
             .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -1785,7 +1887,7 @@ impl LoopMesh {
         // whole block of a flanking face of its beveled edge. Phase 1 registers the
         // remaining donors (junction fills, miter rings, terminal fans) as it walks the
         // pristine endpoints; the bank is sealed once, before the re-stitch.
-        let mut templates = TemplateBank::default();
+        let mut templates = TemplateBank::new(self, options.segments);
         let strip_templates: Vec<FaceTemplate> = beveled_manifold
             .iter()
             .map(|&edge| templates.register(self.edge_flanking_face(edge)))
@@ -2225,8 +2327,13 @@ impl LoopMesh {
         // §6.6.1: the odd-`segments` centre n-gon of the [V-ADJ] grid (§8.5) is the fourth
         // ring-spanning fill family — the tie-break reaches it at a seam-carrying junction
         // exactly as it reaches the cap, the patch and the terminal fill.
-        let central_representative =
-            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
+        let central_representative = templates.register(self.ring_spanning_donor(
+            vertex,
+            is_beveled,
+            affect,
+            segments,
+            templates.interp_components(),
+        ));
 
         junction_cuts.push(JunctionCut {
             vertex,
@@ -2569,6 +2676,7 @@ impl LoopMesh {
                 &|leg| beveled.contains(&leg),
                 affect,
                 segments,
+                templates.interp_components(),
             ));
 
             // The fill ring walks the legs in **rotational** order (§8.3.0.2's
@@ -3825,8 +3933,13 @@ impl LoopMesh {
         // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
         // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
-        let central_representative =
-            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
+        let central_representative = templates.register(self.ring_spanning_donor(
+            vertex,
+            is_beveled,
+            affect,
+            segments,
+            templates.interp_components(),
+        ));
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -4287,8 +4400,13 @@ impl LoopMesh {
         // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
         // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
         let representative = templates.register(self.vert_face_keys(vertex).first().copied());
-        let central_representative =
-            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
+        let central_representative = templates.register(self.ring_spanning_donor(
+            vertex,
+            is_beveled,
+            affect,
+            segments,
+            templates.interp_components(),
+        ));
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -5403,8 +5521,13 @@ impl LoopMesh {
         // first boundvert's rep — or §6.6.1.4's tie-break winner over the beveled legs when
         // the junction carries a seam leg. Registered while the junction still has its
         // faces — the re-stitch consumes the vertex.
-        let representative =
-            templates.register(self.ring_spanning_donor(vertex, is_beveled, affect, segments));
+        let representative = templates.register(self.ring_spanning_donor(
+            vertex,
+            is_beveled,
+            affect,
+            segments,
+            templates.interp_components(),
+        ));
 
         junction_patches.push(JunctionPatch {
             vertex,
@@ -5464,6 +5587,7 @@ impl LoopMesh {
             &|leg| beveled.contains(&leg),
             affect,
             segments,
+            templates.interp_components(),
         ));
 
         // The caller planned every terminal of the edge set before the first mint, so a
@@ -7626,6 +7750,67 @@ impl LoopMesh {
             .map(|l| self.loop_face(l))
     }
 
+    /// The mesh's UV-class loop layers: every float2 loop layer. These are the only layers
+    /// §6.6.1.4.1's component partition reads (the guide's colour-only corollary), and their
+    /// mere presence is what makes key 1 live.
+    fn uv_class_loop_layers(&self) -> Vec<ElementAttributeKey> {
+        let attribs = self.loop_attribs();
+        attribs
+            .iter_descriptors()
+            .filter(|(key, _)| matches!(attribs.storage_of(*key), Some(AttributeStorage::Vec2(_))))
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// The face across `edge` from `face` when `edge` is **loop-contiguous** — the negation
+    /// of BEVEL.md §6.6.1.4's seam condition (2), restricted to the UV-class layers
+    /// §6.6.1.4.1's partition is built from. `None` when the flood must not cross:
+    ///
+    /// - the edge does not present **exactly two** loops (a boundary or wire edge joins
+    ///   nothing; a fan-resolved non-manifold edge is a seam on that ground alone), or
+    /// - its two loops run the **same** direction along it (inconsistently wound flanks —
+    ///   again a seam whatever the layer values), or
+    /// - any UV-class layer disagrees at **either** endpoint.
+    ///
+    /// The layer compare is exact per component: §6.6.1.4 says "any disagreement" and names
+    /// no tolerance.
+    fn interp_contiguous_neighbor(
+        &self,
+        face: FaceKey,
+        edge: EdgeKey,
+        uv_layers: &[ElementAttributeKey],
+    ) -> Option<FaceKey> {
+        let mut radial = self.iter_radial_loops(edge);
+        let first = radial.next()?;
+        let second = radial.next()?;
+        if radial.next().is_some() {
+            return None;
+        }
+
+        let (near, far) = if self.loop_face(first) == face {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if self.loop_vertex(near) == self.loop_vertex(far) {
+            return None;
+        }
+
+        // Consistent winding pairs the four corners by their shared endpoint: `near` and
+        // `loop_next(far)` sit on one end, `loop_next(near)` and `far` on the other.
+        let near_far_end = self.loop_next(near);
+        let far_far_end = self.loop_next(far);
+        for &layer in uv_layers {
+            let attribs = self.loop_attribs();
+            let uv = |l: LoopKey| attribs.get_vec2(layer, l.as_usize());
+            if uv(near) != uv(far_far_end) || uv(near_far_end) != uv(far) {
+                return None;
+            }
+        }
+
+        Some(self.loop_face(far))
+    }
+
     /// The stage-1 donor of a **ring-spanning** fill at corner `vertex` — the vertex cap
     /// (BEVEL.md §5), the junction patch (§7.6.3) and the terminal / endpoint fill (§7.5),
     /// the row family whose donor §6.6.1 pins to the representative face of the ring's
@@ -7647,24 +7832,28 @@ impl LoopMesh {
     /// loop layer, the UV-island seam — is **not implemented**: a corner seamed only that
     /// way still takes the positional pick, exactly as it did before this rule existed.
     ///
-    /// **The override declines wholesale when key 1 of the tie-break is live.** Key 1 —
-    /// the interpolation-component id (§6.6.1.4.1) — is live exactly when a UV-class
-    /// (float2) loop layer is present **and** `segments` is odd, and it is *not* an
-    /// isomorphism invariant: it reads a mesh-wide component partition numbered in face
-    /// enumeration order. Keys 2–4 are then arbitrary with respect to it, so a tie-break
-    /// run without key 1 is **not** a safe substitute for the positional pick in that
-    /// regime — it is merely a different arbitrary answer. So in that regime this returns
-    /// the positional donor unchanged: exact wherever key 1 is provably inert, explicitly
-    /// declined where it is live. (The same UV-class presence also arms §6.6.1.4's
-    /// `degenerate_uv_image` candidate filter, which is not implemented either; at an
-    /// **even** `segments` UV-carrying mesh the tie-break below therefore still runs, and
-    /// can keep a candidate whose UV image of the corner collapses.)
+    /// **The override declines only where key 1 of the tie-break actually separates the
+    /// candidates.** Key 1 — the interpolation-component id (§6.6.1.4.1) — is *live* when a
+    /// UV-class (float2) loop layer is present **and** `segments` is odd. Live is not the
+    /// same as separating: `components` carries the mesh-wide partition, and whenever the
+    /// candidates all sit in **one** component key 1 ties for every one of them, so keys
+    /// 2–4 decide and the answer is an isomorphism invariant — the single-UV-island mesh,
+    /// which is the common textured case. Only a candidate set that **straddles** two
+    /// components needs §6.6.1.4.1's *numbering*, which is a construction-order artefact
+    /// (face-enumeration seeds, then the top/bottom label swaps) and is not implemented; a
+    /// tie-break run without it there would be a different arbitrary answer rather than a
+    /// safer one, so that — and only that — falls back to §6.6.1's positional donor.
+    ///
+    /// (The UV-class presence also arms §6.6.1.4's `degenerate_uv_image` candidate filter,
+    /// which is not implemented at any `segments`: a candidate whose UV image of the corner
+    /// collapses to near-zero area is kept here where the reference would drop it.)
     fn ring_spanning_donor(
         &self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         affect: BevelAffect,
         segments: u32,
+        components: Option<&InterpComponents>,
     ) -> Option<FaceKey> {
         let positional = self.first_incident_face(vertex);
 
@@ -7679,10 +7868,6 @@ impl LoopMesh {
             return positional;
         }
 
-        if segments % 2 == 1 && self.active_uv_loop_layer().is_some() {
-            return positional;
-        }
-
         // §6.6.1.4's candidate set: every leg contributes when the corner carries exactly
         // one beveled leg (an edge bevel's terminal) or when a vertex bevel runs at odd
         // `segments`; otherwise only the beveled legs do (an edge bevel's junction).
@@ -7692,10 +7877,40 @@ impl LoopMesh {
             .count();
         let every_leg =
             beveled_leg_count == 1 || (affect == BevelAffect::Vertices && segments % 2 == 1);
+        let considers = |leg: EdgeKey| every_leg || is_beveled(leg);
+
+        // Key 1 (§6.6.1.4.1). The test is over **every face the tie-break will look at** —
+        // both flanks of every considered leg, not just the per-leg winners — because key 1
+        // leads the key chain inside the per-leg reduce as well as over the survivors. When
+        // they all share a component the key ties at every comparison this corner makes and
+        // dropping it is exact; when they straddle, the missing numbering would decide
+        // comparisons that keys 2–4 cannot stand in for, so the whole override declines.
+        if InterpComponents::live(self, segments) {
+            let mut consulted: Vec<FaceKey> = Vec::new();
+            for leg in self.iter_disk_edges(vertex).filter(|&leg| considers(leg)) {
+                for flank in [
+                    self.arriving_face(vertex, leg),
+                    self.departing_face(vertex, leg),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !consulted.contains(&flank) {
+                        consulted.push(flank);
+                    }
+                }
+            }
+            let ties = components
+                .map(|partition| partition.all_share_component(&consulted))
+                .unwrap_or(false);
+            if !ties {
+                return positional;
+            }
+        }
 
         let mut candidates: Vec<FaceKey> = Vec::new();
         for leg in self.iter_disk_edges(vertex) {
-            if !every_leg && !is_beveled(leg) {
+            if !considers(leg) {
                 continue;
             }
             // Each leg first reduces its own two flanking faces to one, by the very same
@@ -7740,11 +7955,12 @@ impl LoopMesh {
     /// Does `candidate` beat `best` on BEVEL.md §6.6.1.4's key chain? A total tie answers
     /// `false`, which keeps the earlier candidate — the guide's own last resort.
     ///
-    /// **Key 1 — the interpolation-layer component id (§6.6.1.4.1) — is not implemented**,
-    /// and the caller does not run this chain where it would be live: a UV-class loop layer
-    /// with odd `segments` declines the whole override
-    /// ([`ring_spanning_donor`](Self::ring_spanning_donor)). Everywhere this chain *does*
-    /// run, key 1 ties for every candidate and omitting it is exact.
+    /// **Key 1 — the interpolation-layer component id (§6.6.1.4.1) — is not compared here**,
+    /// and the caller never runs this chain where it could separate: where key 1 is live,
+    /// [`ring_spanning_donor`](Self::ring_spanning_donor) admits the chain only after
+    /// proving every face it will consult sits in one interpolation component (key 1 tied),
+    /// and declines the override entirely otherwise. Everywhere this chain *does* run, key 1
+    /// ties for every candidate and omitting it is exact.
     fn donor_precedes(&self, candidate: FaceKey, best: FaceKey) -> bool {
         // Key 2: selected beats unselected. This reads the face's **own** header flag, not
         // its membership in the operator's input geometry.
@@ -7942,6 +8158,7 @@ impl LoopMesh {
                 &|_| false,
                 BevelAffect::Vertices,
                 segments,
+                templates.interp_components(),
             ));
 
             let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
@@ -25997,7 +26214,11 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(result.faces.len(), 1, "the wired corner mints exactly its cap");
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "the wired corner mints exactly its cap"
+        );
         assert_eq!(
             mesh.face_material_index(result.faces[0]),
             1,
@@ -26168,35 +26389,48 @@ mod tests {
         );
     }
 
-    /// The **declined** regime of the override. Key 1 of §6.6.1.4's tie-break — the
-    /// interpolation-component id (§6.6.1.4.1) — is live exactly when a UV-class loop layer
-    /// is present *and* `segments` is odd, and it is not an isomorphism invariant, so keys
-    /// 2–4 are arbitrary with respect to it. loopmesh does not compute the partition, and
-    /// running the rest of the chain there would be a *different* arbitrary answer rather
-    /// than a safer one — so it declines the override wholesale and keeps §6.6.1's positional
-    /// donor.
-    ///
-    /// Observable form: on the boundary corner whose *untextured* cap follows the lower slot
-    /// whichever quad holds it, adding a UV layer must make the cap follow the **same quad**
-    /// in both decorations — so the two runs come out on *different* slots.
-    #[test]
-    fn face_cd_uv_layer_at_odd_segments_declines_the_ring_spanning_override() {
-        let mut slots = Vec::new();
-        for swapped in [false, true] {
-            let (mut mesh, _shared) = two_quad_strip();
-            mesh.register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
-                .expect("Vec2 is a supported loop attribute format");
+    /// A two-quad plane carrying a UV layer, its two quads decorated with slots 5 / 2 (the
+    /// `swapped` run exchanges them) and unwrapped either as **one** island (`islands = 1`:
+    /// UVs read straight off the positions, so both quads agree along the shared edge) or as
+    /// **two** (`islands = 2`: the right quad's `u` is shifted, so the shared edge is a
+    /// UV-island boundary). Every face's UV image has real area either way — the `degenerate_uv_image`
+    /// filter of §6.6.1.4 is not what these tests are about.
+    fn uv_decorated_two_quad_plane(islands: u32, swapped: bool) -> (LoopMesh, VertexKey) {
+        let (mut mesh, _shared) = two_quad_strip();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .expect("Vec2 is a supported loop attribute format");
 
-            let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
-            let left = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
-            for face in mesh.vert_face_keys(corner) {
-                let is_left = mesh.face_vert_keys(face).contains(&left);
-                let slot = match (is_left, swapped) {
-                    (true, false) | (false, true) => 5,
-                    _ => 2,
-                };
-                mesh.set_face_material_index(face, slot);
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        let left = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+        for face in mesh.face_keys() {
+            let is_left = mesh.face_vert_keys(face).contains(&left);
+            let slot = match (is_left, swapped) {
+                (true, false) | (false, true) => 5,
+                _ => 2,
+            };
+            mesh.set_face_material_index(face, slot);
+
+            let shift = if islands == 2 && !is_left { 0.5 } else { 0.0 };
+            for loop_key in mesh.face_loop_keys(face) {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                let value = [(position.x + 2.0) / 4.0 + shift, (position.y + 1.0) / 2.0];
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, loop_key.as_usize(), value);
             }
+        }
+        (mesh, corner)
+    }
+
+    /// Key 1 of §6.6.1.4's tie-break — the interpolation-component id (§6.6.1.4.1) — being
+    /// **live** is not the same as it **separating**. On a single-UV-island mesh every
+    /// candidate sits in one component, key 1 ties for all of them, and the tie-break must
+    /// still reduce through keys 2–4. So the textured boundary corner behaves exactly as the
+    /// untextured one: the cap follows the **lower slot** whichever quad holds it.
+    #[test]
+    fn face_cd_uv_single_island_at_odd_segments_still_reduces_to_the_lower_keys() {
+        for swapped in [false, true] {
+            let (mut mesh, corner) = uv_decorated_two_quad_plane(1, swapped);
 
             let result = mesh.bevel(
                 &[corner.into()],
@@ -26206,14 +26440,90 @@ mod tests {
                 },
             );
             mesh.validate_topology();
+
+            assert_eq!(result.faces.len(), 1, "the corner mints exactly its cap");
+            assert_eq!(
+                mesh.face_material_index(result.faces[0]),
+                2,
+                "swapped = {swapped}: one UV island ⇒ key 1 ties across the candidates, so the \
+                 seamed corner's cap takes the tie-break's lower slot — declining here would \
+                 pin the cap to the positional quad instead",
+            );
+        }
+    }
+
+    /// The **declined** regime, and the whole of what it is now: candidates that genuinely
+    /// **straddle** two interpolation components. Deciding between them needs §6.6.1.4.1's
+    /// *numbering*, which is a construction-order artefact (not an isomorphism invariant) and
+    /// is not implemented — so the override falls back to §6.6.1's positional donor.
+    ///
+    /// Observable form: the cap follows the **same quad** in both decorations, so the two
+    /// runs land on *different* slots — where the single-island run above lands on the lower
+    /// slot in both.
+    #[test]
+    fn face_cd_uv_straddling_candidates_at_odd_segments_decline_to_the_positional_donor() {
+        let mut slots = Vec::new();
+        for swapped in [false, true] {
+            let (mut mesh, corner) = uv_decorated_two_quad_plane(2, swapped);
+
+            let result = mesh.bevel(
+                &[corner.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
             assert_eq!(result.faces.len(), 1, "the corner mints exactly its cap");
             slots.push(mesh.face_material_index(result.faces[0]));
         }
         assert_ne!(
             slots[0], slots[1],
-            "with a UV layer present at odd `segments` the override is declined, so the cap \
-             stays on the positional quad and tracks that quad's slot — a lower-slot pick in \
-             both runs would mean the tie-break ran where key 1 is live",
+            "the shared edge is a UV-island boundary, so the corner's two candidates sit in \
+             different components: the cap declines to the positional quad and tracks that \
+             quad's slot rather than the lower one",
+        );
+    }
+
+    /// §6.6.1.4.1's partition is built **only** when key 1 is live — a UV-class layer present
+    /// *and* `segments` odd — and never otherwise; and when it is built it is the loop-CD
+    /// equivalence relation, which the island count of the fixture decides.
+    #[test]
+    fn interp_component_partition_is_built_only_where_key_one_is_live() {
+        let (untextured, _shared) = two_quad_strip();
+        assert!(
+            TemplateBank::new(&untextured, 1)
+                .interp_components()
+                .is_none(),
+            "no UV-class loop layer ⇒ key 1 is inert ⇒ no partition at any `segments`",
+        );
+
+        let (textured, _corner) = uv_decorated_two_quad_plane(1, false);
+        assert!(
+            TemplateBank::new(&textured, 2)
+                .interp_components()
+                .is_none(),
+            "an even `segments` ⇒ key 1 is inert even with a UV layer ⇒ no partition",
+        );
+
+        let single_island = TemplateBank::new(&textured, 1);
+        let partition = single_island
+            .interp_components()
+            .expect("a UV layer at odd `segments` ⇒ key 1 is live ⇒ the partition is built");
+        assert!(
+            partition.all_share_component(&textured.face_keys()),
+            "a continuous unwrap joins the two quads across the shared edge: one component",
+        );
+
+        let (two_islands, _corner) = uv_decorated_two_quad_plane(2, false);
+        let split = TemplateBank::new(&two_islands, 1);
+        assert!(
+            !split
+                .interp_components()
+                .expect("live")
+                .all_share_component(&two_islands.face_keys()),
+            "the shifted unwrap makes the shared edge a UV-island boundary: two components",
         );
     }
 
@@ -27220,9 +27530,7 @@ mod tests {
                 let legs = mesh
                     .face_vert_keys(face)
                     .into_iter()
-                    .filter(|&w| {
-                        w != corner && mesh.query_edge_exists(corner, w).is_some()
-                    })
+                    .filter(|&w| w != corner && mesh.query_edge_exists(corner, w).is_some())
                     .map(|far| {
                         (
                             mesh.vertex_position(far),
@@ -27496,8 +27804,8 @@ mod tests {
                 })
                 .expect("the strip vert sits on one of the face's legs");
 
-            let t = (position - near_position).length()
-                / (leg_far_position - near_position).length();
+            let t =
+                (position - near_position).length() / (leg_far_position - near_position).length();
             let expected = (1.0 - t) * near_shade + t * leg_far_shade;
             let actual = shade_of(&mesh, shade, strip_corner);
             assert!(
