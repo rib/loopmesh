@@ -411,12 +411,23 @@ struct FaceTemplateRef<'a> {
 /// right, so the capture is not optional.
 ///
 /// Holds the axis-dominant projection of the donor's normal (BMESH.md §10.1.1), its
-/// corners projected through it in loop-cycle order, and a snapshot of those
-/// corners' **vertex** blocks in the same order.
+/// corners projected through it in loop-cycle order, and a snapshot of those corners'
+/// **vertex** and **loop** blocks in that same order. Both domains are captured
+/// because both are blended from the *one* weight vector the corner solves (§5.2.5:
+/// one solve, two domains). The loop snapshot is as mandatory as the vertex one and
+/// for a sharper reason: a re-stitched original's loops are killed with the face, so
+/// its corner values exist *nowhere* once the rebuild starts.
+///
+/// No **weight-snap edge** rides along, because none is implemented: §5.2.1.1's seamed
+/// branch — where a seam-carrying corner's whole per-boundvert donor list collapses to
+/// one override face plus a per-corner snap edge that pulls the sample point onto one
+/// of that face's two edges at the corner — is not built here. Every donor a corner
+/// gets is the *un-snapped positional* one, so the sample point is used as it falls.
 struct CornerDonor {
     projection: PlaneProjection,
     proj_corners: Vec<Vec2>,
-    corner_blocks: SlotSnapshot,
+    corner_vertex_blocks: SlotSnapshot,
+    corner_loop_blocks: SlotSnapshot,
 }
 
 /// Every pre-bevel donor polygon of one bevel run, keyed by the original face.
@@ -440,11 +451,28 @@ impl DonorBank {
         &self.donors[index]
     }
 
-    /// Empty exactly when the mesh carries no per-vertex layer at all, in which case
-    /// the whole blend is a no-op and nothing is captured.
+    /// Empty exactly when the mesh carries neither a per-vertex nor a per-loop layer,
+    /// in which case the whole blend is a no-op and nothing is captured.
     fn is_empty(&self) -> bool {
         self.donors.is_empty()
     }
+}
+
+/// The cap's donor for the corner sitting on `ring_vertex` (BEVEL.md §5.2.1.1, the
+/// non-seam-carrying branch): boundvert `i`'s own representative, resolved against the
+/// same per-leg order `ring_vert_for_edge` and `donors` were both built in. `None` when
+/// no face arrives on that leg — the gap leg of an open fan — in which case the cap
+/// corner is left unblended.
+fn donor_for_ring_vertex(
+    ring_vert_for_edge: &[(EdgeKey, VertexKey)],
+    donors: &[Option<usize>],
+    ring_vertex: VertexKey,
+) -> Option<usize> {
+    ring_vert_for_edge
+        .iter()
+        .zip(donors)
+        .find(|(&(_, ring), _)| ring == ring_vertex)
+        .and_then(|(_, &donor)| donor)
 }
 
 /// A re-stitched original: the *new* face key the rebuild produced, and its own
@@ -712,6 +740,13 @@ impl LoopMesh {
         // original, and that pass writes last (fact (c)) — but the two agree only
         // because the list is per corner, and at §5.2.4 the cap's own write stands.
         // Resolved pre-surgery, like the donors themselves.
+        //
+        // This is §5.2.1.1's **non-seam-carrying** branch only. A seam-carrying corner
+        // (any incident leg an interpolation seam by §6.6.1.4 — which includes every
+        // boundary leg) replaces this whole list with one override donor face plus a
+        // per-corner weight-snap edge; neither the seam predicate nor the tie-break that
+        // selects the override face is built yet, so such a corner still takes the
+        // positional list below.
         let cap_donors: Vec<Vec<Option<usize>>> = if bank.is_empty() {
             Vec::new()
         } else {
@@ -747,6 +782,7 @@ impl LoopMesh {
         // across a shared edge. The cap *adopts* the chamfer edges the re-stitch minted and
         // *creates* the ones no face could mint (the gap steps of §2.3's table); that
         // adopt-or-create is the whole rule, not a boundary patch-up.
+        let mut cap_faces: Vec<Option<FaceKey>> = Vec::with_capacity(corners.len());
         for corner in &corners {
             if corner.ring_order.len() >= 3 {
                 let cap = self.build_cap_face(&corner.ring_order);
@@ -760,7 +796,9 @@ impl LoopMesh {
                 );
                 result.faces.push(cap.face);
                 result.edges.extend(cap.ring_edges);
+                cap_faces.push(Some(cap.face));
             } else {
+                cap_faces.push(None);
                 // Valence 2 (§2.3's one special case): a two-corner "n-gon" is not a face, so
                 // no cap — but the single ring edge is still minted *here*, by the operator
                 // itself. A face-less two-wire hub (§6.2.1) has no re-stitch to mint it.
@@ -781,13 +819,23 @@ impl LoopMesh {
         // the operator builds *or rebuilds*, and the **last write wins** — so the
         // order below is part of the value rule, not housekeeping. The fills go
         // first, the re-stitched originals last.
-        for (corner, donors) in corners.iter().zip(&cap_donors) {
-            if corner.ring_order.len() < 3 {
+        //
+        // The cap's write is the *only* writer of the cap's own loops — a ring vert is
+        // a corner of a re-stitched original too, so its per-vertex value is decided
+        // there, but no other face owns the cap's corners. A cap corner left unblended
+        // reads the layer default (§5.2.5's per-loop half) — which is what a
+        // boundary/open-fan corner's gap leg still gets: no face arrives along it, so it
+        // has no positional donor, and the override donor of §5.2.1.1's seamed branch
+        // (which is what such a corner is *supposed* to take) is not implemented.
+        for ((corner, donors), &cap) in corners.iter().zip(&cap_donors).zip(&cap_faces) {
+            let Some(cap) = cap else {
                 continue;
-            }
-            for (&(_, ring_vertex), &donor) in corner.ring_vert_for_edge.iter().zip(donors) {
+            };
+            for cap_corner in self.face_loop_keys(cap) {
+                let ring_vertex = self.loop_vertex(cap_corner);
+                let donor = donor_for_ring_vertex(&corner.ring_vert_for_edge, donors, ring_vertex);
                 if let Some(donor) = donor {
-                    self.blend_vertex_from_donor(ring_vertex, bank.donor(donor));
+                    self.blend_corner_from_donor(cap_corner, bank.donor(donor));
                 }
             }
         }
@@ -7321,31 +7369,55 @@ impl LoopMesh {
 
     /// Capture one face as a **pre-bevel donor polygon** (BEVEL.md §5.2.1 fact (a)):
     /// its corners flattened through the axis-dominant projection of its normal
-    /// (BMESH.md §10.1.1), and a snapshot of those corners' per-vertex blocks in the
-    /// same loop-cycle order. Must run while the face still stands as it did before
-    /// the bevel — for a face about to be re-stitched, that means before its corner
-    /// edges are re-pointed, not merely before it is killed.
+    /// (BMESH.md §10.1.1), and a snapshot of those corners' per-vertex and per-loop
+    /// blocks in the same loop-cycle order. Must run while the face still stands as it
+    /// did before the bevel — for a face about to be re-stitched, that means before its
+    /// corner edges are re-pointed, not merely before it is killed.
+    ///
+    /// A domain with no layers is skipped outright — no slot list, no gather — because
+    /// this runs once per incident face of every beveled corner and a mesh decorated on
+    /// only one of the two domains is the common case.
     fn capture_corner_donor(&self, face: FaceKey) -> CornerDonor {
-        let corners = self.face_vert_keys(face);
+        let cycle = self.face_loop_keys(face);
         let projection = PlaneProjection::from_normal(self.face_plane_normal(face));
-        let proj_corners = corners
-            .iter()
-            .map(|&corner| projection.project(self.vertex_position(corner)))
-            .collect();
-        let slots: Vec<usize> = corners.iter().map(|corner| corner.as_usize()).collect();
+
+        let has_vertex_layers = !self.vertex_attribs().is_empty();
+        let mut proj_corners = Vec::with_capacity(cycle.len());
+        let mut vertex_slots = Vec::with_capacity(if has_vertex_layers { cycle.len() } else { 0 });
+        for &corner in &cycle {
+            let vertex = self.loop_vertex(corner);
+            proj_corners.push(projection.project(self.vertex_position(vertex)));
+            if has_vertex_layers {
+                vertex_slots.push(vertex.as_usize());
+            }
+        }
+        let corner_vertex_blocks = if has_vertex_layers {
+            self.vertex_attribs().snapshot_slots(&vertex_slots)
+        } else {
+            SlotSnapshot::empty()
+        };
+
+        let corner_loop_blocks = if self.loop_attribs().is_empty() {
+            SlotSnapshot::empty()
+        } else {
+            let loop_slots: Vec<usize> = cycle.iter().map(|corner| corner.as_usize()).collect();
+            self.loop_attribs().snapshot_slots(&loop_slots)
+        };
+
         CornerDonor {
             projection,
             proj_corners,
-            corner_blocks: self.vertex_attribs().snapshot_slots(&slots),
+            corner_vertex_blocks,
+            corner_loop_blocks,
         }
     }
 
     /// Capture the pre-bevel donor of every face in `faces` (deduplicated). A mesh
-    /// with no per-vertex layer has nothing for the blend to write, so it captures
-    /// nothing and pays for none of this.
+    /// with neither a per-vertex nor a per-loop layer has nothing for the blend to
+    /// write, so it captures nothing and pays for none of this.
     fn capture_donor_bank(&self, faces: &[FaceKey]) -> DonorBank {
         let mut bank = DonorBank::default();
-        if self.vertex_attribs().is_empty() {
+        if self.vertex_attribs().is_empty() && self.loop_attribs().is_empty() {
             return bank;
         }
         for &face in faces {
@@ -7359,9 +7431,25 @@ impl LoopMesh {
         bank
     }
 
-    /// The per-corner blend of BEVEL.md §5.2.1 step 2, per-vertex half: overwrite
-    /// `vertex`'s whole per-vertex block with `donor`'s corner blocks resampled at
-    /// the vertex's **final** position.
+    /// The per-corner blend of BEVEL.md §5.2.1 step 2: overwrite the corner's whole
+    /// **per-loop** block *and* its vertex's whole **per-vertex** block with `donor`'s
+    /// corner blocks, resampled at the vertex's **final** position.
+    ///
+    /// Both domains ride one solve (§5.2.5 / BMESH.md §10.1.4): the same donor, the
+    /// same weight vector, the loop half blending the donor's per-**corner** blocks
+    /// where the vertex half blends its per-**vertex** ones. Re-deriving a second,
+    /// separately-computed weight vector for the loop half is not a refactor — it is a
+    /// different value rule.
+    ///
+    /// This is the **un-snapped** case of that call: §5.2.1.1's weight-snap edge (the
+    /// seam-carrying branch, which would move the sample point onto an edge of an
+    /// override donor face before the solve) is unimplemented, so the sample is taken at
+    /// the corner vertex's position as it stands.
+    ///
+    /// The loop half has no §5.2.1 step-1 baseline to fall back on the way the vertex
+    /// half does (a new vertex is minted from `v`'s block; a new loop is not minted
+    /// from anything), so every corner that goes unblended keeps the layer defaults.
+    /// That is what the fills outside the sites §5.2.5 pins still do.
     ///
     /// The weight is **positional, not parametric** — it is solved from where the
     /// vertex actually ended up, so it tracks the `offset_type` measure, the
@@ -7381,12 +7469,18 @@ impl LoopMesh {
     /// already holds survives, which after the §5.2.1 step-1 mint is `cd(v)`'s value.
     /// The interpolable layers need no special case either: at a unit weight they
     /// already come out bit-exact under every policy.
-    fn blend_vertex_from_donor(&mut self, vertex: VertexKey, donor: &CornerDonor) {
+    fn blend_corner_from_donor(&mut self, corner: LoopKey, donor: &CornerDonor) {
+        let vertex = self.loop_vertex(corner);
         let sample = donor.projection.project(self.vertex_position(vertex));
         let weights = mean_value_weights(&donor.proj_corners, sample);
+        self.loop_attribs.interpolate_from_snapshot(
+            corner.as_usize(),
+            &donor.corner_loop_blocks,
+            &weights,
+        );
         self.vertex_attribs.interpolate_from_snapshot(
             vertex.as_usize(),
-            &donor.corner_blocks,
+            &donor.corner_vertex_blocks,
             &weights,
         );
     }
@@ -7398,18 +7492,20 @@ impl LoopMesh {
     /// (§5.2.1 property (3)) — their interpolable layers because a unit weight
     /// reproduces the source value under every policy, their no-interp layers
     /// because the blend never writes those at all (BMESH.md §10.1.4). A rebuilt
-    /// face must not perturb the vertex data of the mesh around it.
+    /// face must not perturb the vertex data of the mesh around it, and it must
+    /// hand every surviving corner of its own back the loop values the killed face
+    /// carried there.
     ///
-    /// The **last** per-vertex write of the run (§5.2.1 fact (c)), so every caller
-    /// runs it after its own fills.
+    /// The **last** write of the run in both domains (§5.2.1 fact (c)), so every
+    /// caller runs it after its own fills.
     fn blend_restitched_originals(&mut self, rebuilt: &[RebuiltOriginal], bank: &DonorBank) {
         for original in rebuilt {
             let Some(index) = original.donor else {
                 continue;
             };
             let donor = bank.donor(index);
-            for corner in self.face_vert_keys(original.face) {
-                self.blend_vertex_from_donor(corner, donor);
+            for corner in self.face_loop_keys(original.face) {
+                self.blend_corner_from_donor(corner, donor);
             }
         }
     }
@@ -26349,6 +26445,427 @@ mod tests {
                 serial_of(&mesh, serial, strip_vertex),
                 near_serial,
                 "the strip vert was not minted from its own endpoint",
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    // ---- §5.2.5: per-loop customdata across the chamfer ----
+
+    const SHADE: &str = "shade";
+
+    /// A cube whose every face-corner carries a value that is affine in the corner's
+    /// **position** and offset by a code for the **face** it belongs to. The face code
+    /// is what makes the layer genuinely per-loop: the four loops meeting at one cube
+    /// vertex hold four different values, so a blend that read the wrong face's corners
+    /// — or read the corner's *vertex* data instead — lands on a value this fixture can
+    /// name.
+    fn loop_decorated_cube() -> (LoopMesh, ElementAttributeKey) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let shade = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom(SHADE),
+                AttrType::F32,
+            ))
+            .expect("F32 is a supported loop attribute format");
+
+        for face in mesh.face_keys() {
+            let code = face_code(mesh.face_plane_normal(face));
+            for corner in mesh.face_loop_keys(face) {
+                let value = loop_field(code, mesh.vertex_position(mesh.loop_vertex(corner)));
+                mesh.loop_attribs_mut()
+                    .set_f32(shade, corner.as_usize(), value);
+            }
+        }
+        (mesh, shade)
+    }
+
+    /// A cube whose per-loop value depends on the corner's **position alone** — every
+    /// face meeting at a vertex holds the *same* value there, so by BEVEL.md §6.6.1.4 no
+    /// edge of it is an interpolation seam: condition (1) cannot fire on a closed cube,
+    /// and condition (2)'s contiguity test agrees at both endpoints of every edge. A
+    /// beveled corner of this cube is therefore **not seam-carrying**, and its cap takes
+    /// §5.2.1.1's positional per-boundvert donor branch — the one that is implemented.
+    ///
+    /// [`loop_decorated_cube`]'s face code, by contrast, makes *every* cube edge a seam
+    /// by condition (2), which routes its caps down the override branch. That is fine for
+    /// the re-stitched-original tests (whose donor is the face itself either way) but not
+    /// for a cap test.
+    fn loop_continuous_cube() -> (LoopMesh, ElementAttributeKey) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let shade = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom(SHADE),
+                AttrType::F32,
+            ))
+            .expect("F32 is a supported loop attribute format");
+
+        for face in mesh.face_keys() {
+            for corner in mesh.face_loop_keys(face) {
+                let value = continuous_loop_field(mesh.vertex_position(mesh.loop_vertex(corner)));
+                mesh.loop_attribs_mut()
+                    .set_f32(shade, corner.as_usize(), value);
+            }
+        }
+        (mesh, shade)
+    }
+
+    /// Non-zero at every cube corner and at every ring vert a `0.25` bevel of one, so an
+    /// unblended corner (which reads the layer default `0`) is never mistaken for a
+    /// blended one.
+    fn continuous_loop_field(position: Vec3) -> f32 {
+        7.0 + 3.0 * position.x + 5.0 * position.y + 11.0 * position.z
+    }
+
+    /// One of the cube's six axis-aligned face directions, as a small integer. A
+    /// rebuilt face keeps its plane, so this identifies an original face *after* the
+    /// re-stitch has given it a new key.
+    fn face_code(normal: Vec3) -> i32 {
+        let axis = if normal.x.abs() > normal.y.abs() && normal.x.abs() > normal.z.abs() {
+            0
+        } else if normal.y.abs() > normal.z.abs() {
+            1
+        } else {
+            2
+        };
+        let sign = if normal[axis] > 0.0 { 1 } else { 0 };
+        (axis * 2 + sign) as i32
+    }
+
+    fn loop_field(face_code: i32, position: Vec3) -> f32 {
+        100.0 * (face_code as f32 + 1.0) + 3.0 * position.x + 5.0 * position.y + 11.0 * position.z
+    }
+
+    fn shade_of(mesh: &LoopMesh, layer: ElementAttributeKey, corner: LoopKey) -> f32 {
+        mesh.loop_attribs()
+            .get_f32(layer, corner.as_usize())
+            .expect("the shade layer is registered")
+    }
+
+    /// The loop of `face` at `vertex`.
+    fn corner_of(mesh: &LoopMesh, face: FaceKey, vertex: VertexKey) -> LoopKey {
+        mesh.face_loop_keys(face)
+            .into_iter()
+            .find(|&corner| mesh.loop_vertex(corner) == vertex)
+            .expect("the face has a corner at this vertex")
+    }
+
+    fn face_with_normal(mesh: &LoopMesh, code: i32) -> FaceKey {
+        mesh.face_keys()
+            .into_iter()
+            .find(|&face| face_code(mesh.face_plane_normal(face)) == code)
+            .expect("the cube has a face in this plane")
+    }
+
+    /// BEVEL.md §5.2.5 + §5.2.2: the per-loop blend is the same call as the per-vertex
+    /// one — same donor, same weights — so a re-stitched original's new corner at a ring
+    /// vert takes **that face's own pre-bevel corner loops**, collapsed by the on-edge
+    /// short-circuit to the edge-linear form on the leg the ring vert sits on. The
+    /// donated values are the *face's* corner values, not the beveled vertex's, and they
+    /// are certainly not the layer default.
+    #[test]
+    fn vertex_bevel_rebuilt_face_corners_blend_the_loops_across_the_chamfer() {
+        let (mut mesh, shade) = loop_decorated_cube();
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let corner_position = mesh.vertex_position(corner);
+
+        // The three faces at the corner, and each face's two legs at it, read pre-bevel.
+        let incident: Vec<(i32, Vec<(Vec3, f32)>, f32)> = mesh
+            .vert_face_keys(corner)
+            .into_iter()
+            .map(|face| {
+                let code = face_code(mesh.face_plane_normal(face));
+                let corner_shade = shade_of(&mesh, shade, corner_of(&mesh, face, corner));
+                let legs = mesh
+                    .face_vert_keys(face)
+                    .into_iter()
+                    .filter(|&w| {
+                        w != corner && mesh.query_edge_exists(corner, w).is_some()
+                    })
+                    .map(|far| {
+                        (
+                            mesh.vertex_position(far),
+                            shade_of(&mesh, shade, corner_of(&mesh, face, far)),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(legs.len(), 2, "a cube face meets two of the corner's legs");
+                (code, legs, corner_shade)
+            })
+            .collect();
+        assert_eq!(incident.len(), 3);
+
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+
+        for (code, legs, corner_shade) in incident {
+            let face = face_with_normal(&mesh, code);
+            // The rebuilt face's two new corners: the ring verts, each on one of the
+            // face's two legs at the beveled corner.
+            let new_corners: Vec<LoopKey> = mesh
+                .face_loop_keys(face)
+                .into_iter()
+                .filter(|&loop_key| {
+                    (mesh.vertex_position(mesh.loop_vertex(loop_key)) - corner_position).length()
+                        < 0.5
+                })
+                .collect();
+            assert_eq!(new_corners.len(), 2, "the corner run has two ring verts");
+
+            for new_corner in new_corners {
+                let position = mesh.vertex_position(mesh.loop_vertex(new_corner));
+                let &(far_position, far_shade) = legs
+                    .iter()
+                    .min_by(|(a, _), (b, _)| {
+                        let da = (position - corner_position)
+                            .normalize()
+                            .dot((*a - corner_position).normalize());
+                        let db = (position - corner_position)
+                            .normalize()
+                            .dot((*b - corner_position).normalize());
+                        db.partial_cmp(&da).expect("finite")
+                    })
+                    .expect("the ring vert sits on one of the face's two legs");
+
+                let t = (position - corner_position).length()
+                    / (far_position - corner_position).length();
+                assert!((t - 0.125).abs() < 1.0e-5, "realised fraction {t}");
+
+                let expected = (1.0 - t) * corner_shade + t * far_shade;
+                let actual = shade_of(&mesh, shade, new_corner);
+                assert!(
+                    (actual - expected).abs() < 1.0e-3,
+                    "rebuilt corner shade {actual} != edge-linear {expected} on face {code} \
+                     (corner loop {corner_shade}, far loop {far_shade}, t {t})",
+                );
+                assert!(
+                    actual.abs() > 1.0e-3,
+                    "the rebuilt corner read the layer default — no per-loop blend ran",
+                );
+            }
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §5.2.1 property (3), per-loop half: a re-stitched original blends **all**
+    /// its corners, and a corner sampled at its own donor corner takes weight `1` — so
+    /// the surviving corners of a rebuilt face must come back holding the loop values the
+    /// killed face carried there. The face's loops are destroyed with it, so a missing
+    /// blend here shows up as the layer default, not as drift.
+    #[test]
+    fn vertex_bevel_untouched_corners_of_a_rebuilt_face_keep_their_loop_block() {
+        let (mut mesh, shade) = loop_decorated_cube();
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+
+        for face in mesh.face_keys() {
+            let code = face_code(mesh.face_plane_normal(face));
+            for loop_key in mesh.face_loop_keys(face) {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                // Only the original (un-slid) cube corners: the cube's own verts are the
+                // only positions with all-unit coordinates.
+                if position.abs().min_element() < 0.99 {
+                    continue;
+                }
+                let expected = loop_field(code, position);
+                let actual = shade_of(&mesh, shade, loop_key);
+                assert!(
+                    (actual - expected).abs() < 1.0e-3,
+                    "an untouched corner of a rebuilt face lost its loop value: {actual} != \
+                     {expected}",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §5.2.1.1 + §5.2.5: the cap is the **only** face that owns its corners'
+    /// loops, so its blend decides them outright. Its donor list is per corner —
+    /// boundvert `i` takes the face whose winding *arrives* at `v` along `e_i` — and the
+    /// ring vert lies on `e_i`, which is that donor's boundary edge, so the value is the
+    /// edge-linear one **in that donor face's loops**. Collapse the list to one face and
+    /// the corner on the leg that face does not hold projects onto `v` itself, taking
+    /// `v`'s value instead of the edge-linear one.
+    ///
+    /// Pins the **non-seam-carrying** branch, and so runs on the seam-free cube: a corner
+    /// with any seamed incident leg takes a §6.6.1.4 override face plus a weight-snap
+    /// edge instead, and that branch is unimplemented. Rewrite this test when it lands.
+    #[test]
+    fn vertex_bevel_cap_corners_blend_from_their_own_boundvert_donor() {
+        let (mut mesh, shade) = loop_continuous_cube();
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let corner_position = mesh.vertex_position(corner);
+
+        // Per leg: the far endpoint, and the arriving face's loop values at both ends of
+        // that leg — the donor the cap's corner on this leg must use.
+        let legs: Vec<(Vec3, f32, f32)> = mesh
+            .iter_disk_edges(corner)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|edge| {
+                let [a, b] = mesh.edge_vert_keys(edge);
+                let far = if a == corner { b } else { a };
+                let arriving = mesh
+                    .vert_face_keys(corner)
+                    .into_iter()
+                    .find(|&face| {
+                        let cycle = mesh.face_vert_keys(face);
+                        let index = cycle
+                            .iter()
+                            .position(|&w| w == corner)
+                            .expect("an incident face has the corner");
+                        let previous = cycle[(index + cycle.len() - 1) % cycle.len()];
+                        mesh.query_edge_exists(previous, corner) == Some(edge)
+                    })
+                    .expect("a closed fan has an arriving face on every leg");
+                (
+                    mesh.vertex_position(far),
+                    shade_of(&mesh, shade, corner_of(&mesh, arriving, corner)),
+                    shade_of(&mesh, shade, corner_of(&mesh, arriving, far)),
+                )
+            })
+            .collect();
+        assert_eq!(legs.len(), 3);
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.faces.len(), 1, "one cap");
+        let cap = result.faces[0];
+
+        for cap_corner in mesh.face_loop_keys(cap) {
+            let position = mesh.vertex_position(mesh.loop_vertex(cap_corner));
+            let &(far_position, donor_corner_shade, donor_far_shade) = legs
+                .iter()
+                .min_by(|(a, _, _), (b, _, _)| {
+                    let da = (position - corner_position)
+                        .normalize()
+                        .dot((*a - corner_position).normalize());
+                    let db = (position - corner_position)
+                        .normalize()
+                        .dot((*b - corner_position).normalize());
+                    db.partial_cmp(&da).expect("finite")
+                })
+                .expect("the cap corner is a ring vert on one of the three legs");
+
+            let t =
+                (position - corner_position).length() / (far_position - corner_position).length();
+            let expected = (1.0 - t) * donor_corner_shade + t * donor_far_shade;
+            let actual = shade_of(&mesh, shade, cap_corner);
+            assert!(
+                (actual - expected).abs() < 1.0e-3,
+                "cap corner shade {actual} != the arriving donor's edge-linear {expected} \
+                 (donor loops {donor_corner_shade} / {donor_far_shade}, t {t})",
+            );
+            assert!(
+                actual.abs() > 1.0e-3,
+                "the cap corner read the layer default — no per-loop blend ran on the cap",
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §5.2.3 + §5.2.5: at an edge bevel the strip verts sit on the **legs**, so
+    /// the rebuilt face's corner at a strip vert blends that face's loops along the leg —
+    /// the beveled edge's own far endpoint appears in no such blend at that end.
+    #[test]
+    fn edge_bevel_rebuilt_face_corners_blend_the_loops_along_their_leg() {
+        let (mut mesh, shade) = loop_decorated_cube();
+        let near = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let far_end = vert_at(&mesh, Vec3::new(1.0, -1.0, 1.0));
+        let beveled = mesh
+            .query_edge_exists(near, far_end)
+            .expect("the cube has this edge");
+        let near_position = mesh.vertex_position(near);
+
+        // The one face at `near` that the beveled edge does *not* bound: its two corners
+        // at `near`'s legs are both re-stitched, and neither leg is the beveled edge.
+        let flanking = mesh.edge_face_keys(beveled);
+        let side_face = mesh
+            .vert_face_keys(near)
+            .into_iter()
+            .find(|face| !flanking.contains(face))
+            .expect("the cube corner has a third face");
+        let side_code = face_code(mesh.face_plane_normal(side_face));
+        let near_shade = shade_of(&mesh, shade, corner_of(&mesh, side_face, near));
+        let legs: Vec<(Vec3, f32)> = mesh
+            .face_vert_keys(side_face)
+            .into_iter()
+            .filter(|&w| w != near && mesh.query_edge_exists(near, w).is_some())
+            .map(|far| {
+                (
+                    mesh.vertex_position(far),
+                    shade_of(&mesh, shade, corner_of(&mesh, side_face, far)),
+                )
+            })
+            .collect();
+        assert_eq!(legs.len(), 2);
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let rebuilt = face_with_normal(&mesh, side_code);
+        let strip_corners: Vec<LoopKey> = mesh
+            .face_loop_keys(rebuilt)
+            .into_iter()
+            .filter(|&loop_key| {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                (position - near_position).length() > 1.0e-4
+                    && (position - near_position).length() < 0.5
+            })
+            .collect();
+        assert_eq!(
+            strip_corners.len(),
+            2,
+            "the face opposite the beveled edge holds both of `near`'s legs, so its corner \
+             at `near` is replaced by both strip verts",
+        );
+
+        for strip_corner in strip_corners {
+            let position = mesh.vertex_position(mesh.loop_vertex(strip_corner));
+            let &(leg_far_position, leg_far_shade) = legs
+                .iter()
+                .min_by(|(a, _), (b, _)| {
+                    let da = (position - *a).length();
+                    let db = (position - *b).length();
+                    da.partial_cmp(&db).expect("finite")
+                })
+                .expect("the strip vert sits on one of the face's legs");
+
+            let t = (position - near_position).length()
+                / (leg_far_position - near_position).length();
+            let expected = (1.0 - t) * near_shade + t * leg_far_shade;
+            let actual = shade_of(&mesh, shade, strip_corner);
+            assert!(
+                (actual - expected).abs() < 1.0e-3,
+                "strip corner shade {actual} != leg-linear {expected} (endpoint loop \
+                 {near_shade}, leg-far loop {leg_far_shade}, t {t})",
             );
         }
 

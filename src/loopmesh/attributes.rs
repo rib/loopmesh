@@ -1306,6 +1306,12 @@ pub(crate) struct SlotSnapshot {
 }
 
 impl SlotSnapshot {
+    /// A snapshot of a domain that carries no layers: every read of it is a no-op,
+    /// so a caller with nothing to blend can skip both the slot list and the gather.
+    pub(crate) fn empty() -> Self {
+        Self { layers: Vec::new() }
+    }
+
     /// Number of captured slots (snapshot corners).
     pub(crate) fn len(&self) -> usize {
         self.layers.first().map_or(0, |(_, _, v)| v.len())
