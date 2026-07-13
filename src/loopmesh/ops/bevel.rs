@@ -793,51 +793,23 @@ impl LoopMesh {
             }
         }
 
-        // Count how many beveled edges meet at each endpoint: `s == 1` is a
-        // terminal close (§7.5), `s ≥ 2` a junction (§7.6).
-        let mut beveled_at: Vec<(VertexKey, usize)> = Vec::new();
-        for &edge in &beveled {
-            for endpoint in self.edge_vert_keys(edge) {
-                match beveled_at.iter_mut().find(|(v, _)| *v == endpoint) {
-                    Some((_, count)) => *count += 1,
-                    None => beveled_at.push((endpoint, 1)),
-                }
-            }
-        }
-        // The set of endpoints that are junctions (≥ 2 beveled edges meeting).
-        let junctions: Vec<VertexKey> = beveled_at
-            .iter()
-            .filter(|(_, count)| *count >= 2)
-            .map(|(v, _)| *v)
-            .collect();
-
         // The multi-segment orchestrator (BEVEL.md §8.2 / §8.3) drives junctions and
         // terminals alike: a junction-free edge set simply has no fill to build, and
-        // resolves to the §8.3.0.1 terminal-to-terminal through-strip.
+        // resolves to the §8.3.0.1 terminal-to-terminal through-strip. It plans its own
+        // edge set, off the manifold subset.
         if options.segments >= 2 {
-            self.bevel_edges_cutoff_multisegment(&beveled, &junctions, options, &mut result);
+            self.bevel_edges_cutoff_multisegment(&beveled, options, &mut result);
             return result;
         }
 
         // §7.5: a terminal endpoint needs two flanking legs to meet its strip verts
         // against, so a valence-2 endpoint has no close at all. Decline such an edge
-        // here, whole, or the strip build finds no corner to land on at that end.
-        let beveled = self.single_segment_buildable_edges(&beveled);
+        // here, whole, or the strip build finds no corner to land on at that end. The plan
+        // hands back the junctions (§7.6) of the surviving set along with it.
+        let (beveled, junctions) = self.buildable_beveled_edges(&beveled);
         if beveled.is_empty() {
             return result;
         }
-        // Declining an edge can demote its junction, so read the junctions back off
-        // the surviving set.
-        let junctions: Vec<VertexKey> = junctions
-            .into_iter()
-            .filter(|&vertex| {
-                beveled
-                    .iter()
-                    .filter(|&&edge| self.edge_vert_keys(edge).contains(&vertex))
-                    .count()
-                    >= 2
-            })
-            .collect();
 
         if junctions.is_empty() {
             // No shared endpoint: every edge is isolated, every endpoint terminal
@@ -898,21 +870,37 @@ impl LoopMesh {
             .map(|&loop_key| self.loop_face(loop_key))
     }
 
-    /// The beveled edges the `segments = 1` path can actually build (BEVEL.md §7.5):
-    /// every endpoint must be either a junction (§7.6, any valence) or a terminal whose
-    /// close [`terminal_close_legs`](Self::terminal_close_legs) can lay out — and the
-    /// edge itself must have a direction to offset off, since a zero-length `E` has no
-    /// offset line and every corner at either end would decline mid-build. Dropping an
-    /// edge can turn a junction into a terminal, which can drop a further edge, so the
+    /// The beveled edges the operator can actually build (BEVEL.md §7.5), at **every**
+    /// `segments`: every endpoint must be either a junction (§7.6, any valence) or a
+    /// terminal whose close [`terminal_close_legs`](Self::terminal_close_legs) can lay out
+    /// — and the edge itself must have a direction to offset off, since a zero-length `E`
+    /// has no offset line and every corner at either end would decline mid-build. Dropping
+    /// an edge can turn a junction into a terminal, which can drop a further edge, so the
     /// set is shrunk to a fixed point.
     ///
     /// The decline is **whole-edge and up-front**: the close is placement-before-surgery
     /// (§7.5), so an endpoint that only fails half way through would strand the verts the
     /// other end already minted, and a fill recorded over a leg the close declined would
-    /// lay a face over geometry the surviving faces still cover.
-    fn single_segment_buildable_edges(&self, beveled: &[EdgeKey]) -> Vec<EdgeKey> {
+    /// lay a face over geometry the surviving faces still cover. The terminal's admission
+    /// is the same predicate at `segments ≥ 2` — the multi-segment chain build wants the
+    /// same layout, the same leg directions, and the same clean face corners.
+    ///
+    /// Returns the surviving edges **and their junctions** — the endpoints where two or more
+    /// of them meet (§7.6). The two are one answer: a junction is defined against the *kept*
+    /// set (declining an edge can demote a junction back to a terminal, which can decline a
+    /// further edge), so the builders' preconditions — "this endpoint is a junction, or its
+    /// terminal close was admitted" — only hold if every caller reads the same set the fixed
+    /// point settled on. Handing them back together is what keeps a second, drifting
+    /// definition from being written at each call site.
+    fn buildable_beveled_edges(&self, beveled: &[EdgeKey]) -> (Vec<EdgeKey>, Vec<VertexKey>) {
         let mut buildable: Vec<EdgeKey> = beveled.to_vec();
         loop {
+            let mut beveled_degree: HashMap<VertexKey, usize> = HashMap::new();
+            for &edge in &buildable {
+                for endpoint in self.edge_vert_keys(edge) {
+                    *beveled_degree.entry(endpoint).or_default() += 1;
+                }
+            }
             let kept: Vec<EdgeKey> = buildable
                 .iter()
                 .copied()
@@ -923,18 +911,26 @@ impl LoopMesh {
                         return false;
                     }
                     [a, b].into_iter().all(|endpoint| {
-                        let beveled_here = buildable
-                            .iter()
-                            .filter(|&&other| self.edge_vert_keys(other).contains(&endpoint))
-                            .count();
-                        beveled_here >= 2 || self.terminal_close_admits(endpoint, edge)
+                        beveled_degree[&endpoint] >= 2 || self.terminal_close_admits(endpoint, edge)
                     })
                 })
                 .collect();
-            if kept.len() == buildable.len() {
-                return kept;
+            if kept.len() != buildable.len() {
+                buildable = kept;
+                continue;
             }
-            buildable = kept;
+            // The degrees were counted over exactly this set, so they are the fixed point's.
+            // Collected off the edge list rather than the map, to keep the order the callers
+            // walk the junctions in independent of the map's iteration order.
+            let mut junctions: Vec<VertexKey> = Vec::new();
+            for &edge in &kept {
+                for endpoint in self.edge_vert_keys(edge) {
+                    if beveled_degree[&endpoint] >= 2 && !junctions.contains(&endpoint) {
+                        junctions.push(endpoint);
+                    }
+                }
+            }
+            return (kept, junctions);
         }
     }
 
@@ -1472,7 +1468,6 @@ impl LoopMesh {
     fn bevel_edges_cutoff_multisegment(
         &mut self,
         beveled: &[EdgeKey],
-        junctions: &[VertexKey],
         options: &BevelOptions,
         result: &mut BevelResult,
     ) {
@@ -1481,12 +1476,24 @@ impl LoopMesh {
         let segments = options.segments;
         let profile = options.profile;
 
-        let mut beveled_manifold: Vec<EdgeKey> = Vec::new();
+        let mut manifold: Vec<EdgeKey> = Vec::new();
         for &edge in beveled {
             if self.edge_radial_iter(edge).count() == 2 {
-                beveled_manifold.push(edge);
+                manifold.push(edge);
             }
         }
+
+        // §7.5 placement-before-surgery, hoisted to the whole edge set — the same plan the
+        // `segments = 1` path takes, for the same reason. `build_terminal_chains` is
+        // all-or-nothing, so a terminal declining *after* another endpoint (this edge's own
+        // far end, or another edge's) had already minted its chain would leave those verts
+        // stranded on a mesh no face of this pass reaches. The planner is pure and reads the
+        // same pristine disks phase 1 does, so a plan taken here still holds when phase 1
+        // asks for it — which is why the builders below `expect` rather than skip.
+        // The plan's junctions (§7.6) are the ones the surviving set defines — declining an
+        // edge can demote a junction back to a terminal — and every `expect` below rests on
+        // reading exactly that set, not a second copy of the predicate.
+        let (beveled_manifold, junctions) = self.buildable_beveled_edges(&manifold);
         if beveled_manifold.is_empty() {
             return;
         }
@@ -2140,32 +2147,36 @@ impl LoopMesh {
             .find(|&e| beveled.contains(&e))
             .expect("a terminal endpoint has its one beveled edge");
 
+        // The caller planned every terminal of the edge set before the first mint
+        // (`buildable_beveled_edges`), so each of the three preconditions below — E manifold,
+        // a layout, and that layout's flanking faces being E's radial pair — is a broken
+        // invariant here rather than an input shape. Bailing on one mid-pass is what would
+        // strand the verts a previously built endpoint already minted.
         let radial_faces: Vec<FaceKey> = self
             .edge_loop_keys(edge)
             .iter()
             .map(|&l| self.loop_face(l))
             .collect();
-        if radial_faces.len() != 2 {
-            return;
-        }
+        assert_eq!(
+            radial_faces.len(),
+            2,
+            "the plan admitted only manifold beveled edges",
+        );
         let face_left = radial_faces[0];
         let face_right = radial_faces[1];
 
         // The rotational layout is the *one* source of truth for this terminal: the two
         // flanking legs and the faces they bound with E, and the order the rest are walked
-        // in. It stands on an open fan as well as a closed one (only the `segments = 1`
-        // close's admission cares about the difference), and it declines a zero-length E,
-        // which has no offset line to place a strip vert on.
-        let Some(legs) = self.terminal_leg_layout(vertex, edge) else {
-            return;
-        };
-        // A layout whose flanking faces are not E's radial pair has no face-keyed corner
-        // for the strip build to land on.
-        if [legs.start_face, legs.end_face] != [face_left, face_right]
-            && [legs.start_face, legs.end_face] != [face_right, face_left]
-        {
-            return;
-        }
+        // in — an arc on an open fan, a cycle on a closed one, and the fill's ring order
+        // either way.
+        let legs = self
+            .terminal_leg_layout(vertex, edge)
+            .expect("the terminal plan admitted this endpoint's layout");
+        assert!(
+            [legs.start_face, legs.end_face] == [face_left, face_right]
+                || [legs.start_face, legs.end_face] == [face_right, face_left],
+            "the terminal plan admitted only layouts flanked by E's radial pair",
+        );
         let starts_left = legs.start_face == face_left;
         let (left_leg, right_leg) = if starts_left {
             (legs.start_leg, legs.end_leg)
@@ -2173,7 +2184,6 @@ impl LoopMesh {
             (legs.end_leg, legs.start_leg)
         };
 
-        let valence = self.iter_disk_edges(vertex).count();
         let surface_normal = self.surface_normal_at(vertex);
 
         let strip_for_leg =
@@ -2215,7 +2225,13 @@ impl LoopMesh {
             set_face_substitution(face_subst, vertex, face, vec![strip_vert]);
         }
 
-        if valence >= 4 {
+        // The fill exists exactly when there is a leg that does not flank `E` — which is a
+        // statement about the *ring* the fill's boundary is walked off (`legs.middle`), and
+        // so must be tested on the ring, not on the raw disk count. The two agree only
+        // because the layout demands the ring cover the whole disk; testing the disk count
+        // here would take this branch with an empty ring and mint the chain's interior rungs
+        // with no face to absorb them (§7.5).
+        if !legs.middle.is_empty() {
             // §8.3.0.2 endpoint fill: one vert slid the plain offset along each unbeveled
             // leg NOT adjacent to E, and one fill over the through-chain plus the leg
             // verts. The original terminal vertex is consumed — every incident face
@@ -2239,10 +2255,13 @@ impl LoopMesh {
                 vec![(left_leg, strip_left), (right_leg, strip_right)];
             let mut leg_verts: Vec<VertexKey> = Vec::with_capacity(legs.middle.len());
             for &leg in &legs.middle {
-                let leg_direction = match self.edge_direction_from(leg, vertex, terminal_position) {
-                    Some(direction) => direction,
-                    None => continue,
-                };
+                // The caller planned this terminal before the first mint, so a leg with no
+                // direction is a broken invariant, not an input shape. Skipping it (the old
+                // shape) would record the fill over a leg that got no vert — a partial
+                // close, which §7.5's all-or-nothing rule forbids.
+                let leg_direction = self
+                    .edge_direction_from(leg, vertex, terminal_position)
+                    .expect("the terminal plan admitted only legs with a direction");
                 // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
                 let leg_vert =
                     self.mint_bevel_vertex(terminal_position + leg_direction * offset, vertex);
@@ -2262,27 +2281,16 @@ impl LoopMesh {
                 if face == face_left || face == face_right {
                     continue;
                 }
-                let cycle_verts = self.face_vert_keys(face);
-                let cycle_length = cycle_verts.len();
-                // A malformed face (wire-edge sharing, non-manifold) may not carry
-                // the endpoint as a clean corner; skip rather than panic (rubric-5).
-                let index = match cycle_verts.iter().position(|&w| w == vertex) {
-                    Some(index) => index,
-                    None => continue,
-                };
-                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
-                let next_vertex = cycle_verts[(index + 1) % cycle_length];
-                let incoming = match self.query_edge_exists(prev_vertex, vertex) {
-                    Some(leg) => leg,
-                    None => continue,
-                };
-                let outgoing = match self.query_edge_exists(vertex, next_vertex) {
-                    Some(leg) => leg,
-                    None => continue,
-                };
-                let (near_in, near_out) = match (near_of(incoming), near_of(outgoing)) {
-                    (Some(near_in), Some(near_out)) => (near_in, near_out),
-                    _ => continue,
+                // The plan admitted this terminal only if every one of its faces resolves to
+                // a corner on two of its disk legs, each of which has just been given a near
+                // vert — so a run that cannot be laid here is a broken invariant. Skipping
+                // the face while keeping the fill would leave the fill spanning geometry the
+                // skipped face still covers.
+                let (incoming, outgoing) = self
+                    .face_corner_edges(face, vertex)
+                    .expect("the terminal plan admitted only faces with a clean corner here");
+                let (Some(near_in), Some(near_out)) = (near_of(incoming), near_of(outgoing)) else {
+                    panic!("the terminal plan placed a near-corner vert on every leg of this face");
                 };
                 let mut run = vec![near_in];
                 if near_out != near_in {
@@ -2325,22 +2333,12 @@ impl LoopMesh {
                 if face == face_left || face == face_right {
                     continue;
                 }
-                let cycle_verts = self.face_vert_keys(face);
-                let cycle_length = cycle_verts.len();
-                // A malformed third face (wire-edge sharing, non-manifold) may not
-                // carry the endpoint as a clean corner, or its incoming corner edge
-                // may not resolve. Skip such a face rather than panic — the gate does
-                // not enforce these as preconditions (rubric-5: panics are for
-                // internal invariants only).
-                let index = match cycle_verts.iter().position(|&w| w == vertex) {
-                    Some(index) => index,
-                    None => continue,
-                };
-                let prev_vertex = cycle_verts[(index + cycle_length - 1) % cycle_length];
-                let incoming_edge = match self.query_edge_exists(prev_vertex, vertex) {
-                    Some(edge) => edge,
-                    None => continue,
-                };
+                // As above: the plan admitted this terminal's every face as a clean corner
+                // on two disk legs, and a third face that failed to absorb the run would
+                // survive the re-stitch still pointing at the consumed endpoint.
+                let (incoming_edge, _) = self
+                    .face_corner_edges(face, vertex)
+                    .expect("the terminal plan admitted only faces with a clean corner here");
                 let ordered = if incoming_edge == right_leg {
                     reverse_run.clone()
                 } else {
@@ -5262,16 +5260,19 @@ impl LoopMesh {
     /// `end`; its last is `leg_(n−3)`, ring-adjacent to `start`).
     ///
     /// The order comes off the **corner ring**, so it is rotational on an *open* fan too —
-    /// a boundary terminal's legs are an arc, and the walk simply continues across the gap
-    /// back to the arc's other end. The per-vertex edge cycle's own order is an insertion
-    /// order and would list the legs arbitrarily, which emits the fill as a bow-tie n-gon
-    /// at valence ≥ 5. So every builder takes its ordering from here, and `closed` records
-    /// whether the disk is a cycle for the **admission** half
-    /// ([`terminal_close_legs`](Self::terminal_close_legs)) to decide on.
+    /// a boundary terminal's legs are an **arc**, and the walk simply continues across the
+    /// gap back to the arc's other end, which is the rotational order the fill's ring wants.
+    /// The per-vertex edge cycle's own order is an insertion order and would list the legs
+    /// arbitrarily, which emits the fill as a bow-tie n-gon at valence ≥ 5. So every builder
+    /// — the `segments = 1` close and the multi-segment chain build alike — takes its
+    /// ordering from here.
     ///
     /// `None` only when there is no layout at all: valence < 3 (nothing for the strip verts
-    /// to meet against), a non-manifold or zero-length `E`, or an open fan whose `E` sits at
-    /// an arc end and so has a leg on one side only.
+    /// to meet against), a non-manifold or zero-length `E`, an open fan whose `E` sits at
+    /// an arc end and so has a leg on one side only, or a disk the corner ring does not
+    /// cover (a wire spoke among the legs — the ring walks faces, so it never reaches one).
+    /// That last case is a **known over-tight decline**, not a real absence of a layout: see
+    /// the guard's own note below.
     fn terminal_leg_layout(&self, vertex: VertexKey, edge: EdgeKey) -> Option<TerminalLegs> {
         let vertex_position = self.vertex_position(vertex);
         // A terminal meets its strip verts against the two legs flanking `E`, so a
@@ -5292,8 +5293,22 @@ impl LoopMesh {
                 disk.push(last.outgoing_edge);
             }
         }
+        // The ring is a walk over *face corners*, so it reaches only the legs that bound a
+        // face here: a wire spoke (or any leg the ring cannot arrive on) is on the disk but
+        // off the ring. The close lays a near-corner vert on every leg it *sees* and then
+        // consumes the endpoint, so a leg the layout never listed would get no vert, be
+        // covered by no substitution, and — being radial-empty — be silently destroyed with
+        // the endpoint.
+        //
+        // Declining the whole edge here is **known over-tight**: a face-less spoke should be
+        // carried as a leg the fill does not span (it has no face corner, so widening the
+        // ring walk is not the fix), and the terminal should close around it with the spoke
+        // left inert. Declining is the safe hold that prevents the wire being destroyed,
+        // until that layout lands.
+        if disk.len() != valence {
+            return None;
+        }
         let closed = corners.len() == valence
-            && disk.len() == valence
             && self
                 .iter_disk_edges(vertex)
                 .all(|leg| self.edge_loop_keys(leg).len() == 2);
@@ -5328,36 +5343,30 @@ impl LoopMesh {
             end_face,
             middle,
             disk,
-            closed,
         })
     }
 
-    /// The **admission** half of a terminal close at `segments = 1` (BEVEL.md §7.5): the
+    /// The **admission** half of a terminal close (BEVEL.md §7.5), at every `segments`: the
     /// layout, plus the preconditions the close's all-or-nothing surgery rests on, or
     /// `None` when this endpoint has no buildable close and the whole edge must be
     /// declined. Pure: it mints nothing, so both the up-front buildability filter and the
     /// close itself can ask it, and they always agree.
     ///
-    /// Beyond the layout it demands:
+    /// An **open** fan is admitted like any other: a boundary terminal's fill ring is the
+    /// same rotational walk, read off the arc, and the one ring edge that spans the arc's
+    /// gap simply comes out as a boundary edge of the fill (§8.3.0.2's ring listing is a
+    /// disk-order statement, not a cycle-of-faces one). The layout's arc-end guard already
+    /// keeps `E` itself off the rim, where it would have a leg on one side only.
     ///
-    /// - a valence-≥ 4 endpoint's disk really **closes** (a closed manifold fan: one face
-    ///   per disk edge, every disk edge radial-2). Its fill is a *cyclic* ring, so on a
-    ///   boundary or non-manifold terminal — whose legs are an arc — closing that ring
-    ///   would lay a face across the exterior wedge, inventing surface the input had none
-    ///   of. Declined rather than filled. (A valence-3 terminal needs no cycle: it has no
-    ///   legs between and so no fill, and its two strip verts meet the two legs flanking
-    ///   `E`, which exist on a rim as well as in a closed fan — §7.4's absorbing third face
-    ///   is simply absent there.)
-    /// - every leg it places a vert on has a direction to place it along, and every face at
-    ///   the endpoint resolves to a corner on two disk legs — otherwise the fill would be
-    ///   recorded over a boundary the substitutions never opened. One bad leg or face
-    ///   declines the whole endpoint.
+    /// Beyond the layout it demands that every leg it places a vert on has a direction to
+    /// place it along, and that the endpoint's faces **partition** the disk's sectors: one
+    /// face per corner of the ring, each resolving to a corner on two disk legs. A face that
+    /// covers no ring sector — or two faces over one — would leave the fill recorded over a
+    /// boundary the substitutions never opened. One bad leg or face declines the whole
+    /// endpoint.
     fn terminal_close_legs(&self, vertex: VertexKey, edge: EdgeKey) -> Option<TerminalLegs> {
         let vertex_position = self.vertex_position(vertex);
         let legs = self.terminal_leg_layout(vertex, edge)?;
-        if !legs.closed && self.iter_disk_edges(vertex).count() >= 4 {
-            return None;
-        }
 
         for &leg in [legs.start_leg, legs.end_leg]
             .iter()
@@ -5365,7 +5374,15 @@ impl LoopMesh {
         {
             self.edge_direction_from(leg, vertex, vertex_position)?;
         }
-        for face in self.vert_face_keys(vertex) {
+        let corners = self.vertex_corner_ring(vertex);
+        let faces = self.vert_face_keys(vertex);
+        if faces.len() != corners.len() {
+            return None;
+        }
+        for face in faces {
+            if corners.iter().filter(|corner| corner.face == face).count() != 1 {
+                return None;
+            }
             let (incoming, outgoing) = self.face_corner_edges(face, vertex)?;
             if !legs.disk.contains(&incoming)
                 || !legs.disk.contains(&outgoing)
@@ -5378,12 +5395,14 @@ impl LoopMesh {
         Some(legs)
     }
 
-    /// Whether a terminal endpoint's `segments = 1` close can be built at all — the
-    /// [admission](Self::terminal_close_legs) *and* the caller-side precondition every
+    /// Whether a terminal endpoint's close can be built at all, at **every** `segments` —
+    /// the [admission](Self::terminal_close_legs) *and* the caller-side precondition every
     /// close shares: the layout's two flanking faces are exactly `E`'s radial pair, which
-    /// is what lets a strip corner be keyed by face. Asked **before the first mint** by
-    /// every entry point into the close (§7.5 placement-before-surgery), so a declined
-    /// endpoint strands nothing.
+    /// is what lets a strip corner be keyed by face. This is the one gate both builders
+    /// stand on: [`close_terminal_endpoint`](Self::close_terminal_endpoint) at `segments =
+    /// 1` and [`build_terminal_chains`](Self::build_terminal_chains) above it. Asked
+    /// **before the first mint** by every entry point into the close (§7.5
+    /// placement-before-surgery), so a declined endpoint strands nothing.
     fn terminal_close_admits(&self, vertex: VertexKey, edge: EdgeKey) -> bool {
         let radial: Vec<FaceKey> = self
             .edge_loop_keys(edge)
@@ -8293,10 +8312,10 @@ struct TerminalFill {
 /// walks them, whose first entry is `leg₁` (ring-adjacent to `end`) and whose last is
 /// `leg_(n−3)` (ring-adjacent to `start`, and the fan's pivot at three boundverts).
 ///
-/// `disk` is the whole rotational walk this was read off — the arc, on an open fan.
-/// `closed` says whether that walk is a cycle: the layout stands either way, and it is
-/// the `segments = 1` [admission](LoopMesh::terminal_close_legs) that declines an open
-/// fan with a fill to build.
+/// `disk` is the whole rotational walk this was read off — the arc, on an open fan, whose
+/// `middle` therefore continues past the arc's end and back around to its other end. That
+/// arc order *is* the fill's ring order, so an open fan builds the same fill as a closed
+/// one, with the ring edge spanning the gap left as a boundary edge.
 struct TerminalLegs {
     start_leg: EdgeKey,
     end_leg: EdgeKey,
@@ -8304,7 +8323,6 @@ struct TerminalLegs {
     end_face: FaceKey,
     middle: Vec<EdgeKey>,
     disk: Vec<EdgeKey>,
-    closed: bool,
 }
 
 /// One **mitered** junction's ring data (BEVEL.md §8.9.2 / §8.9.3 / §8.9.5), consumed
@@ -21851,16 +21869,18 @@ mod tests {
         (mesh, verts)
     }
 
-    /// BEVEL.md §7.5 / §8.3.0.1: the valence-≥4 endpoint fill is defined over the legs
-    /// **strictly between the two `E`-flanking legs in disk order** — a statement about a
-    /// *closed* disk cycle. A **boundary** terminal of valence 4 has no such cycle: its
-    /// legs form an arc, and the "legs between" the flanking pair, read cyclically, run
-    /// out through the hole. Filling there would close a face across the exterior — the
-    /// operator would invent surface where the input had none — so the endpoint has no
-    /// close and the whole edge is declined, whole and up-front (nothing minted, nothing
-    /// re-stitched).
+    /// BEVEL.md §7.5 / §8.3.0.2: a **boundary** valence-4 terminal is filled like any other.
+    /// Its legs are an **arc**, not a cycle, but the ring order §8.3.0.2 asks for is a
+    /// *rotational disk order* statement, and the arc carries that order already — `leg₁`
+    /// is the non-flanking leg following `end` around the disk, the walk continuing across
+    /// the fan's gap. So the ring is `[start, end, leg₁]` and the fill is its one triangle,
+    /// exactly as at an interior terminal; the single ring edge that spans the gap comes out
+    /// as a boundary edge of the fill.
+    ///
+    /// At `(2,2)` of the holed grid the beveled `+x` edge is flanked by the `±y` legs, and
+    /// the one non-flanking leg is `−x` — a rim edge of the hole.
     #[test]
-    fn edge_bevel_boundary_valence_four_terminal_is_declined() {
+    fn edge_bevel_boundary_valence_four_terminal_open_fan_is_filled_from_the_arc() {
         let (mut mesh, verts) = quad_grid_5x5_holed();
         let before = counts(&mesh);
         let rim = verts[2][2];
@@ -21888,12 +21908,299 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(counts(&mesh), before, "the boundary terminal is declined");
-        assert!(result.verts.is_empty() && result.faces.is_empty());
-        assert!(
-            vert_near(&mesh, Vec3::new(2.0, 2.0, 0.0), 1.0e-4).is_some(),
-            "the rim terminal vertex is not consumed",
+        let (verts_after, _, faces_after) = counts(&mesh);
+        assert_eq!(
+            (verts_after, faces_after),
+            (before.0 + 4, before.2 + 3),
+            "both endpoints are valence-4 terminals: 2 verts each, one fill each, one strip",
         );
+        assert!(
+            vert_near(&mesh, Vec3::new(2.0, 2.0, 0.0), 1.0e-4).is_none(),
+            "the rim terminal vertex is consumed by the close",
+        );
+
+        let tol = 1.0e-5;
+        let start = vert_near(&mesh, Vec3::new(2.0, 2.25, 0.0), tol).expect("+y strip vert");
+        let end = vert_near(&mesh, Vec3::new(2.0, 1.75, 0.0), tol).expect("−y strip vert");
+        let leg = vert_near(&mesh, Vec3::new(1.75, 2.0, 0.0), tol).expect("−x leg vert");
+
+        let fills = terminal_fill_faces(&mesh, &result.verts, leg);
+        assert_eq!(fills.len(), 1, "three boundverts ⇒ one fill face");
+        assert!(
+            same_cyclic_order(&fills[0], &[start, end, leg]),
+            "the fill is the arc's ring `[start, end, leg₁]`",
+        );
+        assert!(
+            winding_conflicts(&mesh).is_empty(),
+            "no shared edge is traversed the same way by both its faces",
+        );
+
+        // The fan's gap is the sector between the `−y` and `−x` legs (the missing quad), so
+        // the ring edge `end → leg₁` spans it — and it comes out a **boundary** edge: the
+        // fill adds no surface across the hole beyond its own single face. The ring's other
+        // leg edge, `leg₁ → start`, crosses a surviving sector and is shared with the face
+        // that absorbed both of its ends.
+        let gap_edge = mesh
+            .query_edge_exists(end, leg)
+            .expect("the ring edge spanning the open fan's gap");
+        assert_eq!(
+            mesh.edge_radial_iter(gap_edge).count(),
+            1,
+            "the gap-spanning ring edge is a boundary edge of the fill",
+        );
+        let absorbed_edge = mesh
+            .query_edge_exists(leg, start)
+            .expect("the ring edge across the surviving sector");
+        assert_eq!(mesh.edge_radial_iter(absorbed_edge).count(), 2);
+    }
+
+    /// The open fan's ring is walked off the corner ring at **every** `segments`, and at
+    /// `segments = 1` a valence-6 boundary terminal is the shape where it is emitted **whole**
+    /// (five boundverts, §8.3.0.2's n-gon rule) rather than fanned — so a `middle` in the
+    /// wrong order comes out as a self-crossing **bow-tie pentagon**, not merely a wrongly
+    /// shaped triangle. Every rotation of the build order is exercised: that is what moves
+    /// the per-vertex edge cycle's insertion order, the only other order the legs could be
+    /// read in.
+    #[test]
+    fn edge_bevel_open_fan_valence_six_single_segment_fill_is_one_whole_pentagon() {
+        const SPOKES: usize = 6;
+        const BEVELED: usize = 2;
+
+        for first_face in 0..SPOKES - 1 {
+            let (mut mesh, centre, rim) = open_planar_fan(SPOKES, first_face);
+            let spoke_of = |mesh: &LoopMesh, k: usize| {
+                mesh.query_edge_exists(centre, rim[k]).expect("a fan spoke")
+            };
+            let beveled = spoke_of(&mesh, BEVELED);
+
+            // The rotational ring: `start` on `E`'s disk-preceding leg, `end` on its
+            // following one, then on past `end` — over the arc's open gap and back to
+            // `start`.
+            let corners = mesh.vertex_corner_ring(centre);
+            let mut disk: Vec<EdgeKey> = corners.iter().map(|c| c.incoming_edge).collect();
+            disk.push(corners.last().expect("a corner").outgoing_edge);
+            let seat = disk
+                .iter()
+                .position(|&e| e == beveled)
+                .expect("E on the arc");
+            let leg_index = |edge: EdgeKey| {
+                (0..SPOKES)
+                    .find(|&k| spoke_of(&mesh, k) == edge)
+                    .expect("a spoke")
+            };
+            let ring_spokes: Vec<usize> = std::iter::once(seat + SPOKES - 1)
+                .chain(seat + 1..seat + SPOKES - 1)
+                .map(|step| leg_index(disk[step % SPOKES]))
+                .collect();
+
+            let result = mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            let on_spoke = |mesh: &LoopMesh, k: usize| -> VertexKey {
+                let angle = std::f32::consts::PI * (k as f32) / ((SPOKES - 1) as f32);
+                let direction = Vec3::new(angle.cos(), angle.sin(), 0.0);
+                mesh.vert_keys()
+                    .into_iter()
+                    .find(|&v| {
+                        let position = mesh.vertex_position(v);
+                        let length = position.length();
+                        length > 1.0e-4
+                            && length < 0.9
+                            && (position / length - direction).length() < 1.0e-3
+                    })
+                    .expect("the fill's boundvert on this spoke")
+            };
+            let ring: Vec<VertexKey> = ring_spokes.iter().map(|&k| on_spoke(&mesh, k)).collect();
+
+            let fills = terminal_fill_faces(&mesh, &result.verts, ring[2]);
+            assert_eq!(fills.len(), 1, "five boundverts ⇒ one whole n-gon");
+            let fill = &fills[0];
+            assert_eq!(
+                fill.len(),
+                5,
+                "a pentagon: no interior rung at `segments = 1`"
+            );
+            assert!(
+                same_cyclic_order(fill, &ring),
+                "the face walks `start → end → leg₁ → leg₂ → leg₃` in arc order — no bow-tie",
+            );
+
+            // The one ring edge that spans the arc's gap joins the boundverts of the two
+            // extreme spokes, and is a **boundary** edge: the fill lays no surface over the
+            // hole beyond its own single face.
+            let gap_edge = mesh
+                .query_edge_exists(on_spoke(&mesh, 0), on_spoke(&mesh, SPOKES - 1))
+                .expect("the ring edge spanning the open fan's gap");
+            assert_eq!(
+                mesh.edge_radial_iter(gap_edge).count(),
+                1,
+                "the gap-spanning ring edge is a boundary edge of the fill",
+            );
+            assert!(
+                winding_conflicts(&mesh).is_empty(),
+                "no shared edge is traversed the same way by both its faces",
+            );
+        }
+    }
+
+    /// A wire spoke on the terminal is a leg the **corner ring cannot see** — the ring walks
+    /// face corners, and a radial-empty edge bounds none. The close would lay its near-corner
+    /// verts on the legs it *can* see (an arc of three, here) and then consume the endpoint,
+    /// destroying the wire edge with it and recording a fill over a sector no substitution
+    /// opened. So the layout demands the ring cover the whole disk, and this terminal has no
+    /// close at all: the edge is declined whole, at every `segments`, and the wire survives.
+    /// The decline is a hold, not the right answer — see the test below.
+    fn wire_spoke_open_fan() -> (LoopMesh, VertexKey, EdgeKey, EdgeKey) {
+        let (mut mesh, centre, rim) = open_planar_fan(3, 0);
+        let wire_end = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let wire = mesh.create_edge([centre, wire_end], EdgeCreateFlags::NONE);
+        let beveled = mesh
+            .query_edge_exists(centre, rim[1])
+            .expect("the arc's middle spoke — the one with a leg on both sides");
+        (mesh, centre, beveled, wire)
+    }
+
+    /// **Known divergence, pinned as-is.** The reference behaviour is to *bevel* this shape:
+    /// a face-less spoke on the terminal's disk is treated as **inert**, the edge closes
+    /// around it exactly as it would with the spoke absent, and the wire's far tip is left
+    /// untouched (on a 3×3 grid with a wire at the centre, beveling the centre-adjacent edge
+    /// takes 10/13/4 → 13/18/6 at `segments = 1`, 15/22/8 at 2, 17/26/10 at 3).
+    ///
+    /// loopmesh instead **declines the edge whole** — `terminal_leg_layout` cannot carry a
+    /// leg with no face corner, and its `disk.len() == valence` guard is the safe hold until
+    /// the layout can. So the returned patch is pristine and the counts are unchanged, which
+    /// is *not* parity.
+    ///
+    /// The load-bearing half of this pin is therefore the last assertion: **the wire edge
+    /// survives**. Before the guard, the close swept the wire away with the endpoint —
+    /// silently destroying mesh the user never selected, which is strictly worse than
+    /// doing nothing. That must not regress, whatever fixes the decline.
+    #[test]
+    fn edge_bevel_terminal_with_a_wire_spoke_declines_for_now_and_never_destroys_the_wire() {
+        for segments in [1, 2] {
+            let (mut mesh, centre, beveled, wire) = wire_spoke_open_fan();
+            let before = counts(&mesh);
+            assert_eq!(mesh.iter_disk_edges(centre).count(), 4);
+            assert_eq!(
+                mesh.vertex_corner_ring(centre).len(),
+                2,
+                "the ring sees two sectors — three of the four legs",
+            );
+            assert!(
+                !mesh.terminal_close_admits(centre, beveled),
+                "the disk the ring cannot cover has no close",
+            );
+
+            let result = mesh.bevel(
+                &[beveled.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments,
+                    affect: BevelAffect::Edges,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            assert!(
+                result.verts.is_empty() && result.faces.is_empty(),
+                "the declined edge minted nothing — no stranded verts, no orphan rungs",
+            );
+            assert_eq!(counts(&mesh), before, "and the mesh is untouched");
+            assert!(
+                mesh.edge_keys().contains(&wire),
+                "the wire spoke is not swept away with the terminal",
+            );
+        }
+    }
+
+    /// The smallest mesh that carries the same corner — a `2 × 2` quad grid with one corner
+    /// quad (and its outer vertex) left out: 8 verts, 10 edges, 3 quads, and a centre vertex
+    /// of valence 4 whose fan is open. Returns the centre `(1,1)` and the `(0,1)` end of its
+    /// `−x` spoke, one of the centre's two manifold ones.
+    fn three_quad_open_fan_corner() -> (LoopMesh, VertexKey, VertexKey) {
+        let mut mesh = LoopMesh::new();
+        let coords = [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (0, 2),
+            (1, 2),
+        ];
+        let verts: Vec<VertexKey> = coords
+            .iter()
+            .map(|&(i, j)| mesh.create_vertex(Vec3::new(i as f32, j as f32, 0.0)))
+            .collect();
+        let at = |i: i32, j: i32| {
+            verts[coords
+                .iter()
+                .position(|&c| c == (i, j))
+                .expect("a grid vertex the fixture keeps")]
+        };
+        for (i, j) in [(0, 0), (1, 0), (0, 1)] {
+            mesh.face_create_verts(
+                &[at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)],
+                FaceCreateFlags::NONE,
+            );
+        }
+        (mesh, at(1, 1), at(0, 1))
+    }
+
+    /// The whole shape of the open-fan terminal close, on the smallest fixture that has one:
+    /// `8 / 10 / 3` → `11 / 15 / 5` with face sizes `[3, 4, 4, 4, 5]`. The valence-4 centre
+    /// contributes two strip verts and one leg vert (minus the consumed centre) and one
+    /// **triangle** fill (§8.3.0.2 at three boundverts, `segments = 1`); the valence-3 far
+    /// end contributes its two strip verts and **no** fill (§8.3.0.1's two-boundvert ring);
+    /// the strip is one quad; the face between `end`'s leg and the leg vert grows by one
+    /// side to a pentagon (§7.4's absorb); the two faces flanking `E` swap each corner
+    /// 1-for-1 and stay quads.
+    #[test]
+    fn edge_bevel_open_fan_terminal_close_is_a_triangle_fill_and_a_grown_pentagon() {
+        let (mut mesh, centre, spoke_end) = three_quad_open_fan_corner();
+        assert_eq!(counts(&mesh), (8, 10, 3));
+
+        let beveled = mesh
+            .query_edge_exists(centre, spoke_end)
+            .expect("the centre's −x spoke");
+        assert_eq!(
+            mesh.edge_radial_iter(beveled).count(),
+            2,
+            "the beveled spoke is manifold; the fan around it is not closed",
+        );
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (11, 15, 5));
+        let mut sizes: Vec<usize> = mesh
+            .face_keys()
+            .into_iter()
+            .map(|face| mesh.face_vert_keys(face).len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![3, 4, 4, 4, 5]);
+        assert!(
+            vert_near(&mesh, Vec3::new(1.0, 1.0, 0.0), 1.0e-4).is_none(),
+            "the open-fan terminal vertex is consumed",
+        );
+        assert!(winding_conflicts(&mesh).is_empty());
     }
 
     /// Bevel spoke 0 of a closed planar `spokes`-fan and hand back the centre terminal's
@@ -22005,10 +22312,17 @@ mod tests {
         let (start, end, leg) = (ring[0], ring[1], ring[2]);
 
         let fills = terminal_fill_faces(&mesh, &minted, leg);
-        assert_eq!(fills.len(), 2, "three boundverts ⇒ `segments` = 2 triangles");
+        assert_eq!(
+            fills.len(),
+            2,
+            "three boundverts ⇒ `segments` = 2 triangles"
+        );
         for fill in &fills {
             assert_eq!(fill.len(), 3, "a fanned fill is triangles");
-            assert!(fill.contains(&leg), "every fan triangle carries the leg vert");
+            assert!(
+                fill.contains(&leg),
+                "every fan triangle carries the leg vert"
+            );
         }
         let peak = *fills
             .iter()
@@ -22223,26 +22537,40 @@ mod tests {
         }
     }
 
+    /// The `5 × 5` grid with `(2,1)` slid onto `(2,2)`, so the `−y` **leg** of the `(2,2)`
+    /// terminal is zero-length while the topology stays intact. A leg with no direction has
+    /// no near-corner vert to slide onto, so the close at `(2,2)` declines — permanently:
+    /// it is a degenerate input (rubric 5), not a shape the operator grows into.
+    fn quad_grid_5x5_collapsed_leg() -> (LoopMesh, Vec<Vec<VertexKey>>) {
+        let (mut mesh, verts) = quad_grid_5x5();
+        mesh.set_vertex_position(verts[2][1], Vec3::new(2.0, 2.0, 0.0));
+        (mesh, verts)
+    }
+
     /// BEVEL.md §7.5 placement-before-surgery: a terminal close is all-or-nothing, so the
     /// close is **probed for both endpoints before the first mint**. Beveling this edge
-    /// closes fine at its interior endpoint and declines at the hole rim (a boundary
-    /// valence-4 terminal, whose fill has no cycle to close over) — and a decline taken
-    /// after the interior endpoint had been placed would leave that endpoint's strip and
-    /// leg verts minted, attached to nothing, on a mesh the pass otherwise leaves pristine.
-    /// Driven straight at the isolated-edge builder, past the up-front buildable-edge
-    /// filter, so it is the builder's own probe under test.
+    /// closes fine at its `(3,2)` endpoint and declines at `(2,2)`, whose `−y` leg is
+    /// collapsed and so has no direction to slide a near-corner vert along — and a decline
+    /// taken after `(3,2)` had been placed would leave that endpoint's strip and leg verts
+    /// minted, attached to nothing, on a mesh the pass otherwise leaves pristine. Driven
+    /// straight at the isolated-edge builder, past the up-front buildable-edge filter, so it
+    /// is the builder's own probe under test.
     #[test]
     fn edge_bevel_terminal_decline_mints_nothing_at_the_other_endpoint() {
-        let (mut mesh, verts) = quad_grid_5x5_holed();
+        let (mut mesh, verts) = quad_grid_5x5_collapsed_leg();
         let before = counts(&mesh);
         let rim = verts[2][2];
         let interior = verts[3][2];
         let edge = mesh
             .query_edge_exists(rim, interior)
-            .expect("the +x edge off the hole rim");
+            .expect("the +x edge off the collapsed leg");
+        assert!(
+            !mesh.terminal_close_admits(rim, edge),
+            "the collapsed leg's endpoint declines",
+        );
         assert!(
             mesh.terminal_close_admits(interior, edge),
-            "the interior endpoint's close is admitted — it is the rim's that declines",
+            "the other endpoint's close is admitted — it is the collapsed one that declines",
         );
 
         let mut templates = TemplateBank::default();
@@ -22275,6 +22603,80 @@ mod tests {
                 "no vertex is left face-less",
             );
         }
+    }
+
+    /// The same all-or-nothing rule at `segments ≥ 2` (BEVEL.md §7.5): the multi-segment
+    /// orchestrator plans every terminal of the edge set **before the first mint**, exactly
+    /// as the single-segment one does. This edge closes fine at `(3,2)` and cannot close at
+    /// `(2,2)`, whose `−y` leg is collapsed — so the **whole edge** is declined. Without the
+    /// plan the pass would mint `(3,2)`'s chain, strand it when `(2,2)` declined, and record
+    /// a fill over the leg that never got a vert.
+    #[test]
+    fn edge_bevel_multi_segment_terminal_decline_is_whole_edge_and_up_front() {
+        let (mut mesh, verts) = quad_grid_5x5_collapsed_leg();
+        let before = counts(&mesh);
+        let declined = mesh
+            .query_edge_exists(verts[2][2], verts[3][2])
+            .expect("the +x edge off the collapsed leg");
+
+        let result = mesh.bevel(
+            &[declined.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(
+            counts(&mesh),
+            before,
+            "nothing was minted, nothing stitched"
+        );
+        assert!(result.verts.is_empty() && result.faces.is_empty());
+        for vertex in mesh.vert_keys() {
+            assert!(
+                !mesh.vert_face_keys(vertex).is_empty(),
+                "no vertex is left face-less",
+            );
+        }
+    }
+
+    /// And the `segments ≥ 2` orchestrator's plan does **not** over-decline: the open-fan
+    /// valence-4 terminal it has always built (its ring order comes off the same rotational
+    /// layout the `segments = 1` close now shares) still builds, with the fill fanned from
+    /// its one leg vert into `segments` triangles (§8.3.0.2's three-boundvert rule).
+    #[test]
+    fn edge_bevel_multi_segment_boundary_valence_four_terminal_open_fan_still_builds() {
+        let (mut mesh, verts) = quad_grid_5x5_holed();
+        let before = counts(&mesh);
+        let beveled = mesh
+            .query_edge_exists(verts[2][2], verts[3][2])
+            .expect("the +x edge off the hole rim");
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert!(counts(&mesh).2 > before.2, "the open fan is not declined");
+        let leg = vert_near(&mesh, Vec3::new(1.75, 2.0, 0.0), 1.0e-5).expect("−x leg vert");
+        let fills = terminal_fill_faces(&mesh, &result.verts, leg);
+        assert_eq!(
+            fills.len(),
+            2,
+            "three boundverts ⇒ `segments` fan triangles"
+        );
+        assert!(fills.iter().all(|fill| fill.len() == 3));
+        assert!(winding_conflicts(&mesh).is_empty());
     }
 
     /// The `5 × 5` grid with `(2,2)` slid onto `(3,2)`, so the edge between them is
