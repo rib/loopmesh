@@ -583,12 +583,6 @@ struct FaceRecord {
     /// splits leave it intact, and it is on the ring iff the ring is still the
     /// one the pattern was matched against.
     anchor: VertexKey,
-    /// §7.1 — the fallback's dropped-connect verdict: do this face's two cut
-    /// edges have a **second common face**? Decided here, on the *input*
-    /// topology, and uniform across the face's `N` connects by construction
-    /// (they all sit on the same two cut edges). Always `false` when the face is
-    /// not a two-cut face, which is the only kind that can read it.
-    strip_connects_dropped: bool,
 }
 
 impl FaceRecord {
@@ -1059,24 +1053,17 @@ impl LoopMesh {
                 continue;
             }
 
-            // §7.1 — the dropped-connect precondition, decided here for the same
-            // reason as the §4.3.1 guard beside it: it is a function of the
-            // *input topology*, and only pass one still sees that topology. Both
-            // of the face's cut edges are still whole edges now (from `cuts = 2`
-            // up they are not, by apply time), and asking the live mesh at apply
-            // time asks a different question — an earlier-applied face's
-            // fragments carry cut verts too, so a face that shares both cut edges
-            // can be re-split out of the answer before the fallback gets its turn.
-            let strip_connects_dropped = cut_edges.len() == 2
-                && self.cut_edges_have_a_second_common_face(face, cut_edges[0], cut_edges[1]);
-
+            // §7.1.5 — nothing about the fallback's dropped-connect verdict may
+            // be carried on the record: it is a query against the *live* mesh at
+            // apply time, and it is the exact mirror of the §4.3.1 guard beside
+            // it, which *must* be decided here because the angle it measures no
+            // longer exists later. Each is read where its inputs are still true.
             geom.record_resplit_face(face);
             records.push(FaceRecord {
                 face,
                 pre_len,
                 cut_count: cut_edges.len(),
                 anchor,
-                strip_connects_dropped,
             });
         }
 
@@ -1246,7 +1233,7 @@ impl LoopMesh {
                     !self.face_op_flag_test(guard_layer, face, FLAT_CORNER),
                     "a guarded template-less face is never recorded (§4.3.1)"
                 );
-                self.two_edge_strip(face, &ring, record.strip_connects_dropped, geom);
+                self.two_edge_strip(face, &ring, geom);
             }
             // §4.3 — the fallback is *not* a catch-all. A template-less face with
             // any other cut count (a one-cut or three-cut n-gon, say) is never
@@ -1346,8 +1333,8 @@ impl LoopMesh {
     ///
     /// The §7.1 two-edge fallback deliberately does **not** use this primitive —
     /// it splits the parent face handle directly, and it substitutes its own,
-    /// stricter precondition (two cut edges with a *second* common face drop all
-    /// `N` of its connects) for the no-op rules above. That precondition is
+    /// stricter precondition (a connect whose endpoints any *other* live face
+    /// carries is dropped, §7.1.1) for the no-op rules above. That precondition is
     /// **not** checked here: a template connect targeted at a pair two faces both
     /// carry is resolved by the fewest-corners heuristic, which guesses where the
     /// fallback declines.
@@ -1381,9 +1368,9 @@ impl LoopMesh {
     /// first in loop order, reading from an original corner) and `b_1..b_N`. The
     /// runs face each other *antiparallel* around the rim, so they zip
     /// **outside-in** — `a_i` with `b_{N+1-i}` — for `N` connects that do not
-    /// cross, and hence exactly `N + 1` fragments for every `N` and every face
-    /// size. No hub, no median tie-break, no odd/even asymmetry (contrast
-    /// §9.5.3.1's fan).
+    /// cross, and hence `N + 1` fragments for every `N` and every face size when
+    /// every connect is laid. No hub, no median tie-break, no odd/even asymmetry
+    /// (contrast §9.5.3.1's fan).
     ///
     /// Every connect is a split of the **parent face handle itself** — the
     /// fallback deliberately does *not* go through the §7.0 fewest-corners
@@ -1396,26 +1383,25 @@ impl LoopMesh {
     /// two arguments and the parent keeps the outer band, where the remaining
     /// pairs are not.
     ///
+    /// §7.1.1 — each of the `N` candidate pairs then carries its own
+    /// **dropped-connect precondition**, and it is the fallback's substitute for
+    /// §7.0's no-op-when-absent rule: the connect is laid iff **no face other
+    /// than this one currently carries both of its endpoints as corners**
+    /// ([`Self::another_face_carries_both`]). The `N` queries are independent —
+    /// a co-occupying neighbour can shatter *between* two pairs of one face — so
+    /// the face comes out with `N + 1 - dropped` fragments, any value in
+    /// `[1, N + 1]`. A per-face boolean is wrong here however it is computed, and
+    /// so is sampling one pair and generalising (§7.1.2 / §7.1.3).
+    ///
     /// Caller obligations, all settled before the call: the §4.3.1 flat-corner
-    /// guard, the §7.0.3 abandonment gate, the dispatch that establishes this
-    /// face is template-less with `cut_count = 2`, and `connects_dropped` — the
-    /// §7.1 precondition, which pass one decided on the input topology
-    /// ([`Self::cut_edges_have_a_second_common_face`]). The precondition is the
-    /// fallback's own substitute for §7.0's no-op-when-absent rule, and it takes
-    /// **all `N`** connects or none: every candidate pair has one endpoint on
-    /// each of the same two cut edges, so it cannot differ between the pairs, and
-    /// a partially stripped face is not a reachable outcome of the rule.
+    /// guard, the §7.0.3 abandonment gate, and the dispatch that establishes this
+    /// face is template-less with `cut_count = 2`.
     fn two_edge_strip(
         &mut self,
         face: FaceKey,
         rim: &[(VertexKey, bool)],
-        connects_dropped: bool,
         geom: &mut SubdivideGeom,
     ) {
-        if connects_dropped {
-            return;
-        }
-
         let Some(runs) = Self::two_cut_runs(rim) else {
             debug_assert!(false, "the strip fires only on a face with two cut-vert runs");
             return;
@@ -1429,12 +1415,23 @@ impl LoopMesh {
 
         for i in 0..n {
             let (cut_vert_a, cut_vert_b) = (runs.run_a[i], runs.run_b[n - 1 - i]);
+
+            // §7.1.1 — the query is asked here, of the mesh as it stands: every
+            // earlier-applied face of pass three has re-split by now, and its
+            // fragments count. §7.1.4 licenses asking it per connect rather than
+            // once on arrival — the fragments this face's own earlier connects
+            // minted carry only cut verts *outward* of the pair being tested, so
+            // they can never change a later pair's verdict.
+            if self.another_face_carries_both(face, cut_vert_a, cut_vert_b) {
+                continue;
+            }
+
             let Some((_fragment, connect)) = self.face_split(face, cut_vert_a, cut_vert_b) else {
                 // Not a documented no-op on this path (contrast `template_connect`,
-                // §7.0.2): the parent keeps the inner band, on which every
-                // remaining pair is a diagonal. A refusal here means the retention
-                // convention or the argument order broke, and the face would come
-                // out partially stripped — an outcome §7.1 says is unreachable.
+                // §7.0.2): the parent keeps the inner band — merged across any
+                // dropped pairs, but still holding every remaining pair as a
+                // diagonal. A refusal here means the retention convention or the
+                // argument order broke.
                 debug_assert!(false, "the parent's inner band holds every remaining pair non-adjacent");
                 return;
             };
@@ -1447,43 +1444,32 @@ impl LoopMesh {
         }
     }
 
-    /// §7.1 — the fallback's dropped-connect precondition, in the reduced form the
-    /// guide derives. A connect is laid only when its endpoints are corners of **no
-    /// face other than** the one being re-split; a cut vert of edge `e` is a corner
-    /// of exactly the faces in `e`'s radial cycle, so on the pre-cut mesh the whole
-    /// question is: *do the face's two cut edges have a common face other than this
-    /// one?* One answer settles all `N` of the face's connects, because their
-    /// endpoints always sit on those same two edges.
+    /// §7.1.1 — the fallback's dropped-connect precondition, taken literally: does
+    /// any face **other than** `face` currently carry both `a` and `b` as corners?
+    /// Plain corner membership on the **live** mesh — the other face's size,
+    /// winding, cut status, and whether it holds the two adjacently are all
+    /// irrelevant. Seed the walk from either endpoint; the relation is symmetric.
     ///
-    /// The reduction is a statement about the **input topology**, which is why it
-    /// is asked in pass one and not from the strip. The two forms agree only until
-    /// pass three starts cutting: from then on an earlier-applied face's fragments
-    /// carry cut verts of their own, and a neighbour that shares both cut edges can
-    /// have re-split itself out of any single fragment holding the pair — the live
-    /// query would then say "lay it" where the reduction says "drop it".
+    /// It is a query over **verts, not edges**. The tempting reduction — "the
+    /// face's two cut edges have a second common face", read off the input topology
+    /// in pass one — is **false** (§7.1.2): a cut vert of edge `e` is a corner of
+    /// exactly `e`'s radial faces only *before* pass three starts cutting, and a
+    /// co-occupying neighbour that has already re-split has scattered the pair
+    /// across fragments that hold neither pair whole. From `cuts = 2` up the cut
+    /// edges are not even whole edges by the time the fallback runs; the endpoint
+    /// verts are the only things that survive the dispatch → apply gap.
     ///
     /// Two faces sharing two edges is manifold-legal (the valence-2 pillow corner),
-    /// and both of them drop: the rule is deliberately not a tiebreak, so a pair
-    /// neither face can claim unambiguously is claimed by neither. The §7.0 carrier
-    /// search *does* guess in the same situation — which is exactly why the
-    /// fallback must not be routed through it.
-    fn cut_edges_have_a_second_common_face(
-        &self,
-        face: FaceKey,
-        cut_edge_a: EdgeKey,
-        cut_edge_b: EdgeKey,
-    ) -> bool {
-        let mut radial_a = self.radial_loops(cut_edge_a);
-        while let Some(loop_a) = radial_a.next(self) {
-            let candidate = self.loops.get(loop_a).face;
-            if candidate == face {
-                continue;
-            }
-            let mut radial_b = self.radial_loops(cut_edge_b);
-            while let Some(loop_b) = radial_b.next(self) {
-                if self.loops.get(loop_b).face == candidate {
-                    return true;
-                }
+    /// and when both are fallbacks both of them drop: the rule is deliberately not
+    /// a tiebreak, so a pair neither face can claim unambiguously is claimed by
+    /// neither. The §7.0 carrier search *does* guess in the same situation — which
+    /// is exactly why the fallback must not be routed through it.
+    fn another_face_carries_both(&self, face: FaceKey, a: VertexKey, b: VertexKey) -> bool {
+        let mut fan = self.vert_fan_loops(a);
+        while let Some(corner) = fan.next(self) {
+            let candidate = self.loops.get(corner).face;
+            if candidate != face && self.face_has_vert(candidate, b) {
+                return true;
             }
         }
         false
@@ -2177,8 +2163,8 @@ impl LoopMesh {
                 // §9.5.3.3 / §7.1 — the generic two-edge strip at `cuts = N`, and
                 // the same code path as at `cuts = 1`: it is face-size agnostic
                 // and `N`-agnostic, zipping the two runs outside-in into `N`
-                // connects and `N + 1` fragments (or, when §7.1's precondition
-                // drops them, none at all and one fragment).
+                // connects and `N + 1` fragments (fewer by however many §7.1.1's
+                // per-pair precondition drops — the drops need not agree).
                 //
                 // §9.5.3.5 pins the guard as `cuts`-independent — it reads the
                 // *input* edge directions — so a face the dispatch scan refused to
@@ -2187,7 +2173,7 @@ impl LoopMesh {
                     !self.face_op_flag_test(guard_layer, face, FLAT_CORNER),
                     "a guarded template-less face is never recorded (§4.3.1)"
                 );
-                self.two_edge_strip(face, &rim, record.strip_connects_dropped, geom);
+                self.two_edge_strip(face, &rim, geom);
                 return;
             }
             _ => {}
@@ -5934,11 +5920,13 @@ mod tests {
 
     #[test]
     fn dropped_connect_precondition_holds_for_every_cut_at_higher_n() {
-        // §7.1 — the verdict is uniform across a face's `N` candidate pairs (they
-        // all have one endpoint on each of the same two cut edges), so a face lays
-        // all `N` connects or none. At `cuts = 3` on the quad/pentagon pillow that
-        // is 3 + 3 connects dropped: F stays 2, and a partially stripped face
-        // (which §7.1 says is unreachable) would show up as any other face count.
+        // §7.1.1 at `cuts = 3`, on the pillow where *both* faces are fallbacks. The
+        // verdict is taken per pair, but here all six agree, and the symmetry is
+        // what makes them: whichever face applies first sees its co-occupant intact
+        // (nothing has re-split yet) and drops all three of its pairs — which leaves
+        // it intact in turn, so the second face sees a whole co-occupant too and
+        // drops all three of its own. Neither face is ever split, and the mesh gains
+        // six rim cut verts and not one connecting edge.
         let (mut mesh, _corners, e_ab, e_bc) = quad_pentagon_shared_two_edges();
 
         let geom = match mesh.subdivide_edges(&[e_ab, e_bc], SubdivideParams::default().cuts(3)) {
@@ -5954,7 +5942,7 @@ mod tests {
         assert_eq!(
             geom.geom_inner().edges.len(),
             0,
-            "all-or-nothing: not one of the six candidate connects is laid"
+            "not one of the six candidate connects is laid"
         );
     }
 
@@ -6362,12 +6350,12 @@ mod tests {
     /// The 7-gon is the load-bearing choice. Post-cut `F` carries 9 corners against
     /// `G`'s 8, so `G` wins the carrier contest for its own `m01 - m23` bar
     /// (§7.0.1, strictly fewest corners) and `F` is never carved — while `G`'s grid
-    /// leaves **no** fragment holding both `m01` and `m23`. The precondition's two
-    /// readings therefore come apart: on the *input topology* (§7.1's reduction)
-    /// `F`'s two cut edges have a second common face, namely `G`, so `F` drops. Ask
-    /// the *live* mesh at apply time instead and the answer flips with the apply
-    /// schedule — pass three applies in reverse face-index order (§4.4), so
-    /// whichever face was created second goes first.
+    /// leaves **no** fragment holding both `m01` and `m23`. That is what makes the
+    /// shape discriminating: §7.1.2's *reduction* (`F`'s two cut edges have a second
+    /// common face, namely `G`, so drop) and §7.1.1's live-mesh query disagree here,
+    /// and the live query's answer swings with the apply schedule — pass three
+    /// applies in reverse face-index order (§4.4), so whichever face was created
+    /// second goes first.
     ///
     /// `create_grid_first` flips exactly that. Returns `(mesh, [v0..v3], f)`.
     fn grid_quad_and_ngon_on_two_opposite_edges(
@@ -6413,70 +6401,316 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_precondition_is_a_function_of_the_input_not_the_apply_order() {
-        // §7.1 — the precondition reduces to "the face's two cut edges have a
-        // second common face", a property of the mesh the operator was *handed*.
-        // `F` shares both of its cut edges with `G`, so `F` drops its connect and
-        // stays whole — whichever order the two faces were created in, and hence
-        // whichever order pass three applies them in.
-        //
-        // Both orders: `G` grid-fills into 4 quads (its bar's carrier is itself, 8
-        // corners against `F`'s 9), `F` stays a single 9-ring.
+    fn strip_precondition_drops_connect_while_the_cooccupant_is_whole() {
+        // §7.1.1 / §7.1.2, first row of the table — the grid is created first, so
+        // `F` is applied first (pass three reverses the record order, §4.4) and
+        // reads a mesh in which `G` is still an intact quad carrying both `m01` and
+        // `m23`. A face other than the one being re-split holds the pair, so the
+        // connect is **dropped** and `F` stays a whole 9-ring.
         //   V 12 = 4 quad corners + 3 of the 7-gon's own + 4 rim midpoints + centre
         //   E 17 = 8 halved rim + 5 private + the halved bar + 2 spokes
         //   F  5 = the grid's 4 + the whole 7-gon
-        for create_grid_first in [true, false] {
-            let (mut mesh, [v0, v1, v2, v3], f) =
-                grid_quad_and_ngon_on_two_opposite_edges(create_grid_first);
-            let edges = [
-                mesh.query_edge_exists(v0, v1).unwrap(),
-                mesh.query_edge_exists(v1, v2).unwrap(),
-                mesh.query_edge_exists(v2, v3).unwrap(),
-                mesh.query_edge_exists(v3, v0).unwrap(),
-            ];
+        let (mut mesh, [v0, v1, v2, v3], f) = grid_quad_and_ngon_on_two_opposite_edges(true);
+        let edges = [
+            mesh.query_edge_exists(v0, v1).unwrap(),
+            mesh.query_edge_exists(v1, v2).unwrap(),
+            mesh.query_edge_exists(v2, v3).unwrap(),
+            mesh.query_edge_exists(v3, v0).unwrap(),
+        ];
 
-            let geom = match mesh.subdivide_edges(&edges, SubdivideParams::default()) {
-                SubdivideResult::Ran(g) => g,
-                _ => panic!("subdivide ran"),
-            };
+        let geom = match mesh.subdivide_edges(&edges, SubdivideParams::default()) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(
+            counts(&mesh),
+            (12, 17, 5),
+            "the grid's 4 fragments and the whole 7-gon — the strip laid no chord"
+        );
+        assert_eq!(
+            mesh.face_len(f),
+            9,
+            "the 7-gon keeps its whole ring, its two rim midpoints as flat corners"
+        );
+        assert_eq!(
+            geom.inner_edges.len(),
+            4,
+            "the grid's four spokes and nothing from the dropped strip"
+        );
+        assert!(
+            geom.faces.contains(&f),
+            "the dropped 7-gon keeps its re-split mark — a drop revokes no mark (§4.4)"
+        );
+
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(shapes, vec![4, 4, 4, 4, 9], "the pinned fragment shapes");
+    }
+
+    #[test]
+    fn strip_precondition_lays_connect_after_the_cooccupant_shatters() {
+        // §7.1.1 / §7.1.2, second row — the *same shape*, the other creation order,
+        // and a different mesh. The 7-gon is created first, so `G` is applied first
+        // and has already grid-filled by the time `F` is reached: its bar `m01 -
+        // m23` has itself been halved and **no surviving cell holds both** of `F`'s
+        // cut verts. Nothing other than `F` carries the pair, so the connect is
+        // **laid** and `F` is carved into a 5-gon + 6-gon. V 12 / E 18 / F 6.
+        //
+        // This is what makes the query a live-mesh one. Decide it in pass one off
+        // the input topology (`F`'s two cut edges do have a second common face,
+        // `G`) and this order gives the row above instead — a different operator
+        // (§7.1.2), not a shortcut.
+        let (mut mesh, [v0, v1, v2, v3], f) = grid_quad_and_ngon_on_two_opposite_edges(false);
+        let edges = [
+            mesh.query_edge_exists(v0, v1).unwrap(),
+            mesh.query_edge_exists(v1, v2).unwrap(),
+            mesh.query_edge_exists(v2, v3).unwrap(),
+            mesh.query_edge_exists(v3, v0).unwrap(),
+        ];
+
+        let geom = match mesh.subdivide_edges(&edges, SubdivideParams::default()) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(
+            counts(&mesh),
+            (12, 18, 6),
+            "the grid's 4 fragments plus the 7-gon's two — the strip laid its chord"
+        );
+
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(
+            shapes,
+            vec![4, 4, 4, 4, 5, 6],
+            "the 7-gon banded in two; a 9-ring here is a verdict taken off the input \
+             topology instead of the live mesh"
+        );
+
+        // The chord is the fallback's own, so it is inner-marked — the grid's four
+        // spokes plus this one.
+        assert_eq!(
+            geom.inner_edges.len(),
+            5,
+            "§7.1's output-slot note: the laid strip connect is inner-marked"
+        );
+        assert!(
+            geom.faces.contains(&f),
+            "the re-split face keeps its mark either way"
+        );
+    }
+
+    /// §7.1.3 — the shape on which the verdict differs **between two pairs of one
+    /// face**, so a face comes out partially stripped. `G` is the unit-square quad
+    /// with all four edges cut (a §5.4 / §9.5.1 grid fill); `F` is a hexagon on
+    /// `G`'s two **adjacent** edges `{v0,v1}` and `{v1,v2}`, folded away from `G`'s
+    /// plane, so `v1` is a valence-2 pillow corner and `F` has `cut_count = 2` with
+    /// its two cut edges meeting at a right angle (the §4.3.1 flat-corner guard is
+    /// nowhere near firing).
+    ///
+    /// Once `G` has grid-filled, exactly **one** of its `(N+1)²` cells touches both
+    /// shared rims — the corner cell at `v1` — and it carries exactly the cut vert
+    /// of each rim that is *nearest* `v1`. `F`'s outside-in pairing puts those two
+    /// in the **same** pair, so exactly one of `F`'s `N` pairs is co-held and the
+    /// other `N - 1` fire.
+    ///
+    /// `create_grid_first` decides who applies first (pass three reverses the record
+    /// order, so the face created *second* goes first). Returns
+    /// `(mesh, [v0..v3], f, [p, q, r])`, the last being the hexagon's own corners —
+    /// the marker by which its fragments are told from the grid's cells.
+    fn grid_quad_and_hexagon_on_two_adjacent_edges(
+        create_grid_first: bool,
+    ) -> (LoopMesh, [VertexKey; 4], FaceKey, [VertexKey; 3]) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // The hexagon's own three corners, folded below `G`'s plane.
+        let p = mesh.create_vertex(Vec3::new(1.5, 1.5, -1.0));
+        let q = mesh.create_vertex(Vec3::new(0.5, -1.0, -1.0));
+        let r = mesh.create_vertex(Vec3::new(-0.5, -0.5, -1.0));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e2p = mesh.create_edge([v2, p], EdgeCreateFlags::NONE);
+        let epq = mesh.create_edge([p, q], EdgeCreateFlags::NONE);
+        let eqr = mesh.create_edge([q, r], EdgeCreateFlags::NONE);
+        let er0 = mesh.create_edge([r, v0], EdgeCreateFlags::NONE);
+
+        // `F` walks the two shared edges against `G`'s winding, so both radial
+        // cycles stay length 2 and the pair is consistently wound.
+        let f_verts = [v2, v1, v0, r, q, p];
+        let f_edges = [e12, e01, er0, eqr, epq, e2p];
+        let g_verts = [v0, v1, v2, v3];
+        let g_edges = [e01, e12, e23, e30];
+
+        let f = if create_grid_first {
+            mesh.face_create(&g_verts, &g_edges, FaceCreateFlags::NONE);
+            mesh.face_create(&f_verts, &f_edges, FaceCreateFlags::NONE)
+        } else {
+            let f = mesh.face_create(&f_verts, &f_edges, FaceCreateFlags::NONE);
+            mesh.face_create(&g_verts, &g_edges, FaceCreateFlags::NONE);
+            f
+        };
+        (mesh, [v0, v1, v2, v3], f, [p, q, r])
+    }
+
+    /// The hexagon's fragment shapes after the subdivide, sorted. `F`'s fragments
+    /// are exactly the faces built only from `F`'s post-cut rim verts — the strip
+    /// mints no vert of its own, while **every** cell of `G`'s grid carries at least
+    /// one vert `F` never had (an interior lattice node, or a cut vert of one of
+    /// `G`'s two unshared rims). Reading them off `F`'s three private corners
+    /// instead would miss the corner band, whose verts all sit on the shared rims.
+    fn hexagon_fragment_shapes(mesh: &LoopMesh, rim: &[VertexKey]) -> Vec<usize> {
+        let mut shapes: Vec<usize> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&face| mesh.face_vert_keys(face).iter().all(|v| rim.contains(v)))
+            .map(|face| mesh.face_len(face))
+            .collect();
+        shapes.sort_unstable();
+        shapes
+    }
+
+    /// Runs the subdivide and returns `F`'s **post-cut rim** alongside it: its six
+    /// original corners plus the `2N` cut verts of the two shared edges, which are
+    /// the first `2N` entries of `geom.verts` (the split verts are recorded in input
+    /// -edge order, and the two shared edges lead the `edges` slice).
+    fn subdivide_the_adjacent_pillow(
+        create_grid_first: bool,
+        cuts: u32,
+    ) -> (LoopMesh, SubdivideGeom, FaceKey, Vec<VertexKey>) {
+        let (mut mesh, [v0, v1, v2, v3], f, [p, q, r]) =
+            grid_quad_and_hexagon_on_two_adjacent_edges(create_grid_first);
+        let edges = [
+            mesh.query_edge_exists(v0, v1).unwrap(),
+            mesh.query_edge_exists(v1, v2).unwrap(),
+            mesh.query_edge_exists(v2, v3).unwrap(),
+            mesh.query_edge_exists(v3, v0).unwrap(),
+        ];
+        let geom = match mesh.subdivide_edges(&edges, SubdivideParams::default().cuts(cuts)) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        let mut rim = vec![v0, v1, v2, p, q, r];
+        rim.extend_from_slice(&geom.verts[..2 * cuts as usize]);
+        (mesh, geom, f, rim)
+    }
+
+    #[test]
+    fn strip_precondition_partially_strips_a_face() {
+        // §7.1.3 — the rule's granularity, and the death of "one boolean per face".
+        // `G` is created *second*, so it applies first (pass three reverses the
+        // record order) and grid-fills. `F` then asks its `N` pairs *independently*
+        // and gets **different answers**: the innermost pair (the two cut verts
+        // nearest the pillow corner `v1`) is still co-held by `G`'s corner cell and
+        // drops, while every other pair is free and fires. `F` therefore comes out
+        // with `N` fragments — neither `N + 1` nor `1`.
+        //
+        //   N = 2: F -> [5, 7]      V 19 / E 29 / F 11
+        //   N = 3: F -> [4, 5, 7]   V 28 / E 46 / F 19
+        //
+        // The dropped count stays at **one** as `N` grows, because exactly one cell
+        // of the grid touches both shared rims.
+        for (cuts, expected_counts, expected_f) in [
+            (2u32, (19, 29, 11), vec![5usize, 7]),
+            (3, (28, 46, 19), vec![4, 5, 7]),
+        ] {
+            let (mesh, geom, f, rim) = subdivide_the_adjacent_pillow(false, cuts);
+            let n = cuts as usize;
 
             assert_eq!(
                 counts(&mesh),
-                (12, 17, 5),
-                "create_grid_first = {create_grid_first}: the grid's 4 fragments and \
-                 the whole 7-gon — the strip laid no chord"
+                expected_counts,
+                "cuts = {cuts}: the grid's (N+1)^2 cells plus F's N fragments"
+            );
+
+            // The discriminator: F's own fragment shapes. A per-face boolean gives
+            // either one 6 + 2N ring or N + 1 fragments; the truth is N.
+            assert_eq!(
+                hexagon_fragment_shapes(&mesh, &rim),
+                expected_f,
+                "cuts = {cuts}: F is PARTIALLY stripped — {} of its {n} pairs laid",
+                n - 1
+            );
+            assert!(
+                mesh.face_keys().contains(&f),
+                "cuts = {cuts}: F keeps its handle (the parent retains the inner band)"
+            );
+
+            // Slot check: the grid's spokes plus exactly the N - 1 connects F laid.
+            let grid_inner_edges = 2 * n * (n + 1);
+            assert_eq!(
+                geom.inner_edges.len(),
+                grid_inner_edges + (n - 1),
+                "cuts = {cuts}: a dropped connect is laid nowhere and marked nowhere"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_precondition_partial_stripping_is_order_dependent() {
+        // §7.1.5 — the contrast that shows the partial strip is a fact about the
+        // *live* mesh, not the input. Create `F` second and it applies first, while
+        // `G` is still an intact quad carrying **both** endpoints of every one of
+        // `F`'s pairs — so all `N` drop and `F` stays whole. Same input topology as
+        // the test above, same `cuts`, different mesh: the verdict is legitimately
+        // creation-order-dependent, and no property of the input can see it.
+        //
+        //   N = 2: V 19 / E 28 / F 10   (against 19 / 29 / 11 the other way)
+        //   N = 3: V 28 / E 44 / F 17   (against 28 / 46 / 19)
+        for (cuts, expected_counts) in [(2u32, (19, 28, 10)), (3, (28, 44, 17))] {
+            let (mesh, geom, f, _rim) = subdivide_the_adjacent_pillow(true, cuts);
+            let n = cuts as usize;
+
+            assert_eq!(
+                counts(&mesh),
+                expected_counts,
+                "cuts = {cuts}: F applied first, so every pair is co-held by the whole G"
             );
             assert_eq!(
                 mesh.face_len(f),
-                9,
-                "create_grid_first = {create_grid_first}: the 7-gon keeps its whole \
-                 ring, its two rim midpoints as flat corners"
+                6 + 2 * n,
+                "cuts = {cuts}: F keeps its whole ring, its 2N cut verts flat on the rim"
             );
             assert_eq!(
                 geom.inner_edges.len(),
-                4,
-                "create_grid_first = {create_grid_first}: the grid's four spokes and \
-                 nothing from the dropped strip"
+                2 * n * (n + 1),
+                "cuts = {cuts}: the grid's spokes alone — the strip laid nothing"
             );
-            assert!(
-                geom.faces.contains(&f),
-                "create_grid_first = {create_grid_first}: the dropped 7-gon keeps its \
-                 re-split mark — a drop revokes no mark (§4.4)"
-            );
-            assert_eq!(
-                geom.faces.len(),
-                5,
-                "create_grid_first = {create_grid_first}: the two re-split marks plus \
-                 the three grid fragments that did not keep the quad's handle (§1)"
-            );
+        }
+    }
 
-            let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
-            shapes.sort_unstable();
+    #[test]
+    fn strip_precondition_a_fragment_suppresses_a_connect_as_the_parent_would() {
+        // §7.1.3's control row. At `cuts = 1` the pillow's single pair *is* the
+        // corner cell's pair, so the connect is dropped in **both** orders and the
+        // two readings coincide: V 12 / E 16 / F 5, F a whole 8-ring.
+        //
+        // It is the row worth pinning precisely because the live query is not a
+        // licence to fire — a surviving *fragment* holding the pair suppresses the
+        // connect exactly as the intact parent would. The query asks "does anything
+        // hold both of these verts right now?", never "did my original neighbour
+        // survive?".
+        for create_grid_first in [true, false] {
+            let (mesh, _geom, f, _rim) = subdivide_the_adjacent_pillow(create_grid_first, 1);
+
             assert_eq!(
-                shapes,
-                vec![4, 4, 4, 4, 9],
-                "create_grid_first = {create_grid_first}: a 7-gon split into 2 here is \
-                 the strip reading the live mesh instead of the input topology"
+                counts(&mesh),
+                (12, 16, 5),
+                "create_grid_first = {create_grid_first}: the grid's 4 cells + the whole hexagon"
+            );
+            assert_eq!(
+                mesh.face_len(f),
+                8,
+                "create_grid_first = {create_grid_first}: the corner cell holds the sole \
+                 pair, so the connect drops even after G has shattered"
             );
         }
     }
