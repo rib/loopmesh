@@ -467,16 +467,20 @@ struct BeveledCorner {
     vertex: VertexKey,
     ring_vert_for_edge: Vec<(EdgeKey, VertexKey)>,
     incident_faces: Vec<FaceKey>,
-    interior_fan: bool,
+    /// This corner's ring verts in **disk order** (BEVEL.md §3.2 / §5.1) — the cycle the
+    /// cap walks. One entry per incident edge, wires included (§7.2.1's vertex-mode box).
+    ring_order: Vec<VertexKey>,
     /// Each of this corner's **wire** spokes (face-less, radial-0 incident edges) paired
     /// with the incident face that adopts its ring vert. Vertex mode keeps a wire in the
     /// disk as an ordinary ring member (BEVEL.md §7.2.1's vertex-mode box — the documented
     /// exception to the face-bearing filter edge mode applies): it gets its own ring vert,
-    /// slid along itself by the offset, and that ring vert is an extra corner of the host
-    /// face's corner run (so the host grows by *two* sides) and of the cap.
+    /// slid along itself by the offset.
     ///
-    /// Every wire of a corner with a face has a host (`wire_host_faces` is total), and a
-    /// corner with a wire and no face is declined before it reaches here.
+    /// Only a **closed** fan hosts its wires on a face: the face chain wraps, so the slot
+    /// where it runs out lies inside a faced sector, and that face picks the ring vert up as
+    /// an extra corner (growing by *two* sides). On an open or multi-chain fan the slot is a
+    /// faceless **gap**, so no rebuilt face adopts the wire and the list is empty — the cap
+    /// alone catches the wire's ring vert (§7.2.1's vertex-mode box, open-fan half).
     hosted_wires: Vec<(FaceKey, VertexKey)>,
     /// The representative incident face the cap's stage-1 inherit copies its whole
     /// attribute block from (BEVEL.md §6.6.1: the cap inherits an incident face of `v`,
@@ -502,23 +506,29 @@ struct BevelFrame {
     vertex: VertexKey,
     vertex_position: Vec3,
     placements: Vec<EdgePlacement>,
+    /// The full incident-edge set in the **disk order** of BEVEL.md §3.2 — wires included
+    /// (§7.2.1's vertex-mode box). The ring, and hence the cap, is this cycle.
+    disk_order: Vec<EdgeKey>,
     /// Each wire spoke of this corner paired with the incident face that adopts its ring
     /// vert (BEVEL.md §7.2.1's vertex-mode box), in the order that face's rebuilt corner run
-    /// wants them. Resolved against the pristine mesh with the rest of the frame, and total
-    /// over the corner's wires (`wire_host_faces`).
+    /// wants them. Empty unless the face fan is **closed** — an open or multi-chain fan slots
+    /// its wires into a gap, where no face can adopt them.
     wire_hosts: Vec<(EdgeKey, FaceKey)>,
 }
 
 impl LoopMesh {
     /// Foundational single-segment vertex bevel (BEVEL.md §3–§6).
     ///
-    /// For each beveled vertex `v` of valence `n`, this replaces `v` with a ring
-    /// of `n` new verts — one per incident edge, slid `offset` toward the far
-    /// endpoint (§4) — re-stitches each incident face's `v` corner onto the two
-    /// ring verts of that face's bounding edges (§6.1), and, for an interior
-    /// (closed-fan) corner, closes the ring with a single cap n-gon (§5/§5.1).
-    /// A boundary (open-fan) corner gets no cap (§6.2). The original vertex is
-    /// then removed as a now-loose vertex (§5.1.1).
+    /// For each beveled vertex `v` of valence `n` — the **full** incident-edge count, wire
+    /// spokes included (§7.2.1's vertex-mode box) — this replaces `v` with a ring of `n` new
+    /// verts, one per incident edge, slid `offset` toward the far endpoint (§4); re-stitches
+    /// each incident face's `v` corner onto the ring verts of the disk steps it spans (§6.1);
+    /// and closes the ring with a single cap n-gon (§5 / §5.1). The ring is the disk **cycle**,
+    /// so the cap is minted for *every* corner of valence >= 3 — interior, boundary, bow-tie and
+    /// face-less wire star alike (§6.2, §6.2.1) — and the count delta is a function of `n`
+    /// alone: `+(n−1)` V / `+n` E / `+1` F. Valence 2 is the one special case (§2.3): a
+    /// two-corner n-gon is not a face, so the corner takes its single ring edge and no cap. The
+    /// original vertex is then removed as a now-loose vertex (§5.1.1).
     ///
     /// Implemented for the foundational case: `affect = Vertices`,
     /// `segments = 1`, any `offset_type` (all five modes re-measure the per-edge
@@ -732,24 +742,38 @@ impl LoopMesh {
         // because there the wire has no ring vert of its own.
         let rebuilt = self.restitch_incident_faces(&beveled, &corners, &bank);
 
-        // §5 / §6.2 / §6.4.4: build each corner's cap over its own ring only —
-        // the caps are independent across a shared edge.
+        // §5 step 4 / §6.2 / §6.4.4: cap every corner of valence >= 3 — interior, boundary,
+        // multi-gap and face-less alike — over its own ring only, the caps being independent
+        // across a shared edge. The cap *adopts* the chamfer edges the re-stitch minted and
+        // *creates* the ones no face could mint (the gap steps of §2.3's table); that
+        // adopt-or-create is the whole rule, not a boundary patch-up.
         for corner in &corners {
-            if corner.interior_fan {
-                if let Some(cap) = self.build_cap_face(&corner.ring_vert_for_edge) {
-                    // §6.6: the cap is a new face — inherit the representative incident
-                    // face's whole block, then stamp `material` over the slot if >= 0.
-                    self.assign_bevel_face_attributes(
-                        cap.face,
-                        options.material,
-                        templates.resolve(corner.representative),
-                        BevelNewFaceKind::Cap,
-                    );
-                    result.faces.push(cap.face);
-                    result.edges.extend(cap.chamfer_edges);
-                }
+            if corner.ring_order.len() >= 3 {
+                let cap = self.build_cap_face(&corner.ring_order);
+                // §6.6: the cap is a new face — inherit the representative incident
+                // face's whole block, then stamp `material` over the slot if >= 0.
+                self.assign_bevel_face_attributes(
+                    cap.face,
+                    options.material,
+                    templates.resolve(corner.representative),
+                    BevelNewFaceKind::Cap,
+                );
+                result.faces.push(cap.face);
+                result.edges.extend(cap.ring_edges);
             } else {
-                self.collect_chamfer_edges(&corner.ring_vert_for_edge, &mut result);
+                // Valence 2 (§2.3's one special case): a two-corner "n-gon" is not a face, so
+                // no cap — but the single ring edge is still minted *here*, by the operator
+                // itself. A face-less two-wire hub (§6.2.1) has no re-stitch to mint it.
+                let ring_edge = self.create_edge(
+                    [corner.ring_order[0], corner.ring_order[1]],
+                    EdgeCreateFlags::NO_DUPLICATE,
+                );
+                // §6.3: an edge is reported iff it touches a minted bevel face — and there is
+                // no cap here. The lone carve-out is the ring edge of a **face-less** corner:
+                // it bounds nothing at all, so no rebuild walk ever gets to withhold it.
+                if corner.incident_faces.is_empty() {
+                    result.edges.push(ring_edge);
+                }
             }
         }
 
@@ -758,7 +782,7 @@ impl LoopMesh {
         // order below is part of the value rule, not housekeeping. The fills go
         // first, the re-stitched originals last.
         for (corner, donors) in corners.iter().zip(&cap_donors) {
-            if !corner.interior_fan {
+            if corner.ring_order.len() < 3 {
                 continue;
             }
             for (&(_, ring_vertex), &donor) in corner.ring_vert_for_edge.iter().zip(donors) {
@@ -7422,12 +7446,11 @@ impl LoopMesh {
     /// per-offset slide rate `k` each edge contributes. A vertex with fewer than
     /// two incident edges has no corner to round (§2.1) and is dropped here.
     ///
-    /// Also dropped: a corner that carries a **wire** but no face at all — an all-wire star.
-    /// §7.2.1's vertex-mode box makes a wire a full ring member, and its ring vert has to be
-    /// adopted by the face hosting it; a star has no face chain to host on (`wire_host_faces`)
-    /// and, having no fan, no cap to catch it either (§6.2), so every ring vert would be left
-    /// holding its wire alone and the star would fall apart into loose edges. Declined whole:
-    /// no ring, no surgery, no free. Every frame this returns is one the operator can build.
+    /// Two incident edges is the **whole** eligibility test (§2.1): there is no manifoldness,
+    /// face-count or fan-shape gate anywhere in vertex mode. A boundary corner, a bow-tie, a
+    /// corner carrying wires, and a corner with **nothing but** wires (the face-less star of
+    /// §6.2.1) are all beveled, and all by the same rules — the count delta is a function of
+    /// the valence alone (§2.3).
     fn gather_bevel_frames(
         &self,
         beveled: &[VertexKey],
@@ -7449,18 +7472,18 @@ impl LoopMesh {
                 .filter(|&edge| self.edge_radial_iter(edge).next().is_none())
                 .collect();
             // Only wires need the ring here, and building it is O(F²) in the fan — so the
-            // wire-free corner, which is nearly every corner, must not pay for it.
+            // wire-free corner, which is nearly every corner, must not pay for it. And only a
+            // **closed** fan hosts a wire on a face at all (§7.2.1's vertex-mode box): where an
+            // open or multi-chain fan's chain runs out is a gap, not a faced sector.
             let wire_hosts = if wires.is_empty() {
                 Vec::new()
-            } else {
+            } else if self.face_fan_is_closed(&incident_edges, &self.vert_face_keys(vertex)) {
                 let corner_ring = self.vertex_corner_ring(vertex);
-                // The one corner a wire cannot be hosted on: no face, so no chain end to drop
-                // it into and no cap to catch its ring vert.
-                if corner_ring.is_empty() {
-                    continue;
-                }
                 self.wire_host_faces(vertex, &corner_ring, &wires)
+            } else {
+                Vec::new()
             };
+            let disk_order = self.vertex_mode_disk_order(vertex, &incident_edges, &wire_hosts);
 
             // §8.7.2 / §8.7.3: the per-corner weight prescales this vertex's
             // offset uniformly across all its incident edges, *before* the §4 /
@@ -7488,6 +7511,7 @@ impl LoopMesh {
             frames.push(BevelFrame {
                 vertex,
                 vertex_position,
+                disk_order,
                 wire_hosts,
                 placements: incident_edges
                     .iter()
@@ -7526,9 +7550,9 @@ impl LoopMesh {
         frames
     }
 
-    /// Phase 1b: mint every ring vert (§4) at its clamp-scaled slide position,
-    /// and capture each beveled vertex's interior/boundary classification and
-    /// incident-face set. No face surgery happens here — only vertex creation.
+    /// Phase 1b: mint every ring vert (§4) at its clamp-scaled slide position, and capture
+    /// each beveled vertex's ring cycle and incident-face set. No face surgery happens here —
+    /// only vertex creation.
     fn place_ring_verts(
         &mut self,
         frames: &[BevelFrame],
@@ -7538,9 +7562,7 @@ impl LoopMesh {
     ) -> Vec<BeveledCorner> {
         let mut corners = Vec::with_capacity(frames.len());
         for frame in frames {
-            let incident_edges: Vec<EdgeKey> = frame.placements.iter().map(|p| p.edge).collect();
             let incident_faces = self.vert_face_keys(frame.vertex);
-            let interior_fan = self.is_interior_fan(&incident_edges, &incident_faces);
 
             // §6.6.1: the cap's stage-1 inherit donor is a representative incident face of
             // `v`. Registered now, against the pristine mesh — the bank is sealed before
@@ -7561,20 +7583,28 @@ impl LoopMesh {
                 result.verts.push(ring_vertex);
             }
 
-            // §7.2.1's vertex-mode box: a wire is a full ring member here, but it bounds no
-            // sector of its own, so its ring vert is adopted by the face whose sector holds
-            // the wire — resolved with the frame, against the pristine mesh.
+            // §7.2.1's vertex-mode box, closed-fan half: a wire bounds no sector of its own, so
+            // on a closed fan its ring vert is adopted by the face whose sector holds it —
+            // resolved with the frame, against the pristine mesh. An open fan slots its wires
+            // in the gap and hosts none.
             let hosted_wires: Vec<(FaceKey, VertexKey)> = frame
                 .wire_hosts
                 .iter()
                 .map(|&(wire, host)| (host, self.ring_vertex_of(&ring_vert_for_edge, wire)))
                 .collect();
 
+            // §5.1: the ring the cap walks — the disk cycle, in disk order.
+            let ring_order: Vec<VertexKey> = frame
+                .disk_order
+                .iter()
+                .map(|&edge| self.ring_vertex_of(&ring_vert_for_edge, edge))
+                .collect();
+
             corners.push(BeveledCorner {
                 vertex: frame.vertex,
                 ring_vert_for_edge,
                 incident_faces,
-                interior_fan,
+                ring_order,
                 hosted_wires,
                 representative,
             });
@@ -7825,18 +7855,21 @@ impl LoopMesh {
             .expect("every incident edge has a ring vertex")
     }
 
-    /// Classify the corner as an interior (closed) fan vs a boundary (open) fan
-    /// (BEVEL.md §2.3 / §6). A corner is interior when every **faced** incident edge
-    /// is manifold (exactly two incident faces) and the fan closes — the count of
-    /// incident faces equals the count of faced incident edges. Any boundary edge
-    /// (radial count 1) opens the fan.
+    /// Does the corner's face chain wrap all the way round — every faced spoke manifold
+    /// (radial count 2) and as many faces as faced spokes? This decides **only** where a wire
+    /// spoke's slot in the disk order falls (BEVEL.md §7.2.1's vertex-mode box): a closed fan
+    /// runs out at a seam whose two spokes share a face, so that face hosts the wire; an open
+    /// fan (a radial-1 spoke) or a multi-chain one (a bow-tie, a non-manifold spoke) runs out
+    /// in a faceless **gap**, where nothing can host it.
     ///
-    /// A **wire** spoke (radial count 0) is skipped here even though vertex mode keeps
-    /// it in the disk as a ring member (§7.2.1): it carries no face, so it neither
-    /// closes nor opens the face fan — the fan around a grid centre with a wire on it is
-    /// exactly the closed fan the wire-free grid has, and it is capped. Its ring vert
-    /// still joins the cap, via the host face of §7.2.1's box.
-    fn is_interior_fan(&self, incident_edges: &[EdgeKey], incident_faces: &[FaceKey]) -> bool {
+    /// It is **not** the cap gate. Valence >= 3 is the cap gate, and it is the whole of it
+    /// (§2.3, §6.2): a boundary corner, a bow-tie and a face-less wire star are capped exactly
+    /// like an interior one.
+    ///
+    /// A **wire** spoke (radial count 0) is skipped here even though vertex mode keeps it in
+    /// the disk as a ring member: it carries no face, so it neither closes nor opens the face
+    /// fan.
+    fn face_fan_is_closed(&self, incident_edges: &[EdgeKey], incident_faces: &[FaceKey]) -> bool {
         let mut manifold_spokes = 0usize;
         for &edge in incident_edges {
             match self.edge_radial_iter(edge).count() {
@@ -7848,28 +7881,25 @@ impl LoopMesh {
         !incident_faces.is_empty() && incident_faces.len() == manifold_spokes
     }
 
-    /// Each **wire** spoke of `vertex` paired with the incident face that adopts its ring
-    /// vert in vertex mode (BEVEL.md §7.2.1's vertex-mode box) — the face that therefore
-    /// grows by *two* sides rather than one, while every other rebuilt face grows by one.
+    /// Each **wire** spoke of a **closed-fan** `vertex` paired with the incident face that
+    /// adopts its ring vert in vertex mode (BEVEL.md §7.2.1's vertex-mode box) — the face that
+    /// therefore grows by *two* sides rather than one, while every other rebuilt face grows by
+    /// one.
     ///
-    /// **Total** on any corner that has a face chain at all: every wire gets a host, so no
-    /// beveable corner is ever declined for want of one. §7.2.1 fixes that: a wire shares no
-    /// face with either disk neighbour, so nothing pins its slot in the disk order, and the
-    /// rule is to walk the face chain and drop the wire in **where the chain runs out**. A
-    /// corner with at least one face always has a chain end, so the rule always answers.
+    /// **Only a closed fan reaches here.** A wire shares no face with either disk neighbour, so
+    /// nothing inside the walk pins its slot: it is appended where the face chain runs out. On a
+    /// closed fan the chain wraps, so that slot is a seam *inside* a faced sector and the sector's
+    /// face hosts the wire. On an open or multi-chain fan it is a faceless **gap** — no face can
+    /// adopt it there, and the caller does not ask.
     ///
-    /// Which face it hands the wire to is an order-of-construction artefact and not an
-    /// invariant (§7.2.1 again) — which is exactly the licence for the *preferred* answer
-    /// tried first here. When the wire's direction, flattened into the corner's tangent
-    /// plane, falls inside the rotational sector of two consecutive **faced** spokes that
-    /// bound a common face, that face hosts it: on an open fan this puts a wire pointing
-    /// into a faced sector in the face it actually points into, instead of wherever the
-    /// chain happened to end. Every inconclusive read falls back to the chain end — an
-    /// on-axis wire (it flattens to nothing and lies in no sector in particular), a corner
-    /// with no flattenable faced spoke to take a bearing from, fewer than two spokes to
-    /// bound a sector with, no sector found (spokes that all share one bearing, or a
-    /// projection that reordered them), and a sector whose two spokes bound no common face
-    /// (an open fan's face-less **gap**).
+    /// Which face a closed fan hands the wire to is an order-of-construction artefact and not an
+    /// invariant (§7.2.1 again) — which is exactly the licence for the *preferred* answer tried
+    /// first here. When the wire's direction, flattened into the corner's tangent plane, falls
+    /// inside the rotational sector of two consecutive **faced** spokes that bound a common face,
+    /// that face hosts it. Every inconclusive read falls back to the chain end — an on-axis wire
+    /// (it flattens to nothing and lies in no sector in particular), a corner with no flattenable
+    /// faced spoke to take a bearing from, fewer than two spokes to bound a sector with, and no
+    /// sector found (spokes that all share one bearing, or a projection that reordered them).
     ///
     /// Wires sharing a host come out in the order that host's rebuilt corner run wants them:
     /// the run enters on the face's incoming edge and leaves on its outgoing one, sweeping
@@ -8009,95 +8039,181 @@ impl LoopMesh {
             .map(|corner| corner.face)
     }
 
-    /// Walk the disk's chamfer edges into an ordered ring and build the cap face
-    /// over them, wound opposite the incident faces (BEVEL.md §5.1).
-    fn build_cap_face(&mut self, ring_vert_for_edge: &[(EdgeKey, VertexKey)]) -> Option<CapFace> {
-        let ring_verts: Vec<VertexKey> = ring_vert_for_edge.iter().map(|&(_, r)| r).collect();
+    /// Close the corner with one n-gon over the **whole** ring (BEVEL.md §5 step 4 / §5.1).
+    ///
+    /// `ring` is the corner's ring verts in disk order, so the cap's boundary walk is simply
+    /// that order: the cap runs **with** the disk, `r_0 → r_1 → … → r_(n−1)`, which is
+    /// equivalently "opposite every rebuilt face on the chamfer edge they share" — a rebuilt
+    /// face's corner run is descending, `r_(i+1), r_i` (§6.1). Both readings are one rule, and
+    /// running the ring *against* the disk order is the inward-cap bug. The winding is
+    /// re-derived here from a rebuilt face wherever one exists, so the observable half of the
+    /// rule — every shared ring edge walked in opposite directions by its face and the cap, and
+    /// so a radial count of 2 — holds whichever sense the disk walk came back in.
+    ///
+    /// Each ring edge is **adopted if it exists and created if it does not**: the faced steps'
+    /// chamfer edges were minted by the re-stitch that cut those faces' corners, and the gap
+    /// steps have no face to have minted theirs (§2.3's provenance table), so the cap mints
+    /// them itself — one for an open fan, one per gap for a bow-tie, all `n` for a face-less
+    /// wire star. Never a second, coincident edge over a pair that already has one, which
+    /// would split one radial cycle of 2 into two boundary edges (§5.1).
+    fn build_cap_face(&mut self, ring: &[VertexKey]) -> CapFace {
+        debug_assert!(ring.len() >= 3, "a cap spans at least three ring verts");
 
-        // The chamfer edges minted by the re-stitch connect ring verts pairwise.
-        // For an interior fan they form one closed cycle through all ring verts.
-        // §6.4.4: only this corner's own ring verts are considered, so the
-        // surviving inner segment of a shared edge (which joins a ring vert of
-        // *this* corner to a ring vert of the *other* corner) is never mistaken
-        // for a chamfer edge of this cap.
-        let chamfer_edges = self.chamfer_edges_among(&ring_verts);
-        if chamfer_edges.len() != ring_verts.len() {
-            return None;
-        }
-
-        let ordered_ring = order_ring_cycle(self, &ring_verts, &chamfer_edges)?;
-
-        // §5.1: wind the cap opposite to how the incident faces traverse the
-        // chamfer edges. Take the first chamfer edge's single incident loop and
-        // read its direction; if the face goes a -> b on that edge, the cap goes
-        // b -> a, so reverse the ring whenever it currently runs the face's way.
-        let first_a = ordered_ring[0];
-        let first_b = ordered_ring[1];
-        let shared_edge = self
-            .query_edge_exists(first_a, first_b)
-            .expect("ordered ring pair shares a chamfer edge");
-        let face_runs_forward = {
-            let incident_loops: Vec<LoopKey> = self.edge_loop_keys(shared_edge);
-            incident_loops
-                .first()
-                .map(|&l| {
-                    let start = self.loop_vertex(l);
-                    let end = self.loop_vertex(self.loop_next(l));
-                    start == first_a && end == first_b
-                })
-                .unwrap_or(false)
-        };
-
-        let mut cap_ring = ordered_ring;
-        if face_runs_forward {
+        let mut cap_ring = ring.to_vec();
+        if self.ring_runs_with_a_rebuilt_face(&cap_ring) {
             cap_ring.reverse();
         }
 
-        let cap_edges: Vec<EdgeKey> = (0..cap_ring.len())
-            .map(|i| {
-                let a = cap_ring[i];
-                let b = cap_ring[(i + 1) % cap_ring.len()];
-                self.query_edge_exists(a, b)
-                    .expect("cap reuses the existing chamfer edge")
+        let ring_edges: Vec<EdgeKey> = (0..cap_ring.len())
+            .map(|index| {
+                let from = cap_ring[index];
+                let to = cap_ring[(index + 1) % cap_ring.len()];
+                // §6.5.1: a gap edge has no incident original face to inherit from, so the
+                // mint's default per-edge block stands.
+                self.create_edge([from, to], EdgeCreateFlags::NO_DUPLICATE)
             })
             .collect();
 
-        let cap = self.face_create(&cap_ring, &cap_edges, FaceCreateFlags::NONE);
-
-        let mut unique_edges = cap_edges;
-        unique_edges.sort_by_key(|e| e.as_usize());
-        unique_edges.dedup();
-
-        Some(CapFace {
-            face: cap,
-            chamfer_edges: unique_edges,
-        })
+        let face = self.face_create(&cap_ring, &ring_edges, FaceCreateFlags::NONE);
+        CapFace { face, ring_edges }
     }
 
-    fn collect_chamfer_edges(
+    /// Does `ring`, walked in its own order, traverse some shared chamfer edge the **same**
+    /// way the face on it does (BEVEL.md §5.1)? A rebuilt face runs its chamfer edge
+    /// descending, so a correctly-wound cap never agrees with it; `true` means the ring came
+    /// back reversed and the cap would face inward.
+    ///
+    /// Answers `false` on a face-less star, where no ring edge is shared with anything and the
+    /// cap's orientation is fixed by the disk-order convention alone (and is unobservable).
+    fn ring_runs_with_a_rebuilt_face(&self, ring: &[VertexKey]) -> bool {
+        for index in 0..ring.len() {
+            let from = ring[index];
+            let to = ring[(index + 1) % ring.len()];
+            let Some(chamfer_edge) = self.query_edge_exists(from, to) else {
+                continue; // a gap step: no face minted it, so it says nothing about winding
+            };
+            let Some(&loop_key) = self.edge_loop_keys(chamfer_edge).first() else {
+                continue;
+            };
+            let start = self.loop_vertex(loop_key);
+            let end = self.loop_vertex(self.loop_next(loop_key));
+            return start == from && end == to;
+        }
+        false
+    }
+
+    /// The vertex-mode disk order (BEVEL.md §3.2, §5 step 1): the **full** incident-edge set of
+    /// `vertex` — wire spokes included, per §7.2.1's vertex-mode box — as one cyclic sequence.
+    /// This is *not* edge mode's face-bearing disk, which filters the wires out; reusing that
+    /// here would return an empty ring on a face-less star and drop a wire's ring vert anywhere
+    /// else.
+    ///
+    /// The order is the winding walk `e_i → f_i → e_(i+1)`, where `f_i` is the face whose
+    /// corner at `vertex` *leaves* along `e_i`. The walk chains maximal runs of face-sharing
+    /// spokes and **restarts** on the next unvisited one when a run ends, concatenating the
+    /// chains into a single cycle — which is why a bow-tie corner, whose faces form two
+    /// disjoint fans, still rings up as one cycle whose between-chain steps are the faceless
+    /// gaps (§6.2).
+    ///
+    /// A wire shares a face with nobody, so the walk cannot place it: it is appended where the
+    /// chain runs out. On a closed fan that seam lies inside a faced sector, and `wire_hosts`
+    /// names the face — the wire slots between that face's two spokes, right after the one it
+    /// *leaves* along, so the ascending disk order reads `e_i, wires…, e_(i+1)` and the host's
+    /// descending corner run reads them back the other way (§6.1). Otherwise the wire lands in
+    /// the trailing gap, adopted by no face and caught only by the cap.
+    fn vertex_mode_disk_order(
         &self,
-        ring_vert_for_edge: &[(EdgeKey, VertexKey)],
-        result: &mut BevelResult,
-    ) {
-        let ring_verts: Vec<VertexKey> = ring_vert_for_edge.iter().map(|&(_, r)| r).collect();
-        result.edges.extend(self.chamfer_edges_among(&ring_verts));
-    }
-
-    /// Every edge that connects two ring verts — the chamfer edges minted by the
-    /// re-stitch. Excludes the original incident edges (which connect a ring vert
-    /// to a far neighbour outside the ring set).
-    fn chamfer_edges_among(&self, ring_verts: &[VertexKey]) -> Vec<EdgeKey> {
-        let mut edges: Vec<EdgeKey> = Vec::new();
-        for i in 0..ring_verts.len() {
-            for j in (i + 1)..ring_verts.len() {
-                if let Some(edge) = self.query_edge_exists(ring_verts[i], ring_verts[j]) {
-                    if !edges.contains(&edge) {
-                        edges.push(edge);
-                    }
+        vertex: VertexKey,
+        incident_edges: &[EdgeKey],
+        wire_hosts: &[(EdgeKey, FaceKey)],
+    ) -> Vec<EdgeKey> {
+        // One step per incident face: in along the spoke the face leaves `vertex` on (`e_i`),
+        // out along the spoke it arrives on (`e_(i+1)`).
+        let mut steps: Vec<(EdgeKey, EdgeKey)> = Vec::new();
+        for face in self.vert_face_keys(vertex) {
+            if let Some((arrives_on, leaves_on)) = self.face_corner_edges(face, vertex) {
+                if arrives_on != leaves_on {
+                    steps.push((leaves_on, arrives_on));
                 }
             }
         }
-        edges
+
+        let mut used = vec![false; steps.len()];
+        let mut order: Vec<EdgeKey> = Vec::with_capacity(incident_edges.len());
+        while let Some(seed) = (0..steps.len()).find(|&index| !used[index]) {
+            used[seed] = true;
+            let (seed_enters, seed_leaves) = steps[seed];
+            let mut chain = vec![seed_enters, seed_leaves];
+
+            // Forward: the next face is the one that leaves `vertex` along the spoke this one
+            // arrived on. A face-chain neighbour wound the other way matches on its own
+            // arriving spoke instead, so take either and continue on the far side.
+            loop {
+                let frontier = *chain.last().expect("the chain is seeded with two spokes");
+                let next = steps.iter().enumerate().find(|(index, &(enters, leaves))| {
+                    !used[*index] && (enters == frontier || leaves == frontier)
+                });
+                let Some((index, &(enters, leaves))) = next else {
+                    break;
+                };
+                used[index] = true;
+                let onward = if enters == frontier { leaves } else { enters };
+                if onward == chain[0] {
+                    break; // the fan closed
+                }
+                chain.push(onward);
+            }
+
+            // Backward, since the seed can sit mid-chain on an open fan.
+            loop {
+                let frontier = chain[0];
+                let previous = steps.iter().enumerate().find(|(index, &(enters, leaves))| {
+                    !used[*index] && (enters == frontier || leaves == frontier)
+                });
+                let Some((index, &(enters, leaves))) = previous else {
+                    break;
+                };
+                used[index] = true;
+                let backward = if leaves == frontier { enters } else { leaves };
+                if backward == *chain.last().expect("non-empty chain") {
+                    break;
+                }
+                chain.insert(0, backward);
+            }
+
+            for edge in chain {
+                if !order.contains(&edge) {
+                    order.push(edge);
+                }
+            }
+        }
+
+        // A closed fan's wires: slotted inside their host's sector. `wire_hosts` is ordered as
+        // the host's *descending* corner run wants them, and the disk order ascends, so
+        // inserting each one at the same place reverses them into the order the run reads back.
+        for &(wire, host) in wire_hosts {
+            let leaves_on = self
+                .face_corner_edges(host, vertex)
+                .map(|(_, leaves_on)| leaves_on);
+            match leaves_on.and_then(|edge| order.iter().position(|&e| e == edge)) {
+                Some(slot) => order.insert(slot + 1, wire),
+                None => order.push(wire),
+            }
+        }
+
+        // Everything the walk could not place: the unhosted wires, which land in the gap where
+        // the chain ran out — the tail of the concatenated order.
+        for &edge in incident_edges {
+            if !order.contains(&edge) {
+                order.push(edge);
+            }
+        }
+        debug_assert_eq!(
+            order.len(),
+            incident_edges.len(),
+            "the disk order is a permutation of the incident-edge set",
+        );
+        order
     }
 
     /// Assign the per-face attributes of one **new** bevel face (BEVEL.md §6.6), in the
@@ -8495,9 +8611,11 @@ enum HardenFaceKind {
     Untouched,
 }
 
+/// The cap n-gon and the ring edges it bounds — the faced steps' chamfer edges, adopted, and
+/// the gap steps', minted by the cap itself (BEVEL.md §2.3's provenance table).
 struct CapFace {
     face: FaceKey,
-    chamfer_edges: Vec<EdgeKey>,
+    ring_edges: Vec<EdgeKey>,
 }
 
 /// How one freshly-minted chamfer edge `(leading_ring, trailing_ring)` inherits
@@ -11713,6 +11831,216 @@ mod tests {
         assert_eq!(mesh.face_vert_keys(face).len(), 5, "corner cut into two");
 
         mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.2: the open fan **is still capped** from valence 3 up. The ring is the disk
+    /// *cycle*, and a cycle has no ends — the gap merely means one ring edge had no incident
+    /// face to have minted it during the re-stitch, so the cap mints that one itself. Counts are
+    /// the interior counts: `+(n−1)` V / `+n` E / `+1` F.
+    ///
+    /// The valence-2 grid corner above is the *one* case where "no cap on a boundary" is true
+    /// (a two-corner n-gon is not a face), which is exactly why it is not a general rule.
+    #[test]
+    fn boundary_open_fan_valence_three_is_still_capped() {
+        let (mut mesh, centre, _) = open_planar_fan(3, 0);
+        assert_eq!(counts(&mesh), (4, 5, 2));
+
+        let result = mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (6, 8, 3), "boundary +2 V / +3 E / +1 F");
+        assert_eq!(result.verts.len(), 3, "three ring verts");
+        assert_eq!(result.faces.len(), 1, "one triangular cap");
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![3, 4, 4],
+            "both triangles grown by one, plus the cap over all three ring verts",
+        );
+
+        let cap = result.faces[0];
+        assert_eq!(mesh.face_vert_keys(cap).len(), 3);
+
+        // §6.2: the two chamfer edges keep radial count 2 (their face plus the cap); the gap
+        // edge the cap minted has radial count 1 — a new boundary edge, which is what keeps a
+        // boundary corner on the boundary.
+        let mut radial_counts: Vec<usize> = mesh
+            .face_loop_keys(cap)
+            .into_iter()
+            .map(|loop_key| mesh.edge_radial_iter(mesh.loop_edge(loop_key)).count())
+            .collect();
+        radial_counts.sort_unstable();
+        assert_eq!(radial_counts, vec![1, 2, 2], "one gap edge, two chamfers");
+    }
+
+    /// BEVEL.md §6.2's multi-gap row, measured against the reference: a **bow-tie** corner — two
+    /// triangles meeting at one shared vertex and sharing no edge. Manifoldness is an edge-mode
+    /// precondition (§2.1), so the corner is eligible, and its two disjoint face chains are
+    /// concatenated into a single disk cycle whose between-chain steps are the gaps. Valence 4,
+    /// `s = 2` faced steps and 2 gap steps: `5/6/2 → 8/10/3`, sizes `[4, 4, 4]` — **one** quad
+    /// cap over all four ring verts, closing both gaps, and not a cap per fan.
+    #[test]
+    fn vertex_bevel_multi_gap_bowtie_corner_gets_one_quad_cap() {
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let east = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let north_east = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let west = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let south_west = mesh.create_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        mesh.face_create_verts(&[centre, east, north_east], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[centre, west, south_west], FaceCreateFlags::NONE);
+        assert_eq!(counts(&mesh), (5, 6, 2));
+
+        let result = mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (8, 10, 3), "+3 V / +4 E / +1 F");
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "one cap over the whole ring, not one per fan"
+        );
+        assert_eq!(face_size_multiset(&mesh), vec![4, 4, 4]);
+
+        let cap = result.faces[0];
+        assert_eq!(
+            mesh.face_vert_keys(cap).len(),
+            4,
+            "the cap spans all four ring verts",
+        );
+        for &ring_vertex in &result.verts {
+            assert!(
+                mesh.face_vert_keys(cap).contains(&ring_vertex),
+                "every ring vert is a corner of the one cap",
+            );
+        }
+        let mut radial_counts: Vec<usize> = mesh
+            .face_loop_keys(cap)
+            .into_iter()
+            .map(|loop_key| mesh.edge_radial_iter(mesh.loop_edge(loop_key)).count())
+            .collect();
+        radial_counts.sort_unstable();
+        assert_eq!(
+            radial_counts,
+            vec![1, 1, 2, 2],
+            "two gap edges minted by the cap, two chamfers minted by the re-stitch",
+        );
+    }
+
+    /// BEVEL.md §7.2.1's worked open-fan wire: a single quad with a wire hanging off one corner
+    /// into the void. Valence 3, one incident face — `5/5/1 → 7/8/2`, sizes `[3, 5]`: the quad
+    /// grown by one to a pentagon and a **triangle cap** over the three ring verts (two faced
+    /// spokes and the wire).
+    #[test]
+    fn vertex_bevel_quad_with_a_wire_off_one_corner_caps_the_open_fan() {
+        let mut mesh = LoopMesh::new();
+        let corners: Vec<VertexKey> = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .map(|position| mesh.create_vertex(position))
+        .collect();
+        mesh.face_create_verts(&corners, FaceCreateFlags::NONE);
+        let tip = mesh.create_vertex(Vec3::new(2.0, -1.0, 0.0));
+        mesh.create_edge([corners[1], tip], EdgeCreateFlags::NONE);
+        assert_eq!(counts(&mesh), (5, 5, 1));
+
+        let result = mesh.bevel(
+            &[corners[1].into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (7, 8, 2), "+2 V / +3 E / +1 F");
+        assert_eq!(face_size_multiset(&mesh), vec![3, 5]);
+        assert_eq!(result.faces.len(), 1);
+        assert_eq!(
+            mesh.face_vert_keys(result.faces[0]).len(),
+            3,
+            "the cap is a triangle over the two faced spokes' ring verts and the wire's",
+        );
+        assert_eq!(
+            wire_landings(&mesh, tip).len(),
+            1,
+            "the wire survives, re-pointed onto its own ring vert before the corner is freed",
+        );
+    }
+
+    /// BEVEL.md §5.1's winding rule, and the one fact no count, face-size or canonical-topology
+    /// assertion can see: **an inward cap has the same incidences as an outward one.** The cap
+    /// traverses the ring *in* the disk order, which is equivalently "opposite every rebuilt face
+    /// on their shared chamfer edge" — so on the outward-wound cube its Newell normal points
+    /// **out**, along the beveled corner's own outward diagonal. Winding the ring the other way
+    /// mints an inward-facing cap that every other assertion in this file would wave through.
+    #[test]
+    fn vertex_bevel_cap_normal_points_out_of_the_cube_corner() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let outward = mesh.vertex_position(corner).normalize();
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result.faces.len(), 1, "one triangular cap");
+        let cap = result.faces[0];
+        let normal = mesh.face_plane_normal(cap);
+        assert!(
+            normal.dot(outward) > 0.99,
+            "the cap faces the way the removed corner's surrounding faces faced: got {normal:?}",
+        );
+
+        // The other half of the same rule: each chamfer edge is walked in *opposite* directions
+        // by the cap and by the rebuilt face sharing it — the manifold condition that leaves
+        // every one of them at a radial count of exactly 2.
+        for cap_loop in mesh.face_loop_keys(cap) {
+            let edge = mesh.loop_edge(cap_loop);
+            let radial: Vec<LoopKey> = mesh.edge_loop_keys(edge);
+            assert_eq!(radial.len(), 2, "a closed fan shares every ring edge");
+            let cap_from = mesh.loop_vertex(cap_loop);
+            let cap_to = mesh.loop_vertex(mesh.loop_next(cap_loop));
+            let face_loop = radial
+                .into_iter()
+                .find(|&other| other != cap_loop)
+                .expect("the rebuilt face's loop on the shared chamfer edge");
+            let face_from = mesh.loop_vertex(face_loop);
+            let face_to = mesh.loop_vertex(mesh.loop_next(face_loop));
+            assert!(
+                face_from == cap_to && face_to == cap_from,
+                "the rebuilt face runs the chamfer edge descending, the cap ascending",
+            );
+        }
     }
 
     /// BEVEL.md §2.1: a non-positive offset is a no-op.
@@ -23385,14 +23713,17 @@ mod tests {
         );
     }
 
-    /// A wire on an **open** fan, sitting in a sector that *does* carry a face: the fan
-    /// being open changes nothing for it — §7.2.1's vertex-mode box still makes it a full
-    /// ring member, and the face spanning its sector still adopts its ring vert and grows
-    /// by two sides. The open fan gets no cap (§6.2), so the host face is the *only* thing
-    /// holding the wire's ring vert onto the surface: this is the fixture that tells a
-    /// hosted wire apart from a severed one.
+    /// A wire on an **open** fan, pointing squarely into a sector that *does* carry a face —
+    /// and §7.2.1's vertex-mode box still slots it into the **gap**, "regardless of where the
+    /// wire points geometrically". The chain of an open fan runs from one boundary spoke to the
+    /// other and stops, so where it runs out is the faceless gap, not a seam inside a sector.
+    /// So **no rebuilt face adopts it**: every rebuilt face grows by exactly one (§6.1) and the
+    /// wire's ring vert is a corner of the **cap** alone — which exists, an open fan of valence
+    /// >= 3 being capped like any other (§6.2). This is the fixture that discriminates: handing
+    /// the wire to a chain-end face (the *closed*-fan answer) diverges in counts and in the
+    /// face-size multiset, not merely in a tie.
     #[test]
-    fn vertex_bevel_open_fan_wire_in_a_faced_sector_is_hosted_by_that_face() {
+    fn vertex_bevel_open_fan_wire_lands_in_the_gap_not_the_sector_it_points_into() {
         let (mut mesh, centre, _) = open_planar_fan(3, 0);
         // 45° — squarely inside the sector of the `+x` / `+y` triangle.
         let tip = mesh.create_vertex(Vec3::new(0.6, 0.6, 0.0));
@@ -23412,11 +23743,15 @@ mod tests {
 
         assert_eq!(
             counts(&mesh),
-            (8, 9, 2),
-            "four ring verts (the wire is one), three chamfer segments — two of them in \
-             the host's corner run — and no cap on the open fan",
+            (8, 10, 3),
+            "valence 4: +3 V / +4 E / +1 F — two chamfer edges minted by the re-stitch, two \
+             gap edges minted by the cap",
         );
-        assert_eq!(face_size_multiset(&mesh), vec![4, 5]);
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![4, 4, 4],
+            "each triangle grown by one, plus one quad cap over all four ring verts",
+        );
 
         let slide = 0.2 / 2.0f32.sqrt();
         let wire_ring = Vec3::new(slide, slide, 0.0);
@@ -23428,40 +23763,31 @@ mod tests {
             landings[0],
         );
 
-        for &ring_vertex in &result.verts {
-            assert!(
-                !mesh.vert_face_keys(ring_vertex).is_empty(),
-                "every ring vert is adopted by a face — the wire's included, or it would \
-                 hang off the surface with only the wire on it",
-            );
-        }
         let wire_ring_vert = result
             .verts
             .iter()
             .copied()
             .find(|&vertex| (mesh.vertex_position(vertex) - wire_ring).length() < 1e-5)
             .expect("the wire's ring vert");
-        let host = mesh
-            .vert_face_keys(wire_ring_vert)
+        let cap = cap_face_of(&mesh, &result.verts).expect("an open fan of valence 3+ is capped");
+        let adopters: Vec<FaceKey> = mesh
+            .face_keys()
             .into_iter()
-            .next()
-            .expect("the wire's ring vert has a host face");
-        assert_eq!(
-            mesh.face_vert_keys(host).len(),
-            5,
-            "the host triangle grows by two sides (both ring verts *and* the wire's)",
+            .filter(|&face| face != cap && mesh.face_vert_keys(face).contains(&wire_ring_vert))
+            .collect();
+        assert!(
+            adopters.is_empty(),
+            "no rebuilt face adopts a gap wire — the cap alone catches it",
         );
+        assert!(mesh.face_vert_keys(cap).contains(&wire_ring_vert));
     }
 
-    /// The wire pointing into the same open fan's face-less **gap**: no sector holds it, so
-    /// the rotational read is inconclusive — and §7.2.1's rule is **total** anyway. "Nothing
-    /// pins its slot in the disk order… the reference walks the face chain and drops the wire
-    /// in where the chain runs out": a corner with a face always has a chain end, so the wire
-    /// is hosted there and the corner is beveled exactly like the faced-sector one. Same
-    /// counts, same face sizes — the gap changes *which* face hosts (an artefact, §7.2.1),
-    /// never *whether* one does. Declining here would no-op a perfectly beveable corner.
+    /// The same open fan with the wire pointing into the face-less **gap** instead: same slot,
+    /// same answer. The gap is where the chain runs out either way, so this fixture and the one
+    /// above agree down to the face-size multiset — the geometric bearing of the wire never
+    /// enters into it on an open fan.
     #[test]
-    fn vertex_bevel_open_fan_wire_in_the_boundary_gap_is_hosted_by_the_chain_end() {
+    fn vertex_bevel_open_fan_wire_in_the_boundary_gap_is_caught_by_the_cap() {
         let (mut mesh, centre, _, tip) = wire_spoke_open_fan();
         assert_eq!(counts(&mesh), (5, 6, 2));
 
@@ -23476,13 +23802,8 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(
-            counts(&mesh),
-            (8, 9, 2),
-            "the same answer the faced-sector wire gets: four ring verts, three chamfer \
-             segments, no cap on the open fan",
-        );
-        assert_eq!(face_size_multiset(&mesh), vec![4, 5]);
+        assert_eq!(counts(&mesh), (8, 10, 3));
+        assert_eq!(face_size_multiset(&mesh), vec![4, 4, 4]);
         assert!(
             !mesh.vert_keys().contains(&centre),
             "the corner is beveled, not declined — so it is consumed",
@@ -23499,45 +23820,39 @@ mod tests {
             landings[0],
         );
 
-        for &ring_vertex in &result.verts {
-            assert!(
-                !mesh.vert_face_keys(ring_vertex).is_empty(),
-                "every ring vert is adopted by a face — the gap wire's included, or it \
-                 would hang off the surface with only the wire on it",
-            );
-        }
         let wire_ring_vert = result
             .verts
             .iter()
             .copied()
             .find(|&vertex| (mesh.vertex_position(vertex) - wire_ring).length() < 1e-5)
             .expect("the gap wire's ring vert");
-        let host = mesh
-            .vert_face_keys(wire_ring_vert)
-            .into_iter()
-            .next()
-            .expect("the gap wire's ring vert has a host face");
-        assert_eq!(
-            mesh.face_vert_keys(host).len(),
-            5,
-            "the chain-end triangle hosts it, so it grows by two sides",
-        );
+        let cap = cap_face_of(&mesh, &result.verts).expect("an open fan of valence 3+ is capped");
+        assert_eq!(mesh.face_vert_keys(cap).len(), 4);
+        assert!(mesh.face_vert_keys(cap).contains(&wire_ring_vert));
+        for face in mesh.face_keys() {
+            if face != cap {
+                assert_eq!(
+                    mesh.face_vert_keys(face).len(),
+                    4,
+                    "every rebuilt face grows by exactly one — none hosts the gap wire",
+                );
+            }
+        }
     }
 
-    /// The corner §7.2.1's vertex-mode rule cannot serve: an **all-wire star**, a face-less
-    /// centre with two or more wires on it. A wire's ring vert has to be adopted by the face
-    /// hosting the wire, and this corner has no face — no chain to host on, and no fan, so no
-    /// cap face to catch the ring verts either (§6.2). Every ring vert would be left holding
-    /// its wire alone and the star would fall apart into loose edges. So the corner is
-    /// declined whole: no ring, no surgery, no free — the mesh comes back untouched.
+    /// §6.2.1, the extreme corner: an **all-wire star**, face-less, three wires. Nothing about
+    /// vertex bevel requires a face (§2.1) and the general rule answers with no special case —
+    /// every step of the disk is a gap, so *no* ring edge comes from a re-stitch and the cap
+    /// mints all `n` of them. `4/3/0 → 6/6/1`: three ring verts, three re-pointed wire stubs,
+    /// three cap-minted ring edges, and one free-floating triangular cap.
     #[test]
-    fn vertex_bevel_all_wire_star_is_declined_whole() {
+    fn vertex_bevel_face_less_wire_star_is_capped_by_the_cap_alone() {
         let mut mesh = LoopMesh::new();
         let centre = mesh.create_vertex(Vec3::ZERO);
         let tips: Vec<VertexKey> = [
             Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(-1.0, 0.3, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
         ]
         .into_iter()
         .map(|position| mesh.create_vertex(position))
@@ -23550,7 +23865,7 @@ mod tests {
         let result = mesh.bevel(
             &[centre.into()],
             BevelOptions {
-                offset: 0.2,
+                offset: 0.25,
                 segments: 1,
                 affect: BevelAffect::Vertices,
                 ..Default::default()
@@ -23558,28 +23873,90 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert!(
-            result.verts.is_empty(),
-            "no ring verts: the corner declined"
-        );
-        assert!(result.edges.is_empty());
-        assert!(result.faces.is_empty());
         assert_eq!(
             counts(&mesh),
-            (4, 3, 0),
-            "the star is left exactly as it was"
+            (6, 6, 1),
+            "the face-less star is beveled like any other valence-3 corner",
         );
+        assert_eq!(result.verts.len(), 3, "one ring vert per wire");
+        assert_eq!(result.faces.len(), 1, "one triangular cap");
+        assert_eq!(face_size_multiset(&mesh), vec![3]);
         assert!(
-            mesh.vert_keys().contains(&centre),
-            "the centre is not consumed — declining must not free it",
+            !mesh.vert_keys().contains(&centre),
+            "the hub is consumed like any beveled corner",
         );
-        for &tip in &tips {
-            assert_eq!(
-                wire_landings(&mesh, tip),
-                vec![Vec3::ZERO],
-                "every wire still runs to the untouched centre",
+
+        let cap = result.faces[0];
+        let corners = mesh.face_vert_keys(cap);
+        for expected in [
+            Vec3::new(0.25, 0.0, 0.0),
+            Vec3::new(-0.25, 0.0, 0.0),
+            Vec3::new(0.0, 0.25, 0.0),
+        ] {
+            assert!(
+                corners
+                    .iter()
+                    .any(|&corner| (mesh.vertex_position(corner) - expected).length() < 1e-5),
+                "the cap's corners are the beveled ends of the wires: {expected:?} missing",
             );
         }
+        for (&tip, expected) in tips.iter().zip([
+            Vec3::new(0.25, 0.0, 0.0),
+            Vec3::new(-0.25, 0.0, 0.0),
+            Vec3::new(0.0, 0.25, 0.0),
+        ]) {
+            let landings = wire_landings(&mesh, tip);
+            assert_eq!(landings.len(), 1, "each wire survives, re-pointed");
+            assert!((landings[0] - expected).length() < 1e-5);
+        }
+    }
+
+    /// §6.2.1's valence-2 half: a two-wire hub has no cap (a two-corner n-gon is not a face,
+    /// §2.3) — but the single ring edge is **still** minted, and here nothing else could have
+    /// minted it, there being no face to re-stitch. `3/2/0 → 4/3/0`: the two wires end up
+    /// joined by a new wire edge and the hub is gone. §6.3's carve-out reports that edge,
+    /// because a face-less corner's ring edge bounds nothing at all.
+    #[test]
+    fn vertex_bevel_two_wire_hub_mints_its_ring_edge_with_no_cap() {
+        let mut mesh = LoopMesh::new();
+        let hub = mesh.create_vertex(Vec3::ZERO);
+        let east = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let north = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        mesh.create_edge([hub, east], EdgeCreateFlags::NONE);
+        mesh.create_edge([hub, north], EdgeCreateFlags::NONE);
+        assert_eq!(counts(&mesh), (3, 2, 0));
+
+        let result = mesh.bevel(
+            &[hub.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (4, 3, 0), "+1 V / +1 E / +0 F");
+        assert!(result.faces.is_empty(), "no cap at valence 2");
+        assert_eq!(result.verts.len(), 2);
+        assert!(!mesh.vert_keys().contains(&hub), "the hub is consumed");
+
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "the face-less corner's ring edge bounds nothing and is reported (§6.3)",
+        );
+        let ring_edge = result.edges[0];
+        assert_eq!(
+            mesh.edge_radial_iter(ring_edge).count(),
+            0,
+            "and it is itself a wire",
+        );
+        let [a, b] = mesh.edge_vert_keys(ring_edge);
+        let ends = [mesh.vertex_position(a), mesh.vertex_position(b)];
+        assert!(ends.contains(&Vec3::new(0.25, 0.0, 0.0)));
+        assert!(ends.contains(&Vec3::new(0.0, 0.25, 0.0)));
     }
 
     /// A wire whose **both** endpoints are beveled. Each end re-points the wire onto its
@@ -26237,64 +26614,6 @@ fn inward_axis_angle(vertex: Vec3, far: Vec3, corner_axis: Vec3) -> f32 {
     }
     let cosine = (inward / inward_length).dot(corner_axis / axis_length);
     cosine.clamp(-1.0, 1.0).acos()
-}
-
-/// Order the ring verts into a cycle by following the chamfer edges (BEVEL.md
-/// §5.1 — the disk order). Starts from `ring_verts[0]` and walks the chamfer
-/// adjacency; returns `None` if the chamfer edges do not form a single closed
-/// cycle over all ring verts (an unexpected non-manifold corner).
-fn order_ring_cycle(
-    mesh: &LoopMesh,
-    ring_verts: &[VertexKey],
-    chamfer_edges: &[EdgeKey],
-) -> Option<Vec<VertexKey>> {
-    let mut neighbours: Vec<(VertexKey, VertexKey)> = Vec::with_capacity(chamfer_edges.len());
-    for &edge in chamfer_edges {
-        let [a, b] = mesh.edge_vert_keys(edge);
-        neighbours.push((a, b));
-    }
-
-    let adjacent = |current: VertexKey, skip: VertexKey| -> Option<VertexKey> {
-        for &(a, b) in &neighbours {
-            if a == current && b != skip {
-                return Some(b);
-            }
-            if b == current && a != skip {
-                return Some(a);
-            }
-        }
-        None
-    };
-
-    let start = ring_verts[0];
-    let mut ordered = vec![start];
-    // First step: pick either chamfer neighbour of `start`.
-    let mut previous = start;
-    let mut current = neighbours.iter().find_map(|&(a, b)| {
-        if a == start {
-            Some(b)
-        } else if b == start {
-            Some(a)
-        } else {
-            None
-        }
-    })?;
-
-    while current != start {
-        ordered.push(current);
-        let next = adjacent(current, previous)?;
-        previous = current;
-        current = next;
-        if ordered.len() > ring_verts.len() {
-            return None;
-        }
-    }
-
-    if ordered.len() == ring_verts.len() {
-        Some(ordered)
-    } else {
-        None
-    }
 }
 
 /// The context the §8.2.2.1 degenerate-`mid` rescue needs for one beveled-edge sector:
