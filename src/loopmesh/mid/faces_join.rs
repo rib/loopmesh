@@ -10,6 +10,41 @@ pub struct FacesJoinOutcome {
     pub double: Option<FaceKey>,
 }
 
+/// Which elements the many-input join *removes* on its way out
+/// (`DISSOLVE_FACES.md` §4.1.6). Despite the name, the axis is not "delete the
+/// input faces or not" — it selects **which elements the primitive removes**,
+/// and the two modes remove disjoint kinds of thing.
+///
+/// The classification (§4.1.1–§4.1.3), the boundary chain and the union's
+/// construction are **identical** in both modes; only the final deletion step
+/// differs, and it always runs *last* — after the per-loop attribute transfer
+/// has read its sources off the input faces' loops.
+///
+/// This axis is orthogonal to the §4.2 double fork (§4.1.7): the double fork
+/// picks the *entry point* ([`LoopMesh::faces_join_ex`] resolves,
+/// [`LoopMesh::faces_join_report_double_ex`] reports), because the two forms
+/// differ in what they return; `delete` is a parameter on both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacesJoinDelete {
+    /// Kill the **collected** interior edges and buried vertices (§4.1.3); the
+    /// input faces die as *collateral* of those kills. An input face incident to
+    /// neither kill-set therefore **survives**, overlapped by the union (§4.1.4).
+    /// The mesh is left tidy — no wire leftovers.
+    Yes,
+    /// Kill **every input face by name**; the collected sets are left standing.
+    /// There are no survivors, on any region shape — but a collected manifold
+    /// interior edge is stranded with an empty radial (a **wire edge**), and a
+    /// collected region-enclosed vertex keeps its whole disk (a **wire vertex**,
+    /// not a loose one). Callers wanting the mesh tidy sweep the leftovers on
+    /// their own schedule.
+    ///
+    /// Requires the input array's entries to be **distinct**: the by-name kill
+    /// walks the array, so a repeated entry would be killed twice. A
+    /// non-distinct array is declined through §4.3's null sentinel, ahead of
+    /// any mutation.
+    No,
+}
+
 impl LoopMesh {
     /// The **composed, loop-minting** face join
     /// (`RADIAL_EDGE_STRUCTURE.md` §9), specialised to a manifold pair sharing
@@ -91,16 +126,36 @@ impl LoopMesh {
     /// perimeter edge takes the union's loop as its radial entry and no
     /// region-interior edge ever does (`RADIAL_EDGE_STRUCTURE.md` §9).
     pub fn faces_join(&mut self, faces: &[FaceKey]) -> Option<FaceKey> {
+        self.faces_join_ex(faces, FacesJoinDelete::Yes)
+    }
+
+    /// [`LoopMesh::faces_join`] with the §4.1.6 `delete` axis exposed. See
+    /// [`FacesJoinDelete`] for what the axis actually selects — it is *not*
+    /// "delete the input faces or not".
+    pub fn faces_join_ex(
+        &mut self,
+        faces: &[FaceKey],
+        delete: FacesJoinDelete,
+    ) -> Option<FaceKey> {
+        // §4.1.6's arity guard, ahead of the mode fork: an empty array is a
+        // caller error, and a one-face array is an identity no-op that mints no
+        // union and kills nothing — in *either* mode — handing the input handle
+        // straight back.
         if faces.len() < 2 {
             return faces.first().copied();
         }
 
-        let (union, double, plan) = self.faces_join_build(faces, CallingForm::Resolve)?;
+        let region = faces_region_set(faces);
+        if rejects_repeated_entry(faces, &region, delete) {
+            return None;
+        }
+
+        let (union, double, plan) = self.faces_join_build(faces, &region, CallingForm::Resolve)?;
 
         // §4.2 — the *resolving* calling form: a pre-existing face carrying the
-        // union's corner cycle wins, and the fresh union is killed before the
-        // cascade ever runs. Callers that need to see the double instead reach
-        // for [`LoopMesh::faces_join_report_double`].
+        // union's corner cycle wins, and the fresh union is killed before any
+        // deletion runs. Callers that need to see the double instead reach for
+        // [`LoopMesh::faces_join_report_double`].
         let result = match double {
             Some(shadow) => {
                 self.face_kill(union);
@@ -109,7 +164,7 @@ impl LoopMesh {
             None => union,
         };
 
-        self.faces_join_apply_cascade(plan);
+        self.faces_join_apply_delete(faces, plan, delete);
         Some(result)
     }
 
@@ -124,8 +179,19 @@ impl LoopMesh {
     /// are exactly [`LoopMesh::faces_join`]'s. The one divergence is the §4.1.5
     /// per-loop transfer: this form always runs it, because the union it hands
     /// back is **alive**, and a live face owes the caller initialised per-corner
-    /// data even when a double exists (§9's `reusing` fork).
+    /// data even when a double exists (§9).
     pub fn faces_join_report_double(&mut self, faces: &[FaceKey]) -> Option<FacesJoinOutcome> {
+        self.faces_join_report_double_ex(faces, FacesJoinDelete::Yes)
+    }
+
+    /// [`LoopMesh::faces_join_report_double`] with the §4.1.6 `delete` axis
+    /// exposed. The two axes are independent (§4.1.7's 2x2): every combination
+    /// of calling form and mode is reachable and means something different.
+    pub fn faces_join_report_double_ex(
+        &mut self,
+        faces: &[FaceKey],
+        delete: FacesJoinDelete,
+    ) -> Option<FacesJoinOutcome> {
         if faces.len() < 2 {
             return faces.first().copied().map(|union| FacesJoinOutcome {
                 union,
@@ -133,23 +199,27 @@ impl LoopMesh {
             });
         }
 
-        let (union, double, plan) = self.faces_join_build(faces, CallingForm::Report)?;
-        self.faces_join_apply_cascade(plan);
+        let region = faces_region_set(faces);
+        if rejects_repeated_entry(faces, &region, delete) {
+            return None;
+        }
+
+        let (union, double, plan) = self.faces_join_build(faces, &region, CallingForm::Report)?;
+        self.faces_join_apply_delete(faces, plan, delete);
         Some(FacesJoinOutcome { union, double })
     }
 
     /// §4.1.2 steps 1 + 2 — classify, chain the boundary, mint the union, run the
-    /// §4.2 coincident-face probe. The cascade is *not* applied: the plan comes
+    /// §4.2 coincident-face probe. The deletion is *not* applied: the plan comes
     /// back un-executed so each calling form can settle the double before or
     /// after it, as its contract requires.
     fn faces_join_build(
         &mut self,
         faces: &[FaceKey],
+        region: &std::collections::HashSet<FaceKey>,
         form: CallingForm,
     ) -> Option<(FaceKey, Option<FaceKey>, FacesJoinPlan)> {
-        let region: std::collections::HashSet<FaceKey> = faces.iter().copied().collect();
-
-        let plan = self.faces_join_collect(faces, &region)?;
+        let plan = self.faces_join_collect(faces, region)?;
         let (ring_verts, ring_edges) = self.faces_join_chain_boundary(&plan)?;
 
         // §4.1.2 step 2 — construct. Every perimeter edge gains a freshly-minted
@@ -166,35 +236,60 @@ impl LoopMesh {
         self.face_normal_update(union);
 
         let double = self.faces_join_find_coincident_face(union);
-        // §9's `reusing` fork: the per-loop transfer is skipped only where the
-        // pre-existing face is *adopted* as the merge result — it already carries
-        // its own per-corner data, and the union it displaces is about to die.
-        // The mere existence of a double does not skip it: under the report form
-        // the union stays alive, and a live face with uninitialised corners is a
-        // live face with wrong corners.
-        let reusing = double.is_some() && form == CallingForm::Resolve;
-        if !reusing {
-            self.faces_join_transfer_boundary_loop_attrs(union, &region);
+        // The per-loop transfer is skipped only where the pre-existing face is
+        // *adopted* as the merge result (§9): it already carries its own
+        // per-corner data, and the union it displaces is about to die. The mere
+        // existence of a double does not skip it — under the report form the
+        // union stays alive, and a live face with uninitialised corners is a live
+        // face with wrong corners.
+        let adopting_double = double.is_some() && form == CallingForm::Resolve;
+        if !adopting_double {
+            self.faces_join_transfer_boundary_loop_attrs(union, region);
         }
 
         Some((union, double, plan))
     }
 
-    /// §4.1.2 steps 3 + 4 — the cascade, and the only thing in the join that
-    /// deletes an input face. The two kill-sets partition the dying-edge set
-    /// (§7), so no edge is killed twice: an interior edge with a buried endpoint
-    /// is never collected, and dies inside that vertex's disk instead.
+    /// §4.1.2 steps 3 + 4 — the deletion, and the last thing the join does. It
+    /// runs strictly **after** the union is constructed and after §4.1.5's
+    /// per-loop transfer has read its sources off the input faces' own loops:
+    /// either mode's kills destroy those sources, so a deletion hoisted ahead of
+    /// the transfer would mint an under-initialised union (§4.1.6).
     ///
-    /// The union is never collateral here: it is built over the region's
+    /// Under [`FacesJoinDelete::Yes`] the two cascades are the only thing that
+    /// deletes an input face. The kill-sets partition the dying-edge set (§7), so
+    /// no edge is killed twice: an interior edge with a buried endpoint is never
+    /// collected, and dies inside that vertex's disk instead.
+    ///
+    /// Under [`FacesJoinDelete::No`] the collected sets are simply dropped —
+    /// classification still ran, and its output is left standing as wire geometry
+    /// inside the union — and each input face is killed by name instead.
+    ///
+    /// The union is never collateral of either: it is built over the region's
     /// *boundary* edges, and neither kill-set can touch one (a boundary edge
     /// carries an out-of-region face or nothing at all, so it is never a
-    /// collected interior edge, and its endpoints are never region-enclosed).
-    fn faces_join_apply_cascade(&mut self, plan: FacesJoinPlan) {
-        for edge in plan.kill_edges {
-            self.edge_kill(edge);
-        }
-        for vertex in plan.kill_verts {
-            self.vertex_kill(vertex);
+    /// collected interior edge, and its endpoints are never region-enclosed);
+    /// nor is it in the input array.
+    fn faces_join_apply_delete(
+        &mut self,
+        faces: &[FaceKey],
+        plan: FacesJoinPlan,
+        delete: FacesJoinDelete,
+    ) {
+        match delete {
+            FacesJoinDelete::Yes => {
+                for edge in plan.kill_edges {
+                    self.edge_kill(edge);
+                }
+                for vertex in plan.kill_verts {
+                    self.vertex_kill(vertex);
+                }
+            }
+            FacesJoinDelete::No => {
+                for &face in faces {
+                    self.face_kill(face);
+                }
+            }
         }
     }
 
@@ -454,6 +549,24 @@ impl LoopMesh {
         }
         None
     }
+}
+
+fn faces_region_set(faces: &[FaceKey]) -> std::collections::HashSet<FaceKey> {
+    faces.iter().copied().collect()
+}
+
+/// §4.1.6's distinctness precondition, which only *bites* under
+/// [`FacesJoinDelete::No`]: the cascade is idempotent under a repeated entry,
+/// but a by-name kill of one is a double free. Like the empty-array case it is
+/// a caller error rather than a topological failure, so it reports through
+/// §4.3's null sentinel — and it has to be answered **before** anything is
+/// constructed, since §4.3 promises a failed join modifies nothing.
+fn rejects_repeated_entry(
+    faces: &[FaceKey],
+    region: &std::collections::HashSet<FaceKey>,
+    delete: FacesJoinDelete,
+) -> bool {
+    delete == FacesJoinDelete::No && region.len() != faces.len()
 }
 
 /// Which of §4.2's two calling forms the join is running under. The fork is
@@ -716,7 +829,8 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// §9's `reusing` fork, on the side that only the **report** form reaches:
+    /// §9's adopt-the-double fork, on the side that only the **report** form
+    /// reaches:
     /// a double exists, but the fresh union is handed back **alive**, so §4.1.5's
     /// per-loop transfer must still have run over it. Skipping it on the mere
     /// existence of a double would return a live face whose corners carry the
@@ -778,7 +892,7 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// The `reusing` side of the same fork: under the **resolving** form the
+    /// The adopting side of the same fork: under the **resolving** form the
     /// pre-existing face is adopted as the merge result, and it keeps the
     /// per-corner data it already had — the join must not overwrite it with the
     /// source loops'.
@@ -1482,6 +1596,336 @@ mod tests {
         let perimeter = mesh.face_vert_keys(union);
         assert_eq!(perimeter.len(), 3, "the union is the triangle 0-2-3");
         assert!(!perimeter.contains(&v[1]));
+
+        mesh.validate_topology();
+    }
+
+    /// A standalone 2x2 block of quads (9 V, 12 E, 4 F). The centre vertex is
+    /// buried — its whole disk is the four spokes, each carrying two of the four
+    /// quads — so `kill_edges` is **empty** and `kill_verts = { centre }`, and the
+    /// fixture exercises *both* of §4.1.6's leftovers at once. Returns
+    /// `(verts, faces)` with `verts[r * 3 + c]` on the unit lattice and the centre
+    /// at `verts[4]`.
+    fn build_quad_block_2x2(mesh: &mut LoopMesh) -> (Vec<VertexKey>, Vec<FaceKey>) {
+        let verts: Vec<VertexKey> = (0..3)
+            .flat_map(|r| (0..3).map(move |c| (r, c)))
+            .map(|(r, c)| mesh.create_vertex(Vec3::new(c as f32, r as f32, 0.0)))
+            .collect();
+        let faces: Vec<FaceKey> = (0..2)
+            .flat_map(|r| (0..2).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let ring = [
+                    verts[r * 3 + c],
+                    verts[r * 3 + c + 1],
+                    verts[(r + 1) * 3 + c + 1],
+                    verts[(r + 1) * 3 + c],
+                ];
+                mesh.face_create_verts(&ring, FaceCreateFlags::NONE)
+            })
+            .collect();
+        (verts, faces)
+    }
+
+    /// §4.1.6 — the non-deleting mode on the fixture that shows both of its
+    /// leftovers. The classification is *identical* to the deleting mode's (the
+    /// centre vertex is collected just the same); it is simply not acted on. The
+    /// four quads die **by name**, and the union square is left standing over four
+    /// radial-0 **wire edges** meeting at a degree-4 **wire vertex** — which is
+    /// *not* a loose vertex: its disk is intact.
+    #[test]
+    fn faces_join_non_deleting_mode_strands_wire_spokes_and_a_wire_vertex() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_quad_block_2x2(&mut mesh);
+        let centre = verts[4];
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 4)
+        );
+
+        let union = mesh
+            .faces_join_ex(&faces, FacesJoinDelete::No)
+            .expect("the 2x2 block joins");
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (9, 12, 1),
+            "§4.1.6: -(n-1) F, and *nothing* else is removed — the deleting mode \
+             would have landed on 8 V, 8 E, 1 F"
+        );
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(
+            faces.iter().all(|face| !live.contains(face)),
+            "every input face dies by name — the non-deleting mode has no survivors"
+        );
+        assert!(live.contains(&union));
+
+        let perimeter = mesh.face_vert_keys(union);
+        assert_eq!(perimeter.len(), 8, "the union spans the block's boundary");
+        assert!(!perimeter.contains(&centre));
+
+        for spoke_end in [verts[1], verts[3], verts[5], verts[7]] {
+            let spoke = mesh
+                .query_edge_exists(centre, spoke_end)
+                .expect("the collected interior edge is left standing");
+            assert!(
+                mesh.edge_face_keys(spoke).is_empty(),
+                "it lost both of its input faces and is now a wire edge"
+            );
+        }
+        assert_eq!(
+            mesh.vert_edge_keys(centre).len(),
+            4,
+            "the collected vertex keeps its whole disk: a wire vertex, not a loose one"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// The same block through the **deleting** mode, as the contrast that gives
+    /// the non-deleting numbers their meaning (§4.1.6's worked example): the
+    /// centre's kill takes its four spokes, which take all four quads.
+    #[test]
+    fn faces_join_deleting_mode_consumes_the_buried_vertex_and_its_spokes() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_quad_block_2x2(&mut mesh);
+
+        mesh.faces_join_ex(&faces, FacesJoinDelete::Yes)
+            .expect("the 2x2 block joins");
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 8, 1),
+            "the cascade leaves the mesh tidy"
+        );
+        assert!(mesh.vertices.try_get(verts[4]).is_none());
+
+        mesh.validate_topology();
+    }
+
+    /// §4.1.6's arity guard, which precedes the mode fork: a one-face array mints
+    /// **no** union and kills **nothing**, in *either* mode, and hands the input
+    /// handle straight back. The face-count delta coincides at `n = 1`
+    /// (`-(1 - 1) = 0` either way), so only the returned face's **identity** — and
+    /// the untouched mesh — catch an implementation that applies the non-deleting
+    /// mode's "kill each entry" literally here.
+    #[test]
+    fn faces_join_single_face_array_is_an_identity_noop_in_either_mode() {
+        for delete in [FacesJoinDelete::Yes, FacesJoinDelete::No] {
+            let mut mesh = LoopMesh::new();
+            let (_verts, faces) = build_quad_block_2x2(&mut mesh);
+
+            let result = mesh
+                .faces_join_ex(&faces[0..1], delete)
+                .expect("a one-face array is an identity no-op, not a failure");
+
+            assert_eq!(
+                result, faces[0],
+                "the returned handle *is* the input handle — no union was minted ({delete:?})"
+            );
+            assert_eq!(
+                (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                (9, 12, 4),
+                "nothing was killed and nothing was minted ({delete:?})"
+            );
+            assert!(mesh.faces_join_ex(&[], delete).is_none(), "empty is rejected");
+
+            mesh.validate_topology();
+        }
+    }
+
+    /// §4.1.6(a)'s second domain row: a non-deleting join whose double is resolved
+    /// by **reuse** costs one face *more* than the naive `-(n - 1)`. Every input
+    /// still dies by name, *and* the fresh union is killed in favour of the
+    /// pre-existing coincident face — so the delta is `-n`. The collected interior
+    /// edge is still left standing, now stranded inside the *adopted* face.
+    #[test]
+    fn faces_join_non_deleting_reuse_resolved_double_costs_n_faces() {
+        let mut mesh = LoopMesh::new();
+        let (verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 3)
+        );
+
+        let result = mesh
+            .faces_join_ex(&[f_left, f_right], FacesJoinDelete::No)
+            .expect("the two-quad region joins");
+
+        assert_eq!(
+            result, f_shadow,
+            "the resolving form adopts the pre-existing coincident face"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            1,
+            "-n, not -(n-1): both inputs die by name AND the fresh union is killed"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count()),
+            (6, 7),
+            "the collected interior edge is left standing inside the adopted face"
+        );
+
+        let interior = mesh
+            .query_edge_exists(verts[1], verts[2])
+            .expect("the interior edge survives the non-deleting mode");
+        assert!(
+            mesh.edge_face_keys(interior).is_empty(),
+            "stranded as a wire edge"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// §4.1.6(b), the half a count-only test misses: on a **keep-alive** chord the
+    /// two modes both leave the edge alive but leave *different radials* on it.
+    /// The deleting mode leaves §4.1.4's survivor `f2` on the chord (radial 3);
+    /// the non-deleting mode kills `f2` by name, so the chord ends carrying the
+    /// two out-of-region fins alone (radial 2), and the manifold interior edge
+    /// `{1,4}` — collected but not acted on — is stranded as a wire edge.
+    #[test]
+    fn faces_join_non_deleting_mode_has_no_survivor_on_a_keep_alive_chord() {
+        let mut mesh = LoopMesh::new();
+        let (v, [f0, f1, f2, fin_a, fin_b]) = build_quad_row_with_nonmanifold_chord(&mut mesh);
+
+        mesh.faces_join_ex(&[f0, f1, f2], FacesJoinDelete::No)
+            .expect("the row is edge-connected and has no over-shared edge");
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (12, 16, 3),
+            "-(n-1) F; no edge and no vertex is removed — the deleting mode reads 12/15/4"
+        );
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(
+            !live.contains(&f2),
+            "§4.1.4's survivor is killed by name here: this mode has no survivors"
+        );
+
+        let wire = mesh
+            .query_edge_exists(v[1], v[4])
+            .expect("the collected manifold interior edge is left standing");
+        assert!(mesh.edge_face_keys(wire).is_empty(), "as a wire edge");
+
+        let chord = mesh.query_edge_exists(v[2], v[3]).expect("the chord");
+        let on_chord: std::collections::HashSet<FaceKey> =
+            mesh.edge_face_keys(chord).into_iter().collect();
+        assert_eq!(
+            on_chord,
+            [fin_a, fin_b].into_iter().collect(),
+            "the keep-alive chord lost *both* input-face loops, leaving only the fins"
+        );
+
+        mesh.validate_topology();
+    }
+
+    /// §4.1.6's distinctness precondition. It bites only under the non-deleting
+    /// mode (a by-name kill of a repeated entry is a double free), so that mode
+    /// declines through §4.3's null sentinel — and §4.3 promises a failed join
+    /// modifies **nothing**, which is why the check has to answer ahead of the
+    /// construction. The deleting mode is unaffected: its cascades are idempotent
+    /// under a repeat, and it merges the duplicated array exactly as it would the
+    /// distinct one.
+    #[test]
+    fn faces_join_repeated_entry_is_declined_untouched_under_the_non_deleting_mode() {
+        let mut mesh = LoopMesh::new();
+        let (verts, faces) = build_quad_block_2x2(&mut mesh);
+        let repeated = [faces[0], faces[1], faces[2], faces[3], faces[0]];
+
+        let before_verts: Vec<VertexKey> = mesh.vert_keys();
+        let before_edges: Vec<EdgeKey> = mesh.edge_keys();
+        let before_faces: Vec<FaceKey> = mesh.face_keys();
+
+        assert!(
+            mesh.faces_join_ex(&repeated, FacesJoinDelete::No).is_none(),
+            "a repeated entry is a caller error; the non-deleting mode reports it \
+             through the null sentinel"
+        );
+        assert!(
+            mesh.faces_join_report_double_ex(&repeated, FacesJoinDelete::No)
+                .is_none(),
+            "the reporting calling form declines it identically"
+        );
+
+        // The whole point of hoisting the check: not merely the same *counts*, the
+        // same elements. No union was minted and no face was killed.
+        assert_eq!(mesh.vert_keys(), before_verts);
+        assert_eq!(mesh.edge_keys(), before_edges);
+        assert_eq!(mesh.face_keys(), before_faces);
+        mesh.validate_topology();
+
+        // The deleting mode swallows the repeat: same result as the distinct array.
+        mesh.faces_join_ex(&repeated, FacesJoinDelete::Yes)
+            .expect("a repeated entry is idempotent under the deleting mode");
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (8, 8, 1),
+            "the cascade lands where the distinct array lands"
+        );
+        assert!(mesh.vertices.try_get(verts[4]).is_none());
+        mesh.validate_topology();
+    }
+
+    /// §4.1.7's fourth cell — `(delete = false, report)`, the combination the
+    /// guide names a real caller for. It is exactly the cell that separates
+    /// *report* from *reuse* under the non-deleting mode: the fresh union comes
+    /// back **alive alongside** the double instead of being killed in its favour,
+    /// so the face delta is `−(n − 1)` and not `−n` (§4.1.6(a)'s two domain rows).
+    #[test]
+    fn faces_join_report_double_non_deleting_keeps_the_union_alive_beside_the_double() {
+        let mut mesh = LoopMesh::new();
+        let (verts, [f_left, f_right, f_shadow]) = build_shadow_over_two_quads(&mut mesh);
+
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+            (6, 7, 3)
+        );
+
+        let outcome = mesh
+            .faces_join_report_double_ex(&[f_left, f_right], FacesJoinDelete::No)
+            .expect("the two-quad region joins");
+
+        assert_eq!(
+            outcome.double,
+            Some(f_shadow),
+            "the pre-existing hexagon coincides with the union's corner cycle"
+        );
+        assert_ne!(
+            outcome.union, f_shadow,
+            "the report form hands back the *fresh* union, not the double"
+        );
+
+        let live: std::collections::HashSet<FaceKey> = mesh.face_keys().into_iter().collect();
+        assert!(
+            live.contains(&outcome.union) && live.contains(&f_shadow),
+            "both faces stand: resolving the overlap is the caller's job"
+        );
+        assert!(
+            !live.contains(&f_left) && !live.contains(&f_right),
+            "the inputs still die by name — this mode has no survivors"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            2,
+            "-(n-1), not -n: the reuse cell would have killed the union too"
+        );
+        assert_eq!(
+            (mesh.vertex_count(), mesh.edge_count()),
+            (6, 7),
+            "the collected sets are left standing"
+        );
+
+        let interior = mesh
+            .query_edge_exists(verts[1], verts[2])
+            .expect("the collected interior edge survives the non-deleting mode");
+        assert!(
+            mesh.edge_face_keys(interior).is_empty(),
+            "stranded as a wire edge, inside both of the coincident faces"
+        );
 
         mesh.validate_topology();
     }

@@ -15,4 +15,4 @@ mod face_split;
 mod faces_join;
 mod vert_dissolve;
 
-pub use faces_join::FacesJoinOutcome;
+pub use faces_join::{FacesJoinDelete, FacesJoinOutcome};
