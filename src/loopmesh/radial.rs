@@ -180,7 +180,16 @@ impl LoopMesh {
         );
     }
 
-    /// Append an edge to the disk loop of this hub vertex
+    /// Append an edge to the disk cycle of this hub vertex
+    /// ([`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+    /// §6.5's disk append): the new edge splices in immediately **before** the
+    /// anchor — i.e. at the back of the forward walk from it — and the anchor does
+    /// **not** move. This is the one place the disk parts company with the radial,
+    /// whose append drags its entry onto the new loop; leaving the anchor alone is
+    /// what makes it the earliest-attached edge for the whole life of the mesh.
+    ///
+    /// An edge whose endpoint is *re*-targeted onto `vertex` joins the disk here
+    /// too, and is ordered by that event rather than by when it was created.
     pub(crate) fn vertex_disk_append_edge(&mut self, vertex: VertexKey, edge: EdgeKey) {
         let disk_loop_start = self.vertices.get(vertex).disk_loop_start;
         match disk_loop_start {
@@ -217,6 +226,15 @@ impl LoopMesh {
     }
 
     /// Removes an edge from the disk cycle of a vertex
+    /// ([`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+    /// §6.5's disk removal): the survivors keep their cyclic order, and the anchor
+    /// moves **forward** onto the removed edge's disk successor — exactly once, and
+    /// only when the removed edge *was* the anchor. The vertex's last incident edge
+    /// leaves it isolated, with no anchor.
+    ///
+    /// A backwards re-seat (onto the predecessor) is invisible below degree 3,
+    /// which is why the pins for this rule drive a degree-≥3 disk.
+    ///
     /// Panics if the edge isn't associated with the vertex!
     pub(crate) fn vertex_disk_remove_edge(&mut self, vertex: VertexKey, edge: EdgeKey) {
         let links_old = self.edges.get(edge).disk_loop_links_for_vert(vertex);
@@ -1220,5 +1238,178 @@ mod tests {
         // Poke one of the halves.
         mesh.face_poke(new_face);
         mesh.validate_topology();
+    }
+}
+
+#[cfg(test)]
+mod disk_anchor_convention_tests {
+    use crate::loopmesh::*;
+    use glam::Vec3;
+
+    /// `n` triangular pages sharing the spine `0–1`, listed `[0, 1, 2+i]` and
+    /// built in order. Returns the vertex table; index 0 is the hub the pins
+    /// drive, and its disk reaches degree `n + 1`.
+    fn build_book(mesh: &mut LoopMesh, n: usize) -> Vec<VertexKey> {
+        let mut verts: Vec<VertexKey> = (0..2 + n)
+            .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
+            .collect();
+        for i in 0..n {
+            mesh.face_create_verts(&[verts[0], verts[1], verts[2 + i]], FaceCreateFlags::NONE);
+        }
+        verts.shrink_to_fit();
+        verts
+    }
+
+    /// `verts[hub]`'s disk, in §6.5 walk order (forward from the anchor), read as
+    /// the `verts` index of each edge's far endpoint. This is the observable the
+    /// whole convention turns on; it is invisible to any canonicalising read.
+    fn disk_far_endpoints(mesh: &LoopMesh, verts: &[VertexKey], hub: usize) -> Vec<usize> {
+        mesh.iter_disk_edges(verts[hub])
+            .map(|e| {
+                let [a, b] = mesh.edge_vertices(e);
+                let far = if a == verts[hub] { b } else { a };
+                verts
+                    .iter()
+                    .position(|&v| v == far)
+                    .expect("a disk edge whose far endpoint is not in the table")
+            })
+            .collect()
+    }
+
+    fn edge_between(mesh: &LoopMesh, verts: &[VertexKey], a: usize, b: usize) -> EdgeKey {
+        mesh.query_edge_exists(verts[a], verts[b]).expect("edge")
+    }
+
+    /// §6.5's disk **append** rule: the anchor is the first-attached edge and the
+    /// forward walk is attachment order. `book(4)` mints closing-edge-first, so
+    /// vert 0 gains `{0,2}` then `{0,1}` (face 0), then `{0,3} {0,4} {0,5}`.
+    ///
+    /// Falsifies "the anchor is the last-attached edge" (which would read
+    /// `5 2 1 3 4`) and "the anchor is the face's leading perimeter edge" (`{0,1}`,
+    /// reading `1 3 4 5 2`).
+    #[test]
+    fn disk_anchor_is_first_attached_and_the_walk_is_attachment_order() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_book(&mut mesh, 4);
+        mesh.validate_topology();
+
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[0]),
+            Some(edge_between(&mesh, &verts, 0, 2))
+        );
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 0), vec![2, 1, 3, 4, 5]);
+        // Vert 1's own anchor is the spine — the anchor is per-vertex-local, not a
+        // property of the edge or the face.
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[1]),
+            Some(edge_between(&mesh, &verts, 0, 1))
+        );
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 1), vec![0, 2, 3, 4, 5]);
+    }
+
+    /// The half of the append rule that separates the disk from the radial: a
+    /// fresh attachment lands at the **back** of the walk and does **not** drag
+    /// the anchor with it. (The radial's append does the opposite.)
+    #[test]
+    fn disk_append_does_not_drag_the_anchor() {
+        let mut mesh = LoopMesh::new();
+        let mut verts = build_book(&mut mesh, 4);
+        let anchor_before = mesh.vert_disk_anchor(verts[0]).expect("degree 5");
+
+        let tip = mesh.create_vertex(Vec3::new(9.0, 1.0, 0.0));
+        verts.push(tip);
+        let wire = mesh.create_edge([verts[0], tip], EdgeCreateFlags::NONE);
+        mesh.validate_topology();
+
+        assert_eq!(mesh.vert_disk_anchor(verts[0]), Some(anchor_before));
+        assert_eq!(
+            disk_far_endpoints(&mesh, &verts, 0),
+            vec![2, 1, 3, 4, 5, 6],
+            "the new edge lands at the back of the walk, not at its head"
+        );
+        assert_ne!(anchor_before, wire);
+    }
+
+    /// §6.5's disk **removal** rule, discriminating arm: killing the anchor edge
+    /// re-seats the anchor **forward**, onto its disk successor. At degree 5 the
+    /// walk becomes the pristine walk minus the killed edge — nothing rotates.
+    ///
+    /// A backwards re-seat (onto `{0,5}`), or "re-seat onto the last-attached
+    /// survivor", would both read `5 1 3 4`. Both are invisible below degree 3.
+    #[test]
+    fn disk_anchor_reseats_forward_onto_the_successor_when_the_anchor_is_killed() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_book(&mut mesh, 4);
+        let anchor = edge_between(&mesh, &verts, 0, 2);
+        assert_eq!(mesh.vert_disk_anchor(verts[0]), Some(anchor));
+
+        mesh.edge_kill(anchor);
+        mesh.validate_topology();
+
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[0]),
+            Some(edge_between(&mesh, &verts, 0, 1)),
+            "forward, onto the killed anchor's disk successor"
+        );
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 0), vec![1, 3, 4, 5]);
+    }
+
+    /// The contrast pin: killing a **non-anchor** edge moves nothing. Without it,
+    /// an implementation that re-seats on *every* removal still passes the arm
+    /// above.
+    #[test]
+    fn disk_anchor_is_unmoved_when_a_non_anchor_edge_is_killed() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_book(&mut mesh, 4);
+        let anchor = edge_between(&mesh, &verts, 0, 2);
+
+        mesh.edge_kill(edge_between(&mesh, &verts, 0, 3));
+        mesh.validate_topology();
+
+        assert_eq!(mesh.vert_disk_anchor(verts[0]), Some(anchor));
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 0), vec![2, 1, 4, 5]);
+    }
+
+    /// §6.5's disk **invariant**, unrolled: successive anchor kills walk the anchor
+    /// along the attachment order, so it is always the *earliest-attached surviving*
+    /// edge — never "pinned to the first-attached edge and nulled when it dies".
+    #[test]
+    fn disk_anchor_walks_forward_through_successive_anchor_kills() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_book(&mut mesh, 4);
+
+        mesh.edge_kill(edge_between(&mesh, &verts, 0, 2));
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[0]),
+            Some(edge_between(&mesh, &verts, 0, 1))
+        );
+        mesh.edge_kill(edge_between(&mesh, &verts, 0, 1));
+        mesh.validate_topology();
+
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[0]),
+            Some(edge_between(&mesh, &verts, 0, 3))
+        );
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 0), vec![3, 4, 5]);
+    }
+
+    /// The degenerate end of the rule: the vertex's **last** incident edge leaves
+    /// it isolated, with the anchor cleared rather than dangling at a freed edge.
+    #[test]
+    fn disk_anchor_is_cleared_when_the_last_incident_edge_is_killed() {
+        let mut mesh = LoopMesh::new();
+        let verts = build_book(&mut mesh, 1);
+        assert_eq!(disk_far_endpoints(&mesh, &verts, 0), vec![2, 1]);
+
+        mesh.edge_kill(edge_between(&mesh, &verts, 0, 2));
+        assert_eq!(
+            mesh.vert_disk_anchor(verts[0]),
+            Some(edge_between(&mesh, &verts, 0, 1))
+        );
+        mesh.edge_kill(edge_between(&mesh, &verts, 0, 1));
+        mesh.validate_topology();
+
+        assert_eq!(mesh.vert_disk_anchor(verts[0]), None);
+        assert!(disk_far_endpoints(&mesh, &verts, 0).is_empty());
     }
 }

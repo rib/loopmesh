@@ -395,6 +395,24 @@ impl LoopMesh {
         Some(self.loop_radial_prev(head))
     }
 
+    /// `vertex`'s **disk anchor** — the edge every disk traversal starts at
+    /// ([`RADIAL_EDGE_STRUCTURE.md`](../../../radial-mesh-guides/RADIAL_EDGE_STRUCTURE.md)
+    /// §6.5), and the seed of the fan read (§6.5) and of `vertex_separate`'s fan
+    /// drain (§8.7). `None` for an isolated vertex.
+    ///
+    /// Unlike the radial entry, the disk's stored pointer *is* the anchor: an
+    /// append splices the new edge in just **before** it and leaves it alone,
+    /// while a removal re-seats it **forward** onto the removed edge's disk
+    /// successor, and only when the removed edge *was* the anchor. Those two
+    /// rules give the standing invariant the radial has no counterpart for — the
+    /// anchor is always the **earliest-attached surviving** incident edge, and
+    /// [`LoopMesh::iter_disk_edges`] (which walks forward from here) yields
+    /// attachment order restricted to the survivors, on a mutated mesh as much as
+    /// on a pristine one.
+    pub fn vert_disk_anchor(&self, vertex: VertexKey) -> Option<EdgeKey> {
+        self.vertices.get(vertex).disk_loop_start
+    }
+
     pub fn vertex_disk_print_links(&self, vertex: VertexKey) {
         let v = &self.vertices.get(vertex);
         let start = v.disk_loop_start;
