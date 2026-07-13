@@ -583,6 +583,12 @@ struct FaceRecord {
     /// splits leave it intact, and it is on the ring iff the ring is still the
     /// one the pattern was matched against.
     anchor: VertexKey,
+    /// §7.1 — the fallback's dropped-connect verdict: do this face's two cut
+    /// edges have a **second common face**? Decided here, on the *input*
+    /// topology, and uniform across the face's `N` connects by construction
+    /// (they all sit on the same two cut edges). Always `false` when the face is
+    /// not a two-cut face, which is the only kind that can read it.
+    strip_connects_dropped: bool,
 }
 
 impl FaceRecord {
@@ -591,6 +597,24 @@ impl FaceRecord {
     fn expected_len(&self, cuts: u32) -> usize {
         self.pre_len + cuts as usize * self.cut_count
     }
+}
+
+/// §7.0.3 — what the abandonment gate needs to know about a re-derived rim,
+/// read in one walk without decomposing it into the §9.5 lattice's sides.
+struct RimCensus {
+    corner_count: usize,
+    run_count: usize,
+    /// Every cut-vert run is exactly `cuts` long.
+    runs_uniform: bool,
+    has_anchor: bool,
+}
+
+/// §7.1 — a two-cut face's rim, read as the strip sees it: the two cut-vert runs
+/// in loop order, and whether the sides carrying them share a corner.
+struct TwoCutRuns {
+    run_a: SmallVec<[VertexKey; 4]>,
+    run_b: SmallVec<[VertexKey; 4]>,
+    adjacent: bool,
 }
 
 impl LoopMesh {
@@ -1035,12 +1059,24 @@ impl LoopMesh {
                 continue;
             }
 
+            // §7.1 — the dropped-connect precondition, decided here for the same
+            // reason as the §4.3.1 guard beside it: it is a function of the
+            // *input topology*, and only pass one still sees that topology. Both
+            // of the face's cut edges are still whole edges now (from `cuts = 2`
+            // up they are not, by apply time), and asking the live mesh at apply
+            // time asks a different question — an earlier-applied face's
+            // fragments carry cut verts too, so a face that shares both cut edges
+            // can be re-split out of the answer before the fallback gets its turn.
+            let strip_connects_dropped = cut_edges.len() == 2
+                && self.cut_edges_have_a_second_common_face(face, cut_edges[0], cut_edges[1]);
+
             geom.record_resplit_face(face);
             records.push(FaceRecord {
                 face,
                 pre_len,
                 cut_count: cut_edges.len(),
                 anchor,
+                strip_connects_dropped,
             });
         }
 
@@ -1097,10 +1133,6 @@ impl LoopMesh {
         if self.face_len(face) != record.expected_len(1) {
             return;
         }
-
-        // §4.3.1 — the guard's verdict, decided on the input geometry before the
-        // cuts landed. Consulted only on the fallback rows below.
-        let flat_corner = self.face_op_flag_test(guard_layer, face, FLAT_CORNER);
 
         // §7.0.3 — the pair list is re-derived here, from the ring that exists at
         // *this* moment, never snapshotted once the cuts are in. Walk the loop
@@ -1162,19 +1194,6 @@ impl LoopMesh {
                     self.tri_one_cut(&ring);
                 }
             }
-            (3, 2) => {
-                // §6.2 — triangle, two edges cut. A single shared-corner cut
-                // peels a small triangle and leaves a quad. No gating flag — it
-                // is neither a one-cut nor an all-cut case — but it is a §4.1
-                // *fallback* row (the two-edge strip wearing a template's
-                // clothes), so the §4.3.1 guard applies. Its two cut edges
-                // always share a corner, so the guard is genuinely reachable
-                // here: a degenerate triangle whose two cut edges are collinear
-                // at that corner is left flat.
-                if !flat_corner {
-                    self.tri_two_cut(face, &ring);
-                }
-            }
             (3, 3) => {
                 if params.use_grid_fill {
                     self.tri_three_cut(&ring, geom);
@@ -1196,38 +1215,43 @@ impl LoopMesh {
                     self.quad_four_cut(face, &ring, layer, params, geom);
                 }
             }
-            (4, 2) if Self::quad_two_cut_is_opposite(&ring) => {
-                // §5.2 opposite case — the straight loop cut. This is a §4.1
-                // fallback row too, so the §4.3.1 guard formally covers it and no
-                // gating flag or strategy choice can decline it — but the guard
-                // can never trip: it needs the two cut edges to *share a vertex*,
-                // and opposite quad edges never do. The check is therefore
-                // vacuous here and left out rather than written as dead code.
-                self.quad_two_opposite_cut(face, &ring);
-            }
-            (4, 2) => {
-                // §5.2 adjacent case. The strategy chooses the interior
-                // geometry laid down once the two rim midpoints exist; all four
-                // share the §5.2.1 shared-corner anchor and far corner `v3`.
-                //
-                // STRAIGHT_CUT is the *absence* of a corner template, so it is
-                // the fallback and the §4.3.1 flat-corner guard bites it. The
-                // three real templates re-split even across a straight corner.
+            // §5.2 adjacent case, non-default strategy — the only two-cut row a
+            // *template* claims. The strategy chooses the interior geometry laid
+            // down once the two rim midpoints exist; all three share the §5.2.1
+            // shared-corner anchor and far corner `v3`, and none of them is
+            // guarded (§4.3.1 bites the fallback only). `STRAIGHT_CUT` is the
+            // *absence* of a corner template, so it drops through to the strip.
+            (4, 2)
+                if params.quad_corner_type != QuadCornerType::StraightCut
+                    && Self::cut_runs_are_adjacent(&ring) =>
+            {
                 match params.quad_corner_type {
-                    QuadCornerType::StraightCut => {
-                        if !flat_corner {
-                            self.quad_two_adjacent_straight_cut(face, &ring)
-                        }
-                    }
                     QuadCornerType::InnerVert => {
                         self.quad_two_adjacent_inner_vert(&ring, layer, params, geom)
                     }
                     QuadCornerType::Path => self.quad_two_adjacent_path(&ring),
                     QuadCornerType::Fan => self.quad_two_adjacent_fan(&ring),
+                    QuadCornerType::StraightCut => unreachable!("guarded by the match arm"),
                 }
             }
-            // The n-gon generic two-edge strip (§7.1) and the wider fallback rows
-            // are out of the core's pinned scope (§4.3); leave the face flat.
+            // §4.3 / §7.1 — every other two-cut face, whatever its size, is the
+            // generic strip's: the two-opposite-edge quad, the `STRAIGHT_CUT`
+            // two-adjacent quad, the two-edge triangle, the two-edge n-gon.
+            //
+            // §4.3.1 is enforced upstream, in the dispatch scan, which refuses to
+            // *record* a flat-cornered face no template claimed — so a guarded
+            // face never reaches pass three at all (and carries no re-split mark).
+            (_, 2) => {
+                debug_assert!(
+                    !self.face_op_flag_test(guard_layer, face, FLAT_CORNER),
+                    "a guarded template-less face is never recorded (§4.3.1)"
+                );
+                self.two_edge_strip(face, &ring, record.strip_connects_dropped, geom);
+            }
+            // §4.3 — the fallback is *not* a catch-all. A template-less face with
+            // any other cut count (a one-cut or three-cut n-gon, say) is never
+            // re-split: it keeps its rim cut verts as flat corners and stays one
+            // larger n-gon.
             _ => {}
         }
     }
@@ -1320,14 +1344,13 @@ impl LoopMesh {
     ///   larger carrier holds the pair on a perfectly good diagonal. Re-targeting
     ///   would lay an edge the operator does not lay.
     ///
-    /// The §7.1 two-edge fallback rows (`tri_two_cut`, `quad_two_opposite_cut`,
-    /// `quad_two_adjacent_straight_cut`) deliberately do **not** use this
-    /// primitive — they split the parent face handle directly. §7.1 also carries
-    /// its own, stricter precondition (two cut edges with a *second* common face
-    /// drop all of the fallback's connects); that one is **not** checked here, and
-    /// enforcing it is still an open matrix row. Until it lands, a fallback face
-    /// can split where §7.1 would have left it whole — which is also how a
-    /// template's carrier ends up seeing fragments §7.1 would never have minted.
+    /// The §7.1 two-edge fallback deliberately does **not** use this primitive —
+    /// it splits the parent face handle directly, and it substitutes its own,
+    /// stricter precondition (two cut edges with a *second* common face drop all
+    /// `N` of its connects) for the no-op rules above. That precondition is
+    /// **not** checked here: a template connect targeted at a pair two faces both
+    /// carry is resolved by the fewest-corners heuristic, which guesses where the
+    /// fallback declines.
     fn template_connect(&mut self, a: VertexKey, b: VertexKey) -> Option<(FaceKey, EdgeKey)> {
         let target = self.smallest_face_with_both(a, b)?;
         self.face_split(target, a, b)
@@ -1346,40 +1369,187 @@ impl LoopMesh {
         self.template_connect(m, apex);
     }
 
-    /// §6.2 — triangle, two edges cut. The two cut edges share corner `v1`
-    /// (`{v0,v1}` and `{v1,v2}`), midpoints `m01` and `m12`. After the §3
-    /// insertion the loop cycle is a pentagon `v0, m01, v1, m12, v2`. A single
-    /// face-split connects `m01` → `m12`, carving the shared corner off as a
-    /// small triangle `{m01, v1, m12}` and leaving a quad `{v0, m01, m12, v2}`.
-    /// 1 tri -> 2 fragments (1 triangle + 1 quad).
-    fn tri_two_cut(&mut self, face: FaceKey, ring: &[(VertexKey, bool)]) {
-        // The two midpoints are the only two cut corners and always sit two
-        // apart in the five-corner ring (the shared corner v1 between them).
-        let n = ring.len(); // 5
-        let mids: SmallVec<[usize; 2]> = ring
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, m))| *m)
-            .map(|(i, _)| i)
-            .collect();
-        debug_assert_eq!(mids.len(), 2, "two-cut tri has exactly two midpoints");
-        // Start at the midpoint that has the other exactly two corners ahead,
-        // so v1 (the shared corner) sits between them on the forward arc.
-        let start = if (mids[1] - mids[0]) == 2 {
-            mids[0]
-        } else {
-            mids[1]
-        };
-        let m01 = ring[start].0;
-        let m12 = ring[(start + 2) % n].0;
-        debug_assert!(
-            !ring[(start + 1) % n].1,
-            "shared corner is original, not a midpoint"
-        );
+    /// §7.1 / §9.5.3.3 — **the** generic two-edge strip: the operator's one and
+    /// only fallback, for every template-less face with exactly two cut edges, at
+    /// every face size and every `cuts`. Its `cuts = 1` instances are the cases
+    /// §5.2 (two-opposite quad), §5.2.1 (`STRAIGHT_CUT` two-adjacent quad) and
+    /// §6.2 (two-edge triangle) describe — three sightings of this one path, not
+    /// three templates.
+    ///
+    /// `rim` is the face's post-cut loop cycle as `(vert, is_pass_two_cut_vert)`.
+    /// Its cut verts form two contiguous runs, `a_1..a_N` (the one that comes
+    /// first in loop order, reading from an original corner) and `b_1..b_N`. The
+    /// runs face each other *antiparallel* around the rim, so they zip
+    /// **outside-in** — `a_i` with `b_{N+1-i}` — for `N` connects that do not
+    /// cross, and hence exactly `N + 1` fragments for every `N` and every face
+    /// size. No hub, no median tie-break, no odd/even asymmetry (contrast
+    /// §9.5.3.1's fan).
+    ///
+    /// Every connect is a split of the **parent face handle itself** — the
+    /// fallback deliberately does *not* go through the §7.0 fewest-corners
+    /// carrier search, which ranges over the whole mesh and would substitute a
+    /// neighbour's fragment for the parent (§7.1). That is sound because the
+    /// outside-in pairing leaves the parent holding the *inner band* after each
+    /// split: the split retains the input face on the `l_a -> l_b` side
+    /// (RADIAL_EDGE_STRUCTURE.md §8.3) and `a_i` is issued as `l_a`, so the side
+    /// the parent keeps is the one still carrying every remaining pair. Swap the
+    /// two arguments and the parent keeps the outer band, where the remaining
+    /// pairs are not.
+    ///
+    /// Caller obligations, all settled before the call: the §4.3.1 flat-corner
+    /// guard, the §7.0.3 abandonment gate, the dispatch that establishes this
+    /// face is template-less with `cut_count = 2`, and `connects_dropped` — the
+    /// §7.1 precondition, which pass one decided on the input topology
+    /// ([`Self::cut_edges_have_a_second_common_face`]). The precondition is the
+    /// fallback's own substitute for §7.0's no-op-when-absent rule, and it takes
+    /// **all `N`** connects or none: every candidate pair has one endpoint on
+    /// each of the same two cut edges, so it cannot differ between the pairs, and
+    /// a partially stripped face is not a reachable outcome of the rule.
+    fn two_edge_strip(
+        &mut self,
+        face: FaceKey,
+        rim: &[(VertexKey, bool)],
+        connects_dropped: bool,
+        geom: &mut SubdivideGeom,
+    ) {
+        if connects_dropped {
+            return;
+        }
 
-        // §1 / §6.2 Output-slot note: the corner cut and the two fragments are
-        // *not* inner; only the two rim midpoints (recorded in §3) are.
-        self.face_split(face, m01, m12);
+        let Some(runs) = Self::two_cut_runs(rim) else {
+            debug_assert!(false, "the strip fires only on a face with two cut-vert runs");
+            return;
+        };
+        debug_assert_eq!(
+            runs.run_a.len(),
+            runs.run_b.len(),
+            "both cut edges carry the same number of cut verts"
+        );
+        let n = runs.run_a.len();
+
+        for i in 0..n {
+            let (cut_vert_a, cut_vert_b) = (runs.run_a[i], runs.run_b[n - 1 - i]);
+            let Some((_fragment, connect)) = self.face_split(face, cut_vert_a, cut_vert_b) else {
+                // Not a documented no-op on this path (contrast `template_connect`,
+                // §7.0.2): the parent keeps the inner band, on which every
+                // remaining pair is a diagonal. A refusal here means the retention
+                // convention or the argument order broke, and the face would come
+                // out partially stripped — an outcome §7.1 says is unreachable.
+                debug_assert!(false, "the parent's inner band holds every remaining pair non-adjacent");
+                return;
+            };
+            // §1 rule 3 / §7.1 / §9.5.3.3 Output-slot note: the strip is the
+            // one non-grid path that marks a connecting *edge* inner. Its
+            // fragment faces are not inner, and the face's re-split mark was
+            // stamped once, by the dispatch scan. So a lone two-cut face
+            // yields geom_inner.out = {2N verts, N edges, 0 faces}.
+            geom.record_inner_edge(connect);
+        }
+    }
+
+    /// §7.1 — the fallback's dropped-connect precondition, in the reduced form the
+    /// guide derives. A connect is laid only when its endpoints are corners of **no
+    /// face other than** the one being re-split; a cut vert of edge `e` is a corner
+    /// of exactly the faces in `e`'s radial cycle, so on the pre-cut mesh the whole
+    /// question is: *do the face's two cut edges have a common face other than this
+    /// one?* One answer settles all `N` of the face's connects, because their
+    /// endpoints always sit on those same two edges.
+    ///
+    /// The reduction is a statement about the **input topology**, which is why it
+    /// is asked in pass one and not from the strip. The two forms agree only until
+    /// pass three starts cutting: from then on an earlier-applied face's fragments
+    /// carry cut verts of their own, and a neighbour that shares both cut edges can
+    /// have re-split itself out of any single fragment holding the pair — the live
+    /// query would then say "lay it" where the reduction says "drop it".
+    ///
+    /// Two faces sharing two edges is manifold-legal (the valence-2 pillow corner),
+    /// and both of them drop: the rule is deliberately not a tiebreak, so a pair
+    /// neither face can claim unambiguously is claimed by neither. The §7.0 carrier
+    /// search *does* guess in the same situation — which is exactly why the
+    /// fallback must not be routed through it.
+    fn cut_edges_have_a_second_common_face(
+        &self,
+        face: FaceKey,
+        cut_edge_a: EdgeKey,
+        cut_edge_b: EdgeKey,
+    ) -> bool {
+        let mut radial_a = self.radial_loops(cut_edge_a);
+        while let Some(loop_a) = radial_a.next(self) {
+            let candidate = self.loops.get(loop_a).face;
+            if candidate == face {
+                continue;
+            }
+            let mut radial_b = self.radial_loops(cut_edge_b);
+            while let Some(loop_b) = radial_b.next(self) {
+                if self.loops.get(loop_b).face == candidate {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Locate the two contiguous cut-vert runs of a two-cut face on its post-cut
+    /// `rim`, in loop order from an original corner, and report whether the two
+    /// runs are **adjacent** — separated by a single corner on one side, i.e. the
+    /// two cut edges share it.
+    ///
+    /// `None` when the rim carries anything other than exactly two runs (an
+    /// all-cut-vert ring has no corner to root at, and a ring pass three has
+    /// carved may hold any number of runs — §7.0.3's abandonment gate is what
+    /// decides such a face, so this is not an invariant to assert on).
+    fn two_cut_runs(rim: &[(VertexKey, bool)]) -> Option<TwoCutRuns> {
+        let n = rim.len();
+        let start = rim.iter().position(|(_, is_cut)| !*is_cut)?;
+
+        let mut runs: SmallVec<[SmallVec<[VertexKey; 4]>; 2]> = SmallVec::new();
+        let mut corners = 0usize;
+        let mut corners_between = 0usize;
+        let mut in_run = false;
+        for i in 0..n {
+            let (vert, is_cut) = rim[(start + i) % n];
+            if is_cut {
+                if !in_run {
+                    if runs.len() == 2 {
+                        return None;
+                    }
+                    runs.push(SmallVec::new());
+                    in_run = true;
+                }
+                let last = runs.len() - 1;
+                runs[last].push(vert);
+            } else {
+                in_run = false;
+                corners += 1;
+                // The rim is rooted at a corner, so a corner counted while exactly
+                // one run is open lies strictly between the two runs.
+                if runs.len() == 1 {
+                    corners_between += 1;
+                }
+            }
+        }
+        if runs.len() != 2 {
+            return None;
+        }
+
+        let run_b = runs.pop().expect("two runs");
+        let run_a = runs.pop().expect("two runs");
+        let adjacent = corners_between == 1 || corners - corners_between == 1;
+        Some(TwoCutRuns {
+            run_a,
+            run_b,
+            adjacent,
+        })
+    }
+
+    /// §5.2 / §5.2.1 / §6.2 — are the face's two cut runs on **adjacent** sides
+    /// (sharing a corner between them)? The two-cut quad's ambiguous row is the
+    /// only place this matters: the `quad_corner_type` templates claim the
+    /// adjacent case, while the opposite case is always the §7.1 fallback. Both
+    /// dispatchers ask it in this one spelling — on a `(4, 2)` face "adjacent" and
+    /// "not opposite" are the same question.
+    fn cut_runs_are_adjacent(rim: &[(VertexKey, bool)]) -> bool {
+        Self::two_cut_runs(rim).is_some_and(|runs| runs.adjacent)
     }
 
     /// §6.3 — triangle, three edges cut. Cycle is `v0, m01, v1, m12, v2, m20`;
@@ -1442,78 +1612,6 @@ impl LoopMesh {
     /// loop-cut case) or two apart on the short side (the §5.2 *adjacent*
     /// corner-cut case). The cut edges share a quad corner iff their midpoints
     /// are *not* diametrically opposite in the ring.
-    fn quad_two_cut_is_opposite(ring: &[(VertexKey, bool)]) -> bool {
-        let n = ring.len(); // 6 for a two-cut quad
-        let mids: SmallVec<[usize; 2]> = ring
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, m))| *m)
-            .map(|(i, _)| i)
-            .collect();
-        debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
-        let gap = mids[1] - mids[0];
-        gap == n / 2
-    }
-
-    /// §5.2 opposite case — the straight loop cut. The two cut edges are
-    /// opposite (`{v0,v1}` and `{v2,v3}`), midpoints `m01` and `m23`. After the
-    /// §3 insertion the loop cycle is `v0, m01, v1, v2, m23, v3`; connect the
-    /// two midpoints straight across, splitting the quad into two quads. No
-    /// inner vert, no strategy choice. 1 quad -> 2 quads.
-    fn quad_two_opposite_cut(&mut self, face: FaceKey, ring: &[(VertexKey, bool)]) {
-        let (v, _) = Self::rotate_to_first_midpoint(ring);
-        // v = [m01, v1, v2, m23, v3, v0]; the two opposite midpoints are v[0]
-        // and v[3] (diametrically opposite in the six-corner ring).
-        let (m01, m23) = (v[0], v[3]);
-        // §1 / §5.2 Output-slot note: the loop-cut connecting edge and the two
-        // fragments are *not* inner; only the two rim midpoints (recorded in §3)
-        // are.
-        self.face_split(face, m01, m23);
-    }
-
-    /// §5.2.1 — quad, two **adjacent** edges cut, default `STRAIGHT_CUT`. The
-    /// two cut edges share corner `v1` (`{v0,v1}` and `{v1,v2}`), midpoints
-    /// `m01` and `m12`. After the §3 insertion the loop cycle is a hexagon
-    /// `v0, m01, v1, m12, v2, v3` with `m01` and `m12` two corners apart on the
-    /// short arc and `v1` sitting between them. A single face-split connects
-    /// `m01` → `m12`, carving the shared corner off as a triangle `{m01, v1,
-    /// m12}` and leaving a pentagon `{v0, m01, m12, v2, v3}`. No inner vert.
-    /// 1 quad -> 2 fragments (1 triangle + 1 pentagon).
-    fn quad_two_adjacent_straight_cut(&mut self, face: FaceKey, ring: &[(VertexKey, bool)]) {
-        // Rotate so the start corner is the midpoint that opens the short arc:
-        // the one whose loop successor is the shared corner v1, with the second
-        // midpoint two corners further on. The two midpoints sit two apart on
-        // one side of the six-corner ring; pick the start so v[2] is the other
-        // midpoint (i.e. the two-corner gap runs forward from the start).
-        let n = ring.len(); // 6
-        let mids: SmallVec<[usize; 2]> = ring
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, m))| *m)
-            .map(|(i, _)| i)
-            .collect();
-        debug_assert_eq!(mids.len(), 2, "two-cut quad has exactly two midpoints");
-        // Forward gap from mids[0] to mids[1]; the start is whichever midpoint
-        // has the other exactly two corners ahead of it.
-        let start = if (mids[1] - mids[0]) == 2 {
-            mids[0]
-        } else {
-            mids[1]
-        };
-
-        let m01 = ring[start].0;
-        let m12 = ring[(start + 2) % n].0;
-        debug_assert!(
-            ring[(start + 1) % n].0 != m01,
-            "shared corner between midpoints"
-        );
-
-        // m01 -> m12 carves the corner triangle off the hexagon. §1 / §5.2
-        // Output-slot note: the corner cut and the two fragments are *not*
-        // inner; only the two rim midpoints (recorded in §3) are.
-        self.face_split(face, m01, m12);
-    }
-
     /// Anchor the §5.2 adjacent two-cut quad against its shared corner. The
     /// post-§3 hexagon ring reads `v0, m01, v1, m12, v2, v3` from some start;
     /// rotate so the start corner is the rim midpoint `m01` whose loop successor
@@ -1915,28 +2013,20 @@ impl LoopMesh {
         SubdivideResult::Ran(geom)
     }
 
-    /// Decompose a touched face's post-§3.3 loop cycle into its original
-    /// corners and, for each side, the ordered midpoint run between consecutive
-    /// corners (in face-traversal order). A side with an empty run was not cut.
+    /// Decompose a touched face's post-§3.3 rim — `(vert, is_cut_vert)` in loop
+    /// order — into its original corners and, for each side, the ordered midpoint
+    /// run between consecutive corners (in face-traversal order). A side with an
+    /// empty run was not cut. The §9.5 lattice patterns index these; the §7.1
+    /// strip does not (it reads its two runs off the rim directly).
     ///
     /// `None` for an all-midpoint ring, which has no corner to rotate to. That is
     /// not an invariant to assert on: pass three's own surgery can leave a face
     /// with a ring the dispatcher never saw (§7.0.3), and the abandonment gate —
     /// which consumes this decomposition — is what decides such a face lays
     /// nothing. Panicking here would turn a specified no-op into a crash.
-    fn multicut_corners_and_sides(
-        &self,
-        face: FaceKey,
-        layer: crate::op_flags::VertOpFlagLayer,
+    fn corners_and_sides(
+        rim: &[(VertexKey, bool)],
     ) -> Option<(Vec<VertexKey>, Vec<Vec<VertexKey>>)> {
-        let mut rim: Vec<(VertexKey, bool)> = Vec::new();
-        let mut it = self.face_loops(face);
-        while let Some(l) = it.next(self) {
-            let v = self.loops.get(l).vertex;
-            let is_mid = self.vert_op_flag_test(layer, v, MIDPOINT);
-            rim.push((v, is_mid));
-        }
-
         // Rotate so the rim starts at an original corner.
         let start = rim.iter().position(|(_, m)| !*m)?;
         let n = rim.len();
@@ -1959,6 +2049,51 @@ impl LoopMesh {
         sides.push(std::mem::take(&mut current_run));
         debug_assert_eq!(sides.len(), corners.len());
         Some((corners, sides))
+    }
+
+    /// §7.0.3 — the abandonment gate's reading of a re-derived rim, taken in one
+    /// allocation-free walk rooted at an original corner: how many original
+    /// corners the ring carries, how many contiguous cut-vert runs, whether every
+    /// run is exactly `cuts` long, and whether the recorded anchor is still a
+    /// corner.
+    ///
+    /// `None` for an all-cut-vert ring — no corner to root at. That is not an
+    /// invariant to assert on: pass three's own surgery can leave a face with a
+    /// ring the dispatcher never saw, and the gate is what decides such a face
+    /// lays nothing.
+    fn rim_census(rim: &[(VertexKey, bool)], anchor: VertexKey, cuts: usize) -> Option<RimCensus> {
+        let n = rim.len();
+        let start = rim.iter().position(|(_, is_cut)| !*is_cut)?;
+
+        let mut census = RimCensus {
+            corner_count: 0,
+            run_count: 0,
+            runs_uniform: true,
+            has_anchor: false,
+        };
+        let mut run_len = 0usize;
+        for i in 0..n {
+            let (vert, is_cut) = rim[(start + i) % n];
+            if is_cut {
+                if run_len == 0 {
+                    census.run_count += 1;
+                }
+                run_len += 1;
+            } else {
+                if run_len != 0 {
+                    census.runs_uniform &= run_len == cuts;
+                    run_len = 0;
+                }
+                census.corner_count += 1;
+                census.has_anchor |= vert == anchor;
+            }
+        }
+        // Rooted at a corner, so a run still open here is the one that closes the
+        // cycle back to it.
+        if run_len != 0 {
+            census.runs_uniform &= run_len == cuts;
+        }
+        Some(census)
     }
 
     fn resplit_face_multicut(
@@ -1984,51 +2119,87 @@ impl LoopMesh {
             return;
         }
 
-        // §4.3.1 / §9.5.3.5 — the same verdict as at `cuts = 1`, and consulted on
-        // the same rows: the fallbacks only.
-        let flat_corner = self.face_op_flag_test(guard_layer, face, FLAT_CORNER);
-
-        let re_inflated = {
-            let mut found = false;
-            let mut it = self.face_loops(face);
-            while let Some(l) = it.next(self) {
-                let v = self.loops.get(l).vertex;
-                found |= self.vert_op_flag_test(layer, v, PASS_THREE_VERT);
-            }
-            found
-        };
+        let mut rim: SmallVec<[(VertexKey, bool); 12]> = SmallVec::new();
+        let mut re_inflated = false;
+        let mut it = self.face_loops(face);
+        while let Some(l) = it.next(self) {
+            let v = self.loops.get(l).vertex;
+            re_inflated |= self.vert_op_flag_test(layer, v, PASS_THREE_VERT);
+            rim.push((v, self.vert_op_flag_test(layer, v, MIDPOINT)));
+        }
         if re_inflated {
             return;
         }
 
-        let Some((corners, sides)) = self.multicut_corners_and_sides(face, layer) else {
-            return;
-        };
-        let corner_count = corners.len();
-        let cut_sides = sides.iter().filter(|s| !s.is_empty()).count();
-
         // §7.0.3's strict census: the cut verts must sit in exactly `cut_count`
         // contiguous runs of exactly `cuts`, on a ring of `pre_len` original
         // corners still carrying the recorded anchor. Anything else is a ring the
-        // pattern was never matched for.
-        if corner_count != record.pre_len
-            || cut_sides != record.cut_count
-            || !corners.contains(&record.anchor)
-            || sides
-                .iter()
-                .any(|run| !run.is_empty() && run.len() != cuts as usize)
+        // pattern was never matched for. It is read straight off the rim, so the
+        // strip — which reads its two runs off the rim as well — never pays for
+        // the §9.5 lattice decomposition it does not use.
+        //
+        // §7.1 exempts a *fallback* record from the anchor clause — it locates its
+        // runs on the re-derived ring, never by rotating to an anchor, so the
+        // anchor is not a thing it depends on. loopmesh keeps the clause on that
+        // path too (the record carries an anchor regardless): it is the strictly
+        // stronger test, and any ring it rejects has already lost a corner the
+        // scan saw, which the length and census clauses reject anyway.
+        let Some(census) = Self::rim_census(&rim, record.anchor, cuts as usize) else {
+            return;
+        };
+        if census.corner_count != record.pre_len
+            || census.run_count != record.cut_count
+            || !census.runs_uniform
+            || !census.has_anchor
         {
             return;
         }
 
         // §9.3 — `use_only_quads` gates the *pattern*, not the record (§4.4): the
         // face keeps its re-split mark and its rim cut verts, and stays flat.
-        if params.use_only_quads && corner_count != 4 {
+        if params.use_only_quads && census.corner_count != 4 {
             return;
         }
 
+        match (census.corner_count, census.run_count) {
+            // §5.2.2–§5.2.4 — the `quad_corner_type` templates claim the
+            // two-adjacent quad away from the fallback. Their multi-cut arms are
+            // their own parity row and are not implemented, so such a face stays
+            // flat rather than being handed to the strip, which is not its
+            // pattern. A template is never guarded (§4.3.1), hence no verdict here.
+            (4, 2)
+                if params.quad_corner_type != QuadCornerType::StraightCut
+                    && Self::cut_runs_are_adjacent(&rim) =>
+            {
+                return;
+            }
+            (_, 2) => {
+                // §9.5.3.3 / §7.1 — the generic two-edge strip at `cuts = N`, and
+                // the same code path as at `cuts = 1`: it is face-size agnostic
+                // and `N`-agnostic, zipping the two runs outside-in into `N`
+                // connects and `N + 1` fragments (or, when §7.1's precondition
+                // drops them, none at all and one fragment).
+                //
+                // §9.5.3.5 pins the guard as `cuts`-independent — it reads the
+                // *input* edge directions — so a face the dispatch scan refused to
+                // record at `cuts = 1` is refused at every `N`.
+                debug_assert!(
+                    !self.face_op_flag_test(guard_layer, face, FLAT_CORNER),
+                    "a guarded template-less face is never recorded (§4.3.1)"
+                );
+                self.two_edge_strip(face, &rim, record.strip_connects_dropped, geom);
+                return;
+            }
+            _ => {}
+        }
+
+        let Some((corners, sides)) = Self::corners_and_sides(&rim) else {
+            debug_assert!(false, "the census already found a corner to root at");
+            return;
+        };
+
         let n = cuts as usize;
-        match (corner_count, cut_sides) {
+        match (census.corner_count, census.run_count) {
             (4, 4) => {
                 if params.use_grid_fill {
                     self.quad_grid_fill(face, &corners, &sides, n, layer, params, geom);
@@ -2047,27 +2218,6 @@ impl LoopMesh {
             (3, 1) => {
                 if params.use_single_edge {
                     self.tri_one_edge_fan(&corners, &sides);
-                }
-            }
-            (_, 2) => {
-                // §9.5.3.3 / §7.1 — the fallback rows at `cuts = N`: the generic
-                // two-edge strip (two-opposite-edge quad, STRAIGHT_CUT
-                // two-adjacent quad, two-edge triangle, two-edge n-gon), which
-                // zips the two runs into N connects and N+1 fragments. The strip
-                // surgery is its own parity row and is not implemented yet, so
-                // both the guarded and the unguarded face come out flat today.
-                //
-                // The guard is wired now because it is *not* the strip's
-                // business: §9.5.3.5 pins it as `cuts`-independent, so a face it
-                // suppresses at `cuts = 1` must be suppressed at every N, and
-                // the strip must land already-guarded rather than laying connects
-                // across a straight corner.
-                //
-                // When the §5.2 `quad_corner_type` templates gain their multi-cut
-                // arms they belong *above* this row — a template is never guarded
-                // (§4.3).
-                if flat_corner {
-                    return;
                 }
             }
             // The three-edge quad template (§9.5.3.4) is still a gap, as is any
@@ -3811,29 +3961,76 @@ mod tests {
     }
 
     #[test]
-    fn quad_two_cut_opposite_discriminator() {
-        // Direct check of the opposite-vs-adjacent discriminator on the
-        // post-insertion six-corner ring. Opposite midpoints sit 3 apart;
-        // adjacent midpoints sit 2 apart.
-        let dummy = VertexKey::from_usize(0);
-        let opposite = [
-            (dummy, true),
-            (dummy, false),
-            (dummy, false),
-            (dummy, true),
-            (dummy, false),
-            (dummy, false),
-        ];
-        let adjacent = [
-            (dummy, true),
-            (dummy, false),
-            (dummy, true),
-            (dummy, false),
-            (dummy, false),
-            (dummy, false),
-        ];
-        assert!(LoopMesh::quad_two_cut_is_opposite(&opposite));
-        assert!(!LoopMesh::quad_two_cut_is_opposite(&adjacent));
+    fn cut_runs_adjacency_discriminator() {
+        // §5.2 / §7.1, white-box — the one predicate both dispatchers ask, on
+        // rims the two callers hand it. `v(i)` stands for a distinct corner and
+        // `m(i)` for a cut vert; the rim is `(vert, is_cut_vert)` in loop order.
+        let v = |i: usize| (VertexKey::from_usize(i), false);
+        let m = |i: usize| (VertexKey::from_usize(i), true);
+
+        // Two-cut quad at cuts = 1: adjacent midpoints sit 2 apart, opposite 3.
+        assert!(LoopMesh::cut_runs_are_adjacent(&[
+            v(0),
+            m(1),
+            v(2),
+            m(3),
+            v(4),
+            v(5)
+        ]));
+        assert!(!LoopMesh::cut_runs_are_adjacent(&[
+            v(0),
+            m(1),
+            v(2),
+            v(3),
+            m(4),
+            v(5)
+        ]));
+
+        // The same rim wound so the first run wraps the ring start — the
+        // predicate roots itself at an original corner, so it must not care.
+        assert!(LoopMesh::cut_runs_are_adjacent(&[
+            m(3),
+            v(4),
+            v(5),
+            v(0),
+            m(1),
+            v(2)
+        ]));
+
+        // Multi-cut runs, N = 2: the quad's two runs of two, adjacent (sharing
+        // corner v2) then opposite.
+        assert!(LoopMesh::cut_runs_are_adjacent(&[
+            v(0),
+            m(1),
+            m(2),
+            v(3),
+            m(4),
+            m(5),
+            v(6),
+            v(7)
+        ]));
+        assert!(!LoopMesh::cut_runs_are_adjacent(&[
+            v(0),
+            m(1),
+            m(2),
+            v(3),
+            v(4),
+            m(5),
+            m(6),
+            v(7)
+        ]));
+
+        // A pentagon's two cut runs, two corners apart on both arcs: neither
+        // side is adjacent, and the strip claims it either way.
+        assert!(!LoopMesh::cut_runs_are_adjacent(&[
+            v(0),
+            m(1),
+            v(2),
+            v(3),
+            m(4),
+            v(5),
+            v(6)
+        ]));
     }
 
     #[test]
@@ -5688,14 +5885,18 @@ mod tests {
     }
 
     #[test]
-    fn two_edge_fallback_splits_its_own_face_not_a_smaller_neighbour() {
-        // §7.1 — both faces of this pillow are two-edge fallback rows (§5.2.1 for
-        // the quad, §6.2 for the triangle) and both carry the same `m_ab - m_bc`
-        // pair. Whichever is re-split second faces a strictly smaller carrier: a
-        // fragment of the first. The fallback splits the parent face handle it was
-        // dispatched for, so each parent lays its own diagonal; routing these
-        // through the §7.0 fewest-corners primitive would drag the second cut into
-        // the first face's fragments instead.
+    fn two_edge_fallback_drops_all_its_connects_when_a_second_face_carries_the_pair() {
+        // §7.1's dropped-connect precondition, on its smallest witness. Both faces
+        // of this pillow are two-edge fallback rows (§5.2.1 for the quad, §6.2 for
+        // the triangle) and *both* cut edges bound both faces — so on either face,
+        // the endpoints of the candidate connect are corners of a face other than
+        // the one being re-split. Both faces therefore drop, symmetrically: the
+        // rule is not a tiebreak, and the mesh gains two rim midpoints and **not
+        // one connecting edge**. V 6 / E 7 / F 2.
+        //
+        // Skip the precondition and each parent splits itself instead (V 6 / E 9 /
+        // F 4) — which also mints small fragments that go on to win carrier
+        // contests they should never have entered (the two tests below).
         let (mut mesh, _corners, e_ab, e_bc) = quad_triangle_shared_two_edges();
 
         let geom = match mesh.subdivide_edges(&[e_ab, e_bc], SubdivideParams::default()) {
@@ -5703,36 +5904,57 @@ mod tests {
             _ => panic!("subdivide ran"),
         };
 
-        assert_eq!(
-            counts(&mesh),
-            (6, 9, 4),
-            "both parents split, each laying its own diagonal"
+        assert_eq!(counts(&mesh), (6, 7, 2), "two rim midpoints, no connect");
+
+        let (m_ab, m_bc) = (geom.verts[0], geom.verts[1]);
+        assert!(
+            mesh.query_edge_exists(m_ab, m_bc).is_none(),
+            "neither face may claim the pair the other also carries"
         );
 
         let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
         shapes.sort_unstable();
         assert_eq!(
             shapes,
-            vec![3, 3, 4, 5],
-            "quad -> corner tri + pentagon; triangle -> corner tri + quad"
+            vec![5, 6],
+            "both parents keep their rings, cut verts flat on the rim"
         );
-
-        // The discriminator: two *distinct* edges span the midpoint pair, one
-        // interior to each parent. A §7.0-routed fallback would lay at most one.
-        let (m_ab, m_bc) = (geom.verts[0], geom.verts[1]);
-        let mut diagonals = 0;
-        let mut disk = mesh.disk_edges(m_ab);
-        while let Some(edge) = disk.next(&mesh) {
-            if mesh.edge_vert_keys(edge).contains(&m_bc) {
-                diagonals += 1;
-            }
-        }
-        assert_eq!(diagonals, 2, "each fallback cut its own face");
 
         assert_eq!(
             geom.faces.len(),
             2,
-            "geom.out: one re-split mark per parent, not per fragment"
+            "geom.out: both were recorded in pass one, and a drop revokes no mark"
+        );
+        assert_eq!(
+            geom.geom_inner().edges.len(),
+            0,
+            "a dropped connect is not laid, so it contributes to no slot"
+        );
+    }
+
+    #[test]
+    fn dropped_connect_precondition_holds_for_every_cut_at_higher_n() {
+        // §7.1 — the verdict is uniform across a face's `N` candidate pairs (they
+        // all have one endpoint on each of the same two cut edges), so a face lays
+        // all `N` connects or none. At `cuts = 3` on the quad/pentagon pillow that
+        // is 3 + 3 connects dropped: F stays 2, and a partially stripped face
+        // (which §7.1 says is unreachable) would show up as any other face count.
+        let (mut mesh, _corners, e_ab, e_bc) = quad_pentagon_shared_two_edges();
+
+        let geom = match mesh.subdivide_edges(&[e_ab, e_bc], SubdivideParams::default().cuts(3)) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(
+            counts(&mesh),
+            (6 + 6, 7 + 6, 2),
+            "six rim cut verts, both cut edges quartered, and no connect at all"
+        );
+        assert_eq!(
+            geom.geom_inner().edges.len(),
+            0,
+            "all-or-nothing: not one of the six candidate connects is laid"
         );
     }
 
@@ -5913,20 +6135,27 @@ mod tests {
     }
 
     #[test]
-    fn inner_vert_template_drops_its_corner_cut_onto_an_adjacent_holding_fragment() {
-        // §7.0.2 — the drop is not confined to a template's *last* connect. Cut
-        // both shared edges of the pillow under INNERVERT: the triangle (face 1,
-        // and so applied first, §7.0.3(a)) takes the §6.2 fallback and splits
-        // itself along `m_ab - m_bc`, minting the 3-ring {m_ab, b, m_bc}. The
-        // quad's INNERVERT template then nominates that same pair as its *first*
-        // connect — and the fewest-corners carrier is now that fresh 3-ring, which
-        // holds the two midpoints **adjacent**. Dropped.
+    fn dropped_connect_precondition_is_upstream_of_a_template_carrier_contest() {
+        // §7.1's box — the precondition reaches beyond the fallback's own fragment
+        // count. Cut both shared edges of the pillow under INNERVERT. The triangle
+        // (face 1, so applied first, §7.0.3(a)) is a §6.2 fallback and **drops**:
+        // its two cut edges have a second common face, the quad. It therefore
+        // stays a whole 5-ring, and mints no small fragments.
         //
-        // With no corner cut there is no edge to hang the inner vert `c` on, so
-        // the template lays nothing at all: no `c`, no spoke, and the quad stays a
-        // whole hexagon. Laying nothing is the documented outcome of a dropped
-        // connect, not an internal-invariant failure.
-        let (mut mesh, [_a, b, _c, _d], e_ab, e_bc) = quad_triangle_shared_two_edges();
+        // The quad's INNERVERT template then nominates the same `m_ab - m_bc` pair.
+        // §7.0.1's search is mesh-wide and adjacency-blind, so it takes the
+        // fewest-corners carrier — the untouched triangle (5 corners against the
+        // quad's own 6) — which holds the pair non-adjacent, on either side of `b`.
+        // The corner cut lands **in the neighbour**, `c` is born there, and the
+        // quad's own ring is never touched: its `c - v3` spoke has no carrier at
+        // all (nothing holds both `c` and `d`), so it is a §7.0.2 no-op and the
+        // quad comes out a whole hexagon. V 7 / E 9 / F 3.
+        //
+        // Had the triangle split itself, that same contest would have been decided
+        // by *its* 3-ring fragment instead — a different mesh. Which is exactly why
+        // §7.1 says to implement the precondition before chasing a carrier
+        // divergence: a missing precondition looks like a mis-targeted template.
+        let (mut mesh, [_a, b, _c, d], e_ab, e_bc) = quad_triangle_shared_two_edges();
 
         let geom = match mesh.subdivide_edges(
             &[e_ab, e_bc],
@@ -5938,35 +6167,47 @@ mod tests {
 
         assert_eq!(
             counts(&mesh),
-            (6, 8, 3),
-            "two midpoints, the triangle's own diagonal, and nothing from the quad"
+            (7, 9, 3),
+            "two rim midpoints plus `c`; the corner cut halved by `c`; the triangle split"
         );
 
         let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
         shapes.sort_unstable();
         assert_eq!(
             shapes,
-            vec![3, 4, 6],
-            "the quad is left whole as a hexagon; only the triangle's fragments are new"
+            vec![4, 5, 6],
+            "the quad stays a whole hexagon; the carved triangle is the corner quad + a 5-ring"
         );
 
-        assert!(
-            geom.inner_verts.iter().all(|&v| v != b) && geom.inner_verts.len() == 2,
-            "no inner vert: the dropped corner cut left nothing to split for `c`"
-        );
-
-        // The signature of a template that pressed on regardless: a second edge
-        // spanning the midpoint pair (a duplicate of the triangle's diagonal), or
-        // a 2-gon carved off the 3-ring.
+        // `c` was born on the corner cut, so no *direct* m_ab - m_bc edge survives,
+        // and `c` is a corner of the neighbour's fragments — never of the quad.
         let (m_ab, m_bc) = (geom.verts[0], geom.verts[1]);
-        let mut spans = 0;
-        let mut disk = mesh.disk_edges(m_ab);
-        while let Some(edge) = disk.next(&mesh) {
-            if mesh.edge_vert_keys(edge).contains(&m_bc) {
-                spans += 1;
-            }
-        }
-        assert_eq!(spans, 1, "one m_ab - m_bc edge, laid by the triangle");
+        assert!(
+            mesh.query_edge_exists(m_ab, m_bc).is_none(),
+            "the corner cut was split by `c`"
+        );
+        assert_eq!(
+            geom.inner_verts.len(),
+            3,
+            "two rim midpoints and the one inner vert `c`"
+        );
+        let c_inner = geom.inner_verts[2];
+        assert!(
+            mesh.query_edge_exists(c_inner, d).is_none(),
+            "the far-corner spoke has no carrier: no face holds both `c` and `v3`"
+        );
+
+        let hexagon = mesh
+            .face_keys()
+            .into_iter()
+            .find(|&f| mesh.face_len(f) == 6)
+            .expect("the quad survives as a hexagon");
+        let hexagon_verts = mesh.face_vert_keys(hexagon);
+        assert!(
+            hexagon_verts.contains(&b) && !hexagon_verts.contains(&c_inner),
+            "the template's own face was never carved: `c` is a corner of the neighbour's \
+             fragments alone"
+        );
 
         assert_eq!(
             geom.faces.len(),
@@ -6045,25 +6286,23 @@ mod tests {
     }
 
     #[test]
-    fn grid_fill_bar_dropped_onto_an_adjacent_holding_fragment() {
-        // §7.0.2 / §5.4 — the grid fill's *first* connect is exposed to the drop
-        // exactly as §5.2.2's corner cut is, and without the bar there is no
-        // centre vert and no grid: the template lays nothing.
+    fn grid_fill_bar_lands_in_the_neighbour_the_precondition_left_whole() {
+        // §7.1's box / §5.4 — the same lesson as the INNERVERT pillow, on the grid
+        // fill's *bar*. `A` (face 0) has all four edges cut and is a §5.4 grid
+        // fill. `B` (face 1) shares exactly two of those cut edges, opposite in its
+        // own ring, so it is a §5.2 fallback — and it **drops**: both its cut edges
+        // bound `A` as well. Applying first (pass three is reversed), it lays
+        // nothing and stays a whole 6-ring.
         //
-        // `A` (face 0) has all four edges cut, so it is a §5.4 grid fill nominating
-        // the bar `m01 - m23`. `B` (face 1) shares exactly those two cut edges,
-        // opposite in its own ring, so it takes the §5.2 loop-cut fallback and —
-        // applying first, pass three being reversed — lays a **direct** `m01 - m23`
-        // chord, splitting itself into two 4-rings that each hold the pair
-        // *adjacent*. When `A`'s bar is nominated, its fewest-corners carrier is
-        // one of those 4-rings (4 < A's own 8), the endpoints are consecutive
-        // there, and the split is refused: no edge, no 2-gon, and no retry on `A`
-        // itself — which holds the pair on a perfectly good diagonal.
-        //
-        // `A` therefore stays a whole octagon, keeps its re-split mark, and mints
-        // no centre vert. V 8 / E 11 / F 3.
+        // `A`'s bar `m01 - m23` then goes to the fewest-corners carrier, which is
+        // that intact 6-ring `B` (6 < A's own 8), and it holds the pair on a
+        // diagonal: the bar is laid **in the neighbour**, the centre vert `c` is
+        // born there, and `A`'s two remaining spokes have no carrier (nothing holds
+        // both `c` and `m12` / `m30`), so they are §7.0.2 no-ops. `A` therefore
+        // comes out a whole octagon with no grid at all. V 9 / E 12 / F 3.
         let (mut mesh, [v0, v1, v2, v3]) = quad_quad_shared_two_opposite_edges();
         let a = mesh.face_keys()[0];
+        let b = mesh.face_keys()[1];
         let edges = [
             mesh.query_edge_exists(v0, v1).unwrap(),
             mesh.query_edge_exists(v1, v2).unwrap(),
@@ -6078,27 +6317,532 @@ mod tests {
 
         assert_eq!(
             counts(&mesh),
-            (8, 11, 3),
-            "four rim midpoints and B's loop cut; the grid fill lays nothing"
+            (9, 12, 3),
+            "four rim midpoints, the centre vert, and the halved bar — all inside B"
         );
         assert_eq!(
             mesh.face_len(a),
             8,
-            "A keeps its flat-cornered octagon ring: a dropped bar aborts the fill"
+            "A keeps its whole octagon ring: its bar was laid in the neighbour"
         );
         assert_eq!(
             geom.inner_verts.len(),
-            4,
-            "the four rim midpoints only — no centre vert was minted"
+            5,
+            "four rim midpoints plus the one centre vert the bar's split minted"
+        );
+        let centre = geom.inner_verts[4];
+        assert!(
+            !mesh.face_vert_keys(a).contains(&centre),
+            "the centre vert is a corner of the neighbour's fragments, never of A"
         );
         assert!(
             mesh.face_keys().iter().all(|&f| mesh.face_len(f) >= 3),
-            "the dropped bar must not mint a degenerate 2-gon"
+            "no degenerate 2-gon anywhere"
+        );
+        assert!(
+            geom.faces.contains(&a) && geom.faces.contains(&b),
+            "both faces were recorded — dropping every connect revokes no re-split mark (§4.4)"
         );
         assert_eq!(
             geom.faces.len(),
-            2,
-            "both faces were recorded in pass one, and the drop revokes no mark"
+            3,
+            "the two re-split marks, plus the one fragment the bar minted inside B \
+             (§1: a grid fill's fragments are inner faces; the one that kept B's handle \
+             is already the mark)"
         );
     }
+
+    /// §7.1 — the shape that arbitrates *when* the dropped-connect precondition is
+    /// decided. `G` is a quad `(v0, v1, v2, v3)` with all four edges cut, so it is
+    /// a §5.4 grid fill. `F` is a **7-gon** sharing exactly `G`'s two *opposite*
+    /// edges `{v0,v1}` and `{v2,v3}`, its other five being its own — so `F` has
+    /// `cut_count = 2`, matches no template, and is the §7.1 fallback. Both shared
+    /// edges keep radial length 2; nothing here is degenerate.
+    ///
+    /// The 7-gon is the load-bearing choice. Post-cut `F` carries 9 corners against
+    /// `G`'s 8, so `G` wins the carrier contest for its own `m01 - m23` bar
+    /// (§7.0.1, strictly fewest corners) and `F` is never carved — while `G`'s grid
+    /// leaves **no** fragment holding both `m01` and `m23`. The precondition's two
+    /// readings therefore come apart: on the *input topology* (§7.1's reduction)
+    /// `F`'s two cut edges have a second common face, namely `G`, so `F` drops. Ask
+    /// the *live* mesh at apply time instead and the answer flips with the apply
+    /// schedule — pass three applies in reverse face-index order (§4.4), so
+    /// whichever face was created second goes first.
+    ///
+    /// `create_grid_first` flips exactly that. Returns `(mesh, [v0..v3], f)`.
+    fn grid_quad_and_ngon_on_two_opposite_edges(
+        create_grid_first: bool,
+    ) -> (LoopMesh, [VertexKey; 4], FaceKey) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let v2 = mesh.create_vertex(Vec3::new(2.0, 2.0, 0.0));
+        let v3 = mesh.create_vertex(Vec3::new(0.0, 2.0, 0.0));
+        // The 7-gon's own three corners, folded off the quad's plane so it reads as
+        // a pocket hanging from the two shared edges.
+        let p = mesh.create_vertex(Vec3::new(3.5, -0.5, -1.5));
+        let q = mesh.create_vertex(Vec3::new(3.5, 2.5, -1.5));
+        let r = mesh.create_vertex(Vec3::new(-1.5, 1.0, -1.5));
+
+        let e01 = mesh.create_edge([v0, v1], EdgeCreateFlags::NONE);
+        let e12 = mesh.create_edge([v1, v2], EdgeCreateFlags::NONE);
+        let e23 = mesh.create_edge([v2, v3], EdgeCreateFlags::NONE);
+        let e30 = mesh.create_edge([v3, v0], EdgeCreateFlags::NONE);
+        let e2q = mesh.create_edge([v2, q], EdgeCreateFlags::NONE);
+        let eqp = mesh.create_edge([q, p], EdgeCreateFlags::NONE);
+        let ep1 = mesh.create_edge([p, v1], EdgeCreateFlags::NONE);
+        let e0r = mesh.create_edge([v0, r], EdgeCreateFlags::NONE);
+        let er3 = mesh.create_edge([r, v3], EdgeCreateFlags::NONE);
+
+        // `F` walks the two shared edges against `G`'s winding, so the pair is
+        // consistently wound and every radial cycle stays length 2.
+        let f_verts = [v3, v2, q, p, v1, v0, r];
+        let f_edges = [e23, e2q, eqp, ep1, e01, e0r, er3];
+        let g_verts = [v0, v1, v2, v3];
+        let g_edges = [e01, e12, e23, e30];
+
+        let f = if create_grid_first {
+            mesh.face_create(&g_verts, &g_edges, FaceCreateFlags::NONE);
+            mesh.face_create(&f_verts, &f_edges, FaceCreateFlags::NONE)
+        } else {
+            let f = mesh.face_create(&f_verts, &f_edges, FaceCreateFlags::NONE);
+            mesh.face_create(&g_verts, &g_edges, FaceCreateFlags::NONE);
+            f
+        };
+        (mesh, [v0, v1, v2, v3], f)
+    }
+
+    #[test]
+    fn the_strip_precondition_is_a_function_of_the_input_not_the_apply_order() {
+        // §7.1 — the precondition reduces to "the face's two cut edges have a
+        // second common face", a property of the mesh the operator was *handed*.
+        // `F` shares both of its cut edges with `G`, so `F` drops its connect and
+        // stays whole — whichever order the two faces were created in, and hence
+        // whichever order pass three applies them in.
+        //
+        // Both orders: `G` grid-fills into 4 quads (its bar's carrier is itself, 8
+        // corners against `F`'s 9), `F` stays a single 9-ring.
+        //   V 12 = 4 quad corners + 3 of the 7-gon's own + 4 rim midpoints + centre
+        //   E 17 = 8 halved rim + 5 private + the halved bar + 2 spokes
+        //   F  5 = the grid's 4 + the whole 7-gon
+        for create_grid_first in [true, false] {
+            let (mut mesh, [v0, v1, v2, v3], f) =
+                grid_quad_and_ngon_on_two_opposite_edges(create_grid_first);
+            let edges = [
+                mesh.query_edge_exists(v0, v1).unwrap(),
+                mesh.query_edge_exists(v1, v2).unwrap(),
+                mesh.query_edge_exists(v2, v3).unwrap(),
+                mesh.query_edge_exists(v3, v0).unwrap(),
+            ];
+
+            let geom = match mesh.subdivide_edges(&edges, SubdivideParams::default()) {
+                SubdivideResult::Ran(g) => g,
+                _ => panic!("subdivide ran"),
+            };
+
+            assert_eq!(
+                counts(&mesh),
+                (12, 17, 5),
+                "create_grid_first = {create_grid_first}: the grid's 4 fragments and \
+                 the whole 7-gon — the strip laid no chord"
+            );
+            assert_eq!(
+                mesh.face_len(f),
+                9,
+                "create_grid_first = {create_grid_first}: the 7-gon keeps its whole \
+                 ring, its two rim midpoints as flat corners"
+            );
+            assert_eq!(
+                geom.inner_edges.len(),
+                4,
+                "create_grid_first = {create_grid_first}: the grid's four spokes and \
+                 nothing from the dropped strip"
+            );
+            assert!(
+                geom.faces.contains(&f),
+                "create_grid_first = {create_grid_first}: the dropped 7-gon keeps its \
+                 re-split mark — a drop revokes no mark (§4.4)"
+            );
+            assert_eq!(
+                geom.faces.len(),
+                5,
+                "create_grid_first = {create_grid_first}: the two re-split marks plus \
+                 the three grid fragments that did not keep the quad's handle (§1)"
+            );
+
+            let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+            shapes.sort_unstable();
+            assert_eq!(
+                shapes,
+                vec![4, 4, 4, 4, 9],
+                "create_grid_first = {create_grid_first}: a 7-gon split into 2 here is \
+                 the strip reading the live mesh instead of the input topology"
+            );
+        }
+    }
+
+    /// A convex pentagon, wide enough that no rim corner is anywhere near
+    /// straight (so the §4.3.1 guard never fires on it).
+    fn unit_pentagon(mesh: &mut LoopMesh) -> FaceKey {
+        create_face_from_verts(
+            mesh,
+            &[
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(3.0, 2.0, 0.0),
+                Vec3::new(1.0, 3.0, 0.0),
+                Vec3::new(-1.0, 2.0, 0.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn ngon_two_edges_strip_at_single_cut() {
+        // §7.1 / §4.3 — an n-gon has no template at any cut count, so a pentagon
+        // with exactly two cut edges is the generic strip's, and at `cuts = 1` the
+        // strip is one connect: V 5->7 (2 rim cut verts), E 5->8 (2 halved + 1
+        // connect), 1 pentagon -> 2 fragments.
+        let mut mesh = LoopMesh::new();
+        let face = unit_pentagon(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+
+        let geom = match mesh.subdivide_edges(&[e01, e23], SubdivideParams::default()) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(counts(&mesh), (7, 8, 2), "pentagon, two cut edges: N + 1 = 2");
+
+        let m01 = find_vert_at(&mesh, Vec3::new(1.0, 0.0, 0.0));
+        let m23 = find_vert_at(&mesh, Vec3::new(2.0, 2.5, 0.0));
+        assert!(
+            mesh.query_edge_exists(m01, m23).is_some(),
+            "the strip's lone connect joins the two cut verts"
+        );
+
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(shapes, vec![4, 5], "the connect bands the rim into 4-gon + 5-gon");
+
+        // §7.1 output-slot note — the fallback is the one non-grid path that
+        // inner-marks a connecting edge.
+        assert_eq!(
+            (
+                geom.geom_inner().verts.len(),
+                geom.geom_inner().edges.len(),
+                geom.geom_inner().faces.len()
+            ),
+            (2, 1, 0),
+            "geom_inner.out is 2N verts / N edges / 0 faces at N = 1"
+        );
+    }
+
+    #[test]
+    fn ngon_one_edge_is_never_re_split() {
+        // §4.3 — the corollary that keeps the fallback honest: it fires at
+        // `cut_count = 2` and nowhere else. A pentagon with *one* cut edge (at any
+        // `cuts`) is left as a single flat-cornered n-gon, never fanned.
+        for cuts in [1, 3] {
+            let mut mesh = LoopMesh::new();
+            let face = unit_pentagon(&mut mesh);
+            let fv = mesh.face_vert_keys(face);
+            let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+
+            mesh.subdivide_edges(&[e01], SubdivideParams::default().cuts(cuts));
+
+            let n = cuts as usize;
+            assert_eq!(
+                counts(&mesh),
+                (5 + n, 5 + n, 1),
+                "one-cut n-gon stays flat at cuts = {cuts}"
+            );
+        }
+    }
+
+    #[test]
+    fn quad_two_opposite_edges_cuts3_strip() {
+        // §9.5.3.3 — the strip at `cuts = 3`: three connects, four fragments, and
+        // no odd/even asymmetry. V 4->10, E 4->13 (8 segments + 3 connects), F 4.
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+
+        let geom = match mesh.subdivide_edges(&[e01, e23], SubdivideParams::default().cuts(3)) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(counts(&mesh), (10, 13, 4), "two-opposite quad at N = 3");
+
+        // The outside-in zip is the whole content of the pattern, and this is what
+        // discriminates it: the three connects run *straight across* the quad,
+        // pairing each bottom cut vert with the top one directly above it. A
+        // same-index zip would cross them into an hourglass instead.
+        for x in [0.5f32, 1.0, 1.5] {
+            let bottom = find_vert_at(&mesh, Vec3::new(x, 0.0, 0.0));
+            let top = find_vert_at(&mesh, Vec3::new(x, 2.0, 0.0));
+            assert!(
+                mesh.query_edge_exists(bottom, top).is_some(),
+                "the strip pairs the runs outside-in, so the connect at x = {x} is vertical"
+            );
+        }
+
+        assert!(
+            mesh.face_keys().iter().all(|&f| mesh.face_len(f) == 4),
+            "four quad bands"
+        );
+        assert_eq!(
+            (
+                geom.geom_inner().verts.len(),
+                geom.geom_inner().edges.len(),
+                geom.geom_inner().faces.len()
+            ),
+            (6, 3, 0),
+            "geom_inner.out is 2N verts / N edges / 0 faces at N = 3"
+        );
+        assert_eq!(geom.faces.len(), 1, "geom.out: one re-split mark");
+    }
+
+    #[test]
+    fn tri_two_edges_cuts3_strip() {
+        // §9.5.3.3 — the same strip on a triangle, whose two cut edges *share* a
+        // corner: the runs still zip outside-in, giving N + 1 = 4 fragments (a
+        // corner triangle plus three bands). V 3->9, E 3->12, F 4.
+        let mut mesh = LoopMesh::new();
+        let face = unit_tri(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let geom = match mesh.subdivide_edges(&[e01, e12], SubdivideParams::default().cuts(3)) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+
+        assert_eq!(counts(&mesh), (9, 12, 4), "two-edge triangle at N = 3");
+
+        // The innermost connect walls the shared corner v1 off as a triangle; the
+        // other two band the rest. Outside-in pairing means the cut vert nearest
+        // v1 on one edge joins the one nearest v1 on the other.
+        let mut shapes: Vec<usize> = mesh.face_keys().iter().map(|&f| mesh.face_len(f)).collect();
+        shapes.sort_unstable();
+        assert_eq!(shapes, vec![3, 4, 4, 4], "corner triangle + three bands");
+
+        assert_eq!(
+            (
+                geom.geom_inner().verts.len(),
+                geom.geom_inner().edges.len(),
+                geom.geom_inner().faces.len()
+            ),
+            (6, 3, 0),
+            "the strip inner-marks each connect it lays"
+        );
+    }
+
+    #[test]
+    fn quad_two_adjacent_straight_cut_cuts2_strip() {
+        // §9.5.3.3 — the default `STRAIGHT_CUT` two-adjacent quad is the same
+        // fallback at `cuts = 2`: V 8 / E 10 / F 3, two connects, three fragments.
+        // The guard's verdict is threaded through this row, so a *flat*-cornered
+        // quad in the same configuration stays whole (the contrast below).
+        let mut mesh = LoopMesh::new();
+        let face = unit_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        mesh.subdivide_edges(&[e01, e12], SubdivideParams::default().cuts(2));
+        assert_eq!(counts(&mesh), (8, 10, 3), "adjacent STRAIGHT_CUT at N = 2");
+
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+        let geom = match mesh.subdivide_edges(&[e01, e12], SubdivideParams::default().cuts(2)) {
+            SubdivideResult::Ran(g) => g,
+            _ => panic!("subdivide ran"),
+        };
+        assert_eq!(
+            counts(&mesh),
+            (8, 8, 1),
+            "the guard is cuts-independent: the flat-cornered strip lays nothing"
+        );
+        // §4.3.1 / §4.4 — and the limb that actually carries that behaviour is the
+        // *dispatch scan*, which refuses to record a guarded template-less face at
+        // all. The absent re-split mark is what pins it: the apply pass's own
+        // `flat_corner` read is belt-and-braces on a face that never gets there.
+        assert!(
+            geom.geom().faces.is_empty(),
+            "a guarded fallback face is never recorded, so it carries no re-split mark"
+        );
+        assert!(
+            !geom.geom().faces.contains(&face),
+            "the guarded face itself is absent from geom.out"
+        );
+    }
+
+    #[test]
+    fn ngon_two_edges_strip_at_multicut() {
+        // §7.1 / §9.5.3.3 — the row's own intersection: an n-gon (no template at
+        // any cut count) at `cuts >= 2`. The pentagon's two cut edges give two runs
+        // of N, zipped outside-in into N connects and N + 1 fragments — the strip
+        // is face-size *and* N agnostic.
+        for cuts in [2u32, 3] {
+            let n = cuts as usize;
+            let mut mesh = LoopMesh::new();
+            let face = unit_pentagon(&mut mesh);
+            let fv = mesh.face_vert_keys(face);
+            let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+            let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+
+            let geom = match mesh.subdivide_edges(&[e01, e23], SubdivideParams::default().cuts(cuts))
+            {
+                SubdivideResult::Ran(g) => g,
+                _ => panic!("subdivide ran"),
+            };
+
+            assert_eq!(
+                counts(&mesh),
+                (5 + 2 * n, 5 + 2 * n + n, n + 1),
+                "pentagon, two cut edges at cuts = {cuts}: N + 1 fragments"
+            );
+            assert_eq!(
+                (
+                    geom.geom_inner().verts.len(),
+                    geom.geom_inner().edges.len(),
+                    geom.geom_inner().faces.len()
+                ),
+                (2 * n, n, 0),
+                "geom_inner.out is 2N verts / N edges / 0 faces"
+            );
+            assert_eq!(geom.faces.len(), 1, "geom.out: one re-split mark");
+        }
+
+        // The zip's discriminator at N = 2, read off the geometry: the pentagon's
+        // cut edges run x: 0->2 (y = 0) and x: 3->1 (y = 2 -> 3). Outside-in pairs
+        // the cut vert nearest v0 on the first run with the one nearest v3 on the
+        // second, so the two connects do not cross.
+        let mut mesh = LoopMesh::new();
+        let face = unit_pentagon(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+        mesh.subdivide_edges(&[e01, e23], SubdivideParams::default().cuts(2));
+
+        let near_v0 = find_vert_at(&mesh, Vec3::new(2.0 / 3.0, 0.0, 0.0));
+        let near_v1 = find_vert_at(&mesh, Vec3::new(4.0 / 3.0, 0.0, 0.0));
+        let near_v2 = find_vert_at(&mesh, Vec3::new(3.0 - 2.0 / 3.0, 2.0 + 1.0 / 3.0, 0.0));
+        let near_v3 = find_vert_at(&mesh, Vec3::new(3.0 - 4.0 / 3.0, 2.0 + 2.0 / 3.0, 0.0));
+        assert!(
+            mesh.query_edge_exists(near_v0, near_v3).is_some()
+                && mesh.query_edge_exists(near_v1, near_v2).is_some(),
+            "the runs zip outside-in; a same-index zip would cross the two connects"
+        );
+    }
+
+    #[test]
+    fn corner_strategy_claims_only_the_adjacent_two_cut_quad_at_multicut() {
+        // §5.2 / §9.5.3.3 — the `quad_corner_type` templates claim the *adjacent*
+        // two-cut quad and nothing else, and the adjacency predicate is what draws
+        // the line. Their multi-cut arms are a separate parity row and not yet
+        // implemented, so a claimed face stays flat at `cuts = 2`...
+        for corner_type in [
+            QuadCornerType::Fan,
+            QuadCornerType::Path,
+            QuadCornerType::InnerVert,
+        ] {
+            let mut mesh = LoopMesh::new();
+            let face = unit_quad(&mut mesh);
+            let fv = mesh.face_vert_keys(face);
+            let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+            let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+
+            mesh.subdivide_edges(
+                &[e01, e12],
+                SubdivideParams::default()
+                    .cuts(2)
+                    .quad_corner_type(corner_type),
+            );
+            assert_eq!(
+                counts(&mesh),
+                (8, 8, 1),
+                "{corner_type:?} claims the adjacent two-cut quad, so the strip must not \
+                 take it: the face stays a flat-cornered octagon"
+            );
+
+            // ...while the *opposite* two-cut quad is claimed by no strategy at any
+            // cut count, so it drops onto the strip regardless: two connects, three
+            // fragments. A predicate that answered "adjacent" unconditionally would
+            // leave this face flat too.
+            let mut mesh = LoopMesh::new();
+            let face = unit_quad(&mut mesh);
+            let fv = mesh.face_vert_keys(face);
+            let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+            let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+
+            mesh.subdivide_edges(
+                &[e01, e23],
+                SubdivideParams::default()
+                    .cuts(2)
+                    .quad_corner_type(corner_type),
+            );
+            assert_eq!(
+                counts(&mesh),
+                (8, 10, 3),
+                "{corner_type:?} claims nothing here: the opposite two-cut quad is the \
+                 strip's at N = 2"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_corner_verdict_is_stamped_on_the_face() {
+        // §4.3.1, white-box — the guard's verdict layer itself, independent of any
+        // `cuts` value or dispatch consumer. `push_flat_corner_guard` decides on
+        // the *input* edge directions, and the FLAT_CORNER bit is what the
+        // fallback rows read.
+        let straight = |mesh: &mut LoopMesh, edges: &[EdgeKey], face: FaceKey| -> bool {
+            let (guard_layer, cut_layer, touched) = mesh.push_flat_corner_guard(edges);
+            let verdict = mesh.face_op_flag_test(guard_layer, face, FLAT_CORNER);
+            assert!(touched.contains(&face), "the guard enumerates the cut faces");
+            mesh.pop_edge_op_flag_layer(cut_layer);
+            mesh.pop_face_op_flag_layer(guard_layer);
+            verdict
+        };
+
+        // The two edges flanking the straight (180°) corner v1: collinear, guarded.
+        let mut mesh = LoopMesh::new();
+        let face = flat_corner_quad(&mut mesh);
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+        let e23 = mesh.query_edge_exists(fv[2], fv[3]).unwrap();
+        assert!(
+            straight(&mut mesh, &[e01, e12], face),
+            "collinear cut edges sharing the straight corner are flagged"
+        );
+        // Opposite cut edges share no vertex, so no corner exists to be straight.
+        assert!(
+            !straight(&mut mesh, &[e01, e23], face),
+            "opposite cut edges never trip the guard"
+        );
+
+        // 5° off straight is a real corner, inside the same face shape.
+        let mut mesh = LoopMesh::new();
+        let face = near_flat_corner_quad(&mut mesh, 5.0f32.to_radians());
+        let fv = mesh.face_vert_keys(face);
+        let e01 = mesh.query_edge_exists(fv[0], fv[1]).unwrap();
+        let e12 = mesh.query_edge_exists(fv[1], fv[2]).unwrap();
+        assert!(
+            !straight(&mut mesh, &[e01, e12], face),
+            "5° off straight is outside the collinearity tolerance"
+        );
+    }
+
 }
