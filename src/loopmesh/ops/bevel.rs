@@ -2740,12 +2740,10 @@ impl LoopMesh {
             (legs.end_leg, legs.start_leg)
         };
 
-        let surface_normal = self.surface_normal_at(vertex);
-
         let strip_for_leg =
             |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
                 let position =
-                    this.terminal_strip_vert(vertex, edge, leg, face, offset, surface_normal);
+                    this.terminal_strip_vert(vertex, edge, leg, face, leg == legs.start_leg, offset);
                 // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
                 let strip_vert = this.mint_bevel_vertex(position, vertex);
                 result.verts.push(strip_vert);
@@ -5805,17 +5803,16 @@ impl LoopMesh {
         {
             return None;
         }
-        let surface_normal = self.surface_normal_at(vertex);
-
         // §8.8.5: each strip vert reads its edge-side's §7.6.4-reconciled offset —
         // the spec offset unless a firing slide at this edge's *other* end shifted it
         // (§8.8.4). The recipe is the §7.5.1 leg meet either way; only the offset it
         // is fed ripples, so the terminal moves at an irregular firing junction and
         // stays put at a symmetric one (where the reconciled offset equals the spec).
+        let start_leg = legs.start_leg;
         let mut strip_for_leg = |this: &mut Self, leg: EdgeKey, face: FaceKey| {
             let face_offset = reconciled_offset(reconciled, edge, face, offset);
             let position =
-                this.terminal_strip_vert(vertex, edge, leg, face, face_offset, surface_normal);
+                this.terminal_strip_vert(vertex, edge, leg, face, leg == start_leg, face_offset);
             // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
             let strip_vert = this.mint_bevel_vertex(position, vertex);
             result.verts.push(strip_vert);
@@ -6083,19 +6080,32 @@ impl LoopMesh {
     /// real leg. Reduces exactly to the §7.3 perpendicular slide on a planar, square
     /// terminal, where the edge-cross normal coincides with the face normal.
     ///
-    /// `face` is `E`'s radial face on this leg's side; it is used **only** to pick
-    /// the discrete straddle branch (which side of `E` this strip vert sits on) — its
-    /// plane normal is **not** used to build the offset perpendicular, which is the
-    /// edge-cross local normal alone. The two flanking legs land on opposite sides of
-    /// `E`. Exactly one input carries the offset (`E`); the leg carries 0.
+    /// `face` is `E`'s radial face on this leg's side — the **sector face**, whose own
+    /// plane normal is the §7.5.1 orientation reference that sign-fixes the edge-cross
+    /// local normal (the endpoint's vertex normal is the fallback, used only when that
+    /// face yields no usable normal). It is deliberately *not* an average over the
+    /// endpoint's incident faces: the averaged reading agrees on every consistently-wound
+    /// mesh and disagrees exactly on the mis-wound ones of §7.8, where it cancels toward
+    /// the wrong hemisphere.
+    ///
+    /// Which side of `E` the offset line is pushed to is fixed by `leg_precedes_edge` —
+    /// the pair's order around the endpoint's normalised rotational walk — and by nothing
+    /// else. A disk-preceding leg makes `E` the *second* of the pair and a disk-following
+    /// one makes it the *first*, which negates `E`'s perpendicular; that is what puts the
+    /// two flanking legs' strip verts on opposite sides on an ordinary mesh, and what lets
+    /// a mis-wound flank push into the *other* flank's half-plane, meet its leg behind the
+    /// endpoint, and collapse under the §7.5.2 span clamp (§7.8.2). Steering the push
+    /// toward the sector face's own interior instead would suppress that collapse.
+    ///
+    /// Exactly one input carries the offset (`E`); the leg carries 0.
     fn terminal_strip_vert(
         &self,
         vertex: VertexKey,
         edge: EdgeKey,
         leg: EdgeKey,
         face: FaceKey,
+        leg_precedes_edge: bool,
         offset: f32,
-        surface_normal: Vec3,
     ) -> Vec3 {
         let endpoint = self.vertex_position(vertex);
         // Outward unit directions of `E` and the leg from the endpoint.
@@ -6121,18 +6131,16 @@ impl LoopMesh {
             return self.clamp_zero_offset_terminal(endpoint + leg_out * offset, vertex, leg);
         }
         local_normal /= length;
-        if local_normal.dot(surface_normal) < 0.0 {
+        let reference = self.sector_orientation_reference(vertex, face);
+        if local_normal.dot(reference) < 0.0 {
             local_normal = -local_normal;
         }
 
         // `E`'s offset line is pushed sideways by `offset`, square to `E`, from the
-        // local normal. Its sign is the straddle branch: pick the push that drives
-        // the offset line toward `face`'s interior, so this strip vert sits on the
-        // radial face it belongs to. (The face fixes only this binary side, never the
-        // perpendicular vector.)
+        // local normal. The sign is the rotational order's alone (see the doc comment):
+        // `E` second in the pair pushes along `E × n`, `E` first pushes against it.
         let mut edge_perp = edge_out.cross(local_normal).normalize_or_zero();
-        let face_center = self.face_center_of_mass(face);
-        if edge_perp.dot(face_center - endpoint) < 0.0 {
+        if !leg_precedes_edge {
             edge_perp = -edge_perp;
         }
 
@@ -6177,6 +6185,20 @@ impl LoopMesh {
             far_position
         } else {
             meet
+        }
+    }
+
+    /// §7.5.1's **per-sector** orientation reference: the normal of the single face
+    /// filling the sector the meet is computed in, with the endpoint's vertex normal as
+    /// the fallback when that face yields nothing usable. Never hoisted out of the
+    /// per-sector loop and never averaged — the whole of §7.8 is the case where a
+    /// mis-wound sector face and any endpoint-wide surrogate for it disagree.
+    fn sector_orientation_reference(&self, vertex: VertexKey, face: FaceKey) -> Vec3 {
+        let normal = self.face_plane_normal(face);
+        if normal.length() > f32::EPSILON {
+            normal.normalize()
+        } else {
+            self.vertex_normal(vertex).normalize_or_zero()
         }
     }
 
@@ -6290,13 +6312,53 @@ impl LoopMesh {
             }
         }
 
-        if leading.is_empty() {
+        let ring = if leading.is_empty() {
             ring
         } else {
             leading.reverse();
             leading.extend(ring);
             leading
+        };
+
+        self.normalise_corner_ring(vertex, ring)
+    }
+
+    /// Normalise the rotational order's handedness (BEVEL.md §7.8.1(a)). The chained walk
+    /// above seeds on an arbitrary incident face, so on a mesh whose faces do **not** all
+    /// agree on direction the seed decides which way round the ring runs — and the §7.5.1
+    /// sign reference reads that handedness. One ballot per sector: `+1` when the sector's
+    /// face traverses the sector's two edges in the same sense the ring walks them, `−1`
+    /// when it runs them the other way, `0` when the face presents no such corner. A
+    /// **strictly negative** total reverses the ring; a tie and a positive total leave it
+    /// alone.
+    ///
+    /// Reversing swaps every corner's two edges as well as the sequence, so the sector
+    /// lying between a given pair of edges is still that same pair's sector afterwards —
+    /// dropping that swap would read every sector's face off by one and mis-sign the leg
+    /// meet on ordinary meshes too.
+    fn normalise_corner_ring(&self, vertex: VertexKey, ring: Vec<VertexCorner>) -> Vec<VertexCorner> {
+        let mut tally: i32 = 0;
+        for corner in &ring {
+            let Some((arrives_on, leaves_on)) = self.face_corner_edges(corner.face, vertex) else {
+                continue;
+            };
+            if corner.incoming_edge == leaves_on && corner.outgoing_edge == arrives_on {
+                tally += 1;
+            } else if corner.incoming_edge == arrives_on && corner.outgoing_edge == leaves_on {
+                tally -= 1;
+            }
         }
+        if tally >= 0 {
+            return ring;
+        }
+        ring.into_iter()
+            .rev()
+            .map(|corner| VertexCorner {
+                incoming_edge: corner.outgoing_edge,
+                face: corner.face,
+                outgoing_edge: corner.incoming_edge,
+            })
+            .collect()
     }
 
     /// Place a sector's boundvert by the pairwise offset-line meet (BEVEL.md
@@ -28708,6 +28770,281 @@ mod tests {
 
         mesh.validate_topology();
     }
+
+    // ---- BEVEL.md §7.8: inconsistently-wound flanks — the one-sided strip ----
+
+    /// A unit cube with the `y = +1` face's loop cycle reversed, so both of that face's
+    /// loops traverse each of its four edges the *same* way its neighbour does: every
+    /// edge of it is an inconsistently-wound manifold radial pair (§7.8). Every endpoint
+    /// of every such edge has **three** face-sectors, so §7.8.1's vote is decisive and
+    /// the minority (reversed) face is the disagreeing flank at both ends.
+    fn cube_with_one_reversed_face() -> (LoopMesh, EdgeKey, FaceKey) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let top = *mesh
+            .face_keys()
+            .iter()
+            .find(|&&f| mesh.face_plane_normal(f).y > 0.9)
+            .expect("the cube's +y face");
+        mesh.euler_loop_reverse(top);
+        let edge = mesh
+            .query_edge_exists(
+                vert_at(&mesh, Vec3::new(-1.0, 1.0, -1.0)),
+                vert_at(&mesh, Vec3::new(1.0, 1.0, -1.0)),
+            )
+            .expect("an edge of the reversed face");
+        (mesh, edge, top)
+    }
+
+    fn bevel_one_edge(mesh: &mut LoopMesh, edge: EdgeKey, segments: u32) -> BevelResult {
+        mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn verts_near(mesh: &LoopMesh, position: Vec3) -> Vec<VertexKey> {
+        mesh.vert_keys()
+            .into_iter()
+            .filter(|&v| (mesh.vertex_position(v) - position).length() < 1.0e-4)
+            .collect()
+    }
+
+    /// §7.8.2 / §7.8.3, decisive vote: the reversed flank's strip vert meets its leg
+    /// *behind* the endpoint, the §7.5.2 span clamp snaps it back, and it is minted at
+    /// the killed endpoint's own coordinates. The count delta is the consistent case's,
+    /// and the collapsed end is **one** vert element, not two coincident ones.
+    #[test]
+    fn edge_bevel_noncontiguous_flanks_collapse_onto_the_endpoints() {
+        let endpoints = [Vec3::new(-1.0, 1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)];
+        let (mut mesh, edge, _) = cube_with_one_reversed_face();
+        bevel_one_edge(&mut mesh, edge, 1);
+
+        assert_eq!(counts(&mesh), (10, 15, 7), "the §7.8.3 count delta");
+        for endpoint in endpoints {
+            let coincident = verts_near(&mesh, endpoint);
+            assert_eq!(
+                coincident.len(),
+                1,
+                "exactly one fresh vert reproduces the killed endpoint {endpoint} \
+                 (two would be the §7.8.3 double-mint)",
+            );
+            // Shared by the strip and the rebuilt flank, so it is a full interior corner.
+            assert_eq!(
+                mesh.vert_face_keys(coincident[0]).len(),
+                3,
+                "the collapsed rung end is shared by every face that reaches it",
+            );
+        }
+        mesh.validate_topology();
+    }
+
+    /// §7.8.3: the disagreeing flank is rebuilt with its corners unmoved, so it comes
+    /// out geometrically **unchanged** — the visible "bevel ate one face and left the
+    /// other alone". The agreeing flank does shrink, and the strip is half-width.
+    #[test]
+    fn edge_bevel_noncontiguous_collapse_lands_on_the_reversed_face() {
+        let (mut mesh, edge, reversed) = cube_with_one_reversed_face();
+        let before: Vec<Vec3> = mesh
+            .face_vert_keys(reversed)
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        bevel_one_edge(&mut mesh, edge, 1);
+
+        let survivor: Vec<Vec<Vec3>> = mesh
+            .face_keys()
+            .into_iter()
+            .map(|f| {
+                mesh.face_vert_keys(f)
+                    .into_iter()
+                    .map(|v| mesh.vertex_position(v))
+                    .collect()
+            })
+            .collect();
+        assert!(
+            survivor.iter().any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
+            "the mis-wound flank is rebuilt at its original corners",
+        );
+    }
+
+    /// §7.8.4: segments-independent. The collapse reproduces at every segment count —
+    /// the profile is simply laid across the half-width rung — and the counts stay the
+    /// consistently-wound cube's at the same `segments`.
+    #[test]
+    fn edge_bevel_noncontiguous_collapses_at_every_segment_count() {
+        for segments in 1..=4 {
+            let (mut mesh, edge, _) = cube_with_one_reversed_face();
+            bevel_one_edge(&mut mesh, edge, segments);
+
+            let mut consistent = LoopMesh::new();
+            mesh_add_cube(&mut consistent);
+            let control = consistent
+                .query_edge_exists(
+                    vert_at(&consistent, Vec3::new(-1.0, 1.0, -1.0)),
+                    vert_at(&consistent, Vec3::new(1.0, 1.0, -1.0)),
+                )
+                .expect("the same cube edge");
+            bevel_one_edge(&mut consistent, control, segments);
+
+            assert_eq!(
+                counts(&mesh),
+                counts(&consistent),
+                "segments {segments}: §7.8.3's identical count delta",
+            );
+            for endpoint in [Vec3::new(-1.0, 1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)] {
+                assert_eq!(
+                    verts_near(&mesh, endpoint).len(),
+                    1,
+                    "segments {segments}: the endpoint position is reproduced exactly once",
+                );
+                assert!(
+                    verts_near(&consistent, endpoint).is_empty(),
+                    "segments {segments}: the consistent contrast slides both strip verts",
+                );
+            }
+            mesh.validate_topology();
+        }
+    }
+
+    /// §7.8.1(a): the ballot normalisation is what makes the decisive-vote regime
+    /// deterministic. The disk walk seeds on an arbitrary incident face, so without it
+    /// a mesh whose faces were *built* in a different order would collapse the other
+    /// flank. Rebuilding the same cube with its faces created in every rotation must
+    /// still collapse the reversed one.
+    #[test]
+    fn edge_bevel_noncontiguous_collapse_is_independent_of_face_build_order() {
+        for rotation in 0..6 {
+            // The same geometry with its faces *created* in a rotated order, so the
+            // corner ring's arbitrary seed face differs run to run.
+            let mut mesh = LoopMesh::new();
+            let corner: Vec<VertexKey> = [
+                Vec3::new(1.0, -1.0, -1.0),
+                Vec3::new(-1.0, -1.0, -1.0),
+                Vec3::new(-1.0, 1.0, -1.0),
+                Vec3::new(1.0, 1.0, -1.0),
+                Vec3::new(1.0, -1.0, 1.0),
+                Vec3::new(-1.0, -1.0, 1.0),
+                Vec3::new(-1.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, 1.0),
+            ]
+            .into_iter()
+            .map(|p| mesh.create_vertex(p))
+            .collect();
+            let quads = [
+                [0, 1, 2, 3],
+                [1, 5, 6, 2],
+                [5, 4, 7, 6],
+                [4, 0, 3, 7],
+                [3, 2, 6, 7],
+                [0, 4, 5, 1],
+            ];
+            for step in 0..quads.len() {
+                let quad = quads[(step + rotation) % quads.len()];
+                let ring: Vec<VertexKey> = quad.iter().map(|&i| corner[i]).collect();
+                mesh.face_create_verts(&ring, FaceCreateFlags::NONE);
+            }
+            let top = *mesh
+                .face_keys()
+                .iter()
+                .find(|&&f| mesh.face_plane_normal(f).y > 0.9)
+                .expect("the cube's +y face");
+            mesh.euler_loop_reverse(top);
+            let before: Vec<Vec3> = mesh
+                .face_vert_keys(top)
+                .into_iter()
+                .map(|v| mesh.vertex_position(v))
+                .collect();
+            let edge = mesh
+                .query_edge_exists(
+                    vert_at(&mesh, Vec3::new(-1.0, 1.0, -1.0)),
+                    vert_at(&mesh, Vec3::new(1.0, 1.0, -1.0)),
+                )
+                .expect("an edge of the reversed face");
+            bevel_one_edge(&mut mesh, edge, 1);
+
+            assert_eq!(counts(&mesh), (10, 15, 7), "rotation {rotation}");
+            let survivor: Vec<Vec<Vec3>> = mesh
+                .face_keys()
+                .into_iter()
+                .map(|f| {
+                    mesh.face_vert_keys(f)
+                        .into_iter()
+                        .map(|v| mesh.vertex_position(v))
+                        .collect()
+                })
+                .collect();
+            assert!(
+                survivor.iter().any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
+                "rotation {rotation}: the collapse still lands on the reversed face",
+            );
+        }
+    }
+    /// §7.8.1's **tied-vote** regime: an endpoint with exactly two face-sectors (the
+    /// beveled edge's own two flanks and nothing else) casts `+1` and `−1`, the vote
+    /// cancels, no normalisation happens, and *which* flank collapses follows the stored
+    /// disk order — so the two endpoints decide independently and can pick opposite
+    /// flanks. What is regime-independent is the **placement**: one rung end reproduces
+    /// the killed endpoint exactly, the other slides the offset along its own leg, and
+    /// the rung is half-width. That much is asserted here; the resulting rail pairing
+    /// (§7.8.3's twist, and the edge count that follows from it) is explicitly *not* an
+    /// invariant in the guide and is left unpinned.
+    #[test]
+    fn edge_bevel_noncontiguous_tied_vote_still_builds_one_sided_rungs() {
+        let mut mesh = LoopMesh::new();
+        let plane = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let corner: Vec<VertexKey> = [
+            plane(0.0, 0.0),
+            plane(1.0, 0.0),
+            plane(1.0, 1.0),
+            plane(0.0, 1.0),
+            plane(2.0, 0.0),
+            plane(2.0, 1.0),
+        ]
+        .into_iter()
+        .map(|p| mesh.create_vertex(p))
+        .collect();
+        mesh.face_create_verts(
+            &[corner[0], corner[1], corner[2], corner[3]],
+            FaceCreateFlags::NONE,
+        );
+        // Both quads traverse the shared edge `1 → 2`: the inconsistently-wound pair.
+        mesh.face_create_verts(
+            &[corner[1], corner[2], corner[5], corner[4]],
+            FaceCreateFlags::NONE,
+        );
+        let edge = mesh
+            .query_edge_exists(corner[1], corner[2])
+            .expect("the shared edge");
+        bevel_one_edge(&mut mesh, edge, 1);
+
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.face_count(), 3);
+        for (endpoint, slid) in [
+            (plane(1.0, 0.0), [plane(0.8, 0.0), plane(1.2, 0.0)]),
+            (plane(1.0, 1.0), [plane(0.8, 1.0), plane(1.2, 1.0)]),
+        ] {
+            assert_eq!(
+                verts_near(&mesh, endpoint).len(),
+                1,
+                "the collapsed rung end reproduces {endpoint} exactly once",
+            );
+            assert_eq!(
+                slid.iter()
+                    .filter(|&&p| !verts_near(&mesh, p).is_empty())
+                    .count(),
+                1,
+                "the other rung end slid the offset onto exactly one of the two flanks",
+            );
+        }
+        mesh.validate_topology();
+    }
+
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
