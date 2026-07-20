@@ -8335,6 +8335,24 @@ impl LoopMesh {
         self.donor_tie_break(&candidates).or(positional)
     }
 
+    /// [`straddle_quad_donor`](Self::straddle_quad_donor) read off an edge alone — the shape
+    /// the strip builders need, where the near/far split has no other use at the call site.
+    fn strip_quad_donor(
+        &self,
+        edge: EdgeKey,
+        segments: u32,
+        templates: &TemplateBank,
+    ) -> Option<FaceKey> {
+        let (near_face, far_face) = self.edge_flanking_faces(edge);
+        self.straddle_quad_donor(
+            edge,
+            near_face,
+            far_face,
+            segments,
+            templates.interp_components(),
+        )
+    }
+
     /// The stage-1 donor of the **straddle quad** — the strip quad that sits *on* the
     /// centre line at odd `segments`, and the only face of the run whose donor cannot be
     /// read off the near/far split (BEVEL.md §6.6.2's strip-row scoping, §8.2.2).
@@ -8372,24 +8390,6 @@ impl LoopMesh {
     /// seam-free edge the answer is the near flank, which is the positional donor that path
     /// always took. At even `segments` no quad straddles and this is never consulted; it
     /// still answers the near flank so the field is never a live wrong value.
-    /// [`straddle_quad_donor`](Self::straddle_quad_donor) read off an edge alone — the shape
-    /// the `segments = 1` strip builders need, where the near/far split has no other use.
-    fn strip_quad_donor(
-        &self,
-        edge: EdgeKey,
-        segments: u32,
-        templates: &TemplateBank,
-    ) -> Option<FaceKey> {
-        let (near_face, far_face) = self.edge_flanking_faces(edge);
-        self.straddle_quad_donor(
-            edge,
-            near_face,
-            far_face,
-            segments,
-            templates.interp_components(),
-        )
-    }
-
     fn straddle_quad_donor(
         &self,
         edge: EdgeKey,
@@ -8426,20 +8426,28 @@ impl LoopMesh {
     /// corner-level "any incident leg is a seam" form of the ring-spanning fills. It is not
     /// the seam *flag* of §6.6.7 — no header bit is read.
     ///
-    /// Condition (1), purely topological and layer-free: either endpoint resolves no
-    /// arriving face or no departing face **for this edge**. Note the scope — it is the
-    /// edge's own two flanking slots that are read, not the endpoint's other legs, so an
-    /// interior edge with *boundary endpoints* is not a seam by it (the boundary legs are,
-    /// but that is the corner-level form). What satisfies it: a boundary or wire edge
-    /// outright, and a radial-2 edge whose two flanks are wound **inconsistently**, where
-    /// both loops run the same way along the edge and nothing arrives at one end.
+    /// Condition (1), purely topological and layer-free: one of the edge's own two
+    /// flanking-face slots is left **empty**. Note the scope — it is the edge's own slots
+    /// that are read, not the endpoint's other legs, so an interior edge with *boundary
+    /// endpoints* is not a seam by it (the boundary legs are, but that is the corner-level
+    /// form). What satisfies it is a boundary or wire edge outright, and nothing else here.
+    ///
+    /// **Winding plays no part in filling the slots** (§7.8's restatement of §6.6.1.4): a
+    /// radial-2 edge whose two flanks are wound **inconsistently** still resolves a face
+    /// into both slots, so condition (1) does **not** fire on it and the test falls through
+    /// to condition (2) — where the failed corner pairing seams it *iff* the mesh carries a
+    /// loop layer. Reading the slots through an arriving/departing walk (the corner-level
+    /// fan primitive) would misattribute that case to condition (1) and seam an untextured
+    /// mesh the reference leaves contiguous. A radial-3-or-more edge does not "miss" a face
+    /// either, so it too falls through.
     ///
     /// §6.6.1.4 also names an edge *heading a restarted fan run* at a non-manifold corner.
     /// The slots here are read off the radial cycle rather than off a materialised fan
     /// partition, so that sub-case is **not** distinguished: such an edge reads as
-    /// seam-free unless one of the causes above also holds. The same narrowing applies at
+    /// seam-free unless one of the causes above also holds. A similar narrowing applies at
     /// the corner-level site ([`ring_spanning_donor`](Self::ring_spanning_donor)), which
-    /// shares these two primitives.
+    /// reads its slots through the fan primitive because there the *leg's* two flanking
+    /// slots really are the fan's, and an unfilled one is the corner-level condition (1).
     ///
     /// Condition (2) short-circuits to *not a seam* the moment the mesh carries **zero**
     /// loop layers, before any topology is examined — which is why condition (1) is the
@@ -8451,12 +8459,8 @@ impl LoopMesh {
     /// which is exactly the breadth that makes a colour-only discontinuity a seam. Any
     /// disagreement seams the edge; §6.6.1.4 names no tolerance, so the compare is exact.
     fn edge_is_interp_seam(&self, edge: EdgeKey) -> bool {
-        for endpoint in self.edge_vert_keys(edge) {
-            if self.arriving_face(endpoint, edge).is_none()
-                || self.departing_face(endpoint, edge).is_none()
-            {
-                return true;
-            }
+        if self.iter_radial_loops(edge).take(2).count() < 2 {
+            return true;
         }
 
         if self.loop_attribs().is_empty() {
@@ -27594,20 +27598,9 @@ mod tests {
         );
     }
 
-    /// §6.6.1.4 **condition (1)** at the edge-level site, the arm that fires with **no loop
-    /// layer on the mesh at all** — condition (2) short-circuits to "contiguous" before a
-    /// single value is read, yet the edge is still a seam, purely topologically.
-    ///
-    /// Naming the fixture precisely matters here, because the obvious one is dead. The
-    /// edge-level form asks whether *this* edge resolves an arriving **and** a departing
-    /// face at each of its own endpoints — not whether the endpoint is on the boundary. An
-    /// interior edge with boundary endpoints (a two-quad strip's shared edge) resolves both
-    /// at both ends and is **not** a condition-(1) seam; it is the endpoint's *boundary
-    /// legs* that are seams, which is the corner-level form. What does fire at the edge
-    /// level on an untextured mesh is a pair of **inconsistently wound** flanks: both loops
-    /// then run the same way along the edge, so nothing arrives at one endpoint.
-    #[test]
-    fn face_cd_inconsistently_wound_flanks_seam_the_straddle_quad_by_condition_one() {
+    /// An open two-quad plane whose second quad is wound **against** the first, so both
+    /// flanks of the shared edge traverse it the same way. Returns the shared edge.
+    fn noncontiguous_two_quad_plane() -> (LoopMesh, EdgeKey) {
         let mut mesh = LoopMesh::new();
         let corner = |x: f32, y: f32| Vec3::new(x, y, 0.0);
         let a = mesh.create_vertex(corner(-2.0, -1.0));
@@ -27620,43 +27613,157 @@ mod tests {
         // Reversed against the first quad, so both flanks traverse `b → e`.
         mesh.face_create_verts(&[e, d, c, b], FaceCreateFlags::NONE);
         let edge = mesh.query_edge_exists(b, e).expect("the shared edge");
+        (mesh, edge)
+    }
+
+    /// §6.6.1.4 **condition (1)** at the edge-level site, pinned at the *predicate* rather
+    /// than through a donor observation: the condition reads the edge's own two
+    /// flanking-face slots, and fires exactly when one is empty.
+    ///
+    /// Naming the fixture precisely matters here, because the obvious one is dead. An
+    /// interior edge with boundary *endpoints* (a two-quad strip's shared edge) fills both
+    /// its slots and is **not** a condition-(1) seam; it is the endpoint's boundary *legs*
+    /// that are seams, which is the corner-level form. The edge that fires is the boundary
+    /// edge itself, and it fires with no loop layer on the mesh at all.
+    #[test]
+    fn face_cd_an_empty_flank_slot_is_a_condition_one_seam_with_no_loop_layer() {
+        let mut mesh = LoopMesh::new();
+        let corner = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let a = mesh.create_vertex(corner(-2.0, -1.0));
+        let b = mesh.create_vertex(corner(0.0, -1.0));
+        let c = mesh.create_vertex(corner(2.0, -1.0));
+        let d = mesh.create_vertex(corner(2.0, 1.0));
+        let e = mesh.create_vertex(corner(0.0, 1.0));
+        let f = mesh.create_vertex(corner(-2.0, 1.0));
+        mesh.face_create_verts(&[a, b, e, f], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[b, c, d, e], FaceCreateFlags::NONE);
         assert!(
             mesh.loop_attribs().is_empty(),
             "the fixture must carry no loop layer, or condition (2) is in play",
         );
 
-        let tint = tint_and_slot_faces(&mut mesh);
-        let (near_face, far_face) = mesh.edge_flanking_faces(edge);
-        let near_face = near_face.expect("the shared edge has a near flank");
-        let far_face = far_face.expect("the shared edge has a far flank");
-        mesh.set_face_material_index(near_face, 7);
-        mesh.set_face_material_index(far_face, 2);
-        let block_of = |mesh: &LoopMesh, face: FaceKey| {
-            (
-                mesh.face_material_index(face),
-                mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap(),
-            )
-        };
-        let near_block = block_of(&mesh, near_face);
-        let far_block = block_of(&mesh, far_face);
-        let near_center = mesh.face_center_of_mass(near_face);
-
-        let result = mesh.bevel(
-            &[edge.into()],
-            BevelOptions {
-                offset: 0.25,
-                affect: BevelAffect::Edges,
-                segments: 3,
-                material: -1,
-                ..Default::default()
-            },
+        let boundary = mesh.query_edge_exists(a, b).expect("a boundary edge");
+        assert!(
+            mesh.edge_is_interp_seam(boundary),
+            "a boundary edge leaves one flank slot empty — condition (1), layer-free",
         );
-        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+
+        let interior = mesh.query_edge_exists(b, e).expect("the shared edge");
+        assert!(
+            !mesh.edge_is_interp_seam(interior),
+            "an interior edge with boundary endpoints fills both its own slots, and with \
+             zero loop layers condition (2) short-circuits to contiguous",
+        );
+    }
+
+    /// §6.6.1.4 condition (2)'s **zero-loop-layer short-circuit**, and the classification
+    /// that rides on it: inconsistent winding is a condition-(2) trigger, not a
+    /// condition-(1) one. Winding plays no part in filling the edge's flank slots, so an
+    /// inconsistently wound *manifold* edge fills both — condition (1) cannot fire — and on
+    /// an untextured mesh condition (2) short-circuits before the corner pairing is even
+    /// attempted. The edge is therefore **not a seam**, no tie-break runs, and the straddle
+    /// quad keeps the positional near flank.
+    #[test]
+    fn face_cd_inconsistently_wound_flanks_are_not_a_seam_with_no_loop_layer() {
+        let (mesh, edge) = noncontiguous_two_quad_plane();
+        assert!(
+            mesh.loop_attribs().is_empty(),
+            "the fixture must carry no loop layer, or the short-circuit is not under test",
+        );
+        assert!(
+            !mesh.edge_is_interp_seam(edge),
+            "condition (2) short-circuits to contiguous on a zero-loop-layer mesh, and \
+             inconsistent winding is not a condition-(1) trigger",
+        );
+
+        let (near_face, far_face) = mesh.edge_flanking_faces(edge);
         assert_eq!(
-            blocks,
-            vec![near_block, far_block, far_block],
-            "inconsistently wound flanks are a condition-(1) seam on an untextured mesh, so \
-             the centre quad takes the tie-break winner {far_block:?}",
+            mesh.straddle_quad_donor(edge, near_face, far_face, 3, None),
+            near_face,
+            "an unseamed edge keeps §6.6.1's positional donor at every odd `segments`",
+        );
+    }
+
+    /// The other side of the same short-circuit: add **one** loop layer — even one whose
+    /// type defines no blend at all — and condition (2) is evaluated. The corner pairing an
+    /// inconsistently wound radial pair makes impossible then fails, which is a seam on that
+    /// ground alone, whatever any layer holds.
+    #[test]
+    fn face_cd_inconsistently_wound_flanks_are_a_seam_once_any_loop_layer_exists() {
+        let (mut mesh, edge) = noncontiguous_two_quad_plane();
+        mesh.register_loop_attribute(ElementAttributeDesc::string(AttributeKey::custom(
+            "l_label",
+        )))
+        .expect("a loop layer with no interpolation math");
+
+        assert!(
+            mesh.edge_is_interp_seam(edge),
+            "the flanks' corners cannot be paired across an inconsistently wound edge, so \
+             the layers-agree test reports seam once any loop layer is present",
+        );
+    }
+
+    /// A non-manifold "book" of three triangular pages hinged on the spine `v0–v1`, every
+    /// page wound `[v0, v1, tip]`, so the spine's radial cycle has valence 3. Returns the
+    /// spine.
+    fn book_spine_three_pages() -> (LoopMesh, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        for page in 0..3 {
+            let tip = mesh.create_vertex(Vec3::new(1.0 + page as f32, 0.5, 0.0));
+            mesh.face_create_verts(&[v0, v1, tip], FaceCreateFlags::NONE);
+        }
+        let spine = mesh.query_edge_exists(v0, v1).expect("the spine edge");
+        (mesh, spine)
+    }
+
+    /// §6.6.1.4 condition (1)'s third bullet: an edge with **three or more** faces does not
+    /// "miss" a face, so the test falls through to condition (2) — which, with zero loop
+    /// layers, short-circuits to contiguous. A predicate that asked "is there a face arriving
+    /// at each endpoint" through the fan would resolve no arriving face at `v0` on this
+    /// fixture and misreport a condition-(1) seam on an untextured mesh.
+    #[test]
+    fn face_cd_a_radial_three_edge_is_not_a_condition_one_seam_with_no_loop_layer() {
+        let (mesh, spine) = book_spine_three_pages();
+        assert_eq!(
+            mesh.iter_radial_loops(spine).count(),
+            3,
+            "the fixture must be radial-3, or the fall-through is not under test",
+        );
+        assert!(
+            mesh.loop_attribs().is_empty(),
+            "the fixture must carry no loop layer, or condition (2) is in play",
+        );
+        assert!(
+            !mesh.edge_is_interp_seam(spine),
+            "a radial-3 edge misses no face, so condition (1) cannot fire and the layer-free \
+             mesh short-circuits to contiguous",
+        );
+    }
+
+    /// The other half of §6.6.1.4's corollary — a fan-resolved non-manifold edge is a seam
+    /// **iff** the mesh has at least one loop layer. The same spine that reads contiguous
+    /// untextured becomes a seam once any loop layer exists, because the corner pairing
+    /// condition (2) opens with rejects the third radial loop. Both states are asserted here,
+    /// so the seam is attributable to the layer rather than to the topology alone.
+    #[test]
+    fn face_cd_a_radial_three_edge_is_a_seam_once_any_loop_layer_exists() {
+        let (mut mesh, spine) = book_spine_three_pages();
+        assert!(
+            !mesh.edge_is_interp_seam(spine),
+            "the fixture starts contiguous, or the layer is not what flips it",
+        );
+
+        mesh.register_loop_attribute(ElementAttributeDesc::string(AttributeKey::custom(
+            "l_label",
+        )))
+        .expect("a loop layer with no interpolation math");
+
+        assert!(
+            mesh.edge_is_interp_seam(spine),
+            "a third radial loop makes the corner pairing impossible, which is a seam on that \
+             ground alone",
         );
     }
 

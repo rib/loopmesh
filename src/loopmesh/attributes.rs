@@ -895,7 +895,8 @@ impl ElementAttributes {
 
     /// Exact (bitwise for floats, value-wise otherwise) equality of one
     /// attribute layer at two slots, allocation-free. Used by the non-math
-    /// branch of [`slots_tolerant_equal`]. A missing value on both slots
+    /// branch of [`slots_tolerant_equal`], and directly by callers that want an
+    /// exact compare on a *math* layer too. A missing value on both slots
     /// counts as equal; on only one, unequal.
     pub(crate) fn slot_layer_exact_equal(
         &self,
