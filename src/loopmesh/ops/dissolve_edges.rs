@@ -2034,8 +2034,16 @@ mod tests {
         let e_ps = mesh.create_edge([p, s], EdgeCreateFlags::NO_DUPLICATE);
         let e_sq = mesh.create_edge([s, q], EdgeCreateFlags::NO_DUPLICATE);
 
-        mesh.face_create(&[p, v, q, r], &[e_pv, e_vq, e_qr, e_rp], FaceCreateFlags::NONE);
-        mesh.face_create(&[q, v, p, s], &[e_vq, e_pv, e_ps, e_sq], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[p, v, q, r],
+            &[e_pv, e_vq, e_qr, e_rp],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[q, v, p, s],
+            &[e_vq, e_pv, e_ps, e_sq],
+            FaceCreateFlags::NONE,
+        );
 
         assert_eq!(
             mesh.vertex_disk_count_edges_capped(v, 3),
@@ -2045,7 +2053,10 @@ mod tests {
 
         mesh.dissolve_edges(&[e_pv], &DissolveEdgesParams::default());
 
-        assert!(mesh.edges.try_get(e_pv).is_none(), "the dissolved edge is swept");
+        assert!(
+            mesh.edges.try_get(e_pv).is_none(),
+            "the dissolved edge is swept"
+        );
         assert!(
             mesh.edges.try_get(e_vq).is_none(),
             "the pinch's *other* shared edge went wire in the same merge and is swept too"
@@ -2077,12 +2088,18 @@ mod tests {
             .expect("the vertical interior edge of the bottom quad pair");
         mesh.dissolve_edges(&[shared], &DissolveEdgesParams::default());
 
-        assert!(mesh.edges.try_get(shared).is_none(), "the input edge dissolves");
+        assert!(
+            mesh.edges.try_get(shared).is_none(),
+            "the input edge dissolves"
+        );
         assert!(
             mesh.edges.try_get(stub).is_some(),
             "an unflagged pre-existing wire edge survives the §6.5 sweep"
         );
-        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so does its far end");
+        assert!(
+            mesh.vertices.try_get(stub_end).is_some(),
+            "and so does its far end"
+        );
         mesh.validate_topology();
     }
 }

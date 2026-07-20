@@ -2326,7 +2326,11 @@ mod tests {
 
         let hub = verts[5];
         let spokes: Vec<EdgeKey> = collect_iter::<_, 8>(&mesh, mesh.disk_edges(hub)).to_vec();
-        assert_eq!(spokes.len(), 4, "the grid centre is a four-spoke interior fan");
+        assert_eq!(
+            spokes.len(),
+            4,
+            "the grid centre is a four-spoke interior fan"
+        );
 
         mesh.dissolve_verts(&[hub]);
 
@@ -2340,7 +2344,11 @@ mod tests {
             mesh.vertices.try_get(hub).is_none(),
             "the hub goes out through §6.4's isolated-vert GC, not through the join"
         );
-        assert_eq!(mesh.face_count(), 6, "4 quads → 1 octagon, 5 quads untouched");
+        assert_eq!(
+            mesh.face_count(),
+            6,
+            "4 quads → 1 octagon, 5 quads untouched"
+        );
         mesh.validate_topology();
     }
 
@@ -2366,8 +2374,16 @@ mod tests {
              non-manifold spoke"
         );
         assert_eq!(mesh.vertex_count(), 14, "16 − 2 hubs");
-        assert_eq!(mesh.edge_count(), 17, "24 − 7 spokes (the two disks, shared edge once)");
-        assert_eq!(mesh.face_count(), 4, "the bottom two rows' 6 quads → 1; 3 quads untouched");
+        assert_eq!(
+            mesh.edge_count(),
+            17,
+            "24 − 7 spokes (the two disks, shared edge once)"
+        );
+        assert_eq!(
+            mesh.face_count(),
+            4,
+            "the bottom two rows' 6 quads → 1; 3 quads untouched"
+        );
 
         let mut widest = 0usize;
         let mut face_iter = MeshFaces::default();
@@ -2398,8 +2414,14 @@ mod tests {
             mesh.edges.try_get(stub).is_some(),
             "an unflagged pre-existing wire edge survives the §6.4 sweep"
         );
-        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so does its far end");
-        assert!(mesh.vertices.try_get(verts[5]).is_none(), "the hub still dissolves");
+        assert!(
+            mesh.vertices.try_get(stub_end).is_some(),
+            "and so does its far end"
+        );
+        assert!(
+            mesh.vertices.try_get(verts[5]).is_none(),
+            "the hub still dissolves"
+        );
         mesh.validate_topology();
     }
 }

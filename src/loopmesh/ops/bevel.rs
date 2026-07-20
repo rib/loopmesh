@@ -1189,7 +1189,10 @@ impl LoopMesh {
     fn edge_flanking_faces(&self, edge: EdgeKey) -> (Option<FaceKey>, Option<FaceKey>) {
         let loops = self.edge_loop_keys(edge);
         let near = loops.first().map(|&loop_key| self.loop_face(loop_key));
-        let far = loops.get(1).map(|&loop_key| self.loop_face(loop_key)).or(near);
+        let far = loops
+            .get(1)
+            .map(|&loop_key| self.loop_face(loop_key))
+            .or(near);
         (near, far)
     }
 
@@ -1833,6 +1836,26 @@ impl LoopMesh {
                 }
             }
         }
+        // Each beveled edge's own radial face order, read while `E` still has its loops.
+        // This — not the order the corner records happened to be pushed in — nominates the
+        // strip's winding anchor, so an edge winds the same way whichever route (isolated
+        // or junction) closed its endpoints. The re-stitch below strips `E` of its loops,
+        // hence the capture here rather than inside the strip builder.
+        let strip_flanks: Vec<Option<[FaceKey; 2]>> = beveled_manifold
+            .iter()
+            .map(|&edge| {
+                let faces: Vec<FaceKey> = self
+                    .edge_loop_keys(edge)
+                    .iter()
+                    .map(|&l| self.loop_face(l))
+                    .collect();
+                match faces[..] {
+                    [left, right] => Some([left, right]),
+                    _ => None,
+                }
+            })
+            .collect();
+
         let (rebuilt, donors) = self.restitch_consumed_endpoints(
             &incident_faces,
             &endpoints,
@@ -1843,9 +1866,14 @@ impl LoopMesh {
         // Phase 3: one strip quad per beveled edge over its four near/far corner
         // verts (§7.1 item 2). §6.6: each new strip inherits its donor's whole block,
         // then takes the `material` stamp over the slot if >= 0.
-        for (&edge, &representative) in beveled_manifold.iter().zip(&strip_templates) {
+        for ((&edge, &representative), &flanks) in beveled_manifold
+            .iter()
+            .zip(&strip_templates)
+            .zip(&strip_flanks)
+        {
             self.build_junction_strip(
                 edge,
+                flanks,
                 &corner_vert,
                 material,
                 templates.resolve(representative),
@@ -2759,15 +2787,17 @@ impl LoopMesh {
             (legs.end_leg, legs.start_leg)
         };
 
-        let strip_for_leg =
-            |this: &mut Self, leg: EdgeKey, face: FaceKey, result: &mut BevelResult| {
-                let position =
-                    this.terminal_strip_vert(vertex, edge, leg, face, leg == legs.start_leg, offset);
-                // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
-                let strip_vert = this.mint_bevel_vertex(position, vertex);
-                result.verts.push(strip_vert);
-                strip_vert
-            };
+        let strip_for_leg = |this: &mut Self,
+                             leg: EdgeKey,
+                             face: FaceKey,
+                             result: &mut BevelResult| {
+            let position =
+                this.terminal_strip_vert(vertex, edge, leg, face, leg == legs.start_leg, offset);
+            // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
+            let strip_vert = this.mint_bevel_vertex(position, vertex);
+            result.verts.push(strip_vert);
+            strip_vert
+        };
 
         let strip_left = strip_for_leg(self, left_leg, face_left, result);
         let strip_right = strip_for_leg(self, right_leg, face_right, result);
@@ -5690,6 +5720,7 @@ impl LoopMesh {
                         vertex,
                         face,
                         near_vert: boundvert,
+                        side_label: SideLabel::Unlabelled,
                     });
                 }
             }
@@ -5788,12 +5819,16 @@ impl LoopMesh {
             )
             .expect("the up-front terminal plan admitted this endpoint's close");
 
+        // §7.8.3 property 1: the label is read off the endpoint's *normalised* rotational
+        // order at layout time, not recovered later from which flank touches the vert —
+        // which is why it must ride the record rather than be re-derived from `face`.
         for face in [face_left, face_right] {
             corner_vert.push(CornerVert {
                 edge,
                 vertex,
                 face,
                 near_vert: rung_ends.on_face(face),
+                side_label: rung_ends.label_on_face(face),
             });
         }
     }
@@ -6388,7 +6423,11 @@ impl LoopMesh {
     /// lying between a given pair of edges is still that same pair's sector afterwards —
     /// dropping that swap would read every sector's face off by one and mis-sign the leg
     /// meet on ordinary meshes too.
-    fn normalise_corner_ring(&self, vertex: VertexKey, ring: Vec<VertexCorner>) -> Vec<VertexCorner> {
+    fn normalise_corner_ring(
+        &self,
+        vertex: VertexKey,
+        ring: Vec<VertexCorner>,
+    ) -> Vec<VertexCorner> {
         let mut tally: i32 = 0;
         for corner in &ring {
             let Some((arrives_on, leaves_on)) = self.face_corner_edges(corner.face, vertex) else {
@@ -7160,6 +7199,7 @@ impl LoopMesh {
     fn build_junction_strip(
         &mut self,
         edge: EdgeKey,
+        flanks: Option<[FaceKey; 2]>,
         corner_vert: &[CornerVert],
         material: i32,
         representative: FaceTemplateRef<'_>,
@@ -7181,8 +7221,17 @@ impl LoopMesh {
         if radial_faces.len() != 2 {
             return; // a non-manifold edge produced no strip
         }
-        let face_left = radial_faces[0];
-        let face_right = radial_faces[1];
+        // The left/right nomination comes from `E`'s own pre-stitch radial order, never
+        // from the order the corner records happened to be pushed in: the winding anchor
+        // below must not depend on the sector/push route, or the same edge would wind
+        // opposite ways depending on how its endpoints were closed.
+        let Some([face_left, face_right]) = flanks else {
+            return;
+        };
+        debug_assert!(
+            radial_faces.contains(&face_left) && radial_faces.contains(&face_right),
+            "the recorded corner faces are the beveled edge's own radial pair",
+        );
 
         // A corner the placement pass declined (a degenerate endpoint) has no near vert,
         // so there is no strip to build here — decline rather than assert.
@@ -7194,6 +7243,37 @@ impl LoopMesh {
         ) else {
             return;
         };
+
+        // §7.8.3: pair the rails by side label when both endpoints carry one. On mirrored
+        // labels this is the same cycle the face-keyed order below produces; under the
+        // tied-vote twist it is the twisted quad, and the face-keyed order is the guide's
+        // explicitly named wrong route (the like-label pairing).
+        if let Some((prev_a, next_a)) = labelled_rung_ends(corner_vert, edge, a) {
+            if let Some((prev_b, next_b)) = labelled_rung_ends(corner_vert, edge, b) {
+                let ring = [prev_a, next_b, prev_b, next_a];
+                if ring_has_repeat(&ring) {
+                    self.build_collapsed_strip(&ring, material, representative, result);
+                    return;
+                }
+                // The winding anchor is a *fixed* flank's own pair — read per-face, the
+                // sanctioned use of the labels — so the emitted handedness never varies
+                // with which rail the disk order happened to label first.
+                let strip = self.build_strip_quad(prev_a, next_b, prev_b, next_a, [a_left, b_left]);
+                self.assign_bevel_face_attributes(
+                    strip.face,
+                    material,
+                    representative,
+                    BevelNewFaceKind::Strip,
+                );
+                result.faces.push(strip.face);
+                for strip_edge in strip.edges {
+                    if !result.edges.contains(&strip_edge) {
+                        result.edges.push(strip_edge);
+                    }
+                }
+                return;
+            }
+        }
 
         // A through-junction (s == 2) collapses an edge's two near corners on a
         // side into one boundvert; the strip quad can then degenerate. Skip a strip
@@ -7341,6 +7421,19 @@ impl LoopMesh {
     ) {
         for &edge in beveled {
             let [a, b] = self.edge_vert_keys(edge);
+            // §7.8.3: the two long edges *are* the strip's rails, so name them by side
+            // label wherever both endpoints carry one. The face-keyed pairs below coincide
+            // with the rails on mirrored labels, but under the tied-vote twist they are no
+            // rail at all — copying `edge`'s block onto a rebuilt flank's own edge.
+            if let Some(rails) = labelled_strip_rails(corner_vert, edge, a, b) {
+                for (near_a, near_b) in rails {
+                    if let Some(long_edge) = self.query_edge_exists(near_a, near_b) {
+                        self.edge_attribs
+                            .copy_into(long_edge.as_usize(), edge.as_usize());
+                    }
+                }
+                continue;
+            }
             // One long edge per radial face of the strip: the near corner at `a` to
             // the near corner at `b` on that face.
             let mut faces: Vec<FaceKey> = Vec::new();
@@ -7757,16 +7850,23 @@ impl LoopMesh {
     /// that keeps the shared edge radial-2.
     ///
     /// `anchor` is **one nominated flank's own pair** of rung ends — its ring vert at `a`
-    /// and its ring vert at `b`. Which flank is nominated must not vary with the side
-    /// labels, or the emitted winding would depend on the disk-order accident of which
-    /// rail happened to be picked: the two flanks' rails impose *contradictory* §5.1
-    /// conditions once the labels stop being mirrored. The caller therefore always
-    /// nominates `E`'s first radial face.
+    /// and its ring vert at `b`. Which flank is nominated must be a fixed property of `E`,
+    /// never a by-product of how the endpoints were closed: the caller always nominates
+    /// `E`'s own first radial face, read before the re-stitch.
     ///
-    /// Under §7.8.3's un-mirrored labels the nominated flank's pair is *like*-labelled,
-    /// hence no rail at all — nothing to wind against — and the emission order above
-    /// stands: it is anchored on `E`'s first stored endpoint, which is what makes the
-    /// twisted quad reproducible rather than seed-dependent.
+    /// The regime that makes that nomination load-bearing is the §7.8.3 **decisive-vote
+    /// mis-wound** one: the labels are still mirrored, so both pairs are rails and the
+    /// anchor does resolve, but the two flanks are inconsistently wound *with each other*,
+    /// so each demands the opposite reversal of the emission order. Whichever flank is
+    /// nominated wins, and a nomination that drifted with the record order would flip the
+    /// emitted handedness for the same input.
+    ///
+    /// Under §7.8.3's un-mirrored labels the question does not arise at all: a
+    /// like-labelled pair sits *diagonally* in `[P(a), N(b), P(b), N(a)]` — indices 0/2 or
+    /// 1/3, never consecutive — so `emitted_anchor` is `None`, the anchor is irrelevant,
+    /// and the emission order above stands as written. It is anchored on `E`'s first
+    /// stored endpoint, which is what makes the twisted quad reproducible rather than
+    /// seed-dependent.
     fn build_strip_quad(
         &mut self,
         prev_a: VertexKey,
@@ -7786,8 +7886,10 @@ impl LoopMesh {
             let to = ring[(i + 1) % ring.len()];
             (anchor.contains(&from) && anchor.contains(&to) && from != to).then_some((from, to))
         });
-        let anchor_rail = emitted_anchor
-            .and_then(|(from, to)| self.query_edge_exists(from, to).map(|rail| (rail, from, to)));
+        let anchor_rail = emitted_anchor.and_then(|(from, to)| {
+            self.query_edge_exists(from, to)
+                .map(|rail| (rail, from, to))
+        });
         // Mirrored labels ⇒ the flank's pair is one of the strip's two rails, and the
         // re-stitched flank already owns it; un-mirrored ⇒ it is nobody's rail. Exactly
         // one rail of a pair existing is unreachable under §7.8.3.
@@ -9689,6 +9791,14 @@ struct CornerVert {
     vertex: VertexKey,
     face: FaceKey,
     near_vert: VertexKey,
+    /// Which of `vertex`'s two BEVEL.md §7.8.3 side labels `near_vert` carries:
+    /// `PrevFirst` for `P(vertex)`, `NextFirst` for `N(vertex)`. `Unlabelled` at a
+    /// junction endpoint, whose sector boundvert ring establishes no such label —
+    /// there the rail pairing has no choice but to name the side by flank face, which
+    /// is §7.8.3's wrong route whenever that endpoint is also inconsistently wound.
+    /// §7.8.6's third bullet leaves exactly that configuration unpinned; see
+    /// [`labelled_strip_rails`].
+    side_label: SideLabel,
 }
 
 /// One beveled-edge side's **terminal-end** width-reconciled offset
@@ -9852,6 +9962,21 @@ impl RungEnds {
             self.prev_side
         } else {
             self.next_side
+        }
+    }
+
+    /// The §7.8.3 side label the given flank face's ring vert carries at this endpoint.
+    /// Shares `on_face`'s guard so a face that flanks neither side is caught rather than
+    /// silently labelled `NextFirst`.
+    fn label_on_face(&self, face: FaceKey) -> SideLabel {
+        debug_assert!(
+            face == self.prev_face || face == self.next_face,
+            "only a flank of the beveled edge touches a rung end",
+        );
+        if face == self.prev_face {
+            SideLabel::PrevFirst
+        } else {
+            SideLabel::NextFirst
         }
     }
 }
@@ -10311,6 +10436,48 @@ fn near_corner(
         .iter()
         .find(|c| c.edge == edge && c.vertex == vertex && c.face == face)
         .map(|c| c.near_vert)
+}
+
+/// The endpoint's two labelled rung ends as `(P(vertex), N(vertex))` (BEVEL.md §7.8.3).
+/// `None` when either label is missing — a junction endpoint, or a corner the placement
+/// pass declined.
+fn labelled_rung_ends(
+    corner_vert: &[CornerVert],
+    edge: EdgeKey,
+    vertex: VertexKey,
+) -> Option<(VertexKey, VertexKey)> {
+    let labelled = |wanted: SideLabel| {
+        corner_vert
+            .iter()
+            .find(|c| c.edge == edge && c.vertex == vertex && c.side_label == wanted)
+            .map(|c| c.near_vert)
+    };
+    Some((
+        labelled(SideLabel::PrevFirst)?,
+        labelled(SideLabel::NextFirst)?,
+    ))
+}
+
+/// The beveled edge's two **rails** on the junction path, paired by BEVEL.md §7.8.3's
+/// side-label rule: a rail joins *opposite* labels, `P(a)—N(b)` and `N(a)—P(b)`, never a
+/// flank's own two ring verts. `None` when *either* endpoint is unlabelled (a junction
+/// end), where the pairing falls back to naming the side by flank-face identity.
+///
+/// That fallback is **not** justified by "the labels would have been mirrored anyway": an
+/// inconsistently-wound endpoint carrying two or more beveled edges makes this return
+/// `None` for its edges, so both ends get paired by flank face — §7.8.3's explicitly named
+/// wrong route. What covers it is narrower: §7.8.6's third bullet puts junctions at an
+/// inconsistently-wound endpoint **out of scope**, so that configuration is simply
+/// unpinned. Labelling junction boundverts would close the hole.
+fn labelled_strip_rails(
+    corner_vert: &[CornerVert],
+    edge: EdgeKey,
+    a: VertexKey,
+    b: VertexKey,
+) -> Option<[(VertexKey, VertexKey); 2]> {
+    let (prev_a, next_a) = labelled_rung_ends(corner_vert, edge, a)?;
+    let (prev_b, next_b) = labelled_rung_ends(corner_vert, edge, b)?;
+    Some([(prev_a, next_b), (next_a, prev_b)])
 }
 
 /// True when all the corner-vert positions coincide within tolerance (the §8.3.4
@@ -29005,7 +29172,9 @@ mod tests {
             })
             .collect();
         assert!(
-            survivor.iter().any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
+            survivor
+                .iter()
+                .any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
             "the mis-wound flank is rebuilt at its original corners",
         );
     }
@@ -29178,7 +29347,9 @@ mod tests {
                 })
                 .collect();
             assert!(
-                survivor.iter().any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
+                survivor
+                    .iter()
+                    .any(|cycle| cycle_matches(&before, cycle, 1.0e-4)),
                 "rotation {rotation}: the collapse still lands on the reversed face",
             );
         }
@@ -29317,6 +29488,77 @@ mod tests {
             .count()
     }
 
+    /// Every edge the strip shares with a named flank, as `(shared edges, edges the two
+    /// faces traverse in *opposite* directions)`. §5.1's winding rule makes the second
+    /// equal the first: a rail the re-stitched flank already owns must be walked backwards
+    /// by the strip. Unlike a cycle-up-to-reflection check this pins the strip's *absolute*
+    /// loop direction, since the flank named here is a pre-bevel face with a fixed winding.
+    fn strip_rail_windings(mesh: &LoopMesh) -> (usize, usize) {
+        let left = face_through(mesh, Vec3::ZERO);
+        let right = face_through(mesh, Vec3::new(2.0, 0.0, 0.0));
+        let mut shared = 0;
+        let mut opposed = 0;
+        for face in mesh.face_keys() {
+            if face == left || face == right {
+                continue;
+            }
+            for edge in face_edge_keys(mesh, face) {
+                let loops = mesh.edge_loop_keys(edge);
+                let [one, two] = match loops[..] {
+                    [one, two] => [one, two],
+                    _ => continue,
+                };
+                let flank_side = [one, two]
+                    .into_iter()
+                    .find(|&l| matches!(mesh.loop_face(l), f if f == left || f == right));
+                let Some(flank_loop) = flank_side else {
+                    continue;
+                };
+                let strip_loop = if flank_loop == one { two } else { one };
+                if mesh.loop_face(strip_loop) != face {
+                    continue;
+                }
+                shared += 1;
+                let flank_run = (
+                    mesh.loop_vertex(flank_loop),
+                    mesh.loop_vertex(mesh.loop_next(flank_loop)),
+                );
+                let strip_run = (
+                    mesh.loop_vertex(strip_loop),
+                    mesh.loop_vertex(mesh.loop_next(strip_loop)),
+                );
+                if flank_run == (strip_run.1, strip_run.0) {
+                    opposed += 1;
+                }
+            }
+        }
+        (shared, opposed)
+    }
+
+    /// §5.1 on both strip builders. `cycle_matches` accepts a reflected cycle, so the
+    /// rail-pairing tests leave the strip's absolute handedness free; this pins it against
+    /// the fixed winding of a flank that existed before the bevel. The isolated and
+    /// junction routes must agree — a winding anchor derived from record order rather than
+    /// from `E`'s own radial order is what would split them.
+    #[test]
+    fn strip_winds_opposite_its_flanks_rail_on_both_routes() {
+        let (mut isolated_route, edge) = two_quad_plane(true);
+        bevel_one_edge(&mut isolated_route, edge, 1);
+        assert_eq!(
+            strip_rail_windings(&isolated_route),
+            (2, 2),
+            "isolated route: both rails walked backwards by the strip",
+        );
+
+        let (mut junction_route, isolated, junction) = plane_plus_cube_junction(true);
+        bevel_count_delta(&mut junction_route, &[isolated, junction[0], junction[1]]);
+        assert_eq!(
+            strip_rail_windings(&junction_route),
+            (2, 2),
+            "junction route: the same strip, wound the same way",
+        );
+    }
+
     /// §7.8.3's rail rule on a **contiguous** pair — the regime where the labels come
     /// out mirrored, so each rebuilt flank's own two strip-side verts *are* a rail. The
     /// cross-labelled pairing must reproduce the §7.1 quad exactly: one shared edge per
@@ -29421,6 +29663,111 @@ mod tests {
             strip_flank_shared_edges(&mesh),
             0,
             "the crack survives the profile: both outer rails are cross-labelled",
+        );
+        mesh.validate_topology();
+    }
+
+    /// The two-quad plane plus a **disjoint** cube whose corner `(1, -1, -1)` carries two
+    /// beveled edges. Beveling all three in one call makes the run junction-bearing, which
+    /// is what routes the plane's isolated edge through the junction strip builder rather
+    /// than the isolated-edge path.
+    fn plane_plus_cube_junction(contiguous: bool) -> (LoopMesh, EdgeKey, [EdgeKey; 2]) {
+        let (mut mesh, isolated) = two_quad_plane(contiguous);
+        mesh_add_cube(&mut mesh);
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let junction = [
+            cube_edge(&mesh, corner, Vec3::new(-1.0, -1.0, -1.0)),
+            cube_edge(&mesh, corner, Vec3::new(1.0, 1.0, -1.0)),
+        ];
+        (mesh, isolated, junction)
+    }
+
+    fn bevel_count_delta(mesh: &mut LoopMesh, edges: &[EdgeKey]) -> (i64, i64, i64) {
+        let before = counts(mesh);
+        let selection: Vec<GeomKey> = edges.iter().map(|&e| e.into()).collect();
+        mesh.bevel(
+            &selection,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                ..Default::default()
+            },
+        );
+        let after = counts(mesh);
+        (
+            after.0 as i64 - before.0 as i64,
+            after.1 as i64 - before.1 as i64,
+            after.2 as i64 - before.2 as i64,
+        )
+    }
+
+    /// §7.8.3 on the **junction** route. The rail pairing is the same rule in every
+    /// regime, so which builder a beveled edge happens to reach must not change it.
+    /// Adding a junction-bearing pair elsewhere in the same call sends the tied-vote
+    /// mis-wound isolated edge — both endpoints terminal — through the junction strip
+    /// builder; its own contribution must stay the twisted `+2 V / +5 E / +1 F`, not the
+    /// `+3 E` straight join that keying each rail to a flank *face* would give.
+    #[test]
+    fn junction_path_strip_rails_pair_by_side_label_not_flank_face() {
+        let isolated_alone = {
+            let (mut mesh, edge) = two_quad_plane(false);
+            bevel_count_delta(&mut mesh, &[edge])
+        };
+        let junction_only = {
+            let (mut mesh, _, junction) = plane_plus_cube_junction(false);
+            bevel_count_delta(&mut mesh, &junction)
+        };
+        let (mut mesh, isolated, junction) = plane_plus_cube_junction(false);
+        let together = bevel_count_delta(&mut mesh, &[isolated, junction[0], junction[1]]);
+
+        assert_eq!(
+            (
+                together.0 - junction_only.0,
+                together.1 - junction_only.1,
+                together.2 - junction_only.2,
+            ),
+            isolated_alone,
+            "the isolated edge's contribution must not depend on which strip builder \
+             the run's junctions routed it to",
+        );
+        assert_eq!(
+            strip_flank_shared_edges(&mesh),
+            0,
+            "the §7.8.3 crack survives the junction route: the twisted strip shares no \
+             edge with either rebuilt flank",
+        );
+        mesh.validate_topology();
+    }
+
+    /// The mirrored-label control for the test above: on a contiguous pair the
+    /// cross-labelled rails *are* the rebuilt flanks' own pairs, so the junction route
+    /// must reproduce the §7.1 quad — one shared edge per flank — exactly as before.
+    #[test]
+    fn junction_path_strip_rails_are_the_flanks_own_pairs_when_labels_are_mirrored() {
+        let isolated_alone = {
+            let (mut mesh, edge) = two_quad_plane(true);
+            bevel_count_delta(&mut mesh, &[edge])
+        };
+        let junction_only = {
+            let (mut mesh, _, junction) = plane_plus_cube_junction(true);
+            bevel_count_delta(&mut mesh, &junction)
+        };
+        let (mut mesh, isolated, junction) = plane_plus_cube_junction(true);
+        let together = bevel_count_delta(&mut mesh, &[isolated, junction[0], junction[1]]);
+
+        assert_eq!(
+            (
+                together.0 - junction_only.0,
+                together.1 - junction_only.1,
+                together.2 - junction_only.2,
+            ),
+            isolated_alone,
+        );
+        assert_eq!(
+            strip_flank_shared_edges(&mesh),
+            2,
+            "each rebuilt flank still shares exactly one rail with the strip",
         );
         mesh.validate_topology();
     }

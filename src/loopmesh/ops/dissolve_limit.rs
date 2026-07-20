@@ -2492,8 +2492,16 @@ mod tests {
         let e_ps = mesh.create_edge([p, s], EdgeCreateFlags::NO_DUPLICATE);
         let e_sq = mesh.create_edge([s, q], EdgeCreateFlags::NO_DUPLICATE);
 
-        mesh.face_create(&[p, v, q, r], &[e_pv, e_vq, e_qr, e_rp], FaceCreateFlags::NONE);
-        mesh.face_create(&[q, v, p, s], &[e_vq, e_pv, e_ps, e_sq], FaceCreateFlags::NONE);
+        mesh.face_create(
+            &[p, v, q, r],
+            &[e_pv, e_vq, e_qr, e_rp],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create(
+            &[q, v, p, s],
+            &[e_vq, e_pv, e_ps, e_sq],
+            FaceCreateFlags::NONE,
+        );
 
         let result = mesh.dissolve_limit(
             &[e_pv, e_vq],
@@ -2505,7 +2513,10 @@ mod tests {
         );
         assert!(matches!(result, DissolveLimitResult::Ran { .. }));
 
-        assert!(mesh.edges.try_get(e_pv).is_none(), "the merged-across edge is swept");
+        assert!(
+            mesh.edges.try_get(e_pv).is_none(),
+            "the merged-across edge is swept"
+        );
         assert!(
             mesh.edges.try_get(e_vq).is_none(),
             "the pinch's other shared edge went wire in the same merge and is swept too"
@@ -2542,12 +2553,18 @@ mod tests {
             },
         );
 
-        assert!(mesh.edges.try_get(seam).is_none(), "the coplanar seam dissolves");
+        assert!(
+            mesh.edges.try_get(seam).is_none(),
+            "the coplanar seam dissolves"
+        );
         assert!(
             mesh.edges.try_get(stub).is_some(),
             "an edge that was wire on entry is not the cleanup's business"
         );
-        assert!(mesh.vertices.try_get(stub_end).is_some(), "and so its far end lives");
+        assert!(
+            mesh.vertices.try_get(stub_end).is_some(),
+            "and so its far end lives"
+        );
         mesh.validate_topology();
     }
 }
