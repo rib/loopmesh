@@ -1623,7 +1623,10 @@ mod tests {
         mesh.loop_attribs()
             .blendable_layers()
             .into_iter()
-            .all(|layer| mesh.loop_attribs().slots_agree_on_blendable_layer(layer, a, b))
+            .all(|layer| {
+                mesh.loop_attribs()
+                    .slots_agree_on_blendable_layer(layer, a, b)
+            })
     }
 
     // Keep the unused-import lint happy when assertions don't touch the
@@ -4283,9 +4286,8 @@ mod tests {
         // assertion below would pass vacuously on a merge that never ran.
         let arc_end_uvs = tagged_corner_uvs_at(mesh, moved_hub, &arc_end_faces, uv);
         assert_eq!(arc_end_uvs.len(), 2);
-        let near_uv = |a: [f32; 2], b: [f32; 2]| {
-            (a[0] - b[0]).abs() < 1.0e-4 && (a[1] - b[1]).abs() < 1.0e-4
-        };
+        let near_uv =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1.0e-4 && (a[1] - b[1]).abs() < 1.0e-4;
         assert!(
             near_uv(arc_end_uvs[0], arc_end_uvs[1]),
             "fixture must fire the merge on the blendable layer; got {:?} and {:?}",
@@ -4381,7 +4383,9 @@ mod tests {
             .map(|&f| {
                 let hub = face_loops_at(mesh, f, moved_hub);
                 assert_eq!(hub.len(), 1);
-                mesh.loop_attribs().get_f32(weight, hub[0].as_usize()).unwrap()
+                mesh.loop_attribs()
+                    .get_f32(weight, hub[0].as_usize())
+                    .unwrap()
             })
             .collect();
         assert!(

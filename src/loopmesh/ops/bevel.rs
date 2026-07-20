@@ -6290,47 +6290,20 @@ impl LoopMesh {
             None => return endpoint,
         };
 
-        // The "sideways" perpendicular is built from the LOCAL edge-cross normal,
-        // oriented to the surface's outward side — the decisive §7.5.1 departure from
-        // §7.3's per-face plane normal. The cross is sign-ambiguous; the surface
-        // normal picks the outward branch. `cross(edge_out, leg_out)` is the
-        // canonical orientation; the per-side straddle is set by the offset-push sign
-        // below, not by re-deriving the normal per leg.
-        let mut local_normal = edge_out.cross(leg_out);
-        let length = local_normal.length();
-        if length <= f32::EPSILON {
-            // Leg parallel to E: no perpendicular. Slide along the leg by `offset`.
-            return self.clamp_zero_offset_terminal(endpoint + leg_out * offset, vertex, leg);
-        }
-        local_normal /= length;
-        let reference = self.sector_orientation_reference(vertex, face);
-        if local_normal.dot(reference) < 0.0 {
-            local_normal = -local_normal;
-        }
-
-        // `E`'s offset line is pushed sideways by `offset`, square to `E`, from the
-        // local normal. The sign is the rotational order's alone (see the doc comment):
-        // `E` second in the pair pushes along `E × n`, `E` first pushes against it.
-        let mut edge_perp = edge_out.cross(local_normal).normalize_or_zero();
-        if !leg_precedes_edge {
-            edge_perp = -edge_perp;
-        }
-
-        // Offset line for `E` (base pushed sideways by `offset`) against the leg's own
-        // line (offset 0 ⇒ base on the endpoint). They generally pass skew at a
-        // non-planar terminal; take the closest-points midpoint.
-        let line_edge = Line {
-            point: endpoint + edge_perp * offset,
-            direction: edge_out,
+        let sector_plane = match self.sector_plane_normal(face) {
+            Some(normal) => SectorPlane::Face(normal),
+            None => SectorPlane::NoFaceNormal {
+                reference: self.vertex_normal(vertex).normalize_or_zero(),
+            },
         };
-        let line_leg = Line {
-            point: endpoint,
-            direction: leg_out,
-        };
-        let meet = match intersect_lines(&line_edge, &line_leg) {
-            LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
-            LineMeet::Collinear => line_leg.point,
-        };
+        let meet = terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_out,
+            leg_out,
+            leg_precedes_edge,
+            sector_plane,
+            offset,
+        });
 
         // §7.5.2: the zero-offset leg must not fling the meet past its own span.
         self.clamp_zero_offset_terminal(meet, vertex, leg)
@@ -6360,18 +6333,20 @@ impl LoopMesh {
         }
     }
 
-    /// §7.5.1's **per-sector** orientation reference: the normal of the single face
-    /// filling the sector the meet is computed in, with the endpoint's vertex normal as
-    /// the fallback when that face yields nothing usable. Never hoisted out of the
-    /// per-sector loop and never averaged — the whole of §7.8 is the case where a
-    /// mis-wound sector face and any endpoint-wide surrogate for it disagree.
-    fn sector_orientation_reference(&self, vertex: VertexKey, face: FaceKey) -> Vec3 {
+    /// §7.5.1's **per-sector** quantity: the unit plane normal of the single face
+    /// filling the sector the meet is computed in. Never hoisted out of the per-sector
+    /// loop and never averaged — the whole of §7.8 is the case where a mis-wound sector
+    /// face and any endpoint-wide surrogate for it disagree.
+    ///
+    /// `None` means the face's plane normal is **degenerate** (zero-area / fully
+    /// collinear boundary). It is *not* §7.5.1's "the sector has no face" condition:
+    /// `face` is a `FaceKey`, and both call paths pass one of the beveled edge's two
+    /// radial faces, so a face-less sector cannot reach here at all. The face-less case
+    /// is representable one level down, in `SectorPlane::NoFaceNormal`, and is
+    /// currently unreachable from the mesh side.
+    fn sector_plane_normal(&self, face: FaceKey) -> Option<Vec3> {
         let normal = self.face_plane_normal(face);
-        if normal.length() > f32::EPSILON {
-            normal.normalize()
-        } else {
-            self.vertex_normal(vertex).normalize_or_zero()
-        }
+        (normal.length() > f32::EPSILON).then(|| normal.normalize())
     }
 
     /// §7.5.1 "surface normal at the terminal" / §8.8 junction `n_v`: the outward
@@ -30451,6 +30426,373 @@ mod tests {
         );
         mesh.validate_topology();
     }
+
+    // ---- BEVEL.md §7.5.1 "Three regimes, selected by the direction angle" ----
+
+    /// An independent transcription of §7.5.1's offset-line meet for a **given** plane
+    /// normal: push `E`'s line sideways by `offset` square to `E`, intersect it with the
+    /// zero-offset leg's own line, and resolve a skew pair at the midpoint of their
+    /// closest approach. The regime dispatch is *not* transcribed — the whole point is
+    /// to compare each regime's claimed normal against the placement it must produce.
+    fn leg_meet_oracle(
+        endpoint: Vec3,
+        edge_out: Vec3,
+        leg_out: Vec3,
+        leg_precedes_edge: bool,
+        plane_normal: Vec3,
+        offset: f32,
+    ) -> Vec3 {
+        let mut edge_perp = edge_out.cross(plane_normal).normalize();
+        if !leg_precedes_edge {
+            edge_perp = -edge_perp;
+        }
+        let edge_base = endpoint + edge_perp * offset;
+        let separation = edge_base - endpoint;
+        let along_edge = edge_out.dot(edge_out);
+        let cross_term = edge_out.dot(leg_out);
+        let along_leg = leg_out.dot(leg_out);
+        let edge_projection = edge_out.dot(separation);
+        let leg_projection = leg_out.dot(separation);
+        let denominator = along_edge * along_leg - cross_term * cross_term;
+        let edge_parameter =
+            (cross_term * leg_projection - along_leg * edge_projection) / denominator;
+        let leg_parameter =
+            (along_edge * leg_projection - cross_term * edge_projection) / denominator;
+        ((edge_base + edge_out * edge_parameter) + (endpoint + leg_out * leg_parameter)) * 0.5
+    }
+
+    /// A terminal frame with the given §7.5.1 **direction** angle: `E` runs out along
+    /// `+x`, the leg turns back to within `direction_angle` of straight-through. The
+    /// sector face's normal is deliberately tilted off the `+z` edge-cross normal, so
+    /// the two candidate plane normals produce measurably different placements — the
+    /// non-planar sector that makes regime 2 observable at all.
+    fn shallow_terminal_frame(direction_angle_deg: f32) -> (Vec3, Vec3, Vec3, Vec3) {
+        let angle = direction_angle_deg.to_radians();
+        let edge_out = Vec3::new(1.0, 0.0, 0.0);
+        let leg_out = Vec3::new(-angle.cos(), angle.sin(), 0.0);
+        // The tilt has to be square to `E` to matter at all: `cross(edge_out, n)` is
+        // blind to `n`'s component along `E`.
+        let sector_normal = Vec3::new(0.0, 0.55, 1.0).normalize();
+        (Vec3::ZERO, edge_out, leg_out, sector_normal)
+    }
+
+    fn leg_meet(
+        endpoint: Vec3,
+        edge_out: Vec3,
+        leg_out: Vec3,
+        sector_plane: SectorPlane,
+        offset: f32,
+    ) -> Vec3 {
+        terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_out,
+            leg_out,
+            leg_precedes_edge: true,
+            sector_plane,
+            offset,
+        })
+    }
+
+    /// §7.5.1's dispatch quantity is the **direction** angle — the pair's first member
+    /// taken *into* the endpoint, its second taken *out* of it — and not the wedge the
+    /// two outward directions enclose. The two are supplements, and the value must not
+    /// depend on which of the pair the rotational order happens to put first.
+    #[test]
+    fn terminal_direction_angle_is_the_supplement_of_the_outward_wedge() {
+        for direction_angle_deg in [1.0_f32, 5.0, 10.0, 45.0, 175.0] {
+            let (_, edge_out, leg_out, _) = shallow_terminal_frame(direction_angle_deg);
+            let expected = direction_angle_deg.to_radians();
+            let wedge = edge_out.dot(leg_out).clamp(-1.0, 1.0).acos();
+            assert!(
+                (wedge - (std::f32::consts::PI - expected)).abs() < 1.0e-4,
+                "frame built at wedge = 180° − {direction_angle_deg}°, got {}°",
+                wedge.to_degrees(),
+            );
+            for leg_precedes_edge in [true, false] {
+                let angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
+                assert!(
+                    (angle - expected).abs() < 1.0e-4,
+                    "direction angle at {direction_angle_deg}° (leg first = \
+                     {leg_precedes_edge}) came out {}°",
+                    angle.to_degrees(),
+                );
+            }
+        }
+    }
+
+    /// §7.5.1 regime 2: under `SMALL_ANG = 10°` with a face-bearing sector, the sector
+    /// face's normal **is** the plane normal — used directly, with no sign test — not a
+    /// sign-fixed edge-cross product. Observable only because the sector is non-planar.
+    #[test]
+    fn terminal_leg_meet_shallow_direction_angle_uses_the_sector_face_normal_directly() {
+        let offset = 0.25;
+        let (endpoint, edge_out, leg_out, sector_normal) = shallow_terminal_frame(5.0);
+        let placement = leg_meet(
+            endpoint,
+            edge_out,
+            leg_out,
+            SectorPlane::Face(sector_normal),
+            offset,
+        );
+
+        let by_face_normal =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, sector_normal, offset);
+        let cross_normal = edge_out.cross(leg_out).normalize();
+        let by_cross_normal =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, cross_normal, offset);
+
+        assert!(
+            (placement - by_face_normal).length() < 1.0e-5,
+            "shallow branch must place from the sector face's normal, got \
+             {placement:?} vs {by_face_normal:?}",
+        );
+        assert!(
+            (by_face_normal - by_cross_normal).length() > 1.0e-3,
+            "the fixture must actually discriminate the two normals",
+        );
+    }
+
+    /// `terminal_leg_meet`'s contract when it is handed no sector plane normal: "when
+    /// the sector has no face this regime is unreachable and the angle falls through to
+    /// regime 3" (§7.5.1). The same shallow angle then takes the sign-fixed edge-cross
+    /// product, oriented by the fallback reference.
+    ///
+    /// This pins the *function's* behaviour, not a state the operator can reach today:
+    /// `terminal_strip_vert` only ever produces `NoFaceNormal` from a degenerate sector
+    /// face plane, never from §7.5.1's genuinely face-less sector.
+    #[test]
+    fn terminal_leg_meet_shallow_direction_angle_falls_through_without_a_sector_plane_normal() {
+        let offset = 0.25;
+        let (endpoint, edge_out, leg_out, vertex_normal) = shallow_terminal_frame(5.0);
+        let placement = leg_meet(
+            endpoint,
+            edge_out,
+            leg_out,
+            SectorPlane::NoFaceNormal {
+                reference: vertex_normal,
+            },
+            offset,
+        );
+
+        let cross_normal = edge_out.cross(leg_out).normalize();
+        assert!(
+            cross_normal.dot(vertex_normal) > 0.0,
+            "the reference must already agree with the cross product's sign here",
+        );
+        let by_cross_normal =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, cross_normal, offset);
+        let by_reference =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, vertex_normal, offset);
+
+        assert!(
+            (placement - by_cross_normal).length() < 1.0e-5,
+            "a face-less shallow sector must fall through to the cross product, got \
+             {placement:?} vs {by_cross_normal:?}",
+        );
+        assert!(
+            (placement - by_reference).length() > 1.0e-3,
+            "and must not have used the fallback reference as the plane normal",
+        );
+    }
+
+    /// §7.5.1 regime 3: at or above `SMALL_ANG` the plane normal is the edge-cross
+    /// product, sign-fixed against the sector face's normal — the sector face normal is
+    /// an *orientation reference* here, not the plane normal.
+    #[test]
+    fn terminal_leg_meet_ordinary_direction_angle_uses_the_sign_fixed_edge_cross() {
+        let offset = 0.25;
+        let (endpoint, edge_out, leg_out, sector_normal) = shallow_terminal_frame(35.0);
+        let placement = leg_meet(
+            endpoint,
+            edge_out,
+            leg_out,
+            SectorPlane::Face(sector_normal),
+            offset,
+        );
+
+        let cross_normal = edge_out.cross(leg_out).normalize();
+        let by_cross_normal =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, cross_normal, offset);
+        let by_face_normal =
+            leg_meet_oracle(endpoint, edge_out, leg_out, true, sector_normal, offset);
+
+        assert!(
+            (placement - by_cross_normal).length() < 1.0e-5,
+            "ordinary branch must place from the edge-cross normal, got {placement:?} \
+             vs {by_cross_normal:?}",
+        );
+        assert!(
+            (placement - by_face_normal).length() > 1.0e-3,
+            "and must not have used the sector face's normal as the plane normal",
+        );
+    }
+
+    /// The §7.5.1 band edges: `SMALL_ANG = 10°` is exclusive at the top (10° itself is
+    /// already ordinary) and `EPS_ANG = 2°` is inclusive at the bottom. Below `EPS_ANG`
+    /// the shallow branch must **not** fire — regime 1 owns that band, and letting
+    /// `< SMALL_ANG` swallow it is the mistake §7.5.1 warns about.
+    #[test]
+    fn terminal_leg_meet_direction_angle_band_edges_dispatch_per_the_thresholds() {
+        let offset = 0.25;
+        // The `1.9°` arm pins the **interim** state: with regime 1 unimplemented, the
+        // sub-`EPS_ANG` band lands in regime 3's cross product rather than in the
+        // near-degenerate construction that owns it. Rewrite this arm's expectation
+        // when regime 1 lands — it is the one row here that is not §7.5.1's endpoint.
+        for (direction_angle_deg, expect_shallow) in
+            [(1.9_f32, false), (2.1, true), (9.9, true), (10.1, false)]
+        {
+            let (endpoint, edge_out, leg_out, sector_normal) =
+                shallow_terminal_frame(direction_angle_deg);
+            let placement = leg_meet(
+                endpoint,
+                edge_out,
+                leg_out,
+                SectorPlane::Face(sector_normal),
+                offset,
+            );
+            let cross_normal = edge_out.cross(leg_out).normalize();
+            let expected_normal = if expect_shallow {
+                sector_normal
+            } else {
+                cross_normal
+            };
+            let expected =
+                leg_meet_oracle(endpoint, edge_out, leg_out, true, expected_normal, offset);
+            assert!(
+                (placement - expected).length() < 1.0e-5,
+                "at {direction_angle_deg}° the shallow branch should fire = \
+                 {expect_shallow}, got {placement:?} vs {expected:?}",
+            );
+        }
+    }
+
+    /// The §7.5.1 shallow regime driven through the whole operator: two non-planar quads
+    /// straddle the beveled edge, and at one endpoint each leg turns only ~5° off
+    /// straight-through. Each near-side strip vert must sit where the **sector face's**
+    /// normal puts it, measurably away from where the edge-cross normal would.
+    ///
+    /// The offset is deliberately small: at a 5° direction angle the meet runs out to
+    /// roughly `offset / sin(5°)` along the leg, so anything much larger is snapped by
+    /// the §7.5.2 span clamp onto the leg's far endpoint — which is the *same* point
+    /// under either normal, and the test would stop discriminating the regimes at all.
+    #[test]
+    fn edge_bevel_shallow_direction_angle_terminal_places_strip_verts_by_the_sector_normal() {
+        let leg_turn = 5.0_f32.to_radians();
+        let mut mesh = LoopMesh::new();
+        let near = mesh.create_vertex(Vec3::ZERO);
+        let far = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        // The two legs at `near` turn only `leg_turn` off straight-through, so the
+        // direction angle there is ~5° — inside regime 2's band.
+        let left_leg_end = mesh.create_vertex(Vec3::new(-leg_turn.cos(), leg_turn.sin(), 0.0));
+        let right_leg_end = mesh.create_vertex(Vec3::new(-leg_turn.cos(), -leg_turn.sin(), 0.0));
+        // Lifted out of z = 0 so neither quad is planar and the sector normal genuinely
+        // differs from the corner's edge-cross normal.
+        let left_far = mesh.create_vertex(Vec3::new(1.3, 1.0, 0.6));
+        let right_far = mesh.create_vertex(Vec3::new(1.3, -1.0, -0.6));
+
+        let mut edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        let beveled = edge(&mut mesh, near, far);
+        let left_ring = [
+            beveled,
+            edge(&mut mesh, far, left_far),
+            edge(&mut mesh, left_far, left_leg_end),
+            edge(&mut mesh, left_leg_end, near),
+        ];
+        let left_face = mesh.face_create(
+            &[near, far, left_far, left_leg_end],
+            &left_ring,
+            FaceCreateFlags::NONE,
+        );
+        let right_ring = [
+            edge(&mut mesh, near, right_leg_end),
+            edge(&mut mesh, right_leg_end, right_far),
+            edge(&mut mesh, right_far, far),
+            beveled,
+        ];
+        let right_face = mesh.face_create(
+            &[near, right_leg_end, right_far, far],
+            &right_ring,
+            FaceCreateFlags::NONE,
+        );
+
+        // Both endpoints of the beveled edge are killed by the strip, so the frame has
+        // to be read off the pristine mesh.
+        let near_position = mesh.vertex_position(near);
+        let far_position = mesh.vertex_position(far);
+        let edge_out = (far_position - near_position).normalize();
+        let sectors =
+            [(left_leg_end, left_face), (right_leg_end, right_face)].map(|(leg_end, face)| {
+                let leg_out = (mesh.vertex_position(leg_end) - near_position).normalize();
+                (leg_out, mesh.face_plane_normal(face).normalize())
+            });
+
+        let offset = 0.02;
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The rotational order fixes which side of `E` each leg's offset line is pushed
+        // to; that sign is pinned by the unit tests above, so here take the nearer of
+        // the two and let the *normal* be what discriminates.
+        let nearest_over_signs = |plane_normal: Vec3, leg_out: Vec3, position: Vec3| {
+            [true, false]
+                .map(|leg_precedes_edge| {
+                    let expected = leg_meet_oracle(
+                        near_position,
+                        edge_out,
+                        leg_out,
+                        leg_precedes_edge,
+                        plane_normal,
+                        offset,
+                    );
+                    (expected - position).length()
+                })
+                .into_iter()
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let mut matched = 0;
+        for &vert in &result.verts {
+            let position = mesh.vertex_position(vert);
+            if (position - near_position).length() > (position - far_position).length() {
+                continue; // a strip vert belonging to the other endpoint
+            }
+            let cross_gap = sectors
+                .iter()
+                .map(|&(leg_out, _)| {
+                    nearest_over_signs(edge_out.cross(leg_out).normalize(), leg_out, position)
+                })
+                .fold(f32::INFINITY, f32::min);
+            let sector_gap = sectors
+                .iter()
+                .map(|&(leg_out, sector_normal)| {
+                    nearest_over_signs(sector_normal, leg_out, position)
+                })
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                sector_gap < 1.0e-4,
+                "shallow terminal strip vert is {sector_gap} off the sector-normal meet",
+            );
+            assert!(
+                cross_gap > 1.0e-2,
+                "the fixture must discriminate: the edge-cross normal would put this \
+                 strip vert only {cross_gap} away",
+            );
+            matched += 1;
+        }
+        assert_eq!(
+            matched, 2,
+            "the shallow terminal contributes two strip verts"
+        );
+    }
 }
 
 fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
@@ -30640,6 +30982,166 @@ const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
 /// override's per-profile coplanarity skip: a profile whose projection plane already is
 /// the weld plane keeps its own normal.
 const COPLANAR_NORMAL_TOLERANCE: f32 = 1.0e-4;
+
+/// The §7.5.1 **direction** angle of a terminal leg meet: the angle between the two
+/// edge directions *as the meet binds them* — the pair's **first** member (in the
+/// endpoint's rotational order) taken **into** the endpoint, its **second** taken
+/// **out** of it. A small value therefore means the two edges run nearly straight
+/// *through* the endpoint; a value near `π` means they double back on each other.
+///
+/// This is **not** the wedge ("opening") angle the two outward directions enclose —
+/// the two are supplements, and every §7.5.1 threshold is stated on this one. Reading
+/// a threshold on the wedge inverts the dispatch: it would fire the shallow branch on
+/// a razor-pinched corner instead of a near-straight one.
+///
+/// `leg_precedes_edge` decides which member is first, and the returned value is
+/// *invariant* under it — swapping the pair negates both directions. Keeping the
+/// parameter states §7.5.1's binding literally, so the invariance is a checkable
+/// property (see the unit test) rather than an unstated assumption baked into a
+/// one-sided formula.
+fn terminal_direction_angle(edge_out: Vec3, leg_out: Vec3, leg_precedes_edge: bool) -> f32 {
+    let (first_dir, second_dir) = if leg_precedes_edge {
+        (-leg_out, edge_out)
+    } else {
+        (-edge_out, leg_out)
+    };
+    first_dir
+        .cross(second_dir)
+        .length()
+        .atan2(first_dir.dot(second_dir))
+}
+
+/// §7.5.1 regime 2's angular band: at least `EPS_ANG` (outside the near-degenerate
+/// band, which has no meet plane at all) and strictly under `SMALL_ANG`.
+fn is_shallow_direction_angle(direction_angle: f32) -> bool {
+    (TERMINAL_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
+}
+
+/// The §7.5.1 per-sector orientation input, in the one shape that cannot state the
+/// normal and the reference inconsistently: with a usable sector face plane the two
+/// *are* the same vector, and without one there is no candidate plane normal at all —
+/// only a reference for the sign test.
+///
+/// `NoFaceNormal` covers two things §7.5.1 keeps separate but which land on the same
+/// path: the guide's genuine face-less sector, and a sector face whose plane normal is
+/// degenerate. Only the latter is reachable from `terminal_strip_vert`, whose `face`
+/// argument is always one of `E`'s two radial faces.
+#[derive(Clone, Copy)]
+enum SectorPlane {
+    Face(Vec3),
+    NoFaceNormal { reference: Vec3 },
+}
+
+impl SectorPlane {
+    /// The vector the §7.5.1 regime-3 sign test is run against.
+    fn reference(self) -> Vec3 {
+        match self {
+            SectorPlane::Face(normal) => normal,
+            SectorPlane::NoFaceNormal { reference } => reference,
+        }
+    }
+}
+
+/// The mesh-free inputs to one §7.5.1 terminal leg meet, read off the pristine mesh at
+/// the endpoint.
+struct TerminalLegMeet {
+    endpoint: Vec3,
+    edge_out: Vec3,
+    leg_out: Vec3,
+    leg_precedes_edge: bool,
+    sector_plane: SectorPlane,
+    offset: f32,
+}
+
+/// §7.5.1's leg meet, before the §7.5.2 span clamp: the beveled edge's offset line
+/// against the zero-offset leg's own line, resolved at their closest approach when the
+/// two pass skew.
+fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
+    let TerminalLegMeet {
+        endpoint,
+        edge_out,
+        leg_out,
+        leg_precedes_edge,
+        sector_plane,
+        offset,
+    } = meet;
+
+    let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
+
+    // §7.5.1 regime 2 (shallow direction angle): the two edges run near-straight
+    // through the endpoint, so their cross product is numerically fragile and can come
+    // out almost square to the surface. When the sector has a face, that face's normal
+    // *is* the plane normal — no sign test, because nothing ambiguous is left to
+    // orient. Without a usable sector face normal this regime is unreachable and the
+    // angle falls through to the cross product.
+    let local_normal = match sector_plane {
+        SectorPlane::Face(normal) if is_shallow_direction_angle(direction_angle) => normal,
+        _ => {
+            // Regime 3: the LOCAL edge-cross normal, oriented to the surface's outward
+            // side — the decisive §7.5.1 departure from §7.3's per-face plane normal.
+            // The cross is sign-ambiguous; the reference picks the outward branch.
+            // `cross(edge_out, leg_out)` is the canonical orientation; the per-side
+            // straddle is set by the offset-push sign below, not by re-deriving the
+            // normal per leg.
+            let mut cross_normal = edge_out.cross(leg_out);
+            let length = cross_normal.length();
+            if length <= f32::EPSILON {
+                // Leg parallel to E: no perpendicular. Slide along the leg by `offset`.
+                return endpoint + leg_out * offset;
+            }
+            cross_normal /= length;
+            if cross_normal.dot(sector_plane.reference()) < 0.0 {
+                cross_normal = -cross_normal;
+            }
+            cross_normal
+        }
+    };
+
+    // `E`'s offset line is pushed sideways by `offset`, square to `E`, from the local
+    // normal. The sign is the rotational order's alone (see `terminal_strip_vert`):
+    // `E` second in the pair pushes along `E × n`, `E` first pushes against it.
+    let mut edge_perp = edge_out.cross(local_normal).normalize_or_zero();
+    if !leg_precedes_edge {
+        edge_perp = -edge_perp;
+    }
+
+    // Offset line for `E` (base pushed sideways by `offset`) against the leg's own line
+    // (offset 0 ⇒ base on the endpoint). They generally pass skew at a non-planar
+    // terminal; take the closest-points midpoint.
+    let line_edge = Line {
+        point: endpoint + edge_perp * offset,
+        direction: edge_out,
+    };
+    let line_leg = Line {
+        point: endpoint,
+        direction: leg_out,
+    };
+    match intersect_lines(&line_edge, &line_leg) {
+        LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+        LineMeet::Collinear => line_leg.point,
+    }
+}
+
+/// §7.5.1 `EPS_ANG` — the near-degenerate band half-width (2°, in radians). A terminal
+/// direction angle within this of `0` or of `π` leaves no well-defined meet plane at
+/// all, and §7.5.1 gives that band its own regime 1 (push out along the common
+/// perpendicular / slide along the common line).
+///
+/// **Regime 1 is not implemented.** So this bound is, for now, a pessimization rather
+/// than a guard: it does not hand `[0, EPS_ANG)` (or `(π − EPS_ANG, π]`) to regime 1,
+/// it *routes* that band into regime 3, whose `edge_out × leg_out` is exactly the
+/// short, direction-unstable cross product regime 2 exists to avoid. Only the far
+/// narrower parallel escape in `terminal_leg_meet` catches the true collinear limit.
+/// Dropping the bound would widen regime 2 over that band and be better-conditioned
+/// there — but it would also be unfaithful to §7.5.1, so the bound stays and regime 1
+/// is owed.
+const TERMINAL_DIRECTION_EPS_ANGLE: f32 = 0.034_906_6;
+
+/// §7.5.1 `SMALL_ANG` — the shallow/ordinary threshold (10°, in radians) on the
+/// terminal **direction** angle. Below it (and only with a usable sector face normal)
+/// the sector face's normal is the meet plane's normal outright; at or above it the
+/// sign-fixed edge-cross product is.
+const TERMINAL_DIRECTION_SMALL_ANGLE: f32 = 0.174_532_92;
 
 /// Length tolerance below which the two closest points of two lines are treated as
 /// the same point (a crossing) rather than skew (§7.6.2).
