@@ -498,6 +498,50 @@ struct FaceTemplateRef<'a> {
     block: Option<(&'a SlotSnapshot, usize)>,
 }
 
+/// One beveled edge's multi-segment strip donors, registered against the pristine mesh
+/// (BEVEL.md §6.6.2, the multi-segment profile-strip row). The run of `segments` quads is
+/// **split about the strip's centre line**: the quads on the near flank's side inherit the
+/// near flanking face's whole block, the quads strictly past it the far flanking face's.
+///
+/// `near_at_chain_start` is what *orients* that split onto §8.3.0's quad numbering, and it
+/// is a fact of the pristine mesh: the chain's two ends are the boundverts the edge's two
+/// flanking originals each collapse their corner onto, so which end is the near flank's is
+/// read off the recorded substitutions before the re-stitch retires those faces' keys.
+struct StripDonors {
+    near: FaceTemplate,
+    far: FaceTemplate,
+    near_face: Option<FaceKey>,
+    near_at_chain_start: bool,
+}
+
+/// A strip's resolved donor pair plus the orientation its centre-line split is read in.
+#[derive(Clone, Copy)]
+struct StripDonorRefs<'a> {
+    near: FaceTemplateRef<'a>,
+    far: FaceTemplateRef<'a>,
+    near_at_chain_start: bool,
+}
+
+impl<'a> StripDonorRefs<'a> {
+    /// The donor of strip quad `k` (1-based in §8.3.0's numbering, which runs along the
+    /// anchor chain's samples). Counting from the near flank, the first `⌈segments / 2⌉`
+    /// quads take the near flank and the rest the far one — the ceiling is what hands the
+    /// quad *straddling* the centre line at odd `segments` the **near** flank, the one
+    /// donor §6.6.2 says cannot be read off the split itself.
+    fn quad(&self, k: usize, segments: usize) -> FaceTemplateRef<'a> {
+        let rank_from_near = if self.near_at_chain_start {
+            k
+        } else {
+            segments + 1 - k
+        };
+        if rank_from_near <= (segments + 1) / 2 {
+            self.near
+        } else {
+            self.far
+        }
+    }
+}
+
 /// One **pre-bevel** donor polygon for the per-corner attribute blend of BEVEL.md
 /// §5.2.1 step 2: the face's geometry *and* its corners' attribute blocks, read as
 /// the face stood before the bevel touched it (§5.2.1 fact (a)).
@@ -1110,6 +1154,19 @@ impl LoopMesh {
         self.edge_loop_keys(edge)
             .first()
             .map(|&loop_key| self.loop_face(loop_key))
+    }
+
+    /// A beveled edge's two flanking originals (BEVEL.md §6.6.2, the multi-segment
+    /// profile-strip row): the **near** flank is the one the `segments = 1` strip quad
+    /// inherits from, the **far** flank the one the quads strictly past the strip's centre
+    /// line inherit from. A wire edge has neither; a lone-faced edge reports that face as
+    /// both, so a caller that cannot reach the far side still lands on an adjacent original
+    /// rather than the layer defaults.
+    fn edge_flanking_faces(&self, edge: EdgeKey) -> (Option<FaceKey>, Option<FaceKey>) {
+        let loops = self.edge_loop_keys(edge);
+        let near = loops.first().map(|&loop_key| self.loop_face(loop_key));
+        let far = loops.get(1).map(|&loop_key| self.loop_face(loop_key)).or(near);
+        (near, far)
     }
 
     /// The beveled edges the operator can actually build (BEVEL.md §7.5), at **every**
@@ -1883,14 +1940,24 @@ impl LoopMesh {
         let beveled_set: HashSet<EdgeKey> = beveled_manifold.iter().copied().collect();
         let is_beveled = |edge: EdgeKey| beveled_set.contains(&edge);
 
-        // §6.6.1, as in the single-segment path: each strip's stage-1 inherit copies the
-        // whole block of a flanking face of its beveled edge. Phase 1 registers the
-        // remaining donors (junction fills, miter rings, terminal fans) as it walks the
-        // pristine endpoints; the bank is sealed once, before the re-stitch.
+        // §6.6.1 / §6.6.2: a multi-segment strip has **two** stage-1 donors, not one — its
+        // beveled edge's near and far flanking faces, split about the strip's centre line.
+        // Both are registered here, against the pristine mesh; the split's orientation is
+        // resolved once phase 1 has built the chains. Phase 1 registers the remaining donors
+        // (junction fills, miter rings, terminal fans) as it walks the pristine endpoints;
+        // the bank is sealed once, before the re-stitch.
         let mut templates = TemplateBank::new(self, options.segments);
-        let strip_templates: Vec<FaceTemplate> = beveled_manifold
+        let mut strip_donors: Vec<StripDonors> = beveled_manifold
             .iter()
-            .map(|&edge| templates.register(self.edge_flanking_face(edge)))
+            .map(|&edge| {
+                let (near_face, far_face) = self.edge_flanking_faces(edge);
+                StripDonors {
+                    near: templates.register(near_face),
+                    far: templates.register(far_face),
+                    near_face,
+                    near_at_chain_start: true,
+                }
+            })
             .collect();
 
         let mut endpoints: Vec<VertexKey> = Vec::new();
@@ -2011,6 +2078,14 @@ impl LoopMesh {
             }
         }
 
+        // §6.6.2: orient each strip's centre-line donor split now, while the flanking
+        // originals still stand and still own the corners their boundverts descend from.
+        for (&edge, donors) in beveled_manifold.iter().zip(&mut strip_donors) {
+            let anchor = self.edge_vert_keys(edge)[0];
+            donors.near_at_chain_start =
+                near_flank_is_at_chain_start(anchor, edge, donors.near_face, &chains, &face_subst);
+        }
+
         // §8.3.0.4: each junction's ring is its sector boundverts (a mitered junction's is
         // its enlarged ring's). The chains' *interior* rungs are ring verts but not
         // boundverts, so they are not candidates — which is what makes the wire's landing
@@ -2063,16 +2138,14 @@ impl LoopMesh {
         );
 
         // Phase 3: one strip (segments quads) per beveled edge over its two
-        // endpoint chains (§8.3.0).
-        for (&edge, &representative) in beveled_manifold.iter().zip(&strip_templates) {
-            self.build_multisegment_strip(
-                edge,
-                segments,
-                &chains,
-                material,
-                templates.resolve(representative),
-                result,
-            );
+        // endpoint chains (§8.3.0), its quads' donors split about the centre line (§6.6.2).
+        for (&edge, donors) in beveled_manifold.iter().zip(&strip_donors) {
+            let resolved = StripDonorRefs {
+                near: templates.resolve(donors.near),
+                far: templates.resolve(donors.far),
+                near_at_chain_start: donors.near_at_chain_start,
+            };
+            self.build_multisegment_strip(edge, segments, &chains, material, resolved, result);
         }
 
         // Phase 3b (§8.3.0.3 attribute note): at a **cross** weld — a valence-4 welded
@@ -3059,13 +3132,17 @@ impl LoopMesh {
     /// quads joining the edge's two endpoint chains rung-to-rung, `p`'s sample `k`
     /// against `q`'s sample `segments − k`. Each quad shares its rung edges with
     /// the cut / third faces and its long edges with the re-stitched radial faces.
+    ///
+    /// The run's stage-1 donors are **split about the strip's centre line** (§6.6.2): the
+    /// quads on the near flank's side inherit the near flanking face's whole block, the
+    /// quads strictly past it the far flanking face's.
     fn build_multisegment_strip(
         &mut self,
         edge: EdgeKey,
         segments: u32,
         chains: &[EdgeEndChain],
         material: i32,
-        representative: FaceTemplateRef<'_>,
+        donors: StripDonorRefs<'_>,
         result: &mut BevelResult,
     ) {
         let [a, b] = self.edge_vert_keys(edge);
@@ -3154,7 +3231,7 @@ impl LoopMesh {
             self.assign_bevel_face_attributes(
                 face,
                 material,
-                representative,
+                donors.quad(k, segments as usize),
                 BevelNewFaceKind::Strip,
             );
             result.faces.push(face);
@@ -9686,6 +9763,56 @@ struct CornerRun {
     donor: EdgeKey,
     seam: bool,
     sharp: bool,
+}
+
+/// Whether the near flanking face lies on the **sample-`0`** side of `edge`'s chain at
+/// `anchor` — the endpoint whose chain numbers the strip's quads (BEVEL.md §8.3.0's quad
+/// `k` spans that chain's samples `k − 1` and `k`). This is what orients §6.6.2's
+/// centre-line donor split onto the run.
+///
+/// Read topologically off the pristine substitutions, not measured: the chain's two ends
+/// are the boundverts the beveled edge's two flanking originals each collapse their corner
+/// onto, so the flank whose substitution names an end *is* the flank that end's rail
+/// borders. A geometric compare would be ill-conditioned as the offset shrinks, exactly as
+/// for the rung pairing.
+fn near_flank_is_at_chain_start(
+    anchor: VertexKey,
+    edge: EdgeKey,
+    near_face: Option<FaceKey>,
+    chains: &[EdgeEndChain],
+    substitutions: &[FaceSubstitution],
+) -> bool {
+    let Some(near_face) = near_face else {
+        return true;
+    };
+    let Some(chain) = chains
+        .iter()
+        .find(|chain| chain.edge == edge && chain.endpoint == anchor)
+    else {
+        return true;
+    };
+    let Some(substitution) = substitutions
+        .iter()
+        .find(|s| s.vertex == anchor && s.face == near_face)
+    else {
+        debug_assert!(
+            false,
+            "a beveled edge's flanking original must have a recorded corner substitution at \
+             the endpoint that anchors its strip",
+        );
+        return true;
+    };
+    if substitution.verts.contains(&chain.start) {
+        return true;
+    }
+    if substitution.verts.contains(&chain.end) {
+        return false;
+    }
+    debug_assert!(
+        false,
+        "the near flank's corner must collapse onto one of its strip chain's two ends",
+    );
+    true
 }
 
 /// Record (or overwrite) the ordered substitution for `(vertex, face)`.
@@ -26573,6 +26700,84 @@ mod tests {
             "the strip must carry one flanking original's whole block {flanking:?}, got \
              {inherited:?}",
         );
+    }
+
+    /// BEVEL.md §6.6.2's multi-segment profile-strip row (§8.2.2): the run of `segments`
+    /// quads splits its stage-1 donor about the strip's **centre line** — the quads on the
+    /// near flank's side inherit the near flanking face's whole block, the quads strictly
+    /// past it the far flank's. At odd `segments` the quad that *straddles* the centre line
+    /// belongs to neither half and takes the **near** flank — the same donor the
+    /// `segments = 1` quad takes, not the far one its past-the-midpoint position suggests.
+    ///
+    /// A cube edge terminates at two valence-3 corners, which shed no fill (§8.3.0.1), so
+    /// the run *is* the whole result: at `segments = 2` the blocks read near, far; at
+    /// `segments = 3`, near, near, far.
+    #[test]
+    fn face_cd_multisegment_strip_donor_splits_about_the_centre_line() {
+        for segments in [2_u32, 3] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let tint = tint_and_slot_faces(&mut mesh);
+
+            let edge = cube_edge(&mesh, Vec3::new(1.0, 1.0, 1.0), Vec3::new(-1.0, 1.0, 1.0));
+            let (near_face, far_face) = mesh.edge_flanking_faces(edge);
+            let near_face = near_face.expect("a cube edge has a near flank");
+            let far_face = far_face.expect("a cube edge has a far flank");
+            assert_ne!(near_face, far_face, "a cube edge is manifold");
+
+            let block_of = |mesh: &LoopMesh, face: FaceKey| {
+                (
+                    mesh.face_material_index(face),
+                    mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap(),
+                )
+            };
+            let near_block = block_of(&mesh, near_face);
+            let far_block = block_of(&mesh, far_face);
+            let near_center = mesh.face_center_of_mass(near_face);
+
+            let result = mesh.bevel(
+                &[edge.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    material: -1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                result.faces.len(),
+                segments as usize,
+                "a cube edge's two valence-3 terminals add no fill, so the run is the result",
+            );
+
+            // Ordered by how far across the chamfer they sit: the profile is monotone from
+            // the near flank to the far one, so this is the centre-line order.
+            let mut strip = result.faces.clone();
+            strip.sort_by(|&left, &right| {
+                let left_span = (mesh.face_center_of_mass(left) - near_center).length();
+                let right_span = (mesh.face_center_of_mass(right) - near_center).length();
+                left_span.partial_cmp(&right_span).unwrap()
+            });
+            let blocks: Vec<(i32, [f32; 3])> =
+                strip.iter().map(|&face| block_of(&mesh, face)).collect();
+
+            let near_quads = (segments as usize + 1) / 2;
+            let expected: Vec<(i32, [f32; 3])> = (0..segments as usize)
+                .map(|quad| {
+                    if quad < near_quads {
+                        near_block
+                    } else {
+                        far_block
+                    }
+                })
+                .collect();
+            assert_eq!(
+                blocks, expected,
+                "at segments = {segments} the strip must inherit near ×{near_quads} then far \
+                 for the rest (near {near_block:?}, far {far_block:?})",
+            );
+        }
     }
 
     /// BEVEL.md §6.6, both stages at once: an explicit `material >= 0` overwrites the
