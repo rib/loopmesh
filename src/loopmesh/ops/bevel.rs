@@ -507,9 +507,15 @@ struct FaceTemplateRef<'a> {
 /// is a fact of the pristine mesh: the chain's two ends are the boundverts the edge's two
 /// flanking originals each collapse their corner onto, so which end is the near flank's is
 /// read off the recorded substitutions before the re-stitch retires those faces' keys.
+///
+/// `straddle` is the odd-`segments` centre quad's own donor. It is the near flank
+/// whenever the beveled edge is seam-free, and §6.6.1.4's tie-break winner between the
+/// two flanks when it is not — the one entry of the split the near/far halves do not
+/// determine. At even `segments` no quad straddles and the field goes unread.
 struct StripDonors {
     near: FaceTemplate,
     far: FaceTemplate,
+    straddle: FaceTemplate,
     near_face: Option<FaceKey>,
     near_at_chain_start: bool,
 }
@@ -519,6 +525,7 @@ struct StripDonors {
 struct StripDonorRefs<'a> {
     near: FaceTemplateRef<'a>,
     far: FaceTemplateRef<'a>,
+    straddle: FaceTemplateRef<'a>,
     near_at_chain_start: bool,
 }
 
@@ -526,14 +533,23 @@ impl<'a> StripDonorRefs<'a> {
     /// The donor of strip quad `k` (1-based in §8.3.0's numbering, which runs along the
     /// anchor chain's samples). Counting from the near flank, the first `⌈segments / 2⌉`
     /// quads take the near flank and the rest the far one — the ceiling is what hands the
-    /// quad *straddling* the centre line at odd `segments` the **near** flank, the one
-    /// donor §6.6.2 says cannot be read off the split itself.
+    /// quad *straddling* the centre line at odd `segments` the near flank, the one donor
+    /// §6.6.2 says cannot be read off the split itself.
+    ///
+    /// That last quad is also the run's **only** re-routable donor (§6.6.2's strip-row
+    /// scoping): at a seamed beveled edge `straddle` is the tie-break winner rather than
+    /// the near flank, while every other quad — and every quad at even `segments` — keeps
+    /// its positional half.
     fn quad(&self, k: usize, segments: usize) -> FaceTemplateRef<'a> {
         let rank_from_near = if self.near_at_chain_start {
             k
         } else {
             segments + 1 - k
         };
+        let straddle_rank = (segments + 1) / 2;
+        if segments % 2 == 1 && rank_from_near == straddle_rank {
+            return self.straddle;
+        }
         if rank_from_near <= (segments + 1) / 2 {
             self.near
         } else {
@@ -1069,10 +1085,18 @@ impl LoopMesh {
             // registered and sealed up front, before the *first* edge's re-stitch — a
             // per-edge bank would re-capture every registered layer once per edge, and
             // the later edges' donors are still pristine at this point anyway.
+            //
+            // §6.6.1.4 scopes its override to the odd-`segments` centre quad *and* the lone
+            // `segments = 1` quad, so the single quad here is a straddle quad: it goes
+            // through the same donor. On a seam-free edge that answers the near flank —
+            // `edge_flanking_face`'s own pick — so a contiguous edge is unaffected.
             let mut templates = TemplateBank::new(self, options.segments);
             let strip_templates: Vec<FaceTemplate> = beveled
                 .iter()
-                .map(|&edge| templates.register(self.edge_flanking_face(edge)))
+                .map(|&edge| {
+                    let donor = self.strip_quad_donor(edge, options.segments, &templates);
+                    templates.register(donor)
+                })
                 .collect();
             // §6.6.1: a valence-≥4 terminal's endpoint fill (§7.5) is a ring-spanning fill —
             // it inherits from the rep face of the ring's first boundvert, or from
@@ -1613,10 +1637,17 @@ impl LoopMesh {
         // surgery consumes, so by phase 4 it names no adjacent face at all). Each strip's
         // handle rides its edge's slot in this vec; each patch's rides the patch itself.
         // The bank is sealed once phase 1 has registered them all, before the re-stitch.
+        // The strip's lone quad at `segments = 1` is §6.6.1.4's straddle quad (the section
+        // scopes the override to it by name), so it takes the same donor the multi-segment
+        // centre quad does — the near flank on a seam-free edge, unchanged from the
+        // positional pick.
         let mut templates = TemplateBank::new(self, options.segments);
         let strip_templates: Vec<FaceTemplate> = beveled_manifold
             .iter()
-            .map(|&edge| templates.register(self.edge_flanking_face(edge)))
+            .map(|&edge| {
+                let donor = self.strip_quad_donor(edge, options.segments, &templates);
+                templates.register(donor)
+            })
             .collect();
 
         // A set, not a scan: §6.6.1.4's candidate gate asks this once per leg of every
@@ -1951,9 +1982,29 @@ impl LoopMesh {
             .iter()
             .map(|&edge| {
                 let (near_face, far_face) = self.edge_flanking_faces(edge);
+                let straddle_face = self.straddle_quad_donor(
+                    edge,
+                    near_face,
+                    far_face,
+                    options.segments,
+                    templates.interp_components(),
+                );
+                let near = templates.register(near_face);
+                let far = templates.register(far_face);
+                // The straddle donor is one of the two flanks whenever the override declines
+                // (and at even `segments`, where the handle goes unread), so reuse the handle
+                // rather than banking a third copy of the same block.
+                let straddle = if straddle_face == near_face {
+                    near
+                } else if straddle_face == far_face {
+                    far
+                } else {
+                    templates.register(straddle_face)
+                };
                 StripDonors {
-                    near: templates.register(near_face),
-                    far: templates.register(far_face),
+                    near,
+                    far,
+                    straddle,
                     near_face,
                     near_at_chain_start: true,
                 }
@@ -2143,6 +2194,7 @@ impl LoopMesh {
             let resolved = StripDonorRefs {
                 near: templates.resolve(donors.near),
                 far: templates.resolve(donors.far),
+                straddle: templates.resolve(donors.straddle),
                 near_at_chain_start: donors.near_at_chain_start,
             };
             self.build_multisegment_strip(edge, segments, &chains, material, resolved, result);
@@ -7839,15 +7891,41 @@ impl LoopMesh {
             .collect()
     }
 
+    /// The **topological half** of BEVEL.md §6.6.1.4's seam condition (2): the four corners
+    /// of `edge`'s two flanking faces, paired by the endpoint they share, or `None` when the
+    /// edge fails the pairing outright and is a seam on that ground alone whatever any layer
+    /// holds. It fails when:
+    ///
+    /// - the edge does not present **exactly two** loops (a boundary or wire edge flanks
+    ///   nothing; a fan-resolved non-manifold edge carries three or more), or
+    /// - its two loops run the **same** direction along it — inconsistently wound flanks.
+    ///
+    /// Consistent winding is what makes the pairing well-defined: one flank's loop and the
+    /// *other* flank's `loop_next` sit on the same endpoint. Both callers of condition (2)
+    /// share this walk and differ only in the layer set they then compare the pairs on —
+    /// UV-class alone for §6.6.1.4.1's component partition, every interpolable layer for the
+    /// edge-level seam test.
+    fn paired_corners(&self, edge: EdgeKey) -> Option<[(LoopKey, LoopKey); 2]> {
+        let mut radial = self.iter_radial_loops(edge);
+        let first = radial.next()?;
+        let second = radial.next()?;
+        if radial.next().is_some() {
+            return None;
+        }
+        if self.loop_vertex(first) == self.loop_vertex(second) {
+            return None;
+        }
+        Some([
+            (first, self.loop_next(second)),
+            (self.loop_next(first), second),
+        ])
+    }
+
     /// The face across `edge` from `face` when `edge` is **loop-contiguous** — the negation
     /// of BEVEL.md §6.6.1.4's seam condition (2), restricted to the UV-class layers
-    /// §6.6.1.4.1's partition is built from. `None` when the flood must not cross:
-    ///
-    /// - the edge does not present **exactly two** loops (a boundary or wire edge joins
-    ///   nothing; a fan-resolved non-manifold edge is a seam on that ground alone), or
-    /// - its two loops run the **same** direction along it (inconsistently wound flanks —
-    ///   again a seam whatever the layer values), or
-    /// - any UV-class layer disagrees at **either** endpoint.
+    /// §6.6.1.4.1's partition is built from. `None` when the flood must not cross: either
+    /// [`paired_corners`](Self::paired_corners) rejects the edge, or a UV-class layer
+    /// disagrees on one of the pairs.
     ///
     /// The layer compare is exact per component: §6.6.1.4 says "any disagreement" and names
     /// no tolerance.
@@ -7857,34 +7935,22 @@ impl LoopMesh {
         edge: EdgeKey,
         uv_layers: &[ElementAttributeKey],
     ) -> Option<FaceKey> {
-        let mut radial = self.iter_radial_loops(edge);
-        let first = radial.next()?;
-        let second = radial.next()?;
-        if radial.next().is_some() {
-            return None;
-        }
-
-        let (near, far) = if self.loop_face(first) == face {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        if self.loop_vertex(near) == self.loop_vertex(far) {
-            return None;
-        }
-
-        // Consistent winding pairs the four corners by their shared endpoint: `near` and
-        // `loop_next(far)` sit on one end, `loop_next(near)` and `far` on the other.
-        let near_far_end = self.loop_next(near);
-        let far_far_end = self.loop_next(far);
+        let pairs = self.paired_corners(edge)?;
         for &layer in uv_layers {
             let attribs = self.loop_attribs();
             let uv = |l: LoopKey| attribs.get_vec2(layer, l.as_usize());
-            if uv(near) != uv(far_far_end) || uv(near_far_end) != uv(far) {
+            if pairs.iter().any(|&(left, right)| uv(left) != uv(right)) {
                 return None;
             }
         }
 
+        let (first, _) = pairs[0];
+        let (_, second) = pairs[1];
+        let far = if self.loop_face(first) == face {
+            second
+        } else {
+            first
+        };
         Some(self.loop_face(far))
     }
 
@@ -7906,8 +7972,13 @@ impl LoopMesh {
     ///   picture entirely.
     ///
     /// §6.6.1.4's **condition (2)** — two flanking faces disagreeing on an interpolable
-    /// loop layer, the UV-island seam — is **not implemented**: a corner seamed only that
-    /// way still takes the positional pick, exactly as it did before this rule existed.
+    /// loop layer, the UV-island seam — is implemented, but only at the **edge-level** site
+    /// ([`edge_is_interp_seam`](Self::edge_is_interp_seam), which the strip's straddle quad
+    /// keys on). It is deliberately **not** consulted here: the corner-level form of §6.6.1.4
+    /// asks it of *every* incident leg, which is a different and wider predicate than this
+    /// function's condition-(1) scan, and switching to it moves an already-pinned donor on
+    /// every textured corner. So a corner seamed only by condition (2) still takes the
+    /// positional pick.
     ///
     /// **The override declines only where key 1 of the tie-break actually separates the
     /// candidates.** Key 1 — the interpolation-component id (§6.6.1.4.1) — is *live* when a
@@ -8015,6 +8086,166 @@ impl LoopMesh {
         }
 
         self.donor_tie_break(&candidates).or(positional)
+    }
+
+    /// The stage-1 donor of the **straddle quad** — the strip quad that sits *on* the
+    /// centre line at odd `segments`, and the only face of the run whose donor cannot be
+    /// read off the near/far split (BEVEL.md §6.6.2's strip-row scoping, §8.2.2).
+    ///
+    /// Two regimes, keyed on the **edge-level** form of §6.6.1.4's seam test — is *this*
+    /// beveled edge an interpolation seam — rather than on the corner-level "any incident
+    /// leg" form the ring-spanning fills use:
+    ///
+    /// - **Seam-free edge** — the near flank, exactly as at `segments = 1`, and *not* the
+    ///   far flank its past-the-midpoint position suggests.
+    /// - **Seamed edge** — §6.6.1.4's tie-break, applied **once** over a candidate set that
+    ///   is just the two faces the quad sits between: the beveled edge's near and far
+    ///   flanks. There is no per-leg reduce here and no fan anchor; the ring-spanning
+    ///   two-pass construction belongs to a different row.
+    ///
+    /// Key 1 (§6.6.1.4.1) is live at every odd `segments` on a mesh carrying a UV-class
+    /// layer, so the same discipline [`ring_spanning_donor`](Self::ring_spanning_donor)
+    /// applies holds: the override runs only once the two candidates are shown to share an
+    /// interpolation component (key 1 tied, keys 2–4 decide), and otherwise declines back
+    /// to the positional near flank rather than answering with an unimplemented numbering.
+    /// A **colour-only** discontinuity is the case this leaves fully decided: it seams the
+    /// edge, yet leaves key 1 inert because the partition reads UV-class layers alone.
+    ///
+    /// **The observable reach that follows.** §6.6.1.4.1's partition splits on exactly the
+    /// condition (2) this test runs, so on a mesh carrying a UV layer a condition-(2) seam
+    /// almost always puts the two flanks in *different* components — and the decline above
+    /// then fires, restoring the near flank. What the override actually changes, therefore,
+    /// is (a) any seam on a mesh with **no** UV-class layer — colour-only seams, and every
+    /// condition-(1) seam on a plain untextured mesh — and (b) the rare textured edge that
+    /// is seamed while its flanks still flood together. A UV-island boundary on a textured
+    /// mesh is *not* in that set.
+    ///
+    /// The single quad at `segments = 1` is the same row and routes through here too
+    /// (§6.6.1.4's per-kind scoping names it alongside the odd-`segments` centre quad); on a
+    /// seam-free edge the answer is the near flank, which is the positional donor that path
+    /// always took. At even `segments` no quad straddles and this is never consulted; it
+    /// still answers the near flank so the field is never a live wrong value.
+    /// [`straddle_quad_donor`](Self::straddle_quad_donor) read off an edge alone — the shape
+    /// the `segments = 1` strip builders need, where the near/far split has no other use.
+    fn strip_quad_donor(
+        &self,
+        edge: EdgeKey,
+        segments: u32,
+        templates: &TemplateBank,
+    ) -> Option<FaceKey> {
+        let (near_face, far_face) = self.edge_flanking_faces(edge);
+        self.straddle_quad_donor(
+            edge,
+            near_face,
+            far_face,
+            segments,
+            templates.interp_components(),
+        )
+    }
+
+    fn straddle_quad_donor(
+        &self,
+        edge: EdgeKey,
+        near_face: Option<FaceKey>,
+        far_face: Option<FaceKey>,
+        segments: u32,
+        components: Option<&InterpComponents>,
+    ) -> Option<FaceKey> {
+        if segments % 2 == 0 || !self.edge_is_interp_seam(edge) {
+            return near_face;
+        }
+
+        let mut candidates: Vec<FaceKey> = Vec::with_capacity(2);
+        for face in [near_face, far_face].into_iter().flatten() {
+            if !candidates.contains(&face) {
+                candidates.push(face);
+            }
+        }
+
+        if InterpComponents::live(self, segments) {
+            let ties = components
+                .map(|partition| partition.all_share_component(&candidates))
+                .unwrap_or(false);
+            if !ties {
+                return near_face;
+            }
+        }
+
+        self.donor_tie_break(&candidates).or(near_face)
+    }
+
+    /// The **edge-level** form of BEVEL.md §6.6.1.4's interpolation-seam test: is `edge`
+    /// itself a seam? This is what the strip's centre quad keys on, as against the
+    /// corner-level "any incident leg is a seam" form of the ring-spanning fills. It is not
+    /// the seam *flag* of §6.6.7 — no header bit is read.
+    ///
+    /// Condition (1), purely topological and layer-free: either endpoint resolves no
+    /// arriving face or no departing face **for this edge**. Note the scope — it is the
+    /// edge's own two flanking slots that are read, not the endpoint's other legs, so an
+    /// interior edge with *boundary endpoints* is not a seam by it (the boundary legs are,
+    /// but that is the corner-level form). What satisfies it: a boundary or wire edge
+    /// outright, and a radial-2 edge whose two flanks are wound **inconsistently**, where
+    /// both loops run the same way along the edge and nothing arrives at one end.
+    ///
+    /// §6.6.1.4 also names an edge *heading a restarted fan run* at a non-manifold corner.
+    /// The slots here are read off the radial cycle rather than off a materialised fan
+    /// partition, so that sub-case is **not** distinguished: such an edge reads as
+    /// seam-free unless one of the causes above also holds. The same narrowing applies at
+    /// the corner-level site ([`ring_spanning_donor`](Self::ring_spanning_donor)), which
+    /// shares these two primitives.
+    ///
+    /// Condition (2) short-circuits to *not a seam* the moment the mesh carries **zero**
+    /// loop layers, before any topology is examined — which is why condition (1) is the
+    /// only one that can fire on an untextured mesh. With at least one loop layer the edge
+    /// must first present exactly two loops in **consistent winding**; failing that pairing
+    /// is a seam on that ground alone, whatever the values. Otherwise the two flanks'
+    /// corners are compared at **both** endpoints on every *interpolable* (math-valued)
+    /// loop layer — UVs above all, but colours and any other float-valued layer count too,
+    /// which is exactly the breadth that makes a colour-only discontinuity a seam. Any
+    /// disagreement seams the edge; §6.6.1.4 names no tolerance, so the compare is exact.
+    fn edge_is_interp_seam(&self, edge: EdgeKey) -> bool {
+        for endpoint in self.edge_vert_keys(edge) {
+            if self.arriving_face(endpoint, edge).is_none()
+                || self.departing_face(endpoint, edge).is_none()
+            {
+                return true;
+            }
+        }
+
+        if self.loop_attribs().is_empty() {
+            return false;
+        }
+
+        let Some(pairs) = self.paired_corners(edge) else {
+            return true;
+        };
+        pairs
+            .into_iter()
+            .any(|(left, right)| !self.loops_agree_on_interpolable_layers(left, right))
+    }
+
+    /// Do two corners carry the same value on every **interpolable** loop layer — the
+    /// per-corner half of BEVEL.md §6.6.1.4's seam condition (2)?
+    ///
+    /// "Interpolable" is read as the negation of [`InterpPolicy::NoInterp`], which is
+    /// precisely the crate's own name for "this layer's type defines no blend" — the byte,
+    /// byte-vector, string and id families. Every other policy describes a real blend of the
+    /// sources (a weighted sum for the float family, a rounded sum for the 32-bit integers,
+    /// a disjunction for the booleans), so every other layer carries data a discontinuity in
+    /// is a genuine interpolation discontinuity. §6.6.1.4 says "interpolable (math-valued)"
+    /// and names UVs and colours only as its leading examples, so the narrower "float family
+    /// alone" reading would be a *false negative* — declining the override at an edge the
+    /// reference seams — which is the direction the section forbids.
+    ///
+    /// The compare is exhaustive over the storage types by construction (it runs the shared
+    /// per-slot exact-equality primitive rather than a match with a catch-all arm), so a
+    /// layer type added later cannot silently read as "agrees".
+    fn loops_agree_on_interpolable_layers(&self, left: LoopKey, right: LoopKey) -> bool {
+        let attribs = self.loop_attribs();
+        attribs.iter_descriptors().all(|(_, desc)| {
+            desc.interp == InterpPolicy::NoInterp
+                || attribs.slot_layer_exact_equal(desc, left.as_usize(), right.as_usize())
+        })
     }
 
     /// BEVEL.md §6.6.1.4's deterministic tie-break: the smallest candidate on the first key
@@ -26778,6 +27009,461 @@ mod tests {
                  for the rest (near {near_block:?}, far {far_block:?})",
             );
         }
+    }
+
+    /// One beveled cube edge whose two flanking originals carry deliberately *inverted*
+    /// material slots — the near flank the higher one — so §6.6.1.4's key 3 (lowest slot
+    /// donates) picks the **far** flank and any re-route is visible against the positional
+    /// answer. Returns the edge and the two flanks' whole blocks, near first.
+    fn inverted_slot_strip_fixture(
+        mesh: &mut LoopMesh,
+        tint: ElementAttributeKey,
+    ) -> (EdgeKey, (i32, [f32; 3]), (i32, [f32; 3])) {
+        let edge = cube_edge(mesh, Vec3::new(1.0, 1.0, 1.0), Vec3::new(-1.0, 1.0, 1.0));
+        let (near_face, far_face) = mesh.edge_flanking_faces(edge);
+        let near_face = near_face.expect("a cube edge has a near flank");
+        let far_face = far_face.expect("a cube edge has a far flank");
+        assert_ne!(near_face, far_face, "a cube edge is manifold");
+        mesh.set_face_material_index(near_face, 7);
+        mesh.set_face_material_index(far_face, 2);
+
+        let block_of = |mesh: &LoopMesh, face: FaceKey| {
+            (
+                mesh.face_material_index(face),
+                mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap(),
+            )
+        };
+        (edge, block_of(mesh, near_face), block_of(mesh, far_face))
+    }
+
+    /// The strip's quads' per-face blocks in centre-line order — the near flank's side
+    /// first. The profile is monotone across the chamfer, so distance from the near flank's
+    /// centre is that order.
+    fn strip_blocks_in_centre_line_order(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        near_center: Vec3,
+        tint: ElementAttributeKey,
+    ) -> Vec<(i32, [f32; 3])> {
+        let mut strip = result.faces.clone();
+        strip.sort_by(|&left, &right| {
+            let left_span = (mesh.face_center_of_mass(left) - near_center).length();
+            let right_span = (mesh.face_center_of_mass(right) - near_center).length();
+            left_span.partial_cmp(&right_span).unwrap()
+        });
+        strip
+            .iter()
+            .map(|&face| {
+                (
+                    mesh.face_material_index(face),
+                    mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// BEVEL.md §6.6.2's strip row + §6.6.1.4: at odd `segments` the quad that straddles
+    /// the centre line takes the near flank **only while the beveled edge is seam-free**.
+    /// At a seam its donor is the tie-break winner between the edge's two flanking faces —
+    /// here the far flank, which carries the lower material slot (key 3).
+    ///
+    /// The seam is a **colour-only** loop-layer discontinuity, which is the configuration
+    /// that leaves the rule fully decided: it seams the edge by condition (2), yet key 1
+    /// (§6.6.1.4.1) stays inert because the component partition reads UV-class layers
+    /// alone. Only the centre quad moves — its two neighbours keep their positional halves.
+    #[test]
+    fn face_cd_straddle_quad_takes_the_tie_break_winner_at_a_seamed_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let color = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("l_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, far_block, far_block],
+            "the seamed edge's centre quad must take the tie-break winner (the lower slot, \
+             {far_block:?}), leaving its neighbours on near {near_block:?} / far",
+        );
+    }
+
+    /// The seam-free regression the rule above must not swallow: the very same fixture,
+    /// with the loop colour layer *present but contiguous* across the beveled edge. No
+    /// seam, so §6.6.1.4 never fires and the straddle quad stays on the **near** flank —
+    /// even though the far flank would win the tie-break outright.
+    #[test]
+    fn face_cd_straddle_quad_keeps_the_near_flank_when_the_edge_is_contiguous() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        mesh.register_loop_attribute(ElementAttributeDesc::color(
+            AttributeKey::custom("l_color"),
+            AttrType::Vec3,
+        ))
+        .unwrap();
+        let near_center = mesh.face_center_of_mass(mesh.edge_flanking_faces(edge).0.unwrap());
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, near_block, far_block],
+            "a contiguous edge keeps the positional split — near, near, far",
+        );
+    }
+
+    /// §6.6.2's strip-row scoping: at **even** `segments` no quad straddles the centre
+    /// line and **no** strip face's donor is re-routed, however seamed the beveled edge.
+    /// Each half simply keeps its own flanking face.
+    #[test]
+    fn face_cd_even_segments_strip_ignores_the_edge_seam() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let color = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("l_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, far_block],
+            "an even run keeps both halves positional at a seam",
+        );
+    }
+
+    /// §6.6.1.4.1's decline: with a UV-class layer present at odd `segments`, key 1 is
+    /// **live**, and the numbering it would need is a construction-order artefact this
+    /// crate does not reproduce. When the two candidates sit in *different* interpolation
+    /// components — as they do at a UV-island boundary, which is also what seams the edge —
+    /// the whole override stands down and the straddle quad keeps its positional near
+    /// flank rather than answering with a different arbitrary pick.
+    #[test]
+    fn face_cd_straddle_quad_declines_the_override_across_uv_components() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("l_uv")))
+            .unwrap();
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, corner.as_usize(), [5.0, 5.0]);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, near_block, far_block],
+            "candidates in different interpolation components decline the override",
+        );
+    }
+
+    /// §6.6.1.4 **condition (1)** at the edge-level site, the arm that fires with **no loop
+    /// layer on the mesh at all** — condition (2) short-circuits to "contiguous" before a
+    /// single value is read, yet the edge is still a seam, purely topologically.
+    ///
+    /// Naming the fixture precisely matters here, because the obvious one is dead. The
+    /// edge-level form asks whether *this* edge resolves an arriving **and** a departing
+    /// face at each of its own endpoints — not whether the endpoint is on the boundary. An
+    /// interior edge with boundary endpoints (a two-quad strip's shared edge) resolves both
+    /// at both ends and is **not** a condition-(1) seam; it is the endpoint's *boundary
+    /// legs* that are seams, which is the corner-level form. What does fire at the edge
+    /// level on an untextured mesh is a pair of **inconsistently wound** flanks: both loops
+    /// then run the same way along the edge, so nothing arrives at one endpoint.
+    #[test]
+    fn face_cd_inconsistently_wound_flanks_seam_the_straddle_quad_by_condition_one() {
+        let mut mesh = LoopMesh::new();
+        let corner = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let a = mesh.create_vertex(corner(-2.0, -1.0));
+        let b = mesh.create_vertex(corner(0.0, -1.0));
+        let c = mesh.create_vertex(corner(2.0, -1.0));
+        let d = mesh.create_vertex(corner(2.0, 1.0));
+        let e = mesh.create_vertex(corner(0.0, 1.0));
+        let f = mesh.create_vertex(corner(-2.0, 1.0));
+        mesh.face_create_verts(&[a, b, e, f], FaceCreateFlags::NONE);
+        // Reversed against the first quad, so both flanks traverse `b → e`.
+        mesh.face_create_verts(&[e, d, c, b], FaceCreateFlags::NONE);
+        let edge = mesh.query_edge_exists(b, e).expect("the shared edge");
+        assert!(
+            mesh.loop_attribs().is_empty(),
+            "the fixture must carry no loop layer, or condition (2) is in play",
+        );
+
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (near_face, far_face) = mesh.edge_flanking_faces(edge);
+        let near_face = near_face.expect("the shared edge has a near flank");
+        let far_face = far_face.expect("the shared edge has a far flank");
+        mesh.set_face_material_index(near_face, 7);
+        mesh.set_face_material_index(far_face, 2);
+        let block_of = |mesh: &LoopMesh, face: FaceKey| {
+            (
+                mesh.face_material_index(face),
+                mesh.face_attribs().get_vec3(tint, face.as_usize()).unwrap(),
+            )
+        };
+        let near_block = block_of(&mesh, near_face);
+        let far_block = block_of(&mesh, far_face);
+        let near_center = mesh.face_center_of_mass(near_face);
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, far_block, far_block],
+            "inconsistently wound flanks are a condition-(1) seam on an untextured mesh, so \
+             the centre quad takes the tie-break winner {far_block:?}",
+        );
+    }
+
+    /// §6.6.1.4 scopes the strip override to the odd-`segments` centre quad **and the lone
+    /// quad at `segments = 1`**. The single quad is a straddle quad, so at a seamed edge it
+    /// takes the tie-break winner — here the far flank, on key 3 — rather than the near
+    /// flank the positional rule alone would give it.
+    #[test]
+    fn face_cd_single_segment_strip_quad_takes_the_tie_break_winner_at_a_seamed_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, _near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let color = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("l_color"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![far_block],
+            "the lone `segments = 1` quad is a straddle quad and re-routes at a seam",
+        );
+    }
+
+    /// The regression the `segments = 1` re-route must not swallow: on a **contiguous**
+    /// edge the straddle donor answers the near flank, which is exactly the positional
+    /// donor that path took before the override reached it. Same fixture, colour layer
+    /// present but agreeing across the edge.
+    #[test]
+    fn face_cd_single_segment_strip_quad_keeps_the_near_flank_when_the_edge_is_contiguous() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, _far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        mesh.register_loop_attribute(ElementAttributeDesc::color(
+            AttributeKey::custom("l_color"),
+            AttrType::Vec3,
+        ))
+        .unwrap();
+        let near_center = mesh.face_center_of_mass(mesh.edge_flanking_faces(edge).0.unwrap());
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block],
+            "a contiguous edge keeps the positional near flank at `segments = 1`",
+        );
+    }
+
+    /// §6.6.1.4's condition (2) reads *interpolable* layers only. A layer whose type
+    /// defines no blend — the byte / string / id family, [`InterpPolicy::NoInterp`] — is not
+    /// interpolation data, so a discontinuity in it does **not** seam the edge and the
+    /// straddle quad keeps its near flank. The same fixture with the same values on a
+    /// `Linear` layer does re-route, which is the sibling test above.
+    #[test]
+    fn face_cd_a_no_interp_loop_layer_discontinuity_does_not_seam_the_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let opaque = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("l_opaque_id"),
+                AttrType::Vec4U8,
+            ))
+            .unwrap();
+        assert_eq!(
+            mesh.loop_attribs()
+                .descriptor(opaque)
+                .expect("the layer was just registered")
+                .interp,
+            InterpPolicy::NoInterp,
+            "a plain Vec4U8 layer defines no interpolation",
+        );
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_vec4u8(opaque, corner.as_usize(), [255, 0, 0, 255]);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, near_block, far_block],
+            "a NoInterp discontinuity is not an interpolation seam — the strip stays \
+             positional",
+        );
+    }
+
+    /// The other side of the widened filter: a **boolean** loop layer blends by disjunction,
+    /// which is a real interpolation rule, so a discontinuity in it *is* a condition-(2)
+    /// seam and does re-route the centre quad. Booleans carry no UV class, so key 1 stays
+    /// inert and the tie-break is fully decided — the far flank wins on key 3.
+    #[test]
+    fn face_cd_a_boolean_loop_layer_discontinuity_seams_the_edge() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = tint_and_slot_faces(&mut mesh);
+        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+        let mask = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("l_mask"),
+                AttrType::Bool,
+            ))
+            .unwrap();
+        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+        let near_center = mesh.face_center_of_mass(near_face);
+        for corner in mesh.face_loop_keys(near_face) {
+            mesh.loop_attribs_mut()
+                .set_bool(mask, corner.as_usize(), true);
+        }
+
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                material: -1,
+                ..Default::default()
+            },
+        );
+        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+        assert_eq!(
+            blocks,
+            vec![near_block, far_block, far_block],
+            "a disjunction-blended layer is interpolation data, so it seams the edge",
+        );
     }
 
     /// BEVEL.md §6.6, both stages at once: an explicit `material >= 0` overwrites the

@@ -897,7 +897,12 @@ impl ElementAttributes {
     /// attribute layer at two slots, allocation-free. Used by the non-math
     /// branch of [`slots_tolerant_equal`]. A missing value on both slots
     /// counts as equal; on only one, unequal.
-    fn slot_layer_exact_equal(&self, desc: &ElementAttributeDesc, a: usize, b: usize) -> bool {
+    pub(crate) fn slot_layer_exact_equal(
+        &self,
+        desc: &ElementAttributeDesc,
+        a: usize,
+        b: usize,
+    ) -> bool {
         fn pair_eq<T: PartialEq>(bucket: Option<&[T]>, a: usize, b: usize) -> bool {
             match (bucket.and_then(|s| s.get(a)), bucket.and_then(|s| s.get(b))) {
                 (Some(va), Some(vb)) => va == vb,
