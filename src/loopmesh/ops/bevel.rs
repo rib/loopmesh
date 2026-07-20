@@ -358,7 +358,7 @@ struct TemplateBank {
 
 impl TemplateBank {
     /// The bank for one bevel run, carrying §6.6.1.4.1's interpolation-component partition
-    /// when key 1 of the ring-spanning tie-break is **live** (a UV-class loop layer present
+    /// when key 1 of the ring-spanning tie-break is **live** (a float2 loop layer present
     /// *and* `segments` odd) and nothing at all otherwise. The partition is a mesh-wide
     /// flood fill, so it is built here — once, against the pristine mesh, before any
     /// surgery — rather than per beveled corner.
@@ -412,14 +412,57 @@ impl TemplateBank {
 /// built, or no partition covers it.
 const NO_COMPONENT: u32 = u32::MAX;
 
+/// One row of BEVEL.md §6.6.1.4.0(a)'s closed blendable list, carrying its own equality
+/// predicate (§6.6.1.4.0(b)). The guide's fourth row — the original-space auxiliary — is a
+/// distinct 2-float type there; this crate stores it as `Vec2` like the UV type and it takes
+/// the same threshold, so [`Float2`](Self::Float2) covers both.
+#[derive(Clone, Copy)]
+enum BlendableKind {
+    Float2,
+    ColorFloat,
+    ColorByte,
+}
+
+impl BlendableKind {
+    /// The kind's own constant, as an upper bound on the **summed squared** difference. Absolute
+    /// and coarse: a "painted to the same place" tolerance, not a round-trip-noise one.
+    fn equality_threshold(self) -> f32 {
+        match self {
+            BlendableKind::Float2 => 1e-5,
+            BlendableKind::ColorFloat | BlendableKind::ColorByte => 1e-3,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlendableLayer {
+    key: ElementAttributeKey,
+    kind: BlendableKind,
+}
+
+fn summed_squared_difference(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left_component, right_component)| {
+            let difference = left_component - right_component;
+            difference * difference
+        })
+        .sum()
+}
+
 /// The mesh-wide interpolation-component partition of BEVEL.md §6.6.1.4.1 — its
 /// equivalence **relation** only, never its ids.
 ///
 /// Two faces share a component when a chain of **loop-contiguous** edges joins them: the
-/// negation of §6.6.1.4's seam condition (2), read across the mesh's **UV-class** (float2)
-/// loop layers alone. Colour layers are deliberately not consulted: a colour-only
-/// discontinuity does seam an edge (so the override fires) but leaves key 1 *tied*, and a
-/// partition that split on it would decline where the reference reduces.
+/// negation of §6.6.1.4's seam condition (2), read across the mesh's **blendable** loop
+/// layers (§6.6.1.4.0(a)) — colours included, under §6.6.1.4.0(b)'s per-kind tolerant
+/// compare.
+///
+/// Note the asymmetry §6.6.1.4.1 draws and this type keeps: the partition's *edges* are
+/// decided by the whole blendable set, but whether it is **built** at all is the narrower
+/// float2 *inventory* test of [`live`](Self::live). A colour-only discontinuity therefore
+/// splits components on a mesh that carries a float2 layer anywhere, and leaves key 1 tied
+/// on a mesh that carries none — because there no partition exists.
 ///
 /// The labels this stores are flood-fill order, which is **not** §6.6.1.4.1's
 /// construction-order numbering (face-enumeration seeds plus the top/bottom label swaps).
@@ -434,15 +477,17 @@ struct InterpComponents {
 }
 
 impl InterpComponents {
-    /// Key 1 exists only when a UV-class loop layer is present **and** `segments` is odd
-    /// (§6.6.1.4). In every other configuration it is a constant, ties for every candidate,
-    /// and no partition is built at all.
+    /// Key 1 exists only when a **float2** loop layer is present **and** `segments` is odd
+    /// (§6.6.1.4.1). The arming gate is that one-row *type* test over the layer inventory —
+    /// not blendability and not a role test — so it stays on the float2 layer even though
+    /// the partition's own edges read the wider blendable set. In every other configuration
+    /// key 1 is a constant, ties for every candidate, and no partition is built at all.
     fn live(mesh: &LoopMesh, segments: u32) -> bool {
-        segments % 2 == 1 && mesh.active_uv_loop_layer().is_some()
+        segments % 2 == 1 && mesh.has_float2_loop_layer()
     }
 
     fn build(mesh: &LoopMesh) -> Self {
-        let uv_layers = mesh.uv_class_loop_layers();
+        let blendable_layers = mesh.blendable_loop_layers();
         let mut component_of = vec![NO_COMPONENT; mesh.face_slot_count()];
         let mut next_component: u32 = 0;
         let mut pending: Vec<FaceKey> = Vec::new();
@@ -456,7 +501,8 @@ impl InterpComponents {
             while let Some(face) = pending.pop() {
                 for loop_key in mesh.iter_face_loops(face) {
                     let edge = mesh.loop_edge(loop_key);
-                    let Some(across) = mesh.interp_contiguous_neighbor(face, edge, &uv_layers)
+                    let Some(across) =
+                        mesh.interp_contiguous_neighbor(face, edge, &blendable_layers)
                     else {
                         continue;
                     };
@@ -8126,16 +8172,109 @@ impl LoopMesh {
             .map(|l| self.loop_face(l))
     }
 
-    /// The mesh's UV-class loop layers: every float2 loop layer. These are the only layers
-    /// §6.6.1.4.1's component partition reads (the guide's colour-only corollary), and their
-    /// mere presence is what makes key 1 live.
-    fn uv_class_loop_layers(&self) -> Vec<ElementAttributeKey> {
+    /// The mesh's **blendable** loop layers — BEVEL.md §6.6.1.4.0(a)'s closed four-row list,
+    /// keyed on layer *type* and never on role, name or contents: the 2-float type, the
+    /// original-space auxiliary (a second 2-float type this crate does not model separately,
+    /// and which carries the same threshold anyway), float RGBA, and byte RGBA. Every other
+    /// loop-layer type is skipped outright — a scalar float, a 3-vector float, an integer or
+    /// a boolean layer is never read here however discontinuous it is.
+    ///
+    /// This is the set **both** call sites of condition (2) read — §6.6.1.4.1's component
+    /// partition and [`edge_is_interp_seam`](Self::edge_is_interp_seam). It is deliberately
+    /// **not** the set that arms the partition: arming is the narrower one-row float2
+    /// *inventory* test (§6.6.1.4.0(a)), which [`has_float2_loop_layer`](Self::has_float2_loop_layer)
+    /// answers.
+    ///
+    /// Known divergence: §6.6.1.4.0(a) distinguishes the 2-float *layer type* from the
+    /// original-space auxiliary, which stores two floats under a **distinct** type and so is
+    /// blendable without arming the gate. This crate has no separate storage for that
+    /// auxiliary — it is `Vec2` — so a mesh whose only float2-storage layer is the auxiliary
+    /// arms the gate where the reference does not. Tracked in `bmesh-parity/FOLLOWUPS.md`.
+    fn blendable_loop_layers(&self) -> Vec<BlendableLayer> {
         let attribs = self.loop_attribs();
         attribs
             .iter_descriptors()
-            .filter(|(key, _)| matches!(attribs.storage_of(*key), Some(AttributeStorage::Vec2(_))))
-            .map(|(key, _)| key)
+            .filter_map(|(key, _)| {
+                let kind = match attribs.storage_of(key)? {
+                    AttributeStorage::Vec2(_) => BlendableKind::Float2,
+                    AttributeStorage::Vec4(_) => BlendableKind::ColorFloat,
+                    AttributeStorage::Vec4U8(_) => BlendableKind::ColorByte,
+                    _ => return None,
+                };
+                Some(BlendableLayer { key, kind })
+            })
             .collect()
+    }
+
+    /// Does the mesh's loop-layer **inventory** carry at least one layer of the 2-float type
+    /// — BEVEL.md §6.6.1.4.0(a)'s float2 gate, which arms `degenerate_uv_image` and
+    /// §6.6.1.4.1's whole component partition?
+    ///
+    /// Decided by the layer's **type alone**: not its role, not its name, not its contents.
+    /// A float2 loop layer roled as anything at all arms the gate, which is why this is a
+    /// distinct predicate rather than a query for the *active UV* layer — the latter's role
+    /// preference is a different question and would silently un-arm the partition.
+    fn has_float2_loop_layer(&self) -> bool {
+        let attribs = self.loop_attribs();
+        attribs
+            .iter_descriptors()
+            .any(|(key, _)| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_))))
+    }
+
+    /// Do two corners agree on one blendable layer, under §6.6.1.4.0(b)'s **tolerant** compare:
+    /// the summed squared difference over the whole vector, strictly below the kind's own
+    /// constant. Absolute, not relative; whole-vector, not per-component.
+    ///
+    /// Byte colour is compared on the raw `0..=255` scale rather than normalised, which is what
+    /// makes its threshold vacuous — one step of difference already contributes `1.0`.
+    ///
+    /// The strict `<` is load-bearing at NaN: a NaN component on either side propagates through
+    /// the difference-and-square chain, the comparison is false, and the corners **disagree** —
+    /// including a NaN against the bit-identical NaN. That is the arithmetic falling out, not a
+    /// special case, and it is reproduced rather than fixed.
+    fn loops_agree_on_blendable_layer(
+        &self,
+        layer: BlendableLayer,
+        left: LoopKey,
+        right: LoopKey,
+    ) -> bool {
+        let attribs = self.loop_attribs();
+        // Both corners read the *same* layer, so neither read can be absent; the fallback
+        // answers "agree" so a slot-lookup bug cannot manufacture seams out of nothing.
+        let difference = match layer.kind {
+            BlendableKind::Float2 => {
+                let (Some(left_value), Some(right_value)) = (
+                    attribs.get_vec2(layer.key, left.as_usize()),
+                    attribs.get_vec2(layer.key, right.as_usize()),
+                ) else {
+                    debug_assert!(false, "both corners index the same float2 loop layer");
+                    return true;
+                };
+                summed_squared_difference(&left_value, &right_value)
+            }
+            BlendableKind::ColorFloat => {
+                let (Some(left_value), Some(right_value)) = (
+                    attribs.get_vec4(layer.key, left.as_usize()),
+                    attribs.get_vec4(layer.key, right.as_usize()),
+                ) else {
+                    debug_assert!(false, "both corners index the same float RGBA loop layer");
+                    return true;
+                };
+                summed_squared_difference(&left_value, &right_value)
+            }
+            BlendableKind::ColorByte => {
+                let (Some(left_value), Some(right_value)) = (
+                    attribs.get_vec4u8(layer.key, left.as_usize()),
+                    attribs.get_vec4u8(layer.key, right.as_usize()),
+                ) else {
+                    debug_assert!(false, "both corners index the same byte RGBA loop layer");
+                    return true;
+                };
+                let widen = |bytes: [u8; 4]| bytes.map(f32::from);
+                summed_squared_difference(&widen(left_value), &widen(right_value))
+            }
+        };
+        difference < layer.kind.equality_threshold()
     }
 
     /// The **topological half** of BEVEL.md §6.6.1.4's seam condition (2): the four corners
@@ -8149,9 +8288,11 @@ impl LoopMesh {
     ///
     /// Consistent winding is what makes the pairing well-defined: one flank's loop and the
     /// *other* flank's `loop_next` sit on the same endpoint. Both callers of condition (2)
-    /// share this walk and differ only in the layer set they then compare the pairs on —
-    /// UV-class alone for §6.6.1.4.1's component partition, every interpolable layer for the
-    /// edge-level seam test.
+    /// share this walk **and** the layer set they compare the pairs on — the blendable set
+    /// of §6.6.1.4.0(a), read under §6.6.1.4.0(b)'s tolerant compare. Condition (2) is one
+    /// predicate; the edge-level seam test and §6.6.1.4.1's component partition are two call
+    /// sites of it, differing only in the zero-loop-layer short-circuit the seam test opens
+    /// with.
     fn paired_corners(&self, edge: EdgeKey) -> Option<[(LoopKey, LoopKey); 2]> {
         let mut radial = self.iter_radial_loops(edge);
         let first = radial.next()?;
@@ -8169,24 +8310,25 @@ impl LoopMesh {
     }
 
     /// The face across `edge` from `face` when `edge` is **loop-contiguous** — the negation
-    /// of BEVEL.md §6.6.1.4's seam condition (2), restricted to the UV-class layers
-    /// §6.6.1.4.1's partition is built from. `None` when the flood must not cross: either
-    /// [`paired_corners`](Self::paired_corners) rejects the edge, or a UV-class layer
-    /// disagrees on one of the pairs.
+    /// of BEVEL.md §6.6.1.4's seam condition (2), read over the **blendable set**
+    /// (§6.6.1.4.0(a)) §6.6.1.4.1's partition is built from. `None` when the flood must not
+    /// cross: either [`paired_corners`](Self::paired_corners) rejects the edge, or a
+    /// blendable layer disagrees on one of the pairs.
     ///
-    /// The layer compare is exact per component: §6.6.1.4 says "any disagreement" and names
-    /// no tolerance.
+    /// Colours are in that set, so a colour-only discontinuity does split components — on a
+    /// mesh that carries a float2 layer somewhere to arm the partition at all.
     fn interp_contiguous_neighbor(
         &self,
         face: FaceKey,
         edge: EdgeKey,
-        uv_layers: &[ElementAttributeKey],
+        blendable_layers: &[BlendableLayer],
     ) -> Option<FaceKey> {
         let pairs = self.paired_corners(edge)?;
-        for &layer in uv_layers {
-            let attribs = self.loop_attribs();
-            let uv = |l: LoopKey| attribs.get_vec2(layer, l.as_usize());
-            if pairs.iter().any(|&(left, right)| uv(left) != uv(right)) {
+        for &layer in blendable_layers {
+            if pairs
+                .iter()
+                .any(|&(left, right)| !self.loops_agree_on_blendable_layer(layer, left, right))
+            {
                 return None;
             }
         }
@@ -8218,8 +8360,8 @@ impl LoopMesh {
     ///   over a positionally-named candidate set, and the fan anchor drops out of the
     ///   picture entirely.
     ///
-    /// §6.6.1.4's **condition (2)** — two flanking faces disagreeing on an interpolable
-    /// loop layer, the UV-island seam — is implemented, but only at the **edge-level** site
+    /// §6.6.1.4's **condition (2)** — two flanking faces disagreeing on a **blendable**
+    /// loop layer (§6.6.1.4.0(a)), the UV-island seam — is implemented, but only at the **edge-level** site
     /// ([`edge_is_interp_seam`](Self::edge_is_interp_seam), which the strip's straddle quad
     /// keys on). It is deliberately **not** consulted here: the corner-level form of §6.6.1.4
     /// asks it of *every* incident leg, which is a different and wider predicate than this
@@ -8229,7 +8371,7 @@ impl LoopMesh {
     ///
     /// **The override declines only where key 1 of the tie-break actually separates the
     /// candidates.** Key 1 — the interpolation-component id (§6.6.1.4.1) — is *live* when a
-    /// UV-class (float2) loop layer is present **and** `segments` is odd. Live is not the
+    /// float2 loop layer is present **and** `segments` is odd. Live is not the
     /// same as separating: `components` carries the mesh-wide partition, and whenever the
     /// candidates all sit in **one** component key 1 ties for every one of them, so keys
     /// 2–4 decide and the answer is an isomorphism invariant — the single-UV-island mesh,
@@ -8239,7 +8381,7 @@ impl LoopMesh {
     /// tie-break run without it there would be a different arbitrary answer rather than a
     /// safer one, so that — and only that — falls back to §6.6.1's positional donor.
     ///
-    /// (The UV-class presence also arms §6.6.1.4's `degenerate_uv_image` candidate filter,
+    /// (That same float2 inventory gate also arms §6.6.1.4's `degenerate_uv_image` candidate filter,
     /// which is not implemented at any `segments`: a candidate whose UV image of the corner
     /// collapses to near-zero area is kept here where the reference would drop it.)
     fn ring_spanning_donor(
@@ -8368,19 +8510,21 @@ impl LoopMesh {
     ///   flanks. There is no per-leg reduce here and no fan anchor; the ring-spanning
     ///   two-pass construction belongs to a different row.
     ///
-    /// Key 1 (§6.6.1.4.1) is live at every odd `segments` on a mesh carrying a UV-class
+    /// Key 1 (§6.6.1.4.1) is live at every odd `segments` on a mesh carrying a float2
     /// layer, so the same discipline [`ring_spanning_donor`](Self::ring_spanning_donor)
     /// applies holds: the override runs only once the two candidates are shown to share an
     /// interpolation component (key 1 tied, keys 2–4 decide), and otherwise declines back
     /// to the positional near flank rather than answering with an unimplemented numbering.
-    /// A **colour-only** discontinuity is the case this leaves fully decided: it seams the
-    /// edge, yet leaves key 1 inert because the partition reads UV-class layers alone.
+    /// A **colour-only** discontinuity is the case this leaves fully decided: colours are in
+    /// the blendable set, so it seams the edge here *and* splits the partition — but only on
+    /// a mesh that carries a float2 layer to arm the partition at all. With no float2 layer
+    /// key 1 stays inert and the tie-break runs on keys 2–4.
     ///
     /// **The observable reach that follows.** §6.6.1.4.1's partition splits on exactly the
     /// condition (2) this test runs, so on a mesh carrying a UV layer a condition-(2) seam
     /// almost always puts the two flanks in *different* components — and the decline above
     /// then fires, restoring the near flank. What the override actually changes, therefore,
-    /// is (a) any seam on a mesh with **no** UV-class layer — colour-only seams, and every
+    /// is (a) any seam on a mesh with **no** float2 layer — colour-only seams, and every
     /// condition-(1) seam on a plain untextured mesh — and (b) the rare textured edge that
     /// is seamed while its flanks still flood together. A UV-island boundary on a textured
     /// mesh is *not* in that set.
@@ -8451,13 +8595,19 @@ impl LoopMesh {
     ///
     /// Condition (2) short-circuits to *not a seam* the moment the mesh carries **zero**
     /// loop layers, before any topology is examined — which is why condition (1) is the
-    /// only one that can fire on an untextured mesh. With at least one loop layer the edge
-    /// must first present exactly two loops in **consistent winding**; failing that pairing
-    /// is a seam on that ground alone, whatever the values. Otherwise the two flanks'
-    /// corners are compared at **both** endpoints on every *interpolable* (math-valued)
-    /// loop layer — UVs above all, but colours and any other float-valued layer count too,
-    /// which is exactly the breadth that makes a colour-only discontinuity a seam. Any
-    /// disagreement seams the edge; §6.6.1.4 names no tolerance, so the compare is exact.
+    /// only one that can fire on an untextured mesh. That count is over **every** loop
+    /// layer, blendable or not (§6.6.1.4.0(a)'s short-circuit trap): a mesh carrying only an
+    /// integer flag layer does *not* take it, so a failed pairing there is still a seam
+    /// though not one layer value is ever read.
+    ///
+    /// Past the short-circuit the edge must present exactly two loops in **consistent
+    /// winding**; failing that pairing is a seam on that ground alone, whatever the values.
+    /// Otherwise the two flanks' corners are compared at **both** endpoints over the
+    /// **blendable set** (§6.6.1.4.0(a)) under §6.6.1.4.0(b)'s tolerant per-kind compare —
+    /// the same set and the same compare §6.6.1.4.1's component partition uses, because this
+    /// is one normative predicate with two call sites. Colours are in that set, so a
+    /// colour-only discontinuity (byte colour included) seams the edge; a scalar float, a
+    /// 3-vector, an integer or a boolean layer is not, however discontinuous.
     fn edge_is_interp_seam(&self, edge: EdgeKey) -> bool {
         if self.iter_radial_loops(edge).take(2).count() < 2 {
             return true;
@@ -8470,32 +8620,11 @@ impl LoopMesh {
         let Some(pairs) = self.paired_corners(edge) else {
             return true;
         };
-        pairs
-            .into_iter()
-            .any(|(left, right)| !self.loops_agree_on_interpolable_layers(left, right))
-    }
-
-    /// Do two corners carry the same value on every **interpolable** loop layer — the
-    /// per-corner half of BEVEL.md §6.6.1.4's seam condition (2)?
-    ///
-    /// "Interpolable" is read as the negation of [`InterpPolicy::NoInterp`], which is
-    /// precisely the crate's own name for "this layer's type defines no blend" — the byte,
-    /// byte-vector, string and id families. Every other policy describes a real blend of the
-    /// sources (a weighted sum for the float family, a rounded sum for the 32-bit integers,
-    /// a disjunction for the booleans), so every other layer carries data a discontinuity in
-    /// is a genuine interpolation discontinuity. §6.6.1.4 says "interpolable (math-valued)"
-    /// and names UVs and colours only as its leading examples, so the narrower "float family
-    /// alone" reading would be a *false negative* — declining the override at an edge the
-    /// reference seams — which is the direction the section forbids.
-    ///
-    /// The compare is exhaustive over the storage types by construction (it runs the shared
-    /// per-slot exact-equality primitive rather than a match with a catch-all arm), so a
-    /// layer type added later cannot silently read as "agrees".
-    fn loops_agree_on_interpolable_layers(&self, left: LoopKey, right: LoopKey) -> bool {
-        let attribs = self.loop_attribs();
-        attribs.iter_descriptors().all(|(_, desc)| {
-            desc.interp == InterpPolicy::NoInterp
-                || attribs.slot_layer_exact_equal(desc, left.as_usize(), right.as_usize())
+        let blendable_layers = self.blendable_loop_layers();
+        pairs.into_iter().any(|(left, right)| {
+            blendable_layers
+                .iter()
+                .any(|&layer| !self.loops_agree_on_blendable_layer(layer, left, right))
         })
     }
 
@@ -27214,7 +27343,7 @@ mod tests {
         );
     }
 
-    /// §6.6.1.4.1's partition is built **only** when key 1 is live — a UV-class layer present
+    /// §6.6.1.4.1's partition is built **only** when key 1 is live — a float2 layer present
     /// *and* `segments` odd — and never otherwise; and when it is built it is the loop-CD
     /// equivalence relation, which the island count of the fixture decides.
     #[test]
@@ -27224,7 +27353,7 @@ mod tests {
             TemplateBank::new(&untextured, 1)
                 .interp_components()
                 .is_none(),
-            "no UV-class loop layer ⇒ key 1 is inert ⇒ no partition at any `segments`",
+            "no float2 loop layer ⇒ key 1 is inert ⇒ no partition at any `segments`",
         );
 
         let (textured, _corner) = uv_decorated_two_quad_plane(1, false);
@@ -27252,6 +27381,227 @@ mod tests {
                 .expect("live")
                 .all_share_component(&two_islands.face_keys()),
             "the shifted unwrap makes the shared edge a UV-island boundary: two components",
+        );
+    }
+
+    /// The single-UV-island two-quad plane of [`uv_decorated_two_quad_plane`] plus one more
+    /// loop layer, with the left quad's corners and the right quad's handed back separately so
+    /// a test can make the shared edge discontinuous on that layer **alone**.
+    fn two_quad_plane_with_extra_loop_layer(
+        desc: ElementAttributeDesc,
+    ) -> (LoopMesh, ElementAttributeKey, Vec<LoopKey>, Vec<LoopKey>) {
+        let (mut mesh, _corner) = uv_decorated_two_quad_plane(1, false);
+        let layer = mesh
+            .register_loop_attribute(desc)
+            .expect("a supported loop attribute format");
+
+        let left_vert = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for face in mesh.face_keys() {
+            let corners = if mesh.face_vert_keys(face).contains(&left_vert) {
+                &mut left
+            } else {
+                &mut right
+            };
+            corners.extend(mesh.face_loop_keys(face));
+        }
+        (mesh, layer, left, right)
+    }
+
+    fn quads_share_an_interp_component(mesh: &LoopMesh) -> bool {
+        TemplateBank::new(mesh, 1)
+            .interp_components()
+            .expect("a float2 loop layer at odd `segments` ⇒ the partition is built")
+            .all_share_component(&mesh.face_keys())
+    }
+
+    /// BEVEL.md §6.6.1.4.1's asymmetry, in the direction the partition's *edges* run: they are
+    /// read from the **full blendable set** (§6.6.1.4.0(a)), so a discontinuity in either colour
+    /// kind splits components even though no float2 value disagrees anywhere.
+    #[test]
+    fn interp_component_edges_split_on_a_colour_only_discontinuity() {
+        let (mut mesh, color, left, right) = two_quad_plane_with_extra_loop_layer(
+            ElementAttributeDesc::color(AttributeKey::custom("color"), AttrType::Vec4),
+        );
+        for &corner in left.iter().chain(&right) {
+            mesh.loop_attribs_mut()
+                .set_vec4(color, corner.as_usize(), [0.25, 0.5, 0.75, 1.0]);
+        }
+        assert!(
+            quads_share_an_interp_component(&mesh),
+            "an agreeing float colour layer leaves the continuous unwrap's single component alone",
+        );
+
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec4(color, corner.as_usize(), [0.25, 0.5, 0.75, 0.0]);
+        }
+        assert!(
+            !quads_share_an_interp_component(&mesh),
+            "float RGBA is blendable, so a colour-only discontinuity seams the shared edge and \
+             separates the quads",
+        );
+
+        let (mut mesh, byte_color, _left, right) = two_quad_plane_with_extra_loop_layer(
+            ElementAttributeDesc::color(AttributeKey::custom("byte_color"), AttrType::Vec4U8),
+        );
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec4u8(byte_color, corner.as_usize(), [0, 0, 0, 1]);
+        }
+        assert!(
+            !quads_share_an_interp_component(&mesh),
+            "byte colour is compared on the raw 0..=255 scale, so its tolerance is vacuous and a \
+             one-step difference already separates the quads",
+        );
+    }
+
+    /// §6.6.1.4.0(b): the compare is tolerant, absolute, and on the **summed squared difference
+    /// over the whole vector** — so a disagreement can be reached either by one large component
+    /// gap or by accumulating small ones, and sub-threshold paint noise is not a seam.
+    #[test]
+    fn blendable_compare_is_tolerant_and_whole_vector() {
+        let (mut mesh, auxiliary, _left, right) = two_quad_plane_with_extra_loop_layer(
+            ElementAttributeDesc::numeric(AttributeKey::custom("original_space"), AttrType::Vec2),
+        );
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec2(auxiliary, corner.as_usize(), [2e-3, 0.0]);
+        }
+        assert!(
+            quads_share_an_interp_component(&mesh),
+            "summed squared difference 4e-6 is strictly below the 2-float threshold 1e-5: one \
+             component, where an exact compare would over-seam",
+        );
+
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec2(auxiliary, corner.as_usize(), [4e-3, 0.0]);
+        }
+        assert!(
+            !quads_share_an_interp_component(&mesh),
+            "1.6e-5 exceeds 1e-5: a genuine disagreement",
+        );
+
+        let (mut mesh, color, left, right) = two_quad_plane_with_extra_loop_layer(
+            ElementAttributeDesc::color(AttributeKey::custom("color"), AttrType::Vec4),
+        );
+        for &corner in left.iter().chain(&right) {
+            mesh.loop_attribs_mut()
+                .set_vec4(color, corner.as_usize(), [0.5; 4]);
+        }
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec4(color, corner.as_usize(), [0.52, 0.5, 0.5, 0.5]);
+        }
+        assert!(
+            quads_share_an_interp_component(&mesh),
+            "a 2e-2 gap in one colour component sums to 4e-4, below the colour threshold 1e-3",
+        );
+
+        for &corner in &right {
+            mesh.loop_attribs_mut()
+                .set_vec4(color, corner.as_usize(), [0.52; 4]);
+        }
+        assert!(
+            !quads_share_an_interp_component(&mesh),
+            "the same 2e-2 gap on all four components sums to 1.6e-3, which exceeds 1e-3 — the \
+             test is whole-vector, not per-component",
+        );
+    }
+
+    /// §6.6.1.4.0(a)'s closed list is keyed on layer **type**, and "float-valued" is not the
+    /// key: a scalar float and a 3-vector float loop layer are skipped, as are the integer and
+    /// boolean families. A discontinuity in any of them is invisible to the partition.
+    #[test]
+    fn interp_component_edges_never_read_a_non_blendable_layer() {
+        for (desc, paint) in [
+            (
+                ElementAttributeDesc::numeric(AttributeKey::custom("mask"), AttrType::F32),
+                &(|mesh: &mut LoopMesh, layer, corner: LoopKey| {
+                    mesh.loop_attribs_mut()
+                        .set_f32(layer, corner.as_usize(), 7.0);
+                }) as &dyn Fn(&mut LoopMesh, ElementAttributeKey, LoopKey),
+            ),
+            (
+                ElementAttributeDesc::numeric(AttributeKey::custom("tangent"), AttrType::Vec3),
+                &|mesh, layer, corner| {
+                    mesh.loop_attribs_mut()
+                        .set_vec3(layer, corner.as_usize(), [7.0, 7.0, 7.0]);
+                },
+            ),
+            (
+                ElementAttributeDesc::numeric(AttributeKey::custom("group"), AttrType::I32),
+                &|mesh, layer, corner| {
+                    mesh.loop_attribs_mut().set_i32(layer, corner.as_usize(), 7);
+                },
+            ),
+            (
+                ElementAttributeDesc::numeric(AttributeKey::custom("pinned"), AttrType::Bool),
+                &|mesh, layer, corner| {
+                    mesh.loop_attribs_mut()
+                        .set_bool(layer, corner.as_usize(), true);
+                },
+            ),
+        ] {
+            let name = desc.key.clone();
+            let (mut mesh, layer, _left, right) = two_quad_plane_with_extra_loop_layer(desc);
+            for &corner in &right {
+                paint(&mut mesh, layer, corner);
+            }
+            assert!(
+                quads_share_an_interp_component(&mesh),
+                "{name:?} is not a blendable type, so however discontinuous it is the partition \
+                 never reads it and the quads stay in one component",
+            );
+        }
+    }
+
+    /// §6.6.1.4.0(b)'s NaN corollary: the threshold test is a strict `<`, NaN propagates out of
+    /// the difference-and-square chain, so a NaN component is a **disagreement** — including
+    /// against the bit-identical NaN on the other side.
+    #[test]
+    fn a_nan_in_a_blendable_layer_seams_the_edge_against_itself() {
+        let (mut mesh, auxiliary, left, right) = two_quad_plane_with_extra_loop_layer(
+            ElementAttributeDesc::numeric(AttributeKey::custom("original_space"), AttrType::Vec2),
+        );
+        for &corner in left.iter().chain(&right) {
+            mesh.loop_attribs_mut()
+                .set_vec2(auxiliary, corner.as_usize(), [f32::NAN, 0.0]);
+        }
+        assert!(
+            !quads_share_an_interp_component(&mesh),
+            "both sides hold the same NaN and the edge is still a seam",
+        );
+    }
+
+    /// The other half of §6.6.1.4.1's asymmetry: the **arming** gate stays the one-row float2
+    /// *inventory* test, so on a mesh whose only blendable layers are colours no partition is
+    /// built at all and key 1 stays inert however discontinuous the colour is.
+    #[test]
+    fn a_colour_only_mesh_never_arms_the_partition() {
+        let (mut mesh, _shared) = two_quad_strip();
+        let color = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("color"),
+                AttrType::Vec4,
+            ))
+            .expect("Vec4 is a supported loop attribute format");
+
+        let left_vert = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+        for face in mesh.face_keys() {
+            if mesh.face_vert_keys(face).contains(&left_vert) {
+                continue;
+            }
+            for corner in mesh.face_loop_keys(face) {
+                mesh.loop_attribs_mut()
+                    .set_vec4(color, corner.as_usize(), [1.0; 4]);
+            }
+        }
+
+        assert!(
+            TemplateBank::new(&mesh, 1).interp_components().is_none(),
+            "no float2 loop layer ⇒ nothing arms the partition, colours notwithstanding",
         );
     }
 
@@ -27437,10 +27787,11 @@ mod tests {
     /// At a seam its donor is the tie-break winner between the edge's two flanking faces —
     /// here the far flank, which carries the lower material slot (key 3).
     ///
-    /// The seam is a **colour-only** loop-layer discontinuity, which is the configuration
-    /// that leaves the rule fully decided: it seams the edge by condition (2), yet key 1
-    /// (§6.6.1.4.1) stays inert because the component partition reads UV-class layers
-    /// alone. Only the centre quad moves — its two neighbours keep their positional halves.
+    /// The seam is a **float-RGBA-only** loop-layer discontinuity, which is the configuration
+    /// that leaves the rule fully decided: float RGBA is blendable (§6.6.1.4.0(a)) so it
+    /// seams the edge by condition (2), yet key 1 (§6.6.1.4.1) stays inert because the mesh
+    /// carries no float2 layer to arm the partition. Only the centre quad moves — its two
+    /// neighbours keep their positional halves.
     #[test]
     fn face_cd_straddle_quad_takes_the_tie_break_winner_at_a_seamed_edge() {
         let mut mesh = LoopMesh::new();
@@ -27451,14 +27802,14 @@ mod tests {
         let color = mesh
             .register_loop_attribute(ElementAttributeDesc::color(
                 AttributeKey::custom("l_color"),
-                AttrType::Vec3,
+                AttrType::Vec4,
             ))
             .unwrap();
         let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
         let near_center = mesh.face_center_of_mass(near_face);
         for corner in mesh.face_loop_keys(near_face) {
             mesh.loop_attribs_mut()
-                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+                .set_vec4(color, corner.as_usize(), [1.0, 0.0, 0.0, 1.0]);
         }
 
         let result = mesh.bevel(
@@ -27493,7 +27844,7 @@ mod tests {
 
         mesh.register_loop_attribute(ElementAttributeDesc::color(
             AttributeKey::custom("l_color"),
-            AttrType::Vec3,
+            AttrType::Vec4,
         ))
         .unwrap();
         let near_center = mesh.face_center_of_mass(mesh.edge_flanking_faces(edge).0.unwrap());
@@ -27529,14 +27880,14 @@ mod tests {
         let color = mesh
             .register_loop_attribute(ElementAttributeDesc::color(
                 AttributeKey::custom("l_color"),
-                AttrType::Vec3,
+                AttrType::Vec4,
             ))
             .unwrap();
         let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
         let near_center = mesh.face_center_of_mass(near_face);
         for corner in mesh.face_loop_keys(near_face) {
             mesh.loop_attribs_mut()
-                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+                .set_vec4(color, corner.as_usize(), [1.0, 0.0, 0.0, 1.0]);
         }
 
         let result = mesh.bevel(
@@ -27557,7 +27908,7 @@ mod tests {
         );
     }
 
-    /// §6.6.1.4.1's decline: with a UV-class layer present at odd `segments`, key 1 is
+    /// §6.6.1.4.1's decline: with a float2 layer present at odd `segments`, key 1 is
     /// **live**, and the numbering it would need is a construction-order artefact this
     /// crate does not reproduce. When the two candidates sit in *different* interpolation
     /// components — as they do at a UV-island boundary, which is also what seams the edge —
@@ -27781,14 +28132,14 @@ mod tests {
         let color = mesh
             .register_loop_attribute(ElementAttributeDesc::color(
                 AttributeKey::custom("l_color"),
-                AttrType::Vec3,
+                AttrType::Vec4,
             ))
             .unwrap();
         let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
         let near_center = mesh.face_center_of_mass(near_face);
         for corner in mesh.face_loop_keys(near_face) {
             mesh.loop_attribs_mut()
-                .set_vec3(color, corner.as_usize(), [1.0, 0.0, 0.0]);
+                .set_vec4(color, corner.as_usize(), [1.0, 0.0, 0.0, 1.0]);
         }
 
         let result = mesh.bevel(
@@ -27822,7 +28173,7 @@ mod tests {
 
         mesh.register_loop_attribute(ElementAttributeDesc::color(
             AttributeKey::custom("l_color"),
-            AttrType::Vec3,
+            AttrType::Vec4,
         ))
         .unwrap();
         let near_center = mesh.face_center_of_mass(mesh.edge_flanking_faces(edge).0.unwrap());
@@ -27845,13 +28196,15 @@ mod tests {
         );
     }
 
-    /// §6.6.1.4's condition (2) reads *interpolable* layers only. A layer whose type
-    /// defines no blend — the byte / string / id family, [`InterpPolicy::NoInterp`] — is not
-    /// interpolation data, so a discontinuity in it does **not** seam the edge and the
-    /// straddle quad keeps its near flank. The same fixture with the same values on a
-    /// `Linear` layer does re-route, which is the sibling test above.
+    /// §6.6.1.4.0(a)'s closed list is keyed on layer **type**, never on the crate's own
+    /// interpolation policy — and the byte-RGBA row is where the two readings come apart in
+    /// the *under*-seaming direction. A four-byte colour layer declares
+    /// [`InterpPolicy::NoInterp`] here, yet the guide puts it squarely in the blendable set,
+    /// so a byte-colour-only discontinuity **is** a condition-(2) seam and the straddle quad
+    /// re-routes to the tie-break winner. A policy-derived membership test would leave the
+    /// strip positional.
     #[test]
-    fn face_cd_a_no_interp_loop_layer_discontinuity_does_not_seam_the_edge() {
+    fn face_cd_a_byte_colour_only_discontinuity_seams_the_edge() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let tint = tint_and_slot_faces(&mut mesh);
@@ -27859,7 +28212,7 @@ mod tests {
 
         let opaque = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
-                AttributeKey::custom("l_opaque_id"),
+                AttributeKey::custom("l_byte_color"),
                 AttrType::Vec4U8,
             ))
             .unwrap();
@@ -27869,57 +28222,22 @@ mod tests {
                 .expect("the layer was just registered")
                 .interp,
             InterpPolicy::NoInterp,
-            "a plain Vec4U8 layer defines no interpolation",
+            "the fixture is only sharp while the byte layer declares no interpolation",
         );
         let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
         let near_center = mesh.face_center_of_mass(near_face);
+        assert!(
+            !mesh.edge_is_interp_seam(edge),
+            "an agreeing byte colour layer leaves the edge contiguous",
+        );
         for corner in mesh.face_loop_keys(near_face) {
             mesh.loop_attribs_mut()
                 .set_vec4u8(opaque, corner.as_usize(), [255, 0, 0, 255]);
         }
-
-        let result = mesh.bevel(
-            &[edge.into()],
-            BevelOptions {
-                offset: 0.25,
-                affect: BevelAffect::Edges,
-                segments: 3,
-                material: -1,
-                ..Default::default()
-            },
+        assert!(
+            mesh.edge_is_interp_seam(edge),
+            "byte RGBA is blendable by type, so the discontinuity seams the edge",
         );
-        let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
-        assert_eq!(
-            blocks,
-            vec![near_block, near_block, far_block],
-            "a NoInterp discontinuity is not an interpolation seam — the strip stays \
-             positional",
-        );
-    }
-
-    /// The other side of the widened filter: a **boolean** loop layer blends by disjunction,
-    /// which is a real interpolation rule, so a discontinuity in it *is* a condition-(2)
-    /// seam and does re-route the centre quad. Booleans carry no UV class, so key 1 stays
-    /// inert and the tie-break is fully decided — the far flank wins on key 3.
-    #[test]
-    fn face_cd_a_boolean_loop_layer_discontinuity_seams_the_edge() {
-        let mut mesh = LoopMesh::new();
-        mesh_add_cube(&mut mesh);
-        let tint = tint_and_slot_faces(&mut mesh);
-        let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
-
-        let mask = mesh
-            .register_loop_attribute(ElementAttributeDesc::numeric(
-                AttributeKey::custom("l_mask"),
-                AttrType::Bool,
-            ))
-            .unwrap();
-        let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
-        let near_center = mesh.face_center_of_mass(near_face);
-        for corner in mesh.face_loop_keys(near_face) {
-            mesh.loop_attribs_mut()
-                .set_bool(mask, corner.as_usize(), true);
-        }
 
         let result = mesh.bevel(
             &[edge.into()],
@@ -27935,7 +28253,152 @@ mod tests {
         assert_eq!(
             blocks,
             vec![near_block, far_block, far_block],
-            "a disjunction-blended layer is interpolation data, so it seams the edge",
+            "the seamed edge's centre quad takes the tie-break winner {far_block:?}",
+        );
+    }
+
+    /// The *over*-seaming direction at the same call site: the four families §6.6.1.4.0(a)
+    /// leaves off the closed list — scalar float, 3-vector float, 32-bit integer, boolean —
+    /// are never read, however discontinuous. The 32-bit integer and the boolean are the
+    /// sharp pair: both **are** interpolable (they define a rounded sum and a disjunction),
+    /// so an "interpolable ⇒ consulted" membership test would seam here and re-route the
+    /// centre quad. The strip must stay positional: near, near, far.
+    #[test]
+    fn face_cd_a_non_blendable_loop_layer_discontinuity_never_seams_the_edge() {
+        type Paint = dyn Fn(&mut LoopMesh, ElementAttributeKey, LoopKey);
+        let cases: [(&str, AttrType, &Paint); 4] = [
+            (
+                "l_scalar",
+                AttrType::F32,
+                &|mesh: &mut LoopMesh, layer, corner: LoopKey| {
+                    mesh.loop_attribs_mut()
+                        .set_f32(layer, corner.as_usize(), 7.0);
+                },
+            ),
+            ("l_tangent", AttrType::Vec3, &|mesh, layer, corner| {
+                mesh.loop_attribs_mut()
+                    .set_vec3(layer, corner.as_usize(), [7.0, 7.0, 7.0]);
+            }),
+            ("l_group", AttrType::I32, &|mesh, layer, corner| {
+                mesh.loop_attribs_mut().set_i32(layer, corner.as_usize(), 7);
+            }),
+            ("l_mask", AttrType::Bool, &|mesh, layer, corner| {
+                mesh.loop_attribs_mut()
+                    .set_bool(layer, corner.as_usize(), true);
+            }),
+        ];
+
+        for (name, attr_type, paint) in cases {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let tint = tint_and_slot_faces(&mut mesh);
+            let (edge, near_block, far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+            let layer = mesh
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom(name),
+                    attr_type,
+                ))
+                .unwrap();
+            let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+            let near_center = mesh.face_center_of_mass(near_face);
+            for corner in mesh.face_loop_keys(near_face) {
+                paint(&mut mesh, layer, corner);
+            }
+            assert!(
+                !mesh.edge_is_interp_seam(edge),
+                "{name} is not a blendable type, so condition (2) never reads it",
+            );
+
+            let result = mesh.bevel(
+                &[edge.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments: 3,
+                    material: -1,
+                    ..Default::default()
+                },
+            );
+            let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
+            assert_eq!(
+                blocks,
+                vec![near_block, near_block, far_block],
+                "{name}: an unseamed edge keeps the positional split",
+            );
+        }
+    }
+
+    /// §6.6.1.4.0(b) at the **edge-level** call site: the compare is the tolerant summed
+    /// squared difference, not exact equality. A sub-threshold float2 gap across the beveled
+    /// edge leaves it contiguous where an exact compare would seam it; widening the same gap
+    /// past the threshold does seam it. Both call sites of condition (2) answer alike,
+    /// asserted here on one mesh.
+    #[test]
+    fn face_cd_a_sub_tolerance_float2_gap_does_not_seam_the_edge() {
+        for (gap, expected_seam) in [(1e-3_f32, false), (4e-3_f32, true)] {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let tint = tint_and_slot_faces(&mut mesh);
+            let (edge, _near_block, _far_block) = inverted_slot_strip_fixture(&mut mesh, tint);
+
+            let uv = mesh
+                .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+                .unwrap();
+            let near_face = mesh.edge_flanking_faces(edge).0.unwrap();
+            for corner in mesh.face_loop_keys(near_face) {
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, corner.as_usize(), [gap, 0.0]);
+            }
+
+            assert_eq!(
+                mesh.edge_is_interp_seam(edge),
+                expected_seam,
+                "gap {gap}: summed squared difference against the float2 threshold 1e-5",
+            );
+
+            let far_face = mesh.edge_flanking_faces(edge).1.unwrap();
+            let flanks_share = TemplateBank::new(&mesh, 3)
+                .interp_components()
+                .expect("a float2 layer at odd `segments` arms the partition")
+                .all_share_component(&[near_face, far_face]);
+            assert_eq!(
+                flanks_share, !expected_seam,
+                "gap {gap}: the partition's edges run the same predicate as the seam test",
+            );
+        }
+    }
+
+    /// §6.6.1.4.0(a)'s float2 arming gate is a **type** test over the layer inventory, with
+    /// no role predicate anywhere in it. Positive direction: a float2 loop layer that is
+    /// *not* roled as a UV map still arms §6.6.1.4.1's partition. Gating on the active-UV
+    /// query instead would leave this case armed only through that query's fallback branch,
+    /// and would silently un-arm if the query ever required the role.
+    #[test]
+    fn a_non_uv_roled_float2_layer_arms_the_partition() {
+        let (mut mesh, _shared) = two_quad_strip();
+        let layer = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("original_space"),
+                AttrType::Vec2,
+            ))
+            .expect("Vec2 is a supported loop attribute format");
+        assert_ne!(
+            mesh.loop_attribs()
+                .descriptor(layer)
+                .expect("the layer was just registered")
+                .role,
+            AttrRole::Uv,
+            "the fixture only tests the type gate while the layer carries no UV role",
+        );
+
+        assert!(
+            InterpComponents::live(&mesh, 3),
+            "a float2 loop layer arms key 1 at odd `segments` whatever its role",
+        );
+        assert!(
+            TemplateBank::new(&mesh, 3).interp_components().is_some(),
+            "the armed gate builds the partition",
         );
     }
 
