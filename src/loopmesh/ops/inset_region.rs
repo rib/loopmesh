@@ -1256,6 +1256,14 @@ impl LoopMesh {
     ///    not edge-adjacent through `v`: overwrite every other tagged-region
     ///    loop at `v` whose live value still tolerant-equals one of the two
     ///    corner-pair comparison values.
+    ///
+    /// Steps 1–2 and step 7's edge-adjacency test are pure topology and are
+    /// computed **once** per invocation. Steps 5–8, by contrast, are the *body of
+    /// a loop over the blendable loop layers* (§6.3.0(c)): each blendable layer
+    /// runs its own gate against its own rim-pair values and its own value-match,
+    /// so one layer's closed gate never vetoes another's merge. And every write is
+    /// confined to that one layer (§6.3.0(a)) — a non-blendable layer keeps the
+    /// value it carried into the merge at every loop the merge touches.
     fn inset_merge_corner_loops(
         &mut self,
         face_tag: crate::op_flags::FaceOpFlagLayer,
@@ -1292,6 +1300,12 @@ impl LoopMesh {
         // why the surviving loop is `behind_b` (not `behind_wall`/`behind_a`)
         // under loopmesh's wall-build visit order, and how that is pinned to the
         // guide's stated signed values.
+        //
+        // The layer list is topology-independent, so it is derived once for the
+        // whole pass rather than per invocation.
+        let blendable_layers = self.loop_attribs.blendable_layers();
+        let mut matched: Vec<LoopKey> = Vec::new();
+        let mut candidates: Vec<LoopKey> = Vec::new();
         for side in wall_side_edges {
             // Face B is the side edge's radial-other face. The merge fires only
             // when `e_connect` is manifold (exactly wall A and one other face).
@@ -1342,16 +1356,6 @@ impl LoopMesh {
                 continue;
             }
 
-            // Step 5 — gate on the outer (rim) pair agreeing, using the
-            // *tolerant* per-layer comparator (§6.3 step-5 note): a math UV
-            // layer compares by squared distance, never byte-for-byte.
-            if !self
-                .loop_attribs
-                .slots_agree_on_blendable_layers(outer_a.as_usize(), outer_b.as_usize())
-            {
-                continue;
-            }
-
             // The reconciled value is a SINGLE behind loop's §7 value (§6.3
             // step 6 / §6.3.1.1): one behind loop survives, the other is
             // overwritten with it — never their midpoint. Which of the two
@@ -1391,70 +1395,111 @@ impl LoopMesh {
             let reconciled = survivor;
 
             // Step 7's value-match compares candidate loops against the corner
-            // pair's values "as they stand at the moment the walk begins" — read
-            // live, *before* step 8 seeds them. Cache the comparison sources now
-            // so the step-8 write below cannot move them mid-walk. (At a fan hub
-            // an earlier sibling invocation may already have seeded these; that
-            // is the intended first-writer-wins state, not a poisoning.)
+            // pair, read live and *before* step 8 seeds that pair. Under the
+            // per-layer restructure the ordering that guarantees this is finer
+            // than "cache the values": within ONE layer's pass step 7 still runs
+            // ahead of step 8, and a *different* layer's step-8 write cannot
+            // disturb this layer's comparison because it lands in that layer's
+            // own storage. So naming the loops is enough — no snapshot needed.
+            // (At a fan hub an earlier sibling invocation may already have seeded
+            // these; that is the intended first-writer-wins state.)
             let compare_a = inner_a;
             let compare_b = inner_b;
 
-            // Step 6 — collapse the behind pair to the survivor's value: stamp it
-            // onto the OTHER behind loop. The midpoint the operator computes here
-            // is dead (clobbered the next line), so the net effect is a plain copy
-            // of the single surviving behind value.
-            self.loop_attribs
-                .copy_into(loser.as_usize(), reconciled.as_usize());
-
             // §6.3.1 test (b): behind faces edge-adjacent through `v` → simple
             // case, the collapse already covers the corner, no propagation.
-            // Still seed the corner pair (step 8) with the single behind value.
-            if self.faces_share_edge_through(inset_face_a, inset_face_b, side.moved_corner) {
-                self.loop_attribs
-                    .copy_into(inner_a.as_usize(), reconciled.as_usize());
-                self.loop_attribs
-                    .copy_into(inner_b.as_usize(), reconciled.as_usize());
-                continue;
-            }
+            let edge_adjacent =
+                self.faces_share_edge_through(inset_face_a, inset_face_b, side.moved_corner);
 
-            // Step 7 — distinct and non-edge-adjacent: at least one further
-            // tagged face sits between them around `v`. Overwrite every other
-            // tagged-region loop at `v` whose live value is *tolerant-equal* (the
-            // fuzzy predicate of the step-5 note, NOT a byte-compare) to one of
-            // the two corner-pair comparison values, read live before step 8
-            // seeds them. Loops further than epsilon from either comparison value
-            // are left at their §7-rebaked value (the merge does NOT collapse the
-            // whole hub — §6.3 step-8 verified note).
+            // The step-7 candidate set is topology plus the region tag, so it is
+            // layer-*independent* and derived at most once for all layers — but
+            // deriving it is an O(valence²) disk+radial walk, so it stays lazy:
+            // when every layer's step-5 gate is closed (the deliberate-seam case)
+            // the walk never runs. `handled` are the four loops steps 6 and 8 own
+            // outright.
             let handled = [inner_a, inner_b, behind_a, behind_b];
-            let corner_loops: Vec<LoopKey> = self.loops_at_vertex(side.moved_corner);
-            let mut matched: Vec<LoopKey> = Vec::new();
-            for candidate in corner_loops {
-                if handled.contains(&candidate) {
-                    continue;
-                }
-                if !self.face_op_flag_test(face_tag, self.loop_face(candidate), 0) {
-                    continue;
-                }
-                let matches_a = self
-                    .loop_attribs
-                    .slots_agree_on_blendable_layers(candidate.as_usize(), compare_a.as_usize());
-                let matches_b = self
-                    .loop_attribs
-                    .slots_agree_on_blendable_layers(candidate.as_usize(), compare_b.as_usize());
-                if matches_a || matches_b {
-                    matched.push(candidate);
-                }
-            }
-            for candidate in matched {
-                self.loop_attribs
-                    .copy_into(candidate.as_usize(), reconciled.as_usize());
-            }
+            candidates.clear();
+            let mut candidates_derived = edge_adjacent;
 
-            // Step 8 — seed the corner pair with the single behind value.
-            self.loop_attribs
-                .copy_into(inner_a.as_usize(), reconciled.as_usize());
-            self.loop_attribs
-                .copy_into(inner_b.as_usize(), reconciled.as_usize());
+            // §6.3.0(c) — steps 5–8 run once per blendable layer, independently.
+            for &layer in &blendable_layers {
+                // Step 5 — gate on THIS layer's outer (rim) pair agreeing, using
+                // the *tolerant* per-layer comparator (§6.3 step-5 note): a math
+                // UV layer compares by squared distance, never byte-for-byte. A
+                // layer whose gate is closed keeps the user's seam and is simply
+                // skipped; it does not veto the other layers.
+                if !self.loop_attribs.slots_agree_on_blendable_layer(
+                    layer,
+                    outer_a.as_usize(),
+                    outer_b.as_usize(),
+                ) {
+                    continue;
+                }
+
+                // Step 6 — collapse the behind pair to the survivor's value:
+                // stamp it onto the OTHER behind loop. The midpoint the operator
+                // computes here is dead (clobbered the next line), so the net
+                // effect is a plain copy of the single surviving behind value.
+                self.loop_attribs.copy_blendable_layer_into(
+                    layer,
+                    loser.as_usize(),
+                    reconciled.as_usize(),
+                );
+
+                // Step 7 — distinct and non-edge-adjacent: at least one further
+                // tagged face sits between them around `v`. Overwrite every other
+                // tagged-region loop at `v` whose live value is *tolerant-equal*
+                // (the fuzzy predicate of the step-5 note, NOT a byte-compare) to
+                // one of the two corner-pair comparison values, read live before
+                // step 8 seeds them. Loops further than epsilon from either
+                // comparison value are left at their §7-rebaked value (the merge
+                // does NOT collapse the whole hub — §6.3 step-8 verified note).
+                if !candidates_derived {
+                    candidates.extend(self.loops_at_vertex(side.moved_corner).into_iter().filter(
+                        |&candidate| {
+                            !handled.contains(&candidate)
+                                && self.face_op_flag_test(face_tag, self.loop_face(candidate), 0)
+                        },
+                    ));
+                    candidates_derived = true;
+                }
+
+                matched.clear();
+                for &candidate in &candidates {
+                    let matches_a = self.loop_attribs.slots_agree_on_blendable_layer(
+                        layer,
+                        candidate.as_usize(),
+                        compare_a.as_usize(),
+                    );
+                    let matches_b = self.loop_attribs.slots_agree_on_blendable_layer(
+                        layer,
+                        candidate.as_usize(),
+                        compare_b.as_usize(),
+                    );
+                    if matches_a || matches_b {
+                        matched.push(candidate);
+                    }
+                }
+                for &candidate in &matched {
+                    self.loop_attribs.copy_blendable_layer_into(
+                        layer,
+                        candidate.as_usize(),
+                        reconciled.as_usize(),
+                    );
+                }
+
+                // Step 8 — seed the corner pair with the single behind value.
+                self.loop_attribs.copy_blendable_layer_into(
+                    layer,
+                    inner_a.as_usize(),
+                    reconciled.as_usize(),
+                );
+                self.loop_attribs.copy_blendable_layer_into(
+                    layer,
+                    inner_b.as_usize(),
+                    reconciled.as_usize(),
+                );
+            }
         }
     }
 
@@ -1569,6 +1614,17 @@ mod tests {
     const CORNER_MERGE_EPS_SQ: f32 = 1.0e-5;
     use crate::loopmesh::test_support::create_face_from_verts;
     use crate::loopmesh::*;
+
+    /// Conjunction of the per-layer predicate over the whole blendable set. This is
+    /// **not** the merge's gate — §6.3.0(c) is explicit that the gate is per-layer and
+    /// that a conjunction under-merges — it exists only so the predicate's *set*
+    /// membership (which layer kinds are read at all) can be asserted in one call.
+    fn agrees_on_every_blendable_layer(mesh: &LoopMesh, a: usize, b: usize) -> bool {
+        mesh.loop_attribs()
+            .blendable_layers()
+            .into_iter()
+            .all(|layer| mesh.loop_attribs().slots_agree_on_blendable_layer(layer, a, b))
+    }
 
     // Keep the unused-import lint happy when assertions don't touch the
     // result type's fields.
@@ -3914,6 +3970,10 @@ mod tests {
             out
         };
         let (a, b) = (face_loops[0], face_loops[1]);
+        let uv_layer = BlendableLayer {
+            key: uv,
+            kind: BlendableKind::Float2,
+        };
 
         // Within epsilon: separation 1e-3 → squared distance 1e-6 < 1e-5.
         mesh.loop_attribs_mut()
@@ -3921,8 +3981,11 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec2(uv, b.as_usize(), [0.5 + 1.0e-3, 0.5]);
         assert!(
-            mesh.loop_attribs()
-                .slots_agree_on_blendable_layers(a.as_usize(), b.as_usize()),
+            mesh.loop_attribs().slots_agree_on_blendable_layer(
+                uv_layer,
+                a.as_usize(),
+                b.as_usize()
+            ),
             "values within epsilon must compare tolerant-equal (a byte compare \
              would reject them)"
         );
@@ -3931,9 +3994,11 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec2(uv, b.as_usize(), [0.6, 0.5]);
         assert!(
-            !mesh
-                .loop_attribs()
-                .slots_agree_on_blendable_layers(a.as_usize(), b.as_usize()),
+            !mesh.loop_attribs().slots_agree_on_blendable_layer(
+                uv_layer,
+                a.as_usize(),
+                b.as_usize()
+            ),
             "values beyond epsilon must compare unequal"
         );
     }
@@ -4057,6 +4122,353 @@ mod tests {
             !near(&survivor, &midpoint),
             "surviving arc-end UV {survivor:?} must NOT be the behind-pair \
              midpoint {midpoint:?} (the merge collapses, it does not average)"
+        );
+    }
+
+    /// The loops of `face` anchored at `vertex`, as raw slots.
+    fn face_loops_at(mesh: &LoopMesh, face: FaceKey, vertex: VertexKey) -> Vec<LoopKey> {
+        let mut out = Vec::new();
+        let mut it = mesh.face_loops(face);
+        while let Some(l) = it.next(mesh) {
+            if mesh.loop_vertex(l) == vertex {
+                out.push(l);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn corner_merge_leaves_non_blendable_layers_at_their_rebaked_values() {
+        // §6.3.0(a): every one of the merge's writes is confined to the blendable
+        // set — at EVERY write site, since §6.3.0(b) forbids per-step differences.
+        // The same fan the firing test uses, decorated with two NON-blendable
+        // layers (a scalar float and an i32), each seeded per-face-constant.
+        //
+        // Two arms of the same fixture are built: one whose UVs are continuous
+        // across the hub (every step-5 gate opens, the merge runs steps 6/7/8) and
+        // one whose UVs are per-face constants (every rim pair disagrees, so every
+        // gate closes and the merge declines). §7's rebake of the non-blendable
+        // layers is identical in both arms — the layers are independent — so any
+        // loop at the hub whose non-blendable value differs between the arms was
+        // written by the merge. Comparing the arms loop-for-loop pins all three
+        // write sites at once: the step-6 behind pair, the step-7 propagated
+        // interior hub loops, and the step-8 wall-side corner pair. A `copy_into`
+        // regression at any ONE of them shows up here.
+        //
+        // Step 7 only ever writes candidates whose value ALREADY matches the
+        // corner pair within epsilon, so its blendable write is invisible by
+        // construction and cannot be provoked by a position-derived layer (whose
+        // interior hub values sit far from the corner pair's). The fixture
+        // therefore carries a SECOND blendable layer, `flat`, uniform across the
+        // whole mesh: its gate opens for the same reason, and every interior hub
+        // loop lands in its step-7 match set. It is that layer's pass which drags
+        // the non-blendable values over under a `copy_into` regression.
+        struct Arm {
+            mesh: LoopMesh,
+            uv: ElementAttributeKey,
+            flat: ElementAttributeKey,
+            weight: ElementAttributeKey,
+            tag: ElementAttributeKey,
+            wall_faces: Vec<FaceKey>,
+            moved_hub: VertexKey,
+        }
+
+        let build = |continuous_uv: bool| -> Arm {
+            let mut mesh = LoopMesh::new();
+            let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
+            let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+
+            let uv = mesh
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("uv"),
+                    AttrType::Vec2,
+                ))
+                .unwrap();
+            let flat = mesh
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("flat"),
+                    AttrType::Vec2,
+                ))
+                .unwrap();
+            let weight = mesh
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("weight"),
+                    AttrType::F32,
+                ))
+                .unwrap();
+            let tag = mesh
+                .register_loop_attribute(ElementAttributeDesc::numeric(
+                    AttributeKey::custom("tag"),
+                    AttrType::I32,
+                ))
+                .unwrap();
+
+            let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
+            if continuous_uv {
+                let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+                for l in loops {
+                    let p = mesh.vertex_position(mesh.loop_vertex(l));
+                    mesh.loop_attribs_mut().set_vec2(uv, l.as_usize(), uv_fn(p));
+                    mesh.loop_attribs_mut()
+                        .set_vec2(flat, l.as_usize(), [0.25, 0.75]);
+                }
+            }
+            let face_keys: Vec<FaceKey> = mesh.face_keys();
+            for (face_index, &f) in face_keys.iter().enumerate() {
+                let face_loops: Vec<LoopKey> = {
+                    let mut acc = Vec::new();
+                    let mut it = mesh.face_loops(f);
+                    while let Some(l) = it.next(&mesh) {
+                        acc.push(l);
+                    }
+                    acc
+                };
+                let constant = (face_index + 1) as f32 * 100.0;
+                for l in face_loops {
+                    mesh.loop_attribs_mut()
+                        .set_f32(weight, l.as_usize(), constant);
+                    mesh.loop_attribs_mut()
+                        .set_i32(tag, l.as_usize(), constant as i32);
+                    if !continuous_uv {
+                        // Per-face constants: every rim pair straddles a seam, so
+                        // every layer's step-5 gate closes and the merge declines.
+                        mesh.loop_attribs_mut()
+                            .set_vec2(uv, l.as_usize(), [constant, -constant]);
+                        mesh.loop_attribs_mut()
+                            .set_vec2(flat, l.as_usize(), [-constant, constant]);
+                    }
+                }
+            }
+
+            let result = mesh.inset_region(
+                &tagged,
+                InsetRegionParams {
+                    thickness: 0.1,
+                    use_boundary: false,
+                    use_interpolate: true,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let moved_hub = shared_vertex_of(&mesh, &tagged);
+            Arm {
+                mesh,
+                uv,
+                flat,
+                weight,
+                tag,
+                wall_faces: result.wall_faces,
+                moved_hub,
+            }
+        };
+
+        let merged = build(true);
+        let declined = build(false);
+        let mesh = &merged.mesh;
+        let (uv, flat, weight, tag) = (merged.uv, merged.flat, merged.weight, merged.tag);
+        let moved_hub = merged.moved_hub;
+
+        // Same topology in both arms, so hub loop keys line up.
+        assert_eq!(moved_hub, declined.moved_hub);
+
+        let (triangles, _hub, _rim) = {
+            let mut probe = LoopMesh::new();
+            let fan = make_triangle_fan(&mut probe, 8);
+            fan
+        };
+        let arc_end_faces = [triangles[2], triangles[6]];
+        let interior_faces = [triangles[3], triangles[4], triangles[5]];
+
+        // The blendable layer DID merge in the first arm — otherwise every
+        // assertion below would pass vacuously on a merge that never ran.
+        let arc_end_uvs = tagged_corner_uvs_at(mesh, moved_hub, &arc_end_faces, uv);
+        assert_eq!(arc_end_uvs.len(), 2);
+        let near_uv = |a: [f32; 2], b: [f32; 2]| {
+            (a[0] - b[0]).abs() < 1.0e-4 && (a[1] - b[1]).abs() < 1.0e-4
+        };
+        assert!(
+            near_uv(arc_end_uvs[0], arc_end_uvs[1]),
+            "fixture must fire the merge on the blendable layer; got {:?} and {:?}",
+            arc_end_uvs[0],
+            arc_end_uvs[1]
+        );
+        // ...and it declined in the second arm, so the comparison is between a
+        // merge that ran and one that did not.
+        let declined_uvs =
+            tagged_corner_uvs_at(&declined.mesh, moved_hub, &arc_end_faces, declined.uv);
+        assert!(
+            !near_uv(declined_uvs[0], declined_uvs[1]),
+            "the seam arm must keep its per-face UVs (gate closed), got {declined_uvs:?}"
+        );
+
+        // Step 7 must actually reach the interior hub loops in the merged arm, or
+        // the step-7 half of the comparison below would be vacuous. On the `flat`
+        // layer every interior (non-arc-end) tagged face's hub loop is within
+        // epsilon of the corner pair, which is exactly the step-7 match
+        // condition — so each of them is written by that layer's pass.
+        let interior_flat = tagged_corner_uvs_at(mesh, moved_hub, &interior_faces, flat);
+        assert_eq!(interior_flat.len(), interior_faces.len());
+        let arc_end_flat = tagged_corner_uvs_at(mesh, moved_hub, &arc_end_faces, flat);
+        assert!(
+            interior_flat
+                .iter()
+                .all(|&got| near_uv(got, arc_end_flat[0])),
+            "fixture must put every interior hub loop in step 7's match set; \
+             interior {interior_flat:?} vs corner-pair {arc_end_flat:?}"
+        );
+
+        // The step-8 site must be reachable too: the walls contribute loops at the
+        // moved hub.
+        let wall_hub_loops: Vec<LoopKey> = merged
+            .wall_faces
+            .iter()
+            .flat_map(|&f| face_loops_at(mesh, f, moved_hub))
+            .collect();
+        assert!(
+            !wall_hub_loops.is_empty(),
+            "fixture must exercise step 8; no wall-side loop sits at the moved hub"
+        );
+
+        // Steps 6, 7 and 8 together: every loop at the hub — behind pair, interior
+        // propagated hub loops, wall-side corner pair — must carry exactly the
+        // non-blendable values it would have carried had the merge never run.
+        let mut compared = 0usize;
+        let hub_loops: Vec<LoopKey> = mesh
+            .loops
+            .iter()
+            .filter(|&l| mesh.loop_vertex(l) == moved_hub)
+            .collect();
+        // 5 tagged inset faces + the 2 arc-end walls: the step-6 behind pair,
+        // the 3 step-7 interior hub loops and the step-8 wall-side corner pair.
+        assert_eq!(
+            hub_loops.len(),
+            7,
+            "fixture must present all three write sites at the hub"
+        );
+        for l in hub_loops {
+            let slot = l.as_usize();
+            let got_weight = mesh.loop_attribs().get_f32(weight, slot).unwrap();
+            let got_tag = mesh.loop_attribs().get_i32(tag, slot).unwrap();
+            let base_weight = declined
+                .mesh
+                .loop_attribs()
+                .get_f32(declined.weight, slot)
+                .unwrap();
+            let base_tag = declined
+                .mesh
+                .loop_attribs()
+                .get_i32(declined.tag, slot)
+                .unwrap();
+            assert!(
+                (got_weight - base_weight).abs() < 1.0e-3,
+                "the scalar float layer is off the blendable list, so no merge step may \
+                 touch hub loop {slot}: expected its rebaked {base_weight}, got {got_weight}"
+            );
+            assert_eq!(
+                got_tag, base_tag,
+                "the i32 layer is off the blendable list, so no merge step may touch \
+                 hub loop {slot}"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 7);
+
+        // The behind pair specifically: a per-face-uniform layer resamples to its
+        // own face's constant (§6.2's identity argument), so the two arc-end inset
+        // faces' hub loops still carry DISTINCT constants after the merge.
+        let arc_end_weights: Vec<f32> = arc_end_faces
+            .iter()
+            .map(|&f| {
+                let hub = face_loops_at(mesh, f, moved_hub);
+                assert_eq!(hub.len(), 1);
+                mesh.loop_attribs().get_f32(weight, hub[0].as_usize()).unwrap()
+            })
+            .collect();
+        assert!(
+            (arc_end_weights[0] - arc_end_weights[1]).abs() > 1.0,
+            "step 6 must not equalise the behind pair's non-blendable values; got \
+             {arc_end_weights:?}"
+        );
+    }
+
+    #[test]
+    fn corner_merge_gate_is_per_layer_not_conjunctive() {
+        // §6.3.0(c): each blendable layer runs its own step-5 gate against its own
+        // rim pair. Two float2 layers on one fan — `open` continuous everywhere
+        // (gate open), `seam` carrying a gross discontinuity at the two arc-end
+        // faces' hub corners, which is exactly where the hub invocation's rim pair
+        // lives (§6.2 snapshots those into the walls' rim loops), so its gate is
+        // closed. The reference merges `open` and declines `seam` in the same call.
+        //
+        // A conjunctive "all blendable layers agree" gate under-merges: `seam`'s
+        // closed gate would veto `open`'s merge too, leaving `open`'s two arc-end
+        // hub loops at their distinct §7 values.
+        let mut mesh = LoopMesh::new();
+        let (triangles, hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+        let arc_end_faces = [triangles[2], triangles[6]];
+
+        let open = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv_open"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+        let seam = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv_seam"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+
+        let uv_fn = |p: Vec3| -> [f32; 2] { [p.x * p.y + p.x, p.x * p.x - p.y * p.y] };
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            let value = uv_fn(p);
+            mesh.loop_attribs_mut().set_vec2(open, l.as_usize(), value);
+            mesh.loop_attribs_mut().set_vec2(seam, l.as_usize(), value);
+        }
+        // Author the seam: the two arc-end faces disagree grossly at the hub, and
+        // nowhere else, so `open`'s rim pair is untouched.
+        for (i, &f) in arc_end_faces.iter().enumerate() {
+            for l in face_loops_at(&mesh, f, hub) {
+                let value = [10.0 * (i as f32 + 1.0), -3.0 * (i as f32 + 1.0)];
+                mesh.loop_attribs_mut().set_vec2(seam, l.as_usize(), value);
+            }
+        }
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        let open_values = tagged_corner_uvs_at(&mesh, moved_hub, &arc_end_faces, open);
+        let seam_values = tagged_corner_uvs_at(&mesh, moved_hub, &arc_end_faces, seam);
+        assert_eq!(open_values.len(), 2);
+        assert_eq!(seam_values.len(), 2);
+
+        assert!(
+            (open_values[0][0] - open_values[1][0]).abs() < 1.0e-4
+                && (open_values[0][1] - open_values[1][1]).abs() < 1.0e-4,
+            "the continuous layer's own gate is open, so it must merge however the \
+             other layer's gate answers; got {:?} and {:?}",
+            open_values[0],
+            open_values[1]
+        );
+        assert!(
+            (seam_values[0][0] - seam_values[1][0]).abs() > 1.0,
+            "the seamed layer's own gate is closed, so it keeps its §7 values; \
+             got {:?} and {:?}",
+            seam_values[0],
+            seam_values[1]
         );
     }
 
@@ -4314,7 +4726,7 @@ mod tests {
         mesh.loop_attribs_mut().set_f32(scalar, a, 0.5);
         mesh.loop_attribs_mut().set_f32(scalar, b, 0.5 + 1.0e-6);
         assert!(
-            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            agrees_on_every_blendable_layer(&mesh, a, b),
             "a scalar float layer is off the blendable list and must not be read"
         );
 
@@ -4325,7 +4737,7 @@ mod tests {
         mesh.loop_attribs_mut().set_i32(integer, a, 3);
         mesh.loop_attribs_mut().set_i32(integer, b, 91);
         assert!(
-            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            agrees_on_every_blendable_layer(&mesh, a, b),
             "scalar-float, 3-vector-float and i32 layers are all off the list, so even \
              a gross disagreement on them leaves the slots equal"
         );
@@ -4333,12 +4745,12 @@ mod tests {
         // The 2-float layer is the only one read, under its own constant.
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-4, 0.5]);
         assert!(
-            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            agrees_on_every_blendable_layer(&mesh, a, b),
             "a squared difference below the 2-float constant is still agreement"
         );
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-2, 0.5]);
         assert!(
-            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            !agrees_on_every_blendable_layer(&mesh, a, b),
             "a squared difference above the 2-float constant is a disagreement"
         );
     }
@@ -4369,7 +4781,7 @@ mod tests {
 
         mesh.loop_attribs_mut().set_f32(scalar, a, 0.0);
         mesh.loop_attribs_mut().set_f32(scalar, b, 1.0);
-        assert!(mesh.loop_attribs().slots_agree_on_blendable_layers(a, b));
+        assert!(agrees_on_every_blendable_layer(&mesh, a, b));
     }
 
     #[test]
@@ -4416,7 +4828,7 @@ mod tests {
             "the fixture must sit inside the band the two constants bracket"
         );
         assert!(
-            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            agrees_on_every_blendable_layer(&mesh, a, b),
             "float RGBA is compared against its own 1e-3 constant, so a squared \
              difference of 1e-4 is agreement"
         );
@@ -4425,7 +4837,7 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec4(color, b, [0.25 + 0.2, 0.5, 0.75, 1.0]);
         assert!(
-            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            !agrees_on_every_blendable_layer(&mesh, a, b),
             "beyond the colour constant the slots must compare unequal"
         );
 
@@ -4435,7 +4847,7 @@ mod tests {
             .set_vec4(color, b, [0.25, 0.5, 0.75, 1.0]);
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-2, 0.5]);
         assert!(
-            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            !agrees_on_every_blendable_layer(&mesh, a, b),
             "the same squared difference of 1e-4 is a disagreement on a 2-float layer"
         );
     }
