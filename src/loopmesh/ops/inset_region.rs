@@ -5,15 +5,6 @@ use glam::{Vec2, Vec3};
 use super::mean_value::{mean_value_weights, PlaneProjection};
 use crate::loopmesh::*;
 
-/// Squared-distance tolerance for the corner customdata merge's value
-/// comparisons (INSET.md §6.3 step-5 note). Both the step-5 gate and the
-/// step-7 propagation value-match treat two math-layer values as equal when
-/// their squared distance is below this threshold — roughly `3.2e-3` units of
-/// separation for a two-component float layer. A byte-exact compare here is the
-/// documented byte-match killer: independently-rebaked float resamples that the
-/// operator should treat as identical differ in their low bits.
-const CORNER_MERGE_EPS_SQ: f32 = 1.0e-5;
-
 /// One snapshotted face's customdata baseline (INSET.md §4.5). Captured before
 /// the offset solver moves any corner so that phase four (§7) can resample the
 /// *original* corner attributes at the *new* corner positions.
@@ -1344,11 +1335,10 @@ impl LoopMesh {
             // Step 5 — gate on the outer (rim) pair agreeing, using the
             // *tolerant* per-layer comparator (§6.3 step-5 note): a math UV
             // layer compares by squared distance, never byte-for-byte.
-            if !self.loop_attribs.slots_tolerant_equal(
-                outer_a.as_usize(),
-                outer_b.as_usize(),
-                CORNER_MERGE_EPS_SQ,
-            ) {
+            if !self
+                .loop_attribs
+                .slots_tolerant_equal(outer_a.as_usize(), outer_b.as_usize())
+            {
                 continue;
             }
 
@@ -1435,16 +1425,12 @@ impl LoopMesh {
                 if !self.face_op_flag_test(face_tag, self.loop_face(candidate), 0) {
                     continue;
                 }
-                let matches_a = self.loop_attribs.slots_tolerant_equal(
-                    candidate.as_usize(),
-                    compare_a.as_usize(),
-                    CORNER_MERGE_EPS_SQ,
-                );
-                let matches_b = self.loop_attribs.slots_tolerant_equal(
-                    candidate.as_usize(),
-                    compare_b.as_usize(),
-                    CORNER_MERGE_EPS_SQ,
-                );
+                let matches_a = self
+                    .loop_attribs
+                    .slots_tolerant_equal(candidate.as_usize(), compare_a.as_usize());
+                let matches_b = self
+                    .loop_attribs
+                    .slots_tolerant_equal(candidate.as_usize(), compare_b.as_usize());
                 if matches_a || matches_b {
                     matched.push(candidate);
                 }
@@ -1548,15 +1534,15 @@ impl LoopMesh {
         result
     }
 
-    /// INSET.md §6.3 corner-merge gate — true iff at least one registered loop
-    /// layer is a "math" layer: one whose type supports the pairwise add and
-    /// scalar multiply the merge's average needs (`InterpPolicy::Linear`). The
-    /// integer and boolean families are interpolable (BMESH.md §10.1.4) but not
-    /// math, and must not trigger the corner merge.
+    /// INSET.md §6.3 corner-merge gate — true iff at least one registered loop layer is a
+    /// **math** layer. That class is the same one BEVEL.md §6.6.1.4.0(a) specifies as
+    /// *blendable*, and both guides forbid deriving a second predicate for it, so this
+    /// defers to the single closed list ([`BlendableKind`]): decided by storage type
+    /// alone, never by the layer's interp policy or role. The scalar-float, 3-vector-float,
+    /// integer and boolean families are all outside it — the last two are interpolable
+    /// (BMESH.md §10.1.4) but still must not trigger the corner merge.
     fn has_loop_math_layer(&self) -> bool {
-        self.loop_attribs
-            .iter_descriptors()
-            .any(|(_, desc)| matches!(desc.interp, InterpPolicy::Linear))
+        self.loop_attribs.has_blendable_layer()
     }
 }
 
@@ -1564,7 +1550,13 @@ impl LoopMesh {
 mod tests {
     use glam::Vec3;
 
-    use super::{InsetRegionParams, InsetRegionResult, CORNER_MERGE_EPS_SQ};
+    use super::{InsetRegionParams, InsetRegionResult};
+
+    /// The `Float2` kind's own equality constant (`BEVEL.md` §6.6.1.4.0(b)), restated here
+    /// only so these tests can place a UV just inside or just outside the band the merge
+    /// actually applies. The operator itself never carries a tolerance: the constant is a
+    /// property of the layer kind, read off `BlendableKind::equality_threshold`.
+    const CORNER_MERGE_EPS_SQ: f32 = 1.0e-5;
     use crate::loopmesh::test_support::create_face_from_verts;
     use crate::loopmesh::*;
 
@@ -3833,11 +3825,8 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec2(uv, b.as_usize(), [0.5 + 1.0e-3, 0.5]);
         assert!(
-            mesh.loop_attribs().slots_tolerant_equal(
-                a.as_usize(),
-                b.as_usize(),
-                CORNER_MERGE_EPS_SQ
-            ),
+            mesh.loop_attribs()
+                .slots_tolerant_equal(a.as_usize(), b.as_usize()),
             "values within epsilon must compare tolerant-equal (a byte compare \
              would reject them)"
         );
@@ -3846,11 +3835,9 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec2(uv, b.as_usize(), [0.6, 0.5]);
         assert!(
-            !mesh.loop_attribs().slots_tolerant_equal(
-                a.as_usize(),
-                b.as_usize(),
-                CORNER_MERGE_EPS_SQ
-            ),
+            !mesh
+                .loop_attribs()
+                .slots_tolerant_equal(a.as_usize(), b.as_usize()),
             "values beyond epsilon must compare unequal"
         );
     }
@@ -3974,6 +3961,340 @@ mod tests {
             !near(&survivor, &midpoint),
             "surviving arc-end UV {survivor:?} must NOT be the behind-pair \
              midpoint {midpoint:?} (the merge collapses, it does not average)"
+        );
+    }
+
+    /// Register one loop layer on a fresh mesh and report the §6.3 gate's answer,
+    /// alongside the layer's interp policy — so a test can show the two are no
+    /// longer the same question.
+    fn gate_for(desc: ElementAttributeDesc) -> (bool, InterpPolicy) {
+        let mut mesh = LoopMesh::new();
+        let key = mesh.register_loop_attribute(desc).unwrap();
+        let interp = mesh.loop_attribs().descriptor(key).unwrap().interp;
+        (mesh.has_loop_math_layer(), interp)
+    }
+
+    #[test]
+    fn merge_gate_is_the_closed_blendable_list_not_the_interp_policy() {
+        // INSET.md §6.3's *math* layer is BEVEL.md §6.6.1.4.0(a)'s *blendable* class
+        // named twice, and both guides forbid a second, policy-derived predicate for
+        // it. The list admits exactly the 2-float type, float RGBA and byte RGBA.
+        //
+        // The two rows that pin the direction the policy reading got wrong: a scalar
+        // float and a 3-vector float both carry `Linear`, and both are EXCLUDED —
+        // §6.6.1.4.0(a) calls the 3-vector case the sharpest exclusion.
+        let (scalar_gate, scalar_interp) = gate_for(ElementAttributeDesc::numeric(
+            AttributeKey::custom("mask"),
+            AttrType::F32,
+        ));
+        assert_eq!(scalar_interp, InterpPolicy::Linear);
+        assert!(
+            !scalar_gate,
+            "a scalar float loop layer is not blendable, whatever its interp policy"
+        );
+
+        let (vec3_gate, vec3_interp) = gate_for(ElementAttributeDesc::numeric(
+            AttributeKey::custom("tangent"),
+            AttrType::Vec3,
+        ));
+        assert_eq!(vec3_interp, InterpPolicy::Linear);
+        assert!(
+            !vec3_gate,
+            "a 3-vector float loop layer is not blendable, whatever its interp policy"
+        );
+
+        for ty in [AttrType::Vec2, AttrType::Vec4] {
+            let (gate, _) = gate_for(ElementAttributeDesc::numeric(
+                AttributeKey::custom("blendable"),
+                ty,
+            ));
+            assert!(gate, "{ty:?} is on the closed blendable list");
+        }
+
+        // The interpolable-but-not-blendable families stay out, as they always were.
+        for ty in [AttrType::I32, AttrType::Bool, AttrType::U8] {
+            let (gate, _) = gate_for(ElementAttributeDesc::numeric(
+                AttributeKey::custom("other"),
+                ty,
+            ));
+            assert!(!gate, "{ty:?} must not open the corner-merge gate");
+        }
+    }
+
+    #[test]
+    fn merge_gate_byte_rgba_membership_is_role_independent() {
+        // Byte RGBA is one closed-list row, decided by storage alone. The colour role
+        // opts the layer into `Linear` while a bare one keeps `NoInterp`, so a
+        // policy-derived gate made membership depend on the role — which the guide
+        // forbids outright. Both must now answer the same.
+        let (plain_gate, plain_interp) = gate_for(ElementAttributeDesc::numeric(
+            AttributeKey::custom("bytes"),
+            AttrType::Vec4U8,
+        ));
+        let (color_gate, color_interp) = gate_for(ElementAttributeDesc::color(
+            AttributeKey::custom("col"),
+            AttrType::Vec4U8,
+        ));
+        assert_ne!(
+            plain_interp, color_interp,
+            "fixture must keep the two roles' policies distinct for the test to bite"
+        );
+        assert!(plain_gate, "a bare byte-RGBA loop layer is blendable");
+        assert!(color_gate, "a colour-roled byte-RGBA loop layer is blendable");
+    }
+
+    /// The two hub loops the arc-end inset faces hold at `vertex`, read from a scalar
+    /// loop layer — the scalar mirror of [`tagged_corner_uvs_at`].
+    fn arc_end_scalars_at(
+        mesh: &LoopMesh,
+        vertex: VertexKey,
+        faces: &[FaceKey],
+        layer: ElementAttributeKey,
+    ) -> Vec<f32> {
+        let mut out = Vec::new();
+        for &f in faces {
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(mesh) {
+                if mesh.loop_vertex(l) == vertex {
+                    out.push(mesh.loop_attribs().get_f32(layer, l.as_usize()).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn corner_merge_does_not_fire_for_scalar_float_loop_layer() {
+        // The firing discriminator of
+        // `corner_merge_fires_on_fan_and_collapses_behind_pair_to_single_value`, run
+        // with a *scalar* float layer as the mesh's only loop layer. The §7 rebake
+        // still resamples it (interpolable), so a non-affine field leaves the two
+        // arc-end hub corners DISTINCT — and because a scalar float is off §6.3's
+        // closed list the merge never runs to collapse them.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+
+        let mask = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("mask"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            let value = p.x * p.y + p.x;
+            mesh.loop_attribs_mut().set_f32(mask, l.as_usize(), value);
+        }
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        let arc_ends = [triangles[2], triangles[6]];
+        let values = arc_end_scalars_at(&mesh, moved_hub, &arc_ends, mask);
+        assert_eq!(values.len(), 2);
+        assert!(
+            (values[0] - values[1]).abs() > 1.0e-4,
+            "a scalar float layer must not open the merge gate, so the two arc-end \
+             hub corners keep their distinct rebaked values; got {values:?}"
+        );
+    }
+
+    #[test]
+    fn corner_merge_does_not_fire_for_vec3_float_loop_layer() {
+        // Same discriminator for §6.6.1.4.0(a)'s sharpest exclusion, the 3-vector
+        // float layer: it supplies a scale and an accumulate but is still off the
+        // closed list, so it must not open the gate either.
+        let mut mesh = LoopMesh::new();
+        let (triangles, _hub, _rim) = make_triangle_fan(&mut mesh, 8);
+        let tagged: Vec<FaceKey> = triangles[2..7].to_vec();
+
+        let field = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tangent"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut().set_vec3(
+                field,
+                l.as_usize(),
+                [p.x * p.y + p.x, p.x * p.x - p.y * p.y, 0.0],
+            );
+        }
+
+        mesh.inset_region(
+            &tagged,
+            InsetRegionParams {
+                thickness: 0.1,
+                use_boundary: false,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let moved_hub = shared_vertex_of(&mesh, &tagged);
+        let arc_ends = [triangles[2], triangles[6]];
+        let mut values: Vec<[f32; 3]> = Vec::new();
+        for &f in &arc_ends {
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                if mesh.loop_vertex(l) == moved_hub {
+                    values.push(mesh.loop_attribs().get_vec3(field, l.as_usize()).unwrap());
+                }
+            }
+        }
+        assert_eq!(values.len(), 2);
+        assert!(
+            (0..3).any(|c| (values[0][c] - values[1][c]).abs() > 1.0e-4),
+            "a 3-vector float layer must not open the merge gate; got {values:?}"
+        );
+    }
+
+    #[test]
+    fn tolerant_compare_is_exact_for_layers_off_the_blendable_list() {
+        // The merge's value compare reads the same closed list: only a blendable
+        // layer gets the tolerant squared-distance predicate. A scalar float and a
+        // 3-vector float now compare EXACTLY, so a sub-epsilon difference makes the
+        // slots unequal — while the 2-float type keeps the tolerant compare.
+        let mut mesh = LoopMesh::new();
+        let scalar = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("mask"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        let vector = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tangent"),
+                AttrType::Vec3,
+            ))
+            .unwrap();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+
+        let f = create_face_from_verts(&mut mesh, &[Vec3::ZERO, Vec3::X, Vec3::Y]);
+        let face_loops: Vec<LoopKey> = {
+            let mut out = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                out.push(l);
+            }
+            out
+        };
+        let (a, b) = (face_loops[0].as_usize(), face_loops[1].as_usize());
+
+        // Sub-epsilon on every layer: the 2-float one agrees, the two excluded ones
+        // do not.
+        mesh.loop_attribs_mut().set_vec2(uv, a, [0.5, 0.5]);
+        mesh.loop_attribs_mut().set_vec2(uv, b, [0.5, 0.5]);
+        mesh.loop_attribs_mut().set_f32(scalar, a, 0.5);
+        mesh.loop_attribs_mut().set_f32(scalar, b, 0.5 + 1.0e-6);
+        assert!(
+            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "a scalar float layer compares exactly, so a sub-epsilon difference \
+             must make the slots unequal"
+        );
+
+        mesh.loop_attribs_mut().set_f32(scalar, b, 0.5);
+        mesh.loop_attribs_mut().set_vec3(vector, a, [1.0, 0.0, 0.0]);
+        mesh.loop_attribs_mut()
+            .set_vec3(vector, b, [1.0 + 1.0e-6, 0.0, 0.0]);
+        assert!(
+            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "a 3-vector float layer compares exactly too"
+        );
+
+        mesh.loop_attribs_mut().set_vec3(vector, b, [1.0, 0.0, 0.0]);
+        mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-4, 0.5]);
+        assert!(
+            mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "the 2-float type is blendable and keeps the tolerant compare"
+        );
+    }
+
+    #[test]
+    fn tolerant_compare_uses_the_per_kind_threshold_for_float_rgba() {
+        // BEVEL.md §6.6.1.4.0(b): the constant is a property of the *kind*, and float
+        // RGBA's is 1e-3 — a hundred times the 2-float kind's 1e-5. The band in
+        // between is exactly where a single shared tolerance diverges: a colour
+        // difference there must still count as agreement, so the merge fires.
+        let mut mesh = LoopMesh::new();
+        let color = mesh
+            .register_loop_attribute(
+                ElementAttributeDesc::numeric(AttributeKey::custom("color"), AttrType::Vec4)
+                    .with_role(AttrRole::Color),
+            )
+            .unwrap();
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+
+        let f = create_face_from_verts(&mut mesh, &[Vec3::ZERO, Vec3::X, Vec3::Y]);
+        let face_loops: Vec<LoopKey> = {
+            let mut out = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                out.push(l);
+            }
+            out
+        };
+        let (a, b) = (face_loops[0].as_usize(), face_loops[1].as_usize());
+
+        mesh.loop_attribs_mut().set_vec2(uv, a, [0.5, 0.5]);
+        mesh.loop_attribs_mut().set_vec2(uv, b, [0.5, 0.5]);
+
+        // Squared difference 1e-4: above the 2-float constant, below the colour one.
+        mesh.loop_attribs_mut()
+            .set_vec4(color, a, [0.25, 0.5, 0.75, 1.0]);
+        mesh.loop_attribs_mut()
+            .set_vec4(color, b, [0.25 + 1.0e-2, 0.5, 0.75, 1.0]);
+        assert!(
+            1.0e-4 > CORNER_MERGE_EPS_SQ && 1.0e-4 < 1.0e-3,
+            "the fixture must sit inside the band the two constants bracket"
+        );
+        assert!(
+            mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "float RGBA is compared against its own 1e-3 constant, so a squared \
+             difference of 1e-4 is agreement"
+        );
+
+        // Squared difference 4e-2: above the colour constant too.
+        mesh.loop_attribs_mut()
+            .set_vec4(color, b, [0.25 + 0.2, 0.5, 0.75, 1.0]);
+        assert!(
+            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "beyond the colour constant the slots must compare unequal"
+        );
+
+        // The constant is strict, and it is the kind's own: the 2-float layer is
+        // still held to 1e-5 on the same pair of slots.
+        mesh.loop_attribs_mut()
+            .set_vec4(color, b, [0.25, 0.5, 0.75, 1.0]);
+        mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-2, 0.5]);
+        assert!(
+            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            "the same squared difference of 1e-4 is a disagreement on a 2-float layer"
         );
     }
 

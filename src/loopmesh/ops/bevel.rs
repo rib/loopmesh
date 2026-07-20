@@ -412,44 +412,6 @@ impl TemplateBank {
 /// built, or no partition covers it.
 const NO_COMPONENT: u32 = u32::MAX;
 
-/// One row of BEVEL.md §6.6.1.4.0(a)'s closed blendable list, carrying its own equality
-/// predicate (§6.6.1.4.0(b)). The guide's fourth row — the original-space auxiliary — is a
-/// distinct 2-float type there; this crate stores it as `Vec2` like the UV type and it takes
-/// the same threshold, so [`Float2`](Self::Float2) covers both.
-#[derive(Clone, Copy)]
-enum BlendableKind {
-    Float2,
-    ColorFloat,
-    ColorByte,
-}
-
-impl BlendableKind {
-    /// The kind's own constant, as an upper bound on the **summed squared** difference. Absolute
-    /// and coarse: a "painted to the same place" tolerance, not a round-trip-noise one.
-    fn equality_threshold(self) -> f32 {
-        match self {
-            BlendableKind::Float2 => 1e-5,
-            BlendableKind::ColorFloat | BlendableKind::ColorByte => 1e-3,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct BlendableLayer {
-    key: ElementAttributeKey,
-    kind: BlendableKind,
-}
-
-fn summed_squared_difference(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(left_component, right_component)| {
-            let difference = left_component - right_component;
-            difference * difference
-        })
-        .sum()
-}
-
 /// The mesh-wide interpolation-component partition of BEVEL.md §6.6.1.4.1 — its
 /// equivalence **relation** only, never its ids.
 ///
@@ -8268,19 +8230,7 @@ impl LoopMesh {
     /// auxiliary — it is `Vec2` — so a mesh whose only float2-storage layer is the auxiliary
     /// arms the gate where the reference does not. Tracked in `bmesh-parity/FOLLOWUPS.md`.
     fn blendable_loop_layers(&self) -> Vec<BlendableLayer> {
-        let attribs = self.loop_attribs();
-        attribs
-            .iter_descriptors()
-            .filter_map(|(key, _)| {
-                let kind = match attribs.storage_of(key)? {
-                    AttributeStorage::Vec2(_) => BlendableKind::Float2,
-                    AttributeStorage::Vec4(_) => BlendableKind::ColorFloat,
-                    AttributeStorage::Vec4U8(_) => BlendableKind::ColorByte,
-                    _ => return None,
-                };
-                Some(BlendableLayer { key, kind })
-            })
-            .collect()
+        self.loop_attribs().blendable_layers()
     }
 
     /// Does the mesh's loop-layer **inventory** carry at least one layer of the 2-float type
@@ -8298,60 +8248,17 @@ impl LoopMesh {
             .any(|(key, _)| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_))))
     }
 
-    /// Do two corners agree on one blendable layer, under §6.6.1.4.0(b)'s **tolerant** compare:
-    /// the summed squared difference over the whole vector, strictly below the kind's own
-    /// constant. Absolute, not relative; whole-vector, not per-component.
-    ///
-    /// Byte colour is compared on the raw `0..=255` scale rather than normalised, which is what
-    /// makes its threshold vacuous — one step of difference already contributes `1.0`.
-    ///
-    /// The strict `<` is load-bearing at NaN: a NaN component on either side propagates through
-    /// the difference-and-square chain, the comparison is false, and the corners **disagree** —
-    /// including a NaN against the bit-identical NaN. That is the arithmetic falling out, not a
-    /// special case, and it is reproduced rather than fixed.
+    /// Do two corners agree on one blendable layer? The predicate itself is the class's
+    /// single one — see
+    /// [`ElementAttributes::slots_agree_on_blendable_layer`] — shared verbatim with `INSET.md` §6.3's corner merge, as §6.6.1.4.0(b) requires.
     fn loops_agree_on_blendable_layer(
         &self,
         layer: BlendableLayer,
         left: LoopKey,
         right: LoopKey,
     ) -> bool {
-        let attribs = self.loop_attribs();
-        // Both corners read the *same* layer, so neither read can be absent; the fallback
-        // answers "agree" so a slot-lookup bug cannot manufacture seams out of nothing.
-        let difference = match layer.kind {
-            BlendableKind::Float2 => {
-                let (Some(left_value), Some(right_value)) = (
-                    attribs.get_vec2(layer.key, left.as_usize()),
-                    attribs.get_vec2(layer.key, right.as_usize()),
-                ) else {
-                    debug_assert!(false, "both corners index the same float2 loop layer");
-                    return true;
-                };
-                summed_squared_difference(&left_value, &right_value)
-            }
-            BlendableKind::ColorFloat => {
-                let (Some(left_value), Some(right_value)) = (
-                    attribs.get_vec4(layer.key, left.as_usize()),
-                    attribs.get_vec4(layer.key, right.as_usize()),
-                ) else {
-                    debug_assert!(false, "both corners index the same float RGBA loop layer");
-                    return true;
-                };
-                summed_squared_difference(&left_value, &right_value)
-            }
-            BlendableKind::ColorByte => {
-                let (Some(left_value), Some(right_value)) = (
-                    attribs.get_vec4u8(layer.key, left.as_usize()),
-                    attribs.get_vec4u8(layer.key, right.as_usize()),
-                ) else {
-                    debug_assert!(false, "both corners index the same byte RGBA loop layer");
-                    return true;
-                };
-                let widen = |bytes: [u8; 4]| bytes.map(f32::from);
-                summed_squared_difference(&widen(left_value), &widen(right_value))
-            }
-        };
-        difference < layer.kind.equality_threshold()
+        self.loop_attribs()
+            .slots_agree_on_blendable_layer(layer, left.as_usize(), right.as_usize())
     }
 
     /// The **topological half** of BEVEL.md §6.6.1.4's seam condition (2): the four corners

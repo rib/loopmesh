@@ -5,7 +5,6 @@
 //! and double-precision floats, 2/3/4-component float vectors, four-byte
 //! values, and strings.
 
-use crate::loopmesh::InterpPolicy;
 use std::borrow::Cow;
 
 /// The type of an element attribute. Each variant is a complete value type
@@ -74,16 +73,6 @@ impl AttrType {
     /// True for the one non-numeric type.
     pub fn is_string(self) -> bool {
         matches!(self, AttrType::String)
-    }
-
-    /// True for types whose *default* interpolation policy is the plain
-    /// weighted blend. Derived from [`InterpPolicy::default_for`] rather than
-    /// restating the type→policy routing, which lives there alone.
-    ///
-    /// Note this is the type's default: a `Vec4U8` registered as a colour opts
-    /// into `Linear` and blends, while `AttrType::Vec4U8.is_math()` is `false`.
-    pub fn is_math(self) -> bool {
-        matches!(InterpPolicy::default_for(self), InterpPolicy::Linear)
     }
 }
 

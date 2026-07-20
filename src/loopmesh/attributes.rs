@@ -75,6 +75,70 @@ impl InterpPolicy {
     }
 }
 
+/// One row of `BEVEL.md` §6.6.1.4.0(a)'s closed **blendable** list, carrying its own
+/// equality predicate (§6.6.1.4.0(b)). The guide's fourth row — the original-space
+/// auxiliary — is a distinct 2-float type there; this crate stores it as `Vec2` like the
+/// UV type and it takes the same threshold, so [`Float2`](Self::Float2) covers both.
+///
+/// `INSET.md` §6.3's **math layer** is the same class named twice, and both guides say in
+/// as many words not to build a second predicate for it. So membership lives here, once,
+/// and is keyed on **storage type alone** — never on the layer's
+/// [`InterpPolicy`], its [`AttrRole`], its name, or its contents.
+///
+/// Known divergence: the guides key membership on the *layer type*, while this crate keys
+/// it on the **storage shape**, and accepts the over-admission that follows for every row —
+/// any `Vec2` layer is treated as the UV / original-space kind, any `Vec4` as float RGBA,
+/// any `Vec4U8` as byte RGBA, whatever the layer was declared to mean. So a mesh whose only
+/// `Vec2` layer is an original-space auxiliary also arms the float2 inventory gate, and a
+/// generic `Vec4` layer is read by INSET's corner merge as a colour. Tracked in
+/// `bmesh-parity/FOLLOWUPS.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlendableKind {
+    Float2,
+    ColorFloat,
+    ColorByte,
+}
+
+impl BlendableKind {
+    /// The closed list itself. `None` for every other storage — a scalar float and a
+    /// 3-vector float are both excluded, the 3-vector being §6.6.1.4.0(a)'s sharpest
+    /// exclusion, and so are the integer, byte, boolean and string families.
+    pub(crate) fn of_storage(storage: AttributeStorage) -> Option<Self> {
+        match storage {
+            AttributeStorage::Vec2(_) => Some(BlendableKind::Float2),
+            AttributeStorage::Vec4(_) => Some(BlendableKind::ColorFloat),
+            AttributeStorage::Vec4U8(_) => Some(BlendableKind::ColorByte),
+            _ => None,
+        }
+    }
+
+    /// The kind's own constant, as an upper bound on the **summed squared** difference.
+    /// Absolute and coarse: a "painted to the same place" tolerance, not a
+    /// round-trip-noise one.
+    pub(crate) fn equality_threshold(self) -> f32 {
+        match self {
+            BlendableKind::Float2 => 1e-5,
+            BlendableKind::ColorFloat | BlendableKind::ColorByte => 1e-3,
+        }
+    }
+}
+
+pub(crate) fn summed_squared_difference(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left_component, right_component)| {
+            let difference = left_component - right_component;
+            difference * difference
+        })
+        .sum()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BlendableLayer {
+    pub(crate) key: ElementAttributeKey,
+    pub(crate) kind: BlendableKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct ElementAttributeDesc {
     pub key: AttributeKey,
@@ -586,6 +650,27 @@ impl ElementAttributes {
         }
     }
 
+    /// The layers of [`BlendableKind`]'s closed list, in descriptor order.
+    ///
+    /// Both guides scope the class to **loop** layers; `ElementAttributes` backs all four
+    /// domains, so it is the caller's job to ask this of the loop attributes only.
+    pub(crate) fn blendable_layers(&self) -> Vec<BlendableLayer> {
+        self.iter_descriptors()
+            .filter_map(|(key, desc)| {
+                BlendableKind::of_storage(desc.storage).map(|kind| BlendableLayer { key, kind })
+            })
+            .collect()
+    }
+
+    /// Non-allocating "is the closed list non-empty" — `INSET.md` §6.3's corner-merge
+    /// gate reads this rather than re-deriving membership. As with
+    /// [`blendable_layers`](Self::blendable_layers), the class is a **loop**-layer notion
+    /// in both guides, so ask it of the loop attributes.
+    pub(crate) fn has_blendable_layer(&self) -> bool {
+        self.iter_descriptors()
+            .any(|(_, desc)| BlendableKind::of_storage(desc.storage).is_some())
+    }
+
     pub(crate) fn storage_of(&self, attr: ElementAttributeKey) -> Option<AttributeStorage> {
         self.attributes.get(attr.as_usize()).map(|d| d.storage)
     }
@@ -821,49 +906,32 @@ impl ElementAttributes {
     /// serialisation, this compares each layer under its *own* equality
     /// predicate:
     ///
-    /// - **Math (float) layers** — descriptors whose interp policy is the
-    ///   fractional [`Linear`](InterpPolicy::Linear) blend — compare by
-    ///   **squared distance across components**, treating the two slots as
-    ///   equal when that squared distance is below `tolerance_sq`. Two
-    ///   independently-rebaked resamples that the operator should treat as
+    /// - **Blendable layers** — the closed list of [`BlendableKind`], which
+    ///   `INSET.md` §6.3 calls the *math* layers and `BEVEL.md` §6.6.1.4.0(a)
+    ///   specifies normatively — compare under
+    ///   [`slots_agree_on_blendable_layer`](Self::slots_agree_on_blendable_layer):
+    ///   summed squared difference strictly below the *kind's own* constant.
+    ///   Two independently-rebaked resamples that the operator should treat as
     ///   "the same value" differ only in their low float bits, so a byte
     ///   compare would spuriously call them unequal; the tolerant compare is
-    ///   what the merge gate and the propagation value-match both need.
-    /// - **Every other layer** (the integer / boolean / no-interp families)
-    ///   compares **exactly** — an integer layer's blend is rounded back onto
-    ///   the lattice and a boolean's is a disjunction, so neither carries a
-    ///   near-miss intermediate and their equality is exact.
+    ///   what the merge gate and the propagation value-match both need. Byte
+    ///   RGBA is on that list, but its constant is vacuous on the raw
+    ///   `0..=255` scale, so it compares exactly in practice.
+    /// - **Every other layer** (the scalar-float, 3-vector-float, integer,
+    ///   boolean and no-interp families) compares **exactly** — an integer
+    ///   layer's blend is rounded back onto the lattice and a boolean's is a
+    ///   disjunction, so neither carries a near-miss intermediate and their
+    ///   equality is exact.
     ///
     /// Returns `true` only if *all* layers agree under their respective
     /// predicate.
-    pub fn slots_tolerant_equal(&self, a: usize, b: usize, tolerance_sq: f32) -> bool {
-        for (_, desc) in self.iter_descriptors() {
-            let is_math = matches!(desc.interp, InterpPolicy::Linear);
-            let equal = match desc.storage {
-                AttributeStorage::F32(bucket) if is_math => {
-                    let s = self.f32_bucket(bucket);
-                    match (s.and_then(|v| v.get(a)), s.and_then(|v| v.get(b))) {
-                        (Some(va), Some(vb)) => {
-                            let d = va - vb;
-                            d * d <= tolerance_sq
-                        }
-                        (None, None) => true,
-                        _ => false,
-                    }
+    pub fn slots_tolerant_equal(&self, a: usize, b: usize) -> bool {
+        for (key, desc) in self.iter_descriptors() {
+            let equal = match BlendableKind::of_storage(desc.storage) {
+                Some(kind) => {
+                    self.slots_agree_on_blendable_layer(BlendableLayer { key, kind }, a, b)
                 }
-                AttributeStorage::Vec2(bucket) if is_math => {
-                    self.vec_lanes_within(self.vec2_bucket(bucket), a, b, tolerance_sq)
-                }
-                AttributeStorage::Vec3(bucket) if is_math => {
-                    self.vec_lanes_within(self.vec3_bucket(bucket), a, b, tolerance_sq)
-                }
-                AttributeStorage::Vec4(bucket) if is_math => {
-                    self.vec_lanes_within(self.vec4_bucket(bucket), a, b, tolerance_sq)
-                }
-                _ => {
-                    // Non-math layer: exact per-layer compare (no allocation).
-                    self.slot_layer_exact_equal(desc, a, b)
-                }
+                None => self.slot_layer_exact_equal(desc, a, b),
             };
             if !equal {
                 return false;
@@ -872,30 +940,67 @@ impl ElementAttributes {
         true
     }
 
-    fn vec_lanes_within<const N: usize>(
+    /// **The** equality predicate of the blendable class (`BEVEL.md` §6.6.1.4.0(b),
+    /// `INSET.md` §6.3 step-5 note): form the difference vector over the whole layer value,
+    /// sum the squares of its components, and agree when that sum is **strictly below** the
+    /// kind's own constant. Absolute, not relative; whole-vector, not per-component.
+    ///
+    /// Byte colour is widened onto the raw `0..=255` scale rather than normalised, which is
+    /// what makes its constant vacuous — one step of difference already contributes `1.0`.
+    ///
+    /// The strict `<` is load-bearing at NaN: a NaN component on either side propagates
+    /// through the difference-and-square chain, the comparison is false, and the slots
+    /// **disagree** — including a NaN against the bit-identical NaN. That is the arithmetic
+    /// falling out, not a special case, and it is reproduced rather than fixed.
+    pub(crate) fn slots_agree_on_blendable_layer(
         &self,
-        bucket: Option<&[[f32; N]]>,
+        layer: BlendableLayer,
         a: usize,
         b: usize,
-        tolerance_sq: f32,
     ) -> bool {
-        match (bucket.and_then(|s| s.get(a)), bucket.and_then(|s| s.get(b))) {
-            (Some(va), Some(vb)) => {
-                let mut acc = 0.0_f32;
-                for lane in 0..N {
-                    let d = va[lane] - vb[lane];
-                    acc += d * d;
+        // Both slots read the *same* layer, so a one-sided absence is a lookup bug, not a
+        // value difference: debug builds assert, release builds report "disagree".
+        let difference = match layer.kind {
+            BlendableKind::Float2 => {
+                match (self.get_vec2(layer.key, a), self.get_vec2(layer.key, b)) {
+                    (Some(left), Some(right)) => summed_squared_difference(&left, &right),
+                    (None, None) => return true,
+                    _ => {
+                        debug_assert!(false, "both slots index the same float2 layer");
+                        return false;
+                    }
                 }
-                acc <= tolerance_sq
             }
-            (None, None) => true,
-            _ => false,
-        }
+            BlendableKind::ColorFloat => {
+                match (self.get_vec4(layer.key, a), self.get_vec4(layer.key, b)) {
+                    (Some(left), Some(right)) => summed_squared_difference(&left, &right),
+                    (None, None) => return true,
+                    _ => {
+                        debug_assert!(false, "both slots index the same float RGBA layer");
+                        return false;
+                    }
+                }
+            }
+            BlendableKind::ColorByte => {
+                match (self.get_vec4u8(layer.key, a), self.get_vec4u8(layer.key, b)) {
+                    (Some(left), Some(right)) => {
+                        let widen = |bytes: [u8; 4]| bytes.map(f32::from);
+                        summed_squared_difference(&widen(left), &widen(right))
+                    }
+                    (None, None) => return true,
+                    _ => {
+                        debug_assert!(false, "both slots index the same byte RGBA layer");
+                        return false;
+                    }
+                }
+            }
+        };
+        difference < layer.kind.equality_threshold()
     }
 
     /// Exact (bitwise for floats, value-wise otherwise) equality of one
     /// attribute layer at two slots, allocation-free. Used by the non-math
-    /// branch of [`slots_tolerant_equal`], and directly by callers that want an
+    /// branch of [`slots_tolerant_equal`](Self::slots_tolerant_equal), and directly by callers that want an
     /// exact compare on a *math* layer too. A missing value on both slots
     /// counts as equal; on only one, unequal.
     pub(crate) fn slot_layer_exact_equal(
