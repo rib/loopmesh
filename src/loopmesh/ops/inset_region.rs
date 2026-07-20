@@ -1261,6 +1261,16 @@ impl LoopMesh {
         face_tag: crate::op_flags::FaceOpFlagLayer,
         wall_side_edges: &[WallSideEdge],
     ) {
+        // The gate predicate reads the blendable set only, so it would answer a
+        // vacuous `true` on a mesh with no blendable loop layer. That branch is
+        // unreachable only because the sole caller gates on `has_loop_math_layer`
+        // over the same closed list; assert the coupling rather than leave it
+        // implicit across the two call sites.
+        debug_assert!(
+            self.loop_attribs.has_blendable_layer(),
+            "corner merge requires a blendable loop layer; caller must gate on it"
+        );
+
         // §6.3 runs once per manifold side edge per wall. The side edges are
         // collected in phase-five wall-build order (ascending `edge_keys()`),
         // and we replay them here as a single sequential pass with **live** reads
@@ -1337,7 +1347,7 @@ impl LoopMesh {
             // layer compares by squared distance, never byte-for-byte.
             if !self
                 .loop_attribs
-                .slots_tolerant_equal(outer_a.as_usize(), outer_b.as_usize())
+                .slots_agree_on_blendable_layers(outer_a.as_usize(), outer_b.as_usize())
             {
                 continue;
             }
@@ -1427,10 +1437,10 @@ impl LoopMesh {
                 }
                 let matches_a = self
                     .loop_attribs
-                    .slots_tolerant_equal(candidate.as_usize(), compare_a.as_usize());
+                    .slots_agree_on_blendable_layers(candidate.as_usize(), compare_a.as_usize());
                 let matches_b = self
                     .loop_attribs
-                    .slots_tolerant_equal(candidate.as_usize(), compare_b.as_usize());
+                    .slots_agree_on_blendable_layers(candidate.as_usize(), compare_b.as_usize());
                 if matches_a || matches_b {
                     matched.push(candidate);
                 }
@@ -2521,6 +2531,92 @@ mod tests {
         assert!(
             merged_corners >= 4,
             "math layer should still merge corners, got {merged_corners}"
+        );
+    }
+
+    #[test]
+    fn corner_merge_runs_for_mixed_blendable_and_scalar_loop_layers() {
+        // §6.3's gate reads the blendable set ONLY (`BEVEL.md` §6.6.1.4.0(a)):
+        // a scalar float layer is skipped entirely, however far apart its two
+        // values are. Same mesh and UVs as the single-layer math test, but with
+        // an extra per-face-discontinuous f32 layer that would veto every merge
+        // if the gate read it.
+        let mut mesh = LoopMesh::new();
+        let faces = make_grid_3x3_faces(&mut mesh);
+        let centre = faces[4];
+
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("uv"),
+                AttrType::Vec2,
+            ))
+            .unwrap();
+        let weight = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("weight"),
+                AttrType::F32,
+            ))
+            .unwrap();
+
+        let loops: Vec<LoopKey> = mesh.loops.iter().collect();
+        for l in loops {
+            let p = mesh.vertex_position(mesh.loop_vertex(l));
+            mesh.loop_attribs_mut()
+                .set_vec2(uv, l.as_usize(), [p.x, p.y]);
+        }
+        let face_keys: Vec<FaceKey> = mesh.face_keys();
+        for (face_index, &f) in face_keys.iter().enumerate() {
+            let face_loops: Vec<LoopKey> = {
+                let mut acc = Vec::new();
+                let mut it = mesh.face_loops(f);
+                while let Some(l) = it.next(&mesh) {
+                    acc.push(l);
+                }
+                acc
+            };
+            for l in face_loops {
+                mesh.loop_attribs_mut()
+                    .set_f32(weight, l.as_usize(), face_index as f32 * 1000.0);
+            }
+        }
+
+        let result = mesh.inset_region(
+            &[centre],
+            InsetRegionParams {
+                thickness: 0.2,
+                use_interpolate: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.wall_faces.len(), 4);
+        mesh.validate_topology();
+
+        let mut by_vert: std::collections::HashMap<VertexKey, Vec<[f32; 2]>> =
+            std::collections::HashMap::new();
+        for &wf in &result.wall_faces {
+            let mut it = mesh.face_loops(wf);
+            while let Some(l) = it.next(&mesh) {
+                let v = mesh.loop_vertex(l);
+                let got = mesh.loop_attribs().get_vec2(uv, l.as_usize()).unwrap();
+                by_vert.entry(v).or_default().push(got);
+            }
+        }
+        let mut merged_corners = 0;
+        for vals in by_vert.values() {
+            if vals.len() >= 2 {
+                let first = vals[0];
+                if vals
+                    .iter()
+                    .all(|v| (v[0] - first[0]).abs() < 1e-5 && (v[1] - first[1]).abs() < 1e-5)
+                {
+                    merged_corners += 1;
+                }
+            }
+        }
+        assert!(
+            merged_corners >= 4,
+            "a grossly discontinuous non-blendable layer must not veto the merge, \
+             got {merged_corners}"
         );
     }
 
@@ -3826,7 +3922,7 @@ mod tests {
             .set_vec2(uv, b.as_usize(), [0.5 + 1.0e-3, 0.5]);
         assert!(
             mesh.loop_attribs()
-                .slots_tolerant_equal(a.as_usize(), b.as_usize()),
+                .slots_agree_on_blendable_layers(a.as_usize(), b.as_usize()),
             "values within epsilon must compare tolerant-equal (a byte compare \
              would reject them)"
         );
@@ -3837,7 +3933,7 @@ mod tests {
         assert!(
             !mesh
                 .loop_attribs()
-                .slots_tolerant_equal(a.as_usize(), b.as_usize()),
+                .slots_agree_on_blendable_layers(a.as_usize(), b.as_usize()),
             "values beyond epsilon must compare unequal"
         );
     }
@@ -4040,7 +4136,10 @@ mod tests {
             "fixture must keep the two roles' policies distinct for the test to bite"
         );
         assert!(plain_gate, "a bare byte-RGBA loop layer is blendable");
-        assert!(color_gate, "a colour-roled byte-RGBA loop layer is blendable");
+        assert!(
+            color_gate,
+            "a colour-roled byte-RGBA loop layer is blendable"
+        );
     }
 
     /// The two hub loops the arc-end inset faces hold at `vertex`, read from a scalar
@@ -4165,11 +4264,11 @@ mod tests {
     }
 
     #[test]
-    fn tolerant_compare_is_exact_for_layers_off_the_blendable_list() {
-        // The merge's value compare reads the same closed list: only a blendable
-        // layer gets the tolerant squared-distance predicate. A scalar float and a
-        // 3-vector float now compare EXACTLY, so a sub-epsilon difference makes the
-        // slots unequal — while the 2-float type keeps the tolerant compare.
+    fn tolerant_compare_skips_layers_off_the_blendable_list() {
+        // BEVEL.md §6.6.1.4.0(a): a layer off the closed list is "skipped entirely and
+        // its values are never read here". So a scalar float, a 3-vector float and an
+        // i32 layer may disagree by any amount without affecting the compare — only the
+        // 2-float layer is read, under its own tolerant predicate.
         let mut mesh = LoopMesh::new();
         let scalar = mesh
             .register_loop_attribute(ElementAttributeDesc::numeric(
@@ -4181,6 +4280,12 @@ mod tests {
             .register_loop_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("tangent"),
                 AttrType::Vec3,
+            ))
+            .unwrap();
+        let integer = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("island"),
+                AttrType::I32,
             ))
             .unwrap();
         let uv = mesh
@@ -4201,33 +4306,70 @@ mod tests {
         };
         let (a, b) = (face_loops[0].as_usize(), face_loops[1].as_usize());
 
-        // Sub-epsilon on every layer: the 2-float one agrees, the two excluded ones
-        // do not.
         mesh.loop_attribs_mut().set_vec2(uv, a, [0.5, 0.5]);
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5, 0.5]);
+
+        // A sub-epsilon disagreement is what §7's two independent resamples produce on
+        // their own, with nothing authored: it must not be read.
         mesh.loop_attribs_mut().set_f32(scalar, a, 0.5);
         mesh.loop_attribs_mut().set_f32(scalar, b, 0.5 + 1.0e-6);
         assert!(
-            !mesh.loop_attribs().slots_tolerant_equal(a, b),
-            "a scalar float layer compares exactly, so a sub-epsilon difference \
-             must make the slots unequal"
+            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            "a scalar float layer is off the blendable list and must not be read"
         );
 
-        mesh.loop_attribs_mut().set_f32(scalar, b, 0.5);
+        // Nor is a large, deliberately authored one.
+        mesh.loop_attribs_mut().set_f32(scalar, b, -900.0);
         mesh.loop_attribs_mut().set_vec3(vector, a, [1.0, 0.0, 0.0]);
-        mesh.loop_attribs_mut()
-            .set_vec3(vector, b, [1.0 + 1.0e-6, 0.0, 0.0]);
+        mesh.loop_attribs_mut().set_vec3(vector, b, [0.0, 0.0, 7.0]);
+        mesh.loop_attribs_mut().set_i32(integer, a, 3);
+        mesh.loop_attribs_mut().set_i32(integer, b, 91);
         assert!(
-            !mesh.loop_attribs().slots_tolerant_equal(a, b),
-            "a 3-vector float layer compares exactly too"
+            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            "scalar-float, 3-vector-float and i32 layers are all off the list, so even \
+             a gross disagreement on them leaves the slots equal"
         );
 
-        mesh.loop_attribs_mut().set_vec3(vector, b, [1.0, 0.0, 0.0]);
+        // The 2-float layer is the only one read, under its own constant.
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-4, 0.5]);
         assert!(
-            mesh.loop_attribs().slots_tolerant_equal(a, b),
-            "the 2-float type is blendable and keeps the tolerant compare"
+            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            "a squared difference below the 2-float constant is still agreement"
         );
+        mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-2, 0.5]);
+        assert!(
+            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
+            "a squared difference above the 2-float constant is a disagreement"
+        );
+    }
+
+    #[test]
+    fn tolerant_compare_is_vacuously_true_without_a_blendable_layer() {
+        // With nothing on the closed list there is nothing to read, so the compare
+        // agrees however far apart the non-blendable values are. This is what keeps a
+        // scalar-float-only mesh from vetoing §6.3's corner merges.
+        let mut mesh = LoopMesh::new();
+        let scalar = mesh
+            .register_loop_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("mask"),
+                AttrType::F32,
+            ))
+            .unwrap();
+
+        let f = create_face_from_verts(&mut mesh, &[Vec3::ZERO, Vec3::X, Vec3::Y]);
+        let face_loops: Vec<LoopKey> = {
+            let mut out = Vec::new();
+            let mut it = mesh.face_loops(f);
+            while let Some(l) = it.next(&mesh) {
+                out.push(l);
+            }
+            out
+        };
+        let (a, b) = (face_loops[0].as_usize(), face_loops[1].as_usize());
+
+        mesh.loop_attribs_mut().set_f32(scalar, a, 0.0);
+        mesh.loop_attribs_mut().set_f32(scalar, b, 1.0);
+        assert!(mesh.loop_attribs().slots_agree_on_blendable_layers(a, b));
     }
 
     #[test]
@@ -4274,7 +4416,7 @@ mod tests {
             "the fixture must sit inside the band the two constants bracket"
         );
         assert!(
-            mesh.loop_attribs().slots_tolerant_equal(a, b),
+            mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
             "float RGBA is compared against its own 1e-3 constant, so a squared \
              difference of 1e-4 is agreement"
         );
@@ -4283,7 +4425,7 @@ mod tests {
         mesh.loop_attribs_mut()
             .set_vec4(color, b, [0.25 + 0.2, 0.5, 0.75, 1.0]);
         assert!(
-            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
             "beyond the colour constant the slots must compare unequal"
         );
 
@@ -4293,7 +4435,7 @@ mod tests {
             .set_vec4(color, b, [0.25, 0.5, 0.75, 1.0]);
         mesh.loop_attribs_mut().set_vec2(uv, b, [0.5 + 1.0e-2, 0.5]);
         assert!(
-            !mesh.loop_attribs().slots_tolerant_equal(a, b),
+            !mesh.loop_attribs().slots_agree_on_blendable_layers(a, b),
             "the same squared difference of 1e-4 is a disagreement on a 2-float layer"
         );
     }

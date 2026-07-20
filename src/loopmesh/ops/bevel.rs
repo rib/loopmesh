@@ -8591,9 +8591,10 @@ impl LoopMesh {
     ) -> bool {
         // Key 1: lowest component id.
         if let Some(partition) = components {
-            if let (Some(candidate_component), Some(best_component)) =
-                (partition.component_of(candidate), partition.component_of(best))
-            {
+            if let (Some(candidate_component), Some(best_component)) = (
+                partition.component_of(candidate),
+                partition.component_of(best),
+            ) {
                 if candidate_component != best_component {
                     return candidate_component < best_component;
                 }
@@ -27330,16 +27331,25 @@ mod tests {
     fn interp_component_numbering_follows_face_enumeration_order() {
         let (mesh, _apex) = uv_split_open_fan([3, 5, 1], 2);
         let bank = TemplateBank::new(&mesh, 1);
-        let partition = bank.interp_components().expect("a UV layer at odd `segments`");
+        let partition = bank
+            .interp_components()
+            .expect("a UV layer at odd `segments`");
 
         let faces = mesh.face_keys();
         let ids: Vec<u32> = faces
             .iter()
-            .map(|&face| partition.component_of(face).expect("a pristine face is labelled"))
+            .map(|&face| {
+                partition
+                    .component_of(face)
+                    .expect("a pristine face is labelled")
+            })
             .collect();
 
         assert_eq!(ids[0], ids[1], "the two contiguous faces flood together");
-        assert_ne!(ids[1], ids[2], "the translated UV image seams the third face off");
+        assert_ne!(
+            ids[1], ids[2],
+            "the translated UV image seams the third face off"
+        );
         assert!(
             ids[0] < ids[2],
             "the component seeded first in enumeration order takes the lower id, got {ids:?}",
@@ -27367,7 +27377,11 @@ mod tests {
         );
         mesh.validate_topology();
 
-        assert_eq!(result.faces.len(), 1, "the open fan's apex mints exactly its cap");
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "the open fan's apex mints exactly its cap"
+        );
         assert_eq!(
             mesh.face_material_index(result.faces[0]),
             3,
@@ -27395,11 +27409,17 @@ mod tests {
         }
 
         let bank = TemplateBank::new(&mesh, 1);
-        let partition = bank.interp_components().expect("a UV layer at odd `segments`");
+        let partition = bank
+            .interp_components()
+            .expect("a UV layer at odd `segments`");
         let ids: Vec<u32> = mesh
             .face_keys()
             .iter()
-            .map(|&face| partition.component_of(face).expect("a pristine face is labelled"))
+            .map(|&face| {
+                partition
+                    .component_of(face)
+                    .expect("a pristine face is labelled")
+            })
             .collect();
 
         // Flood fill labels them 0 / 1 / 2. Top is face 1 (id 1), bottom is face 2 (id 2).
@@ -28003,7 +28023,9 @@ mod tests {
 
         let far_face = mesh.edge_flanking_faces(edge).1.unwrap();
         let bank = TemplateBank::new(&mesh, 3);
-        let partition = bank.interp_components().expect("a float2 layer at odd `segments`");
+        let partition = bank
+            .interp_components()
+            .expect("a float2 layer at odd `segments`");
         let (near_component, far_component) = (
             partition.component_of(near_face).unwrap(),
             partition.component_of(far_face).unwrap(),

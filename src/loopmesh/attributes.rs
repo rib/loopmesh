@@ -108,7 +108,16 @@ impl BlendableKind {
             AttributeStorage::Vec2(_) => Some(BlendableKind::Float2),
             AttributeStorage::Vec4(_) => Some(BlendableKind::ColorFloat),
             AttributeStorage::Vec4U8(_) => Some(BlendableKind::ColorByte),
-            _ => None,
+            // Spelled out rather than a catch-all: the list is normatively closed, so a new
+            // storage shape must be an explicit decision, not a silent omission.
+            AttributeStorage::Bool(_)
+            | AttributeStorage::U8(_)
+            | AttributeStorage::I32(_)
+            | AttributeStorage::U32(_)
+            | AttributeStorage::F32(_)
+            | AttributeStorage::F64(_)
+            | AttributeStorage::Vec3(_)
+            | AttributeStorage::String(_) => None,
         }
     }
 
@@ -900,40 +909,40 @@ impl ElementAttributes {
         }
     }
 
-    /// Tolerant per-layer equality of two element slots, used by the corner
-    /// customdata merge (see `INSET.md` §6.3 step-5 note). Unlike
+    /// Tolerant equality of two element slots over the **blendable set only** —
+    /// the comparison used by the corner customdata merge (`INSET.md` §6.3
+    /// step-5 gate and its step-7 value match). Unlike
     /// [`write_fingerprint`](Self::write_fingerprint), which is a byte-exact
-    /// serialisation, this compares each layer under its *own* equality
-    /// predicate:
+    /// serialisation over every layer, this reads *only* the closed list of
+    /// [`BlendableKind`] — `INSET.md` §6.3's *math* layers, specified
+    /// normatively by `BEVEL.md` §6.6.1.4.0(a).
     ///
-    /// - **Blendable layers** — the closed list of [`BlendableKind`], which
-    ///   `INSET.md` §6.3 calls the *math* layers and `BEVEL.md` §6.6.1.4.0(a)
-    ///   specifies normatively — compare under
-    ///   [`slots_agree_on_blendable_layer`](Self::slots_agree_on_blendable_layer):
-    ///   summed squared difference strictly below the *kind's own* constant.
-    ///   Two independently-rebaked resamples that the operator should treat as
-    ///   "the same value" differ only in their low float bits, so a byte
-    ///   compare would spuriously call them unequal; the tolerant compare is
-    ///   what the merge gate and the propagation value-match both need. Byte
-    ///   RGBA is on that list, but its constant is vacuous on the raw
-    ///   `0..=255` scale, so it compares exactly in practice.
-    /// - **Every other layer** (the scalar-float, 3-vector-float, integer,
-    ///   boolean and no-interp families) compares **exactly** — an integer
-    ///   layer's blend is rounded back onto the lattice and a boolean's is a
-    ///   disjunction, so neither carries a near-miss intermediate and their
-    ///   equality is exact.
+    /// The set is as load-bearing as the predicate. §6.6.1.4.0(a) is explicit
+    /// that a non-blendable layer is "skipped entirely and its values are never
+    /// read here": a scalar float, a 3-vector float, an integer, a boolean or a
+    /// string layer contributes **nothing**, however far apart its two values
+    /// are. Reading them would not merely be stricter, it would be wrong in a
+    /// way that shows up with *zero authored disagreement* — §7 resamples the
+    /// two gate slots independently, so a scalar float layer's two values
+    /// differ in their low bits from the arithmetic alone and an exact compare
+    /// on it vetoes merges the reference performs.
     ///
-    /// Returns `true` only if *all* layers agree under their respective
-    /// predicate.
-    pub fn slots_tolerant_equal(&self, a: usize, b: usize) -> bool {
+    /// Each blendable layer compares under
+    /// [`slots_agree_on_blendable_layer`](Self::slots_agree_on_blendable_layer):
+    /// summed squared difference strictly below the *kind's own* constant, for
+    /// exactly the same reason — two independently-rebaked resamples that the
+    /// operator treats as "the same value" agree only to within that constant.
+    /// Byte RGBA is on the list, but its constant is vacuous on the raw
+    /// `0..=255` scale, so it compares exactly in practice.
+    ///
+    /// Returns `true` when every blendable layer agrees — vacuously `true` on a
+    /// mesh with no blendable layer at all.
+    pub(crate) fn slots_agree_on_blendable_layers(&self, a: usize, b: usize) -> bool {
         for (key, desc) in self.iter_descriptors() {
-            let equal = match BlendableKind::of_storage(desc.storage) {
-                Some(kind) => {
-                    self.slots_agree_on_blendable_layer(BlendableLayer { key, kind }, a, b)
-                }
-                None => self.slot_layer_exact_equal(desc, a, b),
+            let Some(kind) = BlendableKind::of_storage(desc.storage) else {
+                continue;
             };
-            if !equal {
+            if !self.slots_agree_on_blendable_layer(BlendableLayer { key, kind }, a, b) {
                 return false;
             }
         }
@@ -996,39 +1005,6 @@ impl ElementAttributes {
             }
         };
         difference < layer.kind.equality_threshold()
-    }
-
-    /// Exact (bitwise for floats, value-wise otherwise) equality of one
-    /// attribute layer at two slots, allocation-free. Used by the non-math
-    /// branch of [`slots_tolerant_equal`](Self::slots_tolerant_equal), and directly by callers that want an
-    /// exact compare on a *math* layer too. A missing value on both slots
-    /// counts as equal; on only one, unequal.
-    pub(crate) fn slot_layer_exact_equal(
-        &self,
-        desc: &ElementAttributeDesc,
-        a: usize,
-        b: usize,
-    ) -> bool {
-        fn pair_eq<T: PartialEq>(bucket: Option<&[T]>, a: usize, b: usize) -> bool {
-            match (bucket.and_then(|s| s.get(a)), bucket.and_then(|s| s.get(b))) {
-                (Some(va), Some(vb)) => va == vb,
-                (None, None) => true,
-                _ => false,
-            }
-        }
-        match desc.storage {
-            AttributeStorage::Bool(bk) => pair_eq(self.bool_bucket(bk), a, b),
-            AttributeStorage::U8(bk) => pair_eq(self.u8_bucket(bk), a, b),
-            AttributeStorage::I32(bk) => pair_eq(self.i32_bucket(bk), a, b),
-            AttributeStorage::U32(bk) => pair_eq(self.u32_bucket(bk), a, b),
-            AttributeStorage::F32(bk) => pair_eq(self.f32_bucket(bk), a, b),
-            AttributeStorage::F64(bk) => pair_eq(self.f64_bucket(bk), a, b),
-            AttributeStorage::Vec2(bk) => pair_eq(self.vec2_bucket(bk), a, b),
-            AttributeStorage::Vec3(bk) => pair_eq(self.vec3_bucket(bk), a, b),
-            AttributeStorage::Vec4(bk) => pair_eq(self.vec4_bucket(bk), a, b),
-            AttributeStorage::Vec4U8(bk) => pair_eq(self.vec4u8_bucket(bk), a, b),
-            AttributeStorage::String(bk) => pair_eq(self.string_bucket(bk), a, b),
-        }
     }
 
     // ----- Customdata interpolation primitives -----
