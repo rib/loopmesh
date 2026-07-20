@@ -464,14 +464,13 @@ fn summed_squared_difference(left: &[f32], right: &[f32]) -> f32 {
 /// splits components on a mesh that carries a float2 layer anywhere, and leaves key 1 tied
 /// on a mesh that carries none — because there no partition exists.
 ///
-/// The labels this stores are flood-fill order, which is **not** §6.6.1.4.1's
-/// construction-order numbering (face-enumeration seeds plus the top/bottom label swaps).
-/// That numbering is not an isomorphism invariant and is not implemented here, so the
-/// labels are only ever compared for **equality**, never ordered. Equality is all key 1
-/// needs to be *decided*: candidates that all sit in one component tie on key 1 whatever
-/// its id is, and the tie-break falls through to keys 2–4 exactly as on an untextured mesh.
-/// A candidate set that genuinely straddles components is the only case that needs the
-/// numbering, and it is the only case the donor declines on.
+/// The labels this stores **are** §6.6.1.4.1's construction-order numbering: flood-fill
+/// seeds taken in face-enumeration order, then the partial top/bottom label swaps. They are
+/// therefore ordered, not merely compared for equality — key 1 keeps the lowest-numbered
+/// component and the remaining keys decide *within* it. That numbering is reproducible by
+/// an engine enumerating faces in the same order, but it is **not** an isomorphism
+/// invariant, so a candidate set straddling components has a donor that is only pinned
+/// against a same-order fixture.
 struct InterpComponents {
     component_of: Vec<u32>,
 }
@@ -515,22 +514,100 @@ impl InterpComponents {
             next_component += 1;
         }
 
-        Self { component_of }
+        let mut partition = Self { component_of };
+        partition.nudge_extremal_components_low(mesh, next_component);
+        partition
     }
 
-    /// Do all of `faces` sit in one component — i.e. does key 1 **tie** across them? A face
-    /// the partition never saw (one minted after the build) has no known component, so the
-    /// answer is `false`: the caller must not assume a tie it cannot demonstrate.
+    /// §6.6.1.4.1's *partial* canonicalisation, run only when the flood fill produced more
+    /// than one component. Its intent is to bring the visually topmost and bottommost
+    /// components onto the low ids; it does not reliably achieve that, and the artefact —
+    /// not the intent — is what has to be reproduced, so the two swaps are keyed on the
+    /// components of the **first two faces in enumeration order** rather than on the literal
+    /// ids `0` and `1`.
+    fn nudge_extremal_components_low(&mut self, mesh: &LoopMesh, component_count: u32) {
+        if component_count < 2 {
+            return;
+        }
+        let enumeration = mesh.face_keys();
+
+        let mut topmost: Option<(FaceKey, f32)> = None;
+        let mut bottommost: Option<(FaceKey, f32)> = None;
+        for &face in &enumeration {
+            let height = mesh.face_bounding_box_center(face).z;
+            // Strict replacement keeps the *first* face in enumeration order on a tie.
+            if topmost.is_none_or(|(_, best)| height.total_cmp(&best).is_gt()) {
+                topmost = Some((face, height));
+            }
+            if bottommost.is_none_or(|(_, best)| height.total_cmp(&best).is_lt()) {
+                bottommost = Some((face, height));
+            }
+        }
+        let (Some((topmost, _)), Some((bottommost, _))) = (topmost, bottommost) else {
+            return;
+        };
+
+        let top = self.component_of[topmost.as_usize()];
+        let bottom = self.component_of[bottommost.as_usize()];
+
+        let first_component = self.component_of[enumeration[0].as_usize()];
+        self.swap_labels(first_component, top);
+
+        if bottom == top {
+            return;
+        }
+        let Some(&second_face) = enumeration.get(1) else {
+            return;
+        };
+        // Re-read the bottom component's label through the swap just applied, then swap it
+        // with whatever component the second enumerated face now wears.
+        let bottom = if bottom == first_component {
+            top
+        } else if bottom == top {
+            first_component
+        } else {
+            bottom
+        };
+        let second_component = self.component_of[second_face.as_usize()];
+        self.swap_labels(second_component, bottom);
+    }
+
+    fn swap_labels(&mut self, left: u32, right: u32) {
+        if left == right {
+            return;
+        }
+        for component in &mut self.component_of {
+            if *component == left {
+                *component = right;
+            } else if *component == right {
+                *component = left;
+            }
+        }
+    }
+
+    /// A face's component id, or `None` for a face the partition never saw (one minted after
+    /// the build). An unknown face cannot be ordered against a known one, so key 1 ties for
+    /// it and the chain falls through.
+    fn component_of(&self, face: FaceKey) -> Option<u32> {
+        match self.component_of.get(face.as_usize()).copied() {
+            Some(component) if component != NO_COMPONENT => Some(component),
+            _ => None,
+        }
+    }
+
+    /// Do all of `faces` sit in one component — i.e. does key 1 **tie** across them? An
+    /// unlabelled face answers `false`: a tie that cannot be demonstrated is not assumed.
+    #[cfg(test)]
     fn all_share_component(&self, faces: &[FaceKey]) -> bool {
         let mut shared: Option<u32> = None;
         for &face in faces {
-            match self.component_of.get(face.as_usize()).copied() {
-                Some(component) if component != NO_COMPONENT => {
+            match self.component_of(face) {
+                Some(component) => {
                     if *shared.get_or_insert(component) != component {
                         return false;
                     }
                 }
-                _ => return false,
+                None => return false,
             }
         }
         true
@@ -8369,17 +8446,14 @@ impl LoopMesh {
     /// every textured corner. So a corner seamed only by condition (2) still takes the
     /// positional pick.
     ///
-    /// **The override declines only where key 1 of the tie-break actually separates the
-    /// candidates.** Key 1 — the interpolation-component id (§6.6.1.4.1) — is *live* when a
-    /// float2 loop layer is present **and** `segments` is odd. Live is not the
-    /// same as separating: `components` carries the mesh-wide partition, and whenever the
-    /// candidates all sit in **one** component key 1 ties for every one of them, so keys
-    /// 2–4 decide and the answer is an isomorphism invariant — the single-UV-island mesh,
-    /// which is the common textured case. Only a candidate set that **straddles** two
-    /// components needs §6.6.1.4.1's *numbering*, which is a construction-order artefact
-    /// (face-enumeration seeds, then the top/bottom label swaps) and is not implemented; a
-    /// tie-break run without it there would be a different arbitrary answer rather than a
-    /// safer one, so that — and only that — falls back to §6.6.1's positional donor.
+    /// **Key 1 runs whenever it is live.** The interpolation-component id (§6.6.1.4.1) is
+    /// live when a float2 loop layer is present **and** `segments` is odd, and `components`
+    /// then carries the mesh-wide partition. Live is not the same as separating: candidates
+    /// sitting in one component tie on key 1, so keys 2–4 decide and the answer is an
+    /// isomorphism invariant — the single-UV-island mesh, the common textured case. A
+    /// candidate set that **straddles** components keeps the lowest-numbered one and then
+    /// runs keys 2–4 *within* it; the numbering is a construction-order artefact, so that
+    /// donor is reproducible against a same-order fixture rather than invariant.
     ///
     /// (That same float2 inventory gate also arms §6.6.1.4's `degenerate_uv_image` candidate filter,
     /// which is not implemented at any `segments`: a candidate whose UV image of the corner
@@ -8416,35 +8490,6 @@ impl LoopMesh {
             beveled_leg_count == 1 || (affect == BevelAffect::Vertices && segments % 2 == 1);
         let considers = |leg: EdgeKey| every_leg || is_beveled(leg);
 
-        // Key 1 (§6.6.1.4.1). The test is over **every face the tie-break will look at** —
-        // both flanks of every considered leg, not just the per-leg winners — because key 1
-        // leads the key chain inside the per-leg reduce as well as over the survivors. When
-        // they all share a component the key ties at every comparison this corner makes and
-        // dropping it is exact; when they straddle, the missing numbering would decide
-        // comparisons that keys 2–4 cannot stand in for, so the whole override declines.
-        if InterpComponents::live(self, segments) {
-            let mut consulted: Vec<FaceKey> = Vec::new();
-            for leg in self.iter_disk_edges(vertex).filter(|&leg| considers(leg)) {
-                for flank in [
-                    self.arriving_face(vertex, leg),
-                    self.departing_face(vertex, leg),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if !consulted.contains(&flank) {
-                        consulted.push(flank);
-                    }
-                }
-            }
-            let ties = components
-                .map(|partition| partition.all_share_component(&consulted))
-                .unwrap_or(false);
-            if !ties {
-                return positional;
-            }
-        }
-
         let mut candidates: Vec<FaceKey> = Vec::new();
         for leg in self.iter_disk_edges(vertex) {
             if !considers(leg) {
@@ -8458,7 +8503,7 @@ impl LoopMesh {
                 self.departing_face(vertex, leg),
             ) {
                 (Some(arriving), Some(departing)) => {
-                    if self.donor_precedes(departing, arriving) {
+                    if self.donor_precedes(departing, arriving, components) {
                         Some(departing)
                     } else {
                         Some(arriving)
@@ -8474,7 +8519,7 @@ impl LoopMesh {
             }
         }
 
-        self.donor_tie_break(&candidates).or(positional)
+        self.donor_tie_break(&candidates, components).or(positional)
     }
 
     /// [`straddle_quad_donor`](Self::straddle_quad_donor) read off an edge alone — the shape
@@ -8510,24 +8555,12 @@ impl LoopMesh {
     ///   flanks. There is no per-leg reduce here and no fan anchor; the ring-spanning
     ///   two-pass construction belongs to a different row.
     ///
-    /// Key 1 (§6.6.1.4.1) is live at every odd `segments` on a mesh carrying a float2
-    /// layer, so the same discipline [`ring_spanning_donor`](Self::ring_spanning_donor)
-    /// applies holds: the override runs only once the two candidates are shown to share an
-    /// interpolation component (key 1 tied, keys 2–4 decide), and otherwise declines back
-    /// to the positional near flank rather than answering with an unimplemented numbering.
-    /// A **colour-only** discontinuity is the case this leaves fully decided: colours are in
-    /// the blendable set, so it seams the edge here *and* splits the partition — but only on
-    /// a mesh that carries a float2 layer to arm the partition at all. With no float2 layer
-    /// key 1 stays inert and the tie-break runs on keys 2–4.
-    ///
-    /// **The observable reach that follows.** §6.6.1.4.1's partition splits on exactly the
-    /// condition (2) this test runs, so on a mesh carrying a UV layer a condition-(2) seam
-    /// almost always puts the two flanks in *different* components — and the decline above
-    /// then fires, restoring the near flank. What the override actually changes, therefore,
-    /// is (a) any seam on a mesh with **no** float2 layer — colour-only seams, and every
-    /// condition-(1) seam on a plain untextured mesh — and (b) the rare textured edge that
-    /// is seamed while its flanks still flood together. A UV-island boundary on a textured
-    /// mesh is *not* in that set.
+    /// Key 1 (§6.6.1.4.1) is live at every odd `segments` on a mesh carrying a float2 layer
+    /// and leads the chain here exactly as it does in
+    /// [`ring_spanning_donor`](Self::ring_spanning_donor). §6.6.1.4.1's partition splits on
+    /// exactly the condition (2) this test runs, so on a float2-bearing mesh a condition-(2)
+    /// seam usually does put the two flanks in different components, and key 1 alone decides
+    /// between them. With no float2 layer key 1 is inert and keys 2–4 decide.
     ///
     /// The single quad at `segments = 1` is the same row and routes through here too
     /// (§6.6.1.4's per-kind scoping names it alongside the odd-`segments` centre quad); on a
@@ -8553,16 +8586,7 @@ impl LoopMesh {
             }
         }
 
-        if InterpComponents::live(self, segments) {
-            let ties = components
-                .map(|partition| partition.all_share_component(&candidates))
-                .unwrap_or(false);
-            if !ties {
-                return near_face;
-            }
-        }
-
-        self.donor_tie_break(&candidates).or(near_face)
+        self.donor_tie_break(&candidates, components).or(near_face)
     }
 
     /// The **edge-level** form of BEVEL.md §6.6.1.4's interpolation-seam test: is `edge`
@@ -8630,9 +8654,13 @@ impl LoopMesh {
 
     /// BEVEL.md §6.6.1.4's deterministic tie-break: the smallest candidate on the first key
     /// that separates it, and on a total tie the earliest in the order the set was built.
-    fn donor_tie_break(&self, candidates: &[FaceKey]) -> Option<FaceKey> {
+    fn donor_tie_break(
+        &self,
+        candidates: &[FaceKey],
+        components: Option<&InterpComponents>,
+    ) -> Option<FaceKey> {
         candidates.iter().copied().reduce(|best, candidate| {
-            if self.donor_precedes(candidate, best) {
+            if self.donor_precedes(candidate, best, components) {
                 candidate
             } else {
                 best
@@ -8643,13 +8671,28 @@ impl LoopMesh {
     /// Does `candidate` beat `best` on BEVEL.md §6.6.1.4's key chain? A total tie answers
     /// `false`, which keeps the earlier candidate — the guide's own last resort.
     ///
-    /// **Key 1 — the interpolation-layer component id (§6.6.1.4.1) — is not compared here**,
-    /// and the caller never runs this chain where it could separate: where key 1 is live,
-    /// [`ring_spanning_donor`](Self::ring_spanning_donor) admits the chain only after
-    /// proving every face it will consult sits in one interpolation component (key 1 tied),
-    /// and declines the override entirely otherwise. Everywhere this chain *does* run, key 1
-    /// ties for every candidate and omitting it is exact.
-    fn donor_precedes(&self, candidate: FaceKey, best: FaceKey) -> bool {
+    /// Key 1 is the interpolation-component id of §6.6.1.4.1, live only where `components`
+    /// is `Some` (a float2 loop layer present *and* `segments` odd). It ties — and the chain
+    /// falls through to keys 2–4 *within* the winning component — whenever the two
+    /// candidates share a component, which is the single-island case, and whenever either
+    /// face is one the partition never saw.
+    fn donor_precedes(
+        &self,
+        candidate: FaceKey,
+        best: FaceKey,
+        components: Option<&InterpComponents>,
+    ) -> bool {
+        // Key 1: lowest component id.
+        if let Some(partition) = components {
+            if let (Some(candidate_component), Some(best_component)) =
+                (partition.component_of(candidate), partition.component_of(best))
+            {
+                if candidate_component != best_component {
+                    return candidate_component < best_component;
+                }
+            }
+        }
+
         // Key 2: selected beats unselected. This reads the face's **own** header flag, not
         // its membership in the operator's input geometry.
         let candidate_selected = self.face_flags(candidate).contains(ElementFlags::SELECTED);
@@ -27309,19 +27352,18 @@ mod tests {
         }
     }
 
-    /// The **declined** regime, and the whole of what it is now: candidates that genuinely
-    /// **straddle** two interpolation components. Deciding between them needs §6.6.1.4.1's
-    /// *numbering*, which is a construction-order artefact (not an isomorphism invariant) and
-    /// is not implemented — so the override falls back to §6.6.1's positional donor.
-    ///
-    /// Observable form: the cap follows the **same quad** in both decorations, so the two
-    /// runs land on *different* slots — where the single-island run above lands on the lower
-    /// slot in both.
+    /// The **straddling** regime: candidates in two different interpolation components. Key 1
+    /// separates them and keeps the **lowest-numbered** one, and §6.6.1.4.1 numbers components
+    /// by the enumeration index of their first face — so the cap tracks the quad that holds
+    /// the mesh's first face, whichever slot that quad happens to carry. (Both quads are
+    /// coplanar here, so the top/bottom label swaps are no-ops and the numbering is pure
+    /// flood-fill order.)
     #[test]
-    fn face_cd_uv_straddling_candidates_at_odd_segments_decline_to_the_positional_donor() {
+    fn face_cd_uv_straddling_candidates_at_odd_segments_take_the_lowest_numbered_component() {
         let mut slots = Vec::new();
         for swapped in [false, true] {
             let (mut mesh, corner) = uv_decorated_two_quad_plane(2, swapped);
+            let first_slot = mesh.face_material_index(mesh.face_keys()[0]);
 
             let result = mesh.bevel(
                 &[corner.into()],
@@ -27333,13 +27375,134 @@ mod tests {
             mesh.validate_topology();
 
             assert_eq!(result.faces.len(), 1, "the corner mints exactly its cap");
-            slots.push(mesh.face_material_index(result.faces[0]));
+            let cap_slot = mesh.face_material_index(result.faces[0]);
+            assert_eq!(
+                cap_slot, first_slot,
+                "swapped = {swapped}: the shared edge is a UV-island boundary, so the two \
+                 candidates sit in different components and key 1 keeps the component seeded \
+                 by the first enumerated face",
+            );
+            slots.push(cap_slot);
         }
         assert_ne!(
             slots[0], slots[1],
-            "the shared edge is a UV-island boundary, so the corner's two candidates sit in \
-             different components: the cap declines to the positional quad and tracks that \
-             quad's slot rather than the lower one",
+            "swapping the decoration must move the slot, or the assertion above would be \
+             satisfied by a rule that simply always picks the lower slot",
+        );
+    }
+
+    /// An open fan of three coplanar triangles about a boundary apex, materials in fan order,
+    /// with one face's UV image translated away so the partition splits **lopsidedly**: two
+    /// faces in the low-numbered component, one alone in the other.
+    fn uv_split_open_fan(slots: [i32; 3], detached: usize) -> (LoopMesh, VertexKey) {
+        let (mut mesh, centre, rim) = open_planar_fan(4, 0);
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .expect("Vec2 is a supported loop attribute format");
+
+        for k in 0..3 {
+            let face = open_fan_face(&mesh, centre, &rim, k);
+            mesh.set_face_material_index(face, slots[k]);
+            let shift = if k == detached { 10.0 } else { 0.0 };
+            for loop_key in mesh.face_loop_keys(face) {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                mesh.loop_attribs_mut().set_vec2(
+                    uv,
+                    loop_key.as_usize(),
+                    [position.x + shift, position.y],
+                );
+            }
+        }
+        (mesh, centre)
+    }
+
+    /// §6.6.1.4.1's numbering, asserted on the partition itself: the component seeded by the
+    /// **earlier** face in enumeration order gets the lower id, and it is the one holding
+    /// *two* of the three faces here.
+    #[test]
+    fn interp_component_numbering_follows_face_enumeration_order() {
+        let (mesh, _apex) = uv_split_open_fan([3, 5, 1], 2);
+        let bank = TemplateBank::new(&mesh, 1);
+        let partition = bank.interp_components().expect("a UV layer at odd `segments`");
+
+        let faces = mesh.face_keys();
+        let ids: Vec<u32> = faces
+            .iter()
+            .map(|&face| partition.component_of(face).expect("a pristine face is labelled"))
+            .collect();
+
+        assert_eq!(ids[0], ids[1], "the two contiguous faces flood together");
+        assert_ne!(ids[1], ids[2], "the translated UV image seams the third face off");
+        assert!(
+            ids[0] < ids[2],
+            "the component seeded first in enumeration order takes the lower id, got {ids:?}",
+        );
+    }
+
+    /// The case the earlier decline got wrong: candidates **straddling** components where the
+    /// lowest-numbered component still holds **more than one** of them. Key 1 narrows to that
+    /// component and keys 2–4 then decide *within* it — here key 3, the lower material slot.
+    ///
+    /// The keying is deliberately lopsided so all three readings differ: the global lowest
+    /// slot (1) sits alone in the *high* component, and the low component holds slots 3 and 5.
+    /// A rule that ignored the split would answer 1; one that declined to the positional donor
+    /// would answer 5; §6.6.1.4.1 answers **3**.
+    #[test]
+    fn face_cd_lopsided_uv_split_runs_keys_two_to_four_inside_the_lowest_component() {
+        let (mut mesh, apex) = uv_split_open_fan([3, 5, 1], 2);
+
+        let result = mesh.bevel(
+            &[apex.into()],
+            BevelOptions {
+                offset: 0.2,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result.faces.len(), 1, "the open fan's apex mints exactly its cap");
+        assert_eq!(
+            mesh.face_material_index(result.faces[0]),
+            3,
+            "key 1 keeps the two-face low component; key 3 then picks the lower slot in it",
+        );
+    }
+
+    /// §6.6.1.4.1's *partial* canonicalisation, on the only shape that exercises it: three
+    /// components at three distinct heights. Read the steps literally — they swap against the
+    /// components of the first two **faces in enumeration order**, not against the literal ids
+    /// `0` and `1`, and they demonstrably do *not* end with "top = 0, bottom = 1".
+    #[test]
+    fn interp_component_numbering_applies_the_partial_top_bottom_swaps() {
+        let mut mesh = LoopMesh::new();
+        mesh.register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .expect("Vec2 is a supported loop attribute format");
+
+        // Disjoint quads: no shared edge, so each is its own component whatever the UVs are.
+        for height in [0.0_f32, 2.0, -1.0] {
+            let corners: Vec<VertexKey> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .into_iter()
+                .map(|(x, y)| mesh.create_vertex(Vec3::new(x + height * 4.0, y, height)))
+                .collect();
+            mesh.face_create_verts(&corners, FaceCreateFlags::NONE);
+        }
+
+        let bank = TemplateBank::new(&mesh, 1);
+        let partition = bank.interp_components().expect("a UV layer at odd `segments`");
+        let ids: Vec<u32> = mesh
+            .face_keys()
+            .iter()
+            .map(|&face| partition.component_of(face).expect("a pristine face is labelled"))
+            .collect();
+
+        // Flood fill labels them 0 / 1 / 2. Top is face 1 (id 1), bottom is face 2 (id 2).
+        // Swap A exchanges face 0's component (0) with top (1) → 1 / 0 / 2. Swap B exchanges
+        // face 1's *current* component (0) with bottom (2) → 1 / 2 / 0.
+        assert_eq!(
+            ids,
+            vec![1, 2, 0],
+            "the topmost face ends on id 2, not 0 — the canonicalisation is partial and the \
+             artefact is what has to be reproduced",
         );
     }
 
@@ -27908,14 +28071,14 @@ mod tests {
         );
     }
 
-    /// §6.6.1.4.1's decline: with a float2 layer present at odd `segments`, key 1 is
-    /// **live**, and the numbering it would need is a construction-order artefact this
-    /// crate does not reproduce. When the two candidates sit in *different* interpolation
-    /// components — as they do at a UV-island boundary, which is also what seams the edge —
-    /// the whole override stands down and the straddle quad keeps its positional near
-    /// flank rather than answering with a different arbitrary pick.
+    /// §6.6.1.4.1 at the straddle quad: with a float2 layer present at odd `segments` key 1
+    /// is **live**, and when the two candidates sit in *different* interpolation components —
+    /// as they do at a UV-island boundary, which is also what seams the edge — key 1 alone
+    /// decides, keeping the **lower-numbered** flank. The expectation is read off the
+    /// partition rather than hard-coded, because the numbering is construction-order
+    /// dependent and hard-coding it would pin the cube's face order, not the rule.
     #[test]
-    fn face_cd_straddle_quad_declines_the_override_across_uv_components() {
+    fn face_cd_straddle_quad_takes_the_lowest_numbered_component_across_uv_components() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let tint = tint_and_slot_faces(&mut mesh);
@@ -27931,6 +28094,23 @@ mod tests {
                 .set_vec2(uv, corner.as_usize(), [5.0, 5.0]);
         }
 
+        let far_face = mesh.edge_flanking_faces(edge).1.unwrap();
+        let bank = TemplateBank::new(&mesh, 3);
+        let partition = bank.interp_components().expect("a float2 layer at odd `segments`");
+        let (near_component, far_component) = (
+            partition.component_of(near_face).unwrap(),
+            partition.component_of(far_face).unwrap(),
+        );
+        assert_ne!(
+            near_component, far_component,
+            "the painted flank is a UV island of its own, so key 1 is separating here",
+        );
+        let straddle_block = if near_component < far_component {
+            near_block
+        } else {
+            far_block
+        };
+
         let result = mesh.bevel(
             &[edge.into()],
             BevelOptions {
@@ -27944,8 +28124,9 @@ mod tests {
         let blocks = strip_blocks_in_centre_line_order(&mesh, &result, near_center, tint);
         assert_eq!(
             blocks,
-            vec![near_block, near_block, far_block],
-            "candidates in different interpolation components decline the override",
+            vec![near_block, straddle_block, far_block],
+            "the straddle quad follows key 1 to the lower-numbered component; the quads off \
+             the centre line stay positional",
         );
     }
 
