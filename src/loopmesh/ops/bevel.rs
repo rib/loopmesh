@@ -6301,7 +6301,7 @@ impl LoopMesh {
                 reference: self.vertex_normal(vertex).normalize_or_zero(),
             },
         };
-        let meet = terminal_leg_meet(TerminalLegMeet {
+        let placement = terminal_leg_meet(TerminalLegMeet {
             endpoint,
             edge_out,
             leg_out,
@@ -6310,8 +6310,14 @@ impl LoopMesh {
             offset,
         });
 
-        // §7.5.2: the zero-offset leg must not fling the meet past its own span.
-        self.clamp_zero_offset_terminal(meet, vertex, leg)
+        match placement {
+            // §7.5.2: the zero-offset leg must not fling the meet past its own span.
+            TerminalPlacement::LineSolve(meet) => {
+                self.clamp_zero_offset_terminal(meet, vertex, leg)
+            }
+            // §7.5.1 returns regime 1 ahead of the clamp; see `TerminalPlacement`.
+            TerminalPlacement::Degenerate(meet) => meet,
+        }
     }
 
     /// §7.5.2 zero-offset span clamp: the unbeveled leg carries offset 0, so its
@@ -6322,6 +6328,9 @@ impl LoopMesh {
     /// closest-approach segment. Out of `[0, 1]`, the meet is snapped bodily onto the
     /// nearer endpoint of the leg's segment (`vertex` … leg's other end), lateral
     /// component discarded.
+    ///
+    /// Only ever handed a line solve: §7.5.1 returns regime 1's closed forms before
+    /// reaching here, and `TerminalPlacement` carries that distinction across.
     fn clamp_zero_offset_terminal(&self, meet: Vec3, vertex: VertexKey, leg: EdgeKey) -> Vec3 {
         let [a, b] = self.edge_vert_keys(leg);
         let far = if a == vertex { b } else { a };
@@ -13753,6 +13762,153 @@ mod tests {
             // The §7.3 slide keeps x = 0 at this corner; the leg meet pulls it off.
             assert!(target.x > 1.0e-2, "leg meet is off the §7.3 in-face slide");
         }
+        mesh.validate_topology();
+    }
+
+    /// Two quads sharing the edge `a`–`b`, where **both** sectors have a near-flat corner
+    /// at `b`: each face's other edge at `b` leaves within `1.7°` of straight-through, so
+    /// both of `b`'s terminal strip verts dispatch to §7.5.1 regime 1's near-collinear
+    /// half. The `±0.03` splay is what makes the corners flat-but-not-exact; the patch is
+    /// planar in `z = 0`. `a`'s own corners stay wide (±45°), so `a` is an ordinary
+    /// regime-3 terminal and the two ends of `E` can be read independently.
+    ///
+    /// `mis_wind_lower` reverses the lower quad's ring so both faces traverse `a`→`b`,
+    /// which is §7.8's inconsistent winding: the lower sector's own plane normal then
+    /// points to the opposite side of the surface from the upper's.
+    fn near_collinear_terminal_patch(mesh: &mut LoopMesh, mis_wind_lower: bool) -> [VertexKey; 2] {
+        let a = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let upper_far = mesh.create_vertex(Vec3::new(2.0, 0.03, 0.0));
+        let lower_far = mesh.create_vertex(Vec3::new(2.0, -0.03, 0.0));
+        let upper = mesh.create_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let lower = mesh.create_vertex(Vec3::new(1.0, -1.0, 0.0));
+        let lower_ring = if mis_wind_lower {
+            [b, lower_far, lower, a]
+        } else {
+            [a, lower, lower_far, b]
+        };
+        for ring in [[a, b, upper_far, upper], lower_ring] {
+            let edges = [
+                mesh.create_edge([ring[0], ring[1]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[1], ring[2]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[2], ring[3]], EdgeCreateFlags::NO_DUPLICATE),
+                mesh.create_edge([ring[3], ring[0]], EdgeCreateFlags::NO_DUPLICATE),
+            ];
+            mesh.face_create(&ring, &edges, FaceCreateFlags::NONE);
+        }
+        [a, b]
+    }
+
+    fn strip_verts_near(mesh: &LoopMesh, result: &BevelResult, target: Vec3) -> Vec<Vec3> {
+        result
+            .verts
+            .iter()
+            .map(|&vert| mesh.vertex_position(vert))
+            .filter(|position| (*position - target).length() < 0.5)
+            .collect()
+    }
+
+    /// BEVEL.md §7.5.1 regime 1, end to end: a near-collinear terminal's two strip verts
+    /// are each pushed `offset / cos(θ_dir/2)` square to the common direction, to
+    /// **opposite** sides of `E`. Nothing here trips the §7.5.2 clamp — on a consistently
+    /// wound surface the along-leg projection comes out positive for both sectors, which
+    /// is §7.8.2's "Panel B is the mirror of Panel A" restated for regime 1.
+    #[test]
+    fn edge_bevel_near_collinear_terminal_pushes_out_the_common_perpendicular() {
+        let mut mesh = LoopMesh::new();
+        let [a, b] = near_collinear_terminal_patch(&mut mesh, false);
+        let endpoint = mesh.vertex_position(b);
+        let edge = mesh.query_edge_exists(a, b).expect("shared edge");
+
+        let offset = 0.25_f32;
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let at_b = strip_verts_near(&mesh, &result, endpoint);
+        assert_eq!(at_b.len(), 2, "both of `b`'s strip verts, got {at_b:?}");
+        for position in &at_b {
+            let push = *position - endpoint;
+            // Regime 1's magnitude `offset / cos(θ_dir/2)`, which at 1.7° is `offset` to
+            // well inside this tolerance.
+            assert!(
+                (push.length() - offset).abs() < 1.0e-3,
+                "strip vert must stand off `b` by ≈ {offset}, got {} at {position:?}",
+                push.length(),
+            );
+            // Square to the common direction (≈ `E`'s own line here), not slid along a leg.
+            assert!(
+                push.y.abs() > 0.99 * offset,
+                "the push must be the common perpendicular, got {push:?}",
+            );
+        }
+        assert!(
+            at_b[0].y * at_b[1].y < 0.0,
+            "the two sectors push to opposite sides of `E`, got {at_b:?}",
+        );
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.5.1: the regime-1 placement is returned **before** the §7.5.2 span
+    /// clamp — the pseudocode's `return` sits ahead of the clamp call — so no regime-1
+    /// strip vert is ever snapped onto its endpoint.
+    ///
+    /// A consistently wound terminal cannot see the difference (the projection is
+    /// positive there either way), so the discriminating fixture is a **mis-wound** one:
+    /// the flipped sector normal throws regime 1's push into the other flank's half-plane
+    /// and its along-leg projection negative, which is precisely §7.8.2's collapse
+    /// trigger. Under regime 1 the collapse must not happen: both of `b`'s strip verts
+    /// still stand `≈ offset` off `b`, merely on the *same* side of `E` instead of
+    /// straddling it. The clamp itself is untouched — `a`'s wide corners are regime 3, and
+    /// its disagreeing flank still collapses onto `a` exactly as §7.8.2 describes.
+    #[test]
+    fn edge_bevel_near_collinear_terminal_skips_the_span_clamp_when_mis_wound() {
+        let mut mesh = LoopMesh::new();
+        let [a, b] = near_collinear_terminal_patch(&mut mesh, true);
+        let far_endpoint = mesh.vertex_position(a);
+        let endpoint = mesh.vertex_position(b);
+        let edge = mesh.query_edge_exists(a, b).expect("shared edge");
+
+        let offset = 0.25_f32;
+        let result = mesh.bevel(
+            &[edge.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let at_b = strip_verts_near(&mesh, &result, endpoint);
+        assert_eq!(at_b.len(), 2, "both of `b`'s strip verts, got {at_b:?}");
+        for position in &at_b {
+            let push = *position - endpoint;
+            assert!(
+                (push.length() - offset).abs() < 1.0e-3,
+                "a regime-1 strip vert must never be clamped onto `b`; got {} at \
+                 {position:?}",
+                push.length(),
+            );
+        }
+        assert!(
+            at_b[0].y * at_b[1].y > 0.0,
+            "the mis-wound sector pushes into the other flank's half-plane, so both land \
+             on one side of `E`, got {at_b:?}",
+        );
+
+        // The clamp is still armed everywhere §7.8.2 says it is: `a`'s corners are wide,
+        // so its disagreeing flank takes the regime-3 line solve and collapses onto `a`.
+        let at_a = strip_verts_near(&mesh, &result, far_endpoint);
+        assert!(
+            at_a.iter()
+                .any(|position| (*position - far_endpoint).length() < 1.0e-6),
+            "`a`'s disagreeing flank must still collapse onto `a`, got {at_a:?}",
+        );
         mesh.validate_topology();
     }
 
@@ -30560,6 +30716,7 @@ mod tests {
             sector_plane,
             offset,
         })
+        .position()
     }
 
     /// §7.5.1's dispatch quantity is the **direction** angle — the pair's first member
@@ -30696,20 +30853,21 @@ mod tests {
         );
     }
 
-    /// The §7.5.1 band edges: `SMALL_ANG = 10°` is exclusive at the top (10° itself is
-    /// already ordinary) and `EPS_ANG = 2°` is inclusive at the bottom. Below `EPS_ANG`
-    /// the shallow branch must **not** fire — regime 1 owns that band, and letting
-    /// `< SMALL_ANG` swallow it is the mistake §7.5.1 warns about.
+    /// The §7.5.1 band edges, on all three regimes: `EPS_ANG = 2°` is inclusive at the
+    /// bottom of regime 2 (so `[0, 2°)` and `(178°, 180°]` belong to regime 1 and the
+    /// shallow branch must **not** swallow them — the mistake §7.5.1 warns about) and
+    /// `SMALL_ANG = 10°` is exclusive at the top (10° itself is already ordinary).
     #[test]
     fn terminal_leg_meet_direction_angle_band_edges_dispatch_per_the_thresholds() {
         let offset = 0.25;
-        // The `1.9°` arm pins the **interim** state: with regime 1 unimplemented, the
-        // sub-`EPS_ANG` band lands in regime 3's cross product rather than in the
-        // near-degenerate construction that owns it. Rewrite this arm's expectation
-        // when regime 1 lands — it is the one row here that is not §7.5.1's endpoint.
-        for (direction_angle_deg, expect_shallow) in
-            [(1.9_f32, false), (2.1, true), (9.9, true), (10.1, false)]
-        {
+        for (direction_angle_deg, expected_regime) in [
+            (1.9_f32, 1),
+            (2.1, 2),
+            (9.9, 2),
+            (10.1, 3),
+            (177.9, 3),
+            (178.1, 1),
+        ] {
             let (endpoint, edge_out, leg_out, sector_normal) =
                 shallow_terminal_frame(direction_angle_deg);
             let placement = leg_meet(
@@ -30719,19 +30877,156 @@ mod tests {
                 SectorPlane::Face(sector_normal),
                 offset,
             );
-            let cross_normal = edge_out.cross(leg_out).normalize();
-            let expected_normal = if expect_shallow {
-                sector_normal
-            } else {
-                cross_normal
+            let expected = match expected_regime {
+                1 => degenerate_placement_oracle(
+                    endpoint,
+                    edge_out,
+                    leg_out,
+                    true,
+                    sector_normal,
+                    offset,
+                ),
+                2 => leg_meet_oracle(endpoint, edge_out, leg_out, true, sector_normal, offset),
+                _ => leg_meet_oracle(
+                    endpoint,
+                    edge_out,
+                    leg_out,
+                    true,
+                    edge_out.cross(leg_out).normalize(),
+                    offset,
+                ),
             };
-            let expected =
-                leg_meet_oracle(endpoint, edge_out, leg_out, true, expected_normal, offset);
             assert!(
                 (placement - expected).length() < 1.0e-5,
-                "at {direction_angle_deg}° the shallow branch should fire = \
-                 {expect_shallow}, got {placement:?} vs {expected:?}",
+                "at {direction_angle_deg}° the dispatch should reach regime \
+                 {expected_regime}, got {placement:?} vs {expected:?}",
             );
+        }
+    }
+
+    /// An independent transcription of §7.5.1 regime 1 / §7.6.2's two special cases,
+    /// stated straight from the guide's prose: sum the two bound directions, cross with
+    /// the sector normal, push by `offset / cos(θ_dir/2)` when the directions run
+    /// straight through; slide along the *second* edge by `offset` when they double back.
+    fn degenerate_placement_oracle(
+        endpoint: Vec3,
+        edge_out: Vec3,
+        leg_out: Vec3,
+        leg_precedes_edge: bool,
+        plane_normal: Vec3,
+        offset: f32,
+    ) -> Vec3 {
+        let (first_dir, second_dir) = if leg_precedes_edge {
+            (-leg_out, edge_out)
+        } else {
+            (-edge_out, leg_out)
+        };
+        let direction_angle = first_dir
+            .cross(second_dir)
+            .length()
+            .atan2(first_dir.dot(second_dir));
+        if direction_angle > std::f32::consts::FRAC_PI_2 {
+            return endpoint + second_dir.normalize() * offset;
+        }
+        let perpendicular = (first_dir + second_dir).cross(plane_normal).normalize();
+        endpoint + perpendicular * (offset / (direction_angle * 0.5).cos())
+    }
+
+    /// §7.5.1 regime 1, near-collinear half: the two edges run straight through the
+    /// endpoint, so there is no isolated crossing to solve for and the meet is pushed
+    /// straight out perpendicular to both by `offset / cos(θ_dir/2)`.
+    ///
+    /// The expectation is a closed form worked by hand in a frame chosen to make one
+    /// available: with the sector plane's normal `+z`, `E` along `+x` and the leg at
+    /// `α` from straight-through, the common direction is `(1 + cos α, −sin α, 0)` of
+    /// length `2 cos(α/2)`, so the unit perpendicular is exactly
+    /// `(−sin(α/2), −cos(α/2), 0)`. That `−y` sense is the *continuity* check: it is
+    /// the side regimes 2 and 3 push `E`'s own offset line to in this frame.
+    #[test]
+    fn terminal_leg_meet_near_collinear_direction_angle_pushes_out_the_common_perpendicular() {
+        let offset = 0.25;
+        let endpoint = Vec3::new(0.3, -0.7, 1.1);
+        let sector_normal = Vec3::Z;
+        let edge_out = Vec3::X;
+        for direction_angle_deg in [0.0_f32, 1.0, 1.9] {
+            let alpha = direction_angle_deg.to_radians();
+            let leg_out = Vec3::new(-alpha.cos(), alpha.sin(), 0.0);
+            let placement = leg_meet(
+                endpoint,
+                edge_out,
+                leg_out,
+                SectorPlane::Face(sector_normal),
+                offset,
+            );
+
+            let half = alpha * 0.5;
+            let expected = endpoint
+                + Vec3::new(-half.sin(), -half.cos(), 0.0) * (offset / half.cos());
+            assert!(
+                (placement - expected).length() < 1.0e-5,
+                "at {direction_angle_deg}° the perpendicular push should land at \
+                 {expected:?}, got {placement:?}",
+            );
+            // The distance is the whole point of the `1 / cos(θ_dir/2)` factor.
+            assert!(
+                ((placement - endpoint).length() - offset / half.cos()).abs() < 1.0e-6,
+                "the push distance must be offset / cos(θ_dir/2)",
+            );
+            // Square to the *common* direction — which is what "perpendicular to both
+            // edges" means once the two directions differ: the push leans `α/2` off
+            // square to each of them individually, and that lean is exactly what the
+            // `1 / cos(θ_dir/2)` factor lengthens the push to compensate for.
+            let push = (placement - endpoint).normalize();
+            let common_direction = (-leg_out + edge_out).normalize();
+            assert!(
+                push.dot(common_direction).abs() < 1.0e-5,
+                "the push must be square to the common direction, got {push:?}",
+            );
+            assert!(
+                (push.dot(edge_out) + half.sin()).abs() < 1.0e-5,
+                "and must lean exactly θ_dir/2 off square to each edge",
+            );
+        }
+    }
+
+    /// §7.5.1 regime 1, doubled-back half: the two edges leave the endpoint the same way
+    /// and lie back on one another, enclosing a zero-area sliver with no wedge to bisect.
+    /// The meet sits **on the common line**, slid out along the *second* edge of the pair
+    /// by the larger of the two offsets — at a terminal, the beveled edge's. There is no
+    /// perpendicular component at all, which is what discriminates it from the other half.
+    ///
+    /// The pair's order decides which edge is slid along, so both orders are exercised:
+    /// with the leg first it is `E`, with `E` first it is the leg.
+    #[test]
+    fn terminal_leg_meet_doubled_back_direction_angle_slides_along_the_second_edge() {
+        let offset = 0.25;
+        let endpoint = Vec3::new(-1.0, 2.0, 0.5);
+        let sector_normal = Vec3::new(0.0, 0.55, 1.0).normalize();
+        for direction_angle_deg in [178.1_f32, 179.5, 180.0] {
+            let alpha = direction_angle_deg.to_radians();
+            let edge_out = Vec3::X;
+            let leg_out = Vec3::new(-alpha.cos(), alpha.sin(), 0.0);
+            for (leg_precedes_edge, slide_along) in [(true, edge_out), (false, leg_out)] {
+                let placement = terminal_leg_meet(TerminalLegMeet {
+                    endpoint,
+                    edge_out,
+                    leg_out,
+                    leg_precedes_edge,
+                    sector_plane: SectorPlane::Face(sector_normal),
+                    offset,
+                })
+                .position();
+                let expected = endpoint + slide_along * offset;
+                assert!(
+                    (placement - expected).length() < 1.0e-5,
+                    "at {direction_angle_deg}° (leg first = {leg_precedes_edge}) the meet \
+                     should slide along the second edge to {expected:?}, got {placement:?}",
+                );
+                assert!(
+                    distance_from_line(placement, endpoint, slide_along) < 1.0e-5,
+                    "the doubled-back meet takes no perpendicular offset at all",
+                );
+            }
         }
     }
 
@@ -30760,7 +31055,8 @@ mod tests {
             leg_precedes_edge: true,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
-        });
+        })
+        .position();
         let edge_first = terminal_leg_meet(TerminalLegMeet {
             endpoint,
             edge_out,
@@ -30768,7 +31064,8 @@ mod tests {
             leg_precedes_edge: false,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
-        });
+        })
+        .position();
 
         // The frame must genuinely produce a skew pair, or nothing below discriminates.
         let midpoint = leg_meet_midpoint_oracle(
@@ -30821,7 +31118,8 @@ mod tests {
             leg_precedes_edge: true,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
-        });
+        })
+        .position();
         // The *sibling* of `on_leg_line`: the other end of the same closest-approach
         // segment, on the same pair of lines (same offset-push sign).
         let sibling = {
@@ -31352,21 +31650,94 @@ const COPLANAR_NORMAL_TOLERANCE: f32 = 1.0e-4;
 /// property (see the unit test) rather than an unstated assumption baked into a
 /// one-sided formula.
 fn terminal_direction_angle(edge_out: Vec3, leg_out: Vec3, leg_precedes_edge: bool) -> f32 {
-    let (first_dir, second_dir) = if leg_precedes_edge {
-        (-leg_out, edge_out)
-    } else {
-        (-edge_out, leg_out)
-    };
+    let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
     first_dir
         .cross(second_dir)
         .length()
         .atan2(first_dir.dot(second_dir))
 }
 
+/// §7.5.1's binding of the pair's two directions: the **first** member of the pair (in
+/// the endpoint's rotational order) taken *into* the endpoint, the **second** taken
+/// *out* of it. Every §7.5.1 quantity stated on "first"/"second" — the direction angle,
+/// the offset-line perpendiculars, regime 1's common direction and its slide edge — is
+/// read off this pair, so it is bound once here.
+fn terminal_meet_directions(
+    edge_out: Vec3,
+    leg_out: Vec3,
+    leg_precedes_edge: bool,
+) -> (Vec3, Vec3) {
+    if leg_precedes_edge {
+        (-leg_out, edge_out)
+    } else {
+        (-edge_out, leg_out)
+    }
+}
+
+/// §7.5.1 regime 1's angular band: within `EPS_ANG` of `0` (the two edges run
+/// straight through the endpoint) or of `π` (they double back on each other).
+/// Neither offset line is well defined there, so no line solve runs at all.
+fn is_degenerate_direction_angle(direction_angle: f32) -> bool {
+    direction_angle < TERMINAL_DIRECTION_EPS_ANGLE
+        || direction_angle > std::f32::consts::PI - TERMINAL_DIRECTION_EPS_ANGLE
+}
+
 /// §7.5.1 regime 2's angular band: at least `EPS_ANG` (outside the near-degenerate
 /// band, which has no meet plane at all) and strictly under `SMALL_ANG`.
 fn is_shallow_direction_angle(direction_angle: f32) -> bool {
     (TERMINAL_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
+}
+
+/// §7.5.1 regime 1 / §7.6.2's "parallel and anti-parallel special cases": the two
+/// closed-form placements for a terminal whose direction angle leaves no meet plane.
+/// `first_dir` / `second_dir` are §7.5.1's bound pair (`terminal_meet_directions`), and
+/// `offset` is the larger of the two sides' offsets — at a terminal the leg carries `0`,
+/// so it is always the beveled edge's.
+///
+/// The band is split at `π/2` because that is where the two closed forms swap which
+/// component survives: below it the directions still enclose a wedge whose bisector is
+/// well defined and the placement is purely perpendicular, above it they lie back on one
+/// another and the placement is purely along the common line. Nothing in `[EPS_ANG,
+/// π − EPS_ANG]` reaches here, so any split strictly inside that gap picks out the same
+/// two halves; `π/2` is simply the one that names them by which end of `[0, π]` the
+/// angle is nearer.
+///
+/// On the **parallel** half only, which side of the surface the perpendicular pushes to
+/// is **not** decided by a sign test. `cross(common_dir, sector_normal)` is the same
+/// construction the line-solve regimes use for their offset-line perpendiculars
+/// (`cross(first_dir, n)` and `cross(second_dir, n)`, which the common direction is the
+/// sum of), so in the limit the push agrees with the offset line the crossing case would
+/// have built and the two bands join without a discontinuity — as
+/// `d = offset / cos(θ_dir/2)` is the crossing case's `t / sin(θ_wedge/2)` written in the
+/// supplementary angle. The argument does **not** carry to the anti-parallel half, where
+/// `first_dir ≈ −second_dir` makes the sum degenerate and names no direction at all;
+/// that half returns from the `> π/2` arm before any of this runs.
+fn degenerate_terminal_placement(
+    endpoint: Vec3,
+    first_dir: Vec3,
+    second_dir: Vec3,
+    direction_angle: f32,
+    sector_normal: Vec3,
+    offset: f32,
+) -> Vec3 {
+    if direction_angle > std::f32::consts::FRAC_PI_2 {
+        // Doubled back: the two edges leave the endpoint the same way and lie back on
+        // one another, so the chamfer runs into a zero-area sliver with no wedge to
+        // bisect. The meet sits on the common line, slid out along the *second* edge —
+        // there is no perpendicular component to take.
+        return endpoint + second_dir.normalize_or_zero() * offset;
+    }
+
+    // Straight through: both offset lines get pushed the same way and land on top of
+    // each other, so the meet goes square to the common direction instead.
+    let common_direction = first_dir + second_dir;
+    let perpendicular = common_direction.cross(sector_normal).normalize_or_zero();
+    if perpendicular == Vec3::ZERO {
+        // The edges run square to the sector's own plane, so the plane names no
+        // sideways direction to push along. Degenerate input, not a reachable regime.
+        return endpoint;
+    }
+    endpoint + perpendicular * (offset / (direction_angle * 0.5).cos())
 }
 
 /// The §7.5.1 per-sector orientation input, in the one shape that cannot state the
@@ -31405,10 +31776,41 @@ struct TerminalLegMeet {
     offset: f32,
 }
 
+/// Where a §7.5.1 terminal placement came from, which is what decides whether the
+/// §7.5.2 span clamp may touch it.
+///
+/// §7.5.1 returns regime 1's closed forms **before** reaching the clamp, and that
+/// ordering is load-bearing rather than incidental. Regime 1's perpendicular push is
+/// square to the *common* direction, so it leans `θ_dir/2` off square to each edge and
+/// its along-leg projection is `−(offset / cos(θ_dir/2)) · sin(θ_dir/2) / |leg|` —
+/// negative for every direction angle above zero, on either side of a well-wound sector.
+/// Clamping it would snap the strip vert bodily onto the endpoint for one of each
+/// terminal's two pair orders, which is §7.8.2's mis-wound collapse fired on a mesh that
+/// is wound correctly, and the exact opposite of regime 1's purpose (a push of magnitude
+/// ≈ `offset`).
+#[derive(Clone, Copy)]
+enum TerminalPlacement {
+    /// A line solve against the zero-offset leg's own line: the meet can run off the
+    /// leg's span, so §7.5.2 arms.
+    LineSolve(Vec3),
+    /// Regime 1's closed form, which no clamp may see.
+    Degenerate(Vec3),
+}
+
+impl TerminalPlacement {
+    fn position(self) -> Vec3 {
+        match self {
+            TerminalPlacement::LineSolve(position) | TerminalPlacement::Degenerate(position) => {
+                position
+            }
+        }
+    }
+}
+
 /// §7.5.1's leg meet, before the §7.5.2 span clamp: the beveled edge's offset line
 /// against the zero-offset leg's own line, resolved at their closest approach when the
 /// two pass skew.
-fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
+fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
     let TerminalLegMeet {
         endpoint,
         edge_out,
@@ -31419,6 +31821,23 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
     } = meet;
 
     let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
+    let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
+
+    // §7.5.1 regime 1 (near-degenerate direction angle): no meet plane is well defined,
+    // so neither offset line is built and no line solve runs. §7.5.1 returns this ahead
+    // of the §7.5.2 clamp, so it is reported as clamp-ineligible — see `TerminalPlacement`.
+    if is_degenerate_direction_angle(direction_angle) {
+        return TerminalPlacement::Degenerate(degenerate_terminal_placement(
+            endpoint,
+            first_dir,
+            second_dir,
+            direction_angle,
+            // The sector normal, in regime 1's own role: the plane the perpendicular is
+            // built *in*. The face-less fallback is already folded into `reference()`.
+            sector_plane.reference(),
+            offset,
+        ));
+    }
 
     // §7.5.1 regime 2 (shallow direction angle): the two edges run near-straight
     // through the endpoint, so their cross product is numerically fragile and can come
@@ -31438,8 +31857,17 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
             let mut cross_normal = edge_out.cross(leg_out);
             let length = cross_normal.length();
             if length <= f32::EPSILON {
-                // Leg parallel to E: no perpendicular. Slide along the leg by `offset`.
-                return endpoint + leg_out * offset;
+                // Collinear to floating-point exactness — deep inside regime 1's band, so
+                // the dispatch above has already taken it. Kept as a division guard, and
+                // routed to the same placement so it cannot answer differently.
+                return TerminalPlacement::Degenerate(degenerate_terminal_placement(
+                    endpoint,
+                    first_dir,
+                    second_dir,
+                    direction_angle,
+                    sector_plane.reference(),
+                    offset,
+                ));
             }
             cross_normal /= length;
             if cross_normal.dot(sector_plane.reference()) < 0.0 {
@@ -31479,29 +31907,32 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
         (&line_edge, &line_leg)
     };
     match closest_approach(line_first, line_second) {
-        Some((on_first, _)) => on_first,
-        // The pair came out (anti)parallel below the direction-angle band that the
-        // `edge_out × leg_out` escape above catches, so there is no first-line point to
-        // take. This band is regime 1's (see `TERMINAL_DIRECTION_EPS_ANGLE`, still owed);
-        // until it lands, stand in with the midpoint of the two lines' base points, which
-        // at least keeps the strip vert off the endpoint that the close is about to kill.
-        None => (line_first.point + line_second.point) * 0.5,
+        Some((on_first, _)) => TerminalPlacement::LineSolve(on_first),
+        // The pair came out (anti)parallel to the line solve despite a direction angle
+        // outside regime 1's band — reachable only as floating-point slop right at the
+        // band edge, since the two lines' directions *are* the two edge directions.
+        // Regime 1's placement is the right answer for a pair with no isolated crossing,
+        // and it carries regime 1's clamp exemption with it for the same reason.
+        None => TerminalPlacement::Degenerate(degenerate_terminal_placement(
+            endpoint,
+            first_dir,
+            second_dir,
+            direction_angle,
+            sector_plane.reference(),
+            offset,
+        )),
     }
 }
 
 /// §7.5.1 `EPS_ANG` — the near-degenerate band half-width (2°, in radians). A terminal
 /// direction angle within this of `0` or of `π` leaves no well-defined meet plane at
 /// all, and §7.5.1 gives that band its own regime 1 (push out along the common
-/// perpendicular / slide along the common line).
+/// perpendicular / slide along the common line — `degenerate_terminal_placement`).
 ///
-/// **Regime 1 is not implemented.** So this bound is, for now, a pessimization rather
-/// than a guard: it does not hand `[0, EPS_ANG)` (or `(π − EPS_ANG, π]`) to regime 1,
-/// it *routes* that band into regime 3, whose `edge_out × leg_out` is exactly the
-/// short, direction-unstable cross product regime 2 exists to avoid. Only the far
-/// narrower parallel escape in `terminal_leg_meet` catches the true collinear limit.
-/// Dropping the bound would widen regime 2 over that band and be better-conditioned
-/// there — but it would also be unfaithful to §7.5.1, so the bound stays and regime 1
-/// is owed.
+/// The bound is what keeps regimes 2 and 3 reachable only on the bands they describe:
+/// without it, `< SMALL_ANG` would swallow the whole near-collinear band into regime 2,
+/// and the `> π − EPS_ANG` band would reach regime 3's `edge_out × leg_out` — the short,
+/// direction-unstable cross product regime 2 already exists to avoid.
 const TERMINAL_DIRECTION_EPS_ANGLE: f32 = 0.034_906_6;
 
 /// §7.5.1 `SMALL_ANG` — the shallow/ordinary threshold (10°, in radians) on the
