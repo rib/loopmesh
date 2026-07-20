@@ -6247,10 +6247,15 @@ impl LoopMesh {
     /// flanking unbeveled `leg` (carrying offset 0), both lines built from a
     /// **local edge-cross normal** (`leg × edge`, sign-fixed by `surface_normal`),
     /// **not** an adjacent face's plane normal. The two lines are generally skew at
-    /// a non-planar terminal, so the meet is their closest-points midpoint
-    /// (`intersect_lines`), then the §7.5.2 zero-offset span clamp anchors it to the
-    /// real leg. Reduces exactly to the §7.3 perpendicular slide on a planar, square
-    /// terminal, where the edge-cross normal coincides with the face normal.
+    /// a non-planar terminal, and §7.5.1 resolves that pair at the closest-approach
+    /// point on the **first** line — the pair's disk predecessor (`closest_approach`) —
+    /// never at the midpoint of the two. So one of the endpoint's two strip verts rides
+    /// its own leg's line and the other rides `E`'s offset line. The §7.5.2 span clamp
+    /// then bounds the meet's *along-leg projection* to `[0, 1]`, snapping an out-of-span
+    /// meet bodily onto the nearer end of the leg segment — lateral component and all,
+    /// so a clamped after-`E` vert leaves `E`'s offset line entirely. Reduces exactly to
+    /// the §7.3 perpendicular slide on a planar, square terminal, where the edge-cross
+    /// normal coincides with the face normal.
     ///
     /// `face` is `E`'s radial face on this leg's side — the **sector face**, whose own
     /// plane normal is the §7.5.1 orientation reference that sign-fixes the edge-cross
@@ -6311,8 +6316,12 @@ impl LoopMesh {
 
     /// §7.5.2 zero-offset span clamp: the unbeveled leg carries offset 0, so its
     /// offset line is the leg itself and the meet can land past the leg's far
-    /// endpoint. Snap any such out-of-span meet back to the nearer endpoint of the
-    /// leg's segment (`vertex` … leg's other end).
+    /// endpoint. The test is on the meet's **along-leg projection**, not on
+    /// containment — only one of the endpoint's two strip verts lands on the leg at
+    /// all, and the projection is the same number for either end of the
+    /// closest-approach segment. Out of `[0, 1]`, the meet is snapped bodily onto the
+    /// nearer endpoint of the leg's segment (`vertex` … leg's other end), lateral
+    /// component discarded.
     fn clamp_zero_offset_terminal(&self, meet: Vec3, vertex: VertexKey, leg: EdgeKey) -> Vec3 {
         let [a, b] = self.edge_vert_keys(leg);
         let far = if a == vertex { b } else { a };
@@ -10733,42 +10742,66 @@ fn orient_normal(candidate: Vec3, reference: Vec3) -> Vec3 {
     }
 }
 
+/// The closest-approach **pair** of two lines: one point on each, in the order the
+/// lines were passed. `None` when the pair is (anti)parallel and no unique pair exists.
+///
+/// Callers pick which of the two they want; there is no project-wide convention.
+/// §7.5.1's terminal leg meet takes the point on the *first* line, §7.6.2's face-drop
+/// path takes the midpoint (see `intersect_lines`).
+///
+/// Both directions are taken as given, so `LINE_PARALLEL_TOLERANCE` is compared against
+/// a determinant that scales with `|first|²·|second|²`. `line_line_nearest_on_first`
+/// wraps this with unit directions, which makes the same tolerance a bound on `sin θ`.
+fn closest_approach(first: &Line, second: &Line) -> Option<(Vec3, Vec3)> {
+    let first_direction = first.direction;
+    let second_direction = second.direction;
+    let base_separation = first.point - second.point;
+    let first_length_squared = first_direction.dot(first_direction);
+    let direction_alignment = first_direction.dot(second_direction);
+    let second_length_squared = second_direction.dot(second_direction);
+    let first_projection = first_direction.dot(base_separation);
+    let second_projection = second_direction.dot(base_separation);
+    let denominator =
+        first_length_squared * second_length_squared - direction_alignment * direction_alignment;
+    if denominator.abs() <= LINE_PARALLEL_TOLERANCE {
+        return None;
+    }
+    let first_parameter = (direction_alignment * second_projection
+        - second_length_squared * first_projection)
+        / denominator;
+    let second_parameter = (first_length_squared * second_projection
+        - direction_alignment * first_projection)
+        / denominator;
+    Some((
+        first.point + first_direction * first_parameter,
+        second.point + second_direction * second_parameter,
+    ))
+}
+
 /// Intersect two lines in 3-D by closest approach (BEVEL.md §7.6.2). Returns the
 /// crossing point when they meet, `Collinear` when they coincide, and the
 /// closest-points midpoint when they are skew.
 fn intersect_lines(first: &Line, second: &Line) -> LineMeet {
-    let d1 = first.direction;
-    let d2 = second.direction;
-    let r = first.point - second.point;
-    let a = d1.dot(d1);
-    let b = d1.dot(d2);
-    let c = d2.dot(d2);
-    let d = d1.dot(r);
-    let e = d2.dot(r);
-    let denominator = a * c - b * b;
-
-    if denominator.abs() <= LINE_PARALLEL_TOLERANCE {
+    let Some((closest_first, closest_second)) = closest_approach(first, second) else {
         // Parallel lines: distinguish coincident (the offset between the two base
         // points lies along the shared direction) from a true parallel pair. The
         // parallel-pair case is reached as a fallback only — the §7.6.2 ladder
         // normally diverts near-parallel edges before the line solve.
-        let along = if a > f32::EPSILON {
-            r - d1 * (d1.dot(r) / a)
+        let direction = first.direction;
+        let base_separation = first.point - second.point;
+        let length_squared = direction.dot(direction);
+        let across = if length_squared > f32::EPSILON {
+            base_separation - direction * (direction.dot(base_separation) / length_squared)
         } else {
-            r
+            base_separation
         };
-        if along.length() <= LINE_COINCIDENT_TOLERANCE {
+        if across.length() <= LINE_COINCIDENT_TOLERANCE {
             return LineMeet::Collinear;
         }
         // Treat a genuine parallel pair as skew with the midpoint of the two base
         // points; the drop step recovers a surface point if one is in-wedge.
         return LineMeet::Skew((first.point + second.point) * 0.5);
-    }
-
-    let t = (b * e - c * d) / denominator;
-    let s = (a * e - b * d) / denominator;
-    let closest_first = first.point + d1 * t;
-    let closest_second = second.point + d2 * s;
+    };
     let gap = closest_first - closest_second;
     if gap.length() <= LINE_COINCIDENT_TOLERANCE {
         LineMeet::Crossing((closest_first + closest_second) * 0.5)
@@ -13702,7 +13735,7 @@ mod tests {
         }
 
         // (2) The §7.5.1 leg-meet targets at the `v0` corner, derived by hand from
-        // the edge-cross local normal + closest-points meet (see the scratch
+        // the edge-cross local normal + §7.5.1's skew resolution (see the scratch
         // prototype): these are measurably off the §7.3 in-face slide, which would
         // keep `x = 0` (the slide stays in each face's plane through `v0`).
         let leg_meet_one = Vec3::new(0.05957, 0.29786, 0.03574);
@@ -30431,10 +30464,46 @@ mod tests {
 
     /// An independent transcription of §7.5.1's offset-line meet for a **given** plane
     /// normal: push `E`'s line sideways by `offset` square to `E`, intersect it with the
-    /// zero-offset leg's own line, and resolve a skew pair at the midpoint of their
-    /// closest approach. The regime dispatch is *not* transcribed — the whole point is
+    /// zero-offset leg's own line, and resolve a skew pair at the closest-approach point
+    /// on the **first** line (the disk predecessor: the leg when `leg_precedes_edge`,
+    /// else `E`). The regime dispatch is *not* transcribed — the whole point is
     /// to compare each regime's claimed normal against the placement it must produce.
     fn leg_meet_oracle(
+        endpoint: Vec3,
+        edge_out: Vec3,
+        leg_out: Vec3,
+        leg_precedes_edge: bool,
+        plane_normal: Vec3,
+        offset: f32,
+    ) -> Vec3 {
+        let mut edge_perp = edge_out.cross(plane_normal).normalize();
+        if !leg_precedes_edge {
+            edge_perp = -edge_perp;
+        }
+        let edge_base = endpoint + edge_perp * offset;
+        let separation = edge_base - endpoint;
+        let along_edge = edge_out.dot(edge_out);
+        let cross_term = edge_out.dot(leg_out);
+        let along_leg = leg_out.dot(leg_out);
+        let edge_projection = edge_out.dot(separation);
+        let leg_projection = leg_out.dot(separation);
+        let denominator = along_edge * along_leg - cross_term * cross_term;
+        let edge_parameter =
+            (cross_term * leg_projection - along_leg * edge_projection) / denominator;
+        let leg_parameter =
+            (along_edge * leg_projection - cross_term * edge_projection) / denominator;
+        let on_edge_line = edge_base + edge_out * edge_parameter;
+        let on_leg_line = endpoint + leg_out * leg_parameter;
+        if leg_precedes_edge {
+            on_leg_line
+        } else {
+            on_edge_line
+        }
+    }
+
+    /// The retracted rule, kept only so the tests below can show they discriminate
+    /// against it: the midpoint of the two closest-approach points.
+    fn leg_meet_midpoint_oracle(
         endpoint: Vec3,
         edge_out: Vec3,
         leg_out: Vec3,
@@ -30664,6 +30733,289 @@ mod tests {
                  {expect_shallow}, got {placement:?} vs {expected:?}",
             );
         }
+    }
+
+    fn distance_from_line(point: Vec3, base: Vec3, direction: Vec3) -> f32 {
+        let unit = direction.normalize();
+        let offset_from_base = point - base;
+        (offset_from_base - unit * offset_from_base.dot(unit)).length()
+    }
+
+    /// §7.5.1's skew resolution: the meet is the closest-approach point on the **first**
+    /// line — the pair's disk predecessor — and *not* the midpoint of the closest pair.
+    ///
+    /// The consequence is an asymmetry, and it is the whole content of this test: with
+    /// the leg first the meet rides the **leg's own line**; with `E` first it rides
+    /// **`E`'s offset line**, exactly `offset` off `E`. Regime 2 is the only branch that
+    /// can make the two lines skew at all, so the frame is shallow and non-planar.
+    #[test]
+    fn terminal_leg_meet_skew_pair_takes_the_closest_point_on_the_first_line() {
+        let offset = 0.1;
+        let (endpoint, edge_out, leg_out, sector_normal) = shallow_terminal_frame(8.0);
+
+        let leg_first = terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_out,
+            leg_out,
+            leg_precedes_edge: true,
+            sector_plane: SectorPlane::Face(sector_normal),
+            offset,
+        });
+        let edge_first = terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_out,
+            leg_out,
+            leg_precedes_edge: false,
+            sector_plane: SectorPlane::Face(sector_normal),
+            offset,
+        });
+
+        // The frame must genuinely produce a skew pair, or nothing below discriminates.
+        let midpoint = leg_meet_midpoint_oracle(
+            endpoint,
+            edge_out,
+            leg_out,
+            true,
+            sector_normal,
+            offset,
+        );
+        assert!(
+            (leg_first - midpoint).length() > 1.0e-3,
+            "the frame must make the two lines skew: first-line point and midpoint \
+             coincide at {leg_first:?}",
+        );
+
+        assert!(
+            distance_from_line(leg_first, endpoint, leg_out) < 1.0e-5,
+            "leg-first meet must land on the leg's own line, it is {} off",
+            distance_from_line(leg_first, endpoint, leg_out),
+        );
+        assert!(
+            (distance_from_line(edge_first, endpoint, edge_out) - offset).abs() < 1.0e-5,
+            "edge-first meet must land on `E`'s offset line, it is {} from `E`",
+            distance_from_line(edge_first, endpoint, edge_out),
+        );
+        assert!(
+            distance_from_line(edge_first, endpoint, leg_out) > 1.0e-3,
+            "edge-first meet must NOT also sit on the leg's line — that is the \
+             symmetrisation §7.5.1 forbids",
+        );
+    }
+
+    /// §7.5.2's along-leg projection: `s_leg` is the same number whichever of the two
+    /// closest-approach points it is measured from, because the segment joining them is
+    /// perpendicular to both line directions and so to `leg_vec` in particular. This is
+    /// the property that lets the clamp be stated once for both strip verts. No clamp is
+    /// invoked here — this pins the projection's pair-independence on its own, which is
+    /// also a check on `closest_approach` returning a genuinely mutual pair.
+    #[test]
+    fn terminal_along_leg_projection_is_pair_independent() {
+        let offset = 0.1;
+        let (endpoint, edge_out, leg_out, sector_normal) = shallow_terminal_frame(8.0);
+        let leg_vec = leg_out; // unit, so the projection is a distance along the leg
+
+        let on_leg_line = terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_out,
+            leg_out,
+            leg_precedes_edge: true,
+            sector_plane: SectorPlane::Face(sector_normal),
+            offset,
+        });
+        // The *sibling* of `on_leg_line`: the other end of the same closest-approach
+        // segment, on the same pair of lines (same offset-push sign).
+        let sibling = {
+            let edge_perp = edge_out.cross(sector_normal).normalize();
+            let edge_base = endpoint + edge_perp * offset;
+            let line_edge = Line {
+                point: edge_base,
+                direction: edge_out,
+            };
+            let line_leg = Line {
+                point: endpoint,
+                direction: leg_out,
+            };
+            closest_approach(&line_edge, &line_leg).expect("skew pair").0
+        };
+
+        let projection = |point: Vec3| (point - endpoint).dot(leg_vec);
+        assert!(
+            (projection(on_leg_line) - projection(sibling)).abs() < 1.0e-4,
+            "s_leg must be pair-independent: {} vs {}",
+            projection(on_leg_line),
+            projection(sibling),
+        );
+        assert!(
+            (on_leg_line - sibling).length() > 1.0e-3,
+            "the two closest points must actually differ, or the check is vacuous",
+        );
+    }
+
+    /// A terminal whose **both** sectors are shallow (regime 2) and non-planar, so both
+    /// strip verts are placed from a genuinely skew line pair. `E` runs out along `+x`;
+    /// the two legs turn ~8° off straight-through and are tilted out of the `z = 0` plane
+    /// in opposite senses. Returns the mesh, the beveled edge, and the two legs' far
+    /// vertices.
+    fn skew_terminal_quad_pair() -> (LoopMesh, EdgeKey, [VertexKey; 2]) {
+        let mut mesh = LoopMesh::new();
+        let near = mesh.create_vertex(Vec3::ZERO);
+        let far = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let left_leg_end = mesh.create_vertex(Vec3::new(-0.99046, 0.09744, 0.09744));
+        let right_leg_end = mesh.create_vertex(Vec3::new(-0.99046, -0.09744, -0.09744));
+        let left_far = mesh.create_vertex(Vec3::new(1.3, 1.0, 0.6));
+        let right_far = mesh.create_vertex(Vec3::new(1.3, -1.0, -0.6));
+
+        let mut edge = |mesh: &mut LoopMesh, a: VertexKey, b: VertexKey| {
+            mesh.create_edge([a, b], EdgeCreateFlags::NONE)
+        };
+        let beveled = edge(&mut mesh, near, far);
+        let left_ring = [
+            beveled,
+            edge(&mut mesh, far, left_far),
+            edge(&mut mesh, left_far, left_leg_end),
+            edge(&mut mesh, left_leg_end, near),
+        ];
+        mesh.face_create(
+            &[near, far, left_far, left_leg_end],
+            &left_ring,
+            FaceCreateFlags::NONE,
+        );
+        let right_ring = [
+            edge(&mut mesh, near, right_leg_end),
+            edge(&mut mesh, right_leg_end, right_far),
+            edge(&mut mesh, right_far, far),
+            beveled,
+        ];
+        mesh.face_create(
+            &[near, right_leg_end, right_far, far],
+            &right_ring,
+            FaceCreateFlags::NONE,
+        );
+        (mesh, beveled, [left_leg_end, right_leg_end])
+    }
+
+    /// §7.5.1's asymmetry, driven through the whole operator: at a non-planar terminal
+    /// the strip vert **before** `E` in rotational order rides its own leg's line, while
+    /// the one **after** `E` rides `E`'s **offset** line — `offset` away from `E`, and
+    /// off its leg entirely.
+    ///
+    /// The two are matched assignment-free: of the two near-end strip verts exactly one
+    /// must sit on a leg, and the other must sit exactly `offset` from `E`. A test that
+    /// only sampled the along-leg station could not see this — both verts share the
+    /// station; it is the lateral component that discriminates.
+    #[test]
+    fn edge_bevel_skew_terminal_strip_verts_ride_different_lines() {
+        let offset = 0.1;
+        let (mut mesh, beveled, legs) = skew_terminal_quad_pair();
+        let [near, far] = mesh.edge_vert_keys(beveled);
+        let near_position = mesh.vertex_position(near);
+        let far_position = mesh.vertex_position(far);
+        let edge_out = (far_position - near_position).normalize();
+        let leg_directions =
+            legs.map(|leg_end| (mesh.vertex_position(leg_end) - near_position).normalize());
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let mut on_a_leg = 0;
+        let mut on_the_offset_line = 0;
+        let mut seen = 0;
+        for &vert in &result.verts {
+            let position = mesh.vertex_position(vert);
+            if (position - near_position).length() > (position - far_position).length() {
+                continue;
+            }
+            seen += 1;
+            let leg_gap = leg_directions
+                .iter()
+                .map(|&leg_out| distance_from_line(position, near_position, leg_out))
+                .fold(f32::INFINITY, f32::min);
+            let edge_gap = distance_from_line(position, near_position, edge_out);
+            // Every strip vert must be on exactly one of the two lines, never both.
+            let rides_a_leg = leg_gap < 1.0e-4;
+            let rides_the_offset_line = (edge_gap - offset).abs() < 1.0e-4;
+            assert!(
+                rides_a_leg != rides_the_offset_line,
+                "strip vert {position:?} is {leg_gap} off its leg and {edge_gap} from \
+                 `E` (offset {offset}) — the two cases must be exclusive here, or the \
+                 asymmetry is unobservable on this fixture",
+            );
+            on_a_leg += usize::from(rides_a_leg);
+            on_the_offset_line += usize::from(rides_the_offset_line);
+        }
+
+        assert_eq!(seen, 2, "the terminal contributes two strip verts");
+        assert_eq!(
+            (on_a_leg, on_the_offset_line),
+            (1, 1),
+            "§7.5.1: exactly one strip vert rides its leg and exactly one rides `E`'s \
+             offset line — symmetrising puts both on the same kind of line",
+        );
+    }
+
+    /// §7.5.2 property (3): once the along-leg projection leaves `[0, 1]` the snap is
+    /// **bodily onto the leg's endpoint**, lateral component and all. So past the flip
+    /// *both* strip verts sit exactly on their own leg's far vertex — including the
+    /// after-`E` one, which thereby leaves `E`'s offset line entirely. "Lands `offset`
+    /// from `E`" is a property of the unclamped meet only.
+    #[test]
+    fn edge_bevel_skew_terminal_span_clamp_snaps_both_verts_onto_their_legs() {
+        let offset = 0.5; // well past the flip: `s_leg` crosses 1 an order sooner
+        let (mut mesh, beveled, legs) = skew_terminal_quad_pair();
+        let [near, far] = mesh.edge_vert_keys(beveled);
+        let near_position = mesh.vertex_position(near);
+        let far_position = mesh.vertex_position(far);
+        let leg_ends = legs.map(|leg_end| mesh.vertex_position(leg_end));
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The clamp is per sector, so the two near-end strip verts must land on the two
+        // *distinct* leg ends — one each. Folding a `min` over both would pass a bug that
+        // snapped both verts onto the same leg.
+        assert!(
+            (leg_ends[0] - leg_ends[1]).length() > 1.0e-2,
+            "the two leg ends must be distinct, or the pairing check is vacuous",
+        );
+        let mut claimed = [false; 2];
+        let mut matched = 0;
+        for &vert in &result.verts {
+            let position = mesh.vertex_position(vert);
+            if (position - near_position).length() > (position - far_position).length() {
+                continue;
+            }
+            let landed_on = leg_ends
+                .iter()
+                .position(|&leg_end| (position - leg_end).length() < 1.0e-4);
+            let Some(index) = landed_on else {
+                panic!(
+                    "a clamped terminal strip vert must land ON a leg's far vertex, it is \
+                     at {position:?}, legs at {leg_ends:?}",
+                );
+            };
+            assert!(
+                !claimed[index],
+                "both strip verts snapped onto leg {index} — §7.5.2 clamps each vert \
+                 against its OWN adjacent leg",
+            );
+            claimed[index] = true;
+            matched += 1;
+        }
+        assert_eq!(matched, 2);
     }
 
     /// The §7.5.1 shallow regime driven through the whole operator: two non-planar quads
@@ -31106,8 +31458,13 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
     }
 
     // Offset line for `E` (base pushed sideways by `offset`) against the leg's own line
-    // (offset 0 ⇒ base on the endpoint). They generally pass skew at a non-planar
-    // terminal; take the closest-points midpoint.
+    // (offset 0 ⇒ base on the endpoint). At a non-planar terminal the two generally pass
+    // skew, and §7.5.1's resolution is to take the closest-approach point on the
+    // **first** line — the pair's disk predecessor — never the midpoint of the pair.
+    //
+    // So the two terminal strip verts are asymmetric by construction: with the leg first
+    // the meet rides the leg's own line, while with `E` first it rides `E`'s offset line,
+    // laterally `offset` from the leg. Symmetrising this matches on one vert of the two.
     let line_edge = Line {
         point: endpoint + edge_perp * offset,
         direction: edge_out,
@@ -31116,9 +31473,19 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> Vec3 {
         point: endpoint,
         direction: leg_out,
     };
-    match intersect_lines(&line_edge, &line_leg) {
-        LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
-        LineMeet::Collinear => line_leg.point,
+    let (line_first, line_second) = if leg_precedes_edge {
+        (&line_leg, &line_edge)
+    } else {
+        (&line_edge, &line_leg)
+    };
+    match closest_approach(line_first, line_second) {
+        Some((on_first, _)) => on_first,
+        // The pair came out (anti)parallel below the direction-angle band that the
+        // `edge_out × leg_out` escape above catches, so there is no first-line point to
+        // take. This band is regime 1's (see `TERMINAL_DIRECTION_EPS_ANGLE`, still owed);
+        // until it lands, stand in with the midpoint of the two lines' base points, which
+        // at least keeps the strip vert off the endpoint that the close is about to kill.
+        None => (line_first.point + line_second.point) * 0.5,
     }
 }
 
@@ -31912,24 +32279,34 @@ fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
 
 /// The point on the first line (`p0 + t·d0`) nearest the second line
 /// (`p1 + s·d1`) — the first-line foot of the mutual closest-approach pair
-/// (BEVEL.md §8.2.2.1 `mid` solve). `None` when the lines are parallel.
-fn line_line_nearest_on_first(p0: Vec3, d0: Vec3, p1: Vec3, d1: Vec3) -> Option<Vec3> {
-    let d0n = d0.normalize_or_zero();
-    if d0n.length_squared() <= f32::EPSILON || d1.length_squared() <= f32::EPSILON {
+/// (BEVEL.md §8.2.2.1 `mid` solve). `None` when either direction is degenerate or the
+/// lines are parallel.
+///
+/// The single solve lives in `closest_approach`; this is the point-and-direction spelling
+/// of it, with both directions unitised first so that `LINE_PARALLEL_TOLERANCE` reads as a
+/// bound on `sin²θ` independent of the inputs' lengths.
+fn line_line_nearest_on_first(
+    first_point: Vec3,
+    first_direction: Vec3,
+    second_point: Vec3,
+    second_direction: Vec3,
+) -> Option<Vec3> {
+    let first_unit = first_direction.normalize_or_zero();
+    let second_unit = second_direction.normalize_or_zero();
+    if first_unit == Vec3::ZERO || second_unit == Vec3::ZERO {
         return None;
     }
-    let r = p0 - p1;
-    let a = d0n.dot(d0n);
-    let b = d0n.dot(d1);
-    let c = d1.dot(d1);
-    let d = d0n.dot(r);
-    let e = d1.dot(r);
-    let denominator = a * c - b * b;
-    if denominator.abs() <= 1.0e-9 {
-        return None;
-    }
-    let t = (b * e - c * d) / denominator;
-    Some(p0 + d0n * t)
+    closest_approach(
+        &Line {
+            point: first_point,
+            direction: first_unit,
+        },
+        &Line {
+            point: second_point,
+            direction: second_unit,
+        },
+    )
+    .map(|(on_first, _)| on_first)
 }
 
 /// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
