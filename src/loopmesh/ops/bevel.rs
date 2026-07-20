@@ -6665,8 +6665,15 @@ impl LoopMesh {
             // Case 3: two different local planes. Each line's normal is taken from
             // the corner at its own end of the sector — the cross of that flanking
             // beveled edge's direction with the nearest in-between leg's direction,
-            // oriented by the adjacent face. The perpendicular is then oriented into
-            // the sector by the face centroid.
+            // oriented by the adjacent face (walk-sense). The perpendicular is then
+            // the pure §7.6.2 right-of-`g_k` / left-of-`g_(k+1)` rotation about that
+            // line's own walk-sense normal — `normal.cross(dir)` for the forward
+            // flank, `dir.cross(normal)` for the backward one. Because the normals
+            // are already walk-sense oriented, the cross pushes each line *into* the
+            // sector with a sign-consistent handedness at convex and reflex corners
+            // alike, with no face-centroid reference (a reflex face's centroid sits
+            // on the convex complement of the sector, so the centroid heuristic
+            // would sign the push backwards there).
             //
             // `g_k`'s leg is the disk edge *next* after it — which is the other edge of
             // `face_first` at `v`, not simply the sector's first recorded in-between
@@ -6694,10 +6701,8 @@ impl LoopMesh {
                 }
                 None => self.face_plane_normal(face_last),
             };
-            let perp_first =
-                self.into_face_perpendicular(dir_first, normal_first, face_first, vertex_position);
-            let perp_second =
-                self.into_face_perpendicular(dir_second, normal_second, face_last, vertex_position);
+            let perp_first = normal_first.cross(dir_first).normalize_or_zero();
+            let perp_second = dir_second.cross(normal_second).normalize_or_zero();
             (normal_first, normal_second, perp_first, perp_second)
         } else {
             // Cases 1 and 2: one shared sector plane. Its normal is the cross product
@@ -23931,6 +23936,124 @@ mod tests {
         assert!(
             point_in_wedge(leg_1, g_k, dir_to(drop_f1), normal_f1),
             "reversed pair measures the reflex wedge and mis-accepts F1",
+        );
+    }
+
+    /// BEVEL.md §7.6.2 case 3, reflex flanking face at the junction vertex, driven
+    /// through the **production path** (`vertex_corner_ring` → `sector_split` →
+    /// `sector_layout`) rather than a hand-built `Sector`. `v` is a boundary junction
+    /// whose forward flank `g_k` (`v→r`) bounds a concave arrowhead quad whose interior
+    /// angle at `v` is ~240° (reflex), while the far flank `g_(k+1)` (`v→b`) lifts out
+    /// of the arrowhead's plane so the shared leg is out-of-plane → the sector is
+    /// genuinely case 3. Because the barbs `r`/`leg` are far out and the notch tip is
+    /// close, the arrowhead's area **centroid sits inside the convex complement** of the
+    /// sector (below `v`, in the excluded down-cone between `g_k` and the leg). The old
+    /// case-3 construction oriented each perpendicular by that centroid and so pushed
+    /// `g_k`'s offset line *out* of the sector — a `2·offset`-scale error. The fix
+    /// (`normal_first × dir_first` on the walk-sense normal) pushes it in regardless of
+    /// convexity. This pins that with the production `point_in_wedge` predicate over the
+    /// sector's own reflex-face wedge: the fixed perpendicular lands **in** the wedge,
+    /// the centroid perpendicular lands **out**.
+    #[test]
+    fn case3_reflex_face_perp_pushes_into_sector() {
+        let mut mesh = LoopMesh::new();
+        // Arrowhead quad in z = 0 with `v` at the reflex notch: far barbs `r`, `leg`
+        // (120° apart, opening downward) and a close tip. The two edges at `v` are
+        // `v→r` (forward flank g_k) and `v→leg` (the in-between leg). Wound
+        // consistently with `face_last` across the shared leg edge (opposite traversal
+        // of `v↔leg`) so the disk walk's sense — and hence §7.6.2's perpendicular
+        // sign — is well defined.
+        let v = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let tip = mesh.create_vertex(Vec3::new(0.0, 0.5, 0.0));
+        let r = mesh.create_vertex(Vec3::new(3.46, -2.0, 0.0));
+        let leg = mesh.create_vertex(Vec3::new(-3.46, -2.0, 0.0));
+        // The far flank g_(k+1) lifts out of z = 0, so the shared leg is out-of-plane
+        // and the sector is case 3.
+        let b = mesh.create_vertex(Vec3::new(-2.5, 0.5, 1.2));
+
+        let reflex_face = mesh.face_create_verts(&[leg, v, r, tip], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, leg, b], FaceCreateFlags::NONE);
+
+        let edge_vr = mesh.query_edge_exists(v, r).expect("g_k edge");
+        let edge_vb = mesh.query_edge_exists(v, b).expect("g_(k+1) edge");
+        let v_pos = mesh.vertex_position(v);
+
+        // The real disk walk and sector split — not a hand-assembled `Sector`.
+        let corners = mesh.vertex_corner_ring(v);
+        let is_beveled = |edge: EdgeKey| edge == edge_vr || edge == edge_vb;
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| {
+                s.bounding_edges.len() == 2
+                    && s.bounding_edges.contains(&edge_vr)
+                    && s.bounding_edges.contains(&edge_vb)
+            })
+            .expect("the r↔b sector");
+        let layout = mesh
+            .sector_layout(v, v_pos, &sector)
+            .expect("case-3 sector layout");
+        assert!(layout.non_planar, "out-of-plane leg → case 3 sector");
+
+        // The walk enters `reflex_face` first (through `g_k = v→r`), so it is the first
+        // drop candidate; `perp_first` is the flank paired with it.
+        assert_eq!(
+            sector.bounding_edges[0], edge_vr,
+            "the reflex flank is the sector's forward flank",
+        );
+        let reflex_wedge = &layout.drop_candidates[0];
+
+        // The sector's forward face is genuinely reflex at `v`: the wedge swept from
+        // `g_k` to its next edge (the leg), about the walk-sense normal, exceeds π.
+        let swept = |from: Vec3, to: Vec3, normal: Vec3| -> f32 {
+            let angle = from.dot(to).clamp(-1.0, 1.0).acos();
+            if from.cross(to).dot(normal) < 0.0 {
+                std::f32::consts::TAU - angle
+            } else {
+                angle
+            }
+        };
+        let wedge_angle = swept(reflex_wedge.dir_walk, reflex_wedge.dir_next, reflex_wedge.normal);
+        assert!(
+            wedge_angle > std::f32::consts::PI,
+            "forward face is reflex at v (wedge {wedge_angle} rad > π)",
+        );
+
+        // The fix: `perp_first = normal_first × dir_first` lands **inside** the sector's
+        // reflex-face wedge — it pushes g_k's offset line into the sector.
+        assert!(
+            point_in_wedge(
+                reflex_wedge.dir_walk,
+                reflex_wedge.dir_next,
+                layout.perp_first,
+                reflex_wedge.normal,
+            ),
+            "the fixed perpendicular pushes g_k's offset INTO the sector wedge",
+        );
+
+        // The old case-3 heuristic oriented the perpendicular by the face centroid.
+        // That centroid sits in the convex complement (below `v`), so its perpendicular
+        // lands **outside** the wedge — the sign bug the fix corrects.
+        let centroid_perp = mesh.into_face_perpendicular(
+            layout.dir_first,
+            layout.normal_first,
+            reflex_face,
+            v_pos,
+        );
+        assert!(
+            !point_in_wedge(
+                reflex_wedge.dir_walk,
+                reflex_wedge.dir_next,
+                centroid_perp,
+                reflex_wedge.normal,
+            ),
+            "the centroid heuristic (old case-3) landed OUT of the sector wedge — the bug",
+        );
+
+        // Documenting the cause: the reflex face's centroid really is on the sector's
+        // convex complement — the half-plane on the far side of `g_k` from `perp_first`.
+        assert!(
+            (mesh.face_center_of_mass(reflex_face) - v_pos).dot(layout.perp_first) < 0.0,
+            "the reflex face's centroid sits on the sector's convex complement",
         );
     }
 
