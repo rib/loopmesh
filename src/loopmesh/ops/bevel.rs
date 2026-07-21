@@ -1730,6 +1730,10 @@ impl LoopMesh {
                 None,
                 options.material,
                 &sector_representatives,
+                // Vertex bevel: the centre column follows the grid — the next-boundvert
+                // rep (§6.6.2's grid row, vertex arm) — with no edge-bevel own-vs-tie-break
+                // exception. So the centre column reuses the sector reps.
+                &sector_representatives,
                 central_representative,
                 apex_blend.as_ref(),
                 Some(&interior_blend),
@@ -3278,12 +3282,6 @@ impl LoopMesh {
             }
         }
 
-        // §6.6.1: the fill's inherit source, registered while the junction still has its
-        // faces — the re-stitch consumes the vertex. Registered unconditionally, even
-        // though the CUTOFF fill (§6.6.1.3) never reads it: gating on `vmesh_method` would
-        // re-introduce a *conditional* donor capture — the bug class this bank exists to
-        // kill — to save one `usize` and one gathered value per layer per junction.
-        let representative = templates.register(self.vert_face_keys(vertex).first().copied());
         // §6.6.1: the odd-`segments` centre n-gon of the [V-ADJ] grid (§8.5) is the fourth
         // ring-spanning fill family — the tie-break reaches it at a seam-carrying junction
         // exactly as it reaches the cap, the patch and the terminal fill.
@@ -3295,6 +3293,46 @@ impl LoopMesh {
             templates.interp_components(),
         ));
 
+        // §6.6.2's [V-ADJ] grid row (edge bevel): each sector's non-centre faces inherit
+        // from that sector's **own** boundvert rep, and — at odd `segments` — its centre
+        // column takes the own rep or the §6.6.1.4 tie-break between this and the next
+        // boundvert's reps (`centre_column_donor`). Registered here against the pristine
+        // mesh; the vertex-mode grid rule (the next-boundvert rep) is the caller's, not
+        // this edge-junction path's.
+        //
+        // B_i **opens** sector `i` along `opening_edges[i]`, but the beveled edge it
+        // *starts* in the CCW ring walk (§6.6.1's "a boundvert that starts a beveled leg
+        // takes that leg's edge") is the sector's **closing** edge — `opening_edges[i + 1]`,
+        // the one B_i's chain departs across. Its `prev_face` is the original face filling
+        // sector `i`'s wedge (between `opening_edges[i]` and `opening_edges[i + 1]`), and the
+        // §5.2.4.2 `e_i` B_i slid along. Reading `opening_edges[i]` instead takes the
+        // *arriving* leg, whose `prev_face` is the previous sector's face — an off-by-one
+        // rotation of the donor across the ring.
+        let sector_count = boundverts.len();
+        let own_edges: Vec<EdgeKey> = (0..sector_count)
+            .map(|i| opening_edges[(i + 1) % sector_count])
+            .collect();
+        let sector_own_faces: Vec<Option<FaceKey>> = own_edges
+            .iter()
+            .map(|&edge| self.boundvert_representative(vertex, edge))
+            .collect();
+        let sector_representatives: Vec<FaceTemplate> = sector_own_faces
+            .iter()
+            .map(|&face| templates.register(face))
+            .collect();
+        let centre_column_representatives: Vec<FaceTemplate> = (0..sector_count)
+            .map(|i| {
+                let donor = self.centre_column_donor(
+                    own_edges[i],
+                    sector_own_faces[i],
+                    sector_own_faces[(i + 1) % sector_count],
+                    is_beveled(own_edges[i]),
+                    templates.interp_components(),
+                );
+                templates.register(donor)
+            })
+            .collect();
+
         // §8.5.1 / §7.6.6: the dihedral-band verdict must be read from the *original*
         // corner — its edges and faces are about to be consumed by the re-stitch — so it is
         // captured now and carried on the cut for the fill-time routing decision.
@@ -3305,8 +3343,9 @@ impl LoopMesh {
             boundverts,
             opening_edges,
             outward,
-            representative,
             central_representative,
+            sector_representatives,
+            centre_column_representatives,
             dihedral_band_ok,
             pipe_override,
         });
@@ -4632,7 +4671,11 @@ impl LoopMesh {
                 }
             };
 
-        let representative = templates.resolve(cut.representative);
+        let sector_representatives: Vec<FaceTemplateRef<'_>> = cut
+            .sector_representatives
+            .iter()
+            .map(|&template| templates.resolve(template))
+            .collect();
 
         // §8.5.2 closed-form apex. The affine `unit_to_corner` axis-map ((1,0,0)→B_0,
         // (0,1,0)→B_1, (0,0,1)→B_2, origin→v) sends the unit body-diagonal point to
@@ -4716,11 +4759,14 @@ impl LoopMesh {
                     quad.reverse();
                 }
             }
+            // §6.6.2's grid row: this `segments = 2` pinwheel quad is sub-patch `i`'s lone
+            // welded cell, so it takes sector `i`'s **own** boundvert rep — not one
+            // corner-wide donor. Even `segments` has no centre column to re-scope.
             let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
             self.assign_bevel_face_attributes(
                 face,
                 material,
-                representative,
+                sector_representatives[i],
                 BevelNewFaceKind::Cap,
             );
             result.faces.push(face);
@@ -5741,6 +5787,10 @@ impl LoopMesh {
             raw_coarse_mids,
             material,
             &sector_representatives,
+            // The miter ring's per-sector centre-column scoping (§8.9.3 / §6.6.2, a
+            // miter-split boundvert's tie-break) is not yet distilled onto this path, so
+            // the centre column keeps the sector's positional donor.
+            &sector_representatives,
             central_representative,
             // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
             // leave the welded apex and the chain-interior verts at their §5.2.4 minted
@@ -5773,6 +5823,7 @@ impl LoopMesh {
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
         sector_representatives: &[FaceTemplateRef<'_>],
+        centre_column_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
@@ -5782,7 +5833,11 @@ impl LoopMesh {
         let seg = segments as usize;
         let half = seg / 2;
         let even = seg % 2 == 0;
-        if sectors < 3 || profiles.len() != sectors || sector_representatives.len() != sectors {
+        if sectors < 3
+            || profiles.len() != sectors
+            || sector_representatives.len() != sectors
+            || centre_column_representatives.len() != sectors
+        {
             return;
         }
         for chain in chain_of {
@@ -5857,6 +5912,7 @@ impl LoopMesh {
                 },
                 material,
                 sector_representatives,
+                centre_column_representatives,
                 central_representative,
                 apex_blend,
                 interior_blend,
@@ -5900,6 +5956,7 @@ impl LoopMesh {
             },
             material,
             sector_representatives,
+            centre_column_representatives,
             central_representative,
             apex_blend,
             interior_blend,
@@ -6033,8 +6090,8 @@ impl LoopMesh {
         let net = adj_relaxed_net(&unit_boundverts, &mids, centre, &profiles, segments);
         let axis = adj_interior_axis(&profiles, segments, 2 * net.half as u32);
 
-        let representative = templates.resolve(cut.representative);
-        let sector_representatives = vec![representative; sectors];
+        let sector_representatives = cut.resolve_sector_representatives(templates);
+        let centre_column_representatives = cut.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(cut.central_representative);
         self.emit_adj_grid(
             sectors,
@@ -6052,6 +6109,7 @@ impl LoopMesh {
             },
             material,
             &sector_representatives,
+            &centre_column_representatives,
             central_representative,
             // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; the edge-mode octant fill's
             // apex and interior are the isomorphism-invariant closed forms of §8.5.5.5(f.2).
@@ -6154,8 +6212,8 @@ impl LoopMesh {
         // relaxation. Every other filled profile (the circular default) keeps the
         // tabulated fullness seed and relaxes.
         let flat = profile_to_exponent(profile) == 1.0;
-        let representative = templates.resolve(cut.representative);
-        let sector_representatives = vec![representative; chain_of.len()];
+        let sector_representatives = cut.resolve_sector_representatives(templates);
+        let centre_column_representatives = cut.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(cut.central_representative);
         self.emit_general_adj_fill(
             cut.vertex,
@@ -6167,6 +6225,7 @@ impl LoopMesh {
             None,
             material,
             &sector_representatives,
+            &centre_column_representatives,
             central_representative,
             // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
             // leave the welded apex and the chain-interior verts at their §5.2.4 minted
@@ -6194,6 +6253,7 @@ impl LoopMesh {
         interior: &AdjInterior<'_>,
         material: i32,
         sector_representatives: &[FaceTemplateRef<'_>],
+        centre_column_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
@@ -6203,6 +6263,11 @@ impl LoopMesh {
             sector_representatives.len(),
             sectors,
             "one representative per sector — §6.6.1's per-sector grid rule",
+        );
+        debug_assert_eq!(
+            centre_column_representatives.len(),
+            sectors,
+            "one centre-column donor per sector — §6.6.2's odd-`segments` grid row",
         );
         let anchor = interior.anchor();
         let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
@@ -6283,7 +6348,11 @@ impl LoopMesh {
         // Odd centre (§8.5.5.5(e)): bridge each pair of adjacent sub-patches with a
         // strip of `half` quads — sub-patch `i`'s inner column (`k = half`) against
         // sub-patch `(i+1)`'s inner row (`j = half`) — covering the chains' central
-        // segments, then close the `G_i` ring with one central `s`-gon face.
+        // segments, then close the `G_i` ring with one central `s`-gon face. This bridge
+        // strip is the sector's **centre column** — the `k == segments/2` run that meets
+        // the centre n-gon (BEVEL.md §6.6.2 / §8.5) — so it carries the centre-column
+        // donor, not the sector's non-centre grid donor. (For vertex bevel the two donors
+        // coincide: both are the next-boundvert rep the caller supplies.)
         for i in 0..sectors {
             let next = (i + 1) % sectors;
             let mut column: Vec<VertexKey> = Vec::with_capacity(half + 1);
@@ -6303,7 +6372,7 @@ impl LoopMesh {
                     &[column[r], row[r], row[r + 1], column[r + 1]],
                     anchor,
                     material,
-                    sector_representatives[i],
+                    centre_column_representatives[i],
                     result,
                 );
             }
@@ -10049,6 +10118,46 @@ impl LoopMesh {
         self.donor_tie_break(&candidates, components).or(near_face)
     }
 
+    /// The stage-1 donor of an edge-bevel [V-ADJ] sector's **centre column** — the run of
+    /// grid faces at `k == segments/2` that meets the centre n-gon, which at odd `segments`
+    /// is the bridge strip between two sub-patches and at even `segments` does not exist
+    /// (BEVEL.md §6.6.2's [V-ADJ] grid row, §8.5).
+    ///
+    /// Two regimes, keyed on the sector's boundvert:
+    ///
+    /// - The boundvert **has a beveled edge that is not an interpolation seam** — the
+    ///   sector's **own** rep, exactly as every non-centre grid face of the sector takes.
+    /// - Otherwise — an unbeveled leg (§6.7.4 / §7.5), a miter-split boundvert (§8.9, which
+    ///   has no beveled edge of its own), or a **seamed** beveled edge — the §6.6.1.4
+    ///   tie-break over a candidate set that is just the sector's own and the **next**
+    ///   boundvert's reps, applied once. No fan anchor enters either way.
+    ///
+    /// The edge-level seam form of [`edge_is_interp_seam`](Self::edge_is_interp_seam) is the
+    /// one this keys on, as against the corner-level "any incident leg" form the
+    /// ring-spanning fills use. `components` leads key 1 of the tie-break exactly as it does
+    /// for the strip's straddle quad.
+    fn centre_column_donor(
+        &self,
+        edge: EdgeKey,
+        own_face: Option<FaceKey>,
+        next_face: Option<FaceKey>,
+        is_beveled: bool,
+        components: Option<&InterpComponents>,
+    ) -> Option<FaceKey> {
+        if is_beveled && !self.edge_is_interp_seam(edge) {
+            return own_face;
+        }
+
+        let mut candidates: Vec<FaceKey> = Vec::with_capacity(2);
+        for face in [own_face, next_face].into_iter().flatten() {
+            if !candidates.contains(&face) {
+                candidates.push(face);
+            }
+        }
+
+        self.donor_tie_break(&candidates, components).or(own_face)
+    }
+
     /// The **edge-level** form of BEVEL.md §6.6.1.4's interpolation-seam test: is `edge`
     /// itself a seam? This is what the strip's centre quad keys on, as against the
     /// corner-level "any incident leg is a seam" form of the ring-spanning fills. It is not
@@ -11697,17 +11806,24 @@ struct JunctionCut {
     /// spans, for the §6.7.5.3 multi-segment seam / sharp bridging.
     opening_edges: Vec<EdgeKey>,
     outward: Vec3,
-    /// The stage-1 inherit donor for this junction's new fill faces (BEVEL.md §6.6.1,
-    /// read at every value of `material`): the whole per-face block of a face incident to
-    /// the junction vertex, captured while the ring is placed — the vertex is consumed by
-    /// the re-stitch, so by fill time it names no adjacent face at all.
-    representative: FaceTemplate,
     /// The donor of the **odd-`segments` centre n-gon** alone (BEVEL.md §8.5.5.5(e)). That
     /// one face of the grid is a **ring-spanning** fill — its corners are the whole
     /// boundvert ring — so §6.6.1 pins it to the ring's first boundvert's rep, displaced by
     /// §6.6.1.4's tie-break at a seam-carrying corner. Every other grid face is per-sector
-    /// and keeps `representative`.
+    /// and keeps `sector_representatives`.
     central_representative: FaceTemplate,
+    /// Per sector `i` (disk order, `boundverts[i]`'s), the [V-ADJ] grid donor for that
+    /// sector's non-centre faces (BEVEL.md §6.6.2's grid row, edge bevel): the sector's
+    /// **own** boundvert rep, `boundvert_representative` of `opening_edges[i]`. Registered
+    /// against the pristine mesh alongside the ring-spanning donors, so it survives the
+    /// re-stitch that consumes the junction vertex.
+    sector_representatives: Vec<FaceTemplate>,
+    /// Per sector `i`, the donor of that sector's **centre column** at odd `segments` (the
+    /// bridge strip meeting the centre n-gon, BEVEL.md §6.6.2 / §8.5): the sector's own rep
+    /// when `opening_edges[i]` is a non-seam beveled edge, else the §6.6.1.4 tie-break
+    /// between this and the next boundvert's reps. Unread at even `segments` (no centre
+    /// column) and under vertex bevel (the caller supplies its own next-boundvert reps).
+    centre_column_representatives: Vec<FaceTemplate>,
     /// Whether the original corner cleared the §8.5.1 **dihedral-band** gate (BEVEL.md
     /// §8.5.1 / §7.6.6): three boundverts, a per-edge signed-dihedral band (no edge folded
     /// past `3·π/4`, exactly `edgecount − 3` near-flat, signed sum within `π/4` of `3·π/2`).
@@ -11728,6 +11844,30 @@ struct JunctionCut {
 }
 
 impl JunctionCut {
+    /// Resolve the per-sector [V-ADJ] grid donors (BEVEL.md §6.6.2's grid row) against the
+    /// sealed template bank — one per sector, in `boundverts` / `chain_of` order.
+    fn resolve_sector_representatives<'a>(
+        &self,
+        templates: &'a TemplateBank,
+    ) -> Vec<FaceTemplateRef<'a>> {
+        self.sector_representatives
+            .iter()
+            .map(|&template| templates.resolve(template))
+            .collect()
+    }
+
+    /// Resolve the per-sector odd-`segments` centre-column donors (BEVEL.md §6.6.2 / §8.5)
+    /// against the sealed bank. Unread at even `segments` (no centre column).
+    fn resolve_centre_column_representatives<'a>(
+        &self,
+        templates: &'a TemplateBank,
+    ) -> Vec<FaceTemplateRef<'a>> {
+        self.centre_column_representatives
+            .iter()
+            .map(|&template| templates.resolve(template))
+            .collect()
+    }
+
     /// The junction's outermost ring as the §6.7.5.3 walk's chain sequence. Every
     /// sector carries exactly one boundvert here (no miter splits it), so every ring
     /// chain crosses a beveled edge and the walk's count and its steps stay in
@@ -20643,6 +20783,289 @@ mod tests {
         (mesh, result)
     }
 
+    /// Paint the three faces meeting cube corner `(1,-1,-1)` with distinct material
+    /// slots (Front=1, Left=2, Bottom=3) so each of the corner's three beveled legs is
+    /// genuinely two-material and each sector's **own** boundvert rep is observable in
+    /// the fill (BEVEL.md §6.6.2's [V-ADJ] grid row). Returns the corner and the three
+    /// beveled-leg edges, plus the per-leg **own-rep material** (`boundvert_representative`
+    /// read on the pristine mesh, exactly as the fill's donor capture does).
+    fn two_material_corner0_fan(
+        mesh: &mut LoopMesh,
+    ) -> (VertexKey, [EdgeKey; 3], [i32; 3]) {
+        let v0 = vert_at(mesh, Vec3::new(1.0, -1.0, -1.0));
+        let mut slot = 1;
+        for face in mesh.face_keys() {
+            if mesh.face_vert_keys(face).contains(&v0) {
+                mesh.set_face_material_index(face, slot);
+                slot += 1;
+            }
+        }
+        let legs = [
+            cube_edge(mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(-1.0, -1.0, -1.0)),
+            cube_edge(mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)),
+            cube_edge(mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0)),
+        ];
+        let own_rep = legs.map(|edge| {
+            mesh.face_material_index(mesh.boundvert_representative(v0, edge).unwrap())
+        });
+        (v0, legs, own_rep)
+    }
+
+    /// BEVEL.md §6.6.2's [V-ADJ] grid row (edge bevel): each sector's fill faces inherit
+    /// their whole per-face block — material slot included — from **that sector's own**
+    /// boundvert rep, not from one corner-wide donor. At **even** `segments` there is no
+    /// centre column, so the whole grid is per-sector: the three `segments = 2` pinwheel
+    /// cells split three-ways across the corner's three own reps. A regression to one
+    /// corner-wide donor collapses them onto a single slot.
+    #[test]
+    fn edge_bevel_junction_grid_donor_is_per_sector_own_rep_segments_2() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let (_, legs, own_rep) = two_material_corner0_fan(&mut mesh);
+
+        let mut expected = own_rep.to_vec();
+        expected.sort_unstable();
+        assert!(
+            expected.first() != expected.last(),
+            "fixture sanity: the three own reps must span ≥2 slots to discriminate a collapse",
+        );
+
+        let result = mesh.bevel(
+            &[legs[0].into(), legs[1].into(), legs[2].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let fill = adj_patch_faces(&mesh, &result);
+        let mut fill_slots: Vec<i32> =
+            fill.iter().map(|&f| mesh.face_material_index(f)).collect();
+        fill_slots.sort_unstable();
+        assert_eq!(
+            fill_slots, expected,
+            "the three welded-apex cells carry the three sectors' own reps — a corner-wide \
+             donor would give one slot repeated three times",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's odd-`segments` centre-column row (edge bevel): the sector's centre
+    /// column — the bridge strip meeting the centre n-gon — takes the sector's **own** rep
+    /// when its boundvert has a non-seam beveled edge, exactly as the sector's non-centre
+    /// grid does. On the seam-free two-material cube corner every leg qualifies, so at
+    /// `segments = 3` all six sector quads (one interior + one centre-column bridge per
+    /// sector) carry that sector's own rep — each own rep twice. A regression that left the
+    /// centre column on a corner-wide donor, or ran the tie-break on a non-seam edge, would
+    /// desync the pairing.
+    #[test]
+    fn edge_bevel_junction_centre_column_donor_is_own_rep_segments_3() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let (_, legs, own_rep) = two_material_corner0_fan(&mut mesh);
+
+        let mut expected: Vec<i32> = own_rep.iter().flat_map(|&m| [m, m]).collect();
+        expected.sort_unstable();
+        assert!(
+            expected.first() != expected.last(),
+            "fixture sanity: the own reps must span ≥2 slots to discriminate a collapse",
+        );
+
+        let result = mesh.bevel(
+            &[legs[0].into(), legs[1].into(), legs[2].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The odd grid is six sector quads plus one ring-spanning centre triangle; the
+        // triangle takes the centre n-gon's own (ring-spanning) donor, so it is set aside.
+        let mut sector_slots: Vec<i32> = adj_patch_faces(&mesh, &result)
+            .into_iter()
+            .filter(|&f| mesh.face_vert_keys(f).len() == 4)
+            .map(|f| mesh.face_material_index(f))
+            .collect();
+        assert_eq!(sector_slots.len(), 6, "six sector quads at s=3 (interior + bridge)");
+        sector_slots.sort_unstable();
+        assert_eq!(
+            sector_slots, expected,
+            "each sector's interior cell and centre-column bridge both carry its own rep",
+        );
+    }
+
+    /// The **per-sector direction** of the edge-bevel grid donor, which the two multiset
+    /// tests above cannot see: a cyclic shift of the sectors' own reps keeps the multiset
+    /// but swaps which sector receives which donor. Pin it geometrically — a boundvert-
+    /// anchored grid cell physically replaces sector `i`'s original wedge, so it and the
+    /// strip quads flanking that wedge (on B_i's side) both inherit the **same** wedge face
+    /// and must carry the same material. B_i *opens* sector `i` along `opening_edges[i]` but
+    /// *starts* the beveled leg `opening_edges[i+1]` (§6.6.1's "a boundvert that starts a
+    /// beveled leg takes that leg's edge"), so its own rep is `prev_face(opening_edges[i+1])`
+    /// = that wedge face. Reading the arriving leg instead rotates every grid cell's donor
+    /// off its strips and this contiguity breaks (BEVEL.md §6.6.2 [V-ADJ] grid row).
+    ///
+    /// The centre-column bridge and the centre n-gon are **excluded** (they anchor on no
+    /// boundvert): the bridge follows the own-rep rule read at the corner, which by design
+    /// can differ from the straddle strip quad's stored-first-endpoint donor (§6.6.2's
+    /// separate strip / centre-column rows), so bridge↔strip contiguity is not expected.
+    fn assert_cap_strip_material_contiguous(mesh: &LoopMesh, result: &BevelResult) {
+        let cap: std::collections::HashSet<FaceKey> =
+            adj_patch_faces(mesh, result).into_iter().collect();
+        assert!(!cap.is_empty(), "the junction cap must have grid faces to check");
+        let corner = Vec3::new(1.0, -1.0, -1.0);
+        let ring_radius = 0.25 * 2.0_f32.sqrt();
+        let boundverts: std::collections::HashSet<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| ((mesh.vertex_position(v) - corner).length() - ring_radius).abs() < 1.0e-4)
+            .collect();
+        assert_eq!(boundverts.len(), 3, "three junction boundverts anchor the grid cells");
+        let mut checked = 0usize;
+        for &f in &cap {
+            // Only the boundvert-anchored grid / pinwheel cells replace an original wedge
+            // and border its strips; skip the centre-column bridge and the centre n-gon.
+            if !mesh.face_vert_keys(f).iter().any(|v| boundverts.contains(v)) {
+                continue;
+            }
+            let fmat = mesh.face_material_index(f);
+            for loop_key in mesh.face_loop_keys(f) {
+                let edge = mesh.loop_edge(loop_key);
+                for other in mesh.iter_radial_loops(edge) {
+                    let g = mesh.loop_face(other);
+                    // cap↔cap rim edges (apex spokes, interior grid, seam column) join two
+                    // sectors' distinct donors; only cap↔strip edges are contiguity edges.
+                    if g == f || cap.contains(&g) {
+                        continue;
+                    }
+                    assert_eq!(
+                        fmat,
+                        mesh.face_material_index(g),
+                        "a boundvert-anchored grid cell and its flanking strip inherit the \
+                         same wedge face's material (BEVEL.md §6.6.2 [V-ADJ] grid row, edge \
+                         mode) — a rotated sector→own-edge map breaks this",
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 3,
+            "each of the ≥3 sectors' grid cell borders a strip — the check must run",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's [V-ADJ] grid row (edge bevel), **per-sector direction** at even
+    /// `segments`: each `segments = 2` pinwheel cap cell borders the two strips flanking
+    /// its own sector, and must inherit *that* sector's wedge face — not the previous
+    /// sector's (the off-by-one this pins, which the multiset test cannot).
+    #[test]
+    fn edge_bevel_junction_grid_donor_direction_segments_2() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let (_, legs, own_rep) = two_material_corner0_fan(&mut mesh);
+        let mut sorted = own_rep.to_vec();
+        sorted.sort_unstable();
+        assert!(
+            sorted.first() != sorted.last(),
+            "fixture sanity: the own reps must span ≥2 slots to discriminate a rotation",
+        );
+
+        let result = mesh.bevel(
+            &[legs[0].into(), legs[1].into(), legs[2].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        assert_cap_strip_material_contiguous(&mesh, &result);
+    }
+
+    /// BEVEL.md §6.6.2's [V-ADJ] grid + centre-column rows (edge bevel), **per-sector
+    /// direction** at odd `segments`: the interior cell *and* the centre-column bridge of
+    /// each sector border that sector's strips, so both must inherit its own wedge face.
+    /// Pins the direction of the own-vs-next map the centre-column donor also keys on.
+    #[test]
+    fn edge_bevel_junction_grid_donor_direction_segments_3() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let (_, legs, own_rep) = two_material_corner0_fan(&mut mesh);
+        let mut sorted = own_rep.to_vec();
+        sorted.sort_unstable();
+        assert!(
+            sorted.first() != sorted.last(),
+            "fixture sanity: the own reps must span ≥2 slots to discriminate a rotation",
+        );
+
+        let result = mesh.bevel(
+            &[legs[0].into(), legs[1].into(), legs[2].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        assert_cap_strip_material_contiguous(&mesh, &result);
+    }
+
+    /// BEVEL.md §6.6.2's [V-ADJ] grid row (**vertex** bevel, the off-by-one arm): each
+    /// sector's grid takes the **next** boundvert's rep. A cyclic shift of the sectors'
+    /// own reps has the same multiset, so this even-`segments` case pins that the fill is
+    /// per-sector distributed (not collapsed onto one corner-wide donor) and carries the
+    /// corner's rep multiset — the seg-3 direction test
+    /// (`vertex_bevel_multiseg_fill_material_distributes_per_sector`) pins the off-by-one
+    /// itself.
+    #[test]
+    fn vertex_bevel_junction_grid_donor_is_per_sector_segments_2() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let (v0, _, own_rep) = two_material_corner0_fan(&mut mesh);
+
+        let mut expected = own_rep.to_vec();
+        expected.sort_unstable();
+        assert!(
+            expected.first() != expected.last(),
+            "fixture sanity: the reps must span ≥2 slots to discriminate a collapse",
+        );
+
+        let result = mesh.bevel(
+            &[v0.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Vertices,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // Vertex bevel mints no strips, so every new face is a cap-grid fill face.
+        let mut fill_slots: Vec<i32> = result
+            .faces
+            .iter()
+            .map(|&f| mesh.face_material_index(f))
+            .collect();
+        fill_slots.sort_unstable();
+        assert_eq!(
+            fill_slots, expected,
+            "the three welded-apex cells distribute across the sectors' reps",
+        );
+    }
+
     /// The corner sphere (centre `c`, radius `R = offset`) the cube-corner patch
     /// lies on (§8.5.5.3), and a "within a few `offset` of `c`" membership test that
     /// isolates the corner-grid verts/faces from the per-edge strips (§8.5.5.6).
@@ -21985,8 +22408,9 @@ mod tests {
             boundverts: spokes.iter().map(|&s| mesh.create_vertex(s)).collect(),
             opening_edges: Vec::new(),
             outward: Vec3::ZERO,
-            representative: FaceTemplate::default(),
             central_representative: FaceTemplate::default(),
+            sector_representatives: Vec::new(),
+            centre_column_representatives: Vec::new(),
             // The synthetic cuts carry no real corner, so the band verdict is inert here;
             // the geometry test alone decides these assertions.
             dihedral_band_ok: false,
@@ -35311,6 +35735,55 @@ mod tests {
         assert_eq!(
             donor, winner,
             "a boundary leg is a condition-(1) seam: the donor is the tie-break winner"
+        );
+    }
+
+    /// BEVEL.md §6.6.2's odd-`segments` centre-column donor selection, in isolation. The
+    /// column takes the sector's **own** rep only when its boundvert has a beveled edge
+    /// that is not an interpolation seam; otherwise — a seamed edge, or an unbeveled leg —
+    /// it takes the §6.6.1.4 tie-break between the own and the **next** boundvert's reps.
+    #[test]
+    fn centre_column_donor_switches_between_own_rep_and_the_tie_break() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 20.0));
+        let r2 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 30.0));
+
+        // Open fan: `{v0,r0}` and `{v0,r2}` are boundary (radial-1) legs — interpolation
+        // seams by condition (1) — while `{v0,r1}` is a radial-2 manifold leg.
+        let own = mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        let next = mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+        // Slot key (§6.6.1.4 key 3) decides the tie-break: the lower slot donates, so with
+        // `own` the higher slot the tie-break winner is `next`, distinct from the own rep.
+        mesh.set_face_material_index(own, 5);
+        mesh.set_face_material_index(next, 2);
+
+        let seamed = mesh.query_edge_exists(v0, r0).unwrap();
+        let manifold = mesh.query_edge_exists(v0, r1).unwrap();
+        assert!(mesh.edge_is_interp_seam(seamed), "boundary leg is a seam");
+        assert!(!mesh.edge_is_interp_seam(manifold), "manifold leg is not a seam");
+
+        let tie_break = mesh.donor_tie_break(&[own, next], None);
+        assert_eq!(tie_break, Some(next), "fixture sanity: the lower slot wins the tie-break");
+
+        // Non-seam beveled edge: the sector's own rep.
+        assert_eq!(
+            mesh.centre_column_donor(manifold, Some(own), Some(next), true, None),
+            Some(own),
+            "a non-seam beveled boundvert keeps its own rep",
+        );
+        // Seamed beveled edge: the tie-break winner, not the own rep.
+        assert_eq!(
+            mesh.centre_column_donor(seamed, Some(own), Some(next), true, None),
+            Some(next),
+            "a seamed beveled boundvert routes through the §6.6.1.4 tie-break",
+        );
+        // Unbeveled boundvert (no beveled edge of its own): the tie-break, seam or not.
+        assert_eq!(
+            mesh.centre_column_donor(manifold, Some(own), Some(next), false, None),
+            Some(next),
+            "an unbeveled / miter-split boundvert takes the tie-break unconditionally",
         );
     }
 }
