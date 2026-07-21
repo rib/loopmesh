@@ -9253,6 +9253,26 @@ impl LoopMesh {
             .map(|l| self.loop_face(l))
     }
 
+    /// Does `leg` genuinely lack a flanking face on one side — the **winding-blind**
+    /// incidence form of BEVEL.md §6.6.1.4 condition (1) (§6.6.1.4.0(c), the winding box)?
+    ///
+    /// The fan's two flanking-face slots are filled by pure *incidence*: a leg resolves
+    /// both slots exactly when it carries **two or more** incident faces, whatever their
+    /// winding. So condition (1) fires only when the leg carries fewer than two — a
+    /// mesh-boundary leg (one incident face) or a wire leg (none). An **inconsistently
+    /// wound** radial-2 edge still fills both slots and is **not** a condition-(1) seam;
+    /// a fan-resolved non-manifold edge (three or more faces) likewise fills both. This is
+    /// the winding-blind test the winding-sensitive
+    /// [`arriving_face`](Self::arriving_face) / [`departing_face`](Self::departing_face)
+    /// resolution mis-answers: those report an empty slot at one endpoint of an
+    /// inconsistently wound radial-2 edge and so mis-file it as a seam.
+    ///
+    /// The count is short-circuited at two: a high-valence non-manifold leg never walks
+    /// its whole radial cycle here.
+    fn leg_missing_flanking_face(&self, leg: EdgeKey) -> bool {
+        self.iter_radial_loops(leg).take(2).count() < 2
+    }
+
     /// A boundvert's own representative face (BEVEL.md §6.6.1's
     /// `representative_face_of_boundvert`, the no-beveled-leg branch a vertex bevel
     /// takes): the face arriving at `vertex` along the boundvert's leg `edge`, else the
@@ -9397,12 +9417,14 @@ impl LoopMesh {
     /// - **Seam-free corner** — every leg's fan walk resolves both flanking faces. The
     ///   donor is §6.6.1's positional pick, which reads the corner's fan anchor and carries
     ///   §6.6.1.2's documented non-invariance. Nothing here can improve on it.
-    /// - **Seam-carrying corner** — §6.6.1.4 condition (1): some leg's fan walk resolves
-    ///   **no arriving face or no departing face**. That is an interpolation seam
-    ///   *unconditionally*, purely topologically, with no customdata layer consulted — so
-    ///   it fires on the plainest untextured mesh, and **every** mesh-boundary leg (and
-    ///   every wire leg, and every leg heading a restarted fan at a non-manifold corner)
-    ///   satisfies it. The positional pick is then displaced by the deterministic tie-break
+    /// - **Seam-carrying corner** — §6.6.1.4 condition (1): some leg genuinely lacks a
+    ///   flanking face on one side. That is an interpolation seam *unconditionally*, purely
+    ///   topologically, with no customdata layer consulted — so it fires on the plainest
+    ///   untextured mesh, and **every** mesh-boundary leg (and every wire leg) satisfies it.
+    ///   The test is **winding-blind** (§6.6.1.4.0(c),
+    ///   [`leg_missing_flanking_face`](Self::leg_missing_flanking_face)): an inconsistently
+    ///   wound radial-2 leg fills both slots by incidence and is **not** a seam. The
+    ///   positional pick is then displaced by the deterministic tie-break
     ///   over a positionally-named candidate set, and the fan anchor drops out of the
     ///   picture entirely.
     ///
@@ -9437,13 +9459,16 @@ impl LoopMesh {
     ) -> Option<FaceKey> {
         let positional = self.first_incident_face(vertex);
 
-        // §6.6.1.4 condition (1): a leg whose fan walk resolves no arriving face or no
-        // departing face is an interpolation seam, unconditionally and purely
-        // topologically. The seam-free corner — the common one — keeps the positional pick,
-        // so this pass runs before a single candidate is built and allocates nothing.
-        let seam_carrying = self.iter_disk_edges(vertex).any(|leg| {
-            self.arriving_face(vertex, leg).is_none() || self.departing_face(vertex, leg).is_none()
-        });
+        // §6.6.1.4 condition (1): a leg whose gap genuinely holds no face is an
+        // interpolation seam, unconditionally and purely topologically. The test is
+        // **winding-blind** (§6.6.1.4.0(c)) — it asks pure incidence, not the
+        // winding-sensitive `arriving_face` / `departing_face` resolution, so an
+        // inconsistently wound radial-2 leg is *not* mis-filed as a seam. The seam-free
+        // corner — the common one — keeps the positional pick, so this pass runs before a
+        // single candidate is built and allocates nothing.
+        let seam_carrying = self
+            .iter_disk_edges(vertex)
+            .any(|leg| self.leg_missing_flanking_face(leg));
         if !seam_carrying {
             return positional;
         }
@@ -34376,6 +34401,130 @@ mod tests {
         assert_eq!(
             matched, 2,
             "the shallow terminal contributes two strip verts"
+        );
+    }
+
+    /// BEVEL.md §6.6.1.4.0(c), condition (1)'s winding box: the flanking-face slots are
+    /// filled by pure incidence, so the seam predicate counts incident faces and is blind
+    /// to winding. Two incident faces fill both slots however they are wound; fewer than
+    /// two genuinely leaves a side empty.
+    #[test]
+    fn leg_missing_flanking_face_is_winding_blind() {
+        let mut mesh = LoopMesh::new();
+        let a = mesh.create_vertex(Vec3::ZERO);
+        let b = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let c = mesh.create_vertex(Vec3::new(0.5, 1.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.5, -1.0, 0.0));
+
+        // Consistently wound radial-2: `[a,b,c]` traverses a→b, `[b,a,d]` traverses b→a.
+        mesh.face_create_verts(&[a, b, c], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[b, a, d], FaceCreateFlags::NONE);
+        let consistent = mesh.query_edge_exists(a, b).expect("shared edge");
+        assert!(
+            !mesh.leg_missing_flanking_face(consistent),
+            "a consistently wound radial-2 leg fills both slots"
+        );
+
+        // Inconsistently wound radial-2: both faces traverse the shared edge the *same*
+        // way. The winding-sensitive resolution reports an empty slot here; incidence does
+        // not — two faces still flank the edge.
+        let mut mis = LoopMesh::new();
+        let p = mis.create_vertex(Vec3::ZERO);
+        let q = mis.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let r = mis.create_vertex(Vec3::new(0.5, 1.0, 0.0));
+        let s = mis.create_vertex(Vec3::new(0.5, -1.0, 0.0));
+        mis.face_create_verts(&[p, q, r], FaceCreateFlags::NONE);
+        mis.face_create_verts(&[p, q, s], FaceCreateFlags::NONE); // same p→q traversal
+        let inconsistent = mis.query_edge_exists(p, q).expect("shared edge");
+        assert!(
+            !mis.leg_missing_flanking_face(inconsistent),
+            "an inconsistently wound radial-2 leg still flanks two faces — not a seam"
+        );
+
+        // Boundary radial-1: one face only.
+        let mut bnd = LoopMesh::new();
+        let u = bnd.create_vertex(Vec3::ZERO);
+        let v = bnd.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let w = bnd.create_vertex(Vec3::new(0.5, 1.0, 0.0));
+        bnd.face_create_verts(&[u, v, w], FaceCreateFlags::NONE);
+        let boundary = bnd.query_edge_exists(u, v).expect("edge");
+        assert!(
+            bnd.leg_missing_flanking_face(boundary),
+            "a boundary leg has one empty side"
+        );
+
+        // Wire radial-0: no faces at all.
+        let mut wire = LoopMesh::new();
+        let x = wire.create_vertex(Vec3::ZERO);
+        let y = wire.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let spoke = wire.create_edge([x, y], EdgeCreateFlags::NONE);
+        assert!(
+            wire.leg_missing_flanking_face(spoke),
+            "a wire leg flanks nothing"
+        );
+    }
+
+    /// A closed corner whose legs are all radial-2 but two of them are inconsistently
+    /// wound: §6.6.1.4 condition (1) is winding-blind (§6.6.1.4.0(c)), so the corner is
+    /// **not** seam-carrying and [`ring_spanning_donor`](LoopMesh::ring_spanning_donor)
+    /// keeps the positional pick rather than the tie-break winner.
+    #[test]
+    fn ring_spanning_donor_condition_one_is_winding_blind_at_the_corner() {
+        let mut mesh = LoopMesh::new();
+        // `v0` sits well below the rim so it is every face's z-extreme; each face's
+        // bounding-box-centre z is then set by the higher of its two rim verts, which lets
+        // the geometry alone pick the tie-break winner (§6.6.1.4 key 4).
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let r1 = mesh.create_vertex(Vec3::new(-0.5, 0.87, 20.0));
+        let r2 = mesh.create_vertex(Vec3::new(-0.5, -0.87, 30.0));
+
+        let f1 = mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        let f2 = mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+        // Flipped from the consistent `[v0, r2, r0]`: this makes legs `{v0,r0}` and
+        // `{v0,r2}` inconsistently wound while every leg stays radial-2.
+        let f3 = mesh.face_create_verts(&[v0, r0, r2], FaceCreateFlags::NONE);
+
+        let positional = mesh.first_incident_face(v0);
+        let winner = mesh.donor_tie_break(&[f1, f2, f3], None);
+        assert_ne!(
+            winner, positional,
+            "fixture sanity: the seam path's tie-break winner must differ from positional"
+        );
+
+        let donor = mesh.ring_spanning_donor(v0, &|_| false, BevelAffect::Vertices, 1, None);
+        assert_eq!(
+            donor, positional,
+            "an inconsistently wound radial-2 corner is not a condition-(1) seam: \
+             the donor is the positional pick, not the tie-break winner"
+        );
+    }
+
+    /// The contrast: a genuine boundary leg (radial-1) *is* a condition-(1) seam, so the
+    /// same fill routes its donor through the tie-break winner, not the positional pick.
+    #[test]
+    fn ring_spanning_donor_boundary_leg_is_a_condition_one_seam() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 20.0));
+        let r2 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 30.0));
+
+        // Open fan: `{v0,r0}` and `{v0,r2}` are boundary legs, `{v0,r1}` is radial-2.
+        mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+
+        let positional = mesh.first_incident_face(v0);
+        let winner = mesh.donor_tie_break(&mesh.face_keys(), None);
+        assert_ne!(
+            winner, positional,
+            "fixture sanity: winner must differ from positional to discriminate the paths"
+        );
+
+        let donor = mesh.ring_spanning_donor(v0, &|_| false, BevelAffect::Vertices, 1, None);
+        assert_eq!(
+            donor, winner,
+            "a boundary leg is a condition-(1) seam: the donor is the tie-break winner"
         );
     }
 }
