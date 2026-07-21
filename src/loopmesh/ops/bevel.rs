@@ -4793,8 +4793,16 @@ impl LoopMesh {
     /// non-sharp `miter_outer` the whole junction is declined here and
     /// [`Self::build_junction_outer_miter`] owns it.
     ///
+    /// The arc build is segments-general (§8.9.5.1): each non-reflex sector's `B1 → B3`
+    /// internal edge carries the `segments + 1`-sample inscribed arc, so odd `segments`
+    /// closes the enlarged ring rather than declining. The inner miter splits **every**
+    /// non-reflex sector, so the central polygon's valence equals the **boundvert-ring
+    /// valence** — `2s` when every sector is convex (each of the `s` sectors contributing
+    /// both `B1` and `B3`), `2s − 1` when one sector is a sharp reflex keeping its single
+    /// meet-point — **not** the outer miter's `s + 1` (§8.9.5.3 splits exactly one sector).
+    ///
     /// All classification runs read-only first; the method returns `false` **without
-    /// mutating** for any junction outside its scope (`segments != 2`, a non-circular
+    /// mutating** for any junction outside its scope (`segments < 2`, a non-circular
     /// profile, fewer than three sectors, an all-non-reflex ring that is not the forced
     /// tri-corner geometry, more than one reflex sector, or a reflex sector the outer
     /// miter owns), so the caller falls back to the sharp ring.
@@ -4815,8 +4823,14 @@ impl LoopMesh {
         miter_ring_junctions: &mut Vec<MiterRingJunction>,
         result: &mut BevelResult,
     ) -> bool {
-        // §8.9.5: the inner miter rides the `segments = 2` circular control net.
-        if segments != 2 || profile_to_exponent(profile) != 2.0 {
+        // §8.9.5: the inner miter rides the [V-ADJ] grid, so `segments ≥ 2`, and the arc
+        // forces the circular profile. The arc build is segments-general (§8.9.5.1) — the
+        // same even-angle inscribed-arc sampling the outer `ARC` uses (§8.9.3 rebuilds the
+        // inner miter "exactly like an outer ARC"), so odd `segments` closes on the enlarged
+        // boundvert ring (valence `2s` all-convex, `2s − 1` with a sharp reflex sector, since
+        // every non-reflex sector splits — not the outer miter's `s + 1`) rather than
+        // declining to the sharp ring.
+        if segments < 2 || profile_to_exponent(profile) != 2.0 {
             return false;
         }
         let corners = self.vertex_corner_ring(vertex);
@@ -4896,12 +4910,14 @@ impl LoopMesh {
 
         // Mutation pass: every check has passed. Each non-reflex sector splits into its
         // arc pair; the reflex sector (if any) keeps its single sharp meet-point.
-        let sqrt2 = std::f32::consts::SQRT_2;
         // Per sector: its ring boundverts in ring order (one when sharp, `B1`/`B3` when
-        // split), the split sector's internal arc chain `[B1, bulge, B3]`, and that arc's
-        // raw bulge position. The arc cell is always symmetric (`|meet − B1| = |meet − B3|
-        // = spread`), so the §8.2.2.1.1 boundary resample is the identity on it and the
-        // raw bulge is also the emitted rim sample (§8.9.5).
+        // split), the split sector's internal arc chain (`segments + 1` samples,
+        // §8.9.5.1), and that arc's raw coarse mid. The arc cell is always symmetric
+        // (`|meet − B1| = |meet − B3| = spread`), but symmetry buys the §8.2.2.1.1 boundary
+        // resample = identity only at `segments = 2`: §8.9.5.2 warns a symmetric cell's
+        // interior samples still move at non-power-of-two `segments`, so the resample runs
+        // unconditionally (§8.9.5) and the raw coarse mid is captured only for the
+        // `segments = 2` centre stencil.
         let mut sector_ring: Vec<Vec<VertexKey>> = Vec::with_capacity(sector_count);
         let mut sector_arc: Vec<Option<Vec<VertexKey>>> = Vec::with_capacity(sector_count);
         let mut sector_arc_profile: Vec<Option<RingChainProfile>> =
@@ -4922,27 +4938,54 @@ impl LoopMesh {
             // beveled edge from the stored meet-point.
             let b1_position = plan.meet + plan.dir_open * spread;
             let b3_position = plan.meet + plan.dir_close * spread;
-            // §8.9.5: the stored meet-point is the outer corner of the square that
-            // circumscribes the arc, not a point on the arc. The single `segments = 2`
-            // interior sample is the inscribed circle's 45° point — pulled in a fraction
-            // `√2 − 1` of the way from the chord midpoint toward that corner.
-            let chord_mid = 0.5 * (b1_position + b3_position);
-            let bulge_position = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * plan.meet;
-            sector_arc_profile.push(Some(RingChainProfile::Arc {
+            // §8.9.3 / §8.9.5.1: the inner arc is rebuilt exactly like the outer `ARC` —
+            // the inscribed quarter-circle in the arc's (non-orthonormal) unit-square frame
+            // of `B1` / `B3` / the stored meet-corner, sampled at even angles and
+            // segments-general. The stored meet-point is the circumscribing square's outer
+            // corner, not a point on the arc; the `segments = 2` interior sample keeps the
+            // closed-form `√2 − 1` bulge.
+            let arc = RingChainProfile::Arc {
                 b1: b1_position,
                 b3: b3_position,
                 midpoint: plan.meet,
-            }));
+            };
+            // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil consumes the arc's
+            // raw coarse `(i, 0, 1)` mid, never the emitted rim mid. The inner arc cell is
+            // symmetric, so its raw bulge is both; captured for the `segments = 2` centre.
+            let raw_bulge = arc.raw_positions(2)[1];
+            // §8.2.2.1.1 / §8.9.5.2: the arc is a ring-edge chain like any other, so its
+            // emitted rim samples are the chord-fraction resample of the raw arc against the
+            // profile at the source resolution. Symmetry makes this the identity only at
+            // `segments = 2` (and powers of two); at odd `segments` even a symmetric cell's
+            // interior samples move (§8.9.5.1 / §8.9.5.2), so the resample is routed
+            // unconditionally precisely because odd `segments` displaces symmetric cells —
+            // "do not gate this regime on skew".
+            let raw_chain = arc.raw_positions(segments);
+            let source_segments = boundary_source_resolution(segments);
+            let emitted = if source_segments == segments {
+                raw_chain
+            } else {
+                let source = arc.raw_positions(source_segments);
+                chord_fraction_resample(&raw_chain, &source)
+            };
+            sector_arc_profile.push(Some(arc));
             // §5.2.4: not yet minted from the corner.
             let b1 = self.create_vertex(b1_position);
-            let bulge = self.create_vertex(bulge_position);
-            let b3 = self.create_vertex(b3_position);
             result.verts.push(b1);
-            result.verts.push(bulge);
+            let mut samples = Vec::with_capacity(segments as usize + 1);
+            samples.push(b1);
+            for position in emitted.iter().take(segments as usize).skip(1) {
+                // §5.2.4: not yet minted from the corner.
+                let sample = self.create_vertex(*position);
+                result.verts.push(sample);
+                samples.push(sample);
+            }
+            let b3 = self.create_vertex(b3_position);
             result.verts.push(b3);
+            samples.push(b3);
             sector_ring.push(vec![b1, b3]);
-            sector_arc.push(Some(vec![b1, bulge, b3]));
-            sector_bulge.push(Some(bulge_position));
+            sector_arc.push(Some(samples));
+            sector_bulge.push(Some(raw_bulge));
         }
 
         // Re-stitch each sector's face(s). A sharp sector collapses its corner onto the
@@ -4991,6 +5034,11 @@ impl LoopMesh {
         // desynchronises the §6.7.5.3 walk, case (6)), `Some` on each strip cross-section.
         let mut ring: Vec<VertexKey> = Vec::with_capacity(sector_count + 2);
         let mut cross_edge: Vec<Option<EdgeKey>> = Vec::with_capacity(sector_count + 2);
+        // §8.9.3.1: a split sector's trailing boundvert `B_3` is the arc *end* — it **owns**
+        // its trailing beveled edge (the sector's closing edge), so it takes a `Some`
+        // cross-edge exactly like the outer miter's reflex-owning `B_3` and a lone sharp
+        // meet-point. Only the arc *start* `B_1`, whose internal arc edge crosses no beveled
+        // edge, is edge-less (`None`).
         for k in 0..sector_count {
             let boundverts = &sector_ring[k];
             for (slot, &boundvert) in boundverts.iter().enumerate() {
@@ -5072,41 +5120,57 @@ impl LoopMesh {
         // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil consumes each ring
         // chain's *raw coarse* profile mid, never the emitted (resampled) rim mid — the
         // arc-flanking cross-sections of a spread-pushed ring are skewed cells, where the
-        // two differ. The arc's own mid is symmetric, so its raw bulge is both.
+        // two differ. The arc's own mid is symmetric, so its raw bulge is both. Only the
+        // `segments = 2` centre stencil consumes these (every other resolution reads the
+        // mids straight off each ring edge's generator profile), so populate them only
+        // there — mirroring the outer miter.
         let mut bulges = sector_bulge.iter().flatten();
-        let raw_coarse_mids: Vec<Vec3> = (0..ring_count)
-            .map(|i| match cross_edge[i] {
-                None => *bulges
-                    .next()
-                    .expect("every internal ring edge has a pre-minted raw bulge"),
-                Some(edge) => self.coarse_flank_mid(
-                    ring[i],
-                    ring[(i + 1) % ring_count],
-                    edge,
-                    profile,
-                    self.mid_rescue(vertex, edge, &corners, is_beveled),
-                ),
-            })
-            .collect();
+        let raw_coarse_mids: Vec<Vec3> = if segments == 2 {
+            (0..ring_count)
+                .map(|i| match cross_edge[i] {
+                    None => *bulges
+                        .next()
+                        .expect("every internal ring edge has a pre-minted raw bulge"),
+                    Some(edge) => self.coarse_flank_mid(
+                        ring[i],
+                        ring[(i + 1) % ring_count],
+                        edge,
+                        profile,
+                        self.mid_rescue(vertex, edge, &corners, is_beveled),
+                    ),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // §6.6.2 grid row: each non-centre grid face takes its own sector's positional donor,
-        // not one uniform rep — a two-material split-sector junction diverges otherwise.
-        let sector_representatives: Vec<FaceTemplate> = self
-            .miter_ring_sector_donors(vertex, &cross_edge)
-            .into_iter()
-            .map(|donor| templates.register(donor))
+        // not one uniform rep — a two-material split-sector junction diverges otherwise. The
+        // split sector's flank quads therefore stay asymmetric: mirror sectors painted from
+        // different slots donate their own (§8.9.3.1).
+        let sector_donors = self.miter_ring_sector_donors(vertex, &cross_edge);
+        let sector_representatives: Vec<FaceTemplate> = sector_donors
+            .iter()
+            .map(|&donor| templates.register(donor))
             .collect();
-        let central_representative = templates.register(self.ring_spanning_donor(
+        // §8.9.3.1: the odd-`segments` centre n-gon takes the **enlarged miter ring's first
+        // boundvert's** rep — the §6.6.1.2 fan anchor of *this* ring, not the raw disk's — on a
+        // seam-free junction (a material boundary raises no interpolation seam), and only a
+        // genuine seam routes it to the junction-wide §6.6.1.4 tie-break.
+        let central_representative = templates.register(self.miter_centre_ngon_donor(
             vertex,
             is_beveled,
             affect,
             segments,
+            sector_donors.first().copied().flatten(),
             templates.interp_components(),
         ));
-        // §6.6.2 / §8.9.3: at odd `segments` each sector's centre column resolves its own
-        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector, the §6.6.1.4
-        // tie-break unconditionally for an edge-less (miter-split) boundvert. Computed
-        // pristine here so it survives the re-stitch.
+        // §6.6.2 / §8.9.3.1: at odd `segments` each sector's centre column resolves its own
+        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector (its `Some` cross-edge,
+        // including the inner arc *end* `B_3`, which owns its trailing beveled edge), the
+        // §6.6.1.4 tie-break unconditionally for the edge-less arc *start* `B_1` (its `None`
+        // cross-edge). Routed identically to the outer miter. Computed pristine here so it
+        // survives the re-stitch.
         let centre_column_donors = self.miter_ring_centre_column_donors(
             vertex,
             &cross_edge,
@@ -5588,10 +5652,11 @@ impl LoopMesh {
             segments,
             templates.interp_components(),
         ));
-        // §6.6.2 / §8.9.3: at odd `segments` each sector's centre column resolves its own
-        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector, the §6.6.1.4
-        // tie-break unconditionally for the outer arc's edge-less far-flank partner. Computed
-        // pristine here.
+        // §6.6.2 / §8.9.3.1: at odd `segments` each sector's centre column resolves its own
+        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector (its `Some`
+        // cross-edge, including the reflex arc *end* `B_3`, which owns the trailing beveled
+        // edge), the §6.6.1.4 tie-break unconditionally for the reflex arc's edge-less *start*
+        // `B_1` (its `None` cross-edge). Computed pristine here.
         let centre_column_donors = self.miter_ring_centre_column_donors(
             vertex,
             &cross_edge,
@@ -10041,10 +10106,7 @@ impl LoopMesh {
         //
         // The seam-free corner — the common one — keeps the positional pick, so this pass
         // runs before a single candidate is built.
-        let seam_carrying = self.iter_disk_edges(vertex).any(|leg| {
-            self.leg_missing_flanking_face(leg) || self.edge_is_interp_seam(leg)
-        });
-        if !seam_carrying {
+        if !self.corner_is_seam_carrying(vertex) {
             return positional;
         }
 
@@ -10089,6 +10151,36 @@ impl LoopMesh {
         }
 
         self.donor_tie_break(&candidates, components).or(positional)
+    }
+
+    /// The stage-1 donor of a miter junction's odd-`segments` **centre n-gon** — the single
+    /// innermost polygon closing the whole mitered junction (BEVEL.md §8.9.3.1, §6.6.2's
+    /// centre-n-gon row). It is a **ring-spanning** fill, so:
+    ///
+    /// - **Seam-free junction** — the §6.6.1.2 fan anchor: the **enlarged miter ring's first
+    ///   boundvert's** rep (`ring_first_boundvert_rep`, the caller's `sector_donors[0]`). This
+    ///   is the ring's *own* anchor, **not** the raw disk's first incident face
+    ///   ([`ring_spanning_donor`](Self::ring_spanning_donor)'s positional pick): the miter
+    ///   enlarges the ring by splitting sectors, so the two seeds differ on a
+    ///   material-straddling junction, and the centre n-gon follows the enlarged ring. Anchor
+    ///   divergence carries here (§6.6.1.2): not isomorphism-invariant, but reproducible given
+    ///   the same ring seeding. A **material** boundary alone keeps this branch (no seam).
+    /// - **Seamed junction** — the junction-wide §6.6.1.4 tie-break over the beveled legs' reps,
+    ///   which is exactly [`ring_spanning_donor`](Self::ring_spanning_donor)'s seamed branch.
+    fn miter_centre_ngon_donor(
+        &self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
+        segments: u32,
+        ring_first_boundvert_rep: Option<FaceKey>,
+        components: Option<&InterpComponents>,
+    ) -> Option<FaceKey> {
+        if self.corner_is_seam_carrying(vertex) {
+            self.ring_spanning_donor(vertex, is_beveled, affect, segments, components)
+        } else {
+            ring_first_boundvert_rep
+        }
     }
 
     /// [`straddle_quad_donor`](Self::straddle_quad_donor) read off an edge alone — the shape
@@ -10282,6 +10374,13 @@ impl LoopMesh {
     /// sector and the edge-less arm read that candidate the same way. Read pristine
     /// (arriving / departing faces need the junction's original faces intact), like every
     /// donor of §6.6.1.
+    ///
+    /// Both the outer- and inner-miter arc *end* `B_3` **owns** its trailing beveled edge
+    /// (§8.9.2 / §8.9.3.1), so both take a `Some` cross-edge and route the seam-gated own-rep
+    /// pick — own rep when the edge is a non-seam, the §6.6.1.4 tie-break when it is. Only the
+    /// edge-less arc *start* `B_1` (a `None` cross-edge) tie-breaks unconditionally. Reading the
+    /// inner `B_3` as edge-less and forcing it through the tie-break inverts §8.9.3.1's rule and
+    /// collapses a two-material split junction's mirror sectors onto one donor.
     fn miter_ring_centre_column_donors(
         &self,
         vertex: VertexKey,
@@ -10294,13 +10393,19 @@ impl LoopMesh {
             .map(|i| {
                 let next_i = (i + 1) % count;
                 match cross_edges[i] {
-                    Some(edge) => self.centre_column_donor(
-                        edge,
-                        sector_reps[i],
-                        sector_reps[next_i],
-                        true,
-                        components,
-                    ),
+                    Some(edge) => {
+                        // §8.9.3.1: a `Some`-cross-edge boundvert is an arc *end* `B_3` (inner
+                        // or outer) that **owns** its trailing beveled edge, so its centre
+                        // column keeps the seam-gated own-vs-tie-break pick — own rep on a
+                        // non-seam edge, the §6.6.1.4 tie-break only when the edge is a seam.
+                        self.centre_column_donor(
+                            edge,
+                            sector_reps[i],
+                            sector_reps[next_i],
+                            true,
+                            components,
+                        )
+                    }
                     None => {
                         // §8.9.5.3 odd-`segments` bullet: the arc-*start* `B_1`'s centre
                         // column routes **its own** rep — the neighbour across the leading
@@ -20424,10 +20529,11 @@ mod tests {
     }
 
     /// Bevel the cube corner of `cube_corner_adj_segments2` with an inner miter
-    /// (BEVEL.md §8.9.3), `miter_inner = kind`, pushed out by `spread`.
-    fn cube_corner_adj_segments2_inner_miter(
+    /// (BEVEL.md §8.9.3), `miter_inner = kind`, pushed out by `spread`, at `segments`.
+    fn cube_corner_adj_inner_miter(
         kind: BevelMiter,
         spread: f32,
+        segments: u32,
     ) -> (LoopMesh, BevelResult) {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
@@ -20444,7 +20550,7 @@ mod tests {
             BevelOptions {
                 offset: 0.25,
                 affect: BevelAffect::Edges,
-                segments: 2,
+                segments,
                 vmesh_method: BevelVmeshMethod::Adj,
                 miter_inner: kind,
                 spread,
@@ -20452,6 +20558,97 @@ mod tests {
             },
         );
         (mesh, result)
+    }
+
+    /// Bevel the cube corner of `cube_corner_adj_segments2` with an inner miter
+    /// (BEVEL.md §8.9.3), `miter_inner = kind`, pushed out by `spread`, at `segments = 2`.
+    fn cube_corner_adj_segments2_inner_miter(
+        kind: BevelMiter,
+        spread: f32,
+    ) -> (LoopMesh, BevelResult) {
+        cube_corner_adj_inner_miter(kind, spread, 2)
+    }
+
+    /// BEVEL.md §8.9.3 / §8.9.5.1: the inner miter rebuilds each non-reflex sector
+    /// "exactly like an outer ARC", so it is segments-general — at odd `segments` the
+    /// arc's `B1 → B3` internal edge carries the full `segments + 1`-sample inscribed arc
+    /// and the enlarged ring is filled by the general valence-`s` [V-ADJ] grid rather than
+    /// declining to the sharp ring. This pins the segments = 3 cube corner: the ARC fires
+    /// (strictly more geometry than the sharp fallback) and the arc-END boundverts land at
+    /// their §8.9.4 spread-pushed positions.
+    #[test]
+    fn inner_miter_arc_odd_segments_builds_arc_not_sharp() {
+        let spread = 0.3;
+        let (mesh, result) = cube_corner_adj_inner_miter(BevelMiter::Arc, spread, 3);
+        let (sharp_mesh, _sharp) = cube_corner_adj_inner_miter(BevelMiter::Sharp, spread, 3);
+        mesh.validate_topology();
+
+        // The ARC fired — three arc starts and their fill, strictly more geometry than
+        // the declined sharp ring at the same segments.
+        let (miter_v, miter_e, miter_f) = counts(&mesh);
+        let (sharp_v, sharp_e, sharp_f) = counts(&sharp_mesh);
+        assert!(
+            miter_v > sharp_v && miter_e > sharp_e && miter_f > sharp_f,
+            "the odd-segments inner miter builds the ARC, not the sharp fallback \
+             (miter {:?} vs sharp {:?})",
+            (miter_v, miter_e, miter_f),
+            (sharp_v, sharp_e, sharp_f),
+        );
+        assert_eq!(
+            (miter_v, miter_e, miter_f),
+            (40, 66, 28),
+            "segments = 3 inner-miter cube corner is 40 V / 66 E / 28 F",
+        );
+
+        // §8.9.3 / §8.9.4: the arc-END boundverts `B1` / `B3` are the chain ends (never
+        // resampled), pushed `spread` out along their own beveled edge from the stored
+        // meet corner. The bottom (z = -1) sector's meet is (0.75, -0.75, -1); `B1` slides
+        // -x to (0.45, -0.75, -1), `B3` slides +y to (0.75, -0.45, -1). The stored corner
+        // is a control point, so no vertex materialises there (§8.9.5).
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.45, -0.75, -1.0)),
+            1,
+            "arc start B1 sits `spread` out along the -x beveled edge",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.75, -0.45, -1.0)),
+            1,
+            "arc end B3 sits `spread` out along the +y beveled edge",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.75, -0.75, -1.0)),
+            0,
+            "the stored meet corner is a control point, not a materialised vertex",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.9.5.1: odd `segments` closes the enlarged inner-miter
+    /// ring on exactly one central `s`-gon. The cube corner splits all three sectors into
+    /// arc pairs, so the ring is valence-6 and odd parity closes on a single central
+    /// hexagon; every other fill cell is a quad. Exercised at two odd resolutions to pin
+    /// the general (not merely segments = 3) build.
+    #[test]
+    fn inner_miter_arc_odd_segments_closes_on_central_hexagon() {
+        for segments in [3u32, 5] {
+            let (mesh, result) = cube_corner_adj_inner_miter(BevelMiter::Arc, 0.3, segments);
+            mesh.validate_topology();
+            let hexagons = result
+                .faces
+                .iter()
+                .filter(|&&f| mesh.face_vert_keys(f).len() == 6)
+                .count();
+            let non_quads = result
+                .faces
+                .iter()
+                .filter(|&&f| mesh.face_vert_keys(f).len() != 4)
+                .count();
+            assert_eq!(
+                (hexagons, non_quads),
+                (1, 1),
+                "segments = {segments} odd inner miter closes on exactly one central \
+                 hexagon; every other fill cell is a quad",
+            );
+        }
     }
 
     /// BEVEL.md §8.9.1: the reflex/non-reflex sign is a property of the *surface
@@ -36276,6 +36473,47 @@ mod tests {
             donors[0],
             Some(own),
             "a non-seam beveled sector's centre column keeps its own rep, not the tie-break winner",
+        );
+    }
+
+    /// BEVEL.md §8.9.3.1: the inner-miter arc *end* `B_3` **owns** its trailing beveled edge
+    /// (its `Some` cross-edge), exactly like the outer miter's reflex-owning `B_3`, so on a
+    /// non-seam edge its centre column keeps that sector's **own** rep — it is **not** routed
+    /// through the §6.6.1.4 tie-break. Only the edge-less arc *start* `B_1` (a `None`
+    /// cross-edge) tie-breaks. This pins the corrected rule that overturns the earlier
+    /// far-flank premise (which wrongly read the inner `B_3` as edge-less): the next boundvert
+    /// carries a lower material slot, so a stray tie-break *would* pick a different face — the
+    /// own rep proves the tie-break did not fire.
+    #[test]
+    fn miter_ring_inner_arc_end_owns_its_edge_and_keeps_its_own_rep() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let a = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let b = mesh.create_vertex(Vec3::new(0.0, 1.0, 20.0));
+        let c = mesh.create_vertex(Vec3::new(-1.0, 0.0, 30.0));
+        let own = mesh.face_create_verts(&[v0, a, b], FaceCreateFlags::NONE);
+        let next = mesh.face_create_verts(&[v0, b, c], FaceCreateFlags::NONE);
+        mesh.set_face_material_index(own, 7);
+        mesh.set_face_material_index(next, 3);
+
+        let e_mid = mesh.query_edge_exists(v0, b).unwrap();
+        let e_next = mesh.query_edge_exists(v0, c).unwrap();
+        assert!(!mesh.edge_is_interp_seam(e_mid), "the beveled leg is a non-seam");
+        assert_eq!(
+            mesh.donor_tie_break(&[own, next], None),
+            Some(next),
+            "fixture sanity: a stray tie-break would pick the lower-slot `next`",
+        );
+
+        // The inner `B_3` (a `Some` cross-edge that owns its trailing beveled edge) keeps its
+        // own rep `own` (7) — the tie-break never fires on the non-seam edge, so the mirror
+        // sectors of a two-material split junction legitimately differ (§8.9.3.1).
+        let cross_edges = [Some(e_mid), Some(e_next)];
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(
+            donors[0],
+            Some(own),
+            "the inner arc-end `B_3` owns its edge, so its non-seam centre column keeps its own rep",
         );
     }
 }
