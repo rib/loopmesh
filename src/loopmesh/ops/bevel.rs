@@ -1283,11 +1283,13 @@ impl LoopMesh {
 
     /// The beveled edges the operator can actually build (BEVEL.md §7.5), at **every**
     /// `segments`: every endpoint must be either a junction (§7.6, any valence) or a
-    /// terminal whose close [`terminal_close_legs`](Self::terminal_close_legs) can lay out
-    /// — and the edge itself must have a direction to offset off, since a zero-length `E`
-    /// has no offset line and every corner at either end would decline mid-build. Dropping
-    /// an edge can turn a junction into a terminal, which can drop a further edge, so the
-    /// set is shrunk to a fixed point.
+    /// terminal whose close [`terminal_close_legs`](Self::terminal_close_legs) can lay out.
+    /// A **zero-length** `E` (coincident endpoints) is *not* declined at a **terminal**:
+    /// §7.5.4 bevels it like any other edge, its boundverts simply collapsing onto the shared
+    /// endpoint in the leg meet. A zero-length `E` keeping a **junction** endpoint is a
+    /// different, undistilled case (§7.5.4 is a terminal rule) and is still declined. Dropping
+    /// an edge can turn a junction into a terminal, which can drop a further edge, so the set
+    /// is shrunk to a fixed point.
     ///
     /// The decline is **whole-edge and up-front**: the close is placement-before-surgery
     /// (§7.5), so an endpoint that only fails half way through would strand the verts the
@@ -1317,12 +1319,18 @@ impl LoopMesh {
                 .copied()
                 .filter(|&edge| {
                     let [a, b] = self.edge_vert_keys(edge);
-                    if (self.vertex_position(b) - self.vertex_position(a)).length() <= f32::EPSILON
-                    {
-                        return false;
-                    }
+                    // §7.5.4: a zero-length edge bevels at a *terminal* (boundverts collapse
+                    // onto the endpoint in the leg meet), but a junction endpoint of one is
+                    // undistilled and still declines the whole edge.
+                    let is_zero_length =
+                        (self.vertex_position(b) - self.vertex_position(a)).length()
+                            <= f32::EPSILON;
                     [a, b].into_iter().all(|endpoint| {
-                        beveled_degree[&endpoint] >= 2 || self.terminal_close_admits(endpoint, edge)
+                        if beveled_degree[&endpoint] >= 2 {
+                            !is_zero_length
+                        } else {
+                            self.terminal_close_admits(endpoint, edge)
+                        }
                     })
                 })
                 .collect();
@@ -1379,12 +1387,11 @@ impl LoopMesh {
         let face_right = radial_faces[1];
 
         // §7.5: both endpoints must *have* a terminal close — two flanking legs for the
-        // strip verts to meet against (valence ≥ 3) — and `E` must have a direction to
-        // offset off. Decided before the first mint: the close is placement-before-
-        // surgery, so bailing after one endpoint were placed would strand its verts.
-        if (self.vertex_position(b) - self.vertex_position(a)).length() <= f32::EPSILON {
-            return;
-        }
+        // strip verts to meet against (valence ≥ 3). A zero-length `E` is *not* declined
+        // (§7.5.4): it bevels like any other edge, its boundverts collapsing onto the
+        // shared endpoint in the leg meet. Decided before the first mint: the close is
+        // placement-before-surgery, so bailing after one endpoint were placed would strand
+        // its verts.
         // Both endpoints are probed here, ahead of the first mint: `close_terminal_endpoint`
         // is placement-before-surgery, so declining `b` after `a` had been closed would
         // strand `a`'s verts on a mesh that is otherwise left pristine. The probe is exactly
@@ -6424,14 +6431,14 @@ impl LoopMesh {
     /// the §8.3.0.4 post-pass, which re-points it onto the finished ring.
     ///
     /// `None` only when there is no layout at all: face-bearing valence < 3 (nothing for the
-    /// strip verts to meet against), a non-manifold or zero-length `E`, an open fan whose
-    /// `E` sits at an arc end and so has a leg on one side only, or a faced disk the corner
-    /// ring does not cover (a malformed fan).
+    /// strip verts to meet against), a non-manifold `E`, an open fan whose `E` sits at an arc
+    /// end and so has a leg on one side only, or a faced disk the corner ring does not cover
+    /// (a malformed fan). A **zero-length** `E` is admitted (§7.5.4): it lays out like any
+    /// other edge and its strip verts collapse onto the endpoint in the leg meet.
     fn terminal_leg_layout(&self, vertex: VertexKey, edge: EdgeKey) -> Option<TerminalLegs> {
-        let vertex_position = self.vertex_position(vertex);
         // A terminal meets its strip verts against the two legs flanking `E`, so a
-        // face-bearing valence of 2 has no close; a zero-length `E` has no offset line; a
-        // non-manifold `E` has no two-sided strip to close onto.
+        // face-bearing valence of 2 has no close, and a non-manifold `E` has no two-sided
+        // strip to close onto. A zero-length `E` still lays out (§7.5.4).
         let faced: Vec<EdgeKey> = self
             .iter_disk_edges(vertex)
             .filter(|&spoke| self.edge_radial_iter(spoke).next().is_some())
@@ -6440,7 +6447,6 @@ impl LoopMesh {
         if valence < 3 || self.edge_loop_keys(edge).len() != 2 {
             return None;
         }
-        self.edge_direction_from(edge, vertex, vertex_position)?;
 
         let corners = self.vertex_corner_ring(vertex);
         let mut disk: Vec<EdgeKey> = corners.iter().map(|corner| corner.incoming_edge).collect();
@@ -6610,11 +6616,14 @@ impl LoopMesh {
         offset: f32,
     ) -> Vec3 {
         let endpoint = self.vertex_position(vertex);
-        // Outward unit directions of `E` and the leg from the endpoint.
-        let edge_out = match self.edge_direction_from(edge, vertex, endpoint) {
-            Some(dir) => dir,
-            None => return endpoint,
-        };
+        // Outward unit directions of `E` and the leg from the endpoint. §7.5.4: a
+        // zero-length `E` has no direction, so `edge_out` is the zero vector and flows into
+        // `terminal_leg_meet` unchanged — its degenerate guard collapses the meet onto the
+        // endpoint rather than a special branch here. The leg always has a direction (the
+        // close plan admits only legs that do).
+        let edge_out = self
+            .edge_direction_from(edge, vertex, endpoint)
+            .unwrap_or(Vec3::ZERO);
         let leg_out = match self.edge_direction_from(leg, vertex, endpoint) {
             Some(dir) => dir,
             None => return endpoint,
@@ -13011,6 +13020,112 @@ mod tests {
             "b-side ring vert at (0.5,-1,-1)",
         );
         mesh.validate_topology();
+    }
+
+    /// A closed flat fan of `spokes` triangles with one rim vertex slid onto the apex,
+    /// so the spoke to that rim vertex is **zero-length** (§7.5.4). Returns the mesh, the
+    /// shared endpoint position (the origin), and the zero-length spoke edge.
+    fn zero_length_spoke_fan(spokes: usize, collapsed_rim: usize) -> (LoopMesh, Vec3, EdgeKey) {
+        let (mut mesh, centre, rim) = planar_fan(spokes);
+        mesh.set_vertex_position(rim[collapsed_rim], Vec3::ZERO);
+        let spoke = mesh
+            .query_edge_exists(centre, rim[collapsed_rim])
+            .expect("the collapsed spoke exists");
+        (mesh, Vec3::ZERO, spoke)
+    }
+
+    /// BEVEL.md §7.5.4: a zero-length beveled edge is **beveled, not declined**. The
+    /// spoke's coincident endpoints give it no direction, but it still sheds a strip and
+    /// grows the mesh to the §7.5.4-pinned counts (the same numbers a canonical, coincident-
+    /// bucketing comparison reports). An implementation that declined the edge would leave
+    /// the pristine 7-face fan untouched.
+    #[test]
+    fn zero_length_beveled_spoke_is_beveled_not_declined_segments1() {
+        let (mut mesh, _shared, spoke) = zero_length_spoke_fan(7, 5);
+        let result = mesh.bevel(
+            &[spoke.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            counts(&mesh),
+            (14, 22, 9),
+            "§7.5.4 segments = 1: 14 V / 22 E / 9 F, not the pristine 8/14/7 of a decline",
+        );
+        // The strip was built (not skipped): a new face beyond the pristine fan's seven.
+        assert!(
+            result.faces.len() >= 2,
+            "the zero-length edge sheds a strip and fills its valence-7 endpoint",
+        );
+        mesh.validate_topology();
+    }
+
+    #[test]
+    fn zero_length_beveled_spoke_is_beveled_not_declined_segments2() {
+        let (mut mesh, _shared, spoke) = zero_length_spoke_fan(7, 5);
+        let result = mesh.bevel(
+            &[spoke.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            counts(&mesh),
+            (16, 25, 10),
+            "§7.5.4 segments = 2: 16 V / 25 E / 10 F",
+        );
+        assert!(result.faces.len() >= 3, "the strip and fill are built");
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §7.5.4: the four boundverts the zero-length edge contributes — two per
+    /// coincident endpoint — all pin to the shared endpoint coordinate (a zero-area strip),
+    /// regardless of the first/second disk-order designation of the leg meet.
+    #[test]
+    fn zero_length_beveled_spoke_boundverts_pin_to_the_shared_endpoint() {
+        // §7.5.4: the four boundverts (two per coincident endpoint) always pin to the
+        // shared point. At `segments = 2` the zero-area strip's two interior chain samples
+        // collapse there too, since the strip's chords have zero length.
+        for (segments, expected_on_shared) in [(1u32, 4usize), (2, 6)] {
+            let (mut mesh, shared, spoke) = zero_length_spoke_fan(7, 5);
+            let result = mesh.bevel(
+                &[spoke.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    ..Default::default()
+                },
+            );
+
+            let on_shared = result
+                .verts
+                .iter()
+                .filter(|&&v| (mesh.vertex_position(v) - shared).length() < 1.0e-6)
+                .count();
+            assert_eq!(
+                on_shared, expected_on_shared,
+                "segments = {segments}: the zero-length edge's boundverts pin to the shared \
+                 point — no NaN, no offset push",
+            );
+            // No minted vertex is non-finite (the zero-direction guard held).
+            assert!(
+                result
+                    .verts
+                    .iter()
+                    .all(|&v| mesh.vertex_position(v).is_finite()),
+                "segments = {segments}: every minted vert is finite",
+            );
+        }
     }
 
     /// BEVEL.md §6.4.2: the clamped-collapse degenerate. At the exact collision
@@ -32884,6 +32999,19 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         sector_plane,
         offset,
     } = meet;
+
+    // §7.5.4 zero-direction degenerate guard. A zero-length beveled edge has no direction,
+    // so its offset line has zero direction and a base at the endpoint: it is not a line but
+    // a single **point** at the endpoint. The meet of a leg line against a point line returns
+    // that point, so both boundverts the edge contributes here pin to the endpoint —
+    // regardless of the first/second disk-order designation. This must fire *before* the
+    // regime dispatch: the direction-angle test, the unit perpendiculars, and the two-line
+    // meet solve below all build an offset line from the edge direction and would normalize a
+    // zero vector into NaN (or fall to the regime-1 push, which is for two *well-formed*
+    // near-collinear legs, not a directionless edge — §7.5.4 keeps them distinct).
+    if edge_out.length_squared() <= f32::EPSILON {
+        return TerminalPlacement::Degenerate(endpoint);
+    }
 
     let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
     let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
