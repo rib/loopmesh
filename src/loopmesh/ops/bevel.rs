@@ -748,10 +748,21 @@ struct ApexBlend {
 /// last-write-wins order-dependent (§5.2.4.2's private/seam/apex invariance split). The
 /// welded apex itself is not routed through here — it keeps the dedicated `ApexBlend`
 /// path of §5.2.4.1.
+///
+/// `centre_donors` carries the §5.2.4.3 odd-`segments` centre n-gon rule (the no-seam
+/// branch): at odd `segments` the innermost `(i, h, h)` corner of each sector is minted
+/// from `v` and its interpolable layers are overwritten by the plain §10.1 interior
+/// mean-value blend of boundvert `i`'s **own** representative face (`prev_face` of `e_i`
+/// by fan direction) — *not* the next-boundvert rep `f2` the off-diagonal grid verts use,
+/// and with **no** weight-snap. Each corner reads its own sector's rep, so the value is
+/// anchor-free / isomorphism-invariant. A seam-carrying corner `v` (the deferred branch)
+/// has all `centre_donors` slots `None`, so its centre corners keep the bare `cd(v)`
+/// baseline. `None` slots (seam-carrying, gap leg, or no donor) keep that baseline too.
 struct AdjInteriorBlend<'a> {
     corner_vertex: VertexKey,
     sector_snaps: &'a [Option<ApexBlend>],
     sector_donors: &'a [Option<&'a CornerDonor>],
+    centre_donors: &'a [Option<&'a CornerDonor>],
 }
 
 /// The cap's donor for the corner sitting on `ring_vertex` (BEVEL.md §5.2.1.1, the
@@ -1379,6 +1390,37 @@ impl LoopMesh {
             })
             .collect();
 
+        // §5.2.4.3 (no-seam branch): at odd `segments` each centre n-gon corner `(i, h, h)`
+        // blends from boundvert `i`'s **own** representative face (the `prev_face` of its own
+        // edge `e_i` by fan direction), with no snap — *not* the next-boundvert rep `f2` the
+        // grid's off-diagonal verts take. The whole face chooses this no-seam list only when
+        // `v` is **not seam-carrying**; a seam-carrying corner (any incident leg an
+        // interpolation seam — the §6.6.1.4 override-donor + snap-edge branch) is deferred, so
+        // all its slots are `None` and its centre corners keep the bare `cd(v)` baseline. Every
+        // in-scope leg here is face-bearing, so the boundary-leg arm of "seam-carrying" never
+        // fires; the seam is purely an interpolation discontinuity.
+        let per_corner_centre_donor_idx: Vec<Vec<Option<usize>>> = corners
+            .iter()
+            .map(|corner| {
+                let sectors = corner.ring_order.len();
+                let seam_carrying = corner
+                    .ring_vert_for_edge
+                    .iter()
+                    .any(|&(edge, _)| self.edge_is_interp_seam(edge));
+                (0..sectors)
+                    .map(|i| {
+                        if seam_carrying {
+                            return None;
+                        }
+                        let own_boundvert = corner.ring_order[i];
+                        edge_of_ring_vertex(&corner.ring_vert_for_edge, own_boundvert)
+                            .and_then(|edge| self.boundvert_representative(corner.vertex, edge))
+                            .and_then(|face| bank.index_of(face))
+                    })
+                    .collect()
+            })
+            .collect();
+
         // Stage 2 (§8.11.2 / §8.11.4): one profile chain per disk sector, built with
         // `mid = v` and `projection_dir = 0`. `ProfileCell::from_control_points` is
         // exactly that cell — the frame is the §8.2.2.1 one with `mid` promoted to the
@@ -1499,10 +1541,18 @@ impl LoopMesh {
                 .iter()
                 .map(|slot| slot.map(|index| bank.donor(index)))
                 .collect();
+            // §5.2.4.3: this corner's per-sector own-rep centre donors, resolved against the
+            // same pristine `bank`. All `None` when `v` is seam-carrying (deferred branch).
+            let centre_donors: Vec<Option<&CornerDonor>> = per_corner_centre_donor_idx
+                [corner_index]
+                .iter()
+                .map(|slot| slot.map(|index| bank.donor(index)))
+                .collect();
             let interior_blend = AdjInteriorBlend {
                 corner_vertex: corner.vertex,
                 sector_snaps: &per_corner_sector_snaps[corner_index],
                 sector_donors: &sector_donors,
+                centre_donors: &centre_donors,
             };
             self.emit_general_adj_fill(
                 corner.vertex,
@@ -6178,11 +6228,15 @@ impl LoopMesh {
             // *every* interior grid vert is a §5.2.1 step-1 copy of `v`'s block, so a
             // `NoInterp` layer keeps `cd(v)` and interpolable layers keep the `cd(v)` baseline
             // rather than falling to a layer default. At **odd** `segments` the central n-gon's
-            // mean-value blend donor is a separate stub (§5.2.4.2 last sentence / §5.2.5), so we
-            // mint that baseline and apply **no** blend. Edge mode carries no `interior_blend`,
-            // so it keeps the plain `create_vertex` default.
+            // `(i, h, h)` corner verts take the §5.2.4.3 own-rep interior blend (no-seam
+            // branch); every other odd interior vert keeps the bare `cd(v)` baseline (its
+            // donor is still a §5.2.5 stub). Edge mode carries no `interior_blend`, so it keeps
+            // the plain `create_vertex` default.
             _ => match interior_blend {
                 Some(blend) if even => self.mint_chain_interior_vert(position, canon, blend),
+                Some(blend) if canon.1 == half && canon.2 == half => {
+                    self.mint_centre_ngon_corner(position, canon.0, blend)
+                }
                 Some(blend) => self.mint_bevel_vertex(position, blend.corner_vertex),
                 None => self.create_vertex(position),
             },
@@ -6239,6 +6293,37 @@ impl LoopMesh {
             return self.mint_bevel_vertex(position, blend.corner_vertex);
         }
         match blend.sector_donors.get(sector).and_then(|d| *d) {
+            Some(donor) => {
+                let vertex = self.mint_bevel_vertex(position, blend.corner_vertex);
+                let sample = donor.projection.project(position);
+                let weights = mean_value_weights(&donor.proj_corners, sample);
+                self.vertex_attribs.interpolate_from_snapshot(
+                    vertex.as_usize(),
+                    &donor.corner_vertex_blocks,
+                    &weights,
+                );
+                vertex
+            }
+            None => self.mint_bevel_vertex(position, blend.corner_vertex),
+        }
+    }
+
+    /// Mint an odd-`segments` centre n-gon corner `(i, h, h)` with the §5.2.4.3 no-seam
+    /// blend. The corner is minted from the beveled corner `v` (§5.2.1 step-1 baseline, so a
+    /// `NoInterp` layer keeps `cd(v)`), then its interpolable per-vertex layers are overwritten
+    /// by the plain §10.1 interior mean-value blend of boundvert `sector`'s **own**
+    /// representative face at the corner's final position — no weight-snap (the innermost vert
+    /// sits well inside the donor, so no §10.1.3 boundary short-circuit fires). Each corner
+    /// reads its own sector's rep, so the value is per-sector-private and anchor-free. A `None`
+    /// donor (a seam-carrying corner — the deferred branch — or a gap leg) keeps the bare
+    /// `cd(v)` baseline.
+    fn mint_centre_ngon_corner(
+        &mut self,
+        position: Vec3,
+        sector: usize,
+        blend: &AdjInteriorBlend<'_>,
+    ) -> VertexKey {
+        match blend.centre_donors.get(sector).and_then(|d| *d) {
             Some(donor) => {
                 let vertex = self.mint_bevel_vertex(position, blend.corner_vertex);
                 let sample = donor.projection.project(position);
@@ -14969,19 +15054,21 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §5.2.4.2 (lines ~1574–1580): the mint-from-`v` baseline is parity-independent.
-    /// At **odd** `segments` the central n-gon's blend donor is a separate stub (§5.2.5), so no
-    /// blend runs — but every chain-interior grid vert is still a §5.2.1 step-1 copy of the
-    /// beveled corner `v`'s per-vertex block. The regression this guards: the pre-fix odd arm
-    /// fell through to `create_vertex`, dropping a `NoInterp` layer to its default and an
-    /// interpolable layer off the `cd(v)` baseline. With the mint-from-`v` baseline restored and
-    /// no blend applied, every interior vert keeps `cd(v)` exactly on *every* layer.
+    /// BEVEL.md §5.2.4.3 (no-seam branch): at **odd** `segments` the [V-ADJ] fill closes on a
+    /// central `s`-gon whose `s` corner verts `(i, h, h)` are minted from the beveled corner
+    /// `v` (§5.2.1 step-1 baseline, so a `NoInterp` layer keeps `cd(v)`) and then blended. On a
+    /// **not-seam-carrying** corner — the fully-interior cube corner — each centre corner takes
+    /// the plain §10.1 interior mean-value blend of boundvert `i`'s **own** representative face
+    /// (no snap). At `segments = 3` (`h = 1`) the valence-3 cap's only interior verts *are*
+    /// those three centre corners, so this pins them all: the `NoInterp` layer keeps `cd(v)`,
+    /// and the interpolable layer is a genuine blend — no longer the bare `cd(v)` baseline the
+    /// pre-blend code left, but a convex combination inside the original-tint hull.
     #[test]
-    fn vertex_bevel_seg3_chain_interior_verts_mint_from_v_baseline() {
+    fn vertex_bevel_seg3_centre_ngon_corners_blend_from_own_rep() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
-        // An interpolable layer: with no odd-donor blend, it must stay at the `cd(v)` baseline
-        // rather than the layer default (0.0) the pre-fix `create_vertex` mint produced.
+        // An interpolable layer: the centre corners must now carry the own-rep interior blend,
+        // never the bare `cd(v)` baseline nor the 0.0 layer default.
         let tint = mesh
             .register_vertex_attribute(ElementAttributeDesc::numeric(
                 AttributeKey::custom("tint"),
@@ -14989,7 +15076,7 @@ mod tests {
             ))
             .unwrap();
         // A NoInterp layer: it can only ever carry a value that was copied, never blended, so it
-        // is the sharp discriminator between the mint-from-`v` baseline and the layer default.
+        // is the sharp discriminator that the centre corners still mint from `v`.
         let seed = mesh
             .register_vertex_attribute(
                 ElementAttributeDesc::numeric(AttributeKey::custom("seed"), AttrType::F32)
@@ -15019,6 +15106,15 @@ mod tests {
             mesh.vertex_attribs_mut().set_f32(tint, v.as_usize(), value);
         }
 
+        // The original-tint hull the convex own-rep blend must land inside.
+        let (tint_min, tint_max) = mesh.vert_keys().into_iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(lo, hi), v| {
+                let t = mesh.vertex_attribs().get_f32(tint, v.as_usize()).unwrap();
+                (lo.min(t), hi.max(t))
+            },
+        );
+
         let result = mesh.bevel(
             &[corner.into()],
             BevelOptions {
@@ -15031,6 +15127,7 @@ mod tests {
         mesh.validate_topology();
 
         // Interior verts: strictly inside the corner octant, off all three incident face planes.
+        // At `segments = 3` these are exactly the three centre n-gon corners `(i, 1, 1)`.
         const EPS: f32 = 1.0e-3;
         let interior: Vec<VertexKey> = result
             .verts
@@ -15041,25 +15138,31 @@ mod tests {
                 p.x < 1.0 - EPS && p.y > -1.0 + EPS && p.z > -1.0 + EPS
             })
             .collect();
-        assert!(
-            !interior.is_empty(),
-            "the odd seg=3 valence-3 cap must mint interior grid verts",
+        assert_eq!(
+            interior.len(),
+            3,
+            "the odd seg=3 valence-3 cap's interior verts are exactly the 3 centre n-gon corners",
         );
 
-        // Every interior vert is a §5.2.1 step-1 copy of `v`: its NoInterp `seed` keeps `cd(v)`'s
-        // 7.0 (not the 0.0 default), and — since the odd donor is stubbed, no blend runs — its
-        // interpolable `tint` also keeps `cd(v)`'s 0.11 exactly, never the 0.0 default.
         for &v in &interior {
+            // §5.2.1 step 1: the NoInterp `seed` keeps `cd(v)`'s 7.0 — the blend never writes it.
             let s = mesh.vertex_attribs().get_f32(seed, v.as_usize()).unwrap();
             assert_eq!(
                 s, 7.0,
-                "interior vert {v:?} must mint from v (NoInterp seed keeps cd(v)), not the default",
+                "centre corner {v:?} must mint from v (NoInterp seed keeps cd(v))",
             );
+            // §5.2.4.3: the interpolable layer is now the own-rep interior blend — a real blend,
+            // never the bare `cd(v)` baseline the pre-blend code left, and inside the tint hull.
             let t = mesh.vertex_attribs().get_f32(tint, v.as_usize()).unwrap();
             assert!(
-                (t - corner_tint).abs() < 1.0e-6,
-                "interior vert {v:?} tint {t} must keep the cd(v) baseline {corner_tint} \
-                 (no odd-donor blend), never the layer default 0.0",
+                (t - corner_tint).abs() > 1.0e-4,
+                "centre corner {v:?} tint {t} must be the own-rep blend, not the cd(v) baseline \
+                 {corner_tint}",
+            );
+            assert!(
+                t >= tint_min - 1.0e-4 && t <= tint_max + 1.0e-4,
+                "centre corner {v:?} tint {t} must lie inside the original-tint hull \
+                 [{tint_min}, {tint_max}]",
             );
         }
     }
