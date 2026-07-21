@@ -5089,10 +5089,13 @@ impl LoopMesh {
             })
             .collect();
 
-        // §6.6.1: the mitered fill's inherit source, registered while the junction still
-        // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
-        // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
-        let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        // §6.6.2 grid row: each non-centre grid face takes its own sector's positional donor,
+        // not one uniform rep — a two-material split-sector junction diverges otherwise.
+        let sector_representatives: Vec<FaceTemplate> = self
+            .miter_ring_sector_donors(vertex, &cross_edge)
+            .into_iter()
+            .map(|donor| templates.register(donor))
+            .collect();
         let central_representative = templates.register(self.ring_spanning_donor(
             vertex,
             is_beveled,
@@ -5100,6 +5103,19 @@ impl LoopMesh {
             segments,
             templates.interp_components(),
         ));
+        // §6.6.2 / §8.9.3: at odd `segments` each sector's centre column resolves its own
+        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector, the §6.6.1.4
+        // tie-break unconditionally for an edge-less (miter-split) boundvert. Computed
+        // pristine here so it survives the re-stitch.
+        let centre_column_donors = self.miter_ring_centre_column_donors(
+            vertex,
+            &cross_edge,
+            templates.interp_components(),
+        );
+        let centre_column_representatives: Vec<FaceTemplate> = centre_column_donors
+            .into_iter()
+            .map(|donor| templates.register(donor))
+            .collect();
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -5110,8 +5126,9 @@ impl LoopMesh {
             cross_edges: cross_edge,
             segments,
             profile,
-            representative,
+            sector_representatives,
             central_representative,
+            centre_column_representatives,
         });
         true
     }
@@ -5557,10 +5574,13 @@ impl LoopMesh {
             Vec::new()
         };
 
-        // §6.6.1: the mitered fill's inherit source, registered while the junction still
-        // has its faces — the re-stitch consumes the vertex. The cap's odd-`segments`
-        // centre n-gon is ring-spanning and takes the §6.6.1.4-displaced donor instead.
-        let representative = templates.register(self.vert_face_keys(vertex).first().copied());
+        // §6.6.2 grid row: each non-centre grid face takes its own sector's positional donor,
+        // not one uniform rep — a two-material split-sector junction diverges otherwise.
+        let sector_representatives: Vec<FaceTemplate> = self
+            .miter_ring_sector_donors(vertex, &cross_edge)
+            .into_iter()
+            .map(|donor| templates.register(donor))
+            .collect();
         let central_representative = templates.register(self.ring_spanning_donor(
             vertex,
             is_beveled,
@@ -5568,6 +5588,19 @@ impl LoopMesh {
             segments,
             templates.interp_components(),
         ));
+        // §6.6.2 / §8.9.3: at odd `segments` each sector's centre column resolves its own
+        // donor — a seam-gated own-rep-vs-tie-break for a beveled sector, the §6.6.1.4
+        // tie-break unconditionally for the outer arc's edge-less far-flank partner. Computed
+        // pristine here.
+        let centre_column_donors = self.miter_ring_centre_column_donors(
+            vertex,
+            &cross_edge,
+            templates.interp_components(),
+        );
+        let centre_column_representatives: Vec<FaceTemplate> = centre_column_donors
+            .into_iter()
+            .map(|donor| templates.register(donor))
+            .collect();
 
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
@@ -5578,8 +5611,9 @@ impl LoopMesh {
             cross_edges: cross_edge,
             segments,
             profile,
-            representative,
+            sector_representatives,
             central_representative,
+            centre_column_representatives,
         });
         true
     }
@@ -5763,11 +5797,16 @@ impl LoopMesh {
         let count = omj.boundverts.len();
         // A miter splits at least one sector of an `s ≥ 3` ring, so the enlarged ring
         // always carries `≥ 4` boundverts.
-        if count < 4 || omj.chains.len() != count || omj.profiles.len() != count {
+        if count < 4
+            || omj.chains.len() != count
+            || omj.profiles.len() != count
+            || omj.sector_representatives.len() != count
+            || omj.centre_column_representatives.len() != count
+        {
             return;
         }
-        let representative = templates.resolve(omj.representative);
-        let sector_representatives = vec![representative; omj.chains.len()];
+        let sector_representatives = omj.resolve_sector_representatives(templates);
+        let centre_column_representatives = omj.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(omj.central_representative);
         // The arc forces the circular profile, so this fill is never the flat cap.
         // §8.9.5.3: feed the centre stencil the raw coarse control-net mids (populated
@@ -5787,10 +5826,11 @@ impl LoopMesh {
             raw_coarse_mids,
             material,
             &sector_representatives,
-            // The miter ring's per-sector centre-column scoping (§8.9.3 / §6.6.2, a
-            // miter-split boundvert's tie-break) is not yet distilled onto this path, so
-            // the centre column keeps the sector's positional donor.
-            &sector_representatives,
+            // §8.9.3 / §6.6.2: at odd `segments` the centre column of an edge-less
+            // (miter-split) boundvert takes the §6.6.1.4 tie-break donor; every other
+            // centre column keeps the sector's positional donor. Even `segments` reads
+            // none of these (no centre column).
+            &centre_column_representatives,
             central_representative,
             // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
             // leave the welded apex and the chain-interior verts at their §5.2.4 minted
@@ -10158,6 +10198,117 @@ impl LoopMesh {
         self.donor_tie_break(&candidates, components).or(own_face)
     }
 
+    /// The per-sector stage-1 donors of a **miter cap's** enlarged ring's **non-centre**
+    /// [V-ADJ] grid faces (BEVEL.md §6.6.2's grid row, edge bevel), keyed on the ring's
+    /// `cross_edges`. One per sector `i` in `chains` / `boundverts` order — the sector whose
+    /// sub-patch is anchored at `boundverts[i]`, whose outgoing chain crosses `cross_edges[i]`.
+    ///
+    /// Each sector takes its **own** boundvert's positional rep: **no** seam gate and **no**
+    /// tie-break enter (§6.6.2 re-routes only the centre column, a distinct slot resolved by
+    /// [`miter_ring_centre_column_donors`](Self::miter_ring_centre_column_donors)). Two
+    /// regimes per sector `i`:
+    ///
+    /// - `cross_edges[i]` is `Some(edge)` — the boundvert owns that beveled edge; its rep is
+    ///   [`boundvert_representative`](Self::boundvert_representative) of it, exactly as
+    ///   [`JunctionCut`]'s per-sector grid donors resolve (§6.6.1's per-sector rule).
+    /// - `cross_edges[i]` is `None` — an **edge-less** miter-split boundvert (§8.9): its
+    ///   outgoing chain is the internal arc / patch chord, so it owns no beveled edge. Its
+    ///   rep follows §6.6.1's edge-less-boundvert primitive: the face departing along the
+    ///   **previous** boundvert's beveled edge, else the one arriving along the **next**
+    ///   boundvert's — the same own-rep the centre-column donor computes before its tie-break.
+    ///
+    /// Read pristine (arriving / departing faces need the junction's original faces intact),
+    /// like every §6.6.1 donor.
+    fn miter_ring_sector_donors(
+        &self,
+        vertex: VertexKey,
+        cross_edges: &[Option<EdgeKey>],
+    ) -> Vec<Option<FaceKey>> {
+        let count = cross_edges.len();
+        (0..count)
+            .map(|i| match cross_edges[i] {
+                Some(edge) => self.boundvert_representative(vertex, edge),
+                None => {
+                    let prev_edge = cross_edges[(i + count - 1) % count];
+                    let next_edge = cross_edges[(i + 1) % count];
+                    prev_edge
+                        .and_then(|edge| self.departing_face(vertex, edge))
+                        .or_else(|| next_edge.and_then(|edge| self.arriving_face(vertex, edge)))
+                }
+            })
+            .collect()
+    }
+
+    /// The per-boundvert stage-1 donor of a **miter cap's** centre column at odd `segments`
+    /// (BEVEL.md §6.6.2's [V-ADJ] grid row / §8.9.3), keyed on the enlarged ring's
+    /// `cross_edges`. No ring-wide uniform donor enters: each sector resolves its own.
+    ///
+    /// Two regimes, per boundvert `i`:
+    ///
+    /// - `cross_edges[i]` is `Some(edge)` — the boundvert owns that beveled edge. Its centre
+    ///   column takes the sector's **own** rep when `edge` is *not* an interpolation seam,
+    ///   and the §6.6.1.4 tie-break between this and the **next** boundvert's rep when it
+    ///   *is* — the seam-gated pick of [`centre_column_donor`](Self::centre_column_donor).
+    ///   A boundary-touching cap has both beveled legs seamed, so its beveled sectors route
+    ///   through the tie-break too.
+    /// - `cross_edges[i]` is `None` — an **edge-less** miter-split boundvert (§8.9): the
+    ///   arc's far-flank partner, whose outgoing chain is the internal arc and so crosses no
+    ///   beveled edge. It owns none, so its centre column takes the §6.6.1.4 tie-break
+    ///   between **this** boundvert's own rep and the **next** boundvert's rep
+    ///   *unconditionally* — there is no beveled edge to seam-gate on (§6.6.2's centre-column
+    ///   row, edge-less arm). The own rep follows §6.6.1's edge-less-boundvert primitive:
+    ///   the face departing along the previous boundvert's beveled edge, else the one
+    ///   arriving along the next boundvert's. Both neighbours own a beveled edge — an
+    ///   edge-less boundvert is always flanked by beveled ring boundverts — so both keys
+    ///   resolve on any well-formed ring.
+    ///
+    /// The **next** boundvert's rep is the per-sector own rep
+    /// [`miter_ring_sector_donors`](Self::miter_ring_sector_donors) computes, so a beveled
+    /// sector and the edge-less arm read that candidate the same way. Read pristine
+    /// (arriving / departing faces need the junction's original faces intact), like every
+    /// donor of §6.6.1.
+    fn miter_ring_centre_column_donors(
+        &self,
+        vertex: VertexKey,
+        cross_edges: &[Option<EdgeKey>],
+        components: Option<&InterpComponents>,
+    ) -> Vec<Option<FaceKey>> {
+        let count = cross_edges.len();
+        let sector_reps = self.miter_ring_sector_donors(vertex, cross_edges);
+        (0..count)
+            .map(|i| {
+                let next_i = (i + 1) % count;
+                match cross_edges[i] {
+                    Some(edge) => self.centre_column_donor(
+                        edge,
+                        sector_reps[i],
+                        sector_reps[next_i],
+                        true,
+                        components,
+                    ),
+                    None => {
+                        let prev_edge = cross_edges[(i + count - 1) % count];
+                        let next_edge = cross_edges[next_i];
+                        let own = prev_edge
+                            .and_then(|edge| self.departing_face(vertex, edge))
+                            .or_else(|| {
+                                next_edge.and_then(|edge| self.arriving_face(vertex, edge))
+                            });
+                        let next_rep =
+                            next_edge.and_then(|edge| self.boundvert_representative(vertex, edge));
+                        let mut candidates: Vec<FaceKey> = Vec::with_capacity(2);
+                        for face in [own, next_rep].into_iter().flatten() {
+                            if !candidates.contains(&face) {
+                                candidates.push(face);
+                            }
+                        }
+                        self.donor_tie_break(&candidates, components).or(own)
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// The **edge-level** form of BEVEL.md §6.6.1.4's interpolation-seam test: is `edge`
     /// itself a seam? This is what the strip's centre quad keys on, as against the
     /// corner-level "any incident leg is a seam" form of the ring-spanning fills. It is not
@@ -12044,14 +12195,28 @@ struct MiterRingJunction {
     /// frame), so this is `0.5` today — carried rather than re-asserted as a literal at the
     /// fill, so widening the miter gate cannot silently leave the cap's fullness behind.
     profile: f32,
-    /// The stage-1 inherit donor for this junction's fill faces (BEVEL.md §6.6.1, read at
-    /// every value of `material`), captured pristine for the same reason [`JunctionCut`]'s
-    /// is.
-    representative: FaceTemplate,
+    /// Per sector `i` (same order as `boundverts` / `chains`), the [V-ADJ] grid donor of
+    /// that sector's **non-centre** faces (BEVEL.md §6.6.2's grid row, edge bevel): the
+    /// sector's **own** boundvert rep — `boundvert_representative` of `cross_edges[i]` for a
+    /// beveled sector, or §6.6.1's edge-less-boundvert primitive for a miter-split
+    /// (edge-less) one whose `cross_edges` entry is `None`. Captured pristine (the re-stitch
+    /// consumes the junction vertex), exactly as [`JunctionCut::sector_representatives`] is.
+    /// The centre column is a distinct slot (`centre_column_representatives`), which is the
+    /// only grid face that ever re-routes off this positional donor (§6.6.2).
+    sector_representatives: Vec<FaceTemplate>,
     /// The donor of the miter cap's **odd-`segments` centre n-gon** — the same
     /// ring-spanning fill [`JunctionCut::central_representative`] carries, over the miter's
     /// enlarged ring.
     central_representative: FaceTemplate,
+    /// Per boundvert (same order as `boundverts`), the stage-1 donor of that sector's
+    /// **centre column** at odd `segments` — the `k == segments/2` bridge strip meeting the
+    /// centre n-gon (BEVEL.md §6.6.2's [V-ADJ] grid row / §8.9.3). A boundvert that owns a
+    /// beveled edge takes that sector's **own** rep when the edge is a non-seam, else the
+    /// §6.6.1.4 tie-break between its own rep and the next boundvert's rep; an **edge-less**
+    /// miter-split boundvert — the arc's far-flank partner, which owns no beveled edge —
+    /// takes that tie-break *unconditionally* (no seam gate). No ring-wide uniform donor
+    /// enters. Unread at even `segments`, where the cap has no centre column.
+    centre_column_representatives: Vec<FaceTemplate>,
 }
 
 impl MiterRingJunction {
@@ -12068,6 +12233,31 @@ impl MiterRingJunction {
                 cross_edge,
                 samples: samples.clone(),
             })
+            .collect()
+    }
+
+    /// Resolve the per-sector [V-ADJ] grid donors (BEVEL.md §6.6.2's grid row) against the
+    /// sealed template bank — one per sector, in `boundverts` / `chains` order. Mirrors
+    /// [`JunctionCut::resolve_sector_representatives`] over the miter's enlarged ring.
+    fn resolve_sector_representatives<'a>(
+        &self,
+        templates: &'a TemplateBank,
+    ) -> Vec<FaceTemplateRef<'a>> {
+        self.sector_representatives
+            .iter()
+            .map(|&template| templates.resolve(template))
+            .collect()
+    }
+
+    /// Resolve the per-boundvert odd-`segments` centre-column donors (BEVEL.md §6.6.2 /
+    /// §8.9.3) against the sealed bank. Unread at even `segments` (no centre column).
+    fn resolve_centre_column_representatives<'a>(
+        &self,
+        templates: &'a TemplateBank,
+    ) -> Vec<FaceTemplateRef<'a>> {
+        self.centre_column_representatives
+            .iter()
+            .map(|&template| templates.resolve(template))
             .collect()
     }
 }
@@ -35784,6 +35974,192 @@ mod tests {
             mesh.centre_column_donor(manifold, Some(own), Some(next), false, None),
             Some(next),
             "an unbeveled / miter-split boundvert takes the tie-break unconditionally",
+        );
+    }
+
+    /// A fan around `v0` whose three legs flank two distinct-slot faces, plus the two edge
+    /// handles a miter ring's `cross_edges` names on either side of an edge-less boundvert.
+    /// `own` (slot 5) departs along `{v0,r0}`; `next` (slot 2) arrives along `{v0,r2}` — so
+    /// an edge-less slot flanked by `Some({v0,r0})` / `Some({v0,r2})` tie-breaks between them.
+    fn miter_centre_column_fan() -> (LoopMesh, VertexKey, EdgeKey, EdgeKey, FaceKey, FaceKey) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.0, 1.0, 20.0));
+        let r2 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 30.0));
+        let own = mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        let next = mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+        mesh.set_face_material_index(own, 5);
+        mesh.set_face_material_index(next, 2);
+        let e_prev = mesh.query_edge_exists(v0, r0).unwrap();
+        let e_next = mesh.query_edge_exists(v0, r2).unwrap();
+        (mesh, v0, e_prev, e_next, own, next)
+    }
+
+    /// BEVEL.md §6.6.2 / §8.9.3: on a miter cap's enlarged ring, both a **seamed beveled**
+    /// sector's centre column and an **edge-less** (miter-split) boundvert's centre column
+    /// route through the §6.6.1.4 tie-break — the beveled sector because its boundary leg is
+    /// a condition-(1) seam, the edge-less boundvert unconditionally. Neither takes a
+    /// ring-wide uniform donor. Pins the direction: the lower-slot face of {this boundvert's
+    /// own rep, the next boundvert's rep} donates.
+    #[test]
+    fn miter_ring_seamed_beveled_and_edge_less_centre_columns_take_the_tie_break() {
+        let (mesh, v0, e_prev, e_next, own, next) = miter_centre_column_fan();
+        // Both beveled legs `{v0,r0}` and `{v0,r2}` are boundary edges — §6.6.1.4
+        // condition-(1) seams — so every sector's centre column takes the tie-break.
+        let cross_edges = [Some(e_prev), None, Some(e_next)];
+        assert!(mesh.edge_is_interp_seam(e_prev), "the beveled leg `{{v0,r0}}` is a seam");
+        assert!(mesh.edge_is_interp_seam(e_next), "the beveled leg `{{v0,r2}}` is a seam");
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+
+        assert_eq!(donors.len(), 3);
+        // Edge-less sector 1: tie-break between its own rep (`own`, 5) and the next
+        // boundvert's rep (`next`, 2) → the lower slot `next`.
+        assert_eq!(
+            donors[1],
+            Some(next),
+            "the edge-less boundvert's centre column takes the §6.6.1.4 tie-break (lower slot)",
+        );
+        // Seamed beveled sector 2: its own rep is `next` (2), its next boundvert (wrap to
+        // sector 0) reps `own` (5); the seam routes it through the tie-break, which picks the
+        // lower slot `next`. A non-seam edge would keep the own rep `next` here too, but the
+        // discriminating fact is that the *ring-wide* uniform donor `own` is **not** taken.
+        assert_eq!(
+            donors[2],
+            Some(next),
+            "a seamed beveled sector routes through the §6.6.1.4 tie-break, not a uniform donor",
+        );
+        assert_ne!(donors[2], donors[0], "sector 2's centre column is not sector 0's donor");
+        // Seamed beveled sector 0: own rep `own` (5); its next boundvert (edge-less sector 1)
+        // also reps `own`, so the tie-break's only candidate is `own` — it resolves there via
+        // the tie-break, not by keeping a ring-wide uniform positional donor.
+        assert_eq!(donors[0], Some(own), "sector 0's tie-break has the single candidate `own`");
+    }
+
+    /// The direction of the tie-break is the §6.6.1.4 material-slot key: the **lower** slot
+    /// donates. Swapping which flank carries the lower slot swaps the edge-less centre
+    /// column's donor, proving the pick is geometric/material-directed, not a fixed side.
+    #[test]
+    fn miter_ring_edge_less_centre_column_follows_the_material_slot_direction() {
+        let (mut mesh, v0, e_prev, e_next, own, next) = miter_centre_column_fan();
+        let cross_edges = [Some(e_prev), None, Some(e_next)];
+
+        // As built: `own` = slot 5, `next` = slot 2 → the lower slot `next` wins.
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(donors[1], Some(next), "lower slot (`next` = 2) donates");
+
+        // Flip the slots: now `own` is the lower slot, so it wins the same edge-less column.
+        mesh.set_face_material_index(own, 2);
+        mesh.set_face_material_index(next, 5);
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(
+            donors[1],
+            Some(own),
+            "after the swap the lower slot (`own` = 2) donates — the pick is slot-directed",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's grid row: a miter cap's enlarged-ring **non-centre** grid faces take
+    /// each sector's **own** boundvert rep — a per-sector positional donor, never one uniform
+    /// rep shared across the ring. No seam gate, no tie-break enters (that is the centre
+    /// column's business). Pins the direction so a two-material split-sector junction cannot
+    /// silently collapse back to a single donor.
+    #[test]
+    fn miter_ring_sector_donors_are_per_sector_positional_own_reps() {
+        let (mesh, v0, e_prev, e_next, own, next) = miter_centre_column_fan();
+        // Ring slot 1 is the edge-less (arc) sector; slots 0 / 2 own the beveled legs
+        // `{v0,r0}` (→ `own`, slot 5) and `{v0,r2}` (→ `next`, slot 2).
+        let cross_edges = [Some(e_prev), None, Some(e_next)];
+        let donors = mesh.miter_ring_sector_donors(v0, &cross_edges);
+
+        assert_eq!(donors.len(), 3);
+        // Beveled sector 0: its own boundvert rep along `e_prev` — `own`.
+        assert_eq!(
+            donors[0],
+            Some(own),
+            "a beveled sector takes `boundvert_representative` of its own cross edge",
+        );
+        // Beveled sector 2: its own boundvert rep along `e_next` — `next`, *distinct* from
+        // sector 0's donor. This is the per-sector fact the uniform `vec![rep; n]` erased.
+        assert_eq!(
+            donors[2],
+            Some(next),
+            "a distinct beveled sector takes its own (distinct) rep, not sector 0's",
+        );
+        assert_ne!(
+            donors[0], donors[2],
+            "sectors with different own faces get different donors — the divergence the fix closes",
+        );
+        // Edge-less sector 1: §6.6.1's edge-less primitive — the face departing along the
+        // previous boundvert's beveled edge (`own`), no tie-break (unlike the centre column).
+        assert_eq!(
+            donors[1],
+            Some(own),
+            "an edge-less sector's non-centre faces take the departing-prev own-rep primitive",
+        );
+    }
+
+    /// The edge-less sector's non-centre grid donor is the *positional* own-rep primitive —
+    /// **not** the §6.6.1.4 tie-break the centre column of that same sector takes. Contrasts
+    /// the two slots on one fixture: on a seamed edge-less sector they diverge.
+    #[test]
+    fn miter_ring_edge_less_sector_donor_is_positional_not_the_centre_column_tie_break() {
+        let (mesh, v0, e_prev, e_next, own, next) = miter_centre_column_fan();
+        let cross_edges = [Some(e_prev), None, Some(e_next)];
+
+        // Non-centre grid faces: positional own-rep = departing along `e_prev` = `own` (5).
+        let sector = mesh.miter_ring_sector_donors(v0, &cross_edges);
+        assert_eq!(sector[1], Some(own), "grid faces keep the positional own-rep");
+
+        // The centre column of the same edge-less sector routes through the tie-break, which
+        // the fan resolves to the lower-slot `next` (2) — a strictly different donor.
+        let centre = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(centre[1], Some(next), "the centre column takes the tie-break winner");
+        assert_ne!(
+            sector[1], centre[1],
+            "grid vs centre-column donors are distinct slots on a seamed edge-less sector",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's beveled arm: a sector whose beveled edge is **not** an interpolation
+    /// seam keeps that sector's **own** rep — the seam gate short-circuits before the
+    /// §6.6.1.4 tie-break. Built with an interior (radial-2, untextured) beveled edge so the
+    /// edge is a non-seam, and with the next boundvert carrying a lower material slot so the
+    /// tie-break *would* pick a different face — proving the own rep, not the tie-break
+    /// winner, is what a non-seam beveled centre column takes.
+    #[test]
+    fn miter_ring_non_seam_beveled_centre_column_keeps_its_own_rep() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let a = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let b = mesh.create_vertex(Vec3::new(0.0, 1.0, 20.0));
+        let c = mesh.create_vertex(Vec3::new(-1.0, 0.0, 30.0));
+        // `{v0,b}` is shared by both faces — an interior radial-2 leg; with no loop layers it
+        // is a non-seam. `{v0,c}` is a boundary leg of the next sector.
+        let own = mesh.face_create_verts(&[v0, a, b], FaceCreateFlags::NONE);
+        let next = mesh.face_create_verts(&[v0, b, c], FaceCreateFlags::NONE);
+        mesh.set_face_material_index(own, 7);
+        mesh.set_face_material_index(next, 3);
+
+        let e_mid = mesh.query_edge_exists(v0, b).unwrap();
+        let e_next = mesh.query_edge_exists(v0, c).unwrap();
+        assert!(!mesh.edge_is_interp_seam(e_mid), "an interior untextured beveled edge is not a seam");
+
+        // Sector 0's own rep is `own` (7); the next boundvert reps `next` (3), so a tie-break
+        // would pick the lower slot `next` — distinct from the own rep the non-seam gate keeps.
+        assert_eq!(mesh.boundvert_representative(v0, e_mid), Some(own), "sector 0's own rep is `own`");
+        assert_eq!(
+            mesh.donor_tie_break(&[own, next], None),
+            Some(next),
+            "fixture sanity: the tie-break would pick the lower-slot `next`",
+        );
+
+        let cross_edges = [Some(e_mid), Some(e_next)];
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(
+            donors[0],
+            Some(own),
+            "a non-seam beveled sector's centre column keeps its own rep, not the tie-break winner",
         );
     }
 }
