@@ -2353,6 +2353,34 @@ impl LoopMesh {
                 continue;
             }
             match options.vmesh_method {
+                // §8.3.4.1: a cutoff ring that clears the pipe-override gate abandons its cut
+                // faces and takes the all-quad adjacency grid instead. The connected fill is
+                // **byte-identical to a from-scratch ADJ bevel** — same topology *and*
+                // positions, because condition 3 forces a locally flat neighbourhood — so the
+                // connected half is a plain delegation to `build_adj_fill`. On top of it the
+                // override also leaves `(segments − 1) · s` **loose, valence-0 leftover verts**:
+                // the cutoff pass sampled each beveled boundvert's profile-arc interior points
+                // as real verts before the pipe test redirected the fill, and the ADJ builder
+                // rebuilt its own arc and orphaned them. So V = V(ADJ) + (segments − 1)·s while
+                // E and F match ADJ exactly.
+                BevelVmeshMethod::Cutoff if cut.pipe_override => {
+                    self.build_adj_fill(
+                        cut,
+                        &chains,
+                        segments,
+                        options.profile,
+                        material,
+                        &templates,
+                        result,
+                    );
+                    self.mint_pipe_override_loose_verts(
+                        cut,
+                        &chains,
+                        segments,
+                        options.profile,
+                        result,
+                    );
+                }
                 BevelVmeshMethod::Cutoff => {
                     self.build_cutoff_fill(
                         cut,
@@ -2526,6 +2554,22 @@ impl LoopMesh {
         let outward = self.junction_outward_normal(vertex);
         let count = boundverts.len();
 
+        // §8.3.4.1: read the pipe-override verdict off the *original* corner before the
+        // chains are built — the beveled-edge directions and incident-face normals are
+        // consumed by the re-stitch. It is captured here (not only carried on the cut for
+        // the fill-time routing) because it also decides the chains' emission: a ring that
+        // takes the override delegates its **connected** fill to the ordinary ADJ path, and
+        // that path's rim must be byte-identical to a from-scratch ADJ bevel — i.e. built on
+        // the **resampled** chain, exactly the emission a plain ADJ junction gets, not the
+        // raw cutoff arc. (The `(segments − 1) · s` loose leftovers are minted separately at
+        // the raw arc samples; only the connected rim moves to the resampled positions.)
+        let pipe_override = self.pipe_override_admits(vertex, vertex_position, &opening_edges);
+        let chain_emission = if pipe_override {
+            ChainEmission::Resampled
+        } else {
+            emission
+        };
+
         if count == 2 {
             // §8.3.0.3: a two-boundvert ring bounds no region — the two sectors' chains
             // span the *same* boundvert pair in opposite directions. They are welded into
@@ -2558,7 +2602,7 @@ impl LoopMesh {
                     profile,
                     rescue,
                     None,
-                    emission,
+                    chain_emission,
                     result,
                 );
                 chains.push(EdgeEndChain {
@@ -2603,6 +2647,7 @@ impl LoopMesh {
             representative,
             central_representative,
             dihedral_band_ok,
+            pipe_override,
         });
     }
 
@@ -3670,6 +3715,67 @@ impl LoopMesh {
             );
             result.faces.push(face);
             self.collect_face_edges(face, result);
+        }
+    }
+
+    /// Mint the §8.3.4.1 pipe-override **loose leftover verts** at a re-tiled junction.
+    ///
+    /// A CUTOFF ring that clears the pipe gate has its connected fill delegated to the
+    /// ADJ grid, byte-identical to a from-scratch ADJ bevel (topology *and* positions,
+    /// the locally flat neighbourhood of condition 3 removing every position freedom).
+    /// But the cutoff pass had already laid down — per beveled boundvert — that
+    /// boundvert's profile-arc `segments − 1` interior points as real verts, *before*
+    /// the pipe test redirected the fill; the ADJ builder then rebuilt its own boundary
+    /// arc and never consumed them. They persist as valence-0 verts in **no edge and no
+    /// face**. This re-creates that surplus: `(segments − 1) · s` loose verts, `s` being
+    /// the ring's beveled-edge count (= its boundvert count here, one beveled spoke per
+    /// sector), placed at the **CUTOFF profile arc** interior samples — the raw
+    /// (un-resampled) superellipse the cutoff fill reads (§8.2.2.1.1 Scope: the cutoff
+    /// fill is not a [V-ADJ] cap, so it emits `ChainEmission::Raw`). At `segments = 2`
+    /// each lands on its profile midpoint (coincident with the ADJ mid-edge ring node);
+    /// at `segments ≥ 3` the cutoff samples differ from the ADJ interior samples and the
+    /// leftovers sit at their own distinct positions. E and F are untouched.
+    fn mint_pipe_override_loose_verts(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        profile: f32,
+        result: &mut BevelResult,
+    ) {
+        if segments < 2 {
+            return;
+        }
+        let count = cut.boundverts.len();
+        for k in 0..count {
+            let next = (k + 1) % count;
+            let start_boundvert = cut.boundverts[k];
+            let end_boundvert = cut.boundverts[next];
+            let chain = chains.iter().find(|c| {
+                c.endpoint == cut.vertex
+                    && ((c.start == start_boundvert && c.end == end_boundvert)
+                        || (c.start == end_boundvert && c.end == start_boundvert))
+            });
+            // Every consecutive boundvert pair of a pipe-override ring was chained (with a
+            // profile cell) by `build_junction_chains` just above; a missing chain or cell
+            // is an internal-invariant break, not a graceful skip.
+            let Some(chain) = chain else {
+                debug_assert!(false, "pipe-override sector {k} has no chain to sample");
+                return;
+            };
+            let Some(cell) = chain.cell.as_ref() else {
+                debug_assert!(false, "pipe-override sector {k} chain carries no profile cell");
+                return;
+            };
+            let positions = cell.chain_positions(segments, profile, ChainEmission::Raw);
+            for position in positions.iter().take(positions.len() - 1).skip(1) {
+                // §5.1.1: minted loose — in no edge and no face. No later phase re-points
+                // or frees it (the wire re-attach and endpoint-free passes key on named
+                // endpoints, not on new verts), so it stays orphaned, matching the
+                // reference operator's leftover.
+                let leftover = self.create_vertex(*position);
+                result.verts.push(leftover);
+            }
         }
     }
 
@@ -5742,6 +5848,73 @@ impl LoopMesh {
             normal = -normal;
         }
         Some(normal)
+    }
+
+    /// The §8.3.4.1 **pipe-override** gate on the **original** corner: whether this multi-edge
+    /// junction re-tiles its `CUTOFF` ring as the all-quad adjacency grid instead of the
+    /// per-sector cut faces. All three conditions of §8.3.4.1 must hold:
+    ///
+    /// 1. **Ring of 3 or 4.** The junction has exactly 3 or 4 beveled spokes (one per sector,
+    ///    hence 3 or 4 boundverts). At `s ≥ 5` the ordinary cut faces stand even with an
+    ///    anti-parallel pair present.
+    /// 2. **A collinear opposite pair.** Two beveled spokes are exactly **anti-parallel**
+    ///    through `vertex` — their rays out of `v` point in opposite directions to within the
+    ///    §7.6.2 near-collinear angular tolerance. The shared line is the **pipe axis**.
+    /// 3. **Incident faces parallel to the pipe axis.** Every face touching the junction has
+    ///    its normal perpendicular to the pipe axis, so the pipe runs straight through a
+    ///    locally flat neighbourhood rather than turning a corner.
+    ///
+    /// Read from the pristine corner (its edges and faces are about to be consumed by the
+    /// re-stitch), so it is captured at ring-placement time and carried on the cut.
+    fn pipe_override_admits(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        opening_edges: &[EdgeKey],
+    ) -> bool {
+        // Condition 1: the ring is a 3- or 4-way junction.
+        let count = opening_edges.len();
+        if count != 3 && count != 4 {
+            return false;
+        }
+
+        // Each sector's opening beveled spoke, as a unit ray out of `vertex`.
+        let mut spoke_directions: Vec<Vec3> = Vec::with_capacity(count);
+        for &edge in opening_edges {
+            match self.edge_direction_from(edge, vertex, vertex_position) {
+                Some(direction) => spoke_directions.push(direction),
+                None => return false,
+            }
+        }
+
+        // Condition 2: some pair of spokes is exactly anti-parallel through `vertex` — the
+        // ray out of `v` along one is the reverse of the ray out along the other. The §7.6.2
+        // near-collinear window is 2°, so the two directions meet at ≥ 178° (`cos ≤ −cos 2°`).
+        let near_collinear_cos = (2.0_f32.to_radians()).cos();
+        let mut pipe_axis: Option<Vec3> = None;
+        'pairs: for i in 0..count {
+            for j in (i + 1)..count {
+                if spoke_directions[i].dot(spoke_directions[j]) <= -near_collinear_cos {
+                    pipe_axis = Some(spoke_directions[i]);
+                    break 'pairs;
+                }
+            }
+        }
+        let pipe_axis = match pipe_axis {
+            Some(axis) => axis,
+            None => return false,
+        };
+
+        // Condition 3: every incident face's normal is perpendicular to the pipe axis, i.e.
+        // the pipe threads a locally flat neighbourhood. `sin 2°` is the perpendicularity
+        // slack matching the same 2° near-collinear window.
+        let perpendicular_slack = (2.0_f32.to_radians()).sin();
+        for face in self.vert_face_keys(vertex) {
+            if self.face_plane_normal(face).dot(pipe_axis).abs() > perpendicular_slack {
+                return false;
+            }
+        }
+        true
     }
 
     /// The §8.5.1 dihedral-band gate on the **original** corner (BEVEL.md §8.5.1 / §7.6.6),
@@ -10326,6 +10499,15 @@ struct JunctionCut {
     /// **oblique / absorbed-leg / reflex** corner that the position-only meet-geometry test
     /// (equal spokes, 60° octant) would decline; the reflex-agnostic split of §7.6.6.
     dihedral_band_ok: bool,
+    /// Whether this junction takes the §8.3.4.1 **pipe override**: a `CUTOFF` ring of 3 or 4
+    /// boundverts carrying an exactly anti-parallel opposite pair of beveled spokes (two
+    /// spokes collinear *through* `v`) in a neighbourhood whose incident faces are all
+    /// parallel to that pipe axis. When set, the cutoff fill is abandoned and the ring takes
+    /// the all-quad adjacency grid (§8.5) over the *cutoff*-configured profile chains instead
+    /// of the per-sector cut faces + bottom n-gon. Read from the *original* corner — the
+    /// beveled-edge directions and incident-face normals are gone by fill time — so it is
+    /// captured here alongside `dihedral_band_ok`.
+    pipe_override: bool,
 }
 
 impl JunctionCut {
@@ -15180,6 +15362,313 @@ mod tests {
         mesh.validate_topology();
     }
 
+    /// Bevel a chosen set of a flat 12-spoke fan's spokes with the CUTOFF method
+    /// (BEVEL.md §8.3.4.1 fixtures). The centre is the multi-edge junction; each beveled
+    /// spoke's rim end is a valence-3 terminal. Spokes `k` and `k + 6` are collinear
+    /// through the centre, so beveling an opposite pair plants the anti-parallel pipe.
+    fn bevel_flat_fan_cutoff(
+        beveled_spokes: &[usize],
+        offset: f32,
+        segments: u32,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        let geom: Vec<GeomKey> = beveled_spokes
+            .iter()
+            .map(|&k| {
+                mesh.query_edge_exists(centre, rim[k])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// Face-side counts of the whole mesh, keyed by corner count (3 = tri, 4 = quad, …).
+    fn face_side_histogram(mesh: &LoopMesh) -> std::collections::BTreeMap<usize, usize> {
+        let mut histogram = std::collections::BTreeMap::new();
+        for face in mesh.face_keys() {
+            *histogram.entry(mesh.face_len(face)).or_insert(0usize) += 1;
+        }
+        histogram
+    }
+
+    /// The number of **loose, valence-0** verts in the mesh: in no edge and no face.
+    /// The §8.3.4.1 pipe override leaves exactly `(segments − 1) · s` of these.
+    fn loose_vertex_count(mesh: &LoopMesh) -> usize {
+        mesh.vert_keys()
+            .into_iter()
+            .filter(|&v| mesh.iter_disk_edges(v).next().is_none())
+            .count()
+    }
+
+    /// The number of **connected** verts (in at least one edge) that sit — within the
+    /// coincident-vertex tolerance — on top of a loose valence-0 leftover's position.
+    /// BEVEL.md §8.3.4.1: the loose leftovers carry the **raw** cutoff-arc samples, while
+    /// the connected fill must be byte-identical to a from-scratch ADJ bevel — its rim on
+    /// the **resampled** arc. On a **skewed** pipe cell raw and resampled diverge, so the
+    /// correct override lands **zero** connected verts on a loose sample. A regression that
+    /// fed the raw cutoff chain into the connected fill would drop every rim node back onto
+    /// its own raw loose sample and drive this count up — which is exactly what the skewed
+    /// `s = 3` grid and the `s = 4` fan at `segments ≥ 3` catch.
+    fn connected_verts_on_loose_sample(mesh: &LoopMesh) -> usize {
+        let loose: Vec<Vec3> = mesh
+            .vert_keys()
+            .into_iter()
+            .filter(|&v| mesh.iter_disk_edges(v).next().is_none())
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        mesh.vert_keys()
+            .into_iter()
+            .filter(|&v| mesh.iter_disk_edges(v).next().is_some())
+            .filter(|&v| {
+                let position = mesh.vertex_position(v);
+                loose.iter().any(|&sample| (position - sample).length() < 1.0e-4)
+            })
+            .count()
+    }
+
+    /// BEVEL.md §8.3.4.1: a 4-way anti-parallel cross ("plus", `s = 4`) at `segments = 2`
+    /// takes the pipe override — the 4 cut pentagons + bottom quad are discarded and the ring
+    /// is re-tiled as 4 quads around a single welded hub. The connected fill is the
+    /// from-scratch ADJ grid (29 V / 52 E / 24 F, 12 tris + 12 quads, no pentagons); on top of
+    /// it the override mints `(segments − 1)·s = 1·4 = 4` loose valence-0 leftover verts, so
+    /// the whole mesh reads **33 V / 52 E / 24 F**.
+    #[test]
+    fn cutoff_pipe_override_cross_segments2_is_all_quads() {
+        let (mesh, _result) = bevel_flat_fan_cutoff(&[1, 4, 7, 10], 0.2, 2);
+
+        assert_eq!(mesh.vert_keys().len(), 33, "vertex count = 29 ADJ + 4 loose");
+        assert_eq!(mesh.edge_keys().len(), 52, "edge count");
+        assert_eq!(mesh.face_keys().len(), 24, "face count");
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            4,
+            "1·4 loose valence-0 leftover verts",
+        );
+
+        let histogram = face_side_histogram(&mesh);
+        assert_eq!(histogram.get(&3).copied().unwrap_or(0), 12, "12 tris");
+        assert_eq!(histogram.get(&4).copied().unwrap_or(0), 12, "12 quads");
+        assert_eq!(
+            histogram.get(&5).copied().unwrap_or(0),
+            0,
+            "the pipe override leaves no cut pentagons",
+        );
+    }
+
+    /// BEVEL.md §8.3.4.1: the same 4-way cross at `segments = 3` — the extra grid row makes
+    /// it a full 3×3 quad block over the ring. The connected fill is the from-scratch ADJ grid
+    /// (40 V / 72 E / 33 F, 12 tris + 21 quads, no hexagons); the override mints
+    /// `(segments − 1)·s = 2·4 = 8` loose leftover verts, so the whole mesh reads
+    /// **48 V / 72 E / 33 F**.
+    #[test]
+    fn cutoff_pipe_override_cross_segments3_is_full_grid() {
+        let (mesh, _result) = bevel_flat_fan_cutoff(&[1, 4, 7, 10], 0.2, 3);
+
+        assert_eq!(mesh.vert_keys().len(), 48, "vertex count = 40 ADJ + 8 loose");
+        assert_eq!(mesh.edge_keys().len(), 72, "edge count");
+        assert_eq!(mesh.face_keys().len(), 33, "face count");
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            8,
+            "2·4 loose valence-0 leftover verts",
+        );
+
+        let histogram = face_side_histogram(&mesh);
+        assert_eq!(histogram.get(&3).copied().unwrap_or(0), 12, "12 tris");
+        assert_eq!(histogram.get(&4).copied().unwrap_or(0), 21, "21 quads");
+        assert_eq!(
+            histogram.get(&6).copied().unwrap_or(0),
+            0,
+            "no cut hexagons survive the override",
+        );
+
+        // §8.3.4.1: at `segments = 3` the fan cell's arc is asymmetric, so the resampled
+        // rim diverges from the raw cutoff samples. The connected fill must ride the
+        // resampled arc (from-scratch ADJ), leaving the raw samples only on the loose
+        // leftovers — no connected rim node may coincide with a loose sample.
+        assert_eq!(
+            connected_verts_on_loose_sample(&mesh),
+            0,
+            "the resampled connected rim moved off the raw arc samples the loose verts carry",
+        );
+    }
+
+    /// BEVEL.md §8.3.4.1 condition 1: `s ≥ 5` keeps the ordinary cut faces even when an
+    /// anti-parallel opposite pair is present. Beveling spokes `0, 1, 2, 3, 6` gives an
+    /// `s = 5` ring with the collinear pair `0`/`6`, yet the fill must stay the n-gon cut
+    /// faces (a pentagon at `segments = 2`), not the all-quad grid.
+    #[test]
+    fn cutoff_pipe_override_declines_at_valence_five() {
+        let (mesh, _result) = bevel_flat_fan_cutoff(&[0, 1, 2, 3, 6], 0.2, 2);
+
+        let histogram = face_side_histogram(&mesh);
+        assert!(
+            histogram.get(&5).copied().unwrap_or(0) > 0,
+            "an `s = 5` anti-parallel ring keeps its cut pentagons: {histogram:?}",
+        );
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            0,
+            "an ordinary (non-override) cutoff ring mints no loose leftover verts",
+        );
+    }
+
+    /// BEVEL.md §8.3.4.1 condition 2: a `s = 4` ring with **no** anti-parallel opposite pair
+    /// (four *adjacent* spokes) does not take the override — the ordinary cutoff n-gon fill
+    /// (pentagons at `segments = 2`) stands, output-identical to before the rule existed.
+    #[test]
+    fn cutoff_pipe_override_declines_without_antiparallel_pair() {
+        let (mesh, _result) = bevel_flat_fan_cutoff(&[0, 1, 2, 3], 0.2, 2);
+
+        let histogram = face_side_histogram(&mesh);
+        assert!(
+            histogram.get(&5).copied().unwrap_or(0) > 0,
+            "a non-anti-parallel `s = 4` ring keeps its cut pentagons: {histogram:?}",
+        );
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            0,
+            "an ordinary (non-override) cutoff ring mints no loose leftover verts",
+        );
+    }
+
+    /// A flat 3×3 quad grid (9 verts, 4 quads). The centre vertex (index 4) has four faced
+    /// spokes; beveling its left (→3), right (→5) and up (→7) spokes plants a `s = 3` pipe:
+    /// left/right collinear through the centre, up transverse, every incident face in the
+    /// `z = 0` plane. Returns `(mesh, result)`.
+    fn bevel_flat_grid_pipe_s3(offset: f32, segments: u32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        let verts: Vec<VertexKey> = [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 1.0],
+            [0.0, 2.0],
+            [1.0, 2.0],
+            [2.0, 2.0],
+        ]
+        .into_iter()
+        .map(|[x, y]| mesh.create_vertex(Vec3::new(x, y, 0.0)))
+        .collect();
+        for cycle in [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]] {
+            let corners: Vec<VertexKey> = cycle.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&corners, FaceCreateFlags::NONE);
+        }
+        let geom: Vec<GeomKey> = [3usize, 5, 7]
+            .into_iter()
+            .map(|far| {
+                mesh.query_edge_exists(verts[4], verts[far])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.3.4.1: the 3-way pipe (`s = 3`, one collinear pair + one transverse spoke)
+    /// at `segments = 2` takes the override — an `s`-quad wheel around one hub, all quads, no
+    /// cut pentagons. On the **bare** grid the connected fill is the from-scratch ADJ grid
+    /// (21 V / 33 E / 13 F); the override mints `(segments − 1)·s = 1·3 = 3` loose leftover
+    /// verts, so the whole mesh reads **24 V / 33 E / 13 F**. (The §8.3.0.4 wire-decorated
+    /// witness adds a further +1 V/+1 E for the re-attached wire spoke — orthogonal to the
+    /// pipe surplus and not exercised here.)
+    #[test]
+    fn cutoff_pipe_override_three_way_segments2_is_all_quads() {
+        let (mesh, _result) = bevel_flat_grid_pipe_s3(0.25, 2);
+
+        assert_eq!(mesh.vert_keys().len(), 24, "vertex count = 21 ADJ + 3 loose");
+        assert_eq!(mesh.edge_keys().len(), 33, "edge count");
+        assert_eq!(mesh.face_keys().len(), 13, "face count");
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            3,
+            "1·3 loose valence-0 leftover verts",
+        );
+
+        let histogram = face_side_histogram(&mesh);
+        assert!(
+            histogram.keys().all(|&sides| sides == 4),
+            "the whole grid re-tile is all quads: {histogram:?}",
+        );
+
+        // §8.3.4.1: the two collinear (left/right) chains are skewed by the transverse
+        // spoke, so their resampled rim nodes must sit **off** their raw cutoff samples —
+        // only the transverse (up) chain is symmetric about the grid's mirror axis, where
+        // raw and resampled coincide. So exactly its `segments − 1` rim nodes land on a
+        // loose sample; the `2·(segments − 1)` skewed rim nodes have all moved off. A
+        // regression that fed the raw cutoff chain into the connected fill would instead
+        // leave every rim node (`3·(segments − 1)` of them) on a loose sample.
+        assert_eq!(
+            connected_verts_on_loose_sample(&mesh),
+            1,
+            "only the symmetric transverse chain's `segments − 1 = 1` rim node stays on the \
+             raw samples; the two skewed chains' rim nodes moved to the resampled arc",
+        );
+    }
+
+    /// BEVEL.md §8.3.4.1: the same 3-way pipe at `segments = 3` — the odd-parity central cap
+    /// appears as one central triangle plus 6 quads over the ring (1 tri + 19 quads whole
+    /// mesh, 20 F). The connected fill is the from-scratch ADJ grid (29 V / 48 E / 20 F);
+    /// the override mints `(segments − 1)·s = 2·3 = 6` loose leftover verts, so the whole
+    /// mesh reads **35 V / 48 E / 20 F**, and — the cell being skewed — the resampled rim
+    /// sits off the raw arc samples the loose verts carry.
+    #[test]
+    fn cutoff_pipe_override_three_way_segments3_is_grid_with_central_cap() {
+        let (mesh, _result) = bevel_flat_grid_pipe_s3(0.25, 3);
+
+        assert_eq!(mesh.vert_keys().len(), 35, "vertex count = 29 ADJ + 6 loose");
+        assert_eq!(mesh.edge_keys().len(), 48, "edge count");
+        assert_eq!(mesh.face_keys().len(), 20, "face count");
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            6,
+            "2·3 loose valence-0 leftover verts",
+        );
+
+        let histogram = face_side_histogram(&mesh);
+        assert_eq!(
+            histogram.get(&3).copied().unwrap_or(0),
+            1,
+            "one §8.5 odd-parity central-cap triangle",
+        );
+        assert_eq!(histogram.get(&4).copied().unwrap_or(0), 19, "19 quads");
+        // §8.3.4.1: only the symmetric transverse chain's `segments − 1 = 2` rim nodes stay
+        // on their raw samples; the two skewed collinear chains' `2·(segments − 1) = 4` rim
+        // nodes moved to the resampled arc. A raw-fed regression would leave all 6 on a
+        // loose sample.
+        assert_eq!(
+            connected_verts_on_loose_sample(&mesh),
+            2,
+            "the two skewed chains' rim nodes moved off the raw arc samples; only the \
+             symmetric transverse chain's two rim nodes stay coincident",
+        );
+    }
+
     /// Build the cube-corner `s = 3` ADJ junction at `segments = 2` (BEVEL.md §8.5).
     /// Vertex 0 = (1,-1,-1) is the junction; its three edges to 1/3/4 are beveled
     /// with the default rounded adjacency-grid fill.
@@ -19260,6 +19749,7 @@ mod tests {
             // The synthetic cuts carry no real corner, so the band verdict is inert here;
             // the geometry test alone decides these assertions.
             dihedral_band_ok: false,
+            pipe_override: false,
         };
 
         // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
