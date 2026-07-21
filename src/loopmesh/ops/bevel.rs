@@ -721,6 +721,19 @@ fn donor_for_ring_vertex(
         .and_then(|(_, &donor)| donor)
 }
 
+/// The incident edge a boundvert sits on — the inverse of the per-leg `ring_vertex_of`
+/// map. Used to resolve a boundvert's own representative face (BEVEL.md §6.6.1's
+/// per-sector grid rule, where each sector fill inherits from the next boundvert).
+fn edge_of_ring_vertex(
+    ring_vert_for_edge: &[(EdgeKey, VertexKey)],
+    ring_vertex: VertexKey,
+) -> Option<EdgeKey> {
+    ring_vert_for_edge
+        .iter()
+        .find(|&&(_, ring)| ring == ring_vertex)
+        .map(|&(edge, _)| edge)
+}
+
 /// A re-stitched original: the *new* face key the rebuild produced, and its own
 /// pre-bevel self in the donor bank. Every corner of a re-stitched original blends
 /// from that face, pre-bevel (BEVEL.md §5.2.1.1), and the re-stitched originals are
@@ -901,6 +914,16 @@ impl LoopMesh {
         if options.segments >= 2 {
             if options.affect == BevelAffect::Edges {
                 return self.bevel_edges(geom, options);
+            }
+            // Vertex-mode multi-segment (BEVEL.md §8.11, Stage [VV]). Only the
+            // bounded valence-3 / default-circular / `segments ≥ 3` corner builds a
+            // real vmesh patch; every other vertex `segments ≥ 2` shape (the
+            // `segments = 2` coarse net, `s ≠ 3`, non-circular profiles, miters)
+            // still declines to the historical no-op below.
+            if options.affect == BevelAffect::Vertices {
+                if let Some(built) = self.bevel_vertices_multiseg(geom, options) {
+                    return built;
+                }
             }
             return result;
         }
@@ -1109,6 +1132,255 @@ impl LoopMesh {
         }
 
         result
+    }
+
+    /// Vertex-mode multi-segment cap (BEVEL.md §8.11, Stage [VV]).
+    ///
+    /// Bounded to the valence-3, default-circular, `segments ≥ 3` corner (§8.11.4):
+    /// the §4 slide ring (a, §8.11.1), the `mid = v` / `projection_dir = 0` profile
+    /// (b, §8.11.2), and the [V-ADJ] general fullness grid entered unconditionally
+    /// (c, §8.11.3 — vertex mode never takes the cube-corner octant fast path).
+    ///
+    /// Returns `None` when the corner is outside that regime (`segments == 2`, a
+    /// non-circular profile, a valence other than 3, or a wire spoke present); the
+    /// caller then declines to the historical no-op. Single-segment vertex bevel and
+    /// every edge-bevel path are untouched — this method is reached only for
+    /// `affect == VERTICES` at `segments ≥ 2`.
+    fn bevel_vertices_multiseg(
+        &mut self,
+        geom: &[GeomKey],
+        options: &BevelOptions,
+    ) -> Option<BevelResult> {
+        let segments = options.segments;
+
+        // §8.11.4 bounds: `segments ≥ 3` (the `segments = 2` coarse-net case is out)
+        // and the default circular profile only (§8.11 is stated for the round
+        // profile; square / custom profiles are OUT).
+        if segments < 3 || profile_to_exponent(options.profile) != 2.0 {
+            return None;
+        }
+
+        let mut result = BevelResult::default();
+
+        let mut beveled: Vec<VertexKey> = Vec::new();
+        for entry in geom {
+            if let GeomKey::Vert(vertex) = *entry {
+                if !beveled.contains(&vertex) {
+                    beveled.push(vertex);
+                }
+            }
+        }
+        if beveled.is_empty() {
+            return None;
+        }
+
+        // §6.4.1 place-before-surgery pre-pass, identical to the single-segment path:
+        // the ring is segment-independent (§8.11.1), so the frame gather and slide are
+        // reused verbatim.
+        let frames = self.gather_bevel_frames(
+            &beveled,
+            options.offset,
+            options.offset_type,
+            options.use_weights,
+            options.vert_weights,
+        );
+        if frames.is_empty() {
+            return None;
+        }
+
+        // §8.11 scope gate: valence 3 only, and no wire spokes (the `[V-ADJ]` grid of
+        // §8.5.5.5 is the only fill this path builds, and its rim must be a clean
+        // faced/gap ring). Any corner outside the regime declines the whole call.
+        for frame in &frames {
+            if frame.disk_order.len() != 3 {
+                return None;
+            }
+            for placement in &frame.placements {
+                if self.edge_radial_iter(placement.edge).next().is_none() {
+                    return None;
+                }
+            }
+        }
+
+        let beveled: Vec<VertexKey> = frames.iter().map(|frame| frame.vertex).collect();
+        let clamp_factor = if options.clamp_overlap {
+            clamp_factor(options.offset, &beveled, &frames)
+        } else {
+            1.0
+        };
+
+        let mut templates = TemplateBank::new(self, segments);
+        let mut corners =
+            self.place_ring_verts(&frames, clamp_factor, segments, &mut templates, &mut result);
+
+        // §6.6.1's grid rule (affect == VERTICES): each sector's [V-ADJ] fill faces inherit
+        // from the **next** boundvert's representative, distributing the donor across the
+        // corner's incident faces rather than collapsing every sector onto one corner-wide
+        // donor. The centre n-gon is the ring's one ring-spanning fill and still takes
+        // `corner.representative` (the §6.6.1.4 tie-broken donor). Registered here, before the
+        // bank is sealed and the incident faces are killed / rebuilt.
+        let per_corner_sector_reps: Vec<Vec<FaceTemplate>> = corners
+            .iter()
+            .map(|corner| {
+                let sectors = corner.ring_order.len();
+                (0..sectors)
+                    .map(|i| {
+                        let next_boundvert = corner.ring_order[(i + 1) % sectors];
+                        let donor =
+                            edge_of_ring_vertex(&corner.ring_vert_for_edge, next_boundvert)
+                                .and_then(|edge| {
+                                    self.boundvert_representative(corner.vertex, edge)
+                                });
+                        templates.register(donor)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        templates.seal(self);
+
+        let incident: Vec<FaceKey> = corners
+            .iter()
+            .flat_map(|corner| corner.incident_faces.iter().copied())
+            .collect();
+        let bank = self.capture_donor_bank(&incident);
+
+        // Stage 2 (§8.11.2 / §8.11.4): one profile chain per disk sector, built with
+        // `mid = v` and `projection_dir = 0`. `ProfileCell::from_control_points` is
+        // exactly that cell — the frame is the §8.2.2.1 one with `mid` promoted to the
+        // corner vertex, and it carries **no** projection (`projection_dir = 0`) while
+        // staying non-linear (the bulge control corner is off the chord), so the
+        // interior samples bulge toward `v` rather than collapsing to the straight
+        // chord. The `segments − 1` interior verts are minted at the §8.2.2.1.1
+        // emitted-rim positions, shared between the cap and the incident faces.
+        let mut per_corner_chains: Vec<Vec<Vec<VertexKey>>> = Vec::with_capacity(corners.len());
+        let mut per_corner_cells: Vec<Vec<ProfileCell>> = Vec::with_capacity(corners.len());
+        let mut per_corner_hosted: Vec<Vec<(FaceKey, VertexKey)>> =
+            Vec::with_capacity(corners.len());
+
+        for corner in &corners {
+            let vertex_position = self.vertex_position(corner.vertex);
+            let ring = corner.ring_order.clone();
+            let sectors = ring.len();
+
+            let mut chains: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
+            let mut cells: Vec<ProfileCell> = Vec::with_capacity(sectors);
+            for i in 0..sectors {
+                let start = ring[i];
+                let end = ring[(i + 1) % sectors];
+                let cell = ProfileCell::from_control_points(
+                    self.vertex_position(start),
+                    self.vertex_position(end),
+                    vertex_position,
+                );
+                let interior = self.mint_chain_interior(
+                    &cell,
+                    segments,
+                    options.profile,
+                    ChainEmission::Resampled,
+                    &mut result,
+                );
+                let mut chain = Vec::with_capacity(segments as usize + 1);
+                chain.push(start);
+                chain.extend(interior);
+                chain.push(end);
+                chains.push(chain);
+                cells.push(cell);
+            }
+
+            // §8.11.4 stage 2: the chain is the boundary the cap and the incident face
+            // **share**. Thread each sector's chain interior through the incident face
+            // that spans it, via the same per-face run-insertion channel a hosted wire
+            // uses — so `restitch_incident_faces` is reused unchanged (it is
+            // segment-independent) and the cap later *adopts* the edges it minted.
+            let mut hosted: Vec<(FaceKey, VertexKey)> = corner.hosted_wires.clone();
+            for &face in &corner.incident_faces {
+                let Some((incoming, outgoing)) = self.face_corner_edges(face, corner.vertex) else {
+                    continue;
+                };
+                let leading = self.ring_vertex_of(&corner.ring_vert_for_edge, incoming);
+                let trailing = self.ring_vertex_of(&corner.ring_vert_for_edge, outgoing);
+                for i in 0..sectors {
+                    let start = ring[i];
+                    let end = ring[(i + 1) % sectors];
+                    let interior = &chains[i][1..chains[i].len() - 1];
+                    if start == leading && end == trailing {
+                        for &wire in interior {
+                            hosted.push((face, wire));
+                        }
+                        break;
+                    }
+                    if start == trailing && end == leading {
+                        for &wire in interior.iter().rev() {
+                            hosted.push((face, wire));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            per_corner_chains.push(chains);
+            per_corner_cells.push(cells);
+            per_corner_hosted.push(hosted);
+        }
+
+        for (corner, hosted) in corners.iter_mut().zip(per_corner_hosted) {
+            corner.hosted_wires = hosted;
+        }
+
+        // §8.11.1 / §6.4.3: the re-stitch is segment-independent — reused verbatim. It
+        // re-points each incident edge onto its ring vert and rebuilds each incident
+        // face, now threading the sector's chain interior between the two boundverts.
+        let rebuilt = self.restitch_incident_faces(&beveled, &corners, &bank);
+
+        // Stages 3–5 (§8.11.3 / §8.11.4): the shared [V-ADJ] general fullness grid,
+        // entered unconditionally (no cube-corner octant fast path in vertex mode).
+        // The cap adopts the incident-face chain edges and mints the gap-sector rim
+        // plus the relaxed interior.
+        for ((corner, (chains, cells)), sector_reps) in corners
+            .iter()
+            .zip(per_corner_chains.iter().zip(per_corner_cells.iter()))
+            .zip(per_corner_sector_reps.iter())
+        {
+            let profiles: Vec<RingChainProfile> = cells
+                .iter()
+                .map(|&cell| RingChainProfile::Cell {
+                    cell,
+                    profile: options.profile,
+                })
+                .collect();
+            // Centre n-gon: the ring-spanning §6.6.1.4 donor. Sector fills: the per-sector
+            // next-boundvert reps registered above (§6.6.1's grid rule).
+            let central_representative = templates.resolve(corner.representative);
+            let sector_representatives: Vec<FaceTemplateRef<'_>> = sector_reps
+                .iter()
+                .map(|&template| templates.resolve(template))
+                .collect();
+            self.emit_general_adj_fill(
+                corner.vertex,
+                chains,
+                &profiles,
+                segments,
+                options.profile,
+                false,
+                None,
+                options.material,
+                &sector_representatives,
+                central_representative,
+                &mut result,
+            );
+        }
+
+        // §5.2.1 fact (c): blend the re-stitched originals' ring-vert corners. The
+        // chain-interior and patch-interior verts are §5.2.4 non-invariant fill geometry
+        // and are left at their minted (default) blocks.
+        self.blend_restitched_originals(&rebuilt, &bank);
+
+        for corner in &corners {
+            self.free_loose_vertex(corner.vertex);
+        }
+
+        Some(result)
     }
 
     /// Foundational single-segment edge bevel (BEVEL.md §7).
@@ -5067,6 +5339,7 @@ impl LoopMesh {
             return;
         }
         let representative = templates.resolve(omj.representative);
+        let sector_representatives = vec![representative; omj.chains.len()];
         let central_representative = templates.resolve(omj.central_representative);
         // The arc forces the circular profile, so this fill is never the flat cap.
         // §8.9.5.3: feed the centre stencil the raw coarse control-net mids (populated
@@ -5085,7 +5358,7 @@ impl LoopMesh {
             false,
             raw_coarse_mids,
             material,
-            representative,
+            &sector_representatives,
             central_representative,
             result,
         );
@@ -5112,7 +5385,7 @@ impl LoopMesh {
         flat: bool,
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
-        representative: FaceTemplateRef<'_>,
+        sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
     ) {
@@ -5120,7 +5393,7 @@ impl LoopMesh {
         let seg = segments as usize;
         let half = seg / 2;
         let even = seg % 2 == 0;
-        if sectors < 3 || profiles.len() != sectors {
+        if sectors < 3 || profiles.len() != sectors || sector_representatives.len() != sectors {
             return;
         }
         for chain in chain_of {
@@ -5194,7 +5467,7 @@ impl LoopMesh {
                     anchor,
                 },
                 material,
-                representative,
+                sector_representatives,
                 central_representative,
                 result,
             );
@@ -5235,7 +5508,7 @@ impl LoopMesh {
                 anchor,
             },
             material,
-            representative,
+            sector_representatives,
             central_representative,
             result,
         );
@@ -5368,6 +5641,7 @@ impl LoopMesh {
         let axis = adj_interior_axis(&profiles, segments, 2 * net.half as u32);
 
         let representative = templates.resolve(cut.representative);
+        let sector_representatives = vec![representative; sectors];
         let central_representative = templates.resolve(cut.central_representative);
         self.emit_adj_grid(
             sectors,
@@ -5384,7 +5658,7 @@ impl LoopMesh {
                 octant,
             },
             material,
-            representative,
+            &sector_representatives,
             central_representative,
             result,
         );
@@ -5484,6 +5758,7 @@ impl LoopMesh {
         // tabulated fullness seed and relaxes.
         let flat = profile_to_exponent(profile) == 1.0;
         let representative = templates.resolve(cut.representative);
+        let sector_representatives = vec![representative; chain_of.len()];
         let central_representative = templates.resolve(cut.central_representative);
         self.emit_general_adj_fill(
             cut.vertex,
@@ -5494,7 +5769,7 @@ impl LoopMesh {
             flat,
             None,
             material,
-            representative,
+            &sector_representatives,
             central_representative,
             result,
         );
@@ -5516,10 +5791,15 @@ impl LoopMesh {
         chain_of: &[Vec<VertexKey>],
         interior: &AdjInterior<'_>,
         material: i32,
-        representative: FaceTemplateRef<'_>,
+        sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
     ) {
+        debug_assert_eq!(
+            sector_representatives.len(),
+            sectors,
+            "one representative per sector — §6.6.1's per-sector grid rule",
+        );
         let anchor = interior.anchor();
         let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
             std::collections::HashMap::new();
@@ -5573,7 +5853,13 @@ impl LoopMesh {
                         &mut grid,
                         result,
                     );
-                    self.emit_patch_face(&[a, b, c, d], anchor, material, representative, result);
+                    self.emit_patch_face(
+                        &[a, b, c, d],
+                        anchor,
+                        material,
+                        sector_representatives[i],
+                        result,
+                    );
                 }
             }
         }
@@ -5605,7 +5891,7 @@ impl LoopMesh {
                     &[column[r], row[r], row[r + 1], column[r + 1]],
                     anchor,
                     material,
-                    representative,
+                    sector_representatives[i],
                     result,
                 );
             }
@@ -8547,6 +8833,17 @@ impl LoopMesh {
         self.iter_radial_loops(edge)
             .find(|&l| self.loop_vertex(l) == vertex)
             .map(|l| self.loop_face(l))
+    }
+
+    /// A boundvert's own representative face (BEVEL.md §6.6.1's
+    /// `representative_face_of_boundvert`, the no-beveled-leg branch a vertex bevel
+    /// takes): the face arriving at `vertex` along the boundvert's leg `edge`, else the
+    /// one departing. No tie-break — §6.6.1's per-sector grid rule feeds each sector's
+    /// fill faces this positional primitive directly, and the ring-spanning tie-break of
+    /// §6.6.1.4 pre-empts only the centre n-gon.
+    fn boundvert_representative(&self, vertex: VertexKey, edge: EdgeKey) -> Option<FaceKey> {
+        self.arriving_face(vertex, edge)
+            .or_else(|| self.departing_face(vertex, edge))
     }
 
     /// The corner's positional donor (BEVEL.md §6.6.1): the representative face of the
@@ -13852,6 +14149,264 @@ mod tests {
             vec![1, 1, 2, 2],
             "two gap edges minted by the cap, two chamfers minted by the re-stitch",
         );
+    }
+
+    /// BEVEL.md §8.11 Stage [VV]: the two-quad-plane valence-3 corner at `segments = 3`
+    /// builds the real vmesh patch — the §4 slide ring (3 boundverts), three `mid = v`
+    /// profile chains (2 interior samples each), and the [V-ADJ] general odd-`segments`
+    /// grid (3 sub-patch quads + 3 seam quads + 1 central triangle). `6/7/2 → 17/25/9`,
+    /// the shape the reference produces. The chain interior verts are shared between the
+    /// cap and the two incident faces (grown to 7-gons); the third sector is the boundary
+    /// gap, whose chain the cap mints alone.
+    #[test]
+    fn vertex_bevel_multiseg_two_quad_plane_valence_three_builds_the_vmesh_patch() {
+        let (mut mesh, _) = two_quad_strip();
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(counts(&mesh), (6, 7, 2));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (17, 25, 9), "§8.11 Stage [VV]: 6/7/2 → 17/25/9");
+        // 3 ring + 3·2 chain interior + 3 patch interior.
+        assert_eq!(result.verts.len(), 12, "3 ring + 6 chain + 3 patch interior");
+        // 3 sub-patch quads + 3 odd seam quads + 1 central triangle.
+        assert_eq!(result.faces.len(), 7, "the [V-ADJ] odd-segments grid");
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![3, 4, 4, 4, 4, 4, 4, 7, 7],
+            "seven grid faces (a central triangle + six quads) and two grown 7-gons",
+        );
+    }
+
+    /// BEVEL.md §6.6.1's per-sector grid rule (affect == VERTICES): each sector's
+    /// [V-ADJ] fill faces inherit their whole per-face block — material slot included —
+    /// from the **next** boundvert's representative, distributing the donor across the
+    /// corner's incident faces. On the material-straddling two-quad plane (quad A =
+    /// slot 5 on x<0, quad B = slot 2 on x>0) the valence-3 shared-edge corner at
+    /// `segments = 3` splits its fill: the two sector faces fed by the quad-A-side
+    /// boundvert land on slot 5, the rest (and the ring-spanning centre n-gon) on
+    /// slot 2 — so the whole mesh carries three slot-5 faces and six slot-2 faces. A
+    /// regression to one corner-wide donor collapses every fill face onto a single
+    /// slot and gives {5: 1, 2: 8}.
+    #[test]
+    fn vertex_bevel_multiseg_fill_material_distributes_per_sector() {
+        let (mut mesh, _) = two_quad_strip();
+        let quad_a_marker = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+        let quad_b_marker = vert_at(&mesh, Vec3::new(2.0, -1.0, 0.0));
+        for face in mesh.face_keys() {
+            let verts = mesh.face_vert_keys(face);
+            if verts.contains(&quad_a_marker) {
+                mesh.set_face_material_index(face, 5);
+            } else if verts.contains(&quad_b_marker) {
+                mesh.set_face_material_index(face, 2);
+            }
+        }
+
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let tally = |materials: &[i32]| -> (usize, usize) {
+            (
+                materials.iter().filter(|&&m| m == 5).count(),
+                materials.iter().filter(|&&m| m == 2).count(),
+            )
+        };
+
+        // The two grown originals keep their own slots (A=5, B=2); the seven fill faces
+        // split 2/5 across the two donors — matching the reference's per-sector
+        // distribution, whose material multiset is three 5s and six 2s.
+        let all: Vec<i32> = mesh
+            .face_keys()
+            .into_iter()
+            .map(|face| mesh.face_material_index(face))
+            .collect();
+        assert_eq!(all.len(), 9);
+        assert_eq!(
+            tally(&all),
+            (3, 6),
+            "three slot-5 faces and six slot-2 — the reference's per-sector distribution",
+        );
+
+        let fill: Vec<i32> = result
+            .faces
+            .iter()
+            .map(|&face| mesh.face_material_index(face))
+            .collect();
+        assert_eq!(fill.len(), 7);
+        assert_eq!(
+            tally(&fill),
+            (2, 5),
+            "the two quad-A-side sector fills inherit slot 5; the rest and the centre \
+             n-gon take slot 2 — a corner-wide donor would give (0, 7)",
+        );
+    }
+
+    /// BEVEL.md §8.11.2 [LOAD-BEARING]: the profile is `mid = v`, `projection_dir = 0` but
+    /// **not** flagged linear, so the interior samples bulge *toward the corner vertex* and
+    /// do not collapse onto the straight `B_k → B_(k+1)` chord. Measured as an aggregate:
+    /// the centroid of the fill verts (chain interior + patch interior) is displaced from
+    /// the ring-vert centroid **toward `v`**. A tier-3 flat-facet regression would leave the
+    /// fill in the ring plane and fail this.
+    #[test]
+    fn vertex_bevel_multiseg_profile_bulges_toward_the_corner_vertex() {
+        // A cube corner, where all three sectors are genuinely non-planar (unlike the
+        // flat 180° gap of the two-quad plane, whose gap chord is collinear with `v`).
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        let fars: Vec<Vec3> = [
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ]
+        .to_vec();
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+
+        // A ring vert lies on one of the three rays from `v` toward a far endpoint (the §4
+        // slide); every other new vert is fill (chain / patch interior).
+        let on_slide_ray = |p: Vec3| -> bool {
+            fars.iter().any(|&far| {
+                let direction = (far - corner_position).normalize();
+                let along = (p - corner_position).dot(direction);
+                along > 1.0e-4
+                    && ((p - corner_position) - along * direction).length() < 1.0e-4
+            })
+        };
+        let mut ring_sum = Vec3::ZERO;
+        let mut ring_count = 0.0;
+        let mut fill_sum = Vec3::ZERO;
+        let mut fill_count = 0.0;
+        for &vertex in &result.verts {
+            let position = mesh.vertex_position(vertex);
+            if on_slide_ray(position) {
+                ring_sum += position;
+                ring_count += 1.0;
+            } else {
+                fill_sum += position;
+                fill_count += 1.0;
+            }
+        }
+        assert_eq!(ring_count as usize, 3, "three §4 slide-ring boundverts");
+        assert_eq!(fill_count as usize, 9, "six chain + three patch interior verts");
+
+        let ring_centroid = ring_sum / ring_count;
+        let fill_centroid = fill_sum / fill_count;
+        let bulge = fill_centroid - ring_centroid;
+        let toward_vertex = corner_position - ring_centroid;
+        assert!(
+            bulge.dot(toward_vertex) > 0.0,
+            "§8.11.2: the profile chains and cap bulge toward the corner vertex, not flat",
+        );
+    }
+
+    /// BEVEL.md §8.11.3: an interior valence-3 corner (a cube corner, all three sectors
+    /// faced, no gap) routes to the **same** general [V-ADJ] grid — vertex mode never takes
+    /// the cube-corner octant fast path. `segments = 3` on a closed cube keeps it closed
+    /// (Euler `V − E + F = 2`): `8/12/6 → 19/30/13`.
+    #[test]
+    fn vertex_bevel_multiseg_cube_corner_valence_three_routes_to_the_general_grid() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!((vertices, edges, faces), (19, 30, 13));
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "beveling one corner of a closed cube keeps it a closed genus-0 solid",
+        );
+    }
+
+    /// The gate is tight: `segments = 2` (the coarse-net case, OUT of §8.11.4), a
+    /// non-circular profile, and a valence other than 3 all decline to the historical
+    /// no-op rather than mis-building.
+    #[test]
+    fn vertex_bevel_multiseg_out_of_scope_cases_decline_to_no_op() {
+        // segments = 2 — the coarse-net case is out.
+        let (mut mesh, _) = two_quad_strip();
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        let before = counts(&mesh);
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "segments = 2 vertex bevel still no-ops");
+
+        // Non-circular profile — square / custom profiles are out.
+        let (mut mesh, _) = two_quad_strip();
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        let before = counts(&mesh);
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "non-circular profile still no-ops");
+
+        // Valence 4 — bounded to valence 3.
+        let (mut mesh, centre, _) = planar_fan(4);
+        let before = counts(&mesh);
+        mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        assert_eq!(counts(&mesh), before, "valence != 3 still no-ops");
     }
 
     /// BEVEL.md §7.2.1's worked open-fan wire: a single quad with a wire hanging off one corner
