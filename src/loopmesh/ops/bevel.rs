@@ -10211,11 +10211,17 @@ impl LoopMesh {
     /// - `cross_edges[i]` is `Some(edge)` — the boundvert owns that beveled edge; its rep is
     ///   [`boundvert_representative`](Self::boundvert_representative) of it, exactly as
     ///   [`JunctionCut`]'s per-sector grid donors resolve (§6.6.1's per-sector rule).
-    /// - `cross_edges[i]` is `None` — an **edge-less** miter-split boundvert (§8.9): its
-    ///   outgoing chain is the internal arc / patch chord, so it owns no beveled edge. Its
-    ///   rep follows §6.6.1's edge-less-boundvert primitive: the face departing along the
-    ///   **previous** boundvert's beveled edge, else the one arriving along the **next**
-    ///   boundvert's — the same own-rep the centre-column donor computes before its tie-break.
+    /// - `cross_edges[i]` is `None` — an **arc-*start*** boundvert `B_1` (§8.9.5.3). Its own
+    ///   beveled edge is cleared, but it is **not** edge-less: it keeps its **leading** flank
+    ///   edge `g_k` (= `cross_edges[i-1]`, the beveled edge the arriving ring edge crosses) as
+    ///   a plain leg. Its rep follows §6.6.1's `first_edge` arm — `prev_face(g_k)` =
+    ///   [`arriving_face`](Self::arriving_face), the **non-reflex neighbour across `g_k`** — and
+    ///   is emphatically **not** `departing_face(g_k)` (`next_face`), the reflex / own-sector
+    ///   face on the opposite fan side. `g_k` is a beveled (manifold) edge, so `arriving_face`
+    ///   always resolves; the departing / next-edge fallbacks serve only a degenerate open fan.
+    ///   The asymmetry is the whole point: the arc *end* `B_3` (a `Some` cross-edge) owns
+    ///   `g_(k+1)` and takes `prev_face(g_(k+1))` = the reflex face, so exactly **one** arc end
+    ///   carries the reflex block.
     ///
     /// Read pristine (arriving / departing faces need the junction's original faces intact),
     /// like every §6.6.1 donor.
@@ -10229,10 +10235,19 @@ impl LoopMesh {
             .map(|i| match cross_edges[i] {
                 Some(edge) => self.boundvert_representative(vertex, edge),
                 None => {
+                    // §8.9.5.3 / §6.6.1 `first_edge` arm: a `None` cross-edge boundvert is an
+                    // arc-*start* `B_1` — its own beveled edge is cleared, but it is **not**
+                    // edge-less: it keeps its **leading** flank edge `g_k` (= `prev_edge`, the
+                    // beveled edge the ring edge arriving here crosses) as a plain leg. Its rep
+                    // is `prev_face(g_k)` = `arriving_face` — the non-reflex sector across `g_k`
+                    // — and emphatically **not** `departing_face(g_k)` (= `next_face`), which is
+                    // the reflex / own-sector face on the opposite fan side. `g_k` is a beveled
+                    // (manifold) edge, so `arriving_face` always resolves; the departing / next
+                    // fallbacks only serve a degenerate open-fan `g_k`.
                     let prev_edge = cross_edges[(i + count - 1) % count];
                     let next_edge = cross_edges[(i + 1) % count];
                     prev_edge
-                        .and_then(|edge| self.departing_face(vertex, edge))
+                        .and_then(|edge| self.boundvert_representative(vertex, edge))
                         .or_else(|| next_edge.and_then(|edge| self.arriving_face(vertex, edge)))
                 }
             })
@@ -10251,16 +10266,16 @@ impl LoopMesh {
     ///   *is* — the seam-gated pick of [`centre_column_donor`](Self::centre_column_donor).
     ///   A boundary-touching cap has both beveled legs seamed, so its beveled sectors route
     ///   through the tie-break too.
-    /// - `cross_edges[i]` is `None` — an **edge-less** miter-split boundvert (§8.9): the
-    ///   arc's far-flank partner, whose outgoing chain is the internal arc and so crosses no
-    ///   beveled edge. It owns none, so its centre column takes the §6.6.1.4 tie-break
-    ///   between **this** boundvert's own rep and the **next** boundvert's rep
-    ///   *unconditionally* — there is no beveled edge to seam-gate on (§6.6.2's centre-column
-    ///   row, edge-less arm). The own rep follows §6.6.1's edge-less-boundvert primitive:
-    ///   the face departing along the previous boundvert's beveled edge, else the one
-    ///   arriving along the next boundvert's. Both neighbours own a beveled edge — an
-    ///   edge-less boundvert is always flanked by beveled ring boundverts — so both keys
-    ///   resolve on any well-formed ring.
+    /// - `cross_edges[i]` is `None` — an **arc-*start*** boundvert `B_1` (§8.9.5.3). Its own
+    ///   beveled edge is cleared, so its centre column takes the §6.6.1.4 tie-break between
+    ///   **this** boundvert's own rep and the **next** boundvert's rep *unconditionally* —
+    ///   there is no beveled edge to seam-gate on (§6.6.2's centre-column row). Its **own rep**
+    ///   is the neighbour across its retained leading flank edge `g_k` (= `cross_edges[i-1]`):
+    ///   `prev_face(g_k)` = [`arriving_face`](Self::arriving_face) (§6.6.1's `first_edge` arm),
+    ///   **not** `departing_face(g_k)` (the reflex / own-sector face). The tie-break is a
+    ///   *choice* between that neighbour rep and the next boundvert's rep (§8.9.5.3's odd-`segments`
+    ///   bullet — it need not return `B_1`'s own). `g_k` and the next boundvert's edge are both
+    ///   beveled, so both candidates resolve on any well-formed ring.
     ///
     /// The **next** boundvert's rep is the per-sector own rep
     /// [`miter_ring_sector_donors`](Self::miter_ring_sector_donors) computes, so a beveled
@@ -10287,10 +10302,16 @@ impl LoopMesh {
                         components,
                     ),
                     None => {
+                        // §8.9.5.3 odd-`segments` bullet: the arc-*start* `B_1`'s centre
+                        // column routes **its own** rep — the neighbour across the leading
+                        // flank `g_k` (= `prev_face(g_k)` = `arriving_face`, §6.6.1's
+                        // `first_edge` arm) — through the §6.6.1.4 tie-break against the
+                        // **next** boundvert's rep. The own candidate is *not*
+                        // `departing_face(g_k)` (the reflex / own-sector face).
                         let prev_edge = cross_edges[(i + count - 1) % count];
                         let next_edge = cross_edges[next_i];
                         let own = prev_edge
-                            .and_then(|edge| self.departing_face(vertex, edge))
+                            .and_then(|edge| self.boundvert_representative(vertex, edge))
                             .or_else(|| {
                                 next_edge.and_then(|edge| self.arriving_face(vertex, edge))
                             });
@@ -36090,13 +36111,108 @@ mod tests {
             donors[0], donors[2],
             "sectors with different own faces get different donors — the divergence the fix closes",
         );
-        // Edge-less sector 1: §6.6.1's edge-less primitive — the face departing along the
-        // previous boundvert's beveled edge (`own`), no tie-break (unlike the centre column).
+        // Arc-start sector 1 (§8.9.5.3): its leading flank `{v0,r0}` is an **open-fan**
+        // (boundary) leg here, so `arriving_face`/`prev_face` is empty and §6.6.1's `first_edge`
+        // arm falls through to the departing face `own`. (On a manifold leading flank — the real
+        // reflex-junction case — the primary `arriving_face`/neighbour branch wins instead; that
+        // is pinned by `miter_ring_arc_start_sector_donor_is_the_neighbour_across_the_leading_flank`.)
         assert_eq!(
             donors[1],
             Some(own),
-            "an edge-less sector's non-centre faces take the departing-prev own-rep primitive",
+            "an arc-start sector's leading-flank rep falls to the departing face on an open fan",
         );
+    }
+
+    /// A **closed** three-face fan around `v0` whose middle legs are radial-2 (manifold), plus
+    /// the two edge handles a miter ring names on either side of an arc-*start* boundvert. This
+    /// is the real reflex-junction shape (unlike [`miter_centre_column_fan`], whose legs are
+    /// open-fan boundaries): the leading flank `g_k = {v0,r1}` has a face on **both** fan sides,
+    /// so `arriving_face(g_k)` (the neighbour `fN`) and `departing_face(g_k)` (the own/reflex
+    /// `fR`) are distinct — the asymmetry §8.9.5.3 turns on. Slots: `fN`=1 (neighbour across
+    /// `g_k`), `fR`=2 (reflex / own sector), `fT`=3 (across the trailing flank).
+    fn miter_arc_start_manifold_fan(
+    ) -> (LoopMesh, VertexKey, EdgeKey, EdgeKey, FaceKey, FaceKey, FaceKey) {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -100.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 10.0));
+        let r1 = mesh.create_vertex(Vec3::new(0.5, 1.0, 20.0));
+        let r2 = mesh.create_vertex(Vec3::new(-0.5, 1.0, 30.0));
+        let r3 = mesh.create_vertex(Vec3::new(-1.0, 0.0, 40.0));
+        let f_n = mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        let f_r = mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+        let f_t = mesh.face_create_verts(&[v0, r2, r3], FaceCreateFlags::NONE);
+        mesh.set_face_material_index(f_n, 1);
+        mesh.set_face_material_index(f_r, 2);
+        mesh.set_face_material_index(f_t, 3);
+        let g_k = mesh.query_edge_exists(v0, r1).unwrap(); // leading flank of the arc start
+        let g_k1 = mesh.query_edge_exists(v0, r2).unwrap(); // trailing flank
+        (mesh, v0, g_k, g_k1, f_n, f_r, f_t)
+    }
+
+    /// BEVEL.md §8.9.5.3 / §6.6.1's `first_edge` arm — the corrected **asymmetric** rule: an
+    /// arc-*start* boundvert `B_1` keeps its **leading** flank edge `g_k` as a plain leg and
+    /// takes `prev_face(g_k)` = the **non-reflex neighbour across `g_k`** (`arriving_face`), NOT
+    /// `departing_face(g_k)` (the reflex / own-sector face). On a manifold `g_k` the two are
+    /// distinct, and the old edge-less reading (departing face) landed the reflex block on the
+    /// wrong arc end. This is the row-1042 divergence: loopmesh gave own/reflex, BMesh the
+    /// neighbour.
+    #[test]
+    fn miter_ring_arc_start_sector_donor_is_the_neighbour_across_the_leading_flank() {
+        let (mesh, v0, g_k, g_k1, f_n, f_r, _f_t) = miter_arc_start_manifold_fan();
+
+        // Fixture sanity: `g_k` is a manifold non-seam leg whose two fan sides are distinct.
+        assert!(!mesh.edge_is_interp_seam(g_k), "the leading flank is a manifold non-seam leg");
+        assert_eq!(
+            mesh.arriving_face(v0, g_k),
+            Some(f_n),
+            "prev_face(g_k) is the neighbour fN across the leading flank",
+        );
+        assert_eq!(
+            mesh.departing_face(v0, g_k),
+            Some(f_r),
+            "next_face(g_k) is the reflex / own sector fR — the wrong donor",
+        );
+
+        // Arc start at ring index 1: leading flank `g_k`, trailing `g_(k+1)`.
+        let cross_edges = [Some(g_k), None, Some(g_k1)];
+        let donors = mesh.miter_ring_sector_donors(v0, &cross_edges);
+        assert_eq!(
+            donors[1],
+            Some(f_n),
+            "the arc-start sector inherits the neighbour across g_k (prev_face), not the reflex face",
+        );
+        assert_ne!(
+            donors[1],
+            Some(f_r),
+            "the reflex block must NOT reach the arc-start sub-patch (§8.9.5.3 asymmetry)",
+        );
+    }
+
+    /// BEVEL.md §8.9.5.3 odd-`segments` bullet: the arc-*start* `B_1`'s centre column feeds **its
+    /// own** rep — the neighbour across `g_k` (`prev_face`, the `first_edge` arm) — into the
+    /// §6.6.1.4 tie-break against the **next** boundvert's rep. With the neighbour on the lower
+    /// slot the tie-break returns it, which the old departing-face reading (whose own candidate
+    /// was the reflex face) could never produce.
+    #[test]
+    fn miter_ring_arc_start_centre_column_tie_breaks_from_the_neighbour_rep() {
+        let (mesh, v0, g_k, g_k1, f_n, f_r, _f_t) = miter_arc_start_manifold_fan();
+        let cross_edges = [Some(g_k), None, Some(g_k1)];
+
+        // The centre column's own candidate is the neighbour `fN` (slot 1); the next boundvert
+        // (arc end `B_3`) reps `fR` (slot 2, = prev_face(g_(k+1)) = the reflex face). The tie-break
+        // picks the lower slot `fN`. The old own candidate would have been `fR`, giving `fR`.
+        assert_eq!(
+            mesh.boundvert_representative(v0, g_k1),
+            Some(f_r),
+            "the next boundvert (arc end) reps the reflex face fR",
+        );
+        let donors = mesh.miter_ring_centre_column_donors(v0, &cross_edges, None);
+        assert_eq!(
+            donors[1],
+            Some(f_n),
+            "the arc-start centre column tie-breaks between the neighbour fN and the reflex fR → fN",
+        );
+        assert_ne!(donors[1], Some(f_r), "the reflex face is the next rep, not the arc-start's own");
     }
 
     /// The edge-less sector's non-centre grid donor is the *positional* own-rep primitive —
