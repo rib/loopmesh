@@ -728,6 +728,32 @@ struct ApexBlend {
     endpoints: SlotSnapshot,
 }
 
+/// Per-sector §5.2.4.2 blend context for the even-`segments` [V-ADJ] **chain-interior**
+/// verts (BEVEL.md §5.2.4.2). From `segments = 4` up a vertex-mode fill mints more
+/// interior verts than the welded apex, and each is minted from the beveled corner `v`
+/// (§5.2.1 step 1, so a `NoInterp` layer keeps `cd(v)` rather than a layer default), then
+/// blended per fill-quad corner in its canonical sector `i`:
+///
+/// - **on the sector diagonal (`j == k`, non-seam):** the corner's position is snapped
+///   onto the sector's own boundvert edge `e_i` and the mean-value blend collapses
+///   (BMESH.md §10.1.3's boundary short-circuit) to the edge-linear
+///   `cd(v) + t·(cd(far) − cd(v))` — the same closed form the apex takes, held per sector
+///   in `sector_snaps[i]`;
+/// - **off the diagonal (`j != k`):** the plain mean-value blend of the **next**
+///   boundvert's representative face `f2` (`sector_donors[i]`) at the corner's own
+///   position, with no snap.
+///
+/// Sector-private interior verts (both indices `< h`) are written by one sector only and
+/// are isomorphism-invariant; the `j = h` seam verts and the welded apex are shared and
+/// last-write-wins order-dependent (§5.2.4.2's private/seam/apex invariance split). The
+/// welded apex itself is not routed through here — it keeps the dedicated `ApexBlend`
+/// path of §5.2.4.1.
+struct AdjInteriorBlend<'a> {
+    corner_vertex: VertexKey,
+    sector_snaps: &'a [Option<ApexBlend>],
+    sector_donors: &'a [Option<&'a CornerDonor>],
+}
+
 /// The cap's donor for the corner sitting on `ring_vertex` (BEVEL.md §5.2.1.1, the
 /// non-seam-carrying branch): boundvert `i`'s own representative, resolved against the
 /// same per-leg order `ring_vert_for_edge` and `donors` were both built in. `None` when
@@ -1307,6 +1333,52 @@ impl LoopMesh {
             })
             .collect();
 
+        // §5.2.4.2: at even `segments ≥ 4` the [V-ADJ] fill mints non-apex chain-interior
+        // verts too. Each is minted from `v`; a sector-diagonal corner takes the
+        // edge-linear snap onto that sector's *own* boundvert edge `e_i` (the same closed
+        // form as the apex, one per sector), and an off-diagonal corner takes the
+        // mean-value blend of the **next** boundvert's rep face `f2`. Captured now against
+        // the pristine mesh, in the same disk-ordered sector enumeration `emit_adj_grid`
+        // walks; the donor indices resolve against the same `bank` the re-stitch reads.
+        let per_corner_sector_snaps: Vec<Vec<Option<ApexBlend>>> = corners
+            .iter()
+            .map(|corner| {
+                (0..corner.ring_order.len())
+                    .map(|i| {
+                        let snap_edge = edge_of_ring_vertex(
+                            &corner.ring_vert_for_edge,
+                            corner.ring_order[i],
+                        )?;
+                        let [a, b] = self.edge_vert_keys(snap_edge);
+                        let far = if a == corner.vertex { b } else { a };
+                        let endpoints = self
+                            .vertex_attribs()
+                            .snapshot_slots(&[corner.vertex.as_usize(), far.as_usize()]);
+                        Some(ApexBlend {
+                            corner_vertex: corner.vertex,
+                            snap_from: self.vertex_position(corner.vertex),
+                            snap_to: self.vertex_position(far),
+                            endpoints,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let per_corner_sector_donor_idx: Vec<Vec<Option<usize>>> = corners
+            .iter()
+            .map(|corner| {
+                let sectors = corner.ring_order.len();
+                (0..sectors)
+                    .map(|i| {
+                        let next_boundvert = corner.ring_order[(i + 1) % sectors];
+                        edge_of_ring_vertex(&corner.ring_vert_for_edge, next_boundvert)
+                            .and_then(|edge| self.boundvert_representative(corner.vertex, edge))
+                            .and_then(|face| bank.index_of(face))
+                    })
+                    .collect()
+            })
+            .collect();
+
         // Stage 2 (§8.11.2 / §8.11.4): one profile chain per disk sector, built with
         // `mid = v` and `projection_dir = 0`. `ProfileCell::from_control_points` is
         // exactly that cell — the frame is the §8.2.2.1 one with `mid` promoted to the
@@ -1399,11 +1471,12 @@ impl LoopMesh {
         // entered unconditionally (no cube-corner octant fast path in vertex mode).
         // The cap adopts the incident-face chain edges and mints the gap-sector rim
         // plus the relaxed interior.
-        for (((corner, (chains, cells)), sector_reps), apex_blend) in corners
+        for (corner_index, (((corner, (chains, cells)), sector_reps), apex_blend)) in corners
             .iter()
             .zip(per_corner_chains.iter().zip(per_corner_cells.iter()))
             .zip(per_corner_sector_reps.iter())
             .zip(apex_blends.iter())
+            .enumerate()
         {
             let profiles: Vec<RingChainProfile> = cells
                 .iter()
@@ -1419,6 +1492,18 @@ impl LoopMesh {
                 .iter()
                 .map(|&template| templates.resolve(template))
                 .collect();
+            // §5.2.4.2: resolve this corner's per-sector `f2` donor indices to the pristine
+            // donors in `bank`; the sector snaps ride along by reference.
+            let sector_donors: Vec<Option<&CornerDonor>> = per_corner_sector_donor_idx
+                [corner_index]
+                .iter()
+                .map(|slot| slot.map(|index| bank.donor(index)))
+                .collect();
+            let interior_blend = AdjInteriorBlend {
+                corner_vertex: corner.vertex,
+                sector_snaps: &per_corner_sector_snaps[corner_index],
+                sector_donors: &sector_donors,
+            };
             self.emit_general_adj_fill(
                 corner.vertex,
                 chains,
@@ -1431,13 +1516,14 @@ impl LoopMesh {
                 &sector_representatives,
                 central_representative,
                 apex_blend.as_ref(),
+                Some(&interior_blend),
                 &mut result,
             );
         }
 
-        // §5.2.1 fact (c): blend the re-stitched originals' ring-vert corners. The
-        // chain-interior and patch-interior verts are §5.2.4 non-invariant fill geometry
-        // and are left at their minted (default) blocks.
+        // §5.2.1 fact (c): blend the re-stitched originals' ring-vert corners. The fill's
+        // own chain-interior verts were already minted-from-`v`-and-blended per §5.2.4.2
+        // (the even-`segments` grid) / §5.2.4.1 (the welded apex) inside the fill above.
         self.blend_restitched_originals(&rebuilt, &bank);
 
         for corner in &corners {
@@ -5424,8 +5510,10 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
-            // §5.2.4.1 is a vertex-mode-only apex rule; edge-mode junction fills leave
-            // the welded apex at its §5.2.4 minted defaults.
+            // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
+            // leave the welded apex and the chain-interior verts at their §5.2.4 minted
+            // defaults.
+            None,
             None,
             result,
         );
@@ -5455,6 +5543,7 @@ impl LoopMesh {
         sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
+        interior_blend: Option<&AdjInteriorBlend<'_>>,
         result: &mut BevelResult,
     ) {
         let sectors = chain_of.len();
@@ -5538,6 +5627,7 @@ impl LoopMesh {
                 sector_representatives,
                 central_representative,
                 apex_blend,
+                interior_blend,
                 result,
             );
             return;
@@ -5580,6 +5670,7 @@ impl LoopMesh {
             sector_representatives,
             central_representative,
             apex_blend,
+            interior_blend,
             result,
         );
     }
@@ -5730,8 +5821,9 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
-            // §5.2.4.1 is a vertex-mode-only apex rule; the edge-mode octant fill's apex
-            // is the isomorphism-invariant closed form of §8.5.5.5(f.2).
+            // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; the edge-mode octant fill's
+            // apex and interior are the isomorphism-invariant closed forms of §8.5.5.5(f.2).
+            None,
             None,
             result,
         );
@@ -5844,8 +5936,10 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
-            // §5.2.4.1 is a vertex-mode-only apex rule; edge-mode junction fills leave
-            // the welded apex at its §5.2.4 minted defaults.
+            // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
+            // leave the welded apex and the chain-interior verts at their §5.2.4 minted
+            // defaults.
+            None,
             None,
             result,
         );
@@ -5870,6 +5964,7 @@ impl LoopMesh {
         sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
+        interior_blend: Option<&AdjInteriorBlend<'_>>,
         result: &mut BevelResult,
     ) {
         debug_assert_eq!(
@@ -5889,7 +5984,7 @@ impl LoopMesh {
                 for cell_k in 0..half {
                     let a = self.adj_grid_vert(
                         i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior, apex_blend,
-                        &mut grid, result,
+                        interior_blend, &mut grid, result,
                     );
                     let b = self.adj_grid_vert(
                         i,
@@ -5902,6 +5997,7 @@ impl LoopMesh {
                         chain_of,
                         interior,
                         apex_blend,
+                        interior_blend,
                         &mut grid,
                         result,
                     );
@@ -5916,6 +6012,7 @@ impl LoopMesh {
                         chain_of,
                         interior,
                         apex_blend,
+                        interior_blend,
                         &mut grid,
                         result,
                     );
@@ -5930,6 +6027,7 @@ impl LoopMesh {
                         chain_of,
                         interior,
                         apex_blend,
+                        interior_blend,
                         &mut grid,
                         result,
                     );
@@ -5960,10 +6058,12 @@ impl LoopMesh {
             let mut row: Vec<VertexKey> = Vec::with_capacity(half + 1);
             for r in 0..=half {
                 column.push(self.adj_grid_vert(
-                    i, r, half, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
+                    i, r, half, half, seg, sectors, even, chain_of, interior, apex_blend,
+                    interior_blend, &mut grid, result,
                 ));
                 row.push(self.adj_grid_vert(
-                    next, half, r, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
+                    next, half, r, half, seg, sectors, even, chain_of, interior, apex_blend,
+                    interior_blend, &mut grid, result,
                 ));
             }
             for r in 0..half {
@@ -5980,7 +6080,8 @@ impl LoopMesh {
         let mut central: Vec<VertexKey> = Vec::with_capacity(sectors);
         for i in 0..sectors {
             central.push(self.adj_grid_vert(
-                i, half, half, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
+                i, half, half, half, seg, sectors, even, chain_of, interior, apex_blend,
+                interior_blend, &mut grid, result,
             ));
         }
         // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
@@ -6010,6 +6111,7 @@ impl LoopMesh {
         chain_of: &[Vec<VertexKey>],
         interior: &AdjInterior<'_>,
         apex_blend: Option<&ApexBlend>,
+        interior_blend: Option<&AdjInteriorBlend<'_>>,
         grid: &mut std::collections::HashMap<(usize, usize, usize), VertexKey>,
         result: &mut BevelResult,
     ) -> VertexKey {
@@ -6050,8 +6152,16 @@ impl LoopMesh {
             Some(blend) if even && j == half && k == half => {
                 self.mint_welded_apex(position, blend)
             }
-            // §5.2.4: every other patch-interior vert is not minted from the corner.
-            _ => self.create_vertex(position),
+            // §5.2.4.2: at even `segments ≥ 4` every other chain-interior vert is minted
+            // from `v` and blended per corner in its canonical sector. On the sector
+            // diagonal (`canon.j == canon.k`, non-apex) it takes the edge-linear snap onto
+            // that sector's own boundvert edge `e_i`; off the diagonal it takes the plain
+            // mean-value blend from the next boundvert's rep face `f2`. Odd `segments` and
+            // edge mode carry no `interior_blend`, so they keep the §5.2.4 minted defaults.
+            _ => match interior_blend {
+                Some(blend) if even => self.mint_chain_interior_vert(position, canon, blend),
+                _ => self.create_vertex(position),
+            },
         };
         result.verts.push(vertex);
         grid.insert(canon, vertex);
@@ -6077,6 +6187,47 @@ impl LoopMesh {
         self.vertex_attribs
             .interpolate_from_snapshot(apex.as_usize(), &blend.endpoints, &[1.0 - t, t]);
         apex
+    }
+
+    /// Mint a §5.2.4.2 even-`segments` [V-ADJ] chain-interior vert (a non-apex interior
+    /// grid vert) from the beveled corner `v` and blend its per-vertex block by the
+    /// per-corner rule of its canonical sector `canon.0`. Minting from `v` is the §5.2.1
+    /// step-1 baseline, so a `NoInterp` layer keeps `cd(v)` instead of falling to a layer
+    /// default (the pre-fix behaviour these verts had).
+    ///
+    /// On the sector diagonal (`canon.j == canon.k`) the corner is snapped onto the
+    /// sector's own boundvert edge and takes the edge-linear closed form — the same
+    /// `mint_welded_apex` machinery, keyed on that sector's snap. Off the diagonal it
+    /// takes the plain mean-value blend of the next boundvert's representative face `f2`
+    /// at the vert's own position (no snap). A sector with no snap edge / no `f2` donor —
+    /// the gap leg of an open fan — keeps the bare `cd(v)` mint.
+    fn mint_chain_interior_vert(
+        &mut self,
+        position: Vec3,
+        canon: (usize, usize, usize),
+        blend: &AdjInteriorBlend<'_>,
+    ) -> VertexKey {
+        let (sector, j, k) = canon;
+        if j == k {
+            if let Some(Some(snap)) = blend.sector_snaps.get(sector).map(|s| s.as_ref()) {
+                return self.mint_welded_apex(position, snap);
+            }
+            return self.mint_bevel_vertex(position, blend.corner_vertex);
+        }
+        match blend.sector_donors.get(sector).and_then(|d| *d) {
+            Some(donor) => {
+                let vertex = self.mint_bevel_vertex(position, blend.corner_vertex);
+                let sample = donor.projection.project(position);
+                let weights = mean_value_weights(&donor.proj_corners, sample);
+                self.vertex_attribs.interpolate_from_snapshot(
+                    vertex.as_usize(),
+                    &donor.corner_vertex_blocks,
+                    &weights,
+                );
+                vertex
+            }
+            None => self.mint_bevel_vertex(position, blend.corner_vertex),
+        }
     }
 
     /// Emit one adjacency-grid patch face (BEVEL.md §8.5.5), wound outward so it is
@@ -14600,6 +14751,149 @@ mod tests {
             mesh.vertex_attribs().get_f32(tint, untouched.as_usize()),
             Some(untouched_tint),
             "a vertex the bevel never touches keeps its block",
+        );
+    }
+
+    /// BEVEL.md §5.2.4.2: at even `segments = 4` the vertex-mode [V-ADJ] fill mints
+    /// **more** interior verts than the welded apex, and every one of them is minted from
+    /// the beveled corner `v` (§5.2.1 step 1) and blended — never left at the layer
+    /// defaults the pre-fix code produced. On the valence-3 corner (`s = 3`, `h = 2`) the
+    /// fill has seven interior verts: three sector-private diagonal verts `(i, 1, 1)`
+    /// (hard-pinnable — one writing sector, so order-independent — each the edge-linear
+    /// snap `cd(v) + t·(cd(far) − cd(v))` onto its own boundvert edge `e_i`), three
+    /// `j = h` seam verts and the one welded apex (both order-dependent, blended from a
+    /// face `f2` / the last-visited sector's edge). This pins the mint-from-`v` baseline
+    /// on all seven (a `NoInterp` layer keeps `cd(v)`) and the exact edge-linear value on
+    /// the three private diagonal verts.
+    #[test]
+    fn vertex_bevel_seg4_chain_interior_verts_mint_from_v_and_blend() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        // A NoInterp layer: the blend must never write it, so every interior vert keeps
+        // its minted `cd(v)` baseline (7.0) — the sharp discriminator against the pre-fix
+        // `create_vertex` mint, which left the layer default (0.0).
+        let seed = mesh
+            .register_vertex_attribute(
+                ElementAttributeDesc::numeric(AttributeKey::custom("seed"), AttrType::F32)
+                    .with_interp(InterpPolicy::NoInterp),
+            )
+            .unwrap();
+
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner_tint = 0.11_f32;
+        let neighbours = [
+            (Vec3::new(1.0, -1.0, 1.0), 0.19_f32),
+            (Vec3::new(1.0, 1.0, -1.0), 0.05_f32),
+            (Vec3::new(-1.0, -1.0, -1.0), 0.23_f32),
+        ];
+
+        // Distinct tints everywhere so no untouched vert can alias a blended one; `v` and
+        // its three neighbours carry the guide values, and the `seed` layer marks `v`.
+        for (index, v) in mesh.vert_keys().into_iter().enumerate() {
+            mesh.vertex_attribs_mut()
+                .set_f32(tint, v.as_usize(), 0.5 + index as f32);
+            mesh.vertex_attribs_mut().set_f32(seed, v.as_usize(), 9.0);
+        }
+        let corner = vert_at(&mesh, corner_position);
+        mesh.vertex_attribs_mut()
+            .set_f32(tint, corner.as_usize(), corner_tint);
+        mesh.vertex_attribs_mut().set_f32(seed, corner.as_usize(), 7.0);
+        for (pos, value) in neighbours {
+            let v = vert_at(&mesh, pos);
+            mesh.vertex_attribs_mut().set_f32(tint, v.as_usize(), value);
+        }
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 4,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // The cap's own interior verts are the new verts strictly inside the corner octant
+        // — off all three incident face planes (`x = 1`, `y = -1`, `z = -1`). Boundverts
+        // sit on original edges and profile-chain verts lie in an incident face plane, so
+        // both keep a coordinate pinned to the plane value and are excluded.
+        const EPS: f32 = 1.0e-3;
+        let interior: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| {
+                let p = mesh.vertex_position(v);
+                p.x < 1.0 - EPS && p.y > -1.0 + EPS && p.z > -1.0 + EPS
+            })
+            .collect();
+        assert_eq!(
+            interior.len(),
+            7,
+            "§5.2.4.2: the valence-3 seg=4 cap has 7 interior verts (3 private + 3 seam + apex)",
+        );
+
+        // Every interior vert is minted from `v`: its NoInterp `seed` keeps `cd(v)`'s 7.0
+        // rather than the layer default. This is the core of the fix.
+        for &v in &interior {
+            let s = mesh.vertex_attribs().get_f32(seed, v.as_usize()).unwrap();
+            assert_eq!(
+                s, 7.0,
+                "interior vert {v:?} must mint from v (NoInterp seed keeps cd(v)), not the default",
+            );
+            let t = mesh.vertex_attribs().get_f32(tint, v.as_usize()).unwrap();
+            assert!(
+                t.abs() > 0.01,
+                "interior vert {v:?} tint {t} must be a blend, never the layer default 0.0",
+            );
+        }
+
+        // The three sector-private diagonal verts `(i, 1, 1)` are the interior verts that
+        // are (a) NOT on the body diagonal (that is the apex) and (b) equal to the
+        // edge-linear snap onto one of `v`'s three incident edges, at their own clamped
+        // projection `t`. They are isomorphism-invariant, so the value is pinned exactly.
+        let edge_linear_candidate = |vert_position: Vec3| -> Vec<f32> {
+            neighbours
+                .iter()
+                .map(|&(far_position, far_tint)| {
+                    let axis = far_position - corner_position;
+                    let t = ((vert_position - corner_position).dot(axis) / axis.length_squared())
+                        .clamp(0.0, 1.0);
+                    corner_tint + t * (far_tint - corner_tint)
+                })
+                .collect()
+        };
+        let is_body_diagonal = |p: Vec3| {
+            let d = p - corner_position;
+            (d.x.abs() - d.y.abs()).abs() < 1.0e-4 && (d.x.abs() - d.z.abs()).abs() < 1.0e-4
+        };
+
+        let mut private_diagonal = 0;
+        for &v in &interior {
+            let p = mesh.vertex_position(v);
+            if is_body_diagonal(p) {
+                continue; // the welded apex, order-dependent — not pinned here
+            }
+            let t = mesh.vertex_attribs().get_f32(tint, v.as_usize()).unwrap();
+            if edge_linear_candidate(p)
+                .iter()
+                .any(|&c| (c - t).abs() < 1.0e-5)
+            {
+                private_diagonal += 1;
+            }
+        }
+        assert_eq!(
+            private_diagonal, 3,
+            "§5.2.4.2: exactly the three sector-private diagonal verts take the edge-linear \
+             snap onto their own boundvert edge (the seam verts blend from a face, the apex \
+             is on the body diagonal)",
         );
     }
 
