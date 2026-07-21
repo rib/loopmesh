@@ -1956,6 +1956,22 @@ impl LoopMesh {
         // rebuilt face's boundary and so the cross edge exists.
         self.apply_corner_run_attributes(&corner_runs);
 
+        // §5.2.5 / §5.2.1.1 third bullet: the strip quad owns its four loops. Its
+        // per-face block took only the near flank (above), but its per-loop blend is per
+        // corner, ordered near/near/far/far (§6.6.2): the two strip verts on `face_left`'s
+        // side blend that flank's pre-bevel corner loops, the two on `face_right`'s side the
+        // other's — each collapsing to the leg-linear form by the same §10.1.3 short-circuit
+        // as the re-stitch below. `face_left` is `E`'s stored-first radial face, so it is the
+        // near flank the block already inherited.
+        self.blend_strip_quad_loops(
+            strip.face,
+            face_left,
+            face_right,
+            [ends_a.on_face(face_left), ends_b.on_face(face_left)],
+            [ends_a.on_face(face_right), ends_b.on_face(face_right)],
+            &donors,
+        );
+
         // §5.2.1 fact (c) / §5.2.3: the re-stitched originals blend every corner from
         // themselves, pre-bevel, and are the **last** faces to write per-vertex data —
         // so this runs after the strip build above, not inside the re-stitch. For a
@@ -9075,6 +9091,54 @@ impl LoopMesh {
             let donor = bank.donor(index);
             for corner in self.face_loop_keys(original.face) {
                 self.blend_corner_from_donor(corner, donor);
+            }
+        }
+    }
+
+    /// Blend the single-segment strip quad's **own** four loops (BEVEL.md §5.2.5, the
+    /// per-loop half of §5.2.1.1's third bullet). The quad owns these loops outright — no
+    /// re-stitched original writes them — so an unblended corner keeps the layer default,
+    /// exactly what the §7-fills' stub still does elsewhere.
+    ///
+    /// Where the quad's per-**face** block takes only the near flank (§6.6.2's strip row),
+    /// its per-loop donor list is per corner, ordered **near/near/far/far**: each strip vert
+    /// sits on a *leg* of one flank of `E` (§5.2.3), so its loop blends **that flank's**
+    /// pre-bevel corner blocks. `near_flank` is `E`'s stored-first radial face (the quad's
+    /// block donor); `far_flank` the other. §10.1.3's on-edge short-circuit collapses each
+    /// solve to the leg-linear closed form at the strip vert's final position, so a
+    /// position-contiguous layer reproduces `f(position)` exactly and either flank yields the
+    /// same number — but the split is nailed down now so the seam-carrying override (a later
+    /// row) only *adds* an override donor rather than reworking this mapping.
+    ///
+    /// Both domains ride one solve, so this also writes each strip vert's per-vertex block
+    /// from its flank; the re-stitched originals overwrite that last (§5.2.1 fact (c)) with
+    /// the identical value (the same flank donates the strip vert in the re-stitch), so the
+    /// order is a formality here, not a value choice.
+    fn blend_strip_quad_loops(
+        &mut self,
+        strip_face: FaceKey,
+        near_flank: FaceKey,
+        far_flank: FaceKey,
+        strip_verts_on_near: [VertexKey; 2],
+        strip_verts_on_far: [VertexKey; 2],
+        bank: &DonorBank,
+    ) {
+        if bank.is_empty() {
+            return;
+        }
+        let near = bank.index_of(near_flank);
+        let far = bank.index_of(far_flank);
+        for corner in self.face_loop_keys(strip_face) {
+            let vertex = self.loop_vertex(corner);
+            let donor = if strip_verts_on_near.contains(&vertex) {
+                near
+            } else if strip_verts_on_far.contains(&vertex) {
+                far
+            } else {
+                None
+            };
+            if let Some(donor) = donor {
+                self.blend_corner_from_donor(corner, bank.donor(donor));
             }
         }
     }
@@ -32561,6 +32625,126 @@ mod tests {
                 (actual - expected).abs() < 1.0e-3,
                 "strip corner shade {actual} != leg-linear {expected} (endpoint loop \
                  {near_shade}, leg-far loop {leg_far_shade}, t {t})",
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §5.2.5 / §5.2.1.1 third bullet: the §7 single-segment strip quad owns its
+    /// four loops, so its per-corner blend decides them outright — nothing else writes
+    /// them, so an unblended corner reads the layer **default**. On a position-contiguous
+    /// layer every donor face reproduces `f(position)` exactly (§10.1.3's on-edge
+    /// short-circuit at each strip vert's leg), so the arriving value is the affine field at
+    /// the vert's own position — and the discriminating fact is that it is **not** the
+    /// default, which is what today's stub left there.
+    #[test]
+    fn edge_bevel_strip_quad_loops_blend_from_their_flank() {
+        let (mut mesh, shade) = loop_continuous_cube();
+        let near = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let far_end = vert_at(&mesh, Vec3::new(1.0, -1.0, 1.0));
+        let beveled = mesh
+            .query_edge_exists(near, far_end)
+            .expect("the cube has this edge");
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "a valence-3 isolated edge mints only the strip quad",
+        );
+        let strip = result.faces[0];
+        assert_eq!(mesh.face_loop_keys(strip).len(), 4, "the strip is a quad");
+
+        for corner in mesh.face_loop_keys(strip) {
+            let position = mesh.vertex_position(mesh.loop_vertex(corner));
+            let expected = continuous_loop_field(position);
+            let actual = shade_of(&mesh, shade, corner);
+            assert!(
+                (actual - expected).abs() < 1.0e-3,
+                "strip quad loop {actual} != the flank's blend {expected} at {position:?}",
+            );
+            assert!(
+                actual.abs() > 1.0e-3,
+                "the strip quad loop read the layer default — no per-loop blend ran on the \
+                 minted strip",
+            );
+        }
+
+        mesh.validate_topology();
+    }
+
+    /// BEVEL.md §6.6.2's strip row + §5.2.3: the strip quad's per-loop donor list is per
+    /// corner, near/near/far/far — each strip vert blends **its own flank's** loops, the
+    /// flank whose leg it sits on. On the per-face-coded cube that flank's value carries the
+    /// face's own code, so the strip quad's loop at a strip vert must **agree** with the
+    /// re-stitched flank's loop that meets it across the shared chamfer edge, and disagree
+    /// with the other flank's code. A default reading (0) or a swapped near/far mapping fails
+    /// on a nameable code offset.
+    #[test]
+    fn edge_bevel_strip_quad_loops_agree_with_their_rebuilt_flank() {
+        let (mut mesh, shade) = loop_decorated_cube();
+        let near = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let far_end = vert_at(&mesh, Vec3::new(1.0, -1.0, 1.0));
+        let beveled = mesh
+            .query_edge_exists(near, far_end)
+            .expect("the cube has this edge");
+        // `E`'s two flanking faces, by plane code — they are re-stitched (keep their plane)
+        // and are the near / far flank donors the strip quad's loops must track.
+        let flank_codes: Vec<i32> = mesh
+            .edge_face_keys(beveled)
+            .into_iter()
+            .map(|face| face_code(mesh.face_plane_normal(face)))
+            .collect();
+        assert_eq!(flank_codes.len(), 2);
+
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.faces.len(), 1);
+        let strip = result.faces[0];
+
+        for corner in mesh.face_loop_keys(strip) {
+            let vertex = mesh.loop_vertex(corner);
+            let position = mesh.vertex_position(vertex);
+            // The flank this strip vert sits on is the one re-stitched face, among `E`'s two,
+            // that still has a corner here (the vert is on that flank's leg only).
+            let flank = flank_codes
+                .iter()
+                .copied()
+                .find(|&code| {
+                    let face = face_with_normal(&mesh, code);
+                    mesh.face_loop_keys(face)
+                        .into_iter()
+                        .any(|other| mesh.loop_vertex(other) == vertex)
+                })
+                .expect("a strip vert lies on exactly one flank's leg");
+            let flank_face = face_with_normal(&mesh, flank);
+            let flank_corner = corner_of(&mesh, flank_face, vertex);
+            let expected = shade_of(&mesh, shade, flank_corner);
+            let actual = shade_of(&mesh, shade, corner);
+            assert!(
+                (actual - expected).abs() < 1.0e-3,
+                "strip quad loop {actual} does not agree with its flank (code {flank}) loop \
+                 {expected} at {position:?} — a default or a swapped near/far donor",
+            );
+            let other_code = *flank_codes.iter().find(|&&c| c != flank).expect("two flanks");
+            assert!(
+                (actual - 100.0 * (other_code as f32 + 1.0)).abs() > 50.0,
+                "strip quad loop {actual} carries the *other* flank's code {other_code} — \
+                 the near/far mapping is swapped",
             );
         }
 
