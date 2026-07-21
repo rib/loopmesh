@@ -704,6 +704,30 @@ impl DonorBank {
     }
 }
 
+/// The §5.2.4.1 edge-linear snap blend for the even-`segments` vertex-mode welded
+/// apex (BEVEL.md §5.2.4.1). The apex `(i, j, k)` with `j > 0` belongs to **no**
+/// rebuilt original face, so it is minted from the beveled corner `v` (the §5.2.1
+/// step-1 baseline — so `NoInterp` layers keep `cd(v)` per BMESH.md §10.1.4) and its
+/// interpolable per-vertex layers then take the edge-linear blend
+/// `cd(v) + t·(cd(far) − cd(v))` on the **last-visited** boundvert's incident edge:
+/// the predecessor of the ring's start, whose sector writes the shared apex last.
+/// `far` is that edge's far endpoint; `t` is the apex's clamped closest-point
+/// projection onto the `v → far` segment, taken at the apex's final position. Because
+/// the projected point lands on a donor boundary edge, §10.1.3's boundary
+/// short-circuit collapses the mean-value resample to exactly this edge-linear form,
+/// regardless of which face donates the interior.
+struct ApexBlend {
+    /// The beveled corner `v` — the §5.2.1 step-1 example the apex is minted from.
+    corner_vertex: VertexKey,
+    /// The snap edge's near endpoint, `pos(v)`.
+    snap_from: Vec3,
+    /// The snap edge's far endpoint, `pos(far)`.
+    snap_to: Vec3,
+    /// The pre-bevel per-vertex blocks of `[v, far]`, in that order — the two ends of
+    /// the edge-linear blend, weighted `[1 − t, t]`.
+    endpoints: SlotSnapshot,
+}
+
 /// The cap's donor for the corner sitting on `ring_vertex` (BEVEL.md §5.2.1.1, the
 /// non-seam-carrying branch): boundvert `i`'s own representative, resolved against the
 /// same per-leg order `ring_vert_for_edge` and `donors` were both built in. `None` when
@@ -1251,6 +1275,33 @@ impl LoopMesh {
             .collect();
         let bank = self.capture_donor_bank(&incident);
 
+        // §5.2.4.1: the even-`segments` welded apex snaps to the **last-visited**
+        // sector's boundvert edge — the predecessor of the ring's start, i.e. the last
+        // boundvert of the disk-ordered ring (`emit_adj_grid` walks the sectors in that
+        // order, so the last sector writes the apex last). `far` is that edge's far
+        // endpoint. Captured now, against the pristine mesh: `v` and `far`'s per-vertex
+        // blocks are still untouched (the re-stitch below re-points edges but does not
+        // blend, and `blend_restitched_originals` runs after the fill).
+        let apex_blends: Vec<Option<ApexBlend>> = corners
+            .iter()
+            .map(|corner| {
+                let snap_boundvert = *corner.ring_order.last()?;
+                let snap_edge =
+                    edge_of_ring_vertex(&corner.ring_vert_for_edge, snap_boundvert)?;
+                let [a, b] = self.edge_vert_keys(snap_edge);
+                let far = if a == corner.vertex { b } else { a };
+                let endpoints = self
+                    .vertex_attribs()
+                    .snapshot_slots(&[corner.vertex.as_usize(), far.as_usize()]);
+                Some(ApexBlend {
+                    corner_vertex: corner.vertex,
+                    snap_from: self.vertex_position(corner.vertex),
+                    snap_to: self.vertex_position(far),
+                    endpoints,
+                })
+            })
+            .collect();
+
         // Stage 2 (§8.11.2 / §8.11.4): one profile chain per disk sector, built with
         // `mid = v` and `projection_dir = 0`. `ProfileCell::from_control_points` is
         // exactly that cell — the frame is the §8.2.2.1 one with `mid` promoted to the
@@ -1343,10 +1394,11 @@ impl LoopMesh {
         // entered unconditionally (no cube-corner octant fast path in vertex mode).
         // The cap adopts the incident-face chain edges and mints the gap-sector rim
         // plus the relaxed interior.
-        for ((corner, (chains, cells)), sector_reps) in corners
+        for (((corner, (chains, cells)), sector_reps), apex_blend) in corners
             .iter()
             .zip(per_corner_chains.iter().zip(per_corner_cells.iter()))
             .zip(per_corner_sector_reps.iter())
+            .zip(apex_blends.iter())
         {
             let profiles: Vec<RingChainProfile> = cells
                 .iter()
@@ -1373,6 +1425,7 @@ impl LoopMesh {
                 options.material,
                 &sector_representatives,
                 central_representative,
+                apex_blend.as_ref(),
                 &mut result,
             );
         }
@@ -5366,6 +5419,9 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
+            // §5.2.4.1 is a vertex-mode-only apex rule; edge-mode junction fills leave
+            // the welded apex at its §5.2.4 minted defaults.
+            None,
             result,
         );
     }
@@ -5393,6 +5449,7 @@ impl LoopMesh {
         material: i32,
         sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
+        apex_blend: Option<&ApexBlend>,
         result: &mut BevelResult,
     ) {
         let sectors = chain_of.len();
@@ -5475,6 +5532,7 @@ impl LoopMesh {
                 material,
                 sector_representatives,
                 central_representative,
+                apex_blend,
                 result,
             );
             return;
@@ -5516,6 +5574,7 @@ impl LoopMesh {
             material,
             sector_representatives,
             central_representative,
+            apex_blend,
             result,
         );
     }
@@ -5666,6 +5725,9 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
+            // §5.2.4.1 is a vertex-mode-only apex rule; the edge-mode octant fill's apex
+            // is the isomorphism-invariant closed form of §8.5.5.5(f.2).
+            None,
             result,
         );
     }
@@ -5777,6 +5839,9 @@ impl LoopMesh {
             material,
             &sector_representatives,
             central_representative,
+            // §5.2.4.1 is a vertex-mode-only apex rule; edge-mode junction fills leave
+            // the welded apex at its §5.2.4 minted defaults.
+            None,
             result,
         );
     }
@@ -5799,6 +5864,7 @@ impl LoopMesh {
         material: i32,
         sector_representatives: &[FaceTemplateRef<'_>],
         central_representative: FaceTemplateRef<'_>,
+        apex_blend: Option<&ApexBlend>,
         result: &mut BevelResult,
     ) {
         debug_assert_eq!(
@@ -5817,8 +5883,8 @@ impl LoopMesh {
             for cell_j in 0..half {
                 for cell_k in 0..half {
                     let a = self.adj_grid_vert(
-                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior, &mut grid,
-                        result,
+                        i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior, apex_blend,
+                        &mut grid, result,
                     );
                     let b = self.adj_grid_vert(
                         i,
@@ -5830,6 +5896,7 @@ impl LoopMesh {
                         even,
                         chain_of,
                         interior,
+                        apex_blend,
                         &mut grid,
                         result,
                     );
@@ -5843,6 +5910,7 @@ impl LoopMesh {
                         even,
                         chain_of,
                         interior,
+                        apex_blend,
                         &mut grid,
                         result,
                     );
@@ -5856,6 +5924,7 @@ impl LoopMesh {
                         even,
                         chain_of,
                         interior,
+                        apex_blend,
                         &mut grid,
                         result,
                     );
@@ -5886,10 +5955,10 @@ impl LoopMesh {
             let mut row: Vec<VertexKey> = Vec::with_capacity(half + 1);
             for r in 0..=half {
                 column.push(self.adj_grid_vert(
-                    i, r, half, half, seg, sectors, even, chain_of, interior, &mut grid, result,
+                    i, r, half, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
                 ));
                 row.push(self.adj_grid_vert(
-                    next, half, r, half, seg, sectors, even, chain_of, interior, &mut grid, result,
+                    next, half, r, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
                 ));
             }
             for r in 0..half {
@@ -5906,7 +5975,7 @@ impl LoopMesh {
         let mut central: Vec<VertexKey> = Vec::with_capacity(sectors);
         for i in 0..sectors {
             central.push(self.adj_grid_vert(
-                i, half, half, half, seg, sectors, even, chain_of, interior, &mut grid, result,
+                i, half, half, half, seg, sectors, even, chain_of, interior, apex_blend, &mut grid, result,
             ));
         }
         // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
@@ -5935,6 +6004,7 @@ impl LoopMesh {
         even: bool,
         chain_of: &[Vec<VertexKey>],
         interior: &AdjInterior<'_>,
+        apex_blend: Option<&ApexBlend>,
         grid: &mut std::collections::HashMap<(usize, usize, usize), VertexKey>,
         result: &mut BevelResult,
     ) -> VertexKey {
@@ -5968,11 +6038,40 @@ impl LoopMesh {
         }
 
         let position = interior.position(canon.0, canon.1, canon.2, half);
-        // §5.2.4: not yet minted from the corner.
-        let vertex = self.create_vertex(position);
+        let vertex = match apex_blend {
+            // §5.2.4.1: the even-`segments` vertex-mode welded apex is minted from the
+            // corner `v` (baseline, so `NoInterp` layers keep `cd(v)`) and its
+            // interpolable layers take the edge-linear snap blend toward `far`.
+            Some(blend) if even && j == half && k == half => {
+                self.mint_welded_apex(position, blend)
+            }
+            // §5.2.4: every other patch-interior vert is not minted from the corner.
+            _ => self.create_vertex(position),
+        };
         result.verts.push(vertex);
         grid.insert(canon, vertex);
         vertex
+    }
+
+    /// Mint the even-`segments` vertex-mode welded apex with the §5.2.4.1 edge-linear
+    /// snap blend. The apex's whole per-vertex block starts as a copy of the corner
+    /// `v`'s (§5.2.1 step 1), so a `NoInterp` layer keeps `cd(v)` (BMESH.md §10.1.4);
+    /// its interpolable layers are then overwritten by `cd(v) + t·(cd(far) − cd(v))`,
+    /// where `t` is the apex's clamped closest-point projection onto the `v → far`
+    /// snap-edge segment taken at the apex's final `position`. `interpolate_from_snapshot`
+    /// leaves the `NoInterp` layers untouched, so the two steps compose exactly.
+    fn mint_welded_apex(&mut self, position: Vec3, blend: &ApexBlend) -> VertexKey {
+        let apex = self.mint_bevel_vertex(position, blend.corner_vertex);
+        let axis = blend.snap_to - blend.snap_from;
+        let length_squared = axis.length_squared();
+        let t = if length_squared <= f32::EPSILON {
+            0.0
+        } else {
+            ((position - blend.snap_from).dot(axis) / length_squared).clamp(0.0, 1.0)
+        };
+        self.vertex_attribs
+            .interpolate_from_snapshot(apex.as_usize(), &blend.endpoints, &[1.0 - t, t]);
+        apex
     }
 
     /// Emit one adjacency-grid patch face (BEVEL.md §8.5.5), wound outward so it is
@@ -14330,6 +14429,146 @@ mod tests {
         assert!(
             bulge.dot(toward_vertex) > 0.0,
             "§8.11.2: the profile chains and cap bulge toward the corner vertex, not flat",
+        );
+    }
+
+    /// BEVEL.md §5.2.4.1: the even-`segments` vertex-mode **welded apex** takes the
+    /// edge-linear snap blend `cd(v) + t·(cd(far) − cd(v))` on the last-visited sector's
+    /// boundvert edge — the predecessor of the ring's start (the last boundvert in the
+    /// disk-ordered ring). It is *not* left at the layer defaults the way the other
+    /// patch-interior verts are. On the guide's load-bearing cube-corner arm (the
+    /// valence-3 corner `v = (1, −1, −1)` at `offset = 0.25`, `segments = 2`, per-vertex
+    /// tint `0.11` on `v` and `{0.19, 0.05, 0.23}` on its neighbours toward
+    /// `(1,−1,1)/(1,1,−1)/(−1,−1,−1)`) the apex snaps to the `(1,1,−1)` edge and lands at
+    /// `0.11 + 0.02104·(0.05 − 0.11) = 0.108738`. `NoInterp` layers keep `cd(v)` (the
+    /// §5.2.1 step-1 mint baseline, BMESH.md §10.1.4); untouched verts keep their block.
+    #[test]
+    fn vertex_bevel_multiseg_welded_apex_takes_the_edge_linear_snap_blend() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let tint = mesh
+            .register_vertex_attribute(ElementAttributeDesc::numeric(
+                AttributeKey::custom("tint"),
+                AttrType::F32,
+            ))
+            .unwrap();
+        // A second float layer forced to NoInterp: the blend must never write it, so the
+        // apex keeps its minted `cd(v)` baseline rather than a blended or default value.
+        let seed = mesh
+            .register_vertex_attribute(
+                ElementAttributeDesc::numeric(AttributeKey::custom("seed"), AttrType::F32)
+                    .with_interp(InterpPolicy::NoInterp),
+            )
+            .unwrap();
+
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner_tint = 0.11_f32;
+        // Neighbour edge → tint, matching the guide's worked cube arm.
+        let neighbours = [
+            (Vec3::new(1.0, -1.0, 1.0), 0.19_f32),
+            (Vec3::new(1.0, 1.0, -1.0), 0.05_f32),
+            (Vec3::new(-1.0, -1.0, -1.0), 0.23_f32),
+        ];
+
+        // Give every vertex a distinct tint so an untouched vert cannot alias a blended
+        // one; the corner and its three neighbours carry the guide's values.
+        for (index, v) in mesh.vert_keys().into_iter().enumerate() {
+            mesh.vertex_attribs_mut()
+                .set_f32(tint, v.as_usize(), 0.5 + index as f32);
+            mesh.vertex_attribs_mut().set_f32(seed, v.as_usize(), 9.0);
+        }
+        let corner = vert_at(&mesh, corner_position);
+        mesh.vertex_attribs_mut()
+            .set_f32(tint, corner.as_usize(), corner_tint);
+        mesh.vertex_attribs_mut()
+            .set_f32(seed, corner.as_usize(), 7.0);
+        for (pos, value) in neighbours {
+            let v = vert_at(&mesh, pos);
+            mesh.vertex_attribs_mut().set_f32(tint, v.as_usize(), value);
+        }
+        // A vertex the bevel never touches, to pin that its block survives.
+        let untouched = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
+        let untouched_tint = mesh
+            .vertex_attribs()
+            .get_f32(tint, untouched.as_usize())
+            .unwrap();
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+
+        // The welded apex is the lone new vert on the corner's body diagonal: all three
+        // of its offsets from `v` are non-zero and equal (every ring / profile vert has
+        // one zero offset component).
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| {
+                let d = mesh.vertex_position(v) - corner_position;
+                d.x.abs() > 1.0e-4
+                    && (d.x.abs() - d.y.abs()).abs() < 1.0e-4
+                    && (d.x.abs() - d.z.abs()).abs() < 1.0e-4
+            })
+            .expect("the welded apex on the body diagonal");
+        let apex_position = mesh.vertex_position(apex);
+        let apex_tint = mesh.vertex_attribs().get_f32(tint, apex.as_usize()).unwrap();
+
+        // Every candidate is the edge-linear blend at the apex's clamped projection `t`
+        // onto that neighbour edge; `t` is the same for all three (the apex is on the
+        // diagonal), so the candidates differ only in `cd(far)`.
+        let candidate = |far_position: Vec3, far_tint: f32| -> f32 {
+            let axis = far_position - corner_position;
+            let t = ((apex_position - corner_position).dot(axis) / axis.length_squared())
+                .clamp(0.0, 1.0);
+            corner_tint + t * (far_tint - corner_tint)
+        };
+        let candidates: Vec<f32> = neighbours
+            .iter()
+            .map(|&(pos, value)| candidate(pos, value))
+            .collect();
+
+        // The apex is one of the three edge-linear candidates — never the layer default
+        // (0.0) it used to mint from, and never a four-corner face mean.
+        assert!(
+            candidates
+                .iter()
+                .any(|&c| (c - apex_tint).abs() < 1.0e-5),
+            "apex tint {apex_tint} must equal one edge-linear candidate {candidates:?}",
+        );
+        assert!(apex_tint.abs() > 1.0e-4, "apex is not the layer default");
+
+        // Construction-specific lock (NOT a cross-backend BMesh-parity claim). Per
+        // BEVEL.md §5.2.4.1 the apex snap-edge choice is *not* isomorphism-invariant: it
+        // is a deterministic function of the ring enumeration start/direction, which
+        // differs by mesh construction. On *this* `mesh_add_cube` construction loopmesh's
+        // ring makes the last-visited boundvert the `(1,1,−1)` edge, so the apex snaps to
+        // `cd(far) = 0.05` and lands at 0.108738 — one of the three §5.2.4.1 candidates
+        // pinned above. A cube built by a different face order (e.g. the A/B harness's)
+        // can legitimately select a different candidate (loopmesh yields 0.112525 there,
+        // BMesh 0.108738), so this equality guards loopmesh's own behaviour here only —
+        // the parity-meaningful check is the candidate-set membership assertion above.
+        assert!(
+            (apex_tint - 0.108738).abs() < 1.0e-4,
+            "apex tint {apex_tint} matches loopmesh's snap-to-{{v,3}} value 0.108738 \
+             on this mesh_add_cube construction",
+        );
+
+        // §10.1.4: the NoInterp layer is never blended — the apex keeps `cd(v)`'s seed.
+        let apex_seed = mesh.vertex_attribs().get_f32(seed, apex.as_usize()).unwrap();
+        assert_eq!(apex_seed, 7.0, "NoInterp layer keeps the minted cd(v)");
+
+        // An untouched vertex is undisturbed.
+        assert_eq!(
+            mesh.vertex_attribs().get_f32(tint, untouched.as_usize()),
+            Some(untouched_tint),
+            "a vertex the bevel never touches keeps its block",
         );
     }
 
