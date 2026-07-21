@@ -6704,20 +6704,32 @@ impl LoopMesh {
         let dir_first = layout.dir_first;
         let dir_second = layout.dir_second;
 
-        // §7.6.2 parallel/anti-parallel ladder, gated on the angle between the two
-        // edge *directions*. cos θ = dir_first · dir_second; the two near-degenerate
-        // ends each have a closed-form placement that the line-line solve cannot
-        // produce (parallel lines never cross, anti-parallel collapse to a sliver).
-        let cos_theta = dir_first.dot(dir_second).clamp(-1.0, 1.0);
-        if cos_theta >= 1.0 - MEET_ANGLE_TOLERANCE {
-            // Edges nearly parallel (θ ≈ 0): no well-defined crossing. Push out
-            // perpendicular to both edges by `offset / cos(θ/2)` (→ `offset` as
-            // θ → 0); a finite placement, not the bisector `t / sin(θ/2)` limit.
-            return self.parallel_meet(vertex_position, &layout, offset, cos_theta);
+        // §7.6.2 parallel/anti-parallel ladder, gated on the **direction angle**
+        // `θ_dir` under the convention that fixes which branch is which: the first
+        // edge's direction is taken *into* `v`, the second's *out* of `v`. Both
+        // `dir_first`/`dir_second` are stored pointing *out* of `v`, so the into-`v`
+        // first direction is `-dir_first` and `cos θ_dir = (-dir_first) · dir_second`.
+        //
+        // This convention is load-bearing: two collinear beveled edges running
+        // straight *through* `v` (rays out of `v` pointing *opposite* ways) fold onto
+        // the *same* into/out vector, so `θ_dir → 0` — the **PARALLEL** branch, whose
+        // perpendicular push lands the boundvert one offset out along the sector's
+        // leg. The anti-parallel slide is reserved for the genuine double-back
+        // (`θ_dir → 180°`: both edges leaving `v` the same way, a zero-area sliver).
+        // Dispatching on the raw ray angle `dir_first · dir_second` swaps the two —
+        // it sends the straight-through config to the slide, which puts the boundvert
+        // on the wrong axis (along the edges instead of perpendicular to them).
+        let cos_dir = (-dir_first).dot(dir_second).clamp(-1.0, 1.0);
+        if cos_dir >= 1.0 - MEET_ANGLE_TOLERANCE {
+            // Directions nearly parallel (θ_dir ≈ 0), the straight-through corner:
+            // the two offset lines coincide, so push out perpendicular to both edges
+            // by `offset / cos(θ_dir/2)` (→ `offset` as θ_dir → 0).
+            return self.parallel_meet(vertex_position, &layout, offset, cos_dir);
         }
-        if cos_theta <= -1.0 + MEET_ANGLE_TOLERANCE {
-            // Edges nearly anti-parallel (opening angle ≈ 180°): slide along the
-            // common edge line by the offset; there is no perpendicular to take.
+        if cos_dir <= -1.0 + MEET_ANGLE_TOLERANCE {
+            // Directions nearly anti-parallel (θ_dir ≈ 180°), the doubled-back corner:
+            // slide along the common edge line by the offset; there is no
+            // perpendicular leg to take.
             return vertex_position + dir_first * offset;
         }
 
@@ -7042,19 +7054,22 @@ impl LoopMesh {
         perpendicular
     }
 
-    /// §7.6.2 parallel special case: with the two edges nearly parallel, the offset
-    /// lines never cross, so place the meet straight out from `v` perpendicular to
-    /// both edges, a distance `offset / cos(θ/2)` along the common direction's
-    /// in-plane perpendicular. `θ` is the (small) angle between the two edge
-    /// directions; `cos(θ/2)` is recovered from `cos θ` by the half-angle identity.
+    /// §7.6.2 parallel special case (θ_dir ≈ 0, the straight-through corner): the
+    /// two offset lines coincide, so place the meet straight out from `v`
+    /// perpendicular to both edges, a distance `offset / cos(θ_dir/2)` along the
+    /// common direction's in-plane perpendicular. `cos_dir` is `cos θ_dir` in the
+    /// dispatch convention (first edge into `v`, second out of `v`), so the common
+    /// direction is `(-dir_first) + dir_second` — for two collinear edges running
+    /// straight through `v` these two into/out vectors coincide, giving a well-defined
+    /// common direction where the raw out-of-`v` sum would cancel to zero.
     fn parallel_meet(
         &self,
         vertex_position: Vec3,
         layout: &SectorLayout,
         offset: f32,
-        cos_theta: f32,
+        cos_dir: f32,
     ) -> Vec3 {
-        let common = (layout.dir_first + layout.dir_second).normalize_or_zero();
+        let common = (-layout.dir_first + layout.dir_second).normalize_or_zero();
         if common == Vec3::ZERO {
             return vertex_position;
         }
@@ -7071,7 +7086,7 @@ impl LoopMesh {
                 perpendicular = -perpendicular;
             }
         }
-        let cos_half = ((1.0 + cos_theta) * 0.5).max(0.0).sqrt();
+        let cos_half = ((1.0 + cos_dir) * 0.5).max(0.0).sqrt();
         let distance = if cos_half > f32::EPSILON {
             offset / cos_half
         } else {
@@ -25006,6 +25021,92 @@ mod tests {
             .query_edge_exists(verts[1][1], verts[2][1])
             .expect("the centre's +x edge");
         (verts[1][1], beveled)
+    }
+
+    /// BEVEL.md §7.6.2 "Parallel and anti-parallel special cases" (the trap note):
+    /// beveling the **two collinear spokes** that run straight *through* the centre of
+    /// a flat grid is the `θ_dir ≈ 0` **parallel** config — the two edges' rays leave
+    /// `v` in *opposite* directions, but taken as (into `v`, out of `v`) they fold onto
+    /// one vector. It takes the **perpendicular push** of bullet 1: each of the two
+    /// half-plane sectors lands its boundvert one `offset` out **along its own
+    /// perpendicular `y`-leg**, at `v ± offset·ŷ`. Sliding along the common `x` edge
+    /// line (bullet 2's doubled-back rule) is the parity bug this pins against — it
+    /// would land the boundverts on the wrong axis, at `v ± offset·x̂`.
+    #[test]
+    fn edge_bevel_collinear_through_vertex_pushes_perpendicular_not_along_the_edge() {
+        let mut mesh = LoopMesh::new();
+        let (centre, edge_plus_x) = grid_3x3(&mut mesh, Vec3::ZERO);
+        // The centre sits at (1, 1, 0); its two collinear spokes run along x.
+        assert_eq!(mesh.vertex_position(centre), Vec3::new(1.0, 1.0, 0.0));
+        let edge_minus_x = mesh
+            .query_edge_exists(centre, vert_at(&mesh, Vec3::new(0.0, 1.0, 0.0)))
+            .expect("the centre's -x edge");
+
+        let result = mesh.bevel(
+            &[GeomKey::from(edge_plus_x), GeomKey::from(edge_minus_x)],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                ..Default::default()
+            },
+        );
+
+        // Perpendicular push: one offset out along the y leg of each half-plane sector.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(1.0, 1.25, 0.0)),
+            1,
+            "upper sector's boundvert must push +y (perpendicular to the beveled x spokes)",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(1.0, 0.75, 0.0)),
+            1,
+            "lower sector's boundvert must push -y",
+        );
+        // The doubled-back slide answer (along the common x line) must not appear.
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(1.25, 1.0, 0.0)),
+            0,
+            "the slide-along-the-edge answer is the anti-parallel bug, not this config",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, Vec3::new(0.75, 1.0, 0.0)),
+            0,
+            "the slide-along-the-edge answer is the anti-parallel bug, not this config",
+        );
+    }
+
+    /// The same perpendicular push holds at every segment count (BEVEL.md §7.6.2 oracle
+    /// pin, "the perpendicular push is what BMesh does here, at every segment count"):
+    /// the two boundverts are the segment chain's endpoints regardless of `segments`.
+    #[test]
+    fn edge_bevel_collinear_through_vertex_pushes_perpendicular_at_every_segment_count() {
+        for segments in 1..=3 {
+            let mut mesh = LoopMesh::new();
+            let (centre, edge_plus_x) = grid_3x3(&mut mesh, Vec3::ZERO);
+            let edge_minus_x = mesh
+                .query_edge_exists(centre, vert_at(&mesh, Vec3::new(0.0, 1.0, 0.0)))
+                .expect("the centre's -x edge");
+            let result = mesh.bevel(
+                &[GeomKey::from(edge_plus_x), GeomKey::from(edge_minus_x)],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, Vec3::new(1.0, 1.25, 0.0)),
+                1,
+                "segments = {segments}: +y boundvert",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, Vec3::new(1.0, 0.75, 0.0)),
+                1,
+                "segments = {segments}: -y boundvert",
+            );
+        }
     }
 
     /// The same patch with a face-less **wire** spoke off its centre out to `tip`:
