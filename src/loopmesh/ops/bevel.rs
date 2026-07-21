@@ -795,6 +795,97 @@ fn edge_of_ring_vertex(
         .map(|&(edge, _)| edge)
 }
 
+/// BEVEL.md §5.2.1.1's seam-carrying cap plan: the single override donor face (as an index
+/// into the run's [`DonorBank`]) and, per ring vert, the world position the per-corner blend
+/// samples at after the §5.2.1.1.1 weight-snap.
+struct OverrideCapPlan {
+    donor: usize,
+    samples: Vec<(VertexKey, Vec3)>,
+}
+
+/// The closest point on the segment `[a, b]` to `p` (clamped to the segment ends).
+fn closest_point_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
+    let axis = b - a;
+    let length_squared = axis.length_squared();
+    if length_squared <= f32::EPSILON {
+        return a;
+    }
+    let t = ((p - a).dot(axis) / length_squared).clamp(0.0, 1.0);
+    a + axis * t
+}
+
+/// Squared distance from `p` to the segment `[a, b]` (BEVEL.md §5.2.1.1.1(i)).
+fn dist_sq_to_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    (p - closest_point_on_segment(p, a, b)).length_squared()
+}
+
+/// The point-in-polygon **ray-crossing parity** test of BEVEL.md §5.2.1.1.1(ii), over a
+/// polygon already flattened to 2D through the donor's axis-dominant projection. Deliberately
+/// *not* tolerance-guarded and *not* a strict-interior test: a point that projects exactly onto
+/// the boundary is decided by the parity arithmetic and may fall either way, exactly as the
+/// guide requires.
+fn point_in_polygon_parity(polygon: &[Vec2], q: Vec2) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = polygon[i];
+        let pj = polygon[j];
+        if (pi.y > q.y) != (pj.y > q.y) {
+            let crossing_x = pi.x + (q.y - pi.y) / (pj.y - pi.y) * (pj.x - pi.x);
+            if q.x < crossing_x {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// BEVEL.md §5.2.6's UV connectivity tolerance: two float2 values are coincident when their
+/// summed squared difference is within `1e-4`. A public engine constant, distinct from (and
+/// coarser than) the seam test's `1e-5`.
+const UV_MERGE_TOLERANCE: f32 = 1.0e-4;
+
+fn float2_within_merge_tolerance(a: [f32; 2], b: [f32; 2]) -> bool {
+    let du = a[0] - b[0];
+    let dv = a[1] - b[1];
+    du * du + dv * dv <= UV_MERGE_TOLERANCE
+}
+
+/// BEVEL.md §5.2.6's `island_connected_at`: two new faces at a beveled vertex `ov` are
+/// island-connected on `layer` when their representative donor faces are the **same** (a
+/// layer-independent identity test) or when those donors' corners at `ov` fell in the **same**
+/// pre-pass bucket for this layer. `corner_index` selects `ov`'s per-corner partition.
+fn island_connected_at(
+    layer: ElementAttributeKey,
+    corner_index: usize,
+    face_a: FaceKey,
+    face_b: FaceKey,
+    representative_donor: &HashMap<FaceKey, FaceKey>,
+    prepass: &[HashMap<ElementAttributeKey, HashMap<FaceKey, usize>>],
+) -> bool {
+    let (Some(&donor_a), Some(&donor_b)) = (
+        representative_donor.get(&face_a),
+        representative_donor.get(&face_b),
+    ) else {
+        return false;
+    };
+    if donor_a == donor_b {
+        return true;
+    }
+    let Some(buckets) = prepass.get(corner_index).and_then(|byle| byle.get(&layer)) else {
+        return false;
+    };
+    match (buckets.get(&donor_a), buckets.get(&donor_b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// A re-stitched original: the *new* face key the rebuild produced, and its own
 /// pre-bevel self in the donor bank. Every corner of a re-stitched original blends
 /// from that face, pre-bevel (BEVEL.md §5.2.1.1), and the re-stitched originals are
@@ -835,6 +926,13 @@ struct BeveledCorner {
     /// whatever `material` is). Captured against the pristine mesh in `place_ring_verts`
     /// before those faces are killed and rebuilt, so it survives the surgery.
     representative: FaceTemplate,
+    /// The `FaceKey` behind [`representative`](Self::representative) — the §6.6.1.4-picked
+    /// override donor at a seam-carrying corner, else the positional pick. Kept alongside the
+    /// template handle because §5.2.1.1's seam-carrying cap branch and §5.2.6's post-pass both
+    /// need the donor face's *identity* (to index the [`DonorBank`] and to compare
+    /// representative donors), which the opaque template handle does not expose. `None` only
+    /// when the corner has no adjacent original at all (a face-less wire star).
+    representative_face: Option<FaceKey>,
 }
 
 /// Per-incident-edge placement record gathered in the slide pre-pass: the edge,
@@ -1076,12 +1174,11 @@ impl LoopMesh {
         // because the list is per corner, and at §5.2.4 the cap's own write stands.
         // Resolved pre-surgery, like the donors themselves.
         //
-        // This is §5.2.1.1's **non-seam-carrying** branch only. A seam-carrying corner
-        // (any incident leg an interpolation seam by §6.6.1.4 — which includes every
-        // boundary leg) replaces this whole list with one override donor face plus a
-        // per-corner weight-snap edge; neither the seam predicate nor the tie-break that
-        // selects the override face is built yet, so such a corner still takes the
-        // positional list below.
+        // This is §5.2.1.1's **non-seam-carrying** branch. A seam-carrying corner (any
+        // incident leg an interpolation seam by §6.6.1.4 — which includes every boundary leg)
+        // replaces this whole list with one override donor face plus a per-corner weight-snap
+        // edge (§5.2.1.1.1), planned in `cap_overrides` below; the override branch wins at
+        // those corners and the positional list here is skipped.
         let cap_donors: Vec<Vec<Option<usize>>> = if bank.is_empty() {
             Vec::new()
         } else {
@@ -1099,6 +1196,41 @@ impl LoopMesh {
                 })
                 .collect()
         };
+
+        // §5.2.1.1's **seam-carrying** branch: at a corner with any seamed incident leg the
+        // whole per-boundvert list collapses to the single §6.6.1.4 override donor (the same
+        // face the block inherit takes, `corner.representative_face`), and each ring vert gets
+        // the §5.2.1.1.1 weight-snap. Planned pre-surgery, while `F`'s edges still meet the
+        // beveled vertex.
+        let cap_overrides: Vec<Option<OverrideCapPlan>> = if bank.is_empty() {
+            Vec::new()
+        } else {
+            corners
+                .iter()
+                .map(|corner| {
+                    if !self.corner_is_seam_carrying(corner.vertex) {
+                        return None;
+                    }
+                    let override_face = corner.representative_face?;
+                    let donor = bank.index_of(override_face)?;
+                    Some(OverrideCapPlan {
+                        donor,
+                        samples: self.plan_override_cap(corner, override_face, bank.donor(donor)),
+                    })
+                })
+                .collect()
+        };
+
+        // §5.2.6's pre-pass: per beveled vertex, per float2 layer, which UV island each
+        // incident original face's corner sat in — recorded now, before the surgery frees the
+        // beveled vertex and the post-pass reads it back.
+        let float2_layers = self.float2_loop_layers();
+        let prepass: Vec<HashMap<ElementAttributeKey, HashMap<FaceKey, usize>>> = corners
+            .iter()
+            .map(|corner| {
+                self.build_prepass_buckets(corner.vertex, &corner.incident_faces, &float2_layers)
+            })
+            .collect();
 
         // §6.4.3: re-stitch each incident face exactly once, swapping *every*
         // beveled corner of that face at the same time. A face straddling a
@@ -1158,23 +1290,57 @@ impl LoopMesh {
         // The cap's write is the *only* writer of the cap's own loops — a ring vert is
         // a corner of a re-stitched original too, so its per-vertex value is decided
         // there, but no other face owns the cap's corners. A cap corner left unblended
-        // reads the layer default (§5.2.5's per-loop half) — which is what a
-        // boundary/open-fan corner's gap leg still gets: no face arrives along it, so it
-        // has no positional donor, and the override donor of §5.2.1.1's seamed branch
-        // (which is what such a corner is *supposed* to take) is not implemented.
-        for ((corner, donors), &cap) in corners.iter().zip(&cap_donors).zip(&cap_faces) {
-            let Some(cap) = cap else {
+        // reads the layer default (§5.2.5's per-loop half).
+        //
+        // At a seam-carrying corner every cap corner takes the single override donor with the
+        // §5.2.1.1.1 weight-snap sample (§5.2.1.1's seamed branch); the gap-leg corner is not
+        // special-cased — it takes the override too (§5.2.6). At a seam-free corner each takes
+        // its own boundvert's positional donor, un-snapped.
+        for corner_index in 0..corners.len() {
+            let Some(cap) = cap_faces[corner_index] else {
                 continue;
             };
+            if bank.is_empty() {
+                continue;
+            }
+            let corner = &corners[corner_index];
+            let override_plan = cap_overrides
+                .get(corner_index)
+                .and_then(|plan| plan.as_ref());
             for cap_corner in self.face_loop_keys(cap) {
                 let ring_vertex = self.loop_vertex(cap_corner);
-                let donor = donor_for_ring_vertex(&corner.ring_vert_for_edge, donors, ring_vertex);
-                if let Some(donor) = donor {
-                    self.blend_corner_from_donor(cap_corner, bank.donor(donor));
+                if let Some(plan) = override_plan {
+                    if let Some(&(_, sample)) = plan
+                        .samples
+                        .iter()
+                        .find(|(ring, _)| *ring == ring_vertex)
+                    {
+                        self.blend_corner_from_donor_at(cap_corner, bank.donor(plan.donor), sample);
+                    }
+                } else {
+                    let donor = donor_for_ring_vertex(
+                        &corner.ring_vert_for_edge,
+                        &cap_donors[corner_index],
+                        ring_vertex,
+                    );
+                    if let Some(donor) = donor {
+                        self.blend_corner_from_donor(cap_corner, bank.donor(donor));
+                    }
                 }
             }
         }
         self.blend_restitched_originals(&rebuilt, &bank);
+
+        // §5.2.6's UV-merge post-pass: reconcile the per-loop float2 values that meet at each
+        // new ring / cap vertex, bucket-then-average, once at the very end.
+        self.reconcile_cap_uv_islands(
+            &corners,
+            &bank,
+            &rebuilt,
+            &cap_faces,
+            &float2_layers,
+            &prepass,
+        );
 
         // §5.1.1 / §6.3: every beveled vertex is now loose. Free each through
         // the same guarded path the edge bevel uses, so a re-point/re-stitch
@@ -9140,8 +9306,28 @@ impl LoopMesh {
     /// The interpolable layers need no special case either: at a unit weight they
     /// already come out bit-exact under every policy.
     fn blend_corner_from_donor(&mut self, corner: LoopKey, donor: &CornerDonor) {
+        let sample_position = self.vertex_position(self.loop_vertex(corner));
+        self.blend_corner_from_donor_at(corner, donor, sample_position);
+    }
+
+    /// The general form of [`blend_corner_from_donor`](Self::blend_corner_from_donor): resample
+    /// the donor at an explicit world position rather than at the corner vertex's own.
+    ///
+    /// This is the mechanism behind §5.2.1.1's **weight-snap** (§5.2.1.1.1): a seam-carrying
+    /// cap corner blends from the single override donor face, but its sample point is first
+    /// moved onto one of that face's two boundary edges at the beveled vertex. Because the
+    /// snapped point lands on a donor boundary edge, §10.1.3's on-edge short-circuit collapses
+    /// the mean-value solve to that edge's two endpoints — the edge-linear form that keeps a
+    /// seamed corner's value on the seam's own side of the discontinuity. The snap moves the
+    /// *sample*, never the vertex, so the geometry is untouched.
+    fn blend_corner_from_donor_at(
+        &mut self,
+        corner: LoopKey,
+        donor: &CornerDonor,
+        sample_position: Vec3,
+    ) {
         let vertex = self.loop_vertex(corner);
-        let sample = donor.projection.project(self.vertex_position(vertex));
+        let sample = donor.projection.project(sample_position);
         let weights = mean_value_weights(&donor.proj_corners, sample);
         self.loop_attribs.interpolate_from_snapshot(
             corner.as_usize(),
@@ -9153,6 +9339,274 @@ impl LoopMesh {
             &donor.corner_vertex_blocks,
             &weights,
         );
+    }
+
+    /// Is `vertex` **seam-carrying** in the sense of BEVEL.md §5.2.1.1 — does *any* incident
+    /// leg satisfy §6.6.1.4's corner-level seam test? This is the single all-or-nothing
+    /// boolean that decides the whole ring-spanning cap's per-loop donor branch: when true
+    /// every cap corner takes the single override donor face plus the §5.2.1.1.1 weight-snap;
+    /// when false every corner takes its own boundvert's positional donor.
+    ///
+    /// Mirrors the seam predicate [`ring_spanning_donor`](Self::ring_spanning_donor) uses to
+    /// decide whether to displace the positional block-inherit donor, so the block inherit and
+    /// the per-loop blend agree on which branch a corner is on. (§5.2.1.1's odd-`segments`
+    /// vertex-level contiguity arm is not modelled here, exactly as it is not there.)
+    fn corner_is_seam_carrying(&self, vertex: VertexKey) -> bool {
+        self.iter_disk_edges(vertex)
+            .any(|leg| self.leg_missing_flanking_face(leg) || self.edge_is_interp_seam(leg))
+    }
+
+    /// The loop of `face` sitting at `vertex`, or `None` when the face has no corner there.
+    fn corner_loop_at(&self, face: FaceKey, vertex: VertexKey) -> Option<LoopKey> {
+        self.face_loop_keys(face)
+            .into_iter()
+            .find(|&loop_key| self.loop_vertex(loop_key) == vertex)
+    }
+
+    /// The loop layers of the 2-component-float type — BEVEL.md §5.2.6's scope, chosen by
+    /// **type alone** (a UV layer or any other float2 loop layer), never by role or name.
+    fn float2_loop_layers(&self) -> Vec<ElementAttributeKey> {
+        let attribs = self.loop_attribs();
+        attribs
+            .iter_descriptors()
+            .filter(|&(key, _)| matches!(attribs.storage_of(key), Some(AttributeStorage::Vec2(_))))
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// Build BEVEL.md §5.2.1.1's **seam-carrying** per-corner blend plan for the cap at a
+    /// beveled vertex: the single override donor face `F` reused for every corner, and one
+    /// sample position per ring vert — the §5.2.1.1.1 weight-snap.
+    ///
+    /// `F`'s two edges at the beveled vertex are collected in the face's **loop (winding)
+    /// order** (§5.2.1.1.1(i)); a ring vert that projects **inside** `F`'s axis-dominant image
+    /// under the ray-crossing parity test (§5.2.1.1.1(ii)) — first three in ring order only
+    /// (§5.2.1.1.1(iii)) — is given no snap and samples at its own position, while every other
+    /// ring vert snaps onto the nearer of the two edges (squared segment distance, strictly
+    /// nearer else the second). Runs pre-surgery, while the edges still meet the beveled
+    /// vertex.
+    fn plan_override_cap(
+        &self,
+        corner: &BeveledCorner,
+        override_face: FaceKey,
+        donor: &CornerDonor,
+    ) -> Vec<(VertexKey, Vec3)> {
+        let vertex = corner.vertex;
+        let vertex_position = self.vertex_position(vertex);
+
+        // (i) F's two edges at the beveled vertex, in loop-cycle order, as (near, far) segments.
+        let segments: Vec<(Vec3, Vec3)> = self
+            .face_edge_keys(override_face)
+            .into_iter()
+            .filter(|&edge| self.edge_vert_keys(edge).contains(&vertex))
+            .map(|edge| {
+                let [a, b] = self.edge_vert_keys(edge);
+                let far = if a == vertex { b } else { a };
+                (vertex_position, self.vertex_position(far))
+            })
+            .collect();
+
+        // (ii) + (iii): the ring verts that project inside F, capped at three in ring order.
+        let mut internal: Vec<VertexKey> = Vec::new();
+        for &ring_vertex in &corner.ring_order {
+            let projected = donor.projection.project(self.vertex_position(ring_vertex));
+            if point_in_polygon_parity(&donor.proj_corners, projected) {
+                internal.push(ring_vertex);
+                if internal.len() == 3 {
+                    break;
+                }
+            }
+        }
+
+        corner
+            .ring_order
+            .iter()
+            .map(|&ring_vertex| {
+                let position = self.vertex_position(ring_vertex);
+                if internal.contains(&ring_vertex) {
+                    return (ring_vertex, position);
+                }
+                let sample = match segments.as_slice() {
+                    [first, second] => {
+                        let nearer = if dist_sq_to_segment(position, first.0, first.1)
+                            < dist_sq_to_segment(position, second.0, second.1)
+                        {
+                            first
+                        } else {
+                            second
+                        };
+                        closest_point_on_segment(position, nearer.0, nearer.1)
+                    }
+                    [only] => closest_point_on_segment(position, only.0, only.1),
+                    _ => position,
+                };
+                (ring_vertex, sample)
+            })
+            .collect()
+    }
+
+    /// BEVEL.md §5.2.6's per-beveled-vertex island partition, built pre-surgery from each
+    /// float2 layer's own values: the original loops incident to `vertex` are bucketed by
+    /// coincidence of their value (summed-squared tolerance `1e-4`, **greedy first-match** —
+    /// not transitive closure), and the record is which bucket each incident face's corner
+    /// fell in. Persisted because the beveled vertex is freed before the post-pass reads it.
+    fn build_prepass_buckets(
+        &self,
+        vertex: VertexKey,
+        incident_faces: &[FaceKey],
+        layers: &[ElementAttributeKey],
+    ) -> HashMap<ElementAttributeKey, HashMap<FaceKey, usize>> {
+        let mut partition = HashMap::new();
+        for &layer in layers {
+            let mut buckets: Vec<Vec<[f32; 2]>> = Vec::new();
+            let mut face_bucket: HashMap<FaceKey, usize> = HashMap::new();
+            for &face in incident_faces {
+                let Some(loop_key) = self.corner_loop_at(face, vertex) else {
+                    continue;
+                };
+                let value = self
+                    .loop_attribs()
+                    .get_vec2(layer, loop_key.as_usize())
+                    .unwrap_or([0.0, 0.0]);
+                let joined = buckets.iter().position(|bucket| {
+                    bucket
+                        .iter()
+                        .any(|&member| float2_within_merge_tolerance(member, value))
+                });
+                let bucket_id = match joined {
+                    Some(id) => {
+                        buckets[id].push(value);
+                        id
+                    }
+                    None => {
+                        buckets.push(vec![value]);
+                        buckets.len() - 1
+                    }
+                };
+                face_bucket.insert(face, bucket_id);
+            }
+            partition.insert(layer, face_bucket);
+        }
+        partition
+    }
+
+    /// BEVEL.md §5.2.6's **UV-merge post-pass**: reconcile the per-loop float2 values that meet
+    /// at each new ring / cap vertex. Runs once, at the very end, on every 2-float loop layer,
+    /// and only ever changes per-loop values — never topology, never per-vertex data.
+    ///
+    /// Per new vertex `nv` (originating from beveled vertex `ov`), the loops at `nv` are
+    /// **bucketed** greedily (first-match, not transitive closure): a loop joins the first
+    /// bucket already holding a neighbour whose face is *island-connected* to it at `ov` — same
+    /// representative donor face, or donors that fell in the same pre-pass island bucket
+    /// (§5.2.6's `island_connected_at`). Each bucket of two or more loops is overwritten with
+    /// its arithmetic mean. The `ra == rb` branch is layer-independent; the pre-pass-bucket
+    /// branch is per layer, so each float2 layer buckets and averages on its own values.
+    fn reconcile_cap_uv_islands(
+        &mut self,
+        corners: &[BeveledCorner],
+        bank: &DonorBank,
+        rebuilt: &[RebuiltOriginal],
+        cap_faces: &[Option<FaceKey>],
+        float2_layers: &[ElementAttributeKey],
+        prepass: &[HashMap<ElementAttributeKey, HashMap<FaceKey, usize>>],
+    ) {
+        if float2_layers.is_empty() {
+            return;
+        }
+
+        // Each new face's stage-1 representative donor original face (§5.2.6): the cap's is the
+        // ring-spanning override / positional pick, a re-stitched original's is the face
+        // itself. `bank.index` inverts the re-stitch donor index back to that original face.
+        let mut representative_donor: HashMap<FaceKey, FaceKey> = HashMap::new();
+        for (corner_index, &cap) in cap_faces.iter().enumerate() {
+            if let (Some(cap), Some(donor)) = (cap, corners[corner_index].representative_face) {
+                representative_donor.insert(cap, donor);
+            }
+        }
+        let donor_face_of_index: HashMap<usize, FaceKey> = bank
+            .index
+            .iter()
+            .map(|(&face, &index)| (index, face))
+            .collect();
+        for original in rebuilt {
+            if let Some(index) = original.donor {
+                if let Some(&face) = donor_face_of_index.get(&index) {
+                    representative_donor.insert(original.face, face);
+                }
+            }
+        }
+
+        // Which beveled corner each ring vert originated from (`ov`), collected in a stable
+        // order so the pass is reproducible.
+        let mut corner_of_ring: HashMap<VertexKey, usize> = HashMap::new();
+        let mut ring_verts: Vec<VertexKey> = Vec::new();
+        for (corner_index, corner) in corners.iter().enumerate() {
+            for &(_, ring_vertex) in &corner.ring_vert_for_edge {
+                if corner_of_ring.insert(ring_vertex, corner_index).is_none() {
+                    ring_verts.push(ring_vertex);
+                }
+            }
+        }
+
+        for ring_vertex in ring_verts {
+            let corner_index = corner_of_ring[&ring_vertex];
+            let loops: Vec<(LoopKey, FaceKey)> = self
+                .vert_face_keys(ring_vertex)
+                .into_iter()
+                .filter_map(|face| self.corner_loop_at(face, ring_vertex).map(|l| (l, face)))
+                .collect();
+            if loops.len() < 2 {
+                continue;
+            }
+            for &layer in float2_layers {
+                let mut buckets: Vec<Vec<LoopKey>> = Vec::new();
+                let mut bucket_faces: Vec<Vec<FaceKey>> = Vec::new();
+                for &(loop_key, face) in &loops {
+                    let joined = (0..buckets.len()).find(|&bucket| {
+                        bucket_faces[bucket].iter().any(|&other| {
+                            island_connected_at(
+                                layer,
+                                corner_index,
+                                face,
+                                other,
+                                &representative_donor,
+                                prepass,
+                            )
+                        })
+                    });
+                    match joined {
+                        Some(bucket) => {
+                            buckets[bucket].push(loop_key);
+                            bucket_faces[bucket].push(face);
+                        }
+                        None => {
+                            buckets.push(vec![loop_key]);
+                            bucket_faces.push(vec![face]);
+                        }
+                    }
+                }
+                for bucket in &buckets {
+                    if bucket.len() < 2 {
+                        continue;
+                    }
+                    let mut sum = [0.0f32; 2];
+                    for &loop_key in bucket {
+                        let value = self
+                            .loop_attribs()
+                            .get_vec2(layer, loop_key.as_usize())
+                            .unwrap_or([0.0, 0.0]);
+                        sum[0] += value[0];
+                        sum[1] += value[1];
+                    }
+                    let count = bucket.len() as f32;
+                    let mean = [sum[0] / count, sum[1] / count];
+                    for &loop_key in bucket {
+                        self.loop_attribs_mut()
+                            .set_vec2(layer, loop_key.as_usize(), mean);
+                    }
+                }
+            }
+        }
     }
 
     /// Blend every corner of a re-stitched original from that face's own pre-bevel
@@ -9891,13 +10345,14 @@ impl LoopMesh {
             // the mesh boundary is. No leg is beveled in vertex mode. Registered now,
             // against the pristine mesh — the bank is sealed before the incident faces are
             // killed / rebuilt.
-            let representative = templates.register(self.ring_spanning_donor(
+            let representative_face = self.ring_spanning_donor(
                 frame.vertex,
                 &|_| false,
                 BevelAffect::Vertices,
                 segments,
                 templates.interp_components(),
-            ));
+            );
+            let representative = templates.register(representative_face);
 
             let mut ring_vert_for_edge: Vec<(EdgeKey, VertexKey)> =
                 Vec::with_capacity(frame.placements.len());
@@ -9937,6 +10392,7 @@ impl LoopMesh {
                 ring_order,
                 hosted_wires,
                 representative,
+                representative_face,
             });
         }
         corners
@@ -32768,6 +33224,238 @@ mod tests {
         }
 
         mesh.validate_topology();
+    }
+
+    // ---- §5.2.1.1 seam-carrying cap override donor + §5.2.6 UV-merge post-pass ----
+
+    /// A boundary valence-3 corner (`b` of [`two_quad_strip`], three spokes, two faces, an open
+    /// fan) carrying one float2 UV loop layer. `uv(is_left, position)` decorates each loop; the
+    /// left quad takes `left_slot`, the right `right_slot`. Beveled at `offset = 0.4`, so each
+    /// ring vert slides `0.4` along its leg (the ring vert on the `b → c` leg lands at
+    /// `(0.4, -1, 0)`). Returns the beveled corner and the UV layer key.
+    fn boundary_corner_uv_plane(
+        uv: impl Fn(bool, Vec3) -> [f32; 2],
+        left_slot: i32,
+        right_slot: i32,
+    ) -> (LoopMesh, VertexKey, ElementAttributeKey) {
+        let (mut mesh, _shared) = two_quad_strip();
+        let key = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .expect("Vec2 is a supported loop attribute format");
+        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
+        let left = vert_at(&mesh, Vec3::new(-2.0, -1.0, 0.0));
+        for face in mesh.face_keys() {
+            let is_left = mesh.face_vert_keys(face).contains(&left);
+            mesh.set_face_material_index(face, if is_left { left_slot } else { right_slot });
+            for loop_key in mesh.face_loop_keys(face) {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                mesh.loop_attribs_mut()
+                    .set_vec2(key, loop_key.as_usize(), uv(is_left, position));
+            }
+        }
+        (mesh, corner, key)
+    }
+
+    /// The ring vert on the `b → c` leg — the shared corner of the cap and the re-stitched
+    /// right pentagon in these fixtures (world `(0.4, -1, 0)` at `offset = 0.4`).
+    fn right_leg_ring_vert(mesh: &LoopMesh, result: &BevelResult) -> VertexKey {
+        *result
+            .verts
+            .iter()
+            .find(|&&v| {
+                let p = mesh.vertex_position(v);
+                p.x > 0.1 && (p.y + 1.0).abs() < 1.0e-4
+            })
+            .expect("the ring vert on the b→c leg")
+    }
+
+    fn uv_of(mesh: &LoopMesh, layer: ElementAttributeKey, loop_key: LoopKey) -> [f32; 2] {
+        mesh.loop_attribs()
+            .get_vec2(layer, loop_key.as_usize())
+            .expect("the UV layer is registered")
+    }
+
+    /// BEVEL.md §5.2.1.1 + §5.2.1.1.1: a boundary corner is seam-carrying (condition (1)), so
+    /// its cap takes the **single override donor face** (the tie-break winner, here the lower-
+    /// slot left quad) with the per-corner weight-snap — **not** the per-boundvert positional
+    /// donor. The `b → c` ring vert projects outside the left quad, so it snaps onto one of the
+    /// left quad's two edges at `b`; both nearest points are `b` itself, so the sample lands on
+    /// the corner and the blend reads the left quad's `b`-loop verbatim: `[0.5, 0]`. Two UV
+    /// islands here (the right quad's `u` is shifted), so the post-pass leaves the cap loop a
+    /// singleton and the snapped value stands. The positional donor (the right quad) would give
+    /// `[1.1, 0]`, so the two branches are cleanly distinguished.
+    #[test]
+    fn vertex_bevel_seam_carrying_cap_takes_override_donor_with_weight_snap() {
+        let (mut mesh, corner, uv) = boundary_corner_uv_plane(
+            |is_left, position| {
+                let shift = if is_left { 0.0 } else { 0.5 };
+                [(position.x + 2.0) / 4.0 + shift, (position.y + 1.0) / 2.0]
+            },
+            1,
+            2,
+        );
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.4,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result.faces.len(), 1, "one cap");
+        let cap = result.faces[0];
+        let ring_vertex = right_leg_ring_vert(&mesh, &result);
+        let cap_loop = corner_of(&mesh, cap, ring_vertex);
+        let value = uv_of(&mesh, uv, cap_loop);
+
+        assert!(
+            (value[0] - 0.5).abs() < 1.0e-5 && value[1].abs() < 1.0e-5,
+            "seam-carrying cap corner took {value:?}, not the override donor's snapped [0.5, 0] \
+             (the positional right-quad donor would give [1.1, 0])",
+        );
+    }
+
+    /// BEVEL.md §5.2.6's worked value on the two-quad plane. Single UV island (continuous
+    /// `u = (x + 2) / 4`, `v = (y + 1) / 2`), left quad the lower-slot override donor. At the
+    /// `b → c` ring vert the cap loop weight-snaps onto the left quad's edge at `b` → `[0.5, 0]`,
+    /// while the re-stitched right pentagon blends affinely on its own `b → c` edge at
+    /// `t = 0.2` → `[0.6, 0]`. Same beveled vertex, single island ⇒ one bucket ⇒ mean
+    /// **`[0.55, 0]`** written back to *every* loop in the bucket.
+    #[test]
+    fn vertex_bevel_uv_merge_reconciles_cap_and_restitched_to_the_mean() {
+        let (mut mesh, corner, uv) = boundary_corner_uv_plane(
+            |_is_left, position| [(position.x + 2.0) / 4.0, (position.y + 1.0) / 2.0],
+            1,
+            2,
+        );
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.4,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let ring_vertex = right_leg_ring_vert(&mesh, &result);
+        // Every loop at the ring vert — the cap loop and the re-stitched right-pentagon loop —
+        // must carry the reconciled mean.
+        let loops_here: Vec<LoopKey> = mesh
+            .vert_face_keys(ring_vertex)
+            .into_iter()
+            .map(|face| corner_of(&mesh, face, ring_vertex))
+            .collect();
+        assert!(loops_here.len() >= 2, "the ring vert hosts a cap and a re-stitched loop");
+        for loop_key in loops_here {
+            let value = uv_of(&mesh, uv, loop_key);
+            assert!(
+                (value[0] - 0.55).abs() < 1.0e-5 && value[1].abs() < 1.0e-5,
+                "post-pass wrote {value:?}, not the bucket mean [0.55, 0]",
+            );
+        }
+    }
+
+    /// BEVEL.md §5.2.6's second worked value, `[1.5625, 2.140625]`, engineered on the same
+    /// boundary corner: the left quad's `b`-loop (the override donor, read at the snapped
+    /// corner) is `[1.5, 2.125]`, and the right quad's `b`/`c` loops are set so the re-stitched
+    /// affine blend at `t = 0.2` lands on `[1.625, 2.15625]`. Both quads agree at `b` and at
+    /// `e`, so the shared edge is UV-contiguous (single island) and the two loops bucket
+    /// together; the mean is `[1.5625, 2.140625]`.
+    #[test]
+    fn vertex_bevel_uv_merge_reconciles_to_the_grid_worked_value() {
+        let (mut mesh, corner, uv) = boundary_corner_uv_plane(
+            |_is_left, position| {
+                // Keyed on vertex position so both quads agree at the shared verts b and e.
+                match (position.x, position.y) {
+                    (x, y) if x == 0.0 && y == -1.0 => [1.5, 2.125],      // b
+                    (x, y) if x == 0.0 && y == 1.0 => [1.5, 3.125],       // e (shared, agree)
+                    (x, y) if x == 2.0 && y == -1.0 => [2.125, 2.28125],  // c
+                    _ => [0.0, 0.0],                                      // a, d, f (unused)
+                }
+            },
+            1,
+            2,
+        );
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.4,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let ring_vertex = right_leg_ring_vert(&mesh, &result);
+        let cap = result.faces[0];
+        let cap_loop = corner_of(&mesh, cap, ring_vertex);
+        let value = uv_of(&mesh, uv, cap_loop);
+        assert!(
+            (value[0] - 1.5625).abs() < 1.0e-4 && (value[1] - 2.140625).abs() < 1.0e-4,
+            "post-pass wrote {value:?}, not the bucket mean [1.5625, 2.140625]",
+        );
+    }
+
+    /// The regression guard: a **non-seam-carrying** corner keeps §5.2.1.1's per-boundvert
+    /// positional donor, and the §5.2.6 post-pass must not corrupt it. A cube corner with a
+    /// *continuous* float2 layer (each face agrees with its neighbours at every shared vertex)
+    /// is seam-free — condition (1) cannot fire on a closed cube, condition (2) agrees on every
+    /// edge — so each cap corner blends edge-linearly from its own boundvert's arriving face.
+    /// The cap and re-stitched loops already agree there (continuous field), so the post-pass
+    /// averages equal values and changes nothing.
+    #[test]
+    fn vertex_bevel_non_seam_cap_keeps_positional_donor_after_post_pass() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let uv = mesh
+            .register_loop_attribute(ElementAttributeDesc::uv(AttributeKey::custom("uv")))
+            .expect("Vec2 is a supported loop attribute format");
+        let field = |p: Vec3| [3.0 * p.x + 5.0 * p.y + 7.0, 2.0 * p.x - 4.0 * p.z + 9.0];
+        for face in mesh.face_keys() {
+            for loop_key in mesh.face_loop_keys(face) {
+                let position = mesh.vertex_position(mesh.loop_vertex(loop_key));
+                mesh.loop_attribs_mut()
+                    .set_vec2(uv, loop_key.as_usize(), field(position));
+            }
+        }
+
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let corner_position = mesh.vertex_position(corner);
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(result.faces.len(), 1, "one cap");
+        let cap = result.faces[0];
+        for cap_corner in mesh.face_loop_keys(cap) {
+            let ring_vertex = mesh.loop_vertex(cap_corner);
+            let position = mesh.vertex_position(ring_vertex);
+            // A seam-free cap corner blends edge-linearly from its arriving face, which for a
+            // continuous field reproduces the field at the ring vert's own position.
+            let expected = field(position);
+            let value = uv_of(&mesh, uv, cap_corner);
+            assert!(
+                (value[0] - expected[0]).abs() < 1.0e-3
+                    && (value[1] - expected[1]).abs() < 1.0e-3,
+                "non-seam cap corner took {value:?}, not the positional edge-linear \
+                 {expected:?} at {position:?}",
+            );
+            // ...and distinct from the beveled corner's own value, so a value that silently
+            // collapsed to cd(v) would be caught.
+            let at_corner = field(corner_position);
+            assert!(
+                (value[0] - at_corner[0]).abs() > 1.0e-4 || (value[1] - at_corner[1]).abs() > 1.0e-4,
+                "the cap corner collapsed to the beveled vertex's value {at_corner:?}",
+            );
+        }
     }
 
     /// BEVEL.md §5.2.3 + §5.2.5: at an edge bevel the strip verts sit on the **legs**, so
