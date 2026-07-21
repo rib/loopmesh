@@ -2590,6 +2590,11 @@ impl LoopMesh {
             templates.interp_components(),
         ));
 
+        // §8.5.1 / §7.6.6: the dihedral-band verdict must be read from the *original*
+        // corner — its edges and faces are about to be consumed by the re-stitch — so it is
+        // captured now and carried on the cut for the fill-time routing decision.
+        let dihedral_band_ok = self.junction_dihedral_band_admits(vertex, &corners);
+
         junction_cuts.push(JunctionCut {
             vertex,
             boundverts,
@@ -2597,6 +2602,7 @@ impl LoopMesh {
             outward,
             representative,
             central_representative,
+            dihedral_band_ok,
         });
     }
 
@@ -3688,6 +3694,13 @@ impl LoopMesh {
     /// chord (`r = 1`, whose octant grid is the flat chamfer plane). All of them are what
     /// the unit-octant grid of §8.5.5.5(f.2) builds. Only the two square exponents, which
     /// take closed-form grids of their own (§8.5.5.5(f.4)/(f.5)), are refused here.
+    /// The gate keys on **3 boundverts** and a smooth exponent, then admits the corner two
+    /// ways (BEVEL.md §8.5.1 / §7.6.6): the position-only meet-geometry test (equal spokes,
+    /// 60° octant — the symmetric cube corner) **or** the per-edge dihedral band captured on
+    /// the cut. The band admits an **oblique / absorbed-leg / reflex** corner the geometry
+    /// test declines; a reflex sector is not itself a disqualifier — only failing the band
+    /// (a fold past `3·π/4`, the wrong near-flat count, or a signed sum outside the `±π/4`
+    /// window) drops the corner through to the general grid of §8.5.5.5.
     fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32) -> bool {
         if cut.boundverts.len() != 3 {
             return false;
@@ -3701,7 +3714,7 @@ impl LoopMesh {
             self.vertex_position(cut.boundverts[1]),
             self.vertex_position(cut.boundverts[2]),
         ];
-        tri_corner_meet_geometry(vertex, &meet_points)
+        tri_corner_meet_geometry(vertex, &meet_points) || cut.dihedral_band_ok
     }
 
     /// Dispatch the rounded adjacency-grid fill at one junction (BEVEL.md §8.5).
@@ -3811,6 +3824,47 @@ impl LoopMesh {
             }
         }
 
+        let vertex_position = self.vertex_position(cut.vertex);
+        let boundvert_positions = [
+            self.vertex_position(cut.boundverts[0]),
+            self.vertex_position(cut.boundverts[1]),
+            self.vertex_position(cut.boundverts[2]),
+        ];
+
+        // §8.5.1 / §8.2.2.1.1: a corner admitted only by the dihedral band (oblique /
+        // absorbed-leg / reflex, §7.6.6) is **not** symmetric, so its rim + apex are not the
+        // profile-cell / circumsphere placement the symmetric octant sub-case shares with the
+        // arriving strips. The cube-corner map (§8.5.2's four-point `unit_to_corner`) +
+        // superellipsoid snap place every cap vert instead: sector `k`'s lone interior sample
+        // rides the unit arc `‖e_k + e_{k+1}‖`, so the two reflex-flank samples share a world
+        // coordinate pair — the map's signature (§7.6.6), not the profile-cell plane. The
+        // symmetric corner keeps its exact existing placement below (the octant arc point and
+        // the circumsphere apex coincide there, §8.5.2), so nothing on that path moves.
+        const UNIT_AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
+        let oblique_apex =
+            if tri_corner_meet_geometry(vertex_position, &boundvert_positions) {
+                None
+            } else {
+                match self.unit_octant(cut) {
+                    Some(octant) => {
+                        for k in 0..count {
+                            let arc_mid =
+                                (UNIT_AXES[k] + UNIT_AXES[(k + 1) % count]).normalize();
+                            let placed =
+                                octant.to_world(snap_to_unit_superellipsoid(arc_mid, exponent));
+                            self.set_vertex_position(interior_of_sector[k], placed);
+                        }
+                        Some(octant.to_world(snap_to_unit_superellipsoid(
+                            Vec3::splat((1.0_f32 / 3.0).sqrt()),
+                            exponent,
+                        )))
+                    }
+                    // A degenerate four-point map cannot build the cube-corner cap; fall back
+                    // to the symmetric apex computation below so the fill still closes.
+                    None => None,
+                }
+            };
+
         let representative = templates.resolve(cut.representative);
 
         // §8.5.2 closed-form apex. The affine `unit_to_corner` axis-map ((1,0,0)→B_0,
@@ -3834,17 +3888,18 @@ impl LoopMesh {
         // centroid, on the chamfer plane). At `r = 2` the two agree — `3^(−1/2)` *is*
         // `c + R·normalize(v − c)` read in octant coordinates — and the circular corner keeps
         // the sphere fit, which is the strictly-pinned forced case (§8.5.4).
-        let vertex_position = self.vertex_position(cut.vertex);
-        let apex_position = if exponent != 2.0 {
+        let apex_position = if let Some(position) = oblique_apex {
+            position
+        } else if exponent != 2.0 {
             match self.unit_octant(cut) {
                 Some(octant) => octant.to_world(Vec3::splat(3.0_f32.powf(-1.0 / exponent))),
                 None => return,
             }
         } else {
             let on_surface = [
-                self.vertex_position(cut.boundverts[0]),
-                self.vertex_position(cut.boundverts[1]),
-                self.vertex_position(cut.boundverts[2]),
+                boundvert_positions[0],
+                boundvert_positions[1],
+                boundvert_positions[2],
                 self.vertex_position(interior_of_sector[0]),
             ];
             match circumsphere(on_surface) {
@@ -5671,6 +5726,103 @@ impl LoopMesh {
             sum += self.face_plane_normal(face);
         }
         sum.normalize_or_zero()
+    }
+
+    /// One corner's face normal oriented to the **walk-positive** side (BEVEL.md §7.6.2):
+    /// the face interior sweeps positively about this normal from the corner's outgoing
+    /// edge round to its incoming one, so `cross(d_out, d_in)` fixes the side and the true
+    /// face plane fixes the tilt (a non-planar reflex quad keeps its Newell normal, not the
+    /// flat wedge one). `None` when either flanking edge is degenerate.
+    fn corner_walk_normal(&self, corner: &VertexCorner, vertex: VertexKey, vertex_position: Vec3) -> Option<Vec3> {
+        let d_in = self.edge_direction_from(corner.incoming_edge, vertex, vertex_position)?;
+        let d_out = self.edge_direction_from(corner.outgoing_edge, vertex, vertex_position)?;
+        let wedge = d_out.cross(d_in);
+        let mut normal = self.face_plane_normal(corner.face);
+        if normal.dot(wedge) < 0.0 {
+            normal = -normal;
+        }
+        Some(normal)
+    }
+
+    /// The §8.5.1 dihedral-band gate on the **original** corner (BEVEL.md §8.5.1 / §7.6.6),
+    /// evaluated over every edge incident to `vertex` (beveled and unbeveled alike, so an
+    /// absorbed leg's own fold is one of the measured edges). All of:
+    ///
+    /// - the corner is a **closed** fan — every incident edge is shared by two of its faces
+    ///   (an open fan or a wire leaves a dihedral undefined and declines);
+    /// - **no** edge is too-folded: `|signed dihedral| < 3·π/4`;
+    /// - **exactly `edgecount − 3`** edges are near-flat (`|signed dihedral| ≤ π/4`);
+    /// - the **signed** dihedrals (convex-positive, §7.6.2's disk-walk sense) sum to within
+    ///   `π/4` of `3·π/2`.
+    ///
+    /// Equal beveled offsets — the gate's other clause — hold structurally here: a junction
+    /// bevels all its edges at the one op-wide `offset`.
+    fn junction_dihedral_band_admits(&self, vertex: VertexKey, corners: &[VertexCorner]) -> bool {
+        if corners.len() < 3 {
+            return false;
+        }
+        let vertex_position = self.vertex_position(vertex);
+
+        let mut edges: Vec<EdgeKey> = Vec::with_capacity(corners.len() + 1);
+        for corner in corners {
+            for edge in [corner.incoming_edge, corner.outgoing_edge] {
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+        let edgecount = edges.len();
+        if edgecount < 3 {
+            return false;
+        }
+
+        let quarter = std::f32::consts::FRAC_PI_4;
+        let three_quarter = 3.0 * quarter;
+        let target = 3.0 * std::f32::consts::FRAC_PI_2;
+        let mut in_plane = 0usize;
+        let mut signed_sum = 0.0_f32;
+
+        for &edge in &edges {
+            let corner_out = corners.iter().find(|c| c.outgoing_edge == edge);
+            let corner_in = corners.iter().find(|c| c.incoming_edge == edge);
+            let (corner_a, corner_b) = match (corner_out, corner_in) {
+                (Some(a), Some(b)) => (a, b),
+                // A single-face (boundary / wire) edge has no dihedral: the band is
+                // undefined and the corner is not tri-corner-eligible here.
+                _ => return false,
+            };
+            if corner_a.face == corner_b.face {
+                return false;
+            }
+            let edge_direction = match self.edge_direction_from(edge, vertex, vertex_position) {
+                Some(direction) => direction,
+                None => return false,
+            };
+            let normal_a = match self.corner_walk_normal(corner_a, vertex, vertex_position) {
+                Some(normal) => normal,
+                None => return false,
+            };
+            let normal_b = match self.corner_walk_normal(corner_b, vertex, vertex_position) {
+                Some(normal) => normal,
+                None => return false,
+            };
+            let magnitude = normal_a.dot(normal_b).clamp(-1.0, 1.0).acos();
+            let orientation = normal_a.cross(normal_b).dot(edge_direction);
+            let signed = TRI_CORNER_CONVEX_SIGN * magnitude * if orientation >= 0.0 { 1.0 } else { -1.0 };
+
+            if magnitude >= three_quarter {
+                return false;
+            }
+            if magnitude <= quarter {
+                in_plane += 1;
+            }
+            signed_sum += signed;
+        }
+
+        if in_plane != edgecount - 3 {
+            return false;
+        }
+        (signed_sum - target).abs() <= quarter
     }
 
     /// Push every edge of `face` into the result's edge set (de-duplicated).
@@ -10151,6 +10303,14 @@ struct JunctionCut {
     /// §6.6.1.4's tie-break at a seam-carrying corner. Every other grid face is per-sector
     /// and keeps `representative`.
     central_representative: FaceTemplate,
+    /// Whether the original corner cleared the §8.5.1 **dihedral-band** gate (BEVEL.md
+    /// §8.5.1 / §7.6.6): three boundverts, a per-edge signed-dihedral band (no edge folded
+    /// past `3·π/4`, exactly `edgecount − 3` near-flat, signed sum within `π/4` of `3·π/2`).
+    /// Captured here — before the re-stitch consumes the vertex — because by fill time the
+    /// corner's edges and faces are gone. It admits the tri-corner cube-corner cap for an
+    /// **oblique / absorbed-leg / reflex** corner that the position-only meet-geometry test
+    /// (equal spokes, 60° octant) would decline; the reflex-agnostic split of §7.6.6.
+    dihedral_band_ok: bool,
 }
 
 impl JunctionCut {
@@ -10573,6 +10733,14 @@ fn corner_verts_coincide(positions: &[Vec3]) -> bool {
         .iter()
         .all(|&position| (position - first).length() <= 1.0e-4)
 }
+
+/// Sign that maps the per-edge chirality `(n_a × n_b)·edge` to the **convex-positive**
+/// convention the §8.5.1 dihedral band sums in (BEVEL.md §7.6.2). The disk walk's
+/// rotational sense (`vertex_corner_ring`, "run against the face winding") makes a genuinely
+/// convex corner's chirality land consistently **negative**, so this constant negates it to
+/// place a convex fold on the positive axis — pinned so the beveled cube corner sums to
+/// `+3·π/2`, the band's centre.
+const TRI_CORNER_CONVEX_SIGN: f32 = -1.0;
 
 /// The §8.5.1 forced-tri-corner geometry test on three meet-point positions
 /// (BEVEL.md §8.5.5.3): equal spoke length and a mutually-60° convex octant
@@ -19074,6 +19242,9 @@ mod tests {
             outward: Vec3::ZERO,
             representative: FaceTemplate::default(),
             central_representative: FaceTemplate::default(),
+            // The synthetic cuts carry no real corner, so the band verdict is inert here;
+            // the geometry test alone decides these assertions.
+            dihedral_band_ok: false,
         };
 
         // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
@@ -19143,6 +19314,186 @@ mod tests {
         assert!(
             !mesh.adj_tri_corner_trigger(&flat, 0.5),
             "non-right-angle corner declines the §8.5.1 trigger",
+        );
+    }
+
+    /// BEVEL.md §7.6.6 / §8.5.1: a **valence-4** apex whose wide (> 180°) reflex sector
+    /// **absorbs one folded unbeveled leg**. The three beveled spokes sit on the unit rim at
+    /// azimuth 20° / 90° / 160° (x-mirror-symmetric about the yz-plane), the apex rides the
+    /// z-axis, and the leg folds down the −y side to `z = −0.6` — so the corner is x-mirror
+    /// symmetric and clears the §8.5.1 dihedral band (`edgecount = 4`, boundvert ring `3`).
+    fn absorbed_leg_reflex_junction() -> (LoopMesh, VertexKey, [EdgeKey; 3]) {
+        let mut mesh = LoopMesh::new();
+        let degrees = std::f32::consts::PI / 180.0;
+        let rim = |azimuth: f32| Vec3::new((azimuth * degrees).cos(), (azimuth * degrees).sin(), 0.0);
+        let v = mesh.create_vertex(Vec3::new(0.0, 0.0, 0.7));
+        let a = mesh.create_vertex(rim(20.0));
+        let b = mesh.create_vertex(rim(90.0));
+        let c = mesh.create_vertex(rim(160.0));
+        let leg = mesh.create_vertex(Vec3::new(0.0, -1.0, -0.6));
+
+        // A closed fan of four faces around `v`, wound so every normal points +z (outward);
+        // the leg sits between the two faces flanking the reflex gap (c → leg → a).
+        mesh.face_create_verts(&[v, a, b], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, b, c], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, c, leg], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, leg, a], FaceCreateFlags::NONE);
+
+        let va = mesh.query_edge_exists(v, a).expect("va");
+        let vb = mesh.query_edge_exists(v, b).expect("vb");
+        let vc = mesh.query_edge_exists(v, c).expect("vc");
+        (mesh, v, [va, vb, vc])
+    }
+
+    /// BEVEL.md §8.5.1 / §7.6.6: the reflex-agnostic dihedral-band gate. It admits the
+    /// absorbed-leg reflex junction and the convex cube corner, and — via the `edgecount − 3`
+    /// near-flat count clause — declines the single-face valence-3 reflex apex, which stays
+    /// on the general fill. The cube corner's all-convex 90° edges also pin the sign
+    /// convention: they must sum to `+3·π/2`, the band's centre.
+    #[test]
+    fn dihedral_band_admits_absorbed_leg_reflex_junction() {
+        let (mesh, apex, _) = absorbed_leg_reflex_junction();
+        let corners = mesh.vertex_corner_ring(apex);
+        assert!(
+            mesh.junction_dihedral_band_admits(apex, &corners),
+            "the absorbed-leg reflex junction clears the §8.5.1 dihedral band",
+        );
+
+        let mut cube = LoopMesh::new();
+        mesh_add_cube(&mut cube);
+        let corner = vert_at(&cube, Vec3::new(1.0, -1.0, -1.0));
+        let cube_corners = cube.vertex_corner_ring(corner);
+        assert!(
+            cube.junction_dihedral_band_admits(corner, &cube_corners),
+            "the convex cube corner clears the band (signed dihedrals sum to +3·π/2)",
+        );
+
+        let (reflex_mesh, reflex_apex, _) = single_face_reflex_junction();
+        let reflex_corners = reflex_mesh.vertex_corner_ring(reflex_apex);
+        assert!(
+            !reflex_mesh.junction_dihedral_band_admits(reflex_apex, &reflex_corners),
+            "the single-face reflex apex fails the near-flat count clause and stays general",
+        );
+    }
+
+    /// BEVEL.md §7.6.6 / §8.5.1 / §8.2.2.1.1: at `segments = 2` the absorbed-leg reflex
+    /// junction routes to the **cube-corner cap**, not the general grid. Every cap vert is
+    /// the four-point `unit_to_corner` map's image of a unit-sphere point, so in octant
+    /// coordinates it rides the unit sphere; the two reflex-flank rim samples share (y, z)
+    /// — the map's signature, not a shared cross-section plane.
+    #[test]
+    fn absorbed_leg_reflex_junction_takes_cube_corner_cap_segments2() {
+        let (mut mesh, _apex, [va, vb, vc]) = absorbed_leg_reflex_junction();
+        let apex_position = Vec3::new(0.0, 0.0, 0.7);
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // §7.6.6: an open test mesh (the dangling folded leg leaves one boundary loop),
+        // so the correct open-mesh characteristic is χ = 1, not a dropped-cap χ = 1 hole.
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            1,
+            "the closed cube-corner cap keeps the open fixture at χ = 1",
+        );
+
+        // The apex cap is the tri-corner pinwheel: one welded centre where three cap quads
+        // meet (the same topology the general fill would give — the divergence is position).
+        let hubs: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                let incident: Vec<FaceKey> = mesh
+                    .face_keys()
+                    .into_iter()
+                    .filter(|&face| mesh.face_vert_keys(face).contains(&candidate))
+                    .collect();
+                incident.len() == 3 && incident.iter().all(|&face| mesh.face_vert_keys(face).len() == 4)
+            })
+            .collect();
+        assert_eq!(hubs.len(), 1, "the reflex junction closes on one welded apex");
+        let apex = hubs[0];
+
+        let cap_faces: Vec<FaceKey> = mesh
+            .face_keys()
+            .into_iter()
+            .filter(|&face| mesh.face_vert_keys(face).contains(&apex))
+            .collect();
+        assert_eq!(cap_faces.len(), 3, "three cap quads meet at the welded apex");
+
+        let mut cap_verts: Vec<VertexKey> = Vec::new();
+        for &face in &cap_faces {
+            for vert in mesh.face_vert_keys(face) {
+                if !cap_verts.contains(&vert) {
+                    cap_verts.push(vert);
+                }
+            }
+        }
+        assert_eq!(cap_verts.len(), 7, "cap = apex + 3 rim samples + 3 boundverts");
+
+        // Rim samples are the apex's neighbours; the boundverts sit diagonal from it.
+        let rim: Vec<VertexKey> = cap_verts
+            .iter()
+            .copied()
+            .filter(|&vert| vert != apex && mesh.query_edge_exists(vert, apex).is_some())
+            .collect();
+        assert_eq!(rim.len(), 3, "the apex touches exactly its three rim samples");
+        let boundverts: Vec<VertexKey> = cap_verts
+            .iter()
+            .copied()
+            .filter(|&vert| vert != apex && !rim.contains(&vert))
+            .collect();
+        assert_eq!(boundverts.len(), 3);
+
+        // §8.5.1: the four-point map determined by (B_0, B_1, B_2, v). For an oblique corner
+        // its image of the unit sphere is an ellipsoid, so the cube-corner test is
+        // membership of the *unit* sphere in octant coordinates, not a world-frame sphere.
+        // The membership is invariant to the boundvert labelling (a signed axis permutation).
+        let octant = UnitOctant::from_corner(
+            [
+                mesh.vertex_position(boundverts[0]),
+                mesh.vertex_position(boundverts[1]),
+                mesh.vertex_position(boundverts[2]),
+            ],
+            apex_position,
+        )
+        .expect("the reflex corner's four-point map is non-degenerate");
+        for &vert in &cap_verts {
+            let octant_norm = octant.to_octant(mesh.vertex_position(vert)).length();
+            assert!(
+                (octant_norm - 1.0).abs() <= 2.0e-3,
+                "cap vert rides the unit-octant sphere (‖octant‖ = {octant_norm}) — the \
+                 cube-corner map, not the general fill's off-surface fullness centre",
+            );
+        }
+
+        // §7.6.6: the two reflex-flank rim samples are images of ‖e_i + e_{i+1}‖ under one
+        // affine map, so on this x-mirror corner they share (y, z) and differ only in world-x.
+        let rim_positions: Vec<Vec3> = rim.iter().map(|&vert| mesh.vertex_position(vert)).collect();
+        let mut flank_pair_shares_yz = false;
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let same_yz = (rim_positions[i].y - rim_positions[j].y).abs() <= 2.0e-3
+                    && (rim_positions[i].z - rim_positions[j].z).abs() <= 2.0e-3;
+                let distinct_x = (rim_positions[i].x - rim_positions[j].x).abs() > 2.0e-3;
+                if same_yz && distinct_x {
+                    flank_pair_shares_yz = true;
+                }
+            }
+        }
+        assert!(
+            flank_pair_shares_yz,
+            "the two reflex-flank rim samples share (y, z) — the cube-corner map signature",
         );
     }
 
