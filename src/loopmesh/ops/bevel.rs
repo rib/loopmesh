@@ -9417,25 +9417,27 @@ impl LoopMesh {
     /// - **Seam-free corner** — every leg's fan walk resolves both flanking faces. The
     ///   donor is §6.6.1's positional pick, which reads the corner's fan anchor and carries
     ///   §6.6.1.2's documented non-invariance. Nothing here can improve on it.
-    /// - **Seam-carrying corner** — §6.6.1.4 condition (1): some leg genuinely lacks a
-    ///   flanking face on one side. That is an interpolation seam *unconditionally*, purely
-    ///   topologically, with no customdata layer consulted — so it fires on the plainest
-    ///   untextured mesh, and **every** mesh-boundary leg (and every wire leg) satisfies it.
-    ///   The test is **winding-blind** (§6.6.1.4.0(c),
-    ///   [`leg_missing_flanking_face`](Self::leg_missing_flanking_face)): an inconsistently
-    ///   wound radial-2 leg fills both slots by incidence and is **not** a seam. The
-    ///   positional pick is then displaced by the deterministic tie-break
-    ///   over a positionally-named candidate set, and the fan anchor drops out of the
-    ///   picture entirely.
+    /// - **Seam-carrying corner** — some incident leg is an interpolation seam under
+    ///   §6.6.1.4's corner-level test, which fires under *either* independent condition:
+    ///   - **Condition (1)**: the leg genuinely lacks a flanking face on one side — an
+    ///     interpolation seam *unconditionally*, purely topologically, with no customdata
+    ///     layer consulted, so it fires on the plainest untextured mesh; **every**
+    ///     mesh-boundary leg (and every wire leg) satisfies it. Read through the
+    ///     **winding-blind** fan primitive (§6.6.1.4.0(c),
+    ///     [`leg_missing_flanking_face`](Self::leg_missing_flanking_face)): an
+    ///     inconsistently wound radial-2 leg fills both slots by incidence and is **not**
+    ///     a seam.
+    ///   - **Condition (2)**: the leg's two flanking faces disagree on a **blendable**
+    ///     loop layer (§6.6.1.4.0(a)) — the UV-island / painted-apart seam. This is the
+    ///     only condition that can seam a *fully interior* closed-fan corner, where every
+    ///     leg resolves both flanking faces. It is read through the edge-level
+    ///     [`edge_is_interp_seam`](Self::edge_is_interp_seam), which carries the
+    ///     layer-tolerant compare and short-circuits to "not a seam" on a zero-loop-layer
+    ///     mesh — so an untextured corner never reaches condition (2) and stays positional.
     ///
-    /// §6.6.1.4's **condition (2)** — two flanking faces disagreeing on a **blendable**
-    /// loop layer (§6.6.1.4.0(a)), the UV-island seam — is implemented, but only at the **edge-level** site
-    /// ([`edge_is_interp_seam`](Self::edge_is_interp_seam), which the strip's straddle quad
-    /// keys on). It is deliberately **not** consulted here: the corner-level form of §6.6.1.4
-    /// asks it of *every* incident leg, which is a different and wider predicate than this
-    /// function's condition-(1) scan, and switching to it moves an already-pinned donor on
-    /// every textured corner. So a corner seamed only by condition (2) still takes the
-    /// positional pick.
+    ///   Under either condition the positional pick is displaced by the deterministic
+    ///   tie-break over a positionally-named candidate set, and the fan anchor drops out
+    ///   of the picture entirely.
     ///
     /// **Key 1 runs whenever it is live.** The interpolation-component id (§6.6.1.4.1) is
     /// live when a float2 loop layer is present **and** `segments` is odd, and `components`
@@ -9459,16 +9461,26 @@ impl LoopMesh {
     ) -> Option<FaceKey> {
         let positional = self.first_incident_face(vertex);
 
-        // §6.6.1.4 condition (1): a leg whose gap genuinely holds no face is an
-        // interpolation seam, unconditionally and purely topologically. The test is
-        // **winding-blind** (§6.6.1.4.0(c)) — it asks pure incidence, not the
-        // winding-sensitive `arriving_face` / `departing_face` resolution, so an
-        // inconsistently wound radial-2 leg is *not* mis-filed as a seam. The seam-free
-        // corner — the common one — keeps the positional pick, so this pass runs before a
-        // single candidate is built and allocates nothing.
-        let seam_carrying = self
-            .iter_disk_edges(vertex)
-            .any(|leg| self.leg_missing_flanking_face(leg));
+        // §6.6.1.4's corner-level seam test: a corner is seam-carrying when **any**
+        // incident leg is an interpolation seam, and a leg is a seam under *either*
+        // independent condition.
+        //
+        // - **Condition (1)** — the leg's fan walk resolves no arriving face or no
+        //   departing face. Unconditional and purely topological (every mesh-boundary
+        //   leg, every wire leg), read through the **winding-blind** fan primitive
+        //   (§6.6.1.4.0(c)) so an inconsistently wound radial-2 leg is *not* mis-filed.
+        // - **Condition (2)** — the leg's two flanking faces disagree on a **blendable**
+        //   loop layer (§6.6.1.4.0(a)). This is what seams a *fully interior* closed-fan
+        //   corner painted apart by a colour / UV discontinuity, where condition (1)
+        //   never fires. `edge_is_interp_seam` carries the layer-tolerant compare and the
+        //   zero-loop-layer short-circuit, so on an untextured mesh it returns before any
+        //   allocation and only condition (1) can fire.
+        //
+        // The seam-free corner — the common one — keeps the positional pick, so this pass
+        // runs before a single candidate is built.
+        let seam_carrying = self.iter_disk_edges(vertex).any(|leg| {
+            self.leg_missing_flanking_face(leg) || self.edge_is_interp_seam(leg)
+        });
         if !seam_carrying {
             return positional;
         }
@@ -30071,6 +30083,92 @@ mod tests {
             mesh.face_material_index(cap),
             7,
             "no leg of a cube corner is a seam, so the cap keeps the positional donor",
+        );
+    }
+
+    /// A **fully interior** valence-4 closed-fan corner seamed by §6.6.1.4 **condition (2)**:
+    /// one incident quad is painted apart on a blendable loop layer (a colour), so the two
+    /// edges bordering it disagree on that layer and are interpolation seams — even though
+    /// every leg resolves both flanking faces, so condition (1) never fires. The cap is a
+    /// ring-spanning fill, so a seam routes its donor through the §6.6.1.4 tie-break, which
+    /// on this float2-free, unselected mesh reduces (key 1 inert, key 2 tied) to the
+    /// **lowest incident material slot** over *all four* incident quads — not the positional
+    /// fan-anchor face, which is decorated away from that slot so the two picks separate.
+    #[test]
+    fn face_cd_interior_grid_corner_condition_2_seam_routes_cap_through_tie_break() {
+        // Discover which incident quad the seam-free positional rule would hand the cap, by
+        // decorating with identity slots — so the seamed layout below can place the global
+        // minimum on a *different* quad and the two rules cannot agree by coincidence.
+        let positional_face = {
+            let mut mesh = LoopMesh::new();
+            let (centre, _) = grid_3x3(&mut mesh, Vec3::ZERO);
+            for (index, face) in mesh.face_keys().into_iter().enumerate() {
+                mesh.set_face_material_index(face, index as i32);
+            }
+            let result = mesh.bevel(
+                &[centre.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    ..Default::default()
+                },
+            );
+            mesh.face_material_index(result.faces[0]) as usize
+        };
+
+        // Slots with a unique global minimum of 1, kept off the positional face.
+        let mut slots = [7_i32, 5, 9, 3];
+        let min_face = (positional_face + 1) % 4;
+        slots[min_face] = 1;
+        assert_ne!(
+            slots[positional_face], 1,
+            "the low slot must sit off the positional face for the test to separate the rules",
+        );
+
+        let mut mesh = LoopMesh::new();
+        let (centre, _) = grid_3x3(&mut mesh, Vec3::ZERO);
+        let faces = mesh.face_keys();
+        for (&face, &slot) in faces.iter().zip(&slots) {
+            mesh.set_face_material_index(face, slot);
+        }
+        // Paint the positional face's quad apart on a colour layer — a blendable, non-float2
+        // discontinuity, so key 1 stays inert and only the seam routing is exercised.
+        let color = mesh
+            .register_loop_attribute(ElementAttributeDesc::color(
+                AttributeKey::custom("color"),
+                AttrType::Vec4,
+            ))
+            .expect("float RGBA is a supported loop attribute format");
+        for &face in &faces {
+            let value = if face == faces[positional_face] {
+                [1.0, 0.0, 0.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            };
+            for loop_key in mesh.face_loop_keys(face) {
+                mesh.loop_attribs_mut().set_vec4(color, loop_key.as_usize(), value);
+            }
+        }
+
+        let result = mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.2,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(
+            result.faces.len(),
+            1,
+            "the interior valence-4 corner mints exactly its cap",
+        );
+        assert_eq!(
+            mesh.face_material_index(result.faces[0]),
+            1,
+            "the colour discontinuity seams the interior corner by condition (2), so the cap's \
+             donor is the tie-break's lowest incident slot — not the positional pick (slot {})",
+            slots[positional_face],
         );
     }
 
