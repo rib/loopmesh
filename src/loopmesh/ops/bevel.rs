@@ -916,10 +916,9 @@ impl LoopMesh {
                 return self.bevel_edges(geom, options);
             }
             // Vertex-mode multi-segment (BEVEL.md §8.11, Stage [VV]). Only the
-            // bounded valence-3 / default-circular / `segments ≥ 3` corner builds a
-            // real vmesh patch; every other vertex `segments ≥ 2` shape (the
-            // `segments = 2` coarse net, `s ≠ 3`, non-circular profiles, miters)
-            // still declines to the historical no-op below.
+            // bounded valence-3 / default-circular / `segments ≥ 2` corner builds a
+            // real vmesh patch; every other vertex `segments ≥ 2` shape (`s ≠ 3`,
+            // non-circular profiles, miters) still declines to the historical no-op below.
             if options.affect == BevelAffect::Vertices {
                 if let Some(built) = self.bevel_vertices_multiseg(geom, options) {
                     return built;
@@ -1136,16 +1135,19 @@ impl LoopMesh {
 
     /// Vertex-mode multi-segment cap (BEVEL.md §8.11, Stage [VV]).
     ///
-    /// Bounded to the valence-3, default-circular, `segments ≥ 3` corner (§8.11.4):
+    /// Bounded to the valence-3, default-circular, `segments ≥ 2` corner (§8.11.4):
     /// the §4 slide ring (a, §8.11.1), the `mid = v` / `projection_dir = 0` profile
     /// (b, §8.11.2), and the [V-ADJ] general fullness grid entered unconditionally
-    /// (c, §8.11.3 — vertex mode never takes the cube-corner octant fast path).
+    /// (c, §8.11.3 — vertex mode never takes the cube-corner octant fast path). The
+    /// `segments = 2` coarse-net case takes the identical path — a 1-vert profile chain
+    /// per sector and an even-parity welded apex (§8.5.5.5(e)) — differing from the
+    /// higher counts only in that the general fill's single mandatory subdivision round
+    /// (§8.5.5.5(d)) resamples straight back down to the coarse resolution.
     ///
-    /// Returns `None` when the corner is outside that regime (`segments == 2`, a
-    /// non-circular profile, a valence other than 3, or a wire spoke present); the
-    /// caller then declines to the historical no-op. Single-segment vertex bevel and
-    /// every edge-bevel path are untouched — this method is reached only for
-    /// `affect == VERTICES` at `segments ≥ 2`.
+    /// Returns `None` when the corner is outside that regime (a non-circular profile, a
+    /// valence other than 3, or a wire spoke present); the caller then declines to the
+    /// historical no-op. Single-segment vertex bevel and every edge-bevel path are
+    /// untouched — this method is reached only for `affect == VERTICES` at `segments ≥ 2`.
     fn bevel_vertices_multiseg(
         &mut self,
         geom: &[GeomKey],
@@ -1153,10 +1155,14 @@ impl LoopMesh {
     ) -> Option<BevelResult> {
         let segments = options.segments;
 
-        // §8.11.4 bounds: `segments ≥ 3` (the `segments = 2` coarse-net case is out)
-        // and the default circular profile only (§8.11 is stated for the round
-        // profile; square / custom profiles are OUT).
-        if segments < 3 || profile_to_exponent(options.profile) != 2.0 {
+        // §8.11.4 bounds: `segments ≥ 2` and the default circular profile only (§8.11 is
+        // stated for the round profile; square / custom profiles are OUT). The `segments = 2`
+        // coarse-net case routes through the *same* general-fullness grid (§8.5.5.5) as the
+        // higher counts — §8.11.3(c): vertex mode never takes the tri-corner octant fast path,
+        // so even the valence-3 cube corner at `segments = 2` builds the fullness-seeded net,
+        // subdivides once (§8.5.5.5(d) blockquote: always at least one round, even at seg=2),
+        // and resamples the even-parity welded apex back down (§8.5.5.5(e)).
+        if segments < 2 || profile_to_exponent(options.profile) != 2.0 {
             return None;
         }
 
@@ -14358,16 +14364,22 @@ mod tests {
         );
     }
 
-    /// The gate is tight: `segments = 2` (the coarse-net case, OUT of §8.11.4), a
-    /// non-circular profile, and a valence other than 3 all decline to the historical
-    /// no-op rather than mis-building.
+    /// BEVEL.md §8.11.3(c) at `segments = 2`: the valence-3 cube corner does **not** take
+    /// the tri-corner octant sphere-snap (that path is gated on `affect == EDGES`) — it
+    /// routes to the *same* general-fullness grid (§8.5.5.5) as the higher counts. Even
+    /// parity (§8.5.5.5(e)) welds a single central apex and mints **no** central face, so
+    /// the coarse net is: 3 §4 slide-ring boundverts, 3 `mid = v` chain interiors (one
+    /// interior sample per sector, §8.11.2), and 1 welded apex. `8/12/6 → 14/21/9`, still a
+    /// closed genus-0 solid: 3 rebuilt hexagons + 3 untouched cube quads + 3 cap quads.
     #[test]
-    fn vertex_bevel_multiseg_out_of_scope_cases_decline_to_no_op() {
-        // segments = 2 — the coarse-net case is out.
-        let (mut mesh, _) = two_quad_strip();
-        let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
-        let before = counts(&mesh);
-        mesh.bevel(
+    fn vertex_bevel_multiseg_cube_corner_seg2_routes_to_the_general_grid_with_a_welded_apex() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
             &[corner.into()],
             BevelOptions {
                 offset: 0.25,
@@ -14376,8 +14388,81 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(counts(&mesh), before, "segments = 2 vertex bevel still no-ops");
+        mesh.validate_topology();
 
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!((vertices, edges, faces), (14, 21, 9), "§8.11 Stage [VV] at seg=2");
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "seg=2 corner bevel keeps the cube a closed genus-0 solid",
+        );
+        // 3 ring + 3 chain interior (one per sector, mid = v) + 1 welded apex.
+        assert_eq!(result.verts.len(), 7, "3 ring + 3 chain mid + 1 apex");
+        // Even parity welds the apex and mints no central face: three cap quads only.
+        assert_eq!(result.faces.len(), 3, "three cap quads, no central polygon (welded apex)");
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![4, 4, 4, 4, 4, 4, 6, 6, 6],
+            "three cap quads + three untouched cube quads + three grown hexagons",
+        );
+
+        // Position spot-check (§8.11.2 / §8.5.5.5(b)): the coarse net bulges toward the
+        // corner vertex, it does not collapse into the ring plane. Within the cap faces each
+        // boundvert sits in exactly one quad, each chain mid in two, and the welded apex in
+        // all three — an order-independent way to pick the three kinds apart.
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let ring_verts: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&vertex| cap_membership(vertex) == 1)
+            .collect();
+        assert_eq!(ring_verts.len(), 3, "three §4 slide-ring boundverts");
+        let ring_centroid =
+            ring_verts.iter().fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v)) / 3.0;
+        let toward_corner = corner_position - ring_centroid;
+
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&vertex| cap_membership(vertex) == 3)
+            .expect("a single welded apex shared by all three cap quads");
+        let apex_offset = mesh.vertex_position(apex) - ring_centroid;
+        assert!(
+            apex_offset.dot(toward_corner) > 0.0,
+            "the welded apex bulges toward the corner vertex (fullness-seeded, not flat)",
+        );
+
+        // Each chain mid is shared by exactly two cap quads and likewise bulges toward `v`.
+        let chain_mids: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&vertex| cap_membership(vertex) == 2)
+            .collect();
+        assert_eq!(chain_mids.len(), 3, "three sector chain mids, one interior sample each");
+        for mid in chain_mids {
+            let offset = mesh.vertex_position(mid) - ring_centroid;
+            assert!(
+                offset.dot(toward_corner) > 0.0,
+                "each `mid = v` chain sample bulges toward the corner, not onto the flat chord",
+            );
+        }
+    }
+
+    /// The gate is tight: a non-circular profile and a valence other than 3 decline to the
+    /// historical no-op rather than mis-building. (`segments = 2` is now *in* scope — it
+    /// routes to the same general-fullness grid, see the coarse-net tests below.)
+    #[test]
+    fn vertex_bevel_multiseg_out_of_scope_cases_decline_to_no_op() {
         // Non-circular profile — square / custom profiles are out.
         let (mut mesh, _) = two_quad_strip();
         let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
@@ -14531,9 +14616,10 @@ mod tests {
         mesh.validate_topology();
     }
 
-    /// BEVEL.md §7.6 / §8: multi-segment is an unimplemented stub — a no-op, not a
-    /// silent wrong result. (Edge bevel `affect = Edges` *is* implemented for the
-    /// isolated single edge, §7; see the edge-bevel tests below.)
+    /// BEVEL.md §8.11: an out-of-scope multi-segment vertex bevel is a no-op, not a
+    /// silent wrong result. A non-circular profile is outside §8.11's round-profile
+    /// regime, so it declines even at the in-scope valence-3 corner. (The circular
+    /// seg ≥ 2 valence-3 case *is* implemented; see the coarse-net / [VV] tests above.)
     #[test]
     fn unsupported_modes_are_noops() {
         let mut mesh = LoopMesh::new();
@@ -14546,6 +14632,8 @@ mod tests {
             BevelOptions {
                 offset: 0.25,
                 segments: 2,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
                 ..Default::default()
             },
         );
@@ -21497,8 +21585,8 @@ mod tests {
 
     /// BEVEL.md §8.5.5.5: ADJ outside the symmetric cube corner stays a stub. A
     /// two-edge (`s = 2`) junction takes no pinwheel fill (the through-strips still
-    /// build, exactly as cutoff), and there is no central apex. Multi-segment vertex
-    /// bevel also remains a no-op.
+    /// build, exactly as cutoff), and there is no central apex. An out-of-scope
+    /// (here non-circular) multi-segment vertex bevel also remains a no-op.
     #[test]
     fn adj_non_forced_and_vertex_are_stubbed() {
         let mut mesh = LoopMesh::new();
@@ -21533,7 +21621,8 @@ mod tests {
             "s=2 ADJ junction: through-strips only, no pinwheel fill (§8.5.5)",
         );
 
-        // segments ≥ 2 vertex bevel: still a stub, no-op.
+        // Out-of-scope (non-circular) segments ≥ 2 vertex bevel: still a stub, no-op.
+        // (The circular seg=2 valence-3 corner is now implemented, §8.11.4.)
         let before = counts(&mesh);
         let v_far = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
         mesh.bevel(
@@ -21542,11 +21631,12 @@ mod tests {
                 offset: 0.25,
                 affect: BevelAffect::Vertices,
                 segments: 2,
+                profile: 0.25,
                 vmesh_method: BevelVmeshMethod::Adj,
                 ..Default::default()
             },
         );
-        assert_eq!(counts(&mesh), before, "segments≥2 vertex bevel is a no-op");
+        assert_eq!(counts(&mesh), before, "out-of-scope vertex multiseg is a no-op");
     }
 
     /// BEVEL.md §8.3.0.1: a junction-free `segments ≥ 2` edge set has no corner to
