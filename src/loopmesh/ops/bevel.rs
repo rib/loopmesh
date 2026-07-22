@@ -33656,46 +33656,103 @@ mod tests {
         }
     }
 
-    /// BEVEL.md §8.6.3.1(6) the seed: the lower-`z` flanking boundvert is the start side, so
-    /// the isolated valence-3 cap's cell picks the forward chain when `start.z < end.z` and
-    /// the mirror when `start.z >= end.z` (exact tie ⇒ reverse). Verified through the cell so
-    /// the `z` read of `raw_chain_positions` is exercised, not just the mapping helper.
+    /// BEVEL.md §8.6.3.1(6) Regime B (vertex bevels): a [V-ADJ] cap runs no orientation
+    /// walk, so every cap sector shares one uniform handedness. On the worked valence-3
+    /// cube corner `(1,-1,-1)` (offset 0.25, segments 2) the three cap sectors' single rim
+    /// mids must form one orbit of the corner's three-fold rotational symmetry — the
+    /// retracted per-sector world-`z` compare mirrored two of the three.
+    ///
+    /// This test drives the **real** vertex-bevel pipeline (not a synthetic `ProfileCell`
+    /// with hand-picked `start`/`end`), because the real pipeline feeds each sector's
+    /// `start`/`end` from loopmesh's cap ring in its own rotational sense — the opposite of
+    /// the sense §8.6.3.1(6)'s table assumes. That winding is exactly what an isolated
+    /// synthetic cell with guide-ordered corners would mask, letting a unit test "pass"
+    /// while the real bevel diverged. Faithful to the real path, the three rim mids must
+    /// land the guide's validated table (chord fraction `0.375`, not the mirrored `0.625`)
+    /// and the welded apex must stay three-fold symmetric.
     #[test]
-    fn custom_profile_cell_seed_selects_orientation_by_boundvert_z() {
-        let poly = BevelCurveProfile::from_points(&[
+    fn custom_profile_vertex_cap_orientation_forms_symmetry_orbit() {
+        let curve = BevelCurveProfile::from_points(&[
             (1.0, 0.0, BevelHandle::Vector),
             (0.5, 0.25, BevelHandle::Vector),
             (0.0, 1.0, BevelHandle::Vector),
         ]);
-        let apex = Vec3::new(0.0, 0.0, 1.0);
-        let edge_dir = Vec3::new(0.0, 0.0, 1.0);
+        let corner = Vec3::new(1.0, -1.0, -1.0);
 
-        // start.z < end.z → reverse = false → interior ties to cell (0.25, 0.5).
-        let cell_fwd = ProfileCell::new(
-            Vec3::new(1.0, 0.0, 0.2),
-            Vec3::new(0.0, 1.0, 0.8),
-            apex,
-            edge_dir,
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_vert = vert_at(&mesh, corner);
+        mesh.bevel(
+            &[corner_vert.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Vertices,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
         );
-        let interior_fwd = cell_fwd.raw_chain_positions(2, 0.5, Some(&poly))[1];
-        assert!(
-            (interior_fwd - cell_fwd.sample(0.25, 0.5)).length()
-                < (interior_fwd - cell_fwd.sample(0.5, 0.25)).length(),
-            "start.z < end.z must take the forward orientation",
-        );
+        mesh.validate_topology();
 
-        // start.z >= end.z → reverse = true → interior ties to cell (0.5, 0.25).
-        let cell_rev = ProfileCell::new(
-            Vec3::new(1.0, 0.0, 0.8),
-            Vec3::new(0.0, 1.0, 0.2),
-            apex,
-            edge_dir,
-        );
-        let interior_rev = cell_rev.raw_chain_positions(2, 0.5, Some(&poly))[1];
+        // The three sector rim mids from §8.6.3.1(6)'s validated table — the values the
+        // BMesh oracle produces and that the real pipeline must reproduce once loopmesh's
+        // opposite cap-ring winding is compensated by the complementary handedness.
+        let expected = [
+            Vec3::new(0.8125, -1.0, -0.875),  // (4,8)  across y = −1
+            Vec3::new(1.0, -0.875, -0.8125),  // (8,11) across x = 1
+            Vec3::new(0.875, -0.8125, -1.0),  // (11,4) across z = −1
+        ];
+        let mut rim_mids = Vec::new();
+        for want in expected {
+            let found = vert_near(&mesh, want, 1.0e-4).unwrap_or_else(|| {
+                panic!(
+                    "real vertex-bevel pipeline must mint a rim mid at the guide-table \
+                     position {want:?} (chord fraction 0.375); the mirrored 0.625 chord \
+                     fraction means the cap landed on the complementary handedness",
+                )
+            });
+            rim_mids.push(mesh.vertex_position(found));
+        }
+
+        // The three rim mids are a single orbit of the corner's three-fold rotation
+        // (cycling edges −x → +y → +z). About `corner`, that rotation acts on a
+        // displacement `d = p − corner` as `R·d = (−d.z, −d.x, d.y)`, and it must send
+        // (4,8) → (11,4) → (8,11) → (4,8). Uniform handedness is exactly what makes the
+        // orbit close; a per-sector orientation bit mirrors at least one sector onto the
+        // flipped chord fraction and breaks it.
+        let rotate = |p: Vec3| {
+            let d = p - corner;
+            corner + Vec3::new(-d.z, -d.x, d.y)
+        };
+        let orbit = [
+            (rim_mids[0], rim_mids[2]), // (4,8)  → (11,4)
+            (rim_mids[2], rim_mids[1]), // (11,4) → (8,11)
+            (rim_mids[1], rim_mids[0]), // (8,11) → (4,8)
+        ];
+        for (from, to) in orbit {
+            assert!(
+                (rotate(from) - to).length() < 1.0e-5,
+                "three-fold rotation must map {from:?} to {to:?}, got {:?}",
+                rotate(from),
+            );
+        }
+
+        // The welded cap apex is the unique minted vertex strictly off every cube face:
+        // the boundverts and all three rim mids each keep at least one coordinate on a
+        // `±1` face, only the apex leaves all three. Uniform handedness keeps it on the
+        // corner's three-fold axis, i.e. its three coordinate magnitudes are equal; a
+        // per-sector flip pulls it off-axis.
+        let on_cube_face = |c: f32| (c.abs() - 1.0).abs() < 1.0e-4;
+        let apex = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .find(|p| !on_cube_face(p.x) && !on_cube_face(p.y) && !on_cube_face(p.z))
+            .expect("the welded cap apex, the lone vertex off every cube face");
         assert!(
-            (interior_rev - cell_rev.sample(0.5, 0.25)).length()
-                < (interior_rev - cell_rev.sample(0.25, 0.5)).length(),
-            "start.z >= end.z must take the mirrored orientation",
+            (apex.x - (-apex.y)).abs() < 1.0e-5 && (apex.x - (-apex.z)).abs() < 1.0e-5,
+            "the welded apex must sit on the corner's three-fold symmetry axis \
+             (|x| = |y| = |z|), got {apex:?}",
         );
     }
 
@@ -41129,11 +41186,29 @@ impl ProfileCell {
             // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
             // bypassing the superellipse exponent / even-arc-length solve entirely.
             let cells = match custom {
-                // §8.6.3.1(6) seed: the lower-`z` flanking boundvert is the start side, so
-                // the mirror fires when `start` (`B_k`) sits at or above `end` (`B_(k+1)`).
-                // For the isolated valence-3 terminal cap the run is a single edge and this
-                // seed is the whole answer (propagation across multi-edge runs is unbuilt).
-                Some(curve) => curve.sample_chain(segments, self.start.z >= self.end.z),
+                // §8.6.3.1(6) Regime B (vertex bevels): a cap sector runs no
+                // orientation walk — there is no beveled edge to traverse — so every
+                // sector of the cap shares **one uniform handedness** bit. Per
+                // §8.6.3.1(6) that bit's *value* is deliberately not universal: it is a
+                // winding-dependent quantity fixed by the rotational sense in which the
+                // implementation itself feeds each sector's `start`/`end` pair into the
+                // cell. The guide's worked rim-mid table is computed under its own
+                // *canonical* forward-feed winding (the `reverse = false` reading);
+                // loopmesh constructs each cap sector's `start`/`end` in the
+                // index-reversed **mirror** of that canonical order, so it needs the
+                // **complementary** constant `true` to land the same rim positions —
+                // chord fraction 0.375 along `B_k → B_(k+1)`, not the mirrored 0.625.
+                // Pinned by the cross-backend A/B arm
+                // `bevel_custom_profile_vertex_cube_corner_two_segments` and the in-crate
+                // test `custom_profile_vertex_cap_orientation_forms_symmetry_orbit`. Do
+                // **NOT** revert this to `false`: §8.6.3.1(6) does not endorse either
+                // literal, and its table is stated under the guide's canonical winding,
+                // not loopmesh's mirror feed order — `false` mirror-flips every sector to
+                // the wrong 0.625 fraction. (Invisible for a symmetric superellipse/line
+                // profile, where the diagonal symmetry makes the bit a no-op; only an
+                // asymmetric custom net exposes it. Regime A — edge bevels — would seed
+                // and parity-walk the bit instead; that path is unbuilt.)
+                Some(curve) => curve.sample_chain(segments, true),
                 None => superellipse_chain(profile, segments),
             };
             for &(u, v) in cells.iter().take(segments as usize).skip(1) {
