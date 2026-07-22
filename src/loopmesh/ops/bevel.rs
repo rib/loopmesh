@@ -1892,6 +1892,7 @@ impl LoopMesh {
                 self.bevel_single_edge(
                     edge,
                     offset,
+                    options.profile,
                     material,
                     &templates,
                     strip_template,
@@ -2022,6 +2023,7 @@ impl LoopMesh {
         &mut self,
         edge: EdgeKey,
         offset: f32,
+        profile: f32,
         material: i32,
         templates: &TemplateBank,
         strip_template: FaceTemplate,
@@ -2075,6 +2077,7 @@ impl LoopMesh {
             face_left,
             face_right,
             offset,
+            profile,
             &[],
             fan_templates[0],
             &mut substitutions,
@@ -2090,6 +2093,7 @@ impl LoopMesh {
             face_left,
             face_right,
             offset,
+            profile,
             &[],
             fan_templates[1],
             &mut substitutions,
@@ -2550,6 +2554,7 @@ impl LoopMesh {
                     options.affect,
                     options.segments,
                     offset,
+                    options.profile,
                     &reconciled,
                     &mut templates,
                     &mut corner_vert,
@@ -3724,9 +3729,13 @@ impl LoopMesh {
                 let leg_direction = self
                     .edge_direction_from(leg, vertex, terminal_position)
                     .expect("the terminal plan admitted only legs with a direction");
+                // §8.3.0.1: the fan pivot slides the spec offset, lengthened by `√2` for a
+                // concave-notch superellipse (`profile < 0.25`) so the fill never cuts into
+                // the swept cross-section; every `profile ≥ 0.25` shape takes the plain offset.
+                let slide = terminal_leg_slide_distance(offset, profile);
                 // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
                 let leg_vert =
-                    self.mint_bevel_vertex(terminal_position + leg_direction * offset, vertex);
+                    self.mint_bevel_vertex(terminal_position + leg_direction * slide, vertex);
                 result.verts.push(leg_vert);
                 leg_verts.push(leg_vert);
                 leg_near.push((leg, leg_vert));
@@ -7190,6 +7199,7 @@ impl LoopMesh {
         affect: BevelAffect,
         segments: u32,
         offset: f32,
+        profile: f32,
         reconciled: &[ReconciledOffset],
         templates: &mut TemplateBank,
         corner_vert: &mut Vec<CornerVert>,
@@ -7240,6 +7250,7 @@ impl LoopMesh {
                 face_left,
                 face_right,
                 offset,
+                profile,
                 reconciled,
                 fan_template,
                 substitutions,
@@ -7300,6 +7311,7 @@ impl LoopMesh {
         face_left: FaceKey,
         face_right: FaceKey,
         offset: f32,
+        profile: f32,
         reconciled: &[ReconciledOffset],
         fan_template: FaceTemplate,
         substitutions: &mut Vec<FaceSubstitution>,
@@ -7344,10 +7356,14 @@ impl LoopMesh {
             set_face_substitution(substitutions, vertex, face, vec![strip_vert]);
         }
 
-        // §7.5: one on-edge vert per leg not flanking `E`, slid the **plain** offset along
-        // that leg (the slide is the §4 one, and carries no reconciliation and no profile
-        // term). `legs.middle` already runs them in the disk order that continues past
-        // `end`, which is the order the fill's boundary walks them in after the `end` rung.
+        // §7.5 / §8.3.0.1: one on-edge vert per leg not flanking `E`, slid along that leg
+        // from the terminal. The slide reads the spec offset (no §7.6.4 reconciliation —
+        // this pivot is not a strip vert), lengthened by `√2` for a concave-notch
+        // superellipse (`profile < 0.25`, strict) and the plain offset for every
+        // `profile ≥ 0.25` shape. `legs.middle` already runs them in the disk order that
+        // continues past `end`, which is the order the fill's boundary walks them in after
+        // the `end` rung.
+        let leg_slide = terminal_leg_slide_distance(offset, profile);
         let mut leg_near: Vec<(EdgeKey, VertexKey)> =
             vec![(legs.start_leg, strip_start), (legs.end_leg, strip_end)];
         let mut leg_verts: Vec<VertexKey> = Vec::with_capacity(legs.middle.len());
@@ -7355,7 +7371,8 @@ impl LoopMesh {
             let leg_direction = self
                 .edge_direction_from(leg, vertex, vertex_position)
                 .expect("the close plan admitted only legs with a direction");
-            let leg_vert = self.mint_bevel_vertex(vertex_position + leg_direction * offset, vertex);
+            let leg_vert =
+                self.mint_bevel_vertex(vertex_position + leg_direction * leg_slide, vertex);
             result.verts.push(leg_vert);
             leg_verts.push(leg_vert);
             leg_near.push((leg, leg_vert));
@@ -28518,6 +28535,110 @@ mod tests {
         assert_eq!(mesh.edge_radial_iter(leg_edge).count(), 2);
     }
 
+    /// BEVEL.md §8.3.0.1, the concave-notch arm: at a valence-4 terminal, a superellipse
+    /// with `profile < 0.25` bows out toward the profile plane's far corner, so the
+    /// non-`E`-adjacent leg vert slides `offset·√2` — the box diagonal — instead of the
+    /// plain offset, keeping the fill's fan pivot outside the swept cross-section. The
+    /// `(2,2)` terminal's beveled edge runs `+x`, so its one non-flanking leg is `−x`, and
+    /// at `offset = 0.25`, `profile = 0.1` the leg vert lands `0.25·√2 ≈ 0.3536` in from
+    /// `(2,2)` — at `x ≈ 1.6464`, not the plain `1.75`.
+    #[test]
+    fn edge_bevel_valence_four_terminal_leg_vert_slides_root_two_for_concave_profile() {
+        let (mut mesh, verts) = quad_grid_5x5();
+        let beveled = mesh
+            .query_edge_exists(verts[2][2], verts[3][2])
+            .expect("the interior grid edge");
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                profile: 0.1,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let tol = 1.0e-5;
+        let slid = 2.0 - 0.25 * std::f32::consts::SQRT_2;
+        assert!(
+            vert_near(&mesh, Vec3::new(slid, 2.0, 0.0), tol).is_some(),
+            "the concave-notch leg vert slides offset·√2 along the −x leg",
+        );
+        assert!(
+            vert_near(&mesh, Vec3::new(1.75, 2.0, 0.0), tol).is_none(),
+            "it does NOT sit at the plain-offset position",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.1, the strict `<` gate: `profile = 0.25` is the straight chord
+    /// (§8.6.2) and takes the **plain** offset, not `offset·√2` — the notch lengthening
+    /// fires only strictly below `0.25`. Same `(2,2)` valence-4 terminal, so the `−x` leg
+    /// vert must sit at the plain `1.75`, byte-identical to the `profile = 0.5` default.
+    #[test]
+    fn edge_bevel_valence_four_terminal_leg_vert_is_plain_at_profile_quarter() {
+        let (mut mesh, verts) = quad_grid_5x5();
+        let beveled = mesh
+            .query_edge_exists(verts[2][2], verts[3][2])
+            .expect("the interior grid edge");
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                profile: 0.25,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let tol = 1.0e-5;
+        assert!(
+            vert_near(&mesh, Vec3::new(1.75, 2.0, 0.0), tol).is_some(),
+            "profile = 0.25 is the straight chord: the leg vert takes the plain offset",
+        );
+        let slid = 2.0 - 0.25 * std::f32::consts::SQRT_2;
+        assert!(
+            vert_near(&mesh, Vec3::new(slid, 2.0, 0.0), tol).is_none(),
+            "the strict `<` gate does not fire at the boundary",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.1: the leg-vert `√2` slide is a property of the fill's fan pivot,
+    /// not of the profile-strip subdivision, so it fires at `segments ≥ 2` exactly as at
+    /// `segments = 1` (the multi-segment terminal-chain builder). At `segments = 2`,
+    /// `offset = 0.25`, `profile = 0.1` the `(2,2)` terminal's `−x` leg vert still lands at
+    /// `x ≈ 1.6464`.
+    #[test]
+    fn edge_bevel_valence_four_terminal_leg_vert_slides_root_two_at_segments_two() {
+        let (mut mesh, verts) = quad_grid_5x5();
+        let beveled = mesh
+            .query_edge_exists(verts[2][2], verts[3][2])
+            .expect("the interior grid edge");
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                profile: 0.1,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let tol = 1.0e-5;
+        let slid = 2.0 - 0.25 * std::f32::consts::SQRT_2;
+        assert!(
+            vert_near(&mesh, Vec3::new(slid, 2.0, 0.0), tol).is_some(),
+            "the notch slide is not gated on segment count — it fires at segments = 2",
+        );
+        assert!(
+            vert_near(&mesh, Vec3::new(1.75, 2.0, 0.0), tol).is_none(),
+            "and the leg vert is not left at the plain-offset position",
+        );
+    }
+
     /// The `5 × 5` grid with the `(1,1)` quad left out. `(2,2)` keeps all four of its
     /// edges but loses one of its four faces, so its disk is an **open arc**
     /// `[boundary, E, interior, boundary]` — valence 4, three faces, and no cycle.
@@ -30550,6 +30671,7 @@ mod tests {
         mesh.bevel_single_edge(
             edge,
             0.25,
+            0.5,
             -1,
             &templates,
             strip_template,
@@ -37758,6 +37880,24 @@ const PROFILE_SQUARE_EXPONENT: f32 = 1.0e4;
 /// Tolerance for snapping the computed exponent onto the special values that
 /// carry closed-form spacing shortcuts (BEVEL.md §8.6.2).
 const PROFILE_EXPONENT_SNAP: f32 = 1.0e-4;
+
+/// The distance a valence-≥4 terminal's non-`E`-adjacent leg vert slides along its
+/// leg (BEVEL.md §8.3.0.1). The base is the beveled edge's **specified** (unreconciled)
+/// offset — the fill's fan pivot, not a strip vert, so §7.6.4 width-reconciliation never
+/// reaches it. It is lengthened by `√2` — the profile plane's box diagonal — exactly
+/// when the superellipse cross-section is a **concave notch** (`profile < 0.25`, strict),
+/// which can bow out toward the square's far corner; every `profile ≥ 0.25` shape (flat
+/// chord, round arc, square) hugs the chord and takes the plain offset. The gate is
+/// strict, so `profile = 0.25` (the straight chord, §8.6.2) is a plain-offset slide.
+/// (The `profile_type == CUSTOM` arm of the rule is out of scope: there is no custom
+/// profile family here.)
+fn terminal_leg_slide_distance(offset: f32, profile: f32) -> f32 {
+    if profile < 0.25 {
+        offset * std::f32::consts::SQRT_2
+    } else {
+        offset
+    }
+}
 
 /// Map the user `profile` scalar (`0..1`) to the superellipse exponent `r`
 /// (BEVEL.md §8.6.2): `r = 2·ln(2) / ln(1/profile)`, snapped onto the special
