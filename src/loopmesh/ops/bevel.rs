@@ -149,6 +149,203 @@ enum BevelNewFaceKind {
     Strip,
 }
 
+/// Which cross-section family a multi-segment bevel rounds toward (BEVEL.md §8.6.3).
+///
+/// [`Superellipse`](Self::Superellipse) is the analytic `u^r + v^r = 1` family the
+/// `profile` scalar governs (§8.6.1). [`Custom`](Self::Custom) samples the chain from a
+/// user-authored [`BevelCurveProfile`] instead — a parameter-spaced Bézier resample of a
+/// handle-typed control-point list (§8.6.3.1), **not** the even-arc-length superellipse
+/// solve. The type (not the `profile` value) also drives the terminal `√2` leg slide and
+/// the three-boundvert un-fan (§8.3.0.1 / §8.3.0.2).
+#[derive(Clone, Copy, Debug)]
+pub enum BevelProfileType<'c> {
+    Superellipse,
+    Custom(&'c BevelCurveProfile),
+}
+
+impl Default for BevelProfileType<'_> {
+    fn default() -> Self {
+        BevelProfileType::Superellipse
+    }
+}
+
+impl<'c> BevelProfileType<'c> {
+    /// The custom curve when this is [`Custom`](Self::Custom), else `None`.
+    fn custom(self) -> Option<&'c BevelCurveProfile> {
+        match self {
+            BevelProfileType::Custom(curve) => Some(curve),
+            BevelProfileType::Superellipse => None,
+        }
+    }
+}
+
+/// A Bézier handle kind for a custom-profile control point (BEVEL.md §8.6.3.1(1)),
+/// reusing the standard curve-widget vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BevelHandle {
+    /// One-third of the way toward the neighbouring control point — a straight segment.
+    Vector,
+    /// A smooth tangent derived from the two neighbours (`t = a/|a| + b/|b|`).
+    Auto,
+    /// An explicit, independently-placed handle location.
+    Free,
+    /// An explicit handle whose opposite side is forced collinear through the point.
+    Aligned,
+}
+
+/// One control point of a [`BevelCurveProfile`] (BEVEL.md §8.6.3.1(1)): a position in the
+/// widget's `(x, y)` space, a per-side handle kind for the arriving (`h1`) and leaving
+/// (`h2`) segment, and — for the free / aligned kinds — an explicit handle location per
+/// side.
+#[derive(Clone, Copy, Debug)]
+struct BevelCurvePoint {
+    x: f32,
+    y: f32,
+    h1: BevelHandle,
+    h2: BevelHandle,
+    h1_loc: Option<(f32, f32)>,
+    h2_loc: Option<(f32, f32)>,
+}
+
+/// A user-authored custom bevel profile curve (BEVEL.md §8.6.3 / §8.6.3.1): an ordered
+/// list of control points in the widget's unit-square `(x, y)` space, with the default
+/// start at `(1, 0)` and end at `(0, 1)`. The chain a multi-segment bevel samples from it
+/// is a **parameter-spaced** per-segment cubic-Bézier resample (§8.6.3.1(2)/(4)), mapped
+/// into the profile cell by the fixed axis swap `u = y`, `v = x` (§8.6.3.1(5)).
+#[derive(Clone, Debug)]
+pub struct BevelCurveProfile {
+    points: Vec<BevelCurvePoint>,
+}
+
+impl BevelCurveProfile {
+    /// Build a custom profile from a list of `(x, y, handle)` control points in the
+    /// widget frame; the given handle kind is applied to both sides of each point. The
+    /// list runs corner-to-corner (default start `(1, 0)`, end `(0, 1)`).
+    pub fn from_points(points: &[(f32, f32, BevelHandle)]) -> Self {
+        BevelCurveProfile {
+            points: points
+                .iter()
+                .map(|&(x, y, handle)| BevelCurvePoint {
+                    x,
+                    y,
+                    h1: handle,
+                    h2: handle,
+                    h1_loc: None,
+                    h2_loc: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The **line** preset (BEVEL.md §8.6.3.1(3)): two auto points `(1, 0)` and `(0, 1)`.
+    /// With the phantom-endpoint rule the auto handles fall on the line, so the evaluated
+    /// segment is the straight diagonal chord — identical to the superellipse `r = 1`
+    /// (line) case.
+    pub fn preset_line() -> Self {
+        Self::from_points(&[(1.0, 0.0, BevelHandle::Auto), (0.0, 1.0, BevelHandle::Auto)])
+    }
+
+    /// The custom profile's `segments + 1` sample chain in the profile **cell** frame
+    /// `(u_k, v_k)` (BEVEL.md §8.6.3.1): resample the control-point Bézier at even
+    /// parameter (step 4), then apply the fixed axis swap `u = y`, `v = x` (step 5). The
+    /// ends are pinned to the cell ring corners `(0, 1)` / `(1, 0)`.
+    fn sample_chain(&self, segments: u32) -> Vec<(f32, f32)> {
+        widget_chain_to_cell(&self.widget_chain(segments))
+    }
+
+    /// The custom-profile fullness law **F1** (BEVEL.md §8.5.5.5(f.3)):
+    /// `(1 / (2·n)) · Σ_{i=0}^{n-1} (u_i + v_i)`. The sum runs over `i = 0..=n-1` — it
+    /// includes the `(0, 1)` endpoint and **excludes** the `(1, 0)` endpoint — and the
+    /// divisor is `2·n`, not `2·(n+1)`. The `x_i + y_i` sum is swap-invariant, so the cell
+    /// chain gives the same value as the widget chain.
+    fn fullness_f1(&self, segments: u32) -> f32 {
+        let n = segments.max(1) as usize;
+        let chain = self.sample_chain(segments);
+        let sum: f32 = chain.iter().take(n).map(|&(u, v)| u + v).sum();
+        sum / (2.0 * n as f32)
+    }
+
+    /// The evaluated Bézier sample chain in the widget's `(x, y)` frame (BEVEL.md
+    /// §8.6.3.1(2)/(4)): resolve every point's handle positions, split the `segments`
+    /// budget across the control-point segments, and sample each segment at even Bézier
+    /// parameter. The result has `segments + 1` entries, ends pinned to the first / last
+    /// control point.
+    fn widget_chain(&self, segments: u32) -> Vec<(f32, f32)> {
+        let n = segments.max(1) as usize;
+        let points = &self.points;
+        // A degenerate (< 2 point) definition has no segment to sample: fall back to the
+        // straight diagonal, the line preset's shape.
+        if points.len() < 2 {
+            return (0..=n)
+                .map(|k| {
+                    let t = k as f32 / n as f32;
+                    (1.0 - t, t)
+                })
+                .collect();
+        }
+
+        let handles = self.resolved_handles();
+        let segment_count = points.len() - 1;
+        let budgets = distribute_budget(points, &handles, n);
+
+        let mut chain: Vec<(f32, f32)> = Vec::with_capacity(n + 1);
+        for seg in 0..segment_count {
+            let m = budgets[seg];
+            if m == 0 {
+                continue;
+            }
+            let p0 = (points[seg].x, points[seg].y);
+            let c1 = handles[seg].right;
+            let c2 = handles[seg + 1].left;
+            let p3 = (points[seg + 1].x, points[seg + 1].y);
+            let first = if chain.is_empty() { 0 } else { 1 };
+            for step in first..=m {
+                let t = step as f32 / m as f32;
+                chain.push(cubic_bezier(p0, c1, c2, p3, t));
+            }
+        }
+        if chain.is_empty() {
+            chain.push((points[0].x, points[0].y));
+        }
+        // Guard the exact endpoint pins against float drift in the Bézier evaluation.
+        let last = points.len() - 1;
+        chain[0] = (points[0].x, points[0].y);
+        let end = chain.len() - 1;
+        chain[end] = (points[last].x, points[last].y);
+        chain
+    }
+
+    /// Resolve every control point's left / right handle location (BEVEL.md §8.6.3.1(2)):
+    /// vector handles at one-third toward the relevant neighbour, auto handles from the
+    /// smooth-tangent rule, with phantom-reflected neighbours at the two endpoints.
+    fn resolved_handles(&self) -> Vec<ResolvedHandles> {
+        let points = &self.points;
+        let count = points.len();
+        (0..count)
+            .map(|i| {
+                let p = (points[i].x, points[i].y);
+                let prev = if i == 0 {
+                    // Phantom reflection of the real neighbour through the point.
+                    let next = (points[1].x, points[1].y);
+                    (2.0 * p.0 - next.0, 2.0 * p.1 - next.1)
+                } else {
+                    (points[i - 1].x, points[i - 1].y)
+                };
+                let next = if i + 1 == count {
+                    let real_prev = (points[i - 1].x, points[i - 1].y);
+                    (2.0 * p.0 - real_prev.0, 2.0 * p.1 - real_prev.1)
+                } else {
+                    (points[i + 1].x, points[i + 1].y)
+                };
+                let left = resolve_handle_side(points[i].h1, points[i].h1_loc, p, prev, next, true);
+                let right =
+                    resolve_handle_side(points[i].h2, points[i].h2_loc, p, prev, next, false);
+                ResolvedHandles { left, right }
+            })
+            .collect()
+    }
+}
+
 /// Parameters for [`LoopMesh::bevel`]. The foundational case (BEVEL.md §3) is
 /// reachable by setting only `offset` and leaving every other field at its
 /// default: `affect = Vertices`, `segments = 1`, `offset_type = Offset`.
@@ -211,9 +408,15 @@ pub struct BevelOptions<'a> {
     /// Only observable at `segments ≥ 2`: a single segment is a straight chamfer
     /// regardless of `profile` (§8.6.2). The mapping to the superellipse exponent
     /// `r` is logarithmic with `0.25 → r = 1` (line), `0.5 → r = 2` (circle),
-    /// `→ 1 → r → ∞` (square). The `CUSTOM` `profile_type` (a tabulated user curve,
-    /// §8.6.3) is not yet representable and is out of scope. Defaults to `0.5`.
+    /// `→ 1 → r → ∞` (square). Ignored when `profile_type` is
+    /// [`Custom`](BevelProfileType::Custom). Defaults to `0.5`.
     pub profile: f32,
+    /// Which cross-section family the profile is sampled from (BEVEL.md §8.6.3):
+    /// [`Superellipse`](BevelProfileType::Superellipse) (the `profile`-scalar analytic
+    /// family, the default) or [`Custom`](BevelProfileType::Custom) (a user-authored
+    /// [`BevelCurveProfile`]). The type also drives the terminal `√2` leg slide and the
+    /// three-boundvert un-fan (§8.3.0.1 / §8.3.0.2). Only observable at `segments ≥ 2`.
+    pub profile_type: BevelProfileType<'a>,
     /// Gate for the per-element bevel-weight prescale (BEVEL.md §8.7.2). When
     /// `false` (the default), weights are ignored entirely and every beveled
     /// element slides the full `offset` — byte-identical to the unweighted path.
@@ -297,6 +500,7 @@ impl Default for BevelOptions<'_> {
             mark_sharp: false,
             vmesh_method: BevelVmeshMethod::Adj,
             profile: 0.5,
+            profile_type: BevelProfileType::Superellipse,
             use_weights: false,
             vert_weights: &[],
             loop_slide: false,
@@ -1419,6 +1623,9 @@ impl LoopMesh {
         // (§8.5.5.5(d) blockquote: always at least one round, even at seg=2), and resamples
         // the even-parity welded apex back down (§8.5.5.5(e)).
         let exponent = profile_to_exponent(options.profile);
+        // §8.6.3: a custom profile supplies the boundary chain and its fullness (law F1),
+        // and is never flat — it routes through the general fullness grid unchanged.
+        let custom = options.profile_type.custom();
         if segments < 2 {
             return None;
         }
@@ -1647,6 +1854,7 @@ impl LoopMesh {
                     &cell,
                     segments,
                     options.profile,
+                    custom,
                     ChainEmission::Resampled,
                     &mut result,
                 );
@@ -1719,6 +1927,7 @@ impl LoopMesh {
                 .map(|&cell| RingChainProfile::Cell {
                     cell,
                     profile: options.profile,
+                    custom,
                 })
                 .collect();
             // Centre n-gon: the ring-spanning §6.6.1.4 donor. Sector fills: the per-sector
@@ -1759,7 +1968,8 @@ impl LoopMesh {
                 &profiles,
                 segments,
                 options.profile,
-                exponent == 1.0,
+                custom,
+                exponent == 1.0 && custom.is_none(),
                 None,
                 options.material,
                 &sector_representatives,
@@ -1909,6 +2119,7 @@ impl LoopMesh {
                     edge,
                     offset,
                     options.profile,
+                    options.profile_type.custom().is_some(),
                     material,
                     &templates,
                     strip_template,
@@ -2040,6 +2251,7 @@ impl LoopMesh {
         edge: EdgeKey,
         offset: f32,
         profile: f32,
+        custom: bool,
         material: i32,
         templates: &TemplateBank,
         strip_template: FaceTemplate,
@@ -2094,6 +2306,7 @@ impl LoopMesh {
             face_right,
             offset,
             profile,
+            custom,
             &[],
             fan_templates[0],
             &mut substitutions,
@@ -2110,6 +2323,7 @@ impl LoopMesh {
             face_right,
             offset,
             profile,
+            custom,
             &[],
             fan_templates[1],
             &mut substitutions,
@@ -2571,6 +2785,7 @@ impl LoopMesh {
                     options.segments,
                     offset,
                     options.profile,
+                    options.profile_type.custom().is_some(),
                     &reconciled,
                     &mut templates,
                     &mut corner_vert,
@@ -2775,6 +2990,7 @@ impl LoopMesh {
         let material = options.material;
         let segments = options.segments;
         let profile = options.profile;
+        let custom = options.profile_type.custom();
 
         let mut manifold: Vec<EdgeKey> = Vec::new();
         for &edge in beveled {
@@ -2951,6 +3167,7 @@ impl LoopMesh {
                     offset,
                     segments,
                     profile,
+                    custom,
                     &mut templates,
                     &mut chains,
                     &mut face_subst,
@@ -3323,6 +3540,7 @@ impl LoopMesh {
                     crossing,
                     segments,
                     profile,
+                    None,
                     rescue,
                     None,
                     chain_emission,
@@ -3464,8 +3682,8 @@ impl LoopMesh {
         // The welded chain is no cap boundary — neither method fills this corner — so
         // both profiles emit their raw samples (§8.2.2.1.1's resample is a [V-ADJ] cap
         // property), which is why `Cutoff` and `Adj` land the same verts here.
-        let first_samples = first.chain_positions(segments, profile, ChainEmission::Raw);
-        let second_samples = second.chain_positions(segments, profile, ChainEmission::Raw);
+        let first_samples = first.chain_positions(segments, profile, None, ChainEmission::Raw);
+        let second_samples = second.chain_positions(segments, profile, None, ChainEmission::Raw);
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for index in 1..segments as usize {
@@ -3637,6 +3855,7 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        custom: Option<&BevelCurveProfile>,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
@@ -3716,6 +3935,7 @@ impl LoopMesh {
             edge,
             segments,
             profile,
+            custom,
             rescue,
             Some(terminal_position),
             ChainEmission::Raw,
@@ -3771,9 +3991,10 @@ impl LoopMesh {
                     .edge_direction_from(leg, vertex, terminal_position)
                     .expect("the terminal plan admitted only legs with a direction");
                 // §8.3.0.1: the fan pivot slides the spec offset, lengthened by `√2` for a
-                // concave-notch superellipse (`profile < 0.25`) so the fill never cuts into
-                // the swept cross-section; every `profile ≥ 0.25` shape takes the plain offset.
-                let slide = terminal_leg_slide_distance(offset, profile);
+                // concave-notch superellipse (`profile < 0.25`) or **any** custom profile so
+                // the fill never cuts into the swept cross-section; every `profile ≥ 0.25`
+                // superellipse shape takes the plain offset.
+                let slide = terminal_leg_slide_distance(offset, profile, custom.is_some());
                 // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
                 let leg_vert =
                     self.mint_bevel_vertex(terminal_position + leg_direction * slide, vertex);
@@ -3843,6 +4064,8 @@ impl LoopMesh {
                 boundary,
                 leg_verts,
                 representative,
+                cell: Some(cell),
+                custom: custom.is_some(),
             });
         } else {
             // A two-boundvert terminal still has a ring, and a wire spoke on its disk still
@@ -3955,6 +4178,28 @@ impl LoopMesh {
             return;
         }
 
+        // §8.3.0.2 the one profile-keyed exception — the **custom-profile un-fan**. At the
+        // three-boundvert case (valence 4, one leg vert) *and only there*, under a custom
+        // profile, if the lone leg vert lies within tolerance of the beveled edge's
+        // terminal-far-end profile plane, the ring is emitted **whole** instead of fanned.
+        // The test is the leg vert's **squared** plane distance against the **un-squared**
+        // coarse epsilon `1e-4` (an effective linear tolerance of `1e-2`) — reproduce the
+        // squared-vs-linear mismatch verbatim; a squared-vs-squared or fine-epsilon test
+        // flips the face count.
+        if fill.custom {
+            if let Some(cell) = &fill.cell {
+                let normal = cell.mid_plane_normal;
+                if normal.length_squared() > 0.0 {
+                    let leg = self.vertex_position(fill.leg_verts[0]);
+                    let distance = (leg - cell.start).dot(normal);
+                    if distance * distance < 1.0e-4 {
+                        emit(self, ring);
+                        return;
+                    }
+                }
+            }
+        }
+
         // Three boundverts: fan from the ring's **last** vert — its one leg vert (§8.3.0.2's
         // pivot: never a chain rung). The run is `(leg, start, peak₁) … (leg, peak_(s−1), end)`
         // — `count − 2` = `segments` triangles, every diagonal emanating from the pivot.
@@ -4003,6 +4248,7 @@ impl LoopMesh {
         edge: EdgeKey,
         segments: u32,
         profile: f32,
+        custom: Option<&BevelCurveProfile>,
         rescue: MidRescue,
         terminal_vertex: Option<Vec3>,
         emission: ChainEmission,
@@ -4017,7 +4263,7 @@ impl LoopMesh {
         if let Some(terminal) = terminal_vertex {
             cell.snap_terminal_plane(terminal);
         }
-        let interior = self.mint_chain_interior(&cell, segments, profile, emission, result);
+        let interior = self.mint_chain_interior(&cell, segments, profile, custom, emission, result);
         (interior, cell)
     }
 
@@ -4049,10 +4295,11 @@ impl LoopMesh {
         cell: &ProfileCell,
         segments: u32,
         profile: f32,
+        custom: Option<&BevelCurveProfile>,
         emission: ChainEmission,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
-        let positions = cell.chain_positions(segments, profile, emission);
+        let positions = cell.chain_positions(segments, profile, custom, emission);
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for position in positions.iter().take(positions.len() - 1).skip(1) {
             // §5.2.4: not yet minted from the corner.
@@ -4130,10 +4377,13 @@ impl LoopMesh {
         edge: EdgeKey,
         profile: f32,
         rescue: MidRescue,
-    ) -> RingChainProfile {
+    ) -> RingChainProfile<'static> {
         RingChainProfile::Cell {
             cell: self.derive_profile_cell(start, end, edge, rescue),
             profile,
+            // Junction / miter ring flanks route the analytic sampler; the custom-profile
+            // edge-junction fill is a separate follow-up (BEVEL.md §8.6.3).
+            custom: None,
         }
     }
 
@@ -4534,7 +4784,7 @@ impl LoopMesh {
                 debug_assert!(false, "pipe-override sector {k} chain carries no profile cell");
                 return;
             };
-            let positions = cell.chain_positions(segments, profile, ChainEmission::Raw);
+            let positions = cell.chain_positions(segments, profile, None, ChainEmission::Raw);
             for position in positions.iter().take(positions.len() - 1).skip(1) {
                 // §5.1.1: minted loose — in no edge and no face. No later phase re-points
                 // or frees it (the wire re-attach and endpoint-free passes key on named
@@ -5309,6 +5559,7 @@ impl LoopMesh {
                         edge,
                         segments,
                         profile,
+                        None,
                         rescue,
                         None,
                         ChainEmission::Resampled,
@@ -5814,6 +6065,7 @@ impl LoopMesh {
                         edge,
                         segments,
                         profile,
+                        None,
                         rescue,
                         None,
                         ChainEmission::Resampled,
@@ -6185,6 +6437,7 @@ impl LoopMesh {
             &omj.profiles,
             omj.segments,
             omj.profile,
+            None,
             false,
             raw_coarse_mids,
             material,
@@ -6317,6 +6570,7 @@ impl LoopMesh {
         profiles: &[RingChainProfile],
         segments: u32,
         profile: f32,
+        custom: Option<&BevelCurveProfile>,
         flat: bool,
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
@@ -6359,16 +6613,30 @@ impl LoopMesh {
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
         let fullness = if flat {
             0.0
+        } else if let Some(curve) = custom {
+            curve.fullness_f1(segments)
         } else {
             adj_fullness(profile, segments)
         };
-        let fullness_seed = centroid + fullness * (vertex_position - centroid);
+        // §8.5.5.5(b): a **custom** profile consumes its fullness *differently* — the centre
+        // is seeded from `v` reflected through the centroid, then moved back toward `v`:
+        // `(2·centroid − v) + 2·fullness·(v − centroid)`, because a tabulated curve has no
+        // analytic sphere to fit (law F1). Every analytic exponent uses the plain blend
+        // `centroid + fullness·(v − centroid)`.
+        let fullness_seed = if custom.is_some() {
+            (2.0 * centroid - vertex_position) + 2.0 * fullness * (vertex_position - centroid)
+        } else {
+            centroid + fullness * (vertex_position - centroid)
+        };
 
         // The face-winding anchor (§8.5.5): a point below the cap, on the solid side away
         // from `v`. The flat cap reflects `v` through the centroid (its `fullness = 0`
-        // would otherwise collapse the anchor onto the in-plane centroid).
+        // would otherwise collapse the anchor onto the in-plane centroid); a custom cap
+        // mirrors its seed through the centroid to stay on the far side.
         let anchor = if flat {
             centroid - (vertex_position - centroid)
+        } else if custom.is_some() {
+            2.0 * centroid - fullness_seed
         } else {
             centroid - fullness * (vertex_position - centroid)
         };
@@ -6580,6 +6848,7 @@ impl LoopMesh {
                 RingChainProfile::Cell {
                     cell: ProfileCell::from_control_points(start, end, start + end),
                     profile,
+                    custom: None,
                 }
             })
             .collect();
@@ -6898,7 +7167,11 @@ impl LoopMesh {
         let mut profiles: Vec<RingChainProfile> = Vec::with_capacity(sectors);
         for i in 0..sectors {
             match self.sector_cell(cut, chains, i) {
-                Some(cell) => profiles.push(RingChainProfile::Cell { cell, profile }),
+                Some(cell) => profiles.push(RingChainProfile::Cell {
+                    cell,
+                    profile,
+                    custom: None,
+                }),
                 None => return,
             }
         }
@@ -6918,6 +7191,7 @@ impl LoopMesh {
             &profiles,
             segments,
             profile,
+            None,
             flat,
             None,
             material,
@@ -7802,6 +8076,7 @@ impl LoopMesh {
         segments: u32,
         offset: f32,
         profile: f32,
+        custom: bool,
         reconciled: &[ReconciledOffset],
         templates: &mut TemplateBank,
         corner_vert: &mut Vec<CornerVert>,
@@ -7853,6 +8128,7 @@ impl LoopMesh {
                 face_right,
                 offset,
                 profile,
+                custom,
                 reconciled,
                 fan_template,
                 substitutions,
@@ -7914,6 +8190,7 @@ impl LoopMesh {
         face_right: FaceKey,
         offset: f32,
         profile: f32,
+        custom: bool,
         reconciled: &[ReconciledOffset],
         fan_template: FaceTemplate,
         substitutions: &mut Vec<FaceSubstitution>,
@@ -7965,7 +8242,7 @@ impl LoopMesh {
         // `profile ≥ 0.25` shape. `legs.middle` already runs them in the disk order that
         // continues past `end`, which is the order the fill's boundary walks them in after
         // the `end` rung.
-        let leg_slide = terminal_leg_slide_distance(offset, profile);
+        let leg_slide = terminal_leg_slide_distance(offset, profile, custom);
         let mut leg_near: Vec<(EdgeKey, VertexKey)> =
             vec![(legs.start_leg, strip_start), (legs.end_leg, strip_end)];
         let mut leg_verts: Vec<VertexKey> = Vec::with_capacity(legs.middle.len());
@@ -8029,6 +8306,10 @@ impl LoopMesh {
                 boundary: vec![strip_start, strip_end],
                 leg_verts,
                 representative: fan_template,
+                // §8.3.0.2: at `segments = 1` the ring is a bare triangle, so fan and whole
+                // coincide — the un-fan is invisible and needs no plane test.
+                cell: None,
+                custom,
             });
         }
 
@@ -12856,6 +13137,14 @@ struct TerminalFill {
     boundary: Vec<VertexKey>,
     leg_verts: Vec<VertexKey>,
     representative: FaceTemplate,
+    /// The chain-owning boundvert's terminal-snapped profile cell (BEVEL.md §8.2.2.1),
+    /// carried so the §8.3.0.2 custom-profile un-fan can test the lone leg vert against
+    /// the terminal-far-end profile plane. `None` at the `segments = 1` close, where the
+    /// un-fan is invisible (the ring is a bare triangle either way).
+    cell: Option<ProfileCell>,
+    /// Whether the bevel uses a custom profile (BEVEL.md §8.6.3) — the discriminant for
+    /// the three-boundvert un-fan (§8.3.0.2). Keyed on the profile *type*, never its value.
+    custom: bool,
 }
 
 /// One beveled vertex's ring **boundverts**, in ring order (BEVEL.md §8.3.0.4 point 1):
@@ -12947,7 +13236,7 @@ struct TerminalLegs {
 /// `boundverts[i]` to `boundverts[(i+1) % len]` (oriented that way): a strip
 /// cross-section across the shared beveled edge (§8.9.5.2), or a split sector's own
 /// fill chain `s_0 … s_segments` (§8.9.5.1). `segments` is the fill width.
-struct MiterRingJunction {
+struct MiterRingJunction<'c> {
     vertex: VertexKey,
     boundverts: Vec<VertexKey>,
     chains: Vec<Vec<VertexKey>>,
@@ -12966,7 +13255,7 @@ struct MiterRingJunction {
     /// not just the emitted rim verts. Heterogeneous by construction — a split sector
     /// contributes an arc (or two patch chords) where the rest contribute cross-section
     /// cells — and the fill never tests which is which (§8.9.5.3).
-    profiles: Vec<RingChainProfile>,
+    profiles: Vec<RingChainProfile<'c>>,
     /// Per ring edge (same order as `chains`), the beveled edge that ring edge's
     /// cross-section crosses — `None` on a split sector's **internal** (arc /
     /// patch-chord) edges, which cross no beveled edge. This is what makes the split
@@ -13032,7 +13321,7 @@ struct ArcPatchStart {
     arc_middle: Vec3,
 }
 
-impl MiterRingJunction {
+impl MiterRingJunction<'_> {
     /// The junction's enlarged outermost ring as the §6.7.5.3 walk's chain sequence.
     /// Each split sector contributes `p − 1` fill chains (`p = 2` for an arc, `3` for the
     /// outer `PATCH`) that no beveled edge crosses, so a span stepping through it comes up
@@ -14962,6 +15251,7 @@ mod tests {
             ProfileCell::from_control_points(start, end, mid).chain_positions(
                 2,
                 0.5,
+                None,
                 ChainEmission::Resampled,
             )[1]
         };
@@ -15148,6 +15438,7 @@ mod tests {
         let expected = ProfileCell::from_control_points(start, end, Vec3::ZERO).chain_positions(
             2,
             0.5,
+            None,
             ChainEmission::Resampled,
         )[1];
         assert_eq!(
@@ -15191,8 +15482,8 @@ mod tests {
             Vec3::new(-0.11547005, -0.2, 0.0),
             Vec3::ZERO,
         );
-        let raw = cell.chain_positions(2, 0.5, ChainEmission::Raw)[1];
-        let resampled = cell.chain_positions(2, 0.5, ChainEmission::Resampled)[1];
+        let raw = cell.chain_positions(2, 0.5, None, ChainEmission::Raw)[1];
+        let resampled = cell.chain_positions(2, 0.5, None, ChainEmission::Resampled)[1];
         assert!(
             (raw - resampled).length() > 1.0e-4,
             "the cell must be skewed enough for the two emissions to be distinguishable",
@@ -21661,7 +21952,7 @@ mod tests {
         );
 
         // The §8.2.2.1.1 chord-fraction resample lands on BMesh's flanking vertex.
-        let resampled = cell.segment2_boundary_resample(0.5);
+        let resampled = cell.segment2_boundary_resample(0.5, None);
         assert!(
             (resampled - Vec3::new(-0.31188, 0.35399, 0.46459)).length() < 1.0e-4,
             "resampled flanking sample = {resampled:?}",
@@ -21694,7 +21985,7 @@ mod tests {
             std::f32::consts::FRAC_PI_4.sin(),
             std::f32::consts::FRAC_PI_4.cos(),
         );
-        let resampled = cell.segment2_boundary_resample(0.5);
+        let resampled = cell.segment2_boundary_resample(0.5, None);
         assert!(
             (resampled - naive).length() < 1.0e-6,
             "symmetric-cell resample is the identity ({resampled:?} vs {naive:?})",
@@ -21714,8 +22005,8 @@ mod tests {
         let end = Vec3::new(-0.36871, 0.24371, 0.42679);
         let cell = ProfileCell::new(start, end, apex, edge_dir);
 
-        let filled = cell.chain_positions(2, 0.5, ChainEmission::Resampled);
-        let terminal = cell.chain_positions(2, 0.5, ChainEmission::Raw);
+        let filled = cell.chain_positions(2, 0.5, None, ChainEmission::Resampled);
+        let terminal = cell.chain_positions(2, 0.5, None, ChainEmission::Raw);
 
         // Endpoints are identical; only the single interior sample can differ.
         assert_eq!(filled.len(), 3);
@@ -21726,7 +22017,7 @@ mod tests {
         // The fill path lands on the resampled sample; the terminal path stays naive.
         let coarse = superellipse_chain(0.5, 2);
         let naive = cell.sample(coarse[1].0, coarse[1].1);
-        assert!((filled[1] - cell.segment2_boundary_resample(0.5)).length() < 1.0e-6);
+        assert!((filled[1] - cell.segment2_boundary_resample(0.5, None)).length() < 1.0e-6);
         assert!(
             (terminal[1] - naive).length() < 1.0e-6,
             "terminal far-end interior stays the naive profile-chain sample",
@@ -22099,8 +22390,8 @@ mod tests {
             mesh.vertex_position(ep0),
             edge_dir,
         );
-        let naive = cell.chain_positions(2, 0.5, ChainEmission::Raw)[1];
-        let emitted = cell.chain_positions(2, 0.5, ChainEmission::Resampled)[1];
+        let naive = cell.chain_positions(2, 0.5, None, ChainEmission::Raw)[1];
+        let emitted = cell.chain_positions(2, 0.5, None, ChainEmission::Resampled)[1];
         assert!(
             (raw - naive).length() < 1.0e-6,
             "coarse_flank_mid is the non-resampled naive coarse mid",
@@ -22260,13 +22551,13 @@ mod tests {
             (rim - apex).normalize(),
         );
         assert_eq!(
-            cell.chain_positions(4, 0.5, ChainEmission::Resampled),
-            cell.chain_positions(4, 0.5, ChainEmission::Raw),
+            cell.chain_positions(4, 0.5, None, ChainEmission::Resampled),
+            cell.chain_positions(4, 0.5, None, ChainEmission::Raw),
             "segments = 4 lands on the source resolution, so the resample is the identity",
         );
         assert_ne!(
-            cell.chain_positions(3, 0.5, ChainEmission::Resampled),
-            cell.chain_positions(3, 0.5, ChainEmission::Raw),
+            cell.chain_positions(3, 0.5, None, ChainEmission::Resampled),
+            cell.chain_positions(3, 0.5, None, ChainEmission::Raw),
             "segments = 3 reads back off the 4-segment profile, moving the interior samples",
         );
     }
@@ -22330,8 +22621,8 @@ mod tests {
             Vec3::new(1.0, 1.0, -1.0),
             Vec3::new(1.0, -1.0, 1.0),
         );
-        let raw = cell.chain_positions(3, 0.5, ChainEmission::Raw);
-        let chord = cell.chain_positions(3, 0.5, ChainEmission::Resampled);
+        let raw = cell.chain_positions(3, 0.5, None, ChainEmission::Raw);
+        let chord = cell.chain_positions(3, 0.5, None, ChainEmission::Resampled);
         let snap = |p: Vec3| {
             adj_sphere_center() + ADJ_SPHERE_RADIUS * (p - adj_sphere_center()).normalize()
         };
@@ -22425,8 +22716,8 @@ mod tests {
             );
         }
 
-        let raw = cell.chain_positions(3, 0.5, ChainEmission::Raw);
-        let chord = cell.chain_positions(3, 0.5, ChainEmission::Resampled);
+        let raw = cell.chain_positions(3, 0.5, None, ChainEmission::Raw);
+        let chord = cell.chain_positions(3, 0.5, None, ChainEmission::Resampled);
         for k in 1..3 {
             assert!(
                 cell_radius(&cell, chord[k]) < 1.0 - 1.0e-2,
@@ -22464,7 +22755,7 @@ mod tests {
             Vec3::new(1.0, 1.0, -1.0),
             Vec3::new(1.0, -1.0, 1.0),
         );
-        let raw = cell.chain_positions(4, 0.5, ChainEmission::Raw);
+        let raw = cell.chain_positions(4, 0.5, None, ChainEmission::Raw);
         for k in 1..4 {
             assert!(
                 (cell_radius(&cell, raw[k]) - 1.0).abs() < 1.0e-4,
@@ -24171,7 +24462,7 @@ mod tests {
         base: &[Vec3],
         offset: f32,
         profile: f32,
-    ) -> (Vec<Vec3>, Vec<RingChainProfile>) {
+    ) -> (Vec<Vec3>, Vec<RingChainProfile<'static>>) {
         let sides = base.len();
         let toward = |p: Vec3| (p - apex).normalize();
         // §7.6.2 in a planar sector: the two offset lines meet on the bisector at
@@ -24194,6 +24485,7 @@ mod tests {
                         toward(crossed),
                     ),
                     profile,
+                    custom: None,
                 }
             })
             .collect();
@@ -33260,6 +33552,271 @@ mod tests {
         }
     }
 
+    // ---- Custom profile (BEVEL.md §8.6.3 / §8.6.3.1 / §8.3.0.1 / §8.3.0.2) ----
+
+    /// BEVEL.md §8.6.3.1: the LINE preset resamples to the straight diagonal chord in the
+    /// cell frame, and a vector-handle polyline resamples to that polyline (linear per
+    /// segment) with an even-parameter budget split — the exact chains the two landed A/B
+    /// evaluation-model pins read back through the FFI.
+    #[test]
+    fn custom_profile_sample_chain_matches_the_evaluation_model() {
+        // LINE preset: two auto points whose handles fall on the line → the diagonal.
+        let line = BevelCurveProfile::preset_line();
+        let chain = line.sample_chain(2);
+        let expected = [(0.0, 1.0), (0.5, 0.5), (1.0, 0.0)];
+        for (got, want) in chain.iter().zip(expected.iter()) {
+            assert!(
+                (got.0 - want.0).abs() < 1.0e-6 && (got.1 - want.1).abs() < 1.0e-6,
+                "line preset sample {got:?} != {want:?}",
+            );
+        }
+
+        // A vector-handle polyline: the chain is the polyline itself (each segment a
+        // straight chord), swapped into the cell frame `u = y, v = x`.
+        let poly = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let chain2 = poly.sample_chain(2);
+        let want2 = [(0.0, 1.0), (0.25, 0.5), (1.0, 0.0)];
+        for (got, want) in chain2.iter().zip(want2.iter()) {
+            assert!(
+                (got.0 - want.0).abs() < 1.0e-6 && (got.1 - want.1).abs() < 1.0e-6,
+                "vector polyline sample {got:?} != {want:?}",
+            );
+        }
+
+        // §8.6.3.1(4): at `segments = 4` the two segments split the budget evenly (2 each),
+        // sampled at even parameter — the chain is the polyline sampled at its midpoints.
+        let chain4 = poly.sample_chain(4);
+        let want4 = [
+            (0.0, 1.0),
+            (0.125, 0.75),
+            (0.25, 0.5),
+            (0.625, 0.25),
+            (1.0, 0.0),
+        ];
+        assert_eq!(chain4.len(), 5, "segments + 1 samples");
+        for (got, want) in chain4.iter().zip(want4.iter()) {
+            assert!(
+                (got.0 - want.0).abs() < 1.0e-6 && (got.1 - want.1).abs() < 1.0e-6,
+                "segments = 4 sample {got:?} != {want:?}",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.3) law **F1**: the custom-profile fullness is
+    /// `(1/(2·n))·Σ_{i=0}^{n-1}(u_i + v_i)` — the `i = n` endpoint `(1,0)` is excluded and
+    /// the divisor is `2·n`.
+    #[test]
+    fn custom_profile_fullness_f1_excludes_the_last_endpoint() {
+        let line = BevelCurveProfile::preset_line();
+        // chain = [(0,1),(0.5,0.5),(1,0)]; sum over i=0,1 of (u+v) = 1 + 1 = 2; /(2·2) = 0.5.
+        assert!((line.fullness_f1(2) - 0.5).abs() < 1.0e-6);
+
+        let poly = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        // chain = [(0,1),(0.25,0.5),(1,0)]; sum over i=0,1 = 1 + 0.75 = 1.75; /(4) = 0.4375.
+        assert!((poly.fullness_f1(2) - 0.4375).abs() < 1.0e-6);
+    }
+
+    /// BEVEL.md §8.6.3 / §8.11: a `profile_type = CUSTOM` vertex bevel of a cube corner
+    /// (valence 3) at `segments = 2` builds the same general fullness grid a curved
+    /// superellipse does — the custom sampler only reshapes the boundary ring and the
+    /// centre fullness (law F1), never the topology. The resulting mesh differs in vertex
+    /// *positions* from the superellipse-circle bevel, proving the custom sampler is wired.
+    #[test]
+    fn bevel_custom_profile_vertex_cube_corner_two_segments_builds_general_grid() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+
+        let mut custom_mesh = LoopMesh::new();
+        mesh_add_cube(&mut custom_mesh);
+        let corner = vert_at(&custom_mesh, corner_position);
+        let result = custom_mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Vertices,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
+        );
+        custom_mesh.validate_topology();
+
+        let (vertices, edges, faces) = counts(&custom_mesh);
+        assert_eq!((vertices, edges, faces), (14, 21, 9), "custom builds the general grid");
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "custom corner bevel keeps the cube a closed genus-0 solid",
+        );
+        assert_eq!(result.faces.len(), 3, "three cap quads, welded apex, no central polygon");
+        assert_eq!(
+            face_size_multiset(&custom_mesh),
+            vec![4, 4, 4, 4, 4, 4, 6, 6, 6],
+            "three cap quads + three untouched cube quads + three grown hexagons",
+        );
+
+        // The custom sampler reshapes the boundary + fullness, so the cap vertices land at
+        // different positions from the superellipse-circle bevel of the same corner.
+        let mut circle_mesh = LoopMesh::new();
+        mesh_add_cube(&mut circle_mesh);
+        let circle_corner = vert_at(&circle_mesh, corner_position);
+        circle_mesh.bevel(
+            &[circle_corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 0.5,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        let custom_positions: Vec<Vec3> =
+            custom_mesh.vert_keys().into_iter().map(|v| custom_mesh.vertex_position(v)).collect();
+        let circle_positions: Vec<Vec3> =
+            circle_mesh.vert_keys().into_iter().map(|v| circle_mesh.vertex_position(v)).collect();
+        let differs = custom_positions.iter().any(|cp| {
+            circle_positions
+                .iter()
+                .all(|sp| (*cp - *sp).length() > 1.0e-4)
+        });
+        assert!(differs, "the custom cap lands verts the superellipse-circle cap does not");
+    }
+
+    /// A planar valence-4 corner whose beveled spoke's two disk-flanking legs are
+    /// **non-collinear** (BEVEL.md §8.3.0.2's un-fan precondition): spokes at `0°` (the
+    /// beveled `E`), `60°`, `180°`, and `300°`, so the flanking legs (`60°` / `300°`) span
+    /// a genuine `120°` and the terminal-far-end profile-plane triangle is non-degenerate.
+    /// Returns the mesh and the beveled spoke edge.
+    fn noncollinear_valence4_fan() -> (LoopMesh, EdgeKey) {
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let angles_deg = [0.0_f32, 60.0, 180.0, 300.0];
+        let rim: Vec<VertexKey> = angles_deg
+            .iter()
+            .map(|deg| {
+                let a = deg.to_radians();
+                mesh.create_vertex(Vec3::new(a.cos(), a.sin(), 0.0))
+            })
+            .collect();
+        for k in 0..rim.len() {
+            let next = (k + 1) % rim.len();
+            mesh.face_create_verts(&[centre, rim[k], rim[next]], FaceCreateFlags::NONE);
+        }
+        let beveled = mesh.query_edge_exists(centre, rim[0]).expect("the E spoke");
+        (mesh, beveled)
+    }
+
+    /// The terminal fill faces at `centre`'s lone leg vert (BEVEL.md §8.3.0.2): the leg vert
+    /// is on the `180°` non-adjacent leg, slid `offset` (superellipse) or `offset·√2`
+    /// (custom) from `centre`. Returns the sorted sizes of the fill faces touching it.
+    fn leg_fill_sizes(mesh: &LoopMesh, minted: &[VertexKey], leg_x: f32) -> Vec<usize> {
+        let leg = vert_near(mesh, Vec3::new(leg_x, 0.0, 0.0), 0.02).expect("the leg vert");
+        let mut sizes: Vec<usize> = terminal_fill_faces(mesh, minted, leg)
+            .iter()
+            .map(|cycle| cycle.len())
+            .collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    /// BEVEL.md §8.3.0.2 — the custom-profile **un-fan**. At the three-boundvert (valence-4)
+    /// terminal, a `profile_type = CUSTOM` bevel whose lone leg vert lies in the beveled
+    /// edge's terminal-far-end profile plane emits the fill ring **whole** (one quad at
+    /// `segments = 2`) instead of fanning it into `segments` triangles. The superellipse
+    /// bevel of the same corner fans — so the custom face count is strictly lower. The leg
+    /// vert also slides `offset·√2` under a custom profile (§8.3.0.1).
+    #[test]
+    fn bevel_custom_profile_terminal_unfan_valence4_emits_whole_ring() {
+        let offset = 0.25_f32;
+        // Superellipse baseline: the valence-4 terminal fans into 2 triangles, leg at −offset.
+        let (mut super_mesh, super_edge) = noncollinear_valence4_fan();
+        let super_result = super_mesh.bevel(
+            &[super_edge.into()],
+            BevelOptions {
+                offset,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        super_mesh.validate_topology();
+        assert_eq!(
+            leg_fill_sizes(&super_mesh, &super_result.verts, -offset),
+            vec![3, 3],
+            "superellipse valence-4 terminal fans into two triangles",
+        );
+
+        // Custom (LINE preset): the un-fan fires — one whole quad — and the leg vert slides
+        // `offset·√2` along the −x leg (§8.3.0.1).
+        let curve = BevelCurveProfile::preset_line();
+        let (mut custom_mesh, custom_edge) = noncollinear_valence4_fan();
+        let custom_result = custom_mesh.bevel(
+            &[custom_edge.into()],
+            BevelOptions {
+                offset,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
+        );
+        custom_mesh.validate_topology();
+        let custom_leg_x = -offset * std::f32::consts::SQRT_2;
+        assert!(
+            vert_near(&custom_mesh, Vec3::new(custom_leg_x, 0.0, 0.0), 0.02).is_some(),
+            "the custom leg vert slid offset·√2 along the −x leg",
+        );
+        assert_eq!(
+            leg_fill_sizes(&custom_mesh, &custom_result.verts, custom_leg_x),
+            vec![4],
+            "custom valence-4 terminal emits the ring whole — one quad, the un-fan",
+        );
+        assert!(
+            custom_mesh.face_keys().len() < super_mesh.face_keys().len(),
+            "the un-fan drops the total face count below the superellipse fan",
+        );
+    }
+
+    /// BEVEL.md §8.3.0.2: the un-fan requires **non-collinear** flanking legs. On the evenly
+    /// spaced `planar_fan(4)` the beveled spoke's two flanking legs are antiparallel, so the
+    /// terminal-far-end profile-plane triangle degenerates and the leg vert falls out of any
+    /// plane — a custom profile there still **fans**, exactly as the superellipse does. This
+    /// pins that the un-fan keys on the plane test, not merely on `profile_type = CUSTOM`.
+    #[test]
+    fn bevel_custom_profile_no_unfan_when_flanking_collinear() {
+        let curve = BevelCurveProfile::preset_line();
+        let (mut mesh, centre, rim) = planar_fan(4);
+        let beveled = mesh.query_edge_exists(centre, rim[0]).expect("the E spoke");
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        assert_eq!(
+            leg_fill_sizes(&mesh, &result.verts, -0.25 * std::f32::consts::SQRT_2),
+            vec![3, 3],
+            "collinear flanking ⇒ degenerate profile plane ⇒ the custom fill still fans",
+        );
+    }
+
     /// The `5 × 5` grid with `(2,1)` slid onto `(2,2)`, so the `−y` **leg** of the `(2,2)`
     /// terminal is zero-length while the topology stays intact. A leg with no direction has
     /// no near-corner vert to slide onto, so the close at `(2,2)` declines — permanently:
@@ -33309,6 +33866,7 @@ mod tests {
             edge,
             0.25,
             0.5,
+            false,
             -1,
             &templates,
             strip_template,
@@ -40435,8 +40993,14 @@ impl ProfileCell {
     /// `profile` (§8.6.4, reducing to the §8.3.6 circular default at `profile =
     /// 0.5`) mapped through the cell. A collinear (flat) corner has no bulge and
     /// falls back to the even straight subdivision of the chord (§8.2.2.1).
-    fn chain_positions(&self, segments: u32, profile: f32, emission: ChainEmission) -> Vec<Vec3> {
-        let raw = self.raw_chain_positions(segments, profile);
+    fn chain_positions(
+        &self,
+        segments: u32,
+        profile: f32,
+        custom: Option<&BevelCurveProfile>,
+        emission: ChainEmission,
+    ) -> Vec<Vec3> {
+        let raw = self.raw_chain_positions(segments, profile, custom);
         if self.collinear {
             return raw;
         }
@@ -40447,7 +41011,7 @@ impl ProfileCell {
         if source_segments == segments {
             return raw;
         }
-        let source = self.raw_chain_positions(source_segments, profile);
+        let source = self.raw_chain_positions(source_segments, profile, custom);
         chord_fraction_resample(&raw, &source)
     }
 
@@ -40455,7 +41019,12 @@ impl ProfileCell {
     /// boundverts and the `SUPERELLIPSE` cell coordinates between them. This is the
     /// coarse control chain the fill's centre stencil reads (§8.5.5.5(d)); the emitted
     /// rim is `chain_positions`' resample of it (§8.2.2.1.1).
-    fn raw_chain_positions(&self, segments: u32, profile: f32) -> Vec<Vec3> {
+    fn raw_chain_positions(
+        &self,
+        segments: u32,
+        profile: f32,
+        custom: Option<&BevelCurveProfile>,
+    ) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
         if self.collinear {
@@ -40464,7 +41033,12 @@ impl ProfileCell {
                 positions.push(self.start + (self.end - self.start) * t);
             }
         } else {
-            let cells = superellipse_chain(profile, segments);
+            // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
+            // bypassing the superellipse exponent / even-arc-length solve entirely.
+            let cells = match custom {
+                Some(curve) => curve.sample_chain(segments),
+                None => superellipse_chain(profile, segments),
+            };
             for &(u, v) in cells.iter().take(segments as usize).skip(1) {
                 positions.push(self.sample(u, v));
             }
@@ -40476,8 +41050,8 @@ impl ProfileCell {
     /// §8.2.2.1.1 at `segments = 2`: the chord-fraction resample of the single interior
     /// sample against the doubled (4-segment) profile. Identity on a symmetric cell
     /// (`f = 0.5` lands on `Q_2`); the skew pushes `f` toward the shorter leg.
-    fn segment2_boundary_resample(&self, profile: f32) -> Vec3 {
-        self.chain_positions(2, profile, ChainEmission::Resampled)[1]
+    fn segment2_boundary_resample(&self, profile: f32, custom: Option<&BevelCurveProfile>) -> Vec3 {
+        self.chain_positions(2, profile, custom, ChainEmission::Resampled)[1]
     }
 
     /// The profile's "height" (BEVEL.md §8.3.3): the span between the cell's
@@ -40648,14 +41222,168 @@ const PROFILE_EXPONENT_SNAP: f32 = 1.0e-4;
 /// which can bow out toward the square's far corner; every `profile ≥ 0.25` shape (flat
 /// chord, round arc, square) hugs the chord and takes the plain offset. The gate is
 /// strict, so `profile = 0.25` (the straight chord, §8.6.2) is a plain-offset slide.
-/// (The `profile_type == CUSTOM` arm of the rule is out of scope: there is no custom
-/// profile family here.)
-fn terminal_leg_slide_distance(offset: f32, profile: f32) -> f32 {
-    if profile < 0.25 {
+/// A **custom** profile takes the `√2` slide unconditionally (`custom == true`): like a
+/// concave notch it can reach the profile box's far corner, so the fan pivot is pushed
+/// out to `offset·√2` to keep the fill clear of the swept cross-section (§8.3.0.1).
+fn terminal_leg_slide_distance(offset: f32, profile: f32, custom: bool) -> f32 {
+    if custom || profile < 0.25 {
         offset * std::f32::consts::SQRT_2
     } else {
         offset
     }
+}
+
+/// A control point's resolved left/right Bézier handle locations in the widget frame
+/// (BEVEL.md §8.6.3.1(2)).
+#[derive(Clone, Copy)]
+struct ResolvedHandles {
+    left: (f32, f32),
+    right: (f32, f32),
+}
+
+/// The fixed auto-handle reach tuning factor (BEVEL.md §8.6.3.1(2)) — reproduce verbatim
+/// for parity; it has no simpler closed form.
+const CURVE_AUTO_HANDLE_FACTOR: f32 = 2.5614;
+
+/// Resolve one side of a control point's Bézier handle (BEVEL.md §8.6.3.1(2)). `is_left`
+/// selects the arriving (`h1`, toward `prev`) vs the leaving (`h2`, toward `next`) side.
+fn resolve_handle_side(
+    kind: BevelHandle,
+    explicit: Option<(f32, f32)>,
+    p: (f32, f32),
+    prev: (f32, f32),
+    next: (f32, f32),
+    is_left: bool,
+) -> (f32, f32) {
+    match kind {
+        BevelHandle::Free | BevelHandle::Aligned => explicit.unwrap_or_else(|| auto_handle(p, prev, next, is_left)),
+        BevelHandle::Vector => {
+            let neighbour = if is_left { prev } else { next };
+            (
+                p.0 + (neighbour.0 - p.0) / 3.0,
+                p.1 + (neighbour.1 - p.1) / 3.0,
+            )
+        }
+        BevelHandle::Auto => auto_handle(p, prev, next, is_left),
+    }
+}
+
+/// The auto (smooth-tangent) handle location (BEVEL.md §8.6.3.1(2)): `a = P − P_prev`,
+/// `b = P_next − P` with each length floored to `1` when zero, `t = a/|a| + b/|b|`,
+/// `L = |t|·2.5614`; the left handle is `P − t·(|a|/L)`, the right `P + t·(|b|/L)`. A zero
+/// `L` (antiparallel unit tangents) leaves the handle on the point.
+fn auto_handle(p: (f32, f32), prev: (f32, f32), next: (f32, f32), is_left: bool) -> (f32, f32) {
+    let a = (p.0 - prev.0, p.1 - prev.1);
+    let b = (next.0 - p.0, next.1 - p.1);
+    let mut len_a = (a.0 * a.0 + a.1 * a.1).sqrt();
+    let mut len_b = (b.0 * b.0 + b.1 * b.1).sqrt();
+    if len_a == 0.0 {
+        len_a = 1.0;
+    }
+    if len_b == 0.0 {
+        len_b = 1.0;
+    }
+    let t = (a.0 / len_a + b.0 / len_b, a.1 / len_a + b.1 / len_b);
+    let l = (t.0 * t.0 + t.1 * t.1).sqrt() * CURVE_AUTO_HANDLE_FACTOR;
+    if l == 0.0 {
+        return p;
+    }
+    if is_left {
+        (p.0 - t.0 * (len_a / l), p.1 - t.1 * (len_a / l))
+    } else {
+        (p.0 + t.0 * (len_b / l), p.1 + t.1 * (len_b / l))
+    }
+}
+
+/// Evaluate a cubic Bézier at parameter `t` (BEVEL.md §8.6.3.1(4)).
+fn cubic_bezier(
+    p0: (f32, f32),
+    c1: (f32, f32),
+    c2: (f32, f32),
+    p3: (f32, f32),
+    t: f32,
+) -> (f32, f32) {
+    let u = 1.0 - t;
+    let w0 = u * u * u;
+    let w1 = 3.0 * u * u * t;
+    let w2 = 3.0 * u * t * t;
+    let w3 = t * t * t;
+    (
+        w0 * p0.0 + w1 * c1.0 + w2 * c2.0 + w3 * p3.0,
+        w0 * p0.1 + w1 * c1.1 + w2 * c2.1 + w3 * p3.1,
+    )
+}
+
+/// Map a widget-frame `(x, y)` chain into the profile cell frame by the fixed axis swap
+/// `u = y`, `v = x` (BEVEL.md §8.6.3.1(5)).
+fn widget_chain_to_cell(chain: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    chain.iter().map(|&(x, y)| (y, x)).collect()
+}
+
+/// Distribute a chain budget of `n` interior advances across the control-point segments
+/// (BEVEL.md §8.6.3.1(4), straight-edge sampling **off**). Returns the per-segment sample
+/// count `m_i` (each segment sampled at `m_i + 1` Bézier points), with `Σ m_i = n`.
+fn distribute_budget(
+    points: &[BevelCurvePoint],
+    handles: &[ResolvedHandles],
+    n: usize,
+) -> Vec<usize> {
+    let segment_count = points.len() - 1;
+    // A segment is curved when either bordering handle is not a vector handle.
+    let curved: Vec<bool> = (0..segment_count)
+        .map(|s| points[s].h2 != BevelHandle::Vector || points[s + 1].h1 != BevelHandle::Vector)
+        .collect();
+    let mut curved_count = curved.iter().filter(|&&c| c).count();
+    let all_curved = curved_count == 0;
+    if all_curved {
+        curved_count = segment_count;
+    }
+    let is_curved = |s: usize| all_curved || curved[s];
+
+    // Curvature per segment: the angle between the two bordering inward handle directions
+    // (BEVEL.md §8.6.3.1(4)) — used only to hand out the leftover remainder.
+    let curvature = |s: usize| -> f32 {
+        let start = (points[s].x, points[s].y);
+        let end = (points[s + 1].x, points[s + 1].y);
+        let d1 = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
+        let d2 = (handles[s + 1].left.0 - end.0, handles[s + 1].left.1 - end.1);
+        let l1 = (d1.0 * d1.0 + d1.1 * d1.1).sqrt();
+        let l2 = (d2.0 * d2.0 + d2.1 * d2.1).sqrt();
+        if l1 == 0.0 || l2 == 0.0 {
+            return 0.0;
+        }
+        ((d1.0 * d2.0 + d1.1 * d2.1) / (l1 * l2)).clamp(-1.0, 1.0).acos()
+    };
+
+    // Curved segments ranked most-curved first (ties by lower index) — the order the
+    // leftover remainder is handed out in.
+    let mut ranked: Vec<usize> = (0..segment_count).filter(|&s| is_curved(s)).collect();
+    ranked.sort_by(|&a, &b| {
+        curvature(b)
+            .partial_cmp(&curvature(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+
+    let mut budget = vec![0usize; segment_count];
+    if n >= segment_count {
+        let straight_count = segment_count - curved_count;
+        let remaining = n.saturating_sub(straight_count);
+        let per = remaining / curved_count;
+        let leftover = remaining % curved_count;
+        for s in 0..segment_count {
+            budget[s] = if is_curved(s) { per } else { 1 };
+        }
+        for &s in ranked.iter().take(leftover) {
+            budget[s] += 1;
+        }
+    } else {
+        // Not enough budget for every segment: one sample each to the `n` most-curved.
+        for &s in ranked.iter().take(n) {
+            budget[s] = 1;
+        }
+    }
+    budget
 }
 
 /// Map the user `profile` scalar (`0..1`) to the superellipse exponent `r`
@@ -41591,13 +42319,26 @@ fn pipe_cross_section_replant(
 /// patch chord (§8.9.5). The three kinds are interchangeable `chain_of` inputs — the fill
 /// never tests which one it holds (§8.9.5.3).
 #[derive(Clone, Copy)]
-enum RingChainProfile {
-    Cell { cell: ProfileCell, profile: f32 },
-    Arc { b1: Vec3, b3: Vec3, midpoint: Vec3 },
-    Chord { start: Vec3, end: Vec3 },
+enum RingChainProfile<'c> {
+    Cell {
+        cell: ProfileCell,
+        profile: f32,
+        /// The custom curve this cell samples its chain from (BEVEL.md §8.6.3), or
+        /// `None` for the analytic superellipse family.
+        custom: Option<&'c BevelCurveProfile>,
+    },
+    Arc {
+        b1: Vec3,
+        b3: Vec3,
+        midpoint: Vec3,
+    },
+    Chord {
+        start: Vec3,
+        end: Vec3,
+    },
 }
 
-impl RingChainProfile {
+impl RingChainProfile<'_> {
     /// The chain's **raw** (un-resampled) `segments + 1` samples, oriented from the ring
     /// edge's opening boundvert. Serves three distinct roles, all raw: the §8.2.2.1.1
     /// *source* polyline, the stencil's pinned Dirichlet boundary at each round's
@@ -41606,7 +42347,11 @@ impl RingChainProfile {
     /// raw coarse profile mids").
     fn raw_positions(&self, segments: u32) -> Vec<Vec3> {
         match *self {
-            RingChainProfile::Cell { cell, profile } => cell.raw_chain_positions(segments, profile),
+            RingChainProfile::Cell {
+                cell,
+                profile,
+                custom,
+            } => cell.raw_chain_positions(segments, profile, custom),
             RingChainProfile::Arc { b1, b3, midpoint } => {
                 arc_chain_positions(b1, b3, midpoint, segments)
             }

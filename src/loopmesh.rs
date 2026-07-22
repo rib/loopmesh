@@ -83,9 +83,10 @@ pub use iter::*;
 pub use math::{SparseCholesky, SparseSolveError};
 pub use mid::{EdgeCollapseFlags, FacesJoinDelete, FacesJoinOutcome};
 pub use ops::{
-    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect,
-    BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,
-    BevelVmeshMethod, BisectGeom, BisectParams, BisectResult, BridgeLoopsParams, BridgeLoopsResult,
+    Axis, BeautifyFillOptions, BeautifyFillResult, BeautifyMethod, BevelAffect, BevelCurveProfile,
+    BevelFaceStrengthMode, BevelHandle, BevelMiter, BevelOffsetType, BevelOptions, BevelProfileType,
+    BevelResult, BevelVmeshMethod, BisectGeom, BisectParams, BisectResult, BridgeLoopsParams,
+    BridgeLoopsResult,
     CenterMode, ConnectVertsNonplanarOut, ContextualCreateParams, ContextualCreateResult,
     ConvexHullResult, DeleteContext, DeleteSeed, DissolveEdgesParams, DissolveEdgesResult,
     DissolveFacesOptions, DissolveFacesResult, DissolveLimitParams, DissolveLimitResult,

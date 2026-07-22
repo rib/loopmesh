@@ -89,8 +89,8 @@ pub use beautify_fill::{BeautifyFillOptions, BeautifyFillResult, BeautifyMethod}
 /// Convention-neutral alias for [`BevelFaceStrengthMode`] (BEVEL.md §8.10.1).
 pub use bevel::BevelFaceStrengthMode as FaceStrengthMode;
 pub use bevel::{
-    BevelAffect, BevelFaceStrengthMode, BevelMiter, BevelOffsetType, BevelOptions, BevelResult,
-    BevelVmeshMethod,
+    BevelAffect, BevelCurveProfile, BevelFaceStrengthMode, BevelHandle, BevelMiter,
+    BevelOffsetType, BevelOptions, BevelProfileType, BevelResult, BevelVmeshMethod,
 };
 pub use bisect_edges::BisectGeom;
 pub use bisect_plane::{BisectParams, BisectResult};
