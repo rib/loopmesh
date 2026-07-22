@@ -5067,10 +5067,9 @@ impl LoopMesh {
             }
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
-            let face = match sector.corners.first() {
-                Some(&(_, face)) => face,
-                None => return false,
-            };
+            if sector.corners.is_empty() {
+                return false;
+            }
             let dir_open = match self.edge_direction_from(opening, vertex, vertex_position) {
                 Some(direction) => direction,
                 None => return false,
@@ -5080,7 +5079,7 @@ impl LoopMesh {
                 None => return false,
             };
             let cross = (-dir_open).cross(-dir_close);
-            let reference = self.face_plane_normal(face);
+            let reference = self.reflex_reference_normal(sector, vertex);
             let reflex = cross.dot(reference) < 0.0;
             let meet = self.solve_meet_point(vertex, vertex_position, sector, offset);
             plans.push(SectorPlan {
@@ -5494,10 +5493,9 @@ impl LoopMesh {
             }
             let opening = sector.bounding_edges[0];
             let closing = sector.bounding_edges[1];
-            let face = match sector.corners.first() {
-                Some(&(_, face)) => face,
-                None => return false,
-            };
+            if sector.corners.is_empty() {
+                return false;
+            }
             let dir_open = match self.edge_direction_from(opening, vertex, vertex_position) {
                 Some(direction) => direction,
                 None => return false,
@@ -5507,7 +5505,7 @@ impl LoopMesh {
                 None => return false,
             };
             let cross = (-dir_open).cross(-dir_close);
-            let reference = self.face_plane_normal(face);
+            let reference = self.reflex_reference_normal(sector, vertex);
             let reflex = cross.dot(reference) < 0.0;
             let meet = self.solve_meet_point(vertex, vertex_position, sector, offset);
             plans.push(SectorPlan {
@@ -7397,6 +7395,25 @@ impl LoopMesh {
             sum += self.face_plane_normal(face);
         }
         sum.normalize_or_zero()
+    }
+
+    /// The §8.9.1 reference normal `n_ref` for a sector's signed reflex test. The chain:
+    /// the **forward** incident face just past `g_k` — the sector's first-corner face
+    /// (§7.6.1: the walk enters the sector on `g_k`, so its first corner's face is the
+    /// one just past `g_k`) — falling back to the **back** incident face just before
+    /// `g_(k+1)` (its last-corner face) when the forward face's plane is degenerate, and
+    /// finally to the junction vertex normal `n_v` when neither incident face is usable.
+    fn reflex_reference_normal(&self, sector: &Sector, vertex: VertexKey) -> Vec3 {
+        for corner in [sector.corners.first(), sector.corners.last()] {
+            if let Some(&(_, face)) = corner {
+                if let Some(normal) = self.face_newell_normal(face) {
+                    if normal.is_finite() {
+                        return normal;
+                    }
+                }
+            }
+        }
+        self.junction_outward_normal(vertex)
     }
 
     /// One corner's face normal oriented to the **walk-positive** side (BEVEL.md §7.6.2):
@@ -9947,6 +9964,14 @@ impl LoopMesh {
     /// Newell's method (BEVEL.md §7.3 needs an in-plane perpendicular; the stored
     /// face normal may be stale during surgery, so this reads positions directly).
     fn face_plane_normal(&self, face: FaceKey) -> Vec3 {
+        self.face_newell_normal(face).unwrap_or(Vec3::Z)
+    }
+
+    /// The face's unit Newell normal, or `None` when the polygon is degenerate
+    /// (near-zero area). `face_plane_normal` substitutes `Vec3::Z` for the `None`
+    /// case; the §8.9.1 reflex reference (`reflex_reference_normal`) instead uses it
+    /// to fall through to the next candidate in the forward → back → `n_v` chain.
+    fn face_newell_normal(&self, face: FaceKey) -> Option<Vec3> {
         let verts = self.face_vert_keys(face);
         let mut normal = Vec3::ZERO;
         for i in 0..verts.len() {
@@ -9958,9 +9983,9 @@ impl LoopMesh {
         }
         let length = normal.length();
         if length <= f32::EPSILON {
-            Vec3::Z
+            None
         } else {
-            normal / length
+            Some(normal / length)
         }
     }
 
@@ -25701,6 +25726,79 @@ mod tests {
             .is_some(),
             "an orthonormal corner is well conditioned at any scale",
         );
+    }
+
+    /// §8.9.1 reflex reference: the signed test's `n_ref` walks a forward-face → back-face →
+    /// `n_v` fallback chain. Pins each rung: the forward (first-corner) face wins when usable,
+    /// a degenerate forward face falls through to the back (last-corner) face, and an empty
+    /// sector drops to the junction vertex normal.
+    #[test]
+    fn reflex_reference_normal_walks_forward_back_nv_chain() {
+        // Forward (first-corner) face wins when it is non-degenerate.
+        {
+            let mut mesh = LoopMesh::new();
+            let v = mesh.create_vertex(Vec3::ZERO);
+            let a = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+            let b = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+            let c = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+            let e_va = mesh.create_edge([v, a], EdgeCreateFlags::NONE);
+            let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+            let e_bv = mesh.create_edge([b, v], EdgeCreateFlags::NONE);
+            let forward = mesh.face_create(&[v, a, b], &[e_va, e_ab, e_bv], FaceCreateFlags::NONE);
+            let e_ac = mesh.create_edge([a, c], EdgeCreateFlags::NONE);
+            let e_cv = mesh.create_edge([c, v], EdgeCreateFlags::NONE);
+            let back = mesh.face_create(&[v, a, c], &[e_va, e_ac, e_cv], FaceCreateFlags::NONE);
+            let sector = Sector {
+                bounding_edges: vec![e_va, e_bv],
+                corners: vec![(e_va, forward), (e_ac, back)],
+            };
+            let reference = mesh.reflex_reference_normal(&sector, v);
+            assert!(reference.abs_diff_eq(mesh.face_plane_normal(forward), 1.0e-6));
+            assert!(!reference.abs_diff_eq(mesh.face_plane_normal(back), 1.0e-6));
+        }
+
+        // A degenerate forward face falls through to the back (last-corner) face.
+        {
+            let mut mesh = LoopMesh::new();
+            let v = mesh.create_vertex(Vec3::ZERO);
+            let d1 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+            let d2 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+            let e_vd1 = mesh.create_edge([v, d1], EdgeCreateFlags::NONE);
+            let e_d1d2 = mesh.create_edge([d1, d2], EdgeCreateFlags::NONE);
+            let e_d2v = mesh.create_edge([d2, v], EdgeCreateFlags::NONE);
+            // Collinear corners — zero Newell area, so this face yields no usable normal.
+            let degenerate =
+                mesh.face_create(&[v, d1, d2], &[e_vd1, e_d1d2, e_d2v], FaceCreateFlags::NONE);
+            let b = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+            let e_d1b = mesh.create_edge([d1, b], EdgeCreateFlags::NONE);
+            let e_bv = mesh.create_edge([b, v], EdgeCreateFlags::NONE);
+            let back = mesh.face_create(&[v, d1, b], &[e_vd1, e_d1b, e_bv], FaceCreateFlags::NONE);
+            assert!(mesh.face_newell_normal(degenerate).is_none());
+            let sector = Sector {
+                bounding_edges: vec![e_vd1, e_bv],
+                corners: vec![(e_vd1, degenerate), (e_d1b, back)],
+            };
+            let reference = mesh.reflex_reference_normal(&sector, v);
+            assert!(reference.abs_diff_eq(mesh.face_plane_normal(back), 1.0e-6));
+        }
+
+        // An empty sector drops to the junction vertex normal `n_v`.
+        {
+            let mut mesh = LoopMesh::new();
+            let v = mesh.create_vertex(Vec3::ZERO);
+            let a = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+            let b = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+            let e_va = mesh.create_edge([v, a], EdgeCreateFlags::NONE);
+            let e_ab = mesh.create_edge([a, b], EdgeCreateFlags::NONE);
+            let e_bv = mesh.create_edge([b, v], EdgeCreateFlags::NONE);
+            mesh.face_create(&[v, a, b], &[e_va, e_ab, e_bv], FaceCreateFlags::NONE);
+            let sector = Sector {
+                bounding_edges: vec![e_va, e_bv],
+                corners: Vec::new(),
+            };
+            let reference = mesh.reflex_reference_normal(&sector, v);
+            assert!(reference.abs_diff_eq(mesh.junction_outward_normal(v), 1.0e-6));
+        }
     }
 
     /// B2 (BEVEL.md §8.5.5.5(f.2)): the flat chamfer (`r = 1`) is a member of the tri-corner
