@@ -3261,6 +3261,11 @@ impl LoopMesh {
                 self.vertex_position(far)
             })
             .collect();
+        // §8.9.1 signed reflex test, evaluated in the genuine vertex-normal frame `n_ref` —
+        // `junction_outward_normal` (`outward`), the averaged incident-face normal — **not** a
+        // single sector face's raw normal, which flips sign on off-plane sectors at an
+        // irregular junction. Inert on the convex pyramid / cube-corner rings (the verdict is
+        // `false` either way), but load-bearing for the reflex sectors this flag classifies.
         let boundvert_reflex: Vec<bool> = (0..count)
             .map(|i| {
                 let edge_in = opening_edge_directions[i];
@@ -3268,12 +3273,7 @@ impl LoopMesh {
                 if edge_in == Vec3::ZERO || edge_out == Vec3::ZERO {
                     return false;
                 }
-                match sectors[i].corners.first() {
-                    Some(&(_, face)) => {
-                        edge_in.cross(edge_out).dot(self.face_plane_normal(face)) < 0.0
-                    }
-                    None => false,
-                }
+                edge_in.cross(edge_out).dot(outward) < 0.0
             })
             .collect();
 
@@ -5418,6 +5418,12 @@ impl LoopMesh {
             sector_representatives,
             central_representative,
             centre_column_representatives,
+            // §8.9.3: the inner miter admits only the circular profile, so it never routes to
+            // the square parallel-offset fill — the (f.5) seed inputs stay empty.
+            opening_edge_directions: Vec::new(),
+            opening_edge_tips: Vec::new(),
+            boundvert_reflex: Vec::new(),
+            arc_patch_start: None,
         });
         true
     }
@@ -5462,13 +5468,21 @@ impl LoopMesh {
         miter_ring_junctions: &mut Vec<MiterRingJunction>,
         result: &mut BevelResult,
     ) -> bool {
-        // §8.9.5: the outer miter rides the [V-ADJ] grid, so `segments ≥ 2`, and the
-        // arc forces the circular profile. `ARC` is segments-general (§8.9.5.1–§8.9.5.3);
-        // `PATCH` is still pinned to `segments = 2` (its flat-chord build below is
-        // seg = 2-only), so decline a non-2 `PATCH` to the sharp ring.
-        if segments < 2 || profile_to_exponent(profile) != 2.0 {
+        // §8.9.5: the outer miter rides the [V-ADJ] grid, so `segments ≥ 2`. The circular
+        // profile is filled by the general relaxed cap; the **square** profile (§8.5.5.5(f.5))
+        // is filled by the parallel-offset grid, which is even-`segments` only, so decline an
+        // odd-`segments` square miter to the sharp ring. Every other exponent stays out of the
+        // outer-miter fill for now.
+        let exponent = profile_to_exponent(profile);
+        let square = exponent == PROFILE_SQUARE_EXPONENT;
+        if segments < 2 || (exponent != 2.0 && !square) {
             return false;
         }
+        if square && segments % 2 != 0 {
+            return false;
+        }
+        // `PATCH` is still pinned to `segments = 2` (its flat-chord build below is
+        // seg = 2-only), so decline a non-2 `PATCH` to the sharp ring.
         if mode == BevelMiter::Patch && segments != 2 {
             return false;
         }
@@ -5744,9 +5758,13 @@ impl LoopMesh {
         // `ring[i] → ring[i+1]`, `None` for the internal `B1 → B3` arc.
         let mut ring: Vec<VertexKey> = Vec::with_capacity(sector_count + 1);
         let mut cross_edge: Vec<Option<EdgeKey>> = Vec::with_capacity(sector_count + 1);
+        // The enlarged-ring index of the reflex sector's leading boundvert `B_1` — the
+        // §8.5.5.5(f.5) arc/patch start (case 1/2 classification), captured as it is pushed.
+        let mut b1_ring_index = 0usize;
         for k in 0..sector_count {
             let next_opening = sectors[(k + 1) % sector_count].bounding_edges[0];
             if k == r {
+                b1_ring_index = ring.len();
                 for (j, &ring_vert) in reflex_ring.iter().enumerate() {
                     ring.push(ring_vert);
                     if j + 1 < reflex_ring.len() {
@@ -5892,6 +5910,38 @@ impl LoopMesh {
             .map(|donor| templates.register(donor))
             .collect();
 
+        // §8.5.5.5(f.5) seed inputs for the square parallel-offset fill. The seeding pass is
+        // over ring boundverts: `edge_in(i)` — the beveled edge boundvert `i` shares with its
+        // *predecessor* — is `cross_edge[i − 1]` (the edge that ring edge crosses), and it is
+        // `None` on the reflex sector's internal arc/patch edge, giving `Vec3::ZERO`. Only the
+        // square profile reads these; the circular outer miter takes the general relaxed cap.
+        let ring_len = ring.len();
+        let opening_edge_directions: Vec<Vec3> = (0..ring_len)
+            .map(|i| match cross_edge[(i + ring_len - 1) % ring_len] {
+                Some(edge) => self
+                    .edge_direction_from(edge, vertex, vertex_position)
+                    .unwrap_or(Vec3::ZERO),
+                None => Vec3::ZERO,
+            })
+            .collect();
+        let opening_edge_tips: Vec<Vec3> = (0..ring_len)
+            .map(|i| match cross_edge[(i + ring_len - 1) % ring_len] {
+                Some(edge) => {
+                    let [a, b] = self.edge_vert_keys(edge);
+                    let far = if a == vertex { b } else { a };
+                    self.vertex_position(far)
+                }
+                None => Vec3::ZERO,
+            })
+            .collect();
+        // The outer miter *opens* its one reflex sector into arc/patch boundverts, so the
+        // enlarged ring carries no reflex boundvert of its own (§8.9.1's single reflex sector
+        // is now the arc/patch start, classified below — not by this flag).
+        let boundvert_reflex = vec![false; ring_len];
+        // Case 1/2 classification: the fired-reflex leading `B_1`, its mode, and — for `ARC` —
+        // the stored §7.6.2 middle control point (`midpoint`, the pre-reposition meet-point).
+        let arc_patch_start = Some((b1_ring_index, mode, midpoint));
+
         miter_ring_junctions.push(MiterRingJunction {
             vertex,
             boundverts: ring,
@@ -5904,6 +5954,10 @@ impl LoopMesh {
             sector_representatives,
             central_representative,
             centre_column_representatives,
+            opening_edge_directions,
+            opening_edge_tips,
+            boundvert_reflex,
+            arc_patch_start,
         });
         true
     }
@@ -6095,6 +6149,20 @@ impl LoopMesh {
         {
             return;
         }
+        // §8.5.5.5(f.5): at a **square** profile the enlarged ring is filled by the
+        // parallel-offset grid (even `segments` only), not the general relaxed cap — the
+        // arc/patch start seeds one centreline off the stored meet-point / boundvert-pair
+        // midpoints and the original corner `v` survives un-rounded at the weld.
+        if profile_to_exponent(omj.profile) == PROFILE_SQUARE_EXPONENT
+            && omj.segments >= 2
+            && omj.segments % 2 == 0
+            && omj.opening_edge_directions.len() == count
+            && omj.opening_edge_tips.len() == count
+            && omj.boundvert_reflex.len() == count
+        {
+            self.build_adj_fill_miter_square_ring(omj, material, templates, result);
+            return;
+        }
         let sector_representatives = omj.resolve_sector_representatives(templates);
         let centre_column_representatives = omj.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(omj.central_representative);
@@ -6125,6 +6193,98 @@ impl LoopMesh {
             // §5.2.4.1 / §5.2.4.2 are vertex-mode-only rules; edge-mode junction fills
             // leave the welded apex and the chain-interior verts at their §5.2.4 minted
             // defaults.
+            None,
+            None,
+            result,
+        );
+    }
+
+    /// Fill a **square-profile** mitered junction with the §8.5.5.5(f.5) parallel-offset grid
+    /// over the enlarged ring — the miter-ring analogue of [`Self::build_adj_fill_square_ring`].
+    ///
+    /// The enlarged ring carries one arc/patch start (§8.5.5.5(f.5) cases 1 & 2): for `ARC`
+    /// the reflex sector's leading `B_1` seeds its one centreline from the stored §7.6.2 meet
+    /// point (`omj.arc_patch_start`'s middle control point); for `PATCH`, `B_1` seeds two
+    /// centrelines from the boundvert-pair midpoints straddling `B_2`. Every other centreline
+    /// comes from the sharp / pass-2 machinery, identical to the plain square ring. The two
+    /// straight rim rows are then redirected onto the seed runs and `v` survives at the weld.
+    fn build_adj_fill_miter_square_ring(
+        &mut self,
+        omj: &MiterRingJunction,
+        material: i32,
+        templates: &TemplateBank,
+        result: &mut BevelResult,
+    ) {
+        let sectors = omj.boundverts.len();
+        let seg = omj.segments as usize;
+        let half = seg / 2;
+        if sectors < 4 || seg < 2 || seg % 2 != 0 {
+            return;
+        }
+        let chain_of = &omj.chains;
+        for chain in chain_of {
+            if chain.len() != seg + 1 {
+                return;
+            }
+        }
+
+        let vertex_position = self.vertex_position(omj.vertex);
+        let boundvert_positions: Vec<Vec3> = (0..sectors)
+            .map(|i| self.vertex_position(chain_of[i][0]))
+            .collect();
+        let arc_patch = omj
+            .arc_patch_start
+            .map(|(index, mode, arc_middle)| ArcPatchStart {
+                index,
+                mode,
+                arc_middle,
+            });
+        let seeds = square_ring_centreline_seeds(
+            &omj.opening_edge_directions,
+            &omj.opening_edge_tips,
+            &omj.boundvert_reflex,
+            &boundvert_positions,
+            vertex_position,
+            arc_patch.as_ref(),
+        );
+        let starts: Vec<(Vec3, Vec3)> = boundvert_positions.iter().copied().zip(seeds).collect();
+
+        // §8.5.5.5(f.5): redirect the grid's two straight rim rows onto the seed runs
+        // `B_i → C_i` / `B_i → C_{i−1}` (the rim verts keep their keys — the cap stays welded
+        // to the arriving strips — only their positions move). Identical to the plain square
+        // ring; the arc sector's fold lands on the stored meet-point (`C_arc`) by construction.
+        for i in 0..sectors {
+            let (b_i, c_i) = starts[i];
+            let previous = (i + sectors - 1) % sectors;
+            let c_prev = starts[previous].1;
+            for step in 1..=half {
+                let t = step as f32 / half as f32;
+                self.set_vertex_position(chain_of[i][step], b_i + t * (c_i - b_i));
+                self.set_vertex_position(chain_of[previous][seg - step], b_i + t * (c_prev - b_i));
+            }
+        }
+
+        let centroid = starts.iter().fold(Vec3::ZERO, |acc, &(b, _)| acc + b) / sectors as f32;
+        let anchor = centroid - (vertex_position - centroid);
+
+        let sector_representatives = omj.resolve_sector_representatives(templates);
+        let centre_column_representatives = omj.resolve_centre_column_representatives(templates);
+        let central_representative = templates.resolve(omj.central_representative);
+        self.emit_adj_grid(
+            sectors,
+            seg,
+            half,
+            true, // even `segments` — the innermost vert welds at `v`
+            chain_of,
+            &AdjInterior::Parallel {
+                starts: &starts,
+                vertex: vertex_position,
+                anchor,
+            },
+            material,
+            &sector_representatives,
+            &centre_column_representatives,
+            central_representative,
             None,
             None,
             result,
@@ -6526,7 +6686,16 @@ impl LoopMesh {
         let boundvert_positions: Vec<Vec3> = (0..sectors)
             .map(|i| self.vertex_position(chain_of[i][0]))
             .collect();
-        let seeds = square_ring_centreline_seeds(cut, &boundvert_positions, vertex_position);
+        let seeds = square_ring_centreline_seeds(
+            &cut.opening_edge_directions,
+            &cut.opening_edge_tips,
+            &cut.boundvert_reflex,
+            &boundvert_positions,
+            vertex_position,
+            // The plain junction cut carries no outer miter, so no arc/patch start —
+            // reflex sectors take pass 2 (cases 1 & 2 are the miter fill's, below).
+            None,
+        );
         let starts: Vec<(Vec3, Vec3)> = boundvert_positions
             .iter()
             .copied()
@@ -6545,8 +6714,8 @@ impl LoopMesh {
         // are left untouched.
         for i in 0..sectors {
             let (b_i, c_i) = starts[i];
-            let c_prev = starts[(i + sectors - 1) % sectors].1;
             let previous = (i + sectors - 1) % sectors;
+            let c_prev = starts[previous].1;
             for step in 1..=half {
                 let t = step as f32 / half as f32;
                 // `j = 0` rim row: `(i, 0, step) = B_i + t·(C_i − B_i)`.
@@ -12800,6 +12969,35 @@ struct MiterRingJunction {
     /// takes that tie-break *unconditionally* (no seam gate). No ring-wide uniform donor
     /// enters. Unread at even `segments`, where the cap has no centre column.
     centre_column_representatives: Vec<FaceTemplate>,
+    /// Per **enlarged-ring boundvert** `i`, the direction (out of `vertex`) of the beveled
+    /// edge shared with the *previous* ring boundvert — `edge_in(i)` in the §8.5.5.5(f.5)
+    /// seeding pass, `Vec3::ZERO` where that ring edge is an internal arc/patch chain that
+    /// crosses no beveled edge. Populated only by the **outer** miter (the one that can ride
+    /// the square parallel-offset grid); empty for the inner miter, which admits only the
+    /// circular profile and so never reaches the square fill.
+    opening_edge_directions: Vec<Vec3>,
+    /// Per enlarged-ring boundvert `i`, the far tip of that same `edge_in(i)` (for pass 2's
+    /// segment projection). Same population rule as `opening_edge_directions`.
+    opening_edge_tips: Vec<Vec3>,
+    /// Per enlarged-ring boundvert `i`, whether the §8.9.1 signed test flags it reflex (so
+    /// the (f.5) seeding pass diverts it to pass 2). The outer miter *opens* its reflex
+    /// sector into arc/patch boundverts, so the enlarged ring carries no reflex boundvert —
+    /// this is all-`false` when populated — but the slot mirrors the plain junction cut.
+    boundvert_reflex: Vec<bool>,
+    /// The one arc/patch start on the enlarged ring (§8.5.5.5(f.5) cases 1 & 2): the ring
+    /// index of the fired-reflex leading boundvert `B_1`, the miter mode (`Arc` / `Patch`),
+    /// and the arc's stored §7.6.2 **middle control point** (the pre-reposition reflex
+    /// meet-point — case 2's `C_i`; unread for `Patch`). `None` when no outer miter fired.
+    arc_patch_start: Option<(usize, BevelMiter, Vec3)>,
+}
+
+/// The §8.5.5.5(f.5) arc/patch seed-input for the square parallel-offset grid: which
+/// enlarged-ring boundvert is the fired-reflex leading `B_1`, its miter mode, and the arc's
+/// stored §7.6.2 middle control point (case 2's centreline seed; unread for `Patch`).
+struct ArcPatchStart {
+    index: usize,
+    mode: BevelMiter,
+    arc_middle: Vec3,
 }
 
 impl MiterRingJunction {
@@ -19952,6 +20150,303 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.5.5.5(f.5) **case 2 (arc start)**: the fired-reflex leading boundvert
+    /// `B_1` seeds its one centreline from the arc's stored §7.6.2 middle control point.
+    ///
+    /// The sector the arc **skips past** (the sector `B_3` opens) is not separately
+    /// suppressed: only the *consumed* arc-end boundvert `B_3` is held out of pass 1, while
+    /// that sector's trailing bounding boundvert is an ordinary sharp boundvert and — per the
+    /// arbitration rule — still emits its parallel-offset seed on the shared edge. The
+    /// closer-to-`v` winner is that pass-1 foot, **not** the pass-2 earlier-boundvert
+    /// projection (which is only the fallback for a *non-sharp* trailing boundvert). Here the
+    /// arc end `B_3` is slid inward off its owned edge, so the two disagree and the pass-1
+    /// foot is the (closer) survivor.
+    #[test]
+    fn square_seeds_arc_start_trailing_sector_takes_pass_one_sharp_seed() {
+        let vertex = Vec3::ZERO;
+        // Ring `[B_1, B_3, sharp2, sharp3]`, arc sector at index 0; ring edge 0 (`B_1 → B_3`)
+        // is the internal arc, so `edge_in(B_3) = directions[1] = ZERO`.
+        let e_lead = Vec3::new(0.0, 1.0, -1.0).normalize(); // B_1's flank
+        let e_trail = Vec3::new(1.0, 0.0, -1.0).normalize(); // the edge `sharp2` shares with `B_3`
+        let e_third = Vec3::new(-1.0, -1.0, -1.0).normalize();
+        let directions = vec![e_lead, Vec3::ZERO, e_trail, e_third];
+        let tips = vec![e_lead * 2.0, Vec3::ZERO, e_trail * 2.0, e_third * 2.0];
+        let b1 = e_lead * 0.5;
+        // `B_3` slid inward off `e_trail` (the §8.9.2 neighbour-plane reposition) so the
+        // pass-1 sharp seed and the pass-2 `B_3` projection are distinguishable.
+        let b3 = e_trail * 0.5 + Vec3::new(-0.05, 0.0, -0.05);
+        let sharp2 = (e_trail + e_third).normalize() * 0.5;
+        let sharp3 = (e_third + e_lead).normalize() * 0.5;
+        let boundverts = vec![b1, b3, sharp2, sharp3];
+        let reflex = vec![false; 4];
+
+        let arc_middle = Vec3::new(0.0, 0.4, 0.6);
+        let arc_patch = ArcPatchStart {
+            index: 0,
+            mode: BevelMiter::Arc,
+            arc_middle,
+        };
+        let seeds = square_ring_centreline_seeds(
+            &directions,
+            &tips,
+            &reflex,
+            &boundverts,
+            vertex,
+            Some(&arc_patch),
+        );
+        assert_eq!(seeds.len(), 4);
+        // Case 2: the arc sector's centreline starts at the stored middle control point.
+        assert!(
+            (seeds[0] - arc_middle).length() < 1.0e-6,
+            "arc sector seeds from the stored §7.6.2 meet-point",
+        );
+        // Sector after the arc (index 1): the trailing sharp boundvert `sharp2` proposes the
+        // parallel-offset foot on the shared edge `e_trail` via its `edge_in`.
+        let expected = line_line_nearest_on_first(vertex, e_trail, sharp2, e_third)
+            .expect("sharp2 proposes a foot on e_trail's line");
+        assert!(
+            (seeds[1] - expected).length() < 1.0e-6,
+            "the sector after the arc takes the trailing sharp boundvert's pass-1 seed",
+        );
+        // It is the closer-to-`v` survivor, strictly nearer than the pass-2 `B_3` projection
+        // fallback would have placed it (that fallback only fires for a non-sharp trailing bv).
+        let pass_two_fallback = closest_point_on_segment(b3, vertex, tips[2]);
+        assert!(
+            seeds[1].length() < pass_two_fallback.length() - 1.0e-4,
+            "the pass-1 sharp seed is closer to v than the pass-2 B_3 projection",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5) **case 1 (patch start)**: `B_1` seeds *two* centrelines from the
+    /// plain boundvert-pair midpoints straddling the hub `B_2`, and consumes `B_2`, `B_3`.
+    #[test]
+    fn square_seeds_patch_start_case_one_midpoints() {
+        let vertex = Vec3::ZERO;
+        // Ring `[B_1, B_2, B_3, sharp3, sharp4]`, patch at index 0; ring edges 0 and 1 are the
+        // internal patch chords, so `directions[1] = directions[2] = ZERO`.
+        let e_lead = Vec3::new(0.0, 1.0, -1.0).normalize();
+        let e_trail = Vec3::new(1.0, 0.0, -1.0).normalize();
+        let e_a = Vec3::new(-1.0, -1.0, -1.0).normalize();
+        let e_b = Vec3::new(-1.0, 1.0, -1.0).normalize();
+        let directions = vec![e_lead, Vec3::ZERO, Vec3::ZERO, e_trail, e_a];
+        let tips = vec![
+            e_lead * 2.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            e_trail * 2.0,
+            e_a * 2.0,
+        ];
+        let b1 = e_lead * 0.5;
+        let b2 = Vec3::new(-0.1, -0.1, 0.6); // the retained lifted meet-point (hub)
+        let b3 = e_trail * 0.5;
+        let sharp3 = (e_a + e_b).normalize() * 0.5;
+        let sharp4 = (e_b + e_lead).normalize() * 0.5;
+        let boundverts = vec![b1, b2, b3, sharp3, sharp4];
+        let reflex = vec![false; 5];
+
+        let arc_patch = ArcPatchStart {
+            index: 0,
+            mode: BevelMiter::Patch,
+            arc_middle: Vec3::ZERO, // unread for Patch
+        };
+        let seeds = square_ring_centreline_seeds(
+            &directions,
+            &tips,
+            &reflex,
+            &boundverts,
+            vertex,
+            Some(&arc_patch),
+        );
+        assert_eq!(seeds.len(), 5);
+        assert!(
+            (seeds[0] - 0.5 * (b1 + b2)).length() < 1.0e-6,
+            "patch centreline 0 is mid(B_1, B_2)",
+        );
+        assert!(
+            (seeds[1] - 0.5 * (b2 + b3)).length() < 1.0e-6,
+            "patch centreline 1 is mid(B_2, B_3)",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5) / §8.9.2: the **square-profile** outer `ARC` miter. Beveling the
+    /// three bunched apex legs of an octagonal bipyramid at `profile = 0.97` (square) fires the
+    /// outer miter over the `270°` reflex gap and fills the enlarged `s = 4` ring with the
+    /// parallel-offset grid — so the original apex `v = (0,0,1)` survives **un-rounded** at the
+    /// weld, unlike the circular miter (whose bulge pulls the corner in to `z ≈ 0.73`).
+    #[test]
+    fn square_outer_arc_welds_apex_and_differs_from_circular() {
+        let build = |profile: f32, miter: BevelMiter| {
+            let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+            mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments: 2,
+                    profile,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: miter,
+                    ..Default::default()
+                },
+            );
+            mesh
+        };
+
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let has_vert_at = |mesh: &LoopMesh, p: Vec3| {
+            mesh.vert_keys().into_iter()
+                .any(|v| (mesh.vertex_position(v) - p).length() < 1.0e-4)
+        };
+
+        let square = build(0.97, BevelMiter::Arc);
+        square.validate_topology();
+        let (v, e, f) = counts(&square);
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "the square outer ARC miter closes to a χ = 2 manifold",
+        );
+        assert!(
+            has_vert_at(&square, apex),
+            "the square profile welds the un-rounded apex v at the grid centre (§8.5.5.5(f.5))",
+        );
+
+        // The circular ARC rounds the corner in — no vertex survives at the apex.
+        let circular = build(0.5, BevelMiter::Arc);
+        assert!(
+            !has_vert_at(&circular, apex),
+            "the circular ARC bulge pulls the corner off the apex",
+        );
+
+        // The miter is not inert: the square outer ARC differs from the square sharp ring.
+        let sharp = build(0.97, BevelMiter::Sharp);
+        assert_ne!(
+            counts(&square),
+            counts(&sharp),
+            "the square outer ARC adds ring geometry the sharp ring lacks",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5) / §8.9.2.1: the **square-profile** outer `PATCH` miter. The patch
+    /// promotes the retained meet corner `B_2` to a ring hub and seeds its two centrelines from
+    /// the boundvert-pair midpoints; the enlarged `s = 5` ring is filled by the parallel-offset
+    /// grid, welding the apex `v` at the centre, and the six reflex faces still close as the
+    /// four hub triangles + two flank pentagons of §8.9.2.1.
+    #[test]
+    fn square_outer_patch_welds_apex_and_keeps_hub_fan() {
+        let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+        mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                profile: 0.97,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Patch,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (v, e, f) = counts(&mesh);
+        assert_eq!(
+            v as i64 - e as i64 + f as i64,
+            2,
+            "the square outer PATCH miter closes to a χ = 2 manifold",
+        );
+
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        assert!(
+            mesh.vert_keys().into_iter()
+                .any(|v| (mesh.vertex_position(v) - apex).length() < 1.0e-4),
+            "the square PATCH welds the un-rounded apex v at the grid centre (§8.5.5.5(f.5))",
+        );
+
+        // §8.9.2.1 fan topology is preserved at the square profile: six reflex faces wrapping
+        // the absorbed legs, four bare triangles + two pentagons. The reflex faces are the
+        // apex-side faces touching an absorbed rim vert; exclude the base-pyramid faces (which
+        // also touch `R4 … R8`) by dropping any face reaching the base vertex `(0,0,-1)`.
+        let is_base = |v: VertexKey| (mesh.vertex_position(v) - Vec3::new(0.0, 0.0, -1.0)).length() < 1.0e-4;
+        let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
+        let mut tris = 0usize;
+        let mut pents = 0usize;
+        let mut reflex_faces = 0usize;
+        for face in mesh.face_keys() {
+            let verts = mesh.face_vert_keys(face);
+            if !verts.iter().any(|x| absorbed.contains(x)) || verts.iter().any(|&x| is_base(x)) {
+                continue;
+            }
+            reflex_faces += 1;
+            match verts.len() {
+                3 => tris += 1,
+                5 => pents += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(reflex_faces, 6, "six reflex faces wrap the 270° gap");
+        assert_eq!(tris, 4, "four interior hub triangles (§8.9.2.1)");
+        assert_eq!(pents, 2, "two flank pentagons (§8.9.2.1)");
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5): the convex sector **trailing** a fired outer miter keeps its
+    /// pass-1 parallel-offset centreline seed. On the octagonal bipyramid arc/patch bevel the
+    /// reflex sector opens over the `270°` gap and the miter's arc/patch end `B_3` lands on the
+    /// beveled edge to `R1` (the `y = 0` symmetry edge). That sector's trailing bounding
+    /// boundvert is an ordinary sharp meet-point, so the sector's centreline is seeded by its
+    /// parallel-offset foot — the same `(0.271, 0, 0.729)` the sharp ring produces — and the
+    /// `3`-fold-symmetric convex inner ring is intact. It must **not** collapse to the pass-2
+    /// `B_3`-projection `(0.503, 0, 0.497)`, which is what over-suppressing the trailing sharp
+    /// proposal (reserving the whole sector for pass 2) would place there.
+    #[test]
+    fn square_outer_miter_trailing_convex_sector_keeps_pass_one_seed() {
+        let build = |miter: BevelMiter| {
+            let (mut mesh, _apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
+            mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments: 2,
+                    profile: 0.97,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: miter,
+                    ..Default::default()
+                },
+            );
+            mesh
+        };
+        let has_vert_at = |mesh: &LoopMesh, p: Vec3| {
+            mesh.vert_keys()
+                .into_iter()
+                .any(|v| (mesh.vertex_position(v) - p).length() < 1.0e-3)
+        };
+
+        // The three convex inner-ring centreline seeds, one per beveled edge — a mirror-
+        // symmetric set about the `x = y` plane through the middle beveled edge (`R2` / 45°).
+        let on_r1 = Vec3::new(0.2714, 0.0, 0.7286); // y = 0 edge, the regressed one
+        let on_r2 = Vec3::new(0.0, 0.2714, 0.7286); // its mirror image across x = y
+        let on_r3 = Vec3::new(0.1919, 0.1919, 0.7286); // the symmetry-axis edge
+        let over_suppressed = Vec3::new(0.5031, 0.0, 0.4969); // the pass-2 B_3 projection
+
+        for miter in [BevelMiter::Arc, BevelMiter::Patch] {
+            let mesh = build(miter);
+            mesh.validate_topology();
+            assert!(
+                has_vert_at(&mesh, on_r1),
+                "{miter:?}: the y=0 trailing convex sector keeps its pass-1 seed",
+            );
+            assert!(
+                has_vert_at(&mesh, on_r2) && has_vert_at(&mesh, on_r3),
+                "{miter:?}: the other two convex centreline seeds are intact",
+            );
+            assert!(
+                !has_vert_at(&mesh, over_suppressed),
+                "{miter:?}: no vertex at the over-suppressed pass-2 B_3 projection",
+            );
+        }
+    }
+
     /// BEVEL.md §8.9.2.2 worked trace: the multi-face reflex outer-`ARC` re-stitch at
     /// `segments = 2`. Beveling the three bunched apex legs `A–R1 … A–R3` of the octagonal
     /// bipyramid leaves the `270°` reflex sector absorbing the five unbeveled legs
@@ -24807,7 +25302,14 @@ mod tests {
             boundvert_reflex: vec![false; 4],
         };
 
-        let seeds = square_ring_centreline_seeds(&cut, &boundverts, Vec3::ZERO);
+        let seeds = square_ring_centreline_seeds(
+            &cut.opening_edge_directions,
+            &cut.opening_edge_tips,
+            &cut.boundvert_reflex,
+            &boundverts,
+            Vec3::ZERO,
+            None,
+        );
         assert_eq!(seeds.len(), 4);
 
         for i in 0..4 {
@@ -24888,7 +25390,14 @@ mod tests {
             boundvert_reflex,
         };
 
-        let seeds = square_ring_centreline_seeds(&cut, &boundverts, Vec3::ZERO);
+        let seeds = square_ring_centreline_seeds(
+            &cut.opening_edge_directions,
+            &cut.opening_edge_tips,
+            &cut.boundvert_reflex,
+            &boundverts,
+            Vec3::ZERO,
+            None,
+        );
 
         // CL_1 (sector 1, shared edge opening_edges[2] = directions[2]) is the pass-2 seed:
         // the closest point of the segment (`v` → tips[2]) to the later boundvert B_2.
@@ -39246,16 +39755,70 @@ fn line_line_nearest_on_first(
 ///   projects the sector's **later** boundvert onto its shared beveled-edge **segment**
 ///   (`v → edge tip`), clamped to the segment; with no shared edge it falls to the midpoint.
 ///
-/// The arc-start / patch-start seeds (cases 1 & 2, needing the square-profile outer miter)
-/// and pass 2's arc branches are out of scope — those centrelines take the no-arc branch.
-fn square_ring_centreline_seeds(cut: &JunctionCut, boundverts: &[Vec3], vertex: Vec3) -> Vec<Vec3> {
+/// When `arc_patch` is set, the enlarged miter ring carries **one** arc-or-patch start
+/// (§8.5.5.5(f.5) cases 1 & 2 — at most one per junction, §8.9.1):
+///
+/// - **Case 1 (`Patch`).** `B_1` seeds **two** centrelines from plain boundvert-pair
+///   midpoints — `C_{B_1} = mid(B_1, B_2)`, `C_{B_2} = mid(B_2, B_3)` — and the pass skips
+///   over `B_2`, `B_3` (no sharp evaluation), resuming at `B_4`.
+/// - **Case 2 (`Arc`).** `B_1` seeds **one** centreline from the arc's stored §7.6.2 middle
+///   control point; the pass skips `B_3` and resumes at `B_2` (`= B_1 + 1` on the ring).
+///
+/// Both seeds enter the same closer-to-`v` arbitration as a sharp proposal. Pass 2 then
+/// gains the arc-aware branch: the sector *immediately after* an arc (predecessor `= B_1`)
+/// projects its **earlier** boundvert onto the shared edge; the two-arc branch is defensive
+/// (unreachable at a single junction).
+fn square_ring_centreline_seeds(
+    directions: &[Vec3],
+    tips: &[Vec3],
+    boundvert_reflex: &[bool],
+    boundverts: &[Vec3],
+    vertex: Vec3,
+    arc_patch: Option<&ArcPatchStart>,
+) -> Vec<Vec3> {
     let sectors = boundverts.len();
-    let directions = &cut.opening_edge_directions;
-    let tips = &cut.opening_edge_tips;
     let mut seeds: Vec<Option<Vec3>> = vec![None; sectors];
+    // Boundverts a patch / arc swallowed — they get no sharp (case-3) evaluation in pass 1.
+    // This is the whole of the skip-ahead (§8.5.5.5(f.5) case 1/2 "the pass resumes at
+    // `B_{i+2}` / `B_{i+3}`"): only the *consumed boundverts* are held out of the case-3
+    // proposal loop. The sector `B_3` opens is **not** separately suppressed — its trailing
+    // bounding boundvert is an ordinary sharp boundvert, and per the arbitration rule it
+    // still emits its parallel-offset proposal for that sector (closer-to-`v` wins). Pass 2's
+    // arc branch is the *fallback* for when that trailing boundvert is non-sharp (straight /
+    // reflex) and so proposes nothing.
+    let mut consumed = vec![false; sectors];
 
+    // Cases 1 & 2 (§8.5.5.5(f.5)): the fired-reflex leading boundvert `B_1` seeds the
+    // arc/patch centrelines first, so they take part in pass 1's closer-to-`v` arbitration.
+    if let Some(ap) = arc_patch {
+        let b1 = ap.index;
+        let b2 = (b1 + 1) % sectors;
+        let b3 = (b1 + 2) % sectors;
+        match ap.mode {
+            BevelMiter::Patch => {
+                seeds[b1] = Some(0.5 * (boundverts[b1] + boundverts[b2]));
+                seeds[b2] = Some(0.5 * (boundverts[b2] + boundverts[b3]));
+                consumed[b2] = true;
+                consumed[b3] = true;
+            }
+            BevelMiter::Arc => {
+                // The arc's two-vert ring is `B_1 → B_3`, so `B_3` is `b1 + 1` on the ring.
+                seeds[b1] = Some(ap.arc_middle);
+                consumed[b2] = true;
+            }
+            BevelMiter::Sharp => {}
+        }
+    }
+
+    // Pass 1 — sharp boundverts (case 3). The arc/patch start and every boundvert a patch
+    // or arc consumed are skipped, so they never propose a sharp candidate. Every other
+    // boundvert — including the sharp one *trailing* the arc/patch — proposes for both of
+    // its adjacent centrelines, and the closer-to-`v` arbitration keeps the survivor.
     for i in 0..sectors {
-        if cut.boundvert_reflex.get(i).copied().unwrap_or(false) {
+        if consumed[i] || boundvert_reflex.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if arc_patch.is_some_and(|ap| ap.index == i) {
             continue;
         }
         let edge_in = directions[i];
@@ -39270,14 +39833,36 @@ fn square_ring_centreline_seeds(cut: &JunctionCut, boundverts: &[Vec3], vertex: 
         }
     }
 
+    // Pass 2 — fill the still-unseeded centrelines from the sector's shared edge segment.
     for i in 0..sectors {
         if seeds[i].is_some() {
             continue;
         }
         let next = (i + 1) % sectors;
+        let previous = (i + sectors - 1) % sectors;
+        let prev_is_arc =
+            arc_patch.is_some_and(|ap| ap.mode == BevelMiter::Arc && ap.index == previous);
+        let next_is_arc =
+            arc_patch.is_some_and(|ap| ap.mode == BevelMiter::Arc && ap.index == next);
         let seed = if directions[next] == Vec3::ZERO {
+            // No shared beveled edge to project onto.
             0.5 * (boundverts[i] + boundverts[next])
+        } else if prev_is_arc && next_is_arc {
+            // A sector flanked by two arcs — §8.9.1 forbids two reflex sectors at one
+            // junction, so this branch is defensive and unreachable here. Meet E's line with
+            // the line through the two boundverts (mid-fallback when they do not meet).
+            line_line_nearest_on_first(
+                vertex,
+                directions[next],
+                boundverts[i],
+                boundverts[next] - boundverts[i],
+            )
+            .unwrap_or_else(|| 0.5 * (boundverts[i] + boundverts[next]))
+        } else if prev_is_arc {
+            // The sector immediately after the arc: project the *earlier* boundvert (`B_3`).
+            closest_point_on_segment(boundverts[i], vertex, tips[next])
         } else {
+            // No-arc / general case: project the *later* boundvert.
             closest_point_on_segment(boundverts[next], vertex, tips[next])
         };
         seeds[i] = Some(seed);
