@@ -5864,16 +5864,24 @@ impl LoopMesh {
 
         // §6.6.2 grid row: each non-centre grid face takes its own sector's positional donor,
         // not one uniform rep — a two-material split-sector junction diverges otherwise.
-        let sector_representatives: Vec<FaceTemplate> = self
-            .miter_ring_sector_donors(vertex, &cross_edge)
-            .into_iter()
-            .map(|donor| templates.register(donor))
+        let sector_donors = self.miter_ring_sector_donors(vertex, &cross_edge);
+        let sector_representatives: Vec<FaceTemplate> = sector_donors
+            .iter()
+            .map(|&donor| templates.register(donor))
             .collect();
-        let central_representative = templates.register(self.ring_spanning_donor(
+        // §8.9.5.3: the outer-miter cap is the §8.5.5.5 general grid over the enlarged
+        // `(s + 1)`-boundvert ring, so its odd-`segments` centre n-gon (§8.5.5.5(e)) takes the
+        // **enlarged miter ring's first boundvert's** rep — the §6.6.1.2 fan anchor of *this*
+        // ring, not the raw disk's `first_incident_face` — on a seam-free junction (a material
+        // boundary raises no interpolation seam), and only a genuine seam routes it to the
+        // junction-wide §6.6.1.4 tie-break. Aligned-by-construction with the inner miter, which
+        // splits its own sectors but feeds the same enlarged-ring grid.
+        let central_representative = templates.register(self.miter_centre_ngon_donor(
             vertex,
             is_beveled,
             affect,
             segments,
+            sector_donors.first().copied().flatten(),
             templates.interp_components(),
         ));
         // §6.6.2 / §8.9.3.1: at odd `segments` each sector's centre column resolves its own
@@ -38727,6 +38735,104 @@ mod tests {
             donors[0],
             Some(own),
             "the inner arc-end `B_3` owns its edge, so its non-seam centre column keeps its own rep",
+        );
+    }
+
+    /// BEVEL.md §8.9.3.1 / §8.9.5.3 centre-n-gon row (and the §6.6.1.2 anchor row): a miter
+    /// junction's odd-`segments` centre n-gon takes the **enlarged miter ring's first
+    /// boundvert's** rep — the §6.6.1.2 fan anchor — on a **seam-free** junction. A material
+    /// boundary raises no interpolation seam, so a closed manifold fan whose faces carry
+    /// distinct slots stays on this branch: the centre polygon follows the enlarged ring's
+    /// seed, which **differs** from `ring_spanning_donor`'s raw-disk `first_incident_face`
+    /// (the two ring seedings diverge on a material-straddling corner — the whole point of
+    /// routing the outer miter through this donor rather than `ring_spanning_donor`).
+    #[test]
+    fn miter_centre_ngon_donor_material_only_junction_takes_the_enlarged_ring_anchor() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::new(0.0, 0.0, -10.0));
+        let r0 = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let r1 = mesh.create_vertex(Vec3::new(-0.5, 0.87, 0.0));
+        let r2 = mesh.create_vertex(Vec3::new(-0.5, -0.87, 0.0));
+        // Closed umbrella: every leg radial-2 manifold, no loop layers — so seam-free even
+        // though the three faces carry distinct material slots.
+        let f0 = mesh.face_create_verts(&[v0, r0, r1], FaceCreateFlags::NONE);
+        let f1 = mesh.face_create_verts(&[v0, r1, r2], FaceCreateFlags::NONE);
+        let f2 = mesh.face_create_verts(&[v0, r2, r0], FaceCreateFlags::NONE);
+        mesh.set_face_material_index(f0, 1);
+        mesh.set_face_material_index(f1, 2);
+        mesh.set_face_material_index(f2, 3);
+        assert!(
+            !mesh.corner_is_seam_carrying(v0),
+            "a closed manifold untextured fan raises no interpolation seam (material alone is none)",
+        );
+
+        let positional = mesh.first_incident_face(v0);
+        let e0 = mesh.query_edge_exists(v0, r0).unwrap();
+        let e1 = mesh.query_edge_exists(v0, r1).unwrap();
+        let e2 = mesh.query_edge_exists(v0, r2).unwrap();
+        // Seed the enlarged ring at a boundvert whose own rep differs from the raw disk head —
+        // the §6.6.1.2 divergence the two donor paths disagree on. On a 3-distinct-face fan
+        // such a leg always exists (the three legs' own reps are three distinct faces).
+        let first_cross = [e0, e1, e2]
+            .into_iter()
+            .find(|&e| mesh.boundvert_representative(v0, e) != positional)
+            .expect("some leg's own rep differs from the disk head on a 3-material fan");
+        let rest: Vec<EdgeKey> = [e0, e1, e2]
+            .into_iter()
+            .filter(|&e| e != first_cross)
+            .collect();
+        let cross_edges = [Some(first_cross), Some(rest[0]), Some(rest[1])];
+        let sector_donors = mesh.miter_ring_sector_donors(v0, &cross_edges);
+        let anchor = sector_donors.first().copied().flatten();
+        assert_ne!(
+            anchor, positional,
+            "fixture sanity: the enlarged-ring anchor diverges from the raw disk head",
+        );
+
+        let donor =
+            mesh.miter_centre_ngon_donor(v0, &|_| true, BevelAffect::Edges, 3, anchor, None);
+        assert_eq!(
+            donor, anchor,
+            "a seam-free material-only junction's centre n-gon takes the enlarged-ring anchor",
+        );
+        assert_eq!(donor, sector_donors[0], "the anchor is the ring's first boundvert's rep");
+        assert_ne!(
+            donor, positional,
+            "and it is NOT ring_spanning_donor's raw-disk `first_incident_face`",
+        );
+    }
+
+    /// BEVEL.md §8.9.3.1 / §8.9.5.3 centre-n-gon row: on a **seamed** junction the centre
+    /// n-gon abandons the §6.6.1.2 enlarged-ring anchor and takes the junction-wide §6.6.1.4
+    /// tie-break — exactly `ring_spanning_donor`'s seamed branch. Built on the open-fan
+    /// (boundary-leg) fixture, whose legs are condition-(1) seams, and passed a deliberately
+    /// wrong anchor to prove the seamed branch drops it.
+    #[test]
+    fn miter_centre_ngon_donor_seamed_junction_routes_to_the_tie_break_winner() {
+        let (mesh, v0, _e_prev, _e_next, own, next) = miter_centre_column_fan();
+        assert!(
+            mesh.corner_is_seam_carrying(v0),
+            "the boundary-leg fan is seam-carrying (§6.6.1.4 condition 1)",
+        );
+
+        let winner = mesh.ring_spanning_donor(v0, &|_| true, BevelAffect::Edges, 3, None);
+        assert_eq!(
+            winner,
+            Some(next),
+            "fixture sanity: the junction-wide tie-break picks the lower-slot `next`",
+        );
+
+        // A deliberately-wrong anchor the seamed branch must ignore.
+        let bogus_anchor = Some(own);
+        let donor =
+            mesh.miter_centre_ngon_donor(v0, &|_| true, BevelAffect::Edges, 3, bogus_anchor, None);
+        assert_eq!(
+            donor, winner,
+            "a seamed junction routes the centre n-gon to the tie-break winner",
+        );
+        assert_ne!(
+            donor, bogus_anchor,
+            "the enlarged-ring anchor is dropped once the junction carries a seam",
         );
     }
 }
