@@ -1076,15 +1076,17 @@ impl LoopMesh {
             }
             // Vertex-mode multi-segment (BEVEL.md §8.11, Stage [VV]). The
             // general-valence (`s ≥ 3`) / `segments ≥ 2` corner builds a real vmesh patch
-            // for the circle, the curved band, and both square sentinels; the remaining
-            // vertex `segments ≥ 2` shapes (valence < 3, wire spokes, miters, and the line /
-            // flat-chamfer profile) still decline to the historical no-op below.
+            // for the circle, the curved band, both square sentinels, and — per §8.5.5.5(f.3)
+            // law **F2** — the line / flat-chamfer profile, which is the *same* general fill
+            // with `fullness = 0` (a planar cap) rather than a distinct construction. Only
+            // valence < 3, wire spokes, and miters still decline to the historical no-op below.
             if options.affect == BevelAffect::Vertices {
                 // §8.5.5.5(f.1): vertex mode never welds and never takes the tri-corner
                 // family — the tri-corner gate refuses `affect == VERTICES` outright
-                // (§8.5.1) — so every exponent except the flat line falls to the general
+                // (§8.5.1) — so every exponent, the flat line included, falls to the general
                 // fullness grid, differing only in the boundary-ring sampler (§8.6) and the
-                // centre fullness (§8.5.5.5(f.3)).
+                // centre fullness (§8.5.5.5(f.3) law **F2**: `r == 1.0` ⇒ `fullness = 0`,
+                // routed through `emit_general_adj_fill`'s `flat` path).
                 if let Some(built) = self.bevel_vertices_multiseg(geom, options) {
                     return built;
                 }
@@ -1399,26 +1401,25 @@ impl LoopMesh {
     ) -> Option<BevelResult> {
         let segments = options.segments;
 
-        // §8.11.4 bounds: `segments ≥ 2` and any *bulging or concave* SUPERELLIPSE exponent.
-        // Vertex mode routes every exponent to the general fullness grid (§8.5.5.5(f.1)
-        // dispatch): steps 1 and 3 — the parallel-offset square grid and the tri-corner
-        // family — are edge-bevel only, and step 4's tri-corner shortcut is refused for
-        // `affect == VERTICES` (§8.5.1), so the circle, the curved band, and both square
-        // sentinels (square `r = ∞` and square-in `r = 0`) all fall to the same (a)–(e)
-        // grid. The exponent only shapes two knobs, both riding on `options.profile`: the
-        // boundary-ring sampler (§8.6, `superellipse_chain`) and the centre fullness
-        // (§8.5.5.5(f.3), `adj_fullness`). The one exponent held out here is the **line /
-        // flat chamfer** (`r = 1`, `profile = 0.25`): the guide routes it to the same grid
-        // with a *planar* cap (§8.5.5.5(f.1) step 4 F2 → the §8.3.0.2.1 `flat` branch), a
-        // distinct construction that stays a follow-up; a line profile keeps declining to
-        // the historical no-op. Custom profiles are unreachable (no `profile_type = CUSTOM`).
+        // §8.11.4 bounds: `segments ≥ 2` and any SUPERELLIPSE exponent. Vertex mode routes
+        // every exponent to the general fullness grid (§8.5.5.5(f.1) dispatch): steps 1 and
+        // 3 — the parallel-offset square grid and the tri-corner family — are edge-bevel
+        // only, and step 4's tri-corner shortcut is refused for `affect == VERTICES`
+        // (§8.5.1), so the circle, the curved band, both square sentinels (square `r = ∞`
+        // and square-in `r = 0`), and the **line / flat chamfer** (`r = 1`, `profile = 0.25`)
+        // all fall to the same (a)–(e) grid. The exponent only shapes two knobs, both riding
+        // on `options.profile`: the boundary-ring sampler (§8.6, `superellipse_chain`) and
+        // the centre fullness (§8.5.5.5(f.3), `adj_fullness`). The line profile is not a
+        // distinct construction — per §8.5.5.5(f.3) law **F2** (`r == 1.0` ⇒ `fullness = 0`)
+        // it is the *same* general fill with a planar cap, threaded through `emit_general_adj_fill`'s
+        // `flat` path below. Custom profiles are unreachable (no `profile_type = CUSTOM`).
         // The `segments = 2` coarse-net case routes through the *same* grid — §8.11.3(c):
         // vertex mode never takes the tri-corner octant fast path, so a corner of any
         // valence at `segments = 2` builds the fullness-seeded net, subdivides once
         // (§8.5.5.5(d) blockquote: always at least one round, even at seg=2), and resamples
         // the even-parity welded apex back down (§8.5.5.5(e)).
         let exponent = profile_to_exponent(options.profile);
-        if segments < 2 || exponent == 1.0 {
+        if segments < 2 {
             return None;
         }
 
@@ -1747,17 +1748,18 @@ impl LoopMesh {
                 sector_donors: &sector_donors,
                 centre_donors: &centre_donors,
             };
-            // The line / flat-chamfer exponent (`r = 1`, the one `flat` cap of §8.3.0.2.1)
-            // is gated out above, so every corner reaching here relaxes the fullness-seeded
-            // net — circle, the curved band, and both square sentinels alike (§8.5.5.5(f.1)
-            // step 4 / (f.3)).
+            // §8.5.5.5(f.3) law **F2**: the line / flat-chamfer exponent (`r == 1.0`,
+            // `profile = 0.25`) is the *same* general fill with `fullness = 0` — a planar
+            // cap on the boundvert-ring plane, reached via `emit_general_adj_fill`'s `flat`
+            // path. Every other exponent (circle, the curved band, both square sentinels)
+            // relaxes the fullness-seeded net instead.
             self.emit_general_adj_fill(
                 corner.vertex,
                 chains,
                 &profiles,
                 segments,
                 options.profile,
-                false,
+                exponent == 1.0,
                 None,
                 options.material,
                 &sector_representatives,
@@ -6300,7 +6302,11 @@ impl LoopMesh {
     /// re-samples it at each subdivision round's own doubled resolution (§8.5.5.5(c)) and,
     /// at the coarse resolution, reads its raw `(i, 0, 1)` control point. `flat` selects
     /// the `r = 1` planar specialisation (fullness zeroed, centre on the ring-plane
-    /// centroid, §8.3.0.2.1), whose net carries no curvature to relax. This is the shared
+    /// centroid, §8.3.0.2.1): only the **even** cap at `segments = 2` — a bare welded apex
+    /// with no interior ring — takes the closed-form bilinear blend. Every other flat cap
+    /// (all odd, and even `segments ≥ 4`, whose interior grid is a determined quantity)
+    /// descends through the same subdivision-limit relaxation the curved caps use, only with
+    /// the `fullness = 0` seed (§8.5.5.5(e) / (f.3) law **F2**). This is the shared
     /// core of the general non-symmetric junction fill and the miter cap fills (§8.9.5.3):
     /// the only per-caller difference is where the chains come from.
     #[allow(clippy::too_many_arguments)]
@@ -6367,30 +6373,23 @@ impl LoopMesh {
             centroid - fullness * (vertex_position - centroid)
         };
 
-        if flat {
-            // §8.3.0.2.1: the straight-chord cap is planar — its coarse net has no bulge to
-            // relax and its centre is the ring-plane centroid, so the sub-patch bilinear
-            // blend *is* the fill. The odd centre ring's spread is the one free interior
-            // choice this specialisation makes (Tier-2, §8.5.5.7).
-            let cap_scale = chain_of
-                .iter()
-                .map(|chain| (self.vertex_position(chain[half]) - fullness_seed).length())
-                .sum::<f32>()
-                / sectors as f32;
+        if flat && even && seg == 2 {
+            // §8.3.0.2.1: the straight-chord **even** cap at `segments = 2` welds at the
+            // ring-plane centroid (`fullness = 0` ⇒ `fullness_seed == centroid`) with **no
+            // interior ring** — each sub-patch is a single quad meeting the shared apex — so
+            // the sub-patch bilinear blend *is* the fill: there is nothing to relax and no
+            // grid to descend. From `segments ≥ 4` an interior grid exists, and its verts are
+            // a *determined* quantity (§8.5.5.5(e) / (f.3) law **F2**) that must descend
+            // through the same subdivision-limit relaxation the odd and curved caps use — not
+            // a planar bilinear patch — so those parities fall through to the relaxed net
+            // below (still with `fullness_seed == centroid` and the flat reflected `anchor`).
             let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
             for i in 0..sectors {
                 let p00 = boundverts[i];
                 let p0t = self.vertex_position(chain_of[i][half]);
                 let prev = (i + sectors - 1) % sectors;
                 let pt0 = self.vertex_position(chain_of[prev][seg - half]);
-                let ptt = if even {
-                    fullness_seed
-                } else {
-                    let toward_boundvert = (p00 - fullness_seed).normalize_or_zero();
-                    let gamma = 1.0 / (half as f32 + 2.0);
-                    fullness_seed + gamma * cap_scale * toward_boundvert
-                };
-                corners.push([p00, p0t, pt0, ptt]);
+                corners.push([p00, p0t, pt0, fullness_seed]);
             }
             self.emit_adj_grid(
                 sectors,
@@ -6412,6 +6411,17 @@ impl LoopMesh {
             );
             return;
         }
+
+        // §8.5.5.5(e) / §8.5.5.5(f.3) law **F2**: the straight-chord cap that reaches here —
+        // every **odd** cap, and the **even** cap at `segments ≥ 4` — has an interior that is
+        // a *determined* quantity, not a free interior choice. The odd cap closes on a central
+        // `s`-gon; the even cap welds a single apex and mints no central face (the parity is
+        // resolved by `emit_adj_grid`'s `even` branch, identical to the curved caps). Either
+        // way the interior descends from the fullness centre (here the ring-plane centroid,
+        // `fullness = 0`) through the very same subdivision-limit relaxation the curved caps
+        // use; only the `fullness = 0` seed differs. So the flat cap folds onto the general
+        // relaxed-net construction below with `fullness_seed == centroid` and the flat
+        // (reflected) `anchor` already in hand — it is not a distinct planar bilinear blend.
 
         // §8.5.5.5(a) and the "the centre stencil consumes the *raw coarse* profile mids"
         // rule: the coarse net's `(i, 0, 1)` control points are each ring edge's own
@@ -17213,6 +17223,347 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.5.5.5(f.3) law **F2**: the **line / flat chamfer** (`profile = 0.25`,
+    /// `r == 1.0`) in vertex mode is no longer declined. It is not a distinct construction —
+    /// it is the *same* general fullness grid with `fullness = 0`, so the even `segments = 2`
+    /// cube corner builds the identical coarse-net topology as the curved / circular grids
+    /// (`8/12/6 → 14/21/9`, three cap quads + welded apex), differing only in that its apex
+    /// is pinned to the boundvert-ring **plane** at the centroid (no bulge toward `v`).
+    #[test]
+    fn vertex_bevel_multiseg_flat_line_builds_planar_cap_distinct_from_curved() {
+        assert_eq!(
+            profile_to_exponent(0.25),
+            1.0,
+            "profile 0.25 snaps to the line/flat-chamfer exponent r = 1",
+        );
+
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        // Same topology class as the curved / circular even grid, and as the edge-mode flat
+        // line (`emit_general_adj_fill` with `flat = true`): `s` cap quads fanning a single
+        // welded apex, one closed genus-0 solid.
+        assert_eq!(counts(&mesh), (14, 21, 9), "flat line builds the general even grid");
+        assert_eq!(result.faces.len(), 3, "three cap quads + welded apex");
+        assert_eq!(result.verts.len(), 7, "3 ring + 3 chain mid + 1 apex");
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![4, 4, 4, 4, 4, 4, 6, 6, 6],
+            "flat line's cap class matches the curved even grid",
+        );
+
+        // F2: `fullness = 0` planar cap — the apex sits ON the boundvert-ring plane at the
+        // centroid, whereas every curved / square / circular profile bulges it toward `v`.
+        let flat = cube_corner_welded_apex_bulge(0.25, 2);
+        let curved = cube_corner_welded_apex_bulge(0.7, 2);
+        let circular = cube_corner_welded_apex_bulge(0.5, 2);
+        assert!(
+            flat.abs() < 1.0e-4,
+            "the flat-line apex is planar (fullness 0, on the ring centroid): {flat}",
+        );
+        assert!(
+            curved > flat + 1.0e-3 && circular > flat + 1.0e-3,
+            "curved ({curved}) and circular ({circular}) bulge strictly past the flat cap ({flat})",
+        );
+        assert_eq!(adj_fullness(0.25, 2), 0.0, "F2: r == 1.0 ⇒ fullness = 0");
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.5.5.5(f.3) law **F2**: the straight-chord (`r = 1`) cap at
+    /// an **odd** segment count does not weld to an apex — it closes on a central `s`-gon
+    /// whose ring is a *determined* quantity. The flat cap is `fullness = 0`, so the whole
+    /// cap stays in the boundvert-ring plane; but the in-plane spread of the central ring is
+    /// **not** a free choice — it descends through the same subdivision-limit relaxation the
+    /// curved caps use, seeded at the ring-plane centroid. This pins the valence-3 cube
+    /// corner at `segments = 3`: the central triangle sits at the relaxed-net radius
+    /// (`0.043943`), strictly outside the ad-hoc `gamma = 1/(half + 2)` spread the old flat
+    /// bilinear blend produced (`0.039284`).
+    #[test]
+    fn vertex_bevel_multiseg_flat_line_odd_segments_valence3_interior_descends_from_relaxed_net() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (radius, _centroid, max_plane) = flat_cap_probe(&mesh, &result, 3);
+        assert!(
+            max_plane < 1.0e-4,
+            "the flat (fullness 0) odd cap is planar — every cap vert on the ring plane: {max_plane}",
+        );
+        assert!(
+            (radius - 0.043_943).abs() < 5.0e-4,
+            "the central triangle descends to the determined relaxed-net radius 0.043943: {radius}",
+        );
+        assert!(
+            radius > 0.041_5,
+            "the descended ring is strictly outside the ad-hoc 1/(half+2) spread (0.039284): {radius}",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e) at valence 4: the same determined odd-centre descent on a
+    /// symmetric square-pyramid apex. The flat cap stays planar and the central quad's ring
+    /// lands at the relaxed-net radius (`0.058926`), not the ad-hoc gamma spread.
+    #[test]
+    fn vertex_bevel_multiseg_flat_line_odd_segments_valence4_interior_descends_from_relaxed_net() {
+        let (mut mesh, apex) = closed_pyramid(4);
+        let result = mesh.bevel(
+            &[apex.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (radius, _centroid, max_plane) = flat_cap_probe(&mesh, &result, 4);
+        assert!(
+            max_plane < 1.0e-4,
+            "the flat valence-4 odd cap is planar: {max_plane}",
+        );
+        assert!(
+            (radius - 0.058_926).abs() < 5.0e-4,
+            "the central quad descends to the determined relaxed-net radius 0.058926: {radius}",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(b): curved and flat caps stay **distinct** — the flat (`fullness =
+    /// 0`) odd cap is planar, whereas the curved profile (`profile = 0.7`) bulges its cap
+    /// strictly out of the boundvert-ring plane. Guards against the odd-centre descent
+    /// unification collapsing the flat cap onto the curved one.
+    #[test]
+    fn vertex_bevel_multiseg_flat_vs_curved_odd_cap_stays_distinct() {
+        let build = |profile: f32| {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+            let result = mesh.bevel(
+                &[corner.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments: 3,
+                    profile,
+                    affect: BevelAffect::Vertices,
+                    ..Default::default()
+                },
+            );
+            cap_max_plane_dev(&mesh, &result)
+        };
+        let flat = build(0.25);
+        let curved = build(0.7);
+        assert!(flat < 1.0e-4, "flat odd cap is planar: {flat}");
+        assert!(
+            curved > 0.02,
+            "curved odd cap bulges out of the ring plane, distinct from the flat cap: {curved}",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(e) / §8.5.5.5(f.3) law **F2**: the straight-chord (`r = 1`) cap at
+    /// an **even** `segments ≥ 4` count welds a single apex and mints no central face (even
+    /// parity), *and* — unlike `segments = 2`, which has no interior ring — it now carries a
+    /// multi-ring interior grid whose verts are a **determined** quantity. That interior must
+    /// descend through the same subdivision-limit relaxation the odd and curved caps use
+    /// (`fullness = 0` seeded at the ring-plane centroid), **not** the ad-hoc planar bilinear
+    /// blend the `segments = 2` fast path uses. This pins the valence-3 cube corner at
+    /// `segments = 4`: the three apex-ring interior (sector-diagonal) verts descend to the
+    /// relaxed-net radius, measurably **off** the bilinear-blend prediction `(R_b + R_m)/4`
+    /// (the blend the old even-`≥4` path emitted), while the whole cap stays planar.
+    #[test]
+    fn vertex_bevel_multiseg_flat_line_even_seg4_valence3_interior_descends_from_relaxed_net() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 4,
+                profile: 0.25,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+
+        // Even parity: one welded apex (shared by all `s` sectors), no central polygon, every
+        // cap face a quad. Same *topology* the old bilinear path emitted — the divergence is
+        // purely positional, so it must be probed positionally below.
+        assert!(
+            result.faces.iter().all(|&f| mesh.face_vert_keys(f).len() == 4),
+            "even seg-4 flat cap is all quads (welded apex, no central polygon)",
+        );
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| cap_membership(v) == 3)
+            .expect("a single welded apex shared by all three cap quads");
+        let center = mesh.vertex_position(apex);
+
+        // The straight-chord (`r = 1`) rim is a set of `s` chords, so a chain's boundverts sit
+        // at the **max** rim radius and its chord midpoints at the **min** — an intrinsic way
+        // to read `R_b` and `R_m` off the cap without reconstructing sector adjacency.
+        let rim: Vec<Vec3> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| cap_membership(v) == 2)
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        let radius = |p: Vec3| (p - center).length();
+        let r_b = rim.iter().copied().map(radius).fold(0.0_f32, f32::max);
+        let r_m = rim
+            .iter()
+            .copied()
+            .map(radius)
+            .fold(f32::INFINITY, f32::min);
+        let bilinear_diagonal = (r_b + r_m) / 4.0;
+
+        // Boundvert directions (the max-radius rim verts) — the apex-ring diagonal verts point
+        // along them; the seam verts point along the chord-mid directions instead.
+        let boundvert_dirs: Vec<Vec3> = rim
+            .iter()
+            .copied()
+            .filter(|&p| radius(p) > 0.9 * r_b)
+            .map(|p| (p - center).normalize())
+            .collect();
+
+        let mut diagonal_radii: Vec<f32> = Vec::new();
+        let mut max_plane = 0.0_f32;
+        let (_bv, _c, normal) = cap_ring_plane(&mesh, &result);
+        for &v in &result.verts {
+            let p = mesh.vertex_position(v);
+            max_plane = max_plane.max((p - center).dot(normal).abs());
+            if cap_membership(v) == 4 {
+                let dir = (p - center).normalize();
+                let align = boundvert_dirs
+                    .iter()
+                    .map(|&b| dir.dot(b))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if align > 0.85 {
+                    diagonal_radii.push(radius(p));
+                }
+            }
+        }
+        assert_eq!(diagonal_radii.len(), 3, "three apex-ring diagonal verts (one per sector)");
+        let diagonal = diagonal_radii.iter().sum::<f32>() / 3.0;
+
+        assert!(
+            max_plane < 1.0e-4,
+            "the flat (fullness 0) even cap is planar — every cap vert on the ring plane: {max_plane}",
+        );
+        assert!(
+            (diagonal - 0.076_547).abs() < 5.0e-4,
+            "the apex-ring diagonal descends to the determined relaxed-net radius 0.076547: {diagonal}",
+        );
+        // The descent lands measurably off the ad-hoc bilinear blend (`(R_b + R_m)/4`) the old
+        // even-`≥4` path emitted — the whole point of routing this parity through the relaxed
+        // net. (Descended radius 0.0765 vs bilinear 0.0593: ~0.017 wu, ~1700 position quanta.)
+        assert!(
+            (diagonal - bilinear_diagonal).abs() > 1.0e-2,
+            "the descended diagonal ({diagonal}) is distinct from the bilinear blend ({bilinear_diagonal})",
+        );
+    }
+
+    // The `sectors` boundverts of a bevel cap (§4 slide-ring meet-points), their centroid,
+    // and the boundvert-ring plane normal. Boundverts are the cap verts each touching exactly
+    // one cap face.
+    fn cap_ring_plane(mesh: &LoopMesh, result: &BevelResult) -> (Vec<Vec3>, Vec3, Vec3) {
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let boundverts: Vec<Vec3> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| cap_membership(v) == 1)
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |a, &b| a + b) / boundverts.len() as f32;
+        let normal =
+            ((boundverts[1] - boundverts[0]).cross(boundverts[2] - boundverts[0])).normalize();
+        (boundverts, centroid, normal)
+    }
+
+    // Max out-of-plane deviation of any cap vert from the boundvert-ring plane.
+    fn cap_max_plane_dev(mesh: &LoopMesh, result: &BevelResult) -> f32 {
+        let (_boundverts, centroid, normal) = cap_ring_plane(mesh, result);
+        result
+            .faces
+            .iter()
+            .flat_map(|&f| mesh.face_vert_keys(f))
+            .map(|v| (mesh.vertex_position(v) - centroid).dot(normal).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    // Probe a flat odd-segments cap: returns (central s-gon ring radius, ring centroid,
+    // max out-of-plane deviation of any cap vert from the boundvert-ring plane).
+    fn flat_cap_probe(mesh: &LoopMesh, result: &BevelResult, sectors: usize) -> (f32, Vec3, f32) {
+        let (_boundverts, centroid, _normal) = cap_ring_plane(mesh, result);
+        let max_plane = cap_max_plane_dev(mesh, result);
+        // The central s-gon: the cap face whose centroid is nearest the ring centroid.
+        let central = result
+            .faces
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let da = face_centroid(mesh, a).distance(centroid);
+                let db = face_centroid(mesh, b).distance(centroid);
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap();
+        let verts = mesh.face_vert_keys(central);
+        assert_eq!(verts.len(), sectors, "odd central s-gon has {sectors} sides");
+        let radius = verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v).distance(centroid))
+            .sum::<f32>()
+            / verts.len() as f32;
+        (radius, centroid, max_plane)
+    }
+
+    fn face_centroid(mesh: &LoopMesh, face: FaceKey) -> Vec3 {
+        let verts = mesh.face_vert_keys(face);
+        verts.iter().fold(Vec3::ZERO, |a, &v| a + mesh.vertex_position(v)) / verts.len() as f32
+    }
+
     /// BEVEL.md §8.11.4 + §8.5.5.5(f.1): the curved exponent builds the general grid at
     /// **general valence** too, not only the valence-3 cube corner. A valence-4 pyramid apex
     /// beveled at `profile = 0.7`, `segments = 2` builds the uniform coarse net — 4 slide-ring
@@ -17551,27 +17902,32 @@ mod tests {
         );
     }
 
-    /// The gate is tight: a non-circular profile and a valence below 3 decline to the
-    /// historical no-op rather than mis-building. (`segments = 2` and valence ≥ 4 are now
-    /// *in* scope — they route to the same general-fullness grid, see the coarse-net and
-    /// higher-valence tests below.)
+    /// The gate is tight: a single segment and a valence below 3 decline the multi-segment
+    /// grid rather than mis-building. Every SUPERELLIPSE exponent — circle, curved, square,
+    /// square-in, and the flat line (`profile = 0.25`, §8.5.5.5(f.3) law F2) — is now *in*
+    /// scope at `segments ≥ 2`, routing to the same general-fullness grid; only custom
+    /// profiles (unreachable here) and `segments < 2` / valence `< 3` fall out.
     #[test]
     fn vertex_bevel_multiseg_out_of_scope_cases_decline_to_no_op() {
-        // Non-circular profile — square / custom profiles are out.
+        // Single segment — the multi-segment grid needs `segments ≥ 2`; a single-segment
+        // vertex bevel takes the foundational path instead, so `bevel_vertices_multiseg`
+        // itself declines here.
         let (mut mesh, _) = two_quad_strip();
         let corner = vert_at(&mesh, Vec3::new(0.0, -1.0, 0.0));
-        let before = counts(&mesh);
-        mesh.bevel(
-            &[corner.into()],
-            BevelOptions {
-                offset: 0.25,
-                segments: 3,
-                profile: 0.25,
-                affect: BevelAffect::Vertices,
-                ..Default::default()
-            },
+        assert!(
+            mesh.bevel_vertices_multiseg(
+                &[corner.into()],
+                &BevelOptions {
+                    offset: 0.25,
+                    segments: 1,
+                    profile: 0.25,
+                    affect: BevelAffect::Vertices,
+                    ..Default::default()
+                },
+            )
+            .is_none(),
+            "single-segment multiseg still declines",
         );
-        assert_eq!(counts(&mesh), before, "non-circular profile still no-ops");
 
         // Valence 2 — the general grid needs at least three sectors to close (§8.11.4 /
         // §2.3: a two-corner cap is no face). The `sectors < 3` floor still declines.
@@ -17708,32 +18064,6 @@ mod tests {
 
         assert_eq!(counts(&mesh), before, "offset <= 0 changes nothing");
         assert!(result.verts.is_empty() && result.edges.is_empty() && result.faces.is_empty());
-        mesh.validate_topology();
-    }
-
-    /// BEVEL.md §8.11: an out-of-scope multi-segment vertex bevel is a no-op, not a
-    /// silent wrong result. A non-circular profile is outside §8.11's round-profile
-    /// regime, so it declines even at the in-scope valence-3 corner. (The circular
-    /// seg ≥ 2 valence-3 case *is* implemented; see the coarse-net / [VV] tests above.)
-    #[test]
-    fn unsupported_modes_are_noops() {
-        let mut mesh = LoopMesh::new();
-        mesh_add_cube(&mut mesh);
-        let before = counts(&mesh);
-        let corner = mesh.vert_keys()[0];
-
-        let multi_segment = mesh.bevel(
-            &[corner.into()],
-            BevelOptions {
-                offset: 0.25,
-                segments: 2,
-                profile: 0.25,
-                affect: BevelAffect::Vertices,
-                ..Default::default()
-            },
-        );
-        assert_eq!(counts(&mesh), before);
-        assert!(multi_segment.verts.is_empty());
         mesh.validate_topology();
     }
 
@@ -26403,12 +26733,12 @@ mod tests {
         );
     }
 
-    /// BEVEL.md §8.5.5.5: ADJ outside the symmetric cube corner stays a stub. A
-    /// two-edge (`s = 2`) junction takes no pinwheel fill (the through-strips still
-    /// build, exactly as cutoff), and there is no central apex. An out-of-scope
-    /// (here non-circular) multi-segment vertex bevel also remains a no-op.
+    /// BEVEL.md §8.5.5.5: a two-edge (`s = 2`) ADJ junction takes no pinwheel fill — the
+    /// §8.5 forced case needs `s ≥ 3`, so the through-strips still build (exactly as cutoff)
+    /// with no central apex. The vertex-mode flat line beveled at the tail is *no longer* a
+    /// stub — per §8.5.5.5(f.3) law F2 it builds the general fullness grid (planar cap).
     #[test]
-    fn adj_non_forced_and_vertex_are_stubbed() {
+    fn adj_s2_non_forced_junction_has_no_pinwheel_fill() {
         let mut mesh = LoopMesh::new();
         mesh_add_cube(&mut mesh);
         let e01 = cube_edge(
@@ -26441,9 +26771,10 @@ mod tests {
             "s=2 ADJ junction: through-strips only, no pinwheel fill (§8.5.5)",
         );
 
-        // Out-of-scope (non-circular) segments ≥ 2 vertex bevel: still a stub, no-op.
-        // (The circular seg=2 valence-3 corner is now implemented, §8.11.4.)
-        let before = counts(&mesh);
+        // §8.5.5.5(f.3) law F2: the flat-line (`profile = 0.25`, `r == 1.0`) vertex bevel
+        // now builds via the general fullness grid — the untouched opposite cube corner
+        // (valence 3) at `segments = 2` grows by one general even grid (+6 V / +9 E / +3 F).
+        let (bv, be, bf) = counts(&mesh);
         let v_far = vert_at(&mesh, Vec3::new(-1.0, 1.0, 1.0));
         mesh.bevel(
             &[v_far.into()],
@@ -26456,7 +26787,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(counts(&mesh), before, "out-of-scope vertex multiseg is a no-op");
+        mesh.validate_topology();
+        let (av, ae, af) = counts(&mesh);
+        assert_eq!(
+            (av - bv, ae - be, af - bf),
+            (6, 9, 3),
+            "flat-line vertex multiseg builds the general even grid (§8.5.5.5(f.3) F2)",
+        );
     }
 
     /// BEVEL.md §8.3.0.1: a junction-free `segments ≥ 2` edge set has no corner to
@@ -40750,10 +41087,13 @@ fn seed_closer_to_vertex(slot: &mut Option<Vec3>, candidate: Vec3, vertex: Vec3)
 /// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
 /// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
 enum AdjInterior<'a> {
-    /// The raw bilinear sub-patch blend. Used by the flat (`r = 1`) planar cap, whose
-    /// `fullness = 0` net carries no curvature to relax and no surface to snap onto — the
-    /// blend *is* the fill (§8.3.0.2.1). `anchor` is the interior point below the cap that
-    /// orients face winding outward.
+    /// The raw bilinear sub-patch blend. Used **only** by the flat (`r = 1`) planar cap at
+    /// even `segments = 2`, which welds at the ring-plane centroid (`fullness = 0`) with no
+    /// interior ring to relax and no surface to snap onto — the blend *is* the fill
+    /// (§8.3.0.2.1). Every other flat cap — all odd `segments`, and even `segments ≥ 4` whose
+    /// interior grid is a *determined* quantity — takes the [`AdjInterior::Relaxed`] descent
+    /// instead (§8.5.5.5(e) / (f.3) law **F2**). `anchor` is the interior point below the cap
+    /// that orients face winding outward.
     Blend {
         corners: &'a [[Vec3; 4]],
         anchor: Vec3,
