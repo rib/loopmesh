@@ -25416,6 +25416,149 @@ mod tests {
         }
     }
 
+    /// BEVEL.md §8.5.5.5(f.5), the **parallel-but-distinct** interior branch: as a sector
+    /// opens toward flat, the `k`-th and `j`-th offset lines rotate to a shared direction
+    /// while their base points stay on two *different* rim rows — parallel yet never
+    /// coincident. The lattice must **route on the directions alone** and interpolate
+    /// `(i, 0, k)` toward `CL_{i−1}[k]` by `j/h`, *not* fall through to the line solver's
+    /// skew / degenerate fallback (which — when the solve turns singular — returns the
+    /// midpoint of the two rim **base** points, off the patch by `|v − B_i|/4`).
+    ///
+    /// Construction: at the centre vert `(1, 1)` of an `n = 4` patch the two offset lines
+    /// are exactly parallel iff `v − B_i ∥ C_i − C_{i−1}` (each is a midline of the patch
+    /// quad `B_i, C_i, v, C_{i−1}`). We pin that config and assert the interpolation, and
+    /// that it is strictly distinct from the base-midpoint the old coincident-only routing
+    /// produced.
+    #[test]
+    fn square_grid_interior_parallel_offset_lines_interpolate_not_base_midpoint() {
+        let vertex = Vec3::ZERO;
+        let b0 = Vec3::new(1.0, 0.0, 1.0);
+        let c0 = Vec3::new(0.6, 0.3, 0.6);
+        let c2 = Vec3::new(0.1, 0.3, 0.1); // c0 - c2 = (0.5,0,0.5) ∥ v - b0 = (-1,0,-1)
+        // sectors 1 and the rest are unread for sector 0's (1, 1) meet; fill with plausibles.
+        let starts = [
+            (b0, c0),
+            (Vec3::new(-1.0, 1.0, 0.0), Vec3::new(-0.3, 0.4, 0.0)),
+            (Vec3::new(0.0, -1.0, 1.0), c2),
+        ];
+        let interior = AdjInterior::Parallel {
+            starts: &starts,
+            vertex,
+            anchor: Vec3::ZERO,
+        };
+        let placed = interior.position(0, 1, 1, 2);
+
+        // Interpolation target: mid of rim row `(0,0,1)` and centreline `CL_2[1]`.
+        let row0_k = 0.5 * (b0 + c0);
+        let cl_prev_k = 0.5 * c2; // C_2 + (1/2)(v − C_2), v = 0
+        let interp = 0.5 * (row0_k + cl_prev_k);
+        assert!(
+            (placed - interp).length() < 1.0e-5,
+            "parallel offset lines interpolate the rim row toward the centreline by j/h",
+        );
+
+        // The pre-fix coincident-only routing fell to the solver's base-point midpoint.
+        let col0_j = 0.5 * (b0 + c2);
+        let base_midpoint = 0.5 * (row0_k + col0_j);
+        assert!(
+            (placed - base_midpoint).length() > 0.3,
+            "the interpolation is the |v − B_i|/4 correction away from the base midpoint",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5): a **clean-crossing** interior meet is unchanged by the
+    /// parallel routing — a mildly-oblique sector keeps the two offset families crossing, so
+    /// the interior vert is the genuine line-line meet, which at `(1, 1)` bisects both lines.
+    #[test]
+    fn square_grid_interior_clean_crossing_takes_the_line_meet() {
+        let vertex = Vec3::ZERO;
+        // A right-angled sector patch in the z = 0 plane: B at the corner, C_i / C_{i−1}
+        // along the two axes, v at the far corner — the offset lines cross at 90°.
+        let b0 = Vec3::new(1.0, 1.0, 0.0);
+        let c0 = Vec3::new(0.0, 1.0, 0.0);
+        let c2 = Vec3::new(1.0, 0.0, 0.0);
+        let starts = [
+            (b0, c0),
+            (Vec3::new(-1.0, -1.0, 0.0), Vec3::new(-0.5, 0.0, 0.0)),
+            (Vec3::new(0.0, -1.0, 0.0), c2),
+        ];
+        let interior = AdjInterior::Parallel {
+            starts: &starts,
+            vertex,
+            anchor: Vec3::ZERO,
+        };
+        let placed = interior.position(0, 1, 1, 2);
+        // Midlines of the unit square `B=(1,1), C_i=(0,1), v=(0,0), C_{i−1}=(1,0)` cross at
+        // the centroid `(0.5, 0.5)`.
+        assert!(
+            (placed - Vec3::new(0.5, 0.5, 0.0)).length() < 1.0e-5,
+            "a clean crossing lands at the patch centroid, not an interpolation artefact",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.5) seed pass on a **strongly-oblique** (near-flat, bunched)
+    /// valence-4 ring: every sector's centreline is still seeded by a **pass-1 sharp** foot
+    /// on its shared beveled edge (the closer-to-`v` of its two bounding boundverts'
+    /// proposals) — no sector falls through to pass 2. This pins that obliquity alone does
+    /// not divert the seed pass off the parallel-offset construction.
+    #[test]
+    fn square_ring_centreline_seeds_oblique_ring_stay_pass_one_sharp() {
+        let vertex = Vec3::ZERO;
+        // Three spokes bunched near 0° plus one at 180°, all splaying down (near-flat apex):
+        // a strongly-oblique ring whose interior meets reach the near-parallel regime.
+        let zc = -0.3_f32;
+        let azimuths = [0.0_f32, 20.0, 40.0, 180.0];
+        let directions: Vec<Vec3> = azimuths
+            .iter()
+            .map(|&a| {
+                let r = a.to_radians();
+                Vec3::new(r.cos(), r.sin(), zc).normalize()
+            })
+            .collect();
+        let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
+        let offset = 0.3_f32;
+        let boundverts: Vec<Vec3> = (0..4)
+            .map(|i| {
+                let da = directions[i];
+                let db = directions[(i + 1) % 4];
+                vertex + offset * (da + db) / da.cross(db).length()
+            })
+            .collect();
+        let reflex = vec![false; 4];
+        let seeds =
+            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+
+        for i in 0..4 {
+            let edge_out = directions[(i + 1) % 4];
+            assert!(
+                seeds[i].cross(edge_out).length() < 1.0e-5,
+                "seed {i} lies on its shared beveled edge line",
+            );
+            // The two pass-1 sharp proposals for CL_i: from B_i (via its edge_in) and from
+            // B_{i+1} (via its edge_out); the closer-to-`v` one is the seed.
+            let from_i = line_line_nearest_on_first(vertex, edge_out, boundverts[i], directions[i]);
+            let from_next = line_line_nearest_on_first(
+                vertex,
+                edge_out,
+                boundverts[(i + 1) % 4],
+                directions[(i + 2) % 4],
+            );
+            let closer = [from_i, from_next]
+                .into_iter()
+                .flatten()
+                .min_by(|a, b| {
+                    a.length_squared()
+                        .partial_cmp(&b.length_squared())
+                        .unwrap()
+                })
+                .expect("a convex sector has at least one pass-1 proposal");
+            assert!(
+                (seeds[i] - closer).length() < 1.0e-5,
+                "seed {i} is the closer-to-v pass-1 sharp foot, not a pass-2 projection",
+            );
+        }
+    }
+
     /// B1 regression (BEVEL.md §8.5.5.5(f.2)): the unit-octant frame's conditioning test is
     /// **scale-free**. The frame's three axes are the corner's boundvert spokes, so its raw
     /// determinant is `±offset³` at the symmetric cube corner — an absolute threshold on it
@@ -38927,6 +39070,17 @@ const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
 /// so this is an angular degeneracy guard, not a length.
 const LINE_PARALLEL_TOLERANCE: f32 = 1.0e-7;
 
+/// `|sin θ|` bound below which two offset lines of the §8.5.5.5(f.5) square-grid
+/// lattice count as **aligned** (parallel-but-distinct *or* coincident). The guide
+/// pins the interior meet to be *routed on directions alone*: once the `k`-th and
+/// `j`-th offset families share a direction — as a sector opens toward flat — the
+/// line-line solve is meaningless (its closest-approach parameters blow up), so the
+/// lattice interpolates the rim row toward the swept centreline instead. Well above
+/// `sqrt(LINE_PARALLEL_TOLERANCE)` (the solver's own parallel floor) so the aligned
+/// band is caught *before* it falls through to the skew / degenerate branch, yet far
+/// tighter than any genuine crossing on a non-degenerate grid.
+const OFFSET_LINE_ALIGNED_TOLERANCE: f32 = 1.0e-3;
+
 /// Angular slack (radians) for the §7.6.2 in-wedge face-drop predicate. Per the
 /// bounded-overshoot rule (§7.6.2): accept a face-drop when its `d1→dp` sweep
 /// overshoots the `d1→d2` wedge by strictly less than `EPS_ANG = 2°`. This is a
@@ -40049,11 +40203,28 @@ impl AdjInterior<'_> {
                     point: col0_j,
                     direction: cl_i_j - col0_j,
                 };
-                match intersect_lines(&line_k, &line_j) {
-                    LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
-                    // Parallel offset lines never meet: interpolate the rim row toward the
-                    // swept centreline by `j / h`, per (f.5)'s parallel branch.
-                    LineMeet::Collinear => row0_k + (j as f32 / h) * (cl_prev_k - row0_k),
+                // (f.5)'s parallel branch: interpolate `(i, 0, k)` toward `CL_{i−1}[k]` by
+                // `j/h`. Continuous with the crossing (they coincide wherever the lines meet),
+                // so it is the correct limit as the two families align.
+                let interpolate = row0_k + (j as f32 / h) * (cl_prev_k - row0_k);
+                // Route on the offset lines' **directions alone** (§8.5.5.5(f.5), the
+                // parallel-but-distinct paragraph): once they share a direction — parallel yet
+                // cast from two different rim rows, so never coincident — the line-line solve
+                // is unstable and its skew / degenerate fallback is *not* the lattice's answer.
+                // A merely-coincident test (the solver's own `Collinear`) misses this, so test
+                // the directions explicitly.
+                let dir_k = line_k.direction.normalize_or_zero();
+                let dir_j = line_j.direction.normalize_or_zero();
+                let aligned = dir_k == Vec3::ZERO
+                    || dir_j == Vec3::ZERO
+                    || dir_k.cross(dir_j).length() <= OFFSET_LINE_ALIGNED_TOLERANCE;
+                if aligned {
+                    interpolate
+                } else {
+                    match intersect_lines(&line_k, &line_j) {
+                        LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+                        LineMeet::Collinear => interpolate,
+                    }
                 }
             }
             AdjInterior::SquareTriCorner { octant, segments } => {
