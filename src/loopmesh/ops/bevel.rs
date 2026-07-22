@@ -25341,74 +25341,195 @@ mod tests {
         }
     }
 
-    /// §8.5.5.5(f.5) **pass-2 fallback**: a centreline both of whose bounding boundverts
-    /// stop proposing (flagged reflex here) is left unseeded by pass 1 and then seeded by
-    /// projecting the sector's *later* boundvert onto the shared beveled-edge segment. This
-    /// pins that the reflex flag diverts boundverts out of pass 1 and that pass 2 lands the
-    /// seed on the edge segment. (Two adjacent reflex boundverts is unphysical at a real
-    /// junction — §8.9.1 allows one — but it is the minimal synthetic input that reaches the
-    /// pass-2 branch, since every centreline otherwise has two proposers.)
+    /// §8.5.5.5(f.5) **pass-2 fallback**: a centreline both of whose flanking parallel-offset
+    /// proposals degenerate — the companion line runs (anti)parallel to the shared edge, so its
+    /// foot is at infinity — is left unseeded by pass 1 and then seeded by projecting the
+    /// sector's *later* boundvert onto the shared beveled-edge segment. The corner angle no
+    /// longer gates pass 1 (a reflex boundvert still proposes; §8.5.5.5(f.5) arbitration), so
+    /// this is the reachable pass-2 trigger: a **straight sector**. Here `B_1` and `B_2` are
+    /// straight (edges collinear along ±x), which strands only `CL_1`; every other centreline
+    /// keeps a live proposer.
     #[test]
-    fn square_ring_centreline_seed_reflex_boundvert_falls_to_pass_two() {
-        let mut mesh = LoopMesh::new();
-        let vertex = mesh.create_vertex(Vec3::ZERO);
-
-        let directions: Vec<Vec3> = [
-            Vec3::new(1.0, 1.0, -1.0),
-            Vec3::new(-1.0, 1.0, -1.0),
-            Vec3::new(-1.0, -1.0, -1.0),
-            Vec3::new(1.0, -1.0, -1.0),
-        ]
-        .into_iter()
-        .map(|d| d.normalize())
-        .collect();
+    fn square_ring_centreline_seed_straight_sector_falls_to_pass_two() {
+        let axis = Vec3::new(1.0, 0.0, 0.0);
+        // Edges 1..=3 collinear (±x): `B_1` (edges +x, −x) and `B_2` (edges −x, +x) are
+        // straight, so `CL_1`'s two proposers — companions parallel to its shared edge — both
+        // vanish.
+        let directions = vec![Vec3::new(1.0, 1.0, -1.0).normalize(), axis, -axis, axis];
         let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
-        let boundverts: Vec<Vec3> = (0..4)
-            .map(|i| 0.5 * (directions[i] + directions[(i + 1) % 4]).normalize())
-            .collect();
-
-        // Flag boundverts 1 and 2 reflex. CL_1's two bounding boundverts are exactly B_1 and
-        // B_2, so both its proposers vanish and CL_1 falls to pass 2; every other centreline
-        // keeps at least one proposer and stays in pass 1.
-        let mut boundvert_reflex = vec![false; 4];
-        boundvert_reflex[1] = true;
-        boundvert_reflex[2] = true;
-
-        let cut = JunctionCut {
-            vertex,
-            boundverts: Vec::new(),
-            opening_edges: Vec::new(),
-            outward: Vec3::ZERO,
-            central_representative: FaceTemplate::default(),
-            sector_representatives: Vec::new(),
-            centre_column_representatives: Vec::new(),
-            dihedral_band_ok: false,
-            dihedral_band_deviation: None,
-            pipe_override: false,
-            opening_edge_directions: directions.clone(),
-            opening_edge_tips: tips.clone(),
-            boundvert_reflex,
-        };
+        let boundverts = vec![
+            Vec3::new(0.4, 0.3, -0.3),
+            Vec3::new(0.3, 0.1, 0.0),
+            Vec3::new(-0.9, -0.1, 0.0),
+            Vec3::new(0.5, -0.3, -0.2),
+        ];
+        let reflex = vec![false; 4];
 
         let seeds = square_ring_centreline_seeds(
-            &cut.opening_edge_directions,
-            &cut.opening_edge_tips,
-            &cut.boundvert_reflex,
+            &directions,
+            &tips,
+            &reflex,
             &boundverts,
             Vec3::ZERO,
             None,
         );
 
-        // CL_1 (sector 1, shared edge opening_edges[2] = directions[2]) is the pass-2 seed:
-        // the closest point of the segment (`v` → tips[2]) to the later boundvert B_2.
+        // CL_1 (shared edge directions[2] = −x) is the pass-2 seed: the closest point of the
+        // segment (`v` → tips[2]) to the later boundvert `B_2`.
         let expected = closest_point_on_segment(boundverts[2], Vec3::ZERO, tips[2]);
         assert!(
             (seeds[1] - expected).length() < 1.0e-6,
-            "reflex neighbour forces CL_1 onto pass 2's edge-segment projection",
+            "a straight sector strands CL_1 onto pass 2's edge-segment projection",
+        );
+        // The straight sector genuinely reached pass 2 (its seed is the segment projection, not
+        // the `v` apex the projection would clamp to if `B_2` sat on the wrong side).
+        assert!(
+            (seeds[1] - Vec3::ZERO).length() > 0.1,
+            "the pass-2 projection lands in the segment interior, not clamped to v",
         );
         // Every seed still lands on its own shared edge line.
         for i in 0..4 {
             let edge_out = directions[(i + 1) % 4];
+            assert!(
+                seeds[i].cross(edge_out).length() < 1.0e-5,
+                "seed {i} lies on its shared beveled edge line",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.5) arbitration, the **near-flat divergence** the row L1015 fix targets: at a
+    /// strongly-oblique valence-4 junction the very-open sector's boundvert lands the near-`v`
+    /// proposal on the shared centreline, while the boundvert on the tight side lands one deep
+    /// toward the far base vertex. The surviving seed must be the **near-`v`** one — and, load-
+    /// bearing for the bug, the very-open boundvert here is classified reflex (its disk sector
+    /// wraps past π), yet its proposal must still be generated. Keeping the farther proposal
+    /// (the pre-fix behaviour, from suppressing the reflex boundvert) is the regression.
+    #[test]
+    fn square_ring_centreline_seed_near_flat_keeps_near_vertex_proposal() {
+        let vertex = Vec3::ZERO;
+        // Three spokes bunched near 0° plus one near 180°, all tilted down: one sector spans
+        // more than π in disk order (a reflex boundvert), the geometry of the near-flat fixture.
+        let zc = -0.3_f32;
+        let azimuths = [0.0_f32, 20.0, 40.0, 175.0];
+        let directions: Vec<Vec3> = azimuths
+            .iter()
+            .map(|&a| {
+                let r = a.to_radians();
+                Vec3::new(r.cos(), r.sin(), zc).normalize()
+            })
+            .collect();
+        let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
+        let offset = 0.3_f32;
+        let boundverts: Vec<Vec3> = (0..4)
+            .map(|i| {
+                let da = directions[i];
+                let db = directions[(i + 1) % 4];
+                vertex + offset * (da + db) / da.cross(db).length()
+            })
+            .collect();
+
+        // Flag the very-open boundvert reflex (sector 3 spans az175→az360 > π), mirroring the
+        // real junction-cut classification. The fix must still generate its proposals.
+        let mut reflex = vec![false; 4];
+        reflex[3] = true;
+        let seeds =
+            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+
+        let mut saw_divergent_spoke = false;
+        for i in 0..4 {
+            let edge_out = directions[(i + 1) % 4];
+            // The two flanking proposals for CL_i, generated *regardless* of the reflex flag.
+            let from_i = line_line_nearest_on_first(vertex, edge_out, boundverts[i], directions[i]);
+            let from_next = line_line_nearest_on_first(
+                vertex,
+                edge_out,
+                boundverts[(i + 1) % 4],
+                directions[(i + 2) % 4],
+            );
+            let proposals: Vec<Vec3> = [from_i, from_next].into_iter().flatten().collect();
+            let nearer = proposals
+                .iter()
+                .copied()
+                .min_by(|a, b| {
+                    (*a - vertex)
+                        .length_squared()
+                        .partial_cmp(&(*b - vertex).length_squared())
+                        .unwrap()
+                })
+                .expect("each centreline has at least one flanking proposal");
+            assert!(
+                (seeds[i] - nearer).length() < 1.0e-5,
+                "seed {i} keeps the near-`v` flanking proposal, not the farther one",
+            );
+            // At the near-flat spoke the two proposals sit far apart and one is contributed by
+            // the reflex very-open boundvert — the regime the L1015 bug misplaced.
+            if proposals.len() == 2 && (proposals[0] - proposals[1]).length() > 0.3 {
+                saw_divergent_spoke = true;
+                let farther = proposals
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| {
+                        (*a - vertex)
+                            .length_squared()
+                            .partial_cmp(&(*b - vertex).length_squared())
+                            .unwrap()
+                    })
+                    .unwrap();
+                assert!(
+                    (seeds[i] - farther).length() > 0.3,
+                    "the near-flat seed is the NEAR proposal, not the far one (the L1015 fix)",
+                );
+            }
+        }
+        assert!(
+            saw_divergent_spoke,
+            "the fixture must exercise the near-flat divergent-proposal regime",
+        );
+    }
+
+    /// §8.5.5.5(f.5) arbitration on an **ordinary convex ring**: the two flanking proposals a
+    /// centreline receives nearly coincide, so the closer-to-`v` tiebreak is unobservable and
+    /// the seed matches either. This is the counter-case the near-flat fix must not regress.
+    #[test]
+    fn square_ring_centreline_seed_convex_ring_proposals_coincide() {
+        let vertex = Vec3::ZERO;
+        // A regular, gently-tilted valence-4 ring: every sector convex and near-symmetric.
+        let azimuths = [45.0_f32, 135.0, 225.0, 315.0];
+        let directions: Vec<Vec3> = azimuths
+            .iter()
+            .map(|&a| {
+                let r = a.to_radians();
+                Vec3::new(r.cos(), r.sin(), -0.4).normalize()
+            })
+            .collect();
+        let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
+        let offset = 0.3_f32;
+        let boundverts: Vec<Vec3> = (0..4)
+            .map(|i| {
+                let da = directions[i];
+                let db = directions[(i + 1) % 4];
+                vertex + offset * (da + db) / da.cross(db).length()
+            })
+            .collect();
+        let reflex = vec![false; 4];
+        let seeds =
+            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+
+        for i in 0..4 {
+            let edge_out = directions[(i + 1) % 4];
+            let from_i = line_line_nearest_on_first(vertex, edge_out, boundverts[i], directions[i])
+                .expect("convex proposal from B_i");
+            let from_next = line_line_nearest_on_first(
+                vertex,
+                edge_out,
+                boundverts[(i + 1) % 4],
+                directions[(i + 2) % 4],
+            )
+            .expect("convex proposal from B_{i+1}");
+            assert!(
+                (from_i - from_next).length() < 1.0e-3,
+                "on a regular convex ring the two flanking proposals coincide (tiebreak inert)",
+            );
             assert!(
                 seeds[i].cross(edge_out).length() < 1.0e-5,
                 "seed {i} lies on its shared beveled edge line",
@@ -39898,16 +40019,24 @@ fn line_line_nearest_on_first(
 /// `opening_edges[i]` and `edge_out(i)` is `opening_edges[(i + 1) % s]`, the edge shared with
 /// the next boundvert, along which sector `i`'s centreline `CL_i` rides.
 ///
-/// - **Pass 1 (convex / sharp boundverts).** `B_i` proposes a candidate for **both** adjacent
-///   centrelines: for `CL_i` (the sector after it), the foot — on `edge_out(i)`'s own line —
-///   of the line through `B_i` parallel to `edge_in(i)`; for `CL_{i−1}` (the sector before
-///   it), the foot on `edge_in(i)`'s line of the line through `B_i` parallel to `edge_out(i)`.
-///   A (anti)parallel pair proposes nothing (this also disposes of a straight boundvert).
+/// - **Pass 1 (parallel-offset proposals).** Every boundvert `B_i` (that a patch/arc did not
+///   swallow) proposes a candidate for **both** adjacent centrelines: for `CL_i` (the sector
+///   after it), the foot — on `edge_out(i)`'s own line — of the line through `B_i` parallel to
+///   `edge_in(i)`; for `CL_{i−1}` (the sector before it), the foot on `edge_in(i)`'s line of
+///   the line through `B_i` parallel to `edge_out(i)`. This is **unconditional in `B_i`'s
+///   corner angle** — the foot construction is well defined at a convex *and* a reflex corner,
+///   and each centreline must receive one proposal from *each* of its two flanking boundverts
+///   (BEVEL.md §8.5.5.5(f.5) arbitration). At a strongly-oblique near-flat junction the
+///   very-open sector's boundvert is the one that lands the near-`v` proposal, so suppressing
+///   it would strand that centreline on its far sibling. A (anti)parallel companion proposes
+///   nothing — its foot is at infinity — which also disposes of a straight corner and a
+///   missing (zero-direction) edge.
 /// - **Arbitration.** A centreline can receive a proposal from each of its two bounding
 ///   boundverts (two points on the same edge line); the one **closer to `v`** wins.
-/// - **Pass 2 (no-arc branch).** A centreline left unseeded (a reflex / straight sector)
-///   projects the sector's **later** boundvert onto its shared beveled-edge **segment**
-///   (`v → edge tip`), clamped to the segment; with no shared edge it falls to the midpoint.
+/// - **Pass 2 (no-arc branch).** A centreline left unseeded (both flanking companions
+///   (anti)parallel — a straight / degenerate sector) projects the sector's **later** boundvert
+///   onto its shared beveled-edge **segment** (`v → edge tip`), clamped to the segment; with no
+///   shared edge it falls to the midpoint.
 ///
 /// When `arc_patch` is set, the enlarged miter ring carries **one** arc-or-patch start
 /// (§8.5.5.5(f.5) cases 1 & 2 — at most one per junction, §8.9.1):
@@ -39925,7 +40054,11 @@ fn line_line_nearest_on_first(
 fn square_ring_centreline_seeds(
     directions: &[Vec3],
     tips: &[Vec3],
-    boundvert_reflex: &[bool],
+    // Retained on the interface (the signed §8.9.1 corner classification the callers already
+    // carry), but the parallel-offset proposal is unconditional in the corner angle — a reflex
+    // boundvert still lands its flanking centrelines' near-`v` proposals — so the pass no longer
+    // reads it. Pass 2 keys off proposal presence, not this flag.
+    _boundvert_reflex: &[bool],
     boundverts: &[Vec3],
     vertex: Vec3,
     arc_patch: Option<&ArcPatchStart>,
@@ -39964,12 +40097,19 @@ fn square_ring_centreline_seeds(
         }
     }
 
-    // Pass 1 — sharp boundverts (case 3). The arc/patch start and every boundvert a patch
-    // or arc consumed are skipped, so they never propose a sharp candidate. Every other
-    // boundvert — including the sharp one *trailing* the arc/patch — proposes for both of
-    // its adjacent centrelines, and the closer-to-`v` arbitration keeps the survivor.
+    // Pass 1 — parallel-offset proposals (case 3). The arc/patch start and every boundvert a
+    // patch or arc consumed are skipped, so they never propose a candidate. **Every other
+    // boundvert proposes for both of its adjacent centrelines** — the closer-to-`v`
+    // arbitration keeps the survivor. This is unconditional in the boundvert's corner angle:
+    // the foot-on-edge-line construction is well defined at a convex *and* a reflex corner,
+    // and at a strongly-oblique near-flat junction the very-open sector's boundvert is the one
+    // that contributes the near-`v` proposal its shared centreline must keep (§8.5.5.5(f.5)
+    // arbitration blockquote). Skipping it there would strand that centreline on its other,
+    // far proposal. A boundvert whose companion line is (anti)parallel to the edge proposes
+    // nothing — the foot is at infinity — which also disposes of a straight corner and a
+    // missing (zero-direction) edge; such a stranded centreline drops to pass 2.
     for i in 0..sectors {
-        if consumed[i] || boundvert_reflex.get(i).copied().unwrap_or(false) {
+        if consumed[i] {
             continue;
         }
         if arc_patch.is_some_and(|ap| ap.index == i) {
