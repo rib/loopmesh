@@ -4549,6 +4549,116 @@ impl LoopMesh {
         tri_corner_meet_geometry(vertex, &meet_points) || cut.dihedral_band_ok
     }
 
+    /// The rounded adjacency-grid fill at one junction, with the §8.5.5.5(f.6) **pipe**
+    /// cross-section replant applied as a post-pass (BEVEL.md §8.5 / §8.5.5.5(f.6)).
+    ///
+    /// A *pipe* junction runs straight **through** `v` — two beveled edges are collinear,
+    /// so the corner is a section of tube (a constant cross-section) rather than a rounded
+    /// corner. Its fill is a two-step post-pass: build the ordinary base grid — the same
+    /// octant / general dispatch this junction would take had the pipe test not fired
+    /// ([`build_adj_fill_base`], step 1) — then re-plant every interior grid vert onto that
+    /// constant cross-section (step 2). Every non-pipe junction runs the base grid alone.
+    ///
+    /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`); the
+    /// axis and the cross-section shape are recovered from the chains at fill time, since
+    /// the original corner's edge directions are gone by now.
+    #[allow(clippy::too_many_arguments)]
+    fn build_adj_fill(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        profile: f32,
+        material: i32,
+        templates: &TemplateBank,
+        result: &mut BevelResult,
+    ) {
+        // §8.5.5.5(f.6): a pipe junction re-plants its interior grid verts once the base
+        // grid exists. The predicate rides the cut (same test as the §8.3.4.1 cutoff
+        // override); the axis + profile are read back from the chains below.
+        //
+        // The §8.3.4.1 predicate is broader than the (f.6) *replant*: it also fires on the
+        // flat/planar anti-parallel and wire-disk junctions the CUTOFF override was built
+        // for. There the whole junction lies in one plane and the base ADJ grid is already
+        // the constant cross-section, correctly placed — the replant must not move a vert.
+        // `pipe_cross_section` declines (returns `None`) for such a planar junction, so only
+        // a genuine 3-D tube reaches the replant below.
+        let pipe = if cut.pipe_override {
+            self.pipe_cross_section(cut, chains)
+        } else {
+            None
+        };
+        // Only the base fill's own interior grid verts are appended to `result.verts` — the
+        // rim (boundvert ring + chain samples) is reused from the strips and never pushed
+        // here (§8.5.5). So every vert added from this point is a §8.5.2 index-canonical
+        // interior vert, already deduplicated by the grid's canon map, hence eligible for
+        // the replant exactly once.
+        let interior_start = result.verts.len();
+        self.build_adj_fill_base(cut, chains, segments, profile, material, templates, result);
+        let Some((pipe_axis, profile_cell)) = pipe else {
+            return;
+        };
+        let exponent = profile_to_exponent(profile);
+        for index in interior_start..result.verts.len() {
+            let vertex = result.verts[index];
+            let base = self.vertex_position(vertex);
+            let replanted = pipe_cross_section_replant(base, pipe_axis, &profile_cell, exponent);
+            self.set_vertex_position(vertex, replanted);
+        }
+    }
+
+    /// Recover a §8.5.5.5(f.6) pipe junction's axis and the pipe boundvert's profile cell
+    /// from its chains (BEVEL.md §8.5.5.5(f.6)).
+    ///
+    /// The two collinear pipe edges are crossed by two chains, and their cells' projection
+    /// directions ride those two collinear edges — so they share a common line (the profile
+    /// cell stores the edge's *line* direction, which is the same for both pipe edges even
+    /// though the two spokes leave `v` in opposite senses). That line is the pipe axis, and
+    /// either chain's cell is the constant tube cross-section: a uniform pipe presents the
+    /// same cross-section from both ends, and the cell reflection that swaps its two ring
+    /// corners leaves the superellipse snap invariant, so the two are interchangeable for
+    /// the replant. `None` when no such pair is recoverable (e.g. a flat-chamfer
+    /// cross-section whose projection direction collapsed to zero), which is outside the
+    /// circular / curved scope this post-pass fills.
+    ///
+    /// `None` also when the junction is **planar** — every cross-section control point in one
+    /// plane. That is the flat §8.3.4.1 configuration (an anti-parallel opposite-pair or a
+    /// wire-disk junction), where the base ADJ grid is already the constant cross-section
+    /// and the replant would collapse a correctly-placed 2-D fill onto a single chord. Only a
+    /// genuine 3-D tube — whose cross-section wraps out of any one plane — replants (f.6). The
+    /// axis a rescued planar cell reports (§8.2.2.1, its `projection_dir` becomes the
+    /// rescued *plane normal*, not the spoke line) is exactly the direction under which the
+    /// cross-section would falsely survive projection, so the geometric planarity test — not
+    /// that axis — is the reliable gate.
+    fn pipe_cross_section(
+        &self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+    ) -> Option<(Vec3, ProfileCell)> {
+        let cells: Vec<ProfileCell> = chains
+            .iter()
+            .filter(|chain| chain.endpoint == cut.vertex)
+            .filter_map(|chain| chain.cell)
+            .filter(|cell| cell.projection_dir.length_squared() > f32::EPSILON)
+            .collect();
+        if junction_cross_sections_are_coplanar(&cells) {
+            return None;
+        }
+        // The §7.6.2 near-collinear window (2°) the pipe test itself uses; the two pipe-edge
+        // cells share the axis *line*, so match on `|dot|` (either sense).
+        let collinear_cos = (2.0_f32.to_radians()).cos();
+        for i in 0..cells.len() {
+            let axis_i = cells[i].projection_dir.normalize();
+            for j in (i + 1)..cells.len() {
+                let axis_j = cells[j].projection_dir.normalize();
+                if axis_i.dot(axis_j).abs() >= collinear_cos {
+                    return Some((axis_i, cells[i]));
+                }
+            }
+        }
+        None
+    }
+
     /// Dispatch the rounded adjacency-grid fill at one junction (BEVEL.md §8.5).
     ///
     /// Three paths share the valence-`s` grid machinery, picked by the corner's
@@ -4571,10 +4681,12 @@ impl LoopMesh {
     ///
     /// Scope this cycle: every **smooth** exponent (circular, curved, and the straight
     /// chord) at the cube corner; circular and flat at the general ring. The square /
-    /// square-in / pipe grids (§8.5.5.5(f.4)/(f.5)/(f.6)) and the curved *general* ring
-    /// stay unfilled.
+    /// square-in grids (§8.5.5.5(f.4)/(f.5)) and the curved *general* ring stay unfilled.
+    /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
+    /// dispatch — with the cross-section replant applied by the [`build_adj_fill`] wrapper
+    /// as a post-pass.
     #[allow(clippy::too_many_arguments)]
-    fn build_adj_fill(
+    fn build_adj_fill_base(
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
@@ -18569,6 +18681,343 @@ mod tests {
             "the two skewed chains' rim nodes moved off the raw arc samples; only the \
              symmetric transverse chain's two rim nodes stay coincident",
         );
+    }
+
+    /// A genuinely-3-D pipe junction (BEVEL.md §8.5.5.5(f.6)): a `3 × 3` grid folded into a
+    /// **tent** — the middle row lifted to `z = 1`, the outer rows at `z = 0` — so the four
+    /// quads tilt into a prism whose cross-section is a real (non-collinear) roof, constant
+    /// along the ridge. The ridge runs `x` through the centre vertex 4 = (1, 1, 1); every
+    /// incident face's plane contains the `x` direction, so all normals are ⊥ `x` (the pipe
+    /// face-normal condition). Beveling the centre's `±x` spokes (to 3 / 5, collinear) plus
+    /// one (`s = 3`) or both (`s = 4`) transverse spokes (to 7 / 1) plants the pipe.
+    fn tented_grid_pipe(
+        beveled_spokes: &[usize],
+        offset: f32,
+        segments: u32,
+        method: BevelVmeshMethod,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        let verts: Vec<VertexKey> = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 1.0, 1.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [2.0, 2.0, 0.0],
+        ]
+        .into_iter()
+        .map(|[x, y, z]| mesh.create_vertex(Vec3::new(x, y, z)))
+        .collect();
+        for cycle in [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]] {
+            let corners: Vec<VertexKey> = cycle.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&corners, FaceCreateFlags::NONE);
+        }
+        let geom: Vec<GeomKey> = beveled_spokes
+            .iter()
+            .map(|&far| {
+                mesh.query_edge_exists(verts[4], verts[far])
+                    .expect("spoke exists")
+                    .into()
+            })
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: method,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// The perpendicular distance from the tented-grid pipe's constant cross-section
+    /// **cylinder** axis (§8.5.5.5(f.6)). The ridge runs `x` through the junction (1,1,1);
+    /// the symmetric skirts make the circular (`offset`-radius) cross-section a quarter
+    /// circle whose centre sits on the mirror plane `y = 1` at `z = 1 − offset·√2`, so a
+    /// vert lands **on the cross-section** iff this equals `offset`. The rounded base-grid
+    /// cap does not — that is what the replant corrects.
+    fn tented_pipe_cyl_distance(position: Vec3, offset: f32) -> f32 {
+        let axis_z = 1.0 - offset * std::f32::consts::SQRT_2;
+        ((position.y - 1.0).powi(2) + (position.z - axis_z).powi(2)).sqrt()
+    }
+
+    /// The bevel-created vert closest to the pipe junction (1,1,1): the innermost cap vert
+    /// — the welded / central apex (`segments = 2`) or a central `s`-gon vert
+    /// (`segments = 3`) — which the §8.5.5.5(f.6) replant snaps onto the cross-section.
+    fn innermost_cap_vert(mesh: &LoopMesh, result: &BevelResult) -> Vec3 {
+        result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .min_by(|a, b| {
+                let da = (*a - Vec3::new(1.0, 1.0, 1.0)).length();
+                let db = (*b - Vec3::new(1.0, 1.0, 1.0)).length();
+                da.partial_cmp(&db).unwrap()
+            })
+            .expect("the pipe fill created cap verts")
+    }
+
+    /// §8.5.5.5(f.6): the replant snaps an interior grid vert onto its station's profile
+    /// curve — a point off the curve is projected on, the station (position along the pipe
+    /// axis) is preserved, and a point already on the curve is a fixed point (idempotent).
+    #[test]
+    fn pipe_replant_snaps_interior_onto_cross_section() {
+        // A unit quarter-circle cross-section in the `y–z` plane; pipe axis `x`.
+        let cell = ProfileCell::from_control_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        );
+        // A point off the arc at station `x = 5`, on the `(0,1,1)` diagonal.
+        let replanted = pipe_cross_section_replant(Vec3::new(5.0, 2.0, 2.0), Vec3::X, &cell, 2.0);
+        let expected = Vec3::new(5.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+        assert!(
+            (replanted - expected).length() < 1.0e-5,
+            "off-curve vert snaps onto the arc at its own station: {replanted:?}",
+        );
+        // On the unit circle in the cross-section plane, at the station it was carried to.
+        assert!((replanted.x - 5.0).abs() < 1.0e-5, "station (pipe-axis coord) preserved");
+        let radius = (replanted.y.powi(2) + replanted.z.powi(2)).sqrt();
+        assert!(
+            (radius - 1.0).abs() < 1.0e-5,
+            "lands on the unit-radius cross-section circle",
+        );
+        // Idempotent: re-planting a vert already on the curve does not move it.
+        let again = pipe_cross_section_replant(replanted, Vec3::X, &cell, 2.0);
+        assert!((again - replanted).length() < 1.0e-6, "replant is idempotent on the curve");
+    }
+
+    /// §8.5.5.5(f.6): the two degenerate cross-sections collapse to a nearest-point rule
+    /// rather than asserting — a point cross-section (`start' == end'`) captures every vert,
+    /// and a chord cross-section (collinear projected control points, e.g. a flat-chamfer
+    /// pipe) captures the nearest point of the chord.
+    #[test]
+    fn pipe_replant_degenerate_point_and_chord_fallbacks() {
+        // `start` / `end` differ only along the pipe axis, so both project to one station
+        // point — the cross-section is a single point.
+        let point_cell = ProfileCell::from_control_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        );
+        let collapsed = pipe_cross_section_replant(Vec3::new(4.0, 9.0, 9.0), Vec3::X, &point_cell, 2.0);
+        assert!(
+            (collapsed - Vec3::new(4.0, 1.0, 0.0)).length() < 1.0e-5,
+            "a point cross-section captures the vert at its station: {collapsed:?}",
+        );
+        // Collinear control points: the cross-section is the chord `start'–end'`.
+        let chord_cell = ProfileCell::from_control_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        );
+        let onto_chord = pipe_cross_section_replant(Vec3::new(0.0, 5.0, 4.0), Vec3::X, &chord_cell, 2.0);
+        assert!(
+            (onto_chord - Vec3::new(0.0, 3.0, 0.0)).length() < 1.0e-5,
+            "a chord cross-section clamps the vert onto the segment end: {onto_chord:?}",
+        );
+    }
+
+    /// §8.5.5.5(f.6): the replant discriminator is junction planarity. A flat junction's
+    /// cross-section control points are coplanar (the base grid is already correct → decline);
+    /// a genuine tube's wrap out of any one plane (→ replant).
+    #[test]
+    fn pipe_coplanar_junction_gates_the_replant() {
+        // Two sectors of a flat junction: both arcs sit in the `z = 0` plane.
+        let flat = [
+            ProfileCell::from_control_points(
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.8, 0.8, 0.0),
+            ),
+            ProfileCell::from_control_points(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(-0.8, 0.8, 0.0),
+            ),
+        ];
+        assert!(
+            junction_cross_sections_are_coplanar(&flat),
+            "a flat junction's cross-sections are coplanar, so the replant declines",
+        );
+        // A tented tube: the second sector lifts its arc to `z = 1`, out of the first's plane.
+        let tube = [
+            ProfileCell::from_control_points(
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.8, 0.8, 0.0),
+            ),
+            ProfileCell::from_control_points(
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(-1.0, 0.0, 1.0),
+                Vec3::new(-0.8, 0.8, 1.0),
+            ),
+        ];
+        assert!(
+            !junction_cross_sections_are_coplanar(&tube),
+            "a genuine tube wraps its cross-section out of any one plane, so the replant fires",
+        );
+    }
+
+    /// BUG-1 regression (BEVEL.md §8.5.5.5(f.6) vs §8.3.4.1): a **flat/planar**
+    /// opposite-spokes junction trips the §8.3.4.1 pipe predicate, but its base ADJ grid is
+    /// already the constant cross-section — the (f.6) replant must be a no-op. The flat
+    /// valence-4 fan is 4-fold symmetric about the origin, so its interior verts stay in
+    /// `z = 0` and their centroid sits on the origin; the regression dragged every interior
+    /// vert onto a single boundvert chord, clustering them off-centre.
+    #[test]
+    fn planar_pipe_override_leaves_the_flat_grid_unmoved() {
+        let offset = 0.2;
+        for (method, segments) in [
+            (BevelVmeshMethod::Adj, 2),
+            (BevelVmeshMethod::Adj, 3),
+            (BevelVmeshMethod::Cutoff, 2),
+            (BevelVmeshMethod::Cutoff, 3),
+        ] {
+            let (mut mesh, centre, rim) = planar_fan(12);
+            // Two anti-parallel pairs (0°/180°, 90°/270°): a planar valence-4 pipe.
+            let geom: Vec<GeomKey> = [0usize, 3, 6, 9]
+                .into_iter()
+                .map(|k| mesh.query_edge_exists(centre, rim[k]).expect("spoke").into())
+                .collect();
+            let result = mesh.bevel(
+                &geom,
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    vmesh_method: method,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let interior: Vec<Vec3> = result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            assert!(!interior.is_empty(), "the fill created interior verts");
+            let centroid = interior.iter().sum::<Vec3>() / interior.len() as f32;
+            assert!(
+                centroid.length() < 1.0e-4,
+                "flat pipe leaves the symmetric grid centred on the origin ({method:?}, seg {segments}): {centroid:?}",
+            );
+            assert!(
+                interior.iter().all(|p| p.z.abs() < 1.0e-4),
+                "flat pipe keeps every interior vert in the fan plane ({method:?}, seg {segments})",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6): a **valence-3** tube junction (octant tri-corner base grid) at
+    /// `segments = 2` and `3`, ADJ fill. The base grid is re-tiled by the cross-section
+    /// replant, so the innermost cap vert lands exactly on the constant tube cross-section
+    /// (a rounded base cap would sit off it). Counts and the odd-`segments` central triangle
+    /// pin the base-grid topology.
+    #[test]
+    fn pipe_adj_three_way_tube_retiles_onto_cross_section() {
+        let offset = 0.2;
+
+        let (mesh, result) = tented_grid_pipe(&[3, 5, 7], offset, 2, BevelVmeshMethod::Adj);
+        assert_eq!(mesh.vert_keys().len(), 21, "V");
+        assert_eq!(mesh.edge_keys().len(), 33, "E");
+        assert_eq!(mesh.face_keys().len(), 13, "F");
+        let apex = innermost_cap_vert(&mesh, &result);
+        assert!(
+            (tented_pipe_cyl_distance(apex, offset) - offset).abs() < 1.0e-4,
+            "the seg-2 pipe apex is re-planted onto the tube cross-section, not the rounded cap",
+        );
+
+        let (mesh, result) = tented_grid_pipe(&[3, 5, 7], offset, 3, BevelVmeshMethod::Adj);
+        assert_eq!(mesh.vert_keys().len(), 29, "V");
+        assert_eq!(mesh.edge_keys().len(), 48, "E");
+        assert_eq!(mesh.face_keys().len(), 20, "F");
+        let histogram = face_side_histogram(&mesh);
+        assert_eq!(
+            histogram.get(&3).copied().unwrap_or(0),
+            1,
+            "the valence-3 odd-`segments` base grid closes on one central triangle",
+        );
+        let central = innermost_cap_vert(&mesh, &result);
+        assert!(
+            (tented_pipe_cyl_distance(central, offset) - offset).abs() < 1.0e-4,
+            "the seg-3 central-triangle vert is re-planted onto the tube cross-section",
+        );
+    }
+
+    /// §8.5.5.5(f.6): a **valence-4** tube junction (general base grid) at `segments = 2`
+    /// and `3`, ADJ fill. Unlike the valence-3 case its odd-`segments` centre is a central
+    /// **quad** (`s = 4`), not a triangle — the general-grid vs octant-grid base
+    /// distinction — yet the same replant snaps the cap onto the constant cross-section.
+    #[test]
+    fn pipe_adj_four_way_tube_retiles_onto_cross_section() {
+        let offset = 0.2;
+
+        let (mesh, result) = tented_grid_pipe(&[3, 5, 7, 1], offset, 2, BevelVmeshMethod::Adj);
+        assert_eq!(mesh.vert_keys().len(), 25, "V");
+        assert_eq!(mesh.edge_keys().len(), 40, "E");
+        assert_eq!(mesh.face_keys().len(), 16, "F");
+        let apex = innermost_cap_vert(&mesh, &result);
+        assert!(
+            (tented_pipe_cyl_distance(apex, offset) - offset).abs() < 1.0e-4,
+            "the seg-2 valence-4 welded apex is re-planted onto the tube cross-section",
+        );
+
+        let (mesh, result) = tented_grid_pipe(&[3, 5, 7, 1], offset, 3, BevelVmeshMethod::Adj);
+        assert_eq!(mesh.vert_keys().len(), 36, "V");
+        assert_eq!(mesh.edge_keys().len(), 60, "E");
+        assert_eq!(mesh.face_keys().len(), 25, "F");
+        let histogram = face_side_histogram(&mesh);
+        assert_eq!(
+            histogram.get(&3).copied().unwrap_or(0),
+            0,
+            "the valence-4 base grid closes on a central quad, so it emits no triangle",
+        );
+        let central = innermost_cap_vert(&mesh, &result);
+        assert!(
+            (tented_pipe_cyl_distance(central, offset) - offset).abs() < 1.0e-4,
+            "the seg-3 valence-4 central vert is re-planted onto the tube cross-section",
+        );
+    }
+
+    /// §8.3.4.1 + §8.5.5.5(f.6): the CUTOFF pipe override delegates its connected fill to
+    /// the ADJ path, so the cross-section replant runs there too — the connected cap lands
+    /// on the tube cross-section, and the override still mints its `(segments − 1)·s` loose
+    /// leftovers on top (counts = the ADJ fill plus the loose verts).
+    #[test]
+    fn pipe_cutoff_override_tube_retiles_like_adj_plus_loose() {
+        let offset = 0.2;
+
+        let (mesh, result) = tented_grid_pipe(&[3, 5, 7], offset, 3, BevelVmeshMethod::Cutoff);
+        assert_eq!(mesh.vert_keys().len(), 35, "V = 29 ADJ + 6 loose");
+        assert_eq!(mesh.edge_keys().len(), 48, "E matches ADJ");
+        assert_eq!(mesh.face_keys().len(), 20, "F matches ADJ");
+        assert_eq!(loose_vertex_count(&mesh), 6, "(segments − 1)·s = 2·3 loose leftovers");
+        // The connected cap vert (loose leftovers are valence-0, so the innermost *connected*
+        // vert is the cap) sits on the tube cross-section — the replant reached the CUTOFF path.
+        let connected_cap = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| mesh.iter_disk_edges(v).next().is_some())
+            .map(|v| mesh.vertex_position(v))
+            .min_by(|a, b| {
+                let da = (*a - Vec3::new(1.0, 1.0, 1.0)).length();
+                let db = (*b - Vec3::new(1.0, 1.0, 1.0)).length();
+                da.partial_cmp(&db).unwrap()
+            })
+            .expect("connected cap vert");
+        assert!(
+            (tented_pipe_cyl_distance(connected_cap, offset) - offset).abs() < 1.0e-4,
+            "the CUTOFF-override connected cap is re-planted onto the tube cross-section",
+        );
+
+        let (mesh, _r) = tented_grid_pipe(&[3, 5, 7, 1], offset, 2, BevelVmeshMethod::Cutoff);
+        assert_eq!(mesh.vert_keys().len(), 29, "valence-4 V = 25 ADJ + 4 loose");
+        assert_eq!(loose_vertex_count(&mesh), 4, "(segments − 1)·s = 1·4 loose leftovers");
     }
 
     /// Build the cube-corner `s = 3` ADJ junction at `segments = 2` (BEVEL.md §8.5).
@@ -37011,6 +37460,13 @@ const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
 /// §8.3.0.3 weld plane and each profile's existing projection plane are tested against.
 const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
 
+/// Signed distance below which a junction's cross-section control points are treated as
+/// coplanar — the §8.5.5.5(f.6) flat-vs-tube gate. A genuine tube wraps its cross-section
+/// out of any plane by a fraction of the offset (order 0.1 wu on the test fixtures), while a
+/// flat §8.3.4.1 junction is coplanar to machine precision, so the two are separated by four
+/// orders of magnitude and this floor sits comfortably between them.
+const COPLANAR_JUNCTION_TOLERANCE: f32 = 1.0e-4;
+
 /// (Anti)parallel tolerance on two unit plane **normals** for the §8.3.0.3 weld
 /// override's per-profile coplanarity skip: a profile whose projection plane already is
 /// the weld plane keeps its own normal.
@@ -38413,6 +38869,112 @@ fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
     let norm = (scaled.x.powf(exponent) + scaled.y.powf(exponent) + scaled.z.powf(exponent))
         .powf(1.0 / exponent);
     scaled / norm
+}
+
+/// Whether every cross-section control point at a junction lies in one plane (BEVEL.md
+/// §8.5.5.5(f.6)) — the discriminator between the two junctions the §8.3.4.1 pipe predicate
+/// conflates:
+///
+/// - a **flat/planar** anti-parallel or wire-disk junction (coplanar): the base ADJ grid is
+///   already the constant cross-section, so the replant must decline;
+/// - a **genuine 3-D tube** (non-coplanar): its cross-section wraps out of any one plane, so
+///   the replant re-tiles the base grid onto it.
+///
+/// Planarity is used rather than "does the cross-section survive projection along the
+/// reported axis", because a rescued planar cell reports its *plane normal* as the axis
+/// (§8.2.2.1) — the one direction under which the flat cross-section would falsely survive.
+/// The junction's geometric planarity does not depend on that reported axis at all.
+fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
+    let points: Vec<Vec3> = cells
+        .iter()
+        .flat_map(|cell| [cell.start, cell.end, cell.mid])
+        .collect();
+    if points.len() < 4 {
+        return true;
+    }
+    let origin = points[0];
+    // The best-conditioned plane normal among the spanning pairs off `origin`.
+    let mut normal = Vec3::ZERO;
+    let mut best = 0.0_f32;
+    for i in 1..points.len() {
+        for j in (i + 1)..points.len() {
+            let candidate = (points[i] - origin).cross(points[j] - origin);
+            let magnitude = candidate.length();
+            if magnitude > best {
+                best = magnitude;
+                normal = candidate;
+            }
+        }
+    }
+    // Every point collinear ⇒ trivially coplanar (a degenerate cross-section chord).
+    if best <= COLLINEAR_MID_TOLERANCE {
+        return true;
+    }
+    let normal = normal / best;
+    points
+        .iter()
+        .all(|&point| (point - origin).dot(normal).abs() <= COPLANAR_JUNCTION_TOLERANCE)
+}
+
+/// Re-plant one interior grid vert onto a pipe junction's constant cross-section
+/// (BEVEL.md §8.5.5.5(f.6), the cross-section replant). `base` is the vert's base-grid
+/// position; the result lies on the pipe boundvert's profile curve, evaluated in the
+/// plane through `base` whose normal is `pipe_axis`.
+///
+/// The three profile control points `start` / `mid` / `end` are carried into that station
+/// plane by orthogonal projection along the axis — the operation that "forgets which
+/// station you are at", which is what makes the cross-section constant along the pipe.
+/// `base` is then read into that planar cell's `(u, v)` frame, snapped onto the §8.6.1
+/// superellipse `u^r + v^r = 1` there (the §8.5.5.5(f.2) surface snap with a zero third
+/// octant coordinate, so only its 2-D behaviour is exercised), and carried back out.
+///
+/// Two shapes admit no curve and collapse to a nearest-point rule, and both are routine
+/// (a pipe through a flat-chamfer profile takes the second): a cross-section degenerated
+/// to a single point (`start' == end'`), and one degenerated to the straight chord
+/// `start'–end'` (collinear projected control points).
+fn pipe_cross_section_replant(
+    base: Vec3,
+    pipe_axis: Vec3,
+    cell: &ProfileCell,
+    exponent: f32,
+) -> Vec3 {
+    let axis = pipe_axis.normalize_or_zero();
+    let to_station = |point: Vec3| point - (point - base).dot(axis) * axis;
+    let start = to_station(cell.start);
+    let end = to_station(cell.end);
+    let mid = to_station(cell.mid);
+
+    // Degenerate: the cross-section is a single point — every vert replants onto it.
+    if (end - start).length() <= COLLINEAR_MID_TOLERANCE {
+        return start;
+    }
+    let a_axis = mid - start;
+    let b_axis = mid - end;
+    // Degenerate: the projected control points are collinear (a flat-chamfer cross-section),
+    // so the curve is the chord `start'–end'` and the vert replants onto its nearest point.
+    if a_axis.cross(b_axis).length() <= COLLINEAR_MID_TOLERANCE {
+        return closest_point_on_segment(base, start, end);
+    }
+
+    // `base` in the planar cell's `(u, v)` frame (§8.2.2.1): solve
+    // `base − origin = u·a_axis + v·b_axis` by the 2×2 normal equations. `base` and the two
+    // axes are coplanar (the station plane), so the projection error is zero.
+    let origin = start + end - mid;
+    let offset = base - origin;
+    let aa = a_axis.dot(a_axis);
+    let ab = a_axis.dot(b_axis);
+    let bb = b_axis.dot(b_axis);
+    let determinant = aa * bb - ab * ab;
+    if determinant.abs() <= f32::EPSILON {
+        return closest_point_on_segment(base, start, end);
+    }
+    let ap = a_axis.dot(offset);
+    let bp = b_axis.dot(offset);
+    let u = (ap * bb - bp * ab) / determinant;
+    let v = (aa * bp - ab * ap) / determinant;
+
+    let snapped = snap_to_unit_superellipsoid(Vec3::new(u, v, 0.0), exponent);
+    origin + snapped.x * a_axis + snapped.y * b_axis
 }
 
 /// The generating profile of one ring edge of a [V-ADJ] cap (BEVEL.md §8.5.5.5(a)),
