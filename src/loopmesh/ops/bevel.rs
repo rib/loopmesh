@@ -3261,22 +3261,6 @@ impl LoopMesh {
                 self.vertex_position(far)
             })
             .collect();
-        // §8.9.1 signed reflex test, evaluated in the genuine vertex-normal frame `n_ref` —
-        // `junction_outward_normal` (`outward`), the averaged incident-face normal — **not** a
-        // single sector face's raw normal, which flips sign on off-plane sectors at an
-        // irregular junction. Inert on the convex pyramid / cube-corner rings (the verdict is
-        // `false` either way), but load-bearing for the reflex sectors this flag classifies.
-        let boundvert_reflex: Vec<bool> = (0..count)
-            .map(|i| {
-                let edge_in = opening_edge_directions[i];
-                let edge_out = opening_edge_directions[(i + 1) % count];
-                if edge_in == Vec3::ZERO || edge_out == Vec3::ZERO {
-                    return false;
-                }
-                edge_in.cross(edge_out).dot(outward) < 0.0
-            })
-            .collect();
-
         // §8.3.4.1: read the pipe-override verdict off the *original* corner before the
         // chains are built — the beveled-edge directions and incident-face normals are
         // consumed by the re-stitch. It is captured here (not only carried on the cut for
@@ -3411,7 +3395,6 @@ impl LoopMesh {
             pipe_override,
             opening_edge_directions,
             opening_edge_tips,
-            boundvert_reflex,
         });
     }
 
@@ -6242,7 +6225,6 @@ impl LoopMesh {
         let seeds = square_ring_centreline_seeds(
             &omj.opening_edge_directions,
             &omj.opening_edge_tips,
-            &omj.boundvert_reflex,
             &boundvert_positions,
             vertex_position,
             arc_patch.as_ref(),
@@ -6689,7 +6671,6 @@ impl LoopMesh {
         let seeds = square_ring_centreline_seeds(
             &cut.opening_edge_directions,
             &cut.opening_edge_tips,
-            &cut.boundvert_reflex,
             &boundvert_positions,
             vertex_position,
             // The plain junction cut carries no outer miter, so no arc/patch start —
@@ -12738,12 +12719,6 @@ struct JunctionCut {
     /// (the beveled-edge tip away from `vertex`). Pairs with `vertex` to give the beveled-edge
     /// **segment** that §8.5.5.5(f.5)'s pass-2 seed projects the later boundvert onto.
     opening_edge_tips: Vec<Vec3>,
-    /// Per boundvert `i`, whether its disk sector (bounded by `opening_edges[i]` and
-    /// `opening_edges[i + 1]`) is **reflex** by §8.9.1's signed 3-D test (`cross · n_ref < 0`).
-    /// A reflex — or straight — boundvert proposes no §8.5.5.5(f.5) centreline candidate
-    /// (pass-1 case 4); its centrelines fall to pass 2. Captured here since the sector faces
-    /// the test reads are gone by fill time.
-    boundvert_reflex: Vec<bool>,
 }
 
 impl JunctionCut {
@@ -20178,7 +20153,6 @@ mod tests {
         let sharp2 = (e_trail + e_third).normalize() * 0.5;
         let sharp3 = (e_third + e_lead).normalize() * 0.5;
         let boundverts = vec![b1, b3, sharp2, sharp3];
-        let reflex = vec![false; 4];
 
         let arc_middle = Vec3::new(0.0, 0.4, 0.6);
         let arc_patch = ArcPatchStart {
@@ -20189,7 +20163,6 @@ mod tests {
         let seeds = square_ring_centreline_seeds(
             &directions,
             &tips,
-            &reflex,
             &boundverts,
             vertex,
             Some(&arc_patch),
@@ -20242,7 +20215,6 @@ mod tests {
         let sharp3 = (e_a + e_b).normalize() * 0.5;
         let sharp4 = (e_b + e_lead).normalize() * 0.5;
         let boundverts = vec![b1, b2, b3, sharp3, sharp4];
-        let reflex = vec![false; 5];
 
         let arc_patch = ArcPatchStart {
             index: 0,
@@ -20252,7 +20224,6 @@ mod tests {
         let seeds = square_ring_centreline_seeds(
             &directions,
             &tips,
-            &reflex,
             &boundverts,
             vertex,
             Some(&arc_patch),
@@ -24286,7 +24257,6 @@ mod tests {
             pipe_override: false,
             opening_edge_directions: Vec::new(),
             opening_edge_tips: Vec::new(),
-            boundvert_reflex: Vec::new(),
         };
 
         // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
@@ -25299,13 +25269,11 @@ mod tests {
             pipe_override: false,
             opening_edge_directions: directions.clone(),
             opening_edge_tips: tips,
-            boundvert_reflex: vec![false; 4],
         };
 
         let seeds = square_ring_centreline_seeds(
             &cut.opening_edge_directions,
             &cut.opening_edge_tips,
-            &cut.boundvert_reflex,
             &boundverts,
             Vec3::ZERO,
             None,
@@ -25363,12 +25331,9 @@ mod tests {
             Vec3::new(-0.9, -0.1, 0.0),
             Vec3::new(0.5, -0.3, -0.2),
         ];
-        let reflex = vec![false; 4];
-
         let seeds = square_ring_centreline_seeds(
             &directions,
             &tips,
-            &reflex,
             &boundverts,
             Vec3::ZERO,
             None,
@@ -25428,12 +25393,10 @@ mod tests {
             })
             .collect();
 
-        // Flag the very-open boundvert reflex (sector 3 spans az175→az360 > π), mirroring the
-        // real junction-cut classification. The fix must still generate its proposals.
-        let mut reflex = vec![false; 4];
-        reflex[3] = true;
+        // Sector 3 spans az175→az360 > π (a reflex boundvert in the real junction-cut
+        // classification); the seed pass generates its proposals regardless of that classification.
         let seeds =
-            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+            square_ring_centreline_seeds(&directions, &tips, &boundverts, vertex, None);
 
         let mut saw_divergent_spoke = false;
         for i in 0..4 {
@@ -25511,9 +25474,8 @@ mod tests {
                 vertex + offset * (da + db) / da.cross(db).length()
             })
             .collect();
-        let reflex = vec![false; 4];
         let seeds =
-            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+            square_ring_centreline_seeds(&directions, &tips, &boundverts, vertex, None);
 
         for i in 0..4 {
             let edge_out = directions[(i + 1) % 4];
@@ -25529,6 +25491,12 @@ mod tests {
             assert!(
                 (from_i - from_next).length() < 1.0e-3,
                 "on a regular convex ring the two flanking proposals coincide (tiebreak inert)",
+            );
+            // With the two proposals coincident, the arbitration survivor is that shared value:
+            // pin the actual seed, not merely the proposals' agreement.
+            assert!(
+                (seeds[i] - from_i).length() < 1.0e-3,
+                "seed {i} lands on the (coincident) flanking parallel-offset proposal",
             );
             assert!(
                 seeds[i].cross(edge_out).length() < 1.0e-5,
@@ -25645,9 +25613,8 @@ mod tests {
                 vertex + offset * (da + db) / da.cross(db).length()
             })
             .collect();
-        let reflex = vec![false; 4];
         let seeds =
-            square_ring_centreline_seeds(&directions, &tips, &reflex, &boundverts, vertex, None);
+            square_ring_centreline_seeds(&directions, &tips, &boundverts, vertex, None);
 
         for i in 0..4 {
             let edge_out = directions[(i + 1) % 4];
@@ -40054,11 +40021,6 @@ fn line_line_nearest_on_first(
 fn square_ring_centreline_seeds(
     directions: &[Vec3],
     tips: &[Vec3],
-    // Retained on the interface (the signed §8.9.1 corner classification the callers already
-    // carry), but the parallel-offset proposal is unconditional in the corner angle — a reflex
-    // boundvert still lands its flanking centrelines' near-`v` proposals — so the pass no longer
-    // reads it. Pass 2 keys off proposal presence, not this flag.
-    _boundvert_reflex: &[bool],
     boundverts: &[Vec3],
     vertex: Vec3,
     arc_patch: Option<&ArcPatchStart>,
@@ -40069,10 +40031,10 @@ fn square_ring_centreline_seeds(
     // This is the whole of the skip-ahead (§8.5.5.5(f.5) case 1/2 "the pass resumes at
     // `B_{i+2}` / `B_{i+3}`"): only the *consumed boundverts* are held out of the case-3
     // proposal loop. The sector `B_3` opens is **not** separately suppressed — its trailing
-    // bounding boundvert is an ordinary sharp boundvert, and per the arbitration rule it
-    // still emits its parallel-offset proposal for that sector (closer-to-`v` wins). Pass 2's
-    // arc branch is the *fallback* for when that trailing boundvert is non-sharp (straight /
-    // reflex) and so proposes nothing.
+    // bounding boundvert emits its parallel-offset proposal for that sector whenever the foot
+    // exists (convex or reflex; per the arbitration rule, closer-to-`v` wins). Pass 2's arc
+    // branch is the *fallback* for when that trailing boundvert proposes nothing — the
+    // straight/degenerate case, where the companion line is (anti)parallel to the edge.
     let mut consumed = vec![false; sectors];
 
     // Cases 1 & 2 (§8.5.5.5(f.5)): the fired-reflex leading boundvert `B_1` seeds the
