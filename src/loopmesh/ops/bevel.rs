@@ -19383,6 +19383,64 @@ mod tests {
         );
     }
 
+    /// §8.5.5.5(f.6) scale-relative planarity: a genuinely flat junction at a **large offset**
+    /// carries an out-of-plane construction residual proportional to its extent. An absolute
+    /// world-unit floor (the old `1e-4`) would read that residual as non-planar and wrongly
+    /// re-fire the replant; the scale-relative test keeps it coplanar. Here the junction spans
+    /// ~`1e4` wu and its lone residual is `5e-3` wu — two orders of magnitude over the old
+    /// absolute floor, yet a `5e-7` fraction of the extent, so it is flat.
+    #[test]
+    fn pipe_large_offset_flat_junction_stays_coplanar() {
+        let scale = 1.0e4_f32;
+        let residual = 5.0e-3_f32; // > old absolute 1e-4 floor, ≪ relative floor · extent
+        let flat = [
+            ProfileCell::from_control_points(
+                Vec3::new(scale, 0.0, 0.0),
+                Vec3::new(0.0, scale, 0.0),
+                Vec3::new(0.8 * scale, 0.8 * scale, 0.0),
+            ),
+            ProfileCell::from_control_points(
+                Vec3::new(0.0, scale, 0.0),
+                Vec3::new(-scale, 0.0, 0.0),
+                // The extent-proportional residual lifts one control point off the `z = 0` plane.
+                Vec3::new(-0.8 * scale, 0.8 * scale, residual),
+            ),
+        ];
+        assert!(
+            junction_cross_sections_are_coplanar(&flat),
+            "a flat junction at large offset stays coplanar under the scale-relative gate",
+        );
+    }
+
+    /// §8.5.5.5(f.6) scale-relative planarity is scale-invariant for a genuine tube: its
+    /// out-of-plane wrap is a fixed fraction of its own size, so it reads as non-coplanar at
+    /// both a tiny and a huge offset. (The same tented tube as the gate test, uniformly scaled.)
+    #[test]
+    fn pipe_tube_stays_non_coplanar_across_scales() {
+        let tube_at = |scale: f32| {
+            [
+                ProfileCell::from_control_points(
+                    Vec3::new(scale, 0.0, 0.0),
+                    Vec3::new(0.0, scale, 0.0),
+                    Vec3::new(0.8 * scale, 0.8 * scale, 0.0),
+                ),
+                ProfileCell::from_control_points(
+                    Vec3::new(0.0, scale, scale),
+                    Vec3::new(-scale, 0.0, scale),
+                    Vec3::new(-0.8 * scale, 0.8 * scale, scale),
+                ),
+            ]
+        };
+        assert!(
+            !junction_cross_sections_are_coplanar(&tube_at(0.01)),
+            "a genuine tube reads as non-coplanar at a tiny offset",
+        );
+        assert!(
+            !junction_cross_sections_are_coplanar(&tube_at(100.0)),
+            "a genuine tube reads as non-coplanar at a huge offset",
+        );
+    }
+
     /// BUG-1 regression (BEVEL.md §8.5.5.5(f.6) vs §8.3.4.1): a **flat/planar**
     /// opposite-spokes junction trips the §8.3.4.1 pipe predicate, but its base ADJ grid is
     /// already the constant cross-section — the (f.6) replant must be a no-op. The flat
@@ -39020,12 +39078,18 @@ const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
 /// §8.3.0.3 weld plane and each profile's existing projection plane are tested against.
 const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
 
-/// Signed distance below which a junction's cross-section control points are treated as
-/// coplanar — the §8.5.5.5(f.6) flat-vs-tube gate. A genuine tube wraps its cross-section
-/// out of any plane by a fraction of the offset (order 0.1 wu on the test fixtures), while a
-/// flat §8.3.4.1 junction is coplanar to machine precision, so the two are separated by four
-/// orders of magnitude and this floor sits comfortably between them.
-const COPLANAR_JUNCTION_TOLERANCE: f32 = 1.0e-4;
+/// **Dimensionless** out-of-plane ratio below which a junction's cross-section control
+/// points are treated as coplanar — the §8.5.5.5(f.6) flat-vs-tube gate. The predicate
+/// divides each point's signed plane distance by the junction's characteristic size
+/// (its spanning extent off the origin), so the test is *scale-relative*: a genuine tube
+/// wraps its cross-section out of any plane by a fraction of the offset (order 0.1 of the
+/// junction's own size), while a flat §8.3.4.1 junction is coplanar to machine precision,
+/// so the two are separated by orders of magnitude and this ratio sits comfortably
+/// between them **at every offset**. An absolute world-unit floor would instead misfire
+/// at extreme offsets — a genuinely flat junction accumulates out-of-plane construction
+/// residual proportional to its extent, which crosses any fixed floor once the offset is
+/// large enough, wrongly re-firing the replant on a flat junction.
+const COPLANAR_JUNCTION_RELATIVE_TOLERANCE: f32 = 1.0e-3;
 
 /// (Anti)parallel tolerance on two unit plane **normals** for the §8.3.0.3 weld
 /// override's per-profile coplanarity skip: a profile whose projection plane already is
@@ -40744,9 +40808,24 @@ fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
         return true;
     }
     let normal = normal / best;
-    points
+    // Characteristic size: the junction's spanning extent off `origin`. The out-of-plane
+    // deviation scales with this extent (roughly with the offset), so the planarity test is
+    // taken *relative* to it rather than against an absolute world-unit floor — otherwise a
+    // flat junction's extent-proportional construction residual would cross a fixed floor at
+    // large offsets and wrongly re-fire the replant.
+    let characteristic = points
         .iter()
-        .all(|&point| (point - origin).dot(normal).abs() <= COPLANAR_JUNCTION_TOLERANCE)
+        .map(|&point| (point - origin).length())
+        .fold(0.0_f32, f32::max);
+    // All points coincident with `origin` — degenerate, so fall back to coplanar rather than
+    // dividing by ~0. (The collinear short-circuit above already covers the wider degeneracy;
+    // this only guards the ratio itself.)
+    if characteristic <= COLLINEAR_MID_TOLERANCE {
+        return true;
+    }
+    points.iter().all(|&point| {
+        (point - origin).dot(normal).abs() <= COPLANAR_JUNCTION_RELATIVE_TOLERANCE * characteristic
+    })
 }
 
 /// Re-plant one interior grid vert onto a pipe junction's constant cross-section
