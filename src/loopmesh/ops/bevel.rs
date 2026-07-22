@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use glam::{Mat3, Vec2, Vec3};
+use glam::{DVec3, Mat3, Vec2, Vec3};
 
 use super::duplicate::GeomKey;
 use super::mean_value::{mean_value_weights, PlaneProjection};
@@ -19383,62 +19383,71 @@ mod tests {
         );
     }
 
-    /// §8.5.5.5(f.6) scale-relative planarity: a genuinely flat junction at a **large offset**
-    /// carries an out-of-plane construction residual proportional to its extent. An absolute
-    /// world-unit floor (the old `1e-4`) would read that residual as non-planar and wrongly
-    /// re-fire the replant; the scale-relative test keeps it coplanar. Here the junction spans
-    /// ~`1e4` wu and its lone residual is `5e-3` wu — two orders of magnitude over the old
-    /// absolute floor, yet a `5e-7` fraction of the extent, so it is flat.
-    #[test]
-    fn pipe_large_offset_flat_junction_stays_coplanar() {
-        let scale = 1.0e4_f32;
-        let residual = 5.0e-3_f32; // > old absolute 1e-4 floor, ≪ relative floor · extent
-        let flat = [
+    /// A flat valence-4 junction, uniformly scaled: both sectors' arcs sit in `z = 0`, with one
+    /// control point lifted by a construction residual proportional to the extent (a `5e-7`
+    /// fraction — orders below the relative gate, two orders *above* the old absolute `1e-4`
+    /// floor once the extent reaches `1e4`). The whole junction is offset off the origin so the
+    /// centred/`f64` fit is exercised against a non-zero absolute position.
+    fn flat_at(scale: f32) -> [ProfileCell; 2] {
+        let residual = 5.0e-7_f32 * scale;
+        let bias = Vec3::new(0.3 * scale, -0.2 * scale, 0.0);
+        [
             ProfileCell::from_control_points(
-                Vec3::new(scale, 0.0, 0.0),
-                Vec3::new(0.0, scale, 0.0),
-                Vec3::new(0.8 * scale, 0.8 * scale, 0.0),
+                Vec3::new(scale, 0.0, 0.0) + bias,
+                Vec3::new(0.0, scale, 0.0) + bias,
+                Vec3::new(0.8 * scale, 0.8 * scale, 0.0) + bias,
             ),
             ProfileCell::from_control_points(
-                Vec3::new(0.0, scale, 0.0),
-                Vec3::new(-scale, 0.0, 0.0),
-                // The extent-proportional residual lifts one control point off the `z = 0` plane.
-                Vec3::new(-0.8 * scale, 0.8 * scale, residual),
+                Vec3::new(0.0, scale, 0.0) + bias,
+                Vec3::new(-scale, 0.0, 0.0) + bias,
+                Vec3::new(-0.8 * scale, 0.8 * scale, residual) + bias,
             ),
-        ];
-        assert!(
-            junction_cross_sections_are_coplanar(&flat),
-            "a flat junction at large offset stays coplanar under the scale-relative gate",
-        );
+        ]
     }
 
-    /// §8.5.5.5(f.6) scale-relative planarity is scale-invariant for a genuine tube: its
-    /// out-of-plane wrap is a fixed fraction of its own size, so it reads as non-coplanar at
-    /// both a tiny and a huge offset. (The same tented tube as the gate test, uniformly scaled.)
+    /// A tented tube, uniformly scaled: the second sector lifts its whole arc to `z = scale`, so
+    /// the cross-section wraps out of any one plane by a fixed fraction of its own size.
+    fn tube_at(scale: f32) -> [ProfileCell; 2] {
+        let bias = Vec3::new(0.3 * scale, -0.2 * scale, 0.0);
+        [
+            ProfileCell::from_control_points(
+                Vec3::new(scale, 0.0, 0.0) + bias,
+                Vec3::new(0.0, scale, 0.0) + bias,
+                Vec3::new(0.8 * scale, 0.8 * scale, 0.0) + bias,
+            ),
+            ProfileCell::from_control_points(
+                Vec3::new(0.0, scale, scale) + bias,
+                Vec3::new(-scale, 0.0, scale) + bias,
+                Vec3::new(-0.8 * scale, 0.8 * scale, scale) + bias,
+            ),
+        ]
+    }
+
+    /// §8.5.5.5(f.6) planarity is scale-invariant: a genuinely flat junction stays classified
+    /// coplanar (predicate `true`) across a wide radius band. The point of the centred/`f64`/
+    /// Newell rewrite is that radius 12+ no longer false-fires the replant — the residual no
+    /// longer grows with extent past the relative tolerance.
+    #[test]
+    fn pipe_flat_junction_stays_coplanar_across_scales() {
+        for scale in [0.01_f32, 0.1, 1.0, 12.0, 100.0, 1.0e3, 1.0e4] {
+            assert!(
+                junction_cross_sections_are_coplanar(&flat_at(scale)),
+                "a flat junction stays coplanar at scale {scale}",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6) planarity does not blind the gate to real pipes: a genuine tube stays
+    /// classified non-coplanar (predicate `false`) across the same radius band, since its
+    /// out-of-plane wrap is a fixed fraction of its own size at every scale.
     #[test]
     fn pipe_tube_stays_non_coplanar_across_scales() {
-        let tube_at = |scale: f32| {
-            [
-                ProfileCell::from_control_points(
-                    Vec3::new(scale, 0.0, 0.0),
-                    Vec3::new(0.0, scale, 0.0),
-                    Vec3::new(0.8 * scale, 0.8 * scale, 0.0),
-                ),
-                ProfileCell::from_control_points(
-                    Vec3::new(0.0, scale, scale),
-                    Vec3::new(-scale, 0.0, scale),
-                    Vec3::new(-0.8 * scale, 0.8 * scale, scale),
-                ),
-            ]
-        };
-        assert!(
-            !junction_cross_sections_are_coplanar(&tube_at(0.01)),
-            "a genuine tube reads as non-coplanar at a tiny offset",
-        );
-        assert!(
-            !junction_cross_sections_are_coplanar(&tube_at(100.0)),
-            "a genuine tube reads as non-coplanar at a huge offset",
-        );
+        for scale in [0.01_f32, 0.1, 1.0, 12.0, 100.0, 1.0e3, 1.0e4] {
+            assert!(
+                !junction_cross_sections_are_coplanar(&tube_at(scale)),
+                "a genuine tube stays non-coplanar at scale {scale}",
+            );
+        }
     }
 
     /// BUG-1 regression (BEVEL.md §8.5.5.5(f.6) vs §8.3.4.1): a **flat/planar**
@@ -40781,6 +40790,25 @@ fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
 /// reported axis", because a rescued planar cell reports its *plane normal* as the axis
 /// (§8.2.2.1) — the one direction under which the flat cross-section would falsely survive.
 /// The junction's geometric planarity does not depend on that reported axis at all.
+///
+/// The test is **classification-preserving** across scale, not bit-identical: it separates a
+/// flat §8.3.4.1 junction from a genuine 3-D tube at every offset from ~0.01 to ~1e4. To hold
+/// that classification steady at large offsets — where a flat junction's construction residual
+/// grows with its extent and `f32` cancellation in `point − origin` grows with it too — the fit
+/// is centred and carried in `f64`:
+///
+/// - deviations are measured off the point set's **centroid**, so conditioning no longer hinges
+///   on which point is first or on the junction's absolute world offset;
+/// - the centroid, the plane normal, and the deviation test all accumulate in `f64`, so the
+///   near-coplanar residual does not inflate through catastrophic cancellation at scale;
+/// - the normal is an area-weighted **Newell** consensus over the ordered point loop, not a
+///   single spanning pair, so no one ill-conditioned pair can set the plane. For a coplanar set
+///   every consecutive edge cross-product is parallel to the plane normal, so the Newell sum is
+///   exactly perpendicular to the plane regardless of loop ordering.
+///
+/// The comparison stays dimensionless — each deviation is judged against the junction's
+/// characteristic size (its greatest centroid offset) — so the threshold means the same fraction
+/// of extent at every scale.
 fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
     let points: Vec<Vec3> = cells
         .iter()
@@ -40789,42 +40817,46 @@ fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
     if points.len() < 4 {
         return true;
     }
-    let origin = points[0];
-    // The best-conditioned plane normal among the spanning pairs off `origin`.
-    let mut normal = Vec3::ZERO;
-    let mut best = 0.0_f32;
-    for i in 1..points.len() {
-        for j in (i + 1)..points.len() {
-            let candidate = (points[i] - origin).cross(points[j] - origin);
-            let magnitude = candidate.length();
-            if magnitude > best {
-                best = magnitude;
-                normal = candidate;
-            }
-        }
-    }
-    // Every point collinear ⇒ trivially coplanar (a degenerate cross-section chord).
-    if best <= COLLINEAR_MID_TOLERANCE {
-        return true;
-    }
-    let normal = normal / best;
-    // Characteristic size: the junction's spanning extent off `origin`. The out-of-plane
-    // deviation scales with this extent (roughly with the offset), so the planarity test is
-    // taken *relative* to it rather than against an absolute world-unit floor — otherwise a
-    // flat junction's extent-proportional construction residual would cross a fixed floor at
-    // large offsets and wrongly re-fire the replant.
-    let characteristic = points
+    let deviations: Vec<DVec3> = {
+        let centroid = points
+            .iter()
+            .fold(DVec3::ZERO, |acc, &point| acc + point.as_dvec3())
+            / points.len() as f64;
+        points
+            .iter()
+            .map(|&point| point.as_dvec3() - centroid)
+            .collect()
+    };
+    // Characteristic size: the junction's greatest offset off its centroid. The out-of-plane
+    // deviation scales with this extent (roughly with the offset), so planarity is judged
+    // *relative* to it rather than against an absolute world-unit floor — otherwise a flat
+    // junction's extent-proportional construction residual would cross a fixed floor at large
+    // offsets and wrongly re-fire the replant.
+    let characteristic = deviations
         .iter()
-        .map(|&point| (point - origin).length())
-        .fold(0.0_f32, f32::max);
-    // All points coincident with `origin` — degenerate, so fall back to coplanar rather than
-    // dividing by ~0. (The collinear short-circuit above already covers the wider degeneracy;
-    // this only guards the ratio itself.)
-    if characteristic <= COLLINEAR_MID_TOLERANCE {
+        .map(|deviation| deviation.length())
+        .fold(0.0_f64, f64::max);
+    // All points coincident ⇒ trivially coplanar (a collapsed cross-section).
+    if characteristic <= COLLINEAR_MID_TOLERANCE as f64 {
         return true;
     }
-    points.iter().all(|&point| {
-        (point - origin).dot(normal).abs() <= COPLANAR_JUNCTION_RELATIVE_TOLERANCE * characteristic
+    // Newell area-weighted normal over the centred point loop.
+    let mut normal = DVec3::ZERO;
+    for i in 0..deviations.len() {
+        let current = deviations[i];
+        let next = deviations[(i + 1) % deviations.len()];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+    // Every point collinear (or the loop's signed area cancels) ⇒ a vanishing normal relative to
+    // the junction's own squared extent ⇒ trivially coplanar (a degenerate cross-section chord).
+    if normal.length() <= COLLINEAR_MID_TOLERANCE as f64 * characteristic * characteristic {
+        return true;
+    }
+    let normal = normal / normal.length();
+    deviations.iter().all(|deviation| {
+        deviation.dot(normal).abs() <= COPLANAR_JUNCTION_RELATIVE_TOLERANCE as f64 * characteristic
     })
 }
 
