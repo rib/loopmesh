@@ -3241,6 +3241,42 @@ impl LoopMesh {
         let outward = self.junction_outward_normal(vertex);
         let count = boundverts.len();
 
+        // §8.5.5.5(f.5): the square parallel-offset grid's centreline seeds are line-line
+        // meets on the beveled edges, projected/arbitrated against the pristine corner. The
+        // beveled edges and their sector faces are consumed by the re-stitch, so their
+        // geometry — each spoke's direction and tip, and the per-sector reflex verdict — is
+        // captured here, exactly as the pipe / band verdicts are.
+        let opening_edge_directions: Vec<Vec3> = opening_edges
+            .iter()
+            .map(|&edge| {
+                self.edge_direction_from(edge, vertex, vertex_position)
+                    .unwrap_or(Vec3::ZERO)
+            })
+            .collect();
+        let opening_edge_tips: Vec<Vec3> = opening_edges
+            .iter()
+            .map(|&edge| {
+                let [a, b] = self.edge_vert_keys(edge);
+                let far = if a == vertex { b } else { a };
+                self.vertex_position(far)
+            })
+            .collect();
+        let boundvert_reflex: Vec<bool> = (0..count)
+            .map(|i| {
+                let edge_in = opening_edge_directions[i];
+                let edge_out = opening_edge_directions[(i + 1) % count];
+                if edge_in == Vec3::ZERO || edge_out == Vec3::ZERO {
+                    return false;
+                }
+                match sectors[i].corners.first() {
+                    Some(&(_, face)) => {
+                        edge_in.cross(edge_out).dot(self.face_plane_normal(face)) < 0.0
+                    }
+                    None => false,
+                }
+            })
+            .collect();
+
         // §8.3.4.1: read the pipe-override verdict off the *original* corner before the
         // chains are built — the beveled-edge directions and incident-face normals are
         // consumed by the re-stitch. It is captured here (not only carried on the cut for
@@ -3373,6 +3409,9 @@ impl LoopMesh {
             dihedral_band_ok,
             dihedral_band_deviation,
             pipe_override,
+            opening_edge_directions,
+            opening_edge_tips,
+            boundvert_reflex,
         });
     }
 
@@ -6438,16 +6477,20 @@ impl LoopMesh {
     /// **survives un-rounded** as the exact innermost (welded) vertex — the whole point of a
     /// square profile.
     ///
-    /// **Centreline start `C_i`.** The (f.5) seeding pass (a pass over boundverts; sharp
-    /// boundverts propose for both adjacent centrelines, straight/reflex sectors seed in pass
-    /// 2 by projecting the later boundvert onto the shared beveled edge) resolves, for an
-    /// **arc-free / patch-free** ring at a square profile with even `segments`, to the point
-    /// on the shared beveled edge where that sector's square cross-section folds. loopmesh
-    /// already carries that point as the sector chain's **midpoint sample**
-    /// `chain_of[i][half]` (the square profile's corner, sampled once by the arriving strips),
-    /// so it is read straight off the rim — which is also what pins each centreline to meet
-    /// the reused rim continuously. The arc-start / patch-start seeds (cases 1 & 2 of (f.5),
-    /// which need the square-profile outer miter to fire) are out of scope here.
+    /// **Centreline start `C_i`.** The (f.5) seeding pass (a pass over boundverts, resolved by
+    /// `square_ring_centreline_seeds`) lands each `C_i` at an exact **line-line meet on the
+    /// shared beveled edge** — *not* at the sector chain's midpoint. The chain midpoint is the
+    /// square cross-section's fold on the profile *rim*, which is off the beveled edge; the
+    /// real seed is the point on the edge where the two offset-line families cross. `C_i`
+    /// feeds both the interior lattice (`AdjInterior::Parallel`) **and** the grid's two
+    /// straight rim rows: (f.5) pins those rows as straight runs `(i, 0, k) = B_i + (k/h)·(C_i
+    /// − B_i)` and `(i, j, 0) = B_i + (j/h)·(C_{i−1} − B_i)`, landing on the seed rather than
+    /// following the reused profile-fold chain. So the rim chain verts keep their keys — the
+    /// cap still shares its rim with the arriving strips, and `adj_grid_vert` still returns
+    /// those keys for `j == 0` / `k == 0` — but their fold-chain **positions are overwritten**
+    /// onto the seed runs here, before the grid is emitted. The arc-start / patch-start seeds
+    /// (cases 1 & 2 of (f.5), which need the square-profile outer miter to fire) are out of
+    /// scope here; reflex / straight sectors take pass 2's projection.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_square_ring(
         &mut self,
@@ -6478,15 +6521,41 @@ impl LoopMesh {
 
         let vertex_position = self.vertex_position(cut.vertex);
         // Per sector: (`B_i`, `C_i`). `B_i` is the sector's opening boundvert; `C_i` is the
-        // centreline start, read off the rim as the sector chain's midpoint (see the doc note).
-        let starts: Vec<(Vec3, Vec3)> = (0..sectors)
-            .map(|i| {
-                (
-                    self.vertex_position(chain_of[i][0]),
-                    self.vertex_position(chain_of[i][half]),
-                )
-            })
+        // §8.5.5.5(f.5) centreline start, the exact line-line meet on the shared beveled edge
+        // (see the doc note) — resolved by the seeding pass, not read off the rim.
+        let boundvert_positions: Vec<Vec3> = (0..sectors)
+            .map(|i| self.vertex_position(chain_of[i][0]))
             .collect();
+        let seeds = square_ring_centreline_seeds(cut, &boundvert_positions, vertex_position);
+        let starts: Vec<(Vec3, Vec3)> = boundvert_positions
+            .iter()
+            .copied()
+            .zip(seeds)
+            .collect();
+
+        // §8.5.5.5(f.5): the grid's two straight rim rows run `B_i → C_i` and `B_i → C_{i−1}`
+        // as straight segments to the line-line seed, *not* along the reused profile-fold
+        // chain (whose fold midpoint sits off the beveled edge). The rim verts keep their keys
+        // (`adj_grid_vert` still returns `chain_of[i][k]` / `chain_of[i−1][seg−j]` for the
+        // boundary), so the cap stays welded to the arriving strips — only their positions are
+        // moved onto the seed runs. The interior lattice is already cast from these same runs.
+        // Each rim row covers half a chain: sector `i`'s `j = 0` row lands `chain_of[i][0..=h]`
+        // and its `k = 0` column lands `chain_of[i−1][h..=seg]`; the shared fold `chain_of[i][h]
+        // = C_i` is written from both sides to the same seed, and the boundverts (`step = 0`)
+        // are left untouched.
+        for i in 0..sectors {
+            let (b_i, c_i) = starts[i];
+            let c_prev = starts[(i + sectors - 1) % sectors].1;
+            let previous = (i + sectors - 1) % sectors;
+            for step in 1..=half {
+                let t = step as f32 / half as f32;
+                // `j = 0` rim row: `(i, 0, step) = B_i + t·(C_i − B_i)`.
+                self.set_vertex_position(chain_of[i][step], b_i + t * (c_i - b_i));
+                // `k = 0` rim column: `(i, step, 0) = B_i + t·(C_{i−1} − B_i)`, whose vert is
+                // the previous sector's chain read back from `B_i` (`chain_of[i−1][seg−step]`).
+                self.set_vertex_position(chain_of[previous][seg - step], b_i + t * (c_prev - b_i));
+            }
+        }
 
         // The face-winding anchor (§8.5.5): a point on the solid side, below the cap. The
         // square cap dips to `v` at its centre and rises to the boundvert ring, so reflecting
@@ -12490,6 +12559,22 @@ struct JunctionCut {
     /// beveled-edge directions and incident-face normals are gone by fill time — so it is
     /// captured here alongside `dihedral_band_ok`.
     pipe_override: bool,
+    /// Per sector `k` (disk order), the **pristine** unit direction of `opening_edges[k]`
+    /// out of `vertex` (BEVEL.md §8.5.5.5(f.5)). The square parallel-offset grid's centreline
+    /// seeds are line-line meets on these beveled edges, but the edges themselves are consumed
+    /// by the re-stitch — so their geometry is captured here, like `pipe_override`'s. `ZERO`
+    /// for a degenerate (zero-length) edge. Empty on synthetic cuts that never fill.
+    opening_edge_directions: Vec<Vec3>,
+    /// Per sector `k`, the pristine world position of `opening_edges[k]`'s **far** endpoint
+    /// (the beveled-edge tip away from `vertex`). Pairs with `vertex` to give the beveled-edge
+    /// **segment** that §8.5.5.5(f.5)'s pass-2 seed projects the later boundvert onto.
+    opening_edge_tips: Vec<Vec3>,
+    /// Per boundvert `i`, whether its disk sector (bounded by `opening_edges[i]` and
+    /// `opening_edges[i + 1]`) is **reflex** by §8.9.1's signed 3-D test (`cross · n_ref < 0`).
+    /// A reflex — or straight — boundvert proposes no §8.5.5.5(f.5) centreline candidate
+    /// (pass-1 case 4); its centrelines fall to pass 2. Captured here since the sector faces
+    /// the test reads are gone by fill time.
+    boundvert_reflex: Vec<bool>,
 }
 
 impl JunctionCut {
@@ -23704,6 +23789,9 @@ mod tests {
             dihedral_band_ok: false,
             dihedral_band_deviation: None,
             pipe_override: false,
+            opening_edge_directions: Vec::new(),
+            opening_edge_tips: Vec::new(),
+            boundvert_reflex: Vec::new(),
         };
 
         // Orthonormal equal-offset cube corner: meet-point spokes `d_i + d_j` over the
@@ -24626,6 +24714,195 @@ mod tests {
             assert!(
                 welds_v(&mesh, &result),
                 "segments {segments}: `v` survives as the exact welded innermost vert",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.5), the **rim run to the seed**: the general-ring square grid's two straight
+    /// rim rows run `B_i → C_i` and `B_i → C_{i−1}` to the line-line seed `C_i` **on the shared
+    /// beveled edge** — not along the profile-fold chain, whose fold midpoint folds *off* the
+    /// edge. On the symmetric pyramid apex the seed `C_i` and the whole seam centreline `CL_i`
+    /// (which runs `C_i → v`) therefore lie exactly on their slant edge's line through `v`. This
+    /// pins the rim redirect: every fold-rim vert (`C_i`) and every non-apex seam vert
+    /// (`CL_i[1..h]`) must sit on a slant line — `sectors · h` of them in all — whereas the
+    /// pre-redirect fold-chain rim left the `C_i` verts off every slant.
+    #[test]
+    fn adj_square_ring_general_ring_rim_runs_to_the_seed_on_the_beveled_edge() {
+        let apex = Vec3::new(0.0, 0.0, 1.4);
+        let bases = [
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+        ];
+        let on_a_slant = |p: Vec3| -> bool {
+            if (p - apex).length() < 1.0e-4 {
+                return false; // the welded apex sits on every slant trivially — exclude it
+            }
+            bases
+                .iter()
+                .any(|&b| (p - apex).cross(b - apex).length() < 1.0e-3)
+        };
+
+        for segments in [2_u32, 4] {
+            let half = (segments / 2) as usize;
+            let (mesh, result) = pyramid_apex_adj(segments, 0.97);
+
+            let on_slant = result
+                .verts
+                .iter()
+                .filter(|&&v| mesh.vertex_position(v).z > 0.9)
+                .filter(|&&v| on_a_slant(mesh.vertex_position(v)))
+                .count();
+            assert_eq!(
+                on_slant,
+                4 * half,
+                "segments {segments}: the {} fold-rim + seam verts must lie on their slant \
+                 edge lines (the seed run), not on the off-edge profile fold",
+                4 * half,
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.5), the **centreline seed**: at a square profile the general-ring grid's
+    /// `C_i` is the exact line-line meet **on the shared beveled edge**, resolved by the
+    /// boundvert-granularity seeding pass — *not* the profile chain's midpoint, which folds
+    /// off the edge. This pins the pass's indexing (`edge_out(i) = opening_edges[i + 1]`),
+    /// its foot-on-the-edge-line construction, and its four-fold symmetry on a synthetic
+    /// convex valence-4 apex, independent of the fill's chain machinery.
+    #[test]
+    fn square_ring_centreline_seed_lands_on_the_beveled_edge_line() {
+        let mut mesh = LoopMesh::new();
+        let vertex = mesh.create_vertex(Vec3::ZERO);
+
+        // Four convex beveled spokes splaying down-and-out, four-fold symmetric about z.
+        let directions: Vec<Vec3> = [
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ]
+        .into_iter()
+        .map(|d| d.normalize())
+        .collect();
+        // Tips two units out; boundverts half a unit out on each adjacent-spoke bisector.
+        let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
+        let boundverts: Vec<Vec3> = (0..4)
+            .map(|i| 0.5 * (directions[i] + directions[(i + 1) % 4]).normalize())
+            .collect();
+
+        let cut = JunctionCut {
+            vertex,
+            boundverts: Vec::new(),
+            opening_edges: Vec::new(),
+            outward: Vec3::ZERO,
+            central_representative: FaceTemplate::default(),
+            sector_representatives: Vec::new(),
+            centre_column_representatives: Vec::new(),
+            dihedral_band_ok: false,
+            dihedral_band_deviation: None,
+            pipe_override: false,
+            opening_edge_directions: directions.clone(),
+            opening_edge_tips: tips,
+            boundvert_reflex: vec![false; 4],
+        };
+
+        let seeds = square_ring_centreline_seeds(&cut, &boundverts, Vec3::ZERO);
+        assert_eq!(seeds.len(), 4);
+
+        for i in 0..4 {
+            let edge_out = directions[(i + 1) % 4];
+            // Defining (f.5) property: the seed lies on edge_out(i)'s line through `v` — a
+            // chain-midpoint seed would sit off the edge, failing this.
+            assert!(
+                seeds[i].cross(edge_out).length() < 1.0e-5,
+                "seed {i} must lie on its shared beveled edge line",
+            );
+            // It is a genuine interior fold, swept down the spoke from `v` (not back at `v`).
+            assert!(
+                seeds[i].dot(edge_out) > 1.0e-4,
+                "seed {i} sweeps out along the edge, away from `v`",
+            );
+        }
+
+        // Four-fold symmetry: equal reach from `v` and equal height.
+        let reach0 = seeds[0].length();
+        for i in 1..4 {
+            assert!(
+                (seeds[i].length() - reach0).abs() < 1.0e-5,
+                "symmetric reach from `v`",
+            );
+            assert!(
+                (seeds[i].z - seeds[0].z).abs() < 1.0e-5,
+                "symmetric height",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.5) **pass-2 fallback**: a centreline both of whose bounding boundverts
+    /// stop proposing (flagged reflex here) is left unseeded by pass 1 and then seeded by
+    /// projecting the sector's *later* boundvert onto the shared beveled-edge segment. This
+    /// pins that the reflex flag diverts boundverts out of pass 1 and that pass 2 lands the
+    /// seed on the edge segment. (Two adjacent reflex boundverts is unphysical at a real
+    /// junction — §8.9.1 allows one — but it is the minimal synthetic input that reaches the
+    /// pass-2 branch, since every centreline otherwise has two proposers.)
+    #[test]
+    fn square_ring_centreline_seed_reflex_boundvert_falls_to_pass_two() {
+        let mut mesh = LoopMesh::new();
+        let vertex = mesh.create_vertex(Vec3::ZERO);
+
+        let directions: Vec<Vec3> = [
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ]
+        .into_iter()
+        .map(|d| d.normalize())
+        .collect();
+        let tips: Vec<Vec3> = directions.iter().map(|&d| d * 2.0).collect();
+        let boundverts: Vec<Vec3> = (0..4)
+            .map(|i| 0.5 * (directions[i] + directions[(i + 1) % 4]).normalize())
+            .collect();
+
+        // Flag boundverts 1 and 2 reflex. CL_1's two bounding boundverts are exactly B_1 and
+        // B_2, so both its proposers vanish and CL_1 falls to pass 2; every other centreline
+        // keeps at least one proposer and stays in pass 1.
+        let mut boundvert_reflex = vec![false; 4];
+        boundvert_reflex[1] = true;
+        boundvert_reflex[2] = true;
+
+        let cut = JunctionCut {
+            vertex,
+            boundverts: Vec::new(),
+            opening_edges: Vec::new(),
+            outward: Vec3::ZERO,
+            central_representative: FaceTemplate::default(),
+            sector_representatives: Vec::new(),
+            centre_column_representatives: Vec::new(),
+            dihedral_band_ok: false,
+            dihedral_band_deviation: None,
+            pipe_override: false,
+            opening_edge_directions: directions.clone(),
+            opening_edge_tips: tips.clone(),
+            boundvert_reflex,
+        };
+
+        let seeds = square_ring_centreline_seeds(&cut, &boundverts, Vec3::ZERO);
+
+        // CL_1 (sector 1, shared edge opening_edges[2] = directions[2]) is the pass-2 seed:
+        // the closest point of the segment (`v` → tips[2]) to the later boundvert B_2.
+        let expected = closest_point_on_segment(boundverts[2], Vec3::ZERO, tips[2]);
+        assert!(
+            (seeds[1] - expected).length() < 1.0e-6,
+            "reflex neighbour forces CL_1 onto pass 2's edge-segment projection",
+        );
+        // Every seed still lands on its own shared edge line.
+        for i in 0..4 {
+            let edge_out = directions[(i + 1) % 4];
+            assert!(
+                seeds[i].cross(edge_out).length() < 1.0e-5,
+                "seed {i} lies on its shared beveled edge line",
             );
         }
     }
@@ -38949,6 +39226,86 @@ fn line_line_nearest_on_first(
     .map(|(on_first, _)| on_first)
 }
 
+/// Resolve the §8.5.5.5(f.5) **centreline seeds** `C_i` for a general-ring square
+/// parallel-offset grid — one point per grid sector, each the exact line-line meet the
+/// seeding pass lands on, *not* the profile chain's midpoint (which lies off the beveled
+/// edge). The seeds feed only the interior lattice; the rim stays the reused chain.
+///
+/// The pass is over **boundverts**, not sectors (BEVEL.md §8.5.5.5(f.5)): `edge_in(i)` is
+/// `opening_edges[i]` and `edge_out(i)` is `opening_edges[(i + 1) % s]`, the edge shared with
+/// the next boundvert, along which sector `i`'s centreline `CL_i` rides.
+///
+/// - **Pass 1 (convex / sharp boundverts).** `B_i` proposes a candidate for **both** adjacent
+///   centrelines: for `CL_i` (the sector after it), the foot — on `edge_out(i)`'s own line —
+///   of the line through `B_i` parallel to `edge_in(i)`; for `CL_{i−1}` (the sector before
+///   it), the foot on `edge_in(i)`'s line of the line through `B_i` parallel to `edge_out(i)`.
+///   A (anti)parallel pair proposes nothing (this also disposes of a straight boundvert).
+/// - **Arbitration.** A centreline can receive a proposal from each of its two bounding
+///   boundverts (two points on the same edge line); the one **closer to `v`** wins.
+/// - **Pass 2 (no-arc branch).** A centreline left unseeded (a reflex / straight sector)
+///   projects the sector's **later** boundvert onto its shared beveled-edge **segment**
+///   (`v → edge tip`), clamped to the segment; with no shared edge it falls to the midpoint.
+///
+/// The arc-start / patch-start seeds (cases 1 & 2, needing the square-profile outer miter)
+/// and pass 2's arc branches are out of scope — those centrelines take the no-arc branch.
+fn square_ring_centreline_seeds(cut: &JunctionCut, boundverts: &[Vec3], vertex: Vec3) -> Vec<Vec3> {
+    let sectors = boundverts.len();
+    let directions = &cut.opening_edge_directions;
+    let tips = &cut.opening_edge_tips;
+    let mut seeds: Vec<Option<Vec3>> = vec![None; sectors];
+
+    for i in 0..sectors {
+        if cut.boundvert_reflex.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let edge_in = directions[i];
+        let edge_out = directions[(i + 1) % sectors];
+        let boundvert = boundverts[i];
+        if let Some(candidate) = line_line_nearest_on_first(vertex, edge_out, boundvert, edge_in) {
+            seed_closer_to_vertex(&mut seeds[i], candidate, vertex);
+        }
+        let previous = (i + sectors - 1) % sectors;
+        if let Some(candidate) = line_line_nearest_on_first(vertex, edge_in, boundvert, edge_out) {
+            seed_closer_to_vertex(&mut seeds[previous], candidate, vertex);
+        }
+    }
+
+    for i in 0..sectors {
+        if seeds[i].is_some() {
+            continue;
+        }
+        let next = (i + 1) % sectors;
+        let seed = if directions[next] == Vec3::ZERO {
+            0.5 * (boundverts[i] + boundverts[next])
+        } else {
+            closest_point_on_segment(boundverts[next], vertex, tips[next])
+        };
+        seeds[i] = Some(seed);
+    }
+
+    seeds
+        .into_iter()
+        .enumerate()
+        .map(|(i, seed)| {
+            seed.unwrap_or_else(|| 0.5 * (boundverts[i] + boundverts[(i + 1) % sectors]))
+        })
+        .collect()
+}
+
+/// Keep the centreline proposal closer to `v` (BEVEL.md §8.5.5.5(f.5) arbitration): the
+/// two bounding boundverts of a sector each propose a point on the shared edge line, and the
+/// survivor is whichever is nearer the corner.
+fn seed_closer_to_vertex(slot: &mut Option<Vec3>, candidate: Vec3, vertex: Vec3) {
+    match slot {
+        None => *slot = Some(candidate),
+        Some(existing) => {
+            if (candidate - vertex).length_squared() < (*existing - vertex).length_squared() {
+                *existing = candidate;
+            }
+        }
+    }
+}
+
 /// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
 /// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
 /// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
@@ -38993,8 +39350,10 @@ enum AdjInterior<'a> {
     /// The §8.5.5.5(f.5) **general-ring** square grid — the planar parallel-offset lattice.
     /// Interior verts are line-line meets of the two families of offset lines swept from the
     /// rim toward `v`; `v` survives as the exact welded innermost vert. `starts[i]` is
-    /// `(B_i, C_i)`: the sector's opening boundvert and its centreline start (the sector
-    /// chain's midpoint, read off the rim).
+    /// `(B_i, C_i)`: the sector's opening boundvert and its centreline start — the exact
+    /// §8.5.5.5(f.5) line-line seed on the shared beveled edge (from the boundvert-granularity
+    /// seeding pass, *not* the sector chain's fold midpoint). The caller uses the same `C_i` to
+    /// reposition the straight rim rows, so rim and interior agree on the seed.
     Parallel {
         starts: &'a [(Vec3, Vec3)],
         vertex: Vec3,
