@@ -24742,7 +24742,7 @@ mod tests {
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 5.0;
         let seed = centroid + adj_fullness(0.5, 4) * (apex_position - centroid);
 
-        let coarse = AdjNet::coarse(&boundverts, &mids, seed);
+        let coarse = AdjNet::coarse(&boundverts, &mids, seed, true);
         // The sharpening pulls each interior chain sample a sixth *away* from the mean of
         // its neighbours, so it moves *outward* from the chord — a curvature sharpening,
         // never the `(1/6, 2/3, 1/6)` smoothing average.
@@ -33817,6 +33817,31 @@ mod tests {
             "three cap quads + three untouched cube quads + three grown hexagons",
         );
 
+        // §8.5.5.5(c)/§8.5.5.7: the welded apex is the deterministic once-subdivided Sabin
+        // extraordinary centre. Custom fullness F1 = 1.75/4 = 0.4375 seeds the coarse blend
+        // `(2·centroid − v) + 2·F·(v − centroid)` to a coarse centre of 0.90625 on each body-
+        // diagonal axis; **one** unmasked (custom chains are not sharpened) subdivision round
+        // with γ_3 = 0.065247584 pulls it to 0.90251. The corner is symmetric on the body
+        // diagonal, so the apex sits at `(0.90251, −0.90251, −0.90251)`.
+        let apex = custom_mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| custom_mesh.vertex_position(v))
+            .find(|p| {
+                // The welded apex sits on the corner's body diagonal (`|x| = |y| = |z|`),
+                // strictly inside the cube, off the corner `v` and off every cap rim vert.
+                (p.x.abs() - p.y.abs()).abs() < 1.0e-3
+                    && (p.x.abs() - p.z.abs()).abs() < 1.0e-3
+                    && p.x.abs() < 0.99
+            })
+            .expect("the welded body-diagonal apex");
+        let expected_apex = Vec3::new(0.902_51, -0.902_51, -0.902_51);
+        assert!(
+            (apex - expected_apex).length() < 2.0e-5,
+            "welded apex at the once-subdivided Sabin extraordinary centre: got {apex:?}, \
+             want {expected_apex:?}",
+        );
+
         // The custom sampler reshapes the boundary + fullness, so the cap vertices land at
         // different positions from the superellipse-circle bevel of the same corner.
         let mut circle_mesh = LoopMesh::new();
@@ -42545,6 +42570,13 @@ impl RingChainProfile<'_> {
                 .collect(),
         }
     }
+
+    /// Whether this ring edge samples a **custom** curve (§8.6.3). A custom chain "is not
+    /// masked at all" by the §8.5.5.5(c) sharpening tap, so a cap built over custom chains
+    /// relaxes its interior against the verbatim boundary.
+    fn is_custom(&self) -> bool {
+        matches!(self, RingChainProfile::Cell { custom: Some(_), .. })
+    }
 }
 
 /// The `segments + 1` raw samples of a miter arc (BEVEL.md §8.9.5 / §8.9.5.1) in the
@@ -42592,16 +42624,23 @@ struct AdjNet {
     /// The `sectors` raw profile chains at this resolution (`2·half + 1` samples each),
     /// oriented `B_i → B_{i+1}` — the net's Dirichlet boundary (§8.5.5.5(c)).
     chains: Vec<Vec<Vec3>>,
+    /// Whether the stencil's boundary-input copy is passed through the `(−1/6, +4/3, −1/6)`
+    /// sharpening three-tap (§8.5.5.5(c)). The analytic superellipse chains are masked; a
+    /// **custom** profile "is not masked at all" (§8.5.5.5(c)), so its chain feeds the
+    /// interior stencil verbatim — masking a concave custom mid would drag the welded apex
+    /// too deep into the solid.
+    mask_boundary: bool,
     data: Vec<Vec3>,
 }
 
 impl AdjNet {
-    fn new(sectors: usize, half: usize, chains: Vec<Vec<Vec3>>) -> AdjNet {
+    fn new(sectors: usize, half: usize, chains: Vec<Vec<Vec3>>, mask_boundary: bool) -> AdjNet {
         let stride = (half + 1) * (half + 1);
         let mut net = AdjNet {
             sectors,
             half,
             chains,
+            mask_boundary,
             data: vec![Vec3::ZERO; sectors * stride],
         };
         net.pin_boundary();
@@ -42610,12 +42649,12 @@ impl AdjNet {
 
     /// The coarse `segments = 2` control net of §8.5.5.5(a)/(b): the `s` boundverts, each
     /// ring edge's single **raw** mid-chain sample, and the fullness-seeded centre.
-    fn coarse(boundverts: &[Vec3], mids: &[Vec3], centre: Vec3) -> AdjNet {
+    fn coarse(boundverts: &[Vec3], mids: &[Vec3], centre: Vec3, mask_boundary: bool) -> AdjNet {
         let sectors = boundverts.len();
         let chains = (0..sectors)
             .map(|i| vec![boundverts[i], mids[i], boundverts[(i + 1) % sectors]])
             .collect();
-        let mut net = AdjNet::new(sectors, 1, chains);
+        let mut net = AdjNet::new(sectors, 1, chains, mask_boundary);
         net.set(0, 1, 1, centre);
         net
     }
@@ -42675,6 +42714,11 @@ impl AdjNet {
     /// mean of its two chain neighbours. It touches only what the interior relaxes
     /// against; the boundary the net stores, and the rim the fill emits, are never masked.
     fn sharpened(&self) -> AdjNet {
+        // §8.5.5.5(c): "A custom profile is not masked at all" — the chain feeds the
+        // interior stencil verbatim, so the sharpening three-tap is suppressed.
+        if !self.mask_boundary {
+            return self.clone();
+        }
         let mut input = self.clone();
         for chain in input.chains.iter_mut() {
             let raw = chain.clone();
@@ -42696,7 +42740,7 @@ impl AdjNet {
         let sectors = self.sectors;
         let half = self.half;
         let input = self.sharpened();
-        let mut next = AdjNet::new(sectors, 2 * half, next_chains);
+        let mut next = AdjNet::new(sectors, 2 * half, next_chains, self.mask_boundary);
 
         for i in 0..sectors {
             for j in 0..half {
@@ -42847,7 +42891,10 @@ fn adj_relaxed_net(
 ) -> AdjNet {
     let gamma_s = sabin_gamma(boundverts.len());
     let target = boundary_source_resolution(segments);
-    let mut net = AdjNet::coarse(boundverts, mids, centre);
+    // §8.5.5.5(c): a custom-profile ring feeds its chains to the interior stencil verbatim
+    // — no sharpening tap. The analytic superellipse chains are masked.
+    let mask_boundary = !profiles.iter().any(RingChainProfile::is_custom);
+    let mut net = AdjNet::coarse(boundverts, mids, centre, mask_boundary);
     while (2 * net.half as u32) < target {
         let resolution = 4 * net.half as u32;
         let next_chains = profiles
@@ -42980,7 +43027,8 @@ fn adj_even_extraordinary_centre(
             .raw_positions(4)
         })
         .collect();
-    AdjNet::coarse(boundverts, mids, centre_0)
+    // This closed form serves the analytic superellipse caps only; the sharpening tap runs.
+    AdjNet::coarse(boundverts, mids, centre_0, true)
         .subdivide(doubled, gamma_s)
         .at(0, 2, 2)
 }
