@@ -248,9 +248,11 @@ impl BevelCurveProfile {
     /// The custom profile's `segments + 1` sample chain in the profile **cell** frame
     /// `(u_k, v_k)` (BEVEL.md §8.6.3.1): resample the control-point Bézier at even
     /// parameter (step 4), then apply the fixed axis swap `u = y`, `v = x` (step 5). The
-    /// ends are pinned to the cell ring corners `(0, 1)` / `(1, 0)`.
-    fn sample_chain(&self, segments: u32) -> Vec<(f32, f32)> {
-        widget_chain_to_cell(&self.widget_chain(segments))
+    /// ends are pinned to the cell ring corners `(0, 1)` / `(1, 0)`. `reverse` is the
+    /// §8.6.3.1(6) handedness bit (see [`widget_chain_to_cell`]); it is a no-op on a
+    /// diagonal-symmetric chain and only observable for an asymmetric control net.
+    fn sample_chain(&self, segments: u32, reverse: bool) -> Vec<(f32, f32)> {
+        widget_chain_to_cell(&self.widget_chain(segments), reverse)
     }
 
     /// The custom-profile fullness law **F1** (BEVEL.md §8.5.5.5(f.3)):
@@ -260,7 +262,9 @@ impl BevelCurveProfile {
     /// chain gives the same value as the widget chain.
     fn fullness_f1(&self, segments: u32) -> f32 {
         let n = segments.max(1) as usize;
-        let chain = self.sample_chain(segments);
+        // The `u + v` sum is invariant under both the axis swap and the §8.6.3.1(6) mirror
+        // (the two excluded endpoints both carry `u + v = 1`), so handedness cannot move it.
+        let chain = self.sample_chain(segments, false);
         let sum: f32 = chain.iter().take(n).map(|&(u, v)| u + v).sum();
         sum / (2.0 * n as f32)
     }
@@ -33562,7 +33566,7 @@ mod tests {
     fn custom_profile_sample_chain_matches_the_evaluation_model() {
         // LINE preset: two auto points whose handles fall on the line → the diagonal.
         let line = BevelCurveProfile::preset_line();
-        let chain = line.sample_chain(2);
+        let chain = line.sample_chain(2, false);
         let expected = [(0.0, 1.0), (0.5, 0.5), (1.0, 0.0)];
         for (got, want) in chain.iter().zip(expected.iter()) {
             assert!(
@@ -33578,7 +33582,7 @@ mod tests {
             (0.5, 0.25, BevelHandle::Vector),
             (0.0, 1.0, BevelHandle::Vector),
         ]);
-        let chain2 = poly.sample_chain(2);
+        let chain2 = poly.sample_chain(2, false);
         let want2 = [(0.0, 1.0), (0.25, 0.5), (1.0, 0.0)];
         for (got, want) in chain2.iter().zip(want2.iter()) {
             assert!(
@@ -33589,7 +33593,7 @@ mod tests {
 
         // §8.6.3.1(4): at `segments = 4` the two segments split the budget evenly (2 each),
         // sampled at even parameter — the chain is the polyline sampled at its midpoints.
-        let chain4 = poly.sample_chain(4);
+        let chain4 = poly.sample_chain(4, false);
         let want4 = [
             (0.0, 1.0),
             (0.125, 0.75),
@@ -33604,6 +33608,95 @@ mod tests {
                 "segments = 4 sample {got:?} != {want:?}",
             );
         }
+    }
+
+    /// BEVEL.md §8.6.3.1(6) the handedness rule: for an asymmetric control net the `reverse`
+    /// bit mirrors every interior sample across the cell diagonal `u = v` and reverses index
+    /// order, so the classic `0.375` ↔ `0.625` flip appears. The two endpoints stay pinned.
+    #[test]
+    fn custom_profile_reverse_bit_mirrors_the_asymmetric_chain() {
+        let poly = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+
+        // segments = 2: the single interior sample flips (0.25, 0.5) ↔ (0.5, 0.25).
+        let forward = poly.sample_chain(2, false);
+        let mirrored = poly.sample_chain(2, true);
+        assert!((forward[1].0 - 0.25).abs() < 1.0e-6 && (forward[1].1 - 0.5).abs() < 1.0e-6);
+        assert!((mirrored[1].0 - 0.5).abs() < 1.0e-6 && (mirrored[1].1 - 0.25).abs() < 1.0e-6);
+        // Endpoints are pinned to the ring corners in both orientations.
+        for k in [0usize, 2] {
+            assert!((forward[k].0 - mirrored[k].0).abs() < 1.0e-6);
+            assert!((forward[k].1 - mirrored[k].1).abs() < 1.0e-6);
+        }
+
+        // segments = 4: the mirror is the forward chain swapped-and-reversed.
+        let forward4 = poly.sample_chain(4, false);
+        let mirrored4 = poly.sample_chain(4, true);
+        let want = [
+            (0.0, 1.0),
+            (0.25, 0.625),
+            (0.5, 0.25),
+            (0.75, 0.125),
+            (1.0, 0.0),
+        ];
+        for (got, w) in mirrored4.iter().zip(want.iter()) {
+            assert!(
+                (got.0 - w.0).abs() < 1.0e-6 && (got.1 - w.1).abs() < 1.0e-6,
+                "mirrored segments = 4 sample {got:?} != {w:?}",
+            );
+        }
+        // The mirror really is index-reversed + diagonal-reflected forward.
+        let n = forward4.len() - 1;
+        for k in 0..=n {
+            let (fx, fy) = forward4[n - k];
+            assert!((mirrored4[k].0 - fy).abs() < 1.0e-6 && (mirrored4[k].1 - fx).abs() < 1.0e-6);
+        }
+    }
+
+    /// BEVEL.md §8.6.3.1(6) the seed: the lower-`z` flanking boundvert is the start side, so
+    /// the isolated valence-3 cap's cell picks the forward chain when `start.z < end.z` and
+    /// the mirror when `start.z >= end.z` (exact tie ⇒ reverse). Verified through the cell so
+    /// the `z` read of `raw_chain_positions` is exercised, not just the mapping helper.
+    #[test]
+    fn custom_profile_cell_seed_selects_orientation_by_boundvert_z() {
+        let poly = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let edge_dir = Vec3::new(0.0, 0.0, 1.0);
+
+        // start.z < end.z → reverse = false → interior ties to cell (0.25, 0.5).
+        let cell_fwd = ProfileCell::new(
+            Vec3::new(1.0, 0.0, 0.2),
+            Vec3::new(0.0, 1.0, 0.8),
+            apex,
+            edge_dir,
+        );
+        let interior_fwd = cell_fwd.raw_chain_positions(2, 0.5, Some(&poly))[1];
+        assert!(
+            (interior_fwd - cell_fwd.sample(0.25, 0.5)).length()
+                < (interior_fwd - cell_fwd.sample(0.5, 0.25)).length(),
+            "start.z < end.z must take the forward orientation",
+        );
+
+        // start.z >= end.z → reverse = true → interior ties to cell (0.5, 0.25).
+        let cell_rev = ProfileCell::new(
+            Vec3::new(1.0, 0.0, 0.8),
+            Vec3::new(0.0, 1.0, 0.2),
+            apex,
+            edge_dir,
+        );
+        let interior_rev = cell_rev.raw_chain_positions(2, 0.5, Some(&poly))[1];
+        assert!(
+            (interior_rev - cell_rev.sample(0.5, 0.25)).length()
+                < (interior_rev - cell_rev.sample(0.25, 0.5)).length(),
+            "start.z >= end.z must take the mirrored orientation",
+        );
     }
 
     /// BEVEL.md §8.5.5.5(f.3) law **F1**: the custom-profile fullness is
@@ -41036,7 +41129,11 @@ impl ProfileCell {
             // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
             // bypassing the superellipse exponent / even-arc-length solve entirely.
             let cells = match custom {
-                Some(curve) => curve.sample_chain(segments),
+                // §8.6.3.1(6) seed: the lower-`z` flanking boundvert is the start side, so
+                // the mirror fires when `start` (`B_k`) sits at or above `end` (`B_(k+1)`).
+                // For the isolated valence-3 terminal cap the run is a single edge and this
+                // seed is the whole answer (propagation across multi-edge runs is unbuilt).
+                Some(curve) => curve.sample_chain(segments, self.start.z >= self.end.z),
                 None => superellipse_chain(profile, segments),
             };
             for &(u, v) in cells.iter().take(segments as usize).skip(1) {
@@ -41314,10 +41411,23 @@ fn cubic_bezier(
     )
 }
 
-/// Map a widget-frame `(x, y)` chain into the profile cell frame by the fixed axis swap
-/// `u = y`, `v = x` (BEVEL.md §8.6.3.1(5)).
-fn widget_chain_to_cell(chain: &[(f32, f32)]) -> Vec<(f32, f32)> {
-    chain.iter().map(|&(x, y)| (y, x)).collect()
+/// Map a widget-frame `(x, y)` chain into the profile cell frame (BEVEL.md §8.6.3.1(5)/(6)).
+///
+/// The `reverse` handedness bit (§8.6.3.1(6)) selects which physical ring corner an
+/// asymmetric profile's shape-start ties to. Both endpoints stay pinned to the ring corners
+/// either way; only the interior handedness differs.
+/// - `reverse = false` (forward): sample `k` → `(u_k, v_k) = (y_k, x_k)`, the plain axis
+///   swap — shape-start (widget `(1, 0)`) ties to `B_k`.
+/// - `reverse = true` (mirrored): sample `k` → `(u_k, v_k) = (x_(N−k), y_(N−k))`, i.e. the
+///   chain read from the far end with the swap **dropped** — reflects every interior sample
+///   across the cell diagonal `u = v` and reverses index order, tying shape-start to
+///   `B_(k+1)`. On a diagonal-symmetric chain this equals the forward mapping.
+fn widget_chain_to_cell(chain: &[(f32, f32)], reverse: bool) -> Vec<(f32, f32)> {
+    if reverse {
+        chain.iter().rev().map(|&(x, y)| (x, y)).collect()
+    } else {
+        chain.iter().map(|&(x, y)| (y, x)).collect()
+    }
 }
 
 /// Distribute a chain budget of `n` interior advances across the control-point segments
