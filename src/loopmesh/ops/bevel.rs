@@ -1079,6 +1079,11 @@ impl LoopMesh {
             // a real vmesh patch; every other vertex `segments ≥ 2` shape (valence < 3,
             // non-circular profiles, miters) still declines to the historical no-op below.
             if options.affect == BevelAffect::Vertices {
+                // §8.5.5.5(f.4b): vertex mode never welds. The circular profile and the
+                // square-in profile (`r = 0`) both build the general fullness grid — the
+                // tri-corner gate refuses vertex mode outright (§8.5.1), so a `profile = 0`
+                // corner takes the same code path as any curved/circular one, square-in
+                // entering only through the boundary-ring sampler and a negative fullness.
                 if let Some(built) = self.bevel_vertices_multiseg(geom, options) {
                     return built;
                 }
@@ -1362,21 +1367,30 @@ impl LoopMesh {
 
     /// Vertex-mode multi-segment cap (BEVEL.md §8.11, Stage [VV]).
     ///
-    /// Handles the **general-valence** (`s ≥ 3`), default-circular, `segments ≥ 2`
-    /// corner (§8.11.4): the §4 slide ring (a, §8.11.1), the `mid = v` /
-    /// `projection_dir = 0` profile (b, §8.11.2), and the [V-ADJ] general fullness grid
-    /// entered unconditionally (c, §8.11.3 — vertex mode is uniform across valence and
-    /// never takes the cube-corner octant fast path, so a valence-3/4/5/… corner all
-    /// route through the same §8.5.5.5 grid). The `segments = 2` coarse-net case takes
-    /// the identical path — a 1-vert profile chain per sector and an even-parity welded
-    /// apex (§8.5.5.5(e)) — differing from the higher counts only in that the general
-    /// fill's single mandatory subdivision round (§8.5.5.5(d)) resamples straight back
-    /// down to the coarse resolution.
+    /// Handles the **general-valence** (`s ≥ 3`), `segments ≥ 2` corner (§8.11.4) at the
+    /// default-circular profile **and** the square-in profile (`r = 0`, §8.5.5.5(f.4b)):
+    /// the §4 slide ring (a, §8.11.1), the `mid = v` / `projection_dir = 0` profile
+    /// (b, §8.11.2), and the [V-ADJ] general fullness grid entered unconditionally
+    /// (c, §8.11.3 — vertex mode is uniform across valence and never takes the cube-corner
+    /// octant fast path, so a valence-3/4/5/… corner all route through the same §8.5.5.5
+    /// grid). The `segments = 2` coarse-net case takes the identical path — a 1-vert
+    /// profile chain per sector and an even-parity welded apex (§8.5.5.5(e)) — differing
+    /// from the higher counts only in that the general fill's single mandatory subdivision
+    /// round (§8.5.5.5(d)) resamples straight back down to the coarse resolution.
     ///
-    /// Returns `None` when the corner is outside that regime (a non-circular profile, a
-    /// valence below 3, or a wire spoke present); the caller then declines to the
-    /// historical no-op. Single-segment vertex bevel and every edge-bevel path are
-    /// untouched — this method is reached only for `affect == VERTICES` at `segments ≥ 2`.
+    /// Square-in (§8.5.5.5(f.4b)) is *not* a special path here: it is the same grid, with
+    /// the boundary ring sampled as the concave square-in profile (§8.6.4) and the centre
+    /// seeded by the **negative** square-in fullness (§8.5.5.5(f.3) law F3 at `profile = 0`),
+    /// which pushes the coarse centre inward past the boundvert centroid. Both knobs fall
+    /// out of passing `options.profile` straight through — the fullness is `adj_fullness`
+    /// and the ring is the profile sampler. There is no surface snap (the general grid never
+    /// snaps).
+    ///
+    /// Returns `None` when the corner is outside that regime (a profile that is neither
+    /// circular nor square-in, a valence below 3, or a wire spoke present); the caller then
+    /// declines to the historical no-op. Single-segment vertex bevel and every edge-bevel
+    /// path are untouched — this method is reached only for `affect == VERTICES` at
+    /// `segments ≥ 2`.
     fn bevel_vertices_multiseg(
         &mut self,
         geom: &[GeomKey],
@@ -1384,14 +1398,17 @@ impl LoopMesh {
     ) -> Option<BevelResult> {
         let segments = options.segments;
 
-        // §8.11.4 bounds: `segments ≥ 2` and the default circular profile only (§8.11 is
-        // stated for the round profile; square / custom profiles are OUT). The `segments = 2`
+        // §8.11.4 bounds: `segments ≥ 2` and either the default circular profile or the
+        // square-in profile (`r = 0`, §8.5.5.5(f.4b) — vertex mode grids square-in instead of
+        // welding; the two knobs, the concave ring and the negative fullness, ride on
+        // `options.profile`). Other profiles (square, custom) stay OUT. The `segments = 2`
         // coarse-net case routes through the *same* general-fullness grid (§8.5.5.5) as the
         // higher counts — §8.11.3(c): vertex mode never takes the tri-corner octant fast path,
         // so a corner of any valence at `segments = 2` builds the fullness-seeded net,
         // subdivides once (§8.5.5.5(d) blockquote: always at least one round, even at seg=2),
         // and resamples the even-parity welded apex back down (§8.5.5.5(e)).
-        if segments < 2 || profile_to_exponent(options.profile) != 2.0 {
+        let exponent = profile_to_exponent(options.profile);
+        if segments < 2 || (exponent != 2.0 && exponent != 0.0) {
             return None;
         }
 
@@ -16114,6 +16131,177 @@ mod tests {
                  [{tint_min}, {tint_max}]",
             );
         }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.4b): vertex-mode square-in (`profile = 0`) does **not** weld —
+    /// it builds the ordinary general adjacency grid, square-in shaped, so the **odd**
+    /// `segments = 3` cube corner has the full interior ring of quads closed by one central
+    /// triangle (the §8.5.5.4 odd parity), identical topology to the circular grid. Total
+    /// `8/12/6 → 19/30/13`, a closed genus-0 solid: 3 rebuilt 7-gons + 3 untouched cube
+    /// quads + 6 cap quads + 1 central triangle. The square-in shape shows only in
+    /// *positions*: the negative fullness (§8.5.5.5(f.3) F3 at `profile = 0`) pushes the
+    /// centre **inward**, away from the corner vertex — the concave notch.
+    #[test]
+    fn vertex_bevel_multiseg_square_in_odd_segments_central_triangle_cube_corner() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                profile: 0.0,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!((vertices, edges, faces), (19, 30, 13), "§8.5.5.5(f.4b) odd grid");
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "square-in odd corner bevel keeps the cube a closed genus-0 solid",
+        );
+
+        // The general grid keeps the full interior ring of quads: 6 cap quads + exactly one
+        // central triangle (the §8.5.5.4 odd parity), not the weld's lone triangle.
+        assert_eq!(result.faces.len(), 7, "6 ring quads + 1 central triangle");
+        let central: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| mesh.face_vert_keys(face).len() == 3)
+            .collect();
+        assert_eq!(central.len(), 1, "one central triangle closes the innermost ring");
+
+        // 3 boundverts + 6 chain interior (2 per sector) + 3 central-ring verts.
+        assert_eq!(result.verts.len(), 12, "3 boundverts + 6 chain mids + 3 central verts");
+
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 7, 7, 7],
+            "1 central triangle + 9 quads (3 cube + 6 cap) + 3 caved 7-gons",
+        );
+
+        // §8.5.5.5(f.4b): the negative square-in fullness seeds the centre inward. Every
+        // central-triangle vertex sits on the *far* side of the ring centroid from the
+        // corner — the concave notch, the opposite of the circular cap's outward bulge.
+        let ring_centroid = {
+            let boundverts: Vec<VertexKey> = result
+                .verts
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    result
+                        .faces
+                        .iter()
+                        .filter(|&&f| mesh.face_vert_keys(f).contains(&v))
+                        .count()
+                        == 1
+                })
+                .collect();
+            assert_eq!(boundverts.len(), 3, "three slide-ring boundverts");
+            boundverts
+                .iter()
+                .fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v))
+                / 3.0
+        };
+        let toward_corner = corner_position - ring_centroid;
+        for &tip in &mesh.face_vert_keys(central[0]) {
+            let offset = mesh.vertex_position(tip) - ring_centroid;
+            assert!(
+                offset.dot(toward_corner) < 0.0,
+                "the central triangle is notched inward (negative fullness), not bulged toward v",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.4b): vertex-mode square-in (`profile = 0`) does **not** weld — the
+    /// **even** `segments = 2` cube corner takes the general grid with a single welded apex
+    /// (the §8.5.5.4 even parity) plus the full ring of cap quads, identical topology to the
+    /// circular grid. Total `8/12/6 → 14/21/9`, a closed solid: 3 rebuilt hexagons + 3
+    /// untouched cube quads + 3 cap quads. Square-in enters only through positions: the
+    /// negative fullness pushes the apex **inward**, away from the corner (the concave notch).
+    #[test]
+    fn vertex_bevel_multiseg_square_in_even_segments_welded_apex_cube_corner() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 0.0,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!((vertices, edges, faces), (14, 21, 9), "§8.5.5.5(f.4b) even grid");
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "square-in even corner bevel keeps the cube a closed genus-0 solid",
+        );
+
+        // Even parity welds one apex and mints no central face, but the ring of cap quads is
+        // present (that is exactly what the weld would delete): three cap quads.
+        assert_eq!(result.faces.len(), 3, "three cap quads, no central polygon (welded apex)");
+
+        // 3 boundverts + 3 chain interior (one per sector) + 1 welded apex.
+        assert_eq!(result.verts.len(), 7, "3 ring + 3 chain mid + 1 apex");
+
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![4, 4, 4, 4, 4, 4, 6, 6, 6],
+            "3 cap quads + 3 untouched cube quads + 3 caved hexagons",
+        );
+
+        // Classify cap verts by how many cap quads they touch: boundverts (1), chain mids
+        // (2), the welded apex (3).
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let ring_verts: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&vertex| cap_membership(vertex) == 1)
+            .collect();
+        assert_eq!(ring_verts.len(), 3, "three slide-ring boundverts");
+        let ring_centroid =
+            ring_verts.iter().fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v)) / 3.0;
+        let toward_corner = corner_position - ring_centroid;
+
+        // §8.5.5.5(f.4b): the negative square-in fullness pushes the apex inward, away from
+        // the corner — the opposite of the circular even cap, whose apex bulges toward `v`.
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&vertex| cap_membership(vertex) == 3)
+            .expect("a single welded apex shared by all three cap quads");
+        let apex_offset = mesh.vertex_position(apex) - ring_centroid;
+        assert!(
+            apex_offset.dot(toward_corner) < 0.0,
+            "the welded apex is notched inward (negative fullness), not bulged toward v",
+        );
     }
 
     /// BEVEL.md §8.11.3: an interior valence-3 corner (a cube corner, all three sectors
