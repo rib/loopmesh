@@ -1075,15 +1075,16 @@ impl LoopMesh {
                 return self.bevel_edges(geom, options);
             }
             // Vertex-mode multi-segment (BEVEL.md §8.11, Stage [VV]). The
-            // general-valence (`s ≥ 3`) / default-circular / `segments ≥ 2` corner builds
-            // a real vmesh patch; every other vertex `segments ≥ 2` shape (valence < 3,
-            // non-circular profiles, miters) still declines to the historical no-op below.
+            // general-valence (`s ≥ 3`) / `segments ≥ 2` corner builds a real vmesh patch
+            // for the circle, the curved band, and both square sentinels; the remaining
+            // vertex `segments ≥ 2` shapes (valence < 3, wire spokes, miters, and the line /
+            // flat-chamfer profile) still decline to the historical no-op below.
             if options.affect == BevelAffect::Vertices {
-                // §8.5.5.5(f.4b): vertex mode never welds. The circular profile and the
-                // square-in profile (`r = 0`) both build the general fullness grid — the
-                // tri-corner gate refuses vertex mode outright (§8.5.1), so a `profile = 0`
-                // corner takes the same code path as any curved/circular one, square-in
-                // entering only through the boundary-ring sampler and a negative fullness.
+                // §8.5.5.5(f.1): vertex mode never welds and never takes the tri-corner
+                // family — the tri-corner gate refuses `affect == VERTICES` outright
+                // (§8.5.1) — so every exponent except the flat line falls to the general
+                // fullness grid, differing only in the boundary-ring sampler (§8.6) and the
+                // centre fullness (§8.5.5.5(f.3)).
                 if let Some(built) = self.bevel_vertices_multiseg(geom, options) {
                     return built;
                 }
@@ -1398,17 +1399,26 @@ impl LoopMesh {
     ) -> Option<BevelResult> {
         let segments = options.segments;
 
-        // §8.11.4 bounds: `segments ≥ 2` and either the default circular profile or the
-        // square-in profile (`r = 0`, §8.5.5.5(f.4b) — vertex mode grids square-in instead of
-        // welding; the two knobs, the concave ring and the negative fullness, ride on
-        // `options.profile`). Other profiles (square, custom) stay OUT. The `segments = 2`
-        // coarse-net case routes through the *same* general-fullness grid (§8.5.5.5) as the
-        // higher counts — §8.11.3(c): vertex mode never takes the tri-corner octant fast path,
-        // so a corner of any valence at `segments = 2` builds the fullness-seeded net,
-        // subdivides once (§8.5.5.5(d) blockquote: always at least one round, even at seg=2),
-        // and resamples the even-parity welded apex back down (§8.5.5.5(e)).
+        // §8.11.4 bounds: `segments ≥ 2` and any *bulging or concave* SUPERELLIPSE exponent.
+        // Vertex mode routes every exponent to the general fullness grid (§8.5.5.5(f.1)
+        // dispatch): steps 1 and 3 — the parallel-offset square grid and the tri-corner
+        // family — are edge-bevel only, and step 4's tri-corner shortcut is refused for
+        // `affect == VERTICES` (§8.5.1), so the circle, the curved band, and both square
+        // sentinels (square `r = ∞` and square-in `r = 0`) all fall to the same (a)–(e)
+        // grid. The exponent only shapes two knobs, both riding on `options.profile`: the
+        // boundary-ring sampler (§8.6, `superellipse_chain`) and the centre fullness
+        // (§8.5.5.5(f.3), `adj_fullness`). The one exponent held out here is the **line /
+        // flat chamfer** (`r = 1`, `profile = 0.25`): the guide routes it to the same grid
+        // with a *planar* cap (§8.5.5.5(f.1) step 4 F2 → the §8.3.0.2.1 `flat` branch), a
+        // distinct construction that stays a follow-up; a line profile keeps declining to
+        // the historical no-op. Custom profiles are unreachable (no `profile_type = CUSTOM`).
+        // The `segments = 2` coarse-net case routes through the *same* grid — §8.11.3(c):
+        // vertex mode never takes the tri-corner octant fast path, so a corner of any
+        // valence at `segments = 2` builds the fullness-seeded net, subdivides once
+        // (§8.5.5.5(d) blockquote: always at least one round, even at seg=2), and resamples
+        // the even-parity welded apex back down (§8.5.5.5(e)).
         let exponent = profile_to_exponent(options.profile);
-        if segments < 2 || (exponent != 2.0 && exponent != 0.0) {
+        if segments < 2 || exponent == 1.0 {
             return None;
         }
 
@@ -1737,6 +1747,10 @@ impl LoopMesh {
                 sector_donors: &sector_donors,
                 centre_donors: &centre_donors,
             };
+            // The line / flat-chamfer exponent (`r = 1`, the one `flat` cap of §8.3.0.2.1)
+            // is gated out above, so every corner reaching here relaxes the fullness-seeded
+            // net — circle, the curved band, and both square sentinels alike (§8.5.5.5(f.1)
+            // step 4 / (f.3)).
             self.emit_general_adj_fill(
                 corner.vertex,
                 chains,
@@ -16947,6 +16961,314 @@ mod tests {
         assert!(
             apex_offset.dot(toward_corner) < 0.0,
             "the welded apex is notched inward (negative fullness), not bulged toward v",
+        );
+    }
+
+    /// Bevel the `(1,-1,-1)` cube corner in vertex mode at `profile` / even `segments` and
+    /// return the signed distance the even-parity welded apex (§8.5.5.5(e)) sits from the
+    /// slide-ring centroid *toward* the original corner `v` (positive = bulged toward `v`).
+    /// Panics unless the cap is the welded-apex grid, so pass even `segments` only.
+    fn cube_corner_welded_apex_bulge(profile: f32, segments: u32) -> f32 {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments,
+                profile,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let ring_verts: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&vertex| cap_membership(vertex) == 1)
+            .collect();
+        assert_eq!(ring_verts.len(), 3, "three slide-ring boundverts");
+        let ring_centroid =
+            ring_verts.iter().fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v)) / 3.0;
+        let toward_corner = (corner_position - ring_centroid).normalize();
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&vertex| cap_membership(vertex) == 3)
+            .expect("a single welded apex shared by all three cap quads");
+        (mesh.vertex_position(apex) - ring_centroid).dot(toward_corner)
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) step 4 / (f.2)/(f.3): a genuinely curved exponent
+    /// (`profile = 0.7`, `r ≈ 3.887`) is no longer declined in vertex mode — it routes to
+    /// the *same* general fullness grid as the circular default, differing only in the
+    /// boundary-ring sampler (§8.6) and the centre fullness (§8.5.5.5(f.3)). The **even**
+    /// `segments = 2` cube corner therefore builds the full coarse net: 3 slide-ring
+    /// boundverts, 3 chain mids, 1 welded apex, `8/12/6 → 14/21/9`, still a closed solid.
+    #[test]
+    fn vertex_bevel_multiseg_curved_profile_even_cube_corner_builds_general_grid() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 0.7,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!((vertices, edges, faces), (14, 21, 9), "curved even grid builds");
+        assert_eq!(
+            vertices as i64 - edges as i64 + faces as i64,
+            2,
+            "curved corner bevel keeps the cube a closed genus-0 solid",
+        );
+        assert_eq!(result.faces.len(), 3, "three cap quads, welded apex, no central polygon");
+        assert_eq!(result.verts.len(), 7, "3 ring + 3 chain mid + 1 apex");
+        assert_eq!(
+            face_size_multiset(&mesh),
+            vec![4, 4, 4, 4, 4, 4, 6, 6, 6],
+            "three cap quads + three untouched cube quads + three grown hexagons",
+        );
+
+        // The fullness-seeded apex bulges toward the corner (fullness ≈1.089 at profile 0.7,
+        // §8.5.5.5(f.3) F3), not onto the flat ring plane.
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let ring_centroid = {
+            let ring: Vec<VertexKey> = result
+                .verts
+                .iter()
+                .copied()
+                .filter(|&v| cap_membership(v) == 1)
+                .collect();
+            assert_eq!(ring.len(), 3, "three slide-ring boundverts");
+            ring.iter().fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v)) / 3.0
+        };
+        let apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| cap_membership(v) == 3)
+            .expect("a single welded apex shared by all three cap quads");
+        assert!(
+            (mesh.vertex_position(apex) - ring_centroid).dot(corner_position - ring_centroid)
+                > 0.0,
+            "curved welded apex bulges toward the corner (fullness-seeded, not flat)",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.3): the general grid's centre is seeded by the profile-dependent
+    /// `fullness` scalar, so a curved corner's apex sits at a *different* position from the
+    /// circular default. F3 at `profile = 0.7` even gives ≈1.089 versus the circular table's
+    /// 0.559 at `segments = 2`, so the curved apex bulges strictly further toward `v`.
+    #[test]
+    fn vertex_bevel_multiseg_curved_apex_uses_profile_dependent_fullness_distinct_from_circular() {
+        let circular = cube_corner_welded_apex_bulge(0.5, 2);
+        let curved = cube_corner_welded_apex_bulge(0.7, 2);
+        assert!(circular > 0.0, "circular apex bulges toward v");
+        assert!(curved > 0.0, "curved apex bulges toward v");
+        assert!(
+            curved > circular + 1.0e-3,
+            "curved profile 0.7 (fullness ≈1.089) bulges further than circular (0.559): \
+             {curved} vs {circular}",
+        );
+        assert!(
+            (adj_fullness(0.7, 2) - adj_fullness(0.5, 2)).abs() > 1.0e-2,
+            "the centre seed reads the profile-dependent fullness, not the circular table",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1)/(f.3) + (e): a curved exponent at **odd** `segments = 3` builds
+    /// the full interior ring of quads closed by one central triangle (the §8.5.5.4 odd
+    /// parity), `8/12/6 → 19/30/13`. The positive fullness (`≈1.049` at profile 0.7, F3 odd)
+    /// bulges the central triangle toward the corner — the convex cap, opposite the
+    /// square-in notch.
+    #[test]
+    fn vertex_bevel_multiseg_curved_profile_odd_cube_corner_central_triangle() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 3,
+                profile: 0.7,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (19, 30, 13), "curved odd grid builds");
+        assert_eq!(result.faces.len(), 7, "6 ring quads + 1 central triangle");
+        let central: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| mesh.face_vert_keys(face).len() == 3)
+            .collect();
+        assert_eq!(central.len(), 1, "one central triangle closes the innermost ring");
+
+        let ring_centroid = {
+            let boundverts: Vec<VertexKey> = result
+                .verts
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    result
+                        .faces
+                        .iter()
+                        .filter(|&&f| mesh.face_vert_keys(f).contains(&v))
+                        .count()
+                        == 1
+                })
+                .collect();
+            assert_eq!(boundverts.len(), 3, "three slide-ring boundverts");
+            boundverts
+                .iter()
+                .fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v))
+                / 3.0
+        };
+        let toward_corner = corner_position - ring_centroid;
+        for &tip in &mesh.face_vert_keys(central[0]) {
+            assert!(
+                (mesh.vertex_position(tip) - ring_centroid).dot(toward_corner) > 0.0,
+                "the curved central triangle bulges toward v (positive fullness), not inward",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1): the **square** exponent (`profile = 1.0`, `r = ∞`) in vertex
+    /// mode never reaches the edge-only parallel-offset grid (step 1) — it falls to the same
+    /// general fullness grid as every other exponent. The even `segments = 2` cube corner
+    /// builds `8/12/6 → 14/21/9` with a welded apex, and its fullness (F3 even ≈1.824,
+    /// §8.5.5.5(f.3)) overshoots the circular seed, so the square apex bulges strictly
+    /// further toward `v` than the circular one.
+    #[test]
+    fn vertex_bevel_multiseg_square_profile_even_cube_corner_builds_and_overshoots() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner_position = Vec3::new(1.0, -1.0, -1.0);
+        let corner = vert_at(&mesh, corner_position);
+        assert_eq!(counts(&mesh), (8, 12, 6));
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 1.0,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(counts(&mesh), (14, 21, 9), "square even grid builds");
+        assert_eq!(result.faces.len(), 3, "three cap quads, welded apex");
+        assert_eq!(result.verts.len(), 7, "3 ring + 3 chain mid + 1 apex");
+        assert_eq!(
+            profile_to_exponent(1.0),
+            PROFILE_SQUARE_EXPONENT,
+            "profile 1.0 snaps to the square sentinel exponent",
+        );
+
+        let square = cube_corner_welded_apex_bulge(1.0, 2);
+        let circular = cube_corner_welded_apex_bulge(0.5, 2);
+        assert!(square > 0.0, "square apex bulges toward v");
+        assert!(
+            square > circular + 1.0e-3,
+            "square profile (fullness ≈1.824) overshoots the circular seed (0.559): \
+             {square} vs {circular}",
+        );
+    }
+
+    /// BEVEL.md §8.11.4 + §8.5.5.5(f.1): the curved exponent builds the general grid at
+    /// **general valence** too, not only the valence-3 cube corner. A valence-4 pyramid apex
+    /// beveled at `profile = 0.7`, `segments = 2` builds the uniform coarse net — 4 slide-ring
+    /// boundverts, 4 chain mids, 1 welded apex, 4 cap quads — with the apex bulged toward the
+    /// original apex by the profile-dependent fullness.
+    #[test]
+    fn vertex_bevel_multiseg_curved_profile_pyramid_apex_general_valence() {
+        let sectors = 4;
+        let (mut mesh, apex) = closed_pyramid(sectors);
+        let apex_position = mesh.vertex_position(apex);
+
+        let result = mesh.bevel(
+            &[apex.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                profile: 0.7,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert_eq!(
+            result.verts.len(),
+            2 * sectors + 1,
+            "s slide-ring boundverts + s chain mids + 1 welded apex",
+        );
+        assert_eq!(result.faces.len(), sectors, "one cap quad per sector, welded apex");
+
+        let cap_membership = |vertex: VertexKey| -> usize {
+            result
+                .faces
+                .iter()
+                .filter(|&&face| mesh.face_vert_keys(face).contains(&vertex))
+                .count()
+        };
+        let ring: Vec<VertexKey> = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| cap_membership(v) == 1)
+            .collect();
+        assert_eq!(ring.len(), sectors, "s slide-ring boundverts");
+        let ring_centroid =
+            ring.iter().fold(Vec3::ZERO, |acc, &v| acc + mesh.vertex_position(v)) / sectors as f32;
+        let welded_apex = result
+            .verts
+            .iter()
+            .copied()
+            .find(|&v| cap_membership(v) == sectors)
+            .expect("a single welded apex shared by all cap quads");
+        assert!(
+            (mesh.vertex_position(welded_apex) - ring_centroid).dot(apex_position - ring_centroid)
+                > 0.0,
+            "the curved general-valence apex bulges toward the original apex (fullness-seeded)",
         );
     }
 
