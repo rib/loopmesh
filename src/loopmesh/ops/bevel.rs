@@ -293,20 +293,6 @@ impl BevelCurveProfile {
         widget_chain_to_cell(&self.widget_chain(segments), reverse)
     }
 
-    /// The custom-profile fullness law **F1** (BEVEL.md §8.5.5.5(f.3)):
-    /// `(1 / (2·n)) · Σ_{i=0}^{n-1} (u_i + v_i)`. The sum runs over `i = 0..=n-1` — it
-    /// includes the `(0, 1)` endpoint and **excludes** the `(1, 0)` endpoint — and the
-    /// divisor is `2·n`, not `2·(n+1)`. The `x_i + y_i` sum is swap-invariant, so the cell
-    /// chain gives the same value as the widget chain.
-    fn fullness_f1(&self, segments: u32) -> f32 {
-        let n = segments.max(1) as usize;
-        // The `u + v` sum is invariant under both the axis swap and the §8.6.3.1(6) mirror
-        // (the two excluded endpoints both carry `u + v = 1`), so handedness cannot move it.
-        let chain = self.sample_chain(segments, false);
-        let sum: f32 = chain.iter().take(n).map(|&(u, v)| u + v).sum();
-        sum / (2.0 * n as f32)
-    }
-
     /// The evaluated Bézier sample chain in the widget's `(x, y)` frame (BEVEL.md
     /// §8.6.3.1(2)/(4)): resolve every point's handle positions, split the `segments`
     /// budget across the control-point segments, and sample each segment at even Bézier
@@ -320,8 +306,12 @@ impl BevelCurveProfile {
     /// every sample is a control point, neither end is pinned, and a run of skipped
     /// segments is a jump rather than a coarse walk.
     ///
-    /// Public for an out-of-tree parity harness that pins the chain directly; no in-tree
-    /// caller needs it outside this module's own tests.
+    /// This is the whole evaluation model, and §8.6.3.1(4).4 caps a bevel at **two** runs of
+    /// it: [`CustomChains::new`] calls here once at the operation's own `segments` and once at
+    /// `doubled_resolution`, and every read at any other resolution is a stride of the second
+    /// chain. So a *read site* calling this method would be the third run the schedule
+    /// forbids — go through `CustomChains` instead. Also public for an out-of-tree parity
+    /// harness that pins the chain directly.
     pub fn widget_chain(&self, segments: u32) -> Vec<(f32, f32)> {
         let n = segments.max(1) as usize;
         let points = &self.points;
@@ -1668,19 +1658,28 @@ impl LoopMesh {
         // the centre fullness (§8.5.5.5(f.3), `adj_fullness`). The line profile is not a
         // distinct construction — per §8.5.5.5(f.3) law **F2** (`r == 1.0` ⇒ `fullness = 0`)
         // it is the *same* general fill with a planar cap, threaded through `emit_general_adj_fill`'s
-        // `flat` path below. Custom profiles are unreachable (no `profile_type = CUSTOM`).
+        // `flat` path below. A `profile_type = CUSTOM` corner takes neither knob from the
+        // exponent — its ring comes from §8.6.3's curve and its fullness from law **F1** — and
+        // is never `flat`, but it still routes through this same (a)–(e) grid.
         // The `segments = 2` coarse-net case routes through the *same* grid — §8.11.3(c):
         // vertex mode never takes the tri-corner octant fast path, so a corner of any
         // valence at `segments = 2` builds the fullness-seeded net, subdivides once
         // (§8.5.5.5(d) blockquote: always at least one round, even at seg=2), and resamples
         // the even-parity welded apex back down (§8.5.5.5(e)).
         let exponent = profile_to_exponent(options.profile);
-        // §8.6.3: a custom profile supplies the boundary chain and its fullness (law F1),
-        // and is never flat — it routes through the general fullness grid unchanged.
-        let custom = options.profile_type.custom();
         if segments < 2 {
             return None;
         }
+        // §8.6.3: a custom profile supplies the boundary chain and its fullness (law F1),
+        // and is never flat — it routes through the general fullness grid unchanged.
+        // §8.6.3.1(4).4: both of its chains are materialised **here, once** for the whole
+        // operation, so every later read is a stride of one of them rather than a fresh run
+        // of the evaluation model at that read's resolution.
+        let custom_chains = options
+            .profile_type
+            .custom()
+            .map(|curve| CustomChains::new(curve, segments));
+        let custom = custom_chains.as_ref();
 
         let mut result = BevelResult::default();
 
@@ -3042,7 +3041,13 @@ impl LoopMesh {
         let material = options.material;
         let segments = options.segments;
         let profile = options.profile;
-        let custom = options.profile_type.custom();
+        // §8.6.3.1(4).4: the custom curve's `target` and `doubled` chains, materialised once
+        // for the whole operation. Every downstream read strides one of them.
+        let custom_chains = options
+            .profile_type
+            .custom()
+            .map(|curve| CustomChains::new(curve, segments));
+        let custom = custom_chains.as_ref();
 
         let mut manifold: Vec<EdgeKey> = Vec::new();
         for &edge in beveled {
@@ -3907,7 +3912,7 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
@@ -4300,7 +4305,7 @@ impl LoopMesh {
         edge: EdgeKey,
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
         rescue: MidRescue,
         terminal_vertex: Option<Vec3>,
         emission: ChainEmission,
@@ -4347,7 +4352,7 @@ impl LoopMesh {
         cell: &ProfileCell,
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
         emission: ChainEmission,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
@@ -6622,7 +6627,7 @@ impl LoopMesh {
         profiles: &[RingChainProfile],
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
         flat: bool,
         raw_coarse_mids: Option<&[Vec3]>,
         material: i32,
@@ -6665,8 +6670,8 @@ impl LoopMesh {
         let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / sectors as f32;
         let fullness = if flat {
             0.0
-        } else if let Some(curve) = custom {
-            curve.fullness_f1(segments)
+        } else if let Some(chains) = custom {
+            chains.fullness
         } else {
             adj_fullness(profile, segments)
         };
@@ -33616,6 +33621,7 @@ mod tests {
         let line = BevelCurveProfile::preset_line();
         let chain = line.sample_chain(2, false);
         let expected = [(0.0, 1.0), (0.5, 0.5), (1.0, 0.0)];
+        assert_eq!(chain.len(), expected.len(), "segments + 1 samples");
         for (got, want) in chain.iter().zip(expected.iter()) {
             assert!(
                 (got.0 - want.0).abs() < 1.0e-6 && (got.1 - want.1).abs() < 1.0e-6,
@@ -33632,6 +33638,7 @@ mod tests {
         ]);
         let chain2 = poly.sample_chain(2, false);
         let want2 = [(0.0, 1.0), (0.25, 0.5), (1.0, 0.0)];
+        assert_eq!(chain2.len(), want2.len(), "segments + 1 samples");
         for (got, want) in chain2.iter().zip(want2.iter()) {
             assert!(
                 (got.0 - want.0).abs() < 1.0e-6 && (got.1 - want.1).abs() < 1.0e-6,
@@ -33780,7 +33787,7 @@ mod tests {
             )
         };
         // Turn order 0 < 1 < 2, so the top-2 cut is {1, 2} and the start corner drops out.
-        let late_turn = all_auto(&[(1.0, 0.0), (0.85, 0.10), (0.20, 0.35), (0.0, 1.0)]);
+        let late_turn = late_turn_net();
         assert_widget_chain(
             &late_turn.widget_chain(2),
             &[(0.85, 0.10), (0.20, 0.35), (0.00, 1.00)],
@@ -33802,13 +33809,7 @@ mod tests {
         // The split net: curvature on the two *outer* control segments only (turns
         // `24.70° / 0° / 0° / 35.13°`), so the top-2 cut is the non-adjacent {0, 3} and the
         // chain steps straight from P0 to P3 — P1 and P2 never appear.
-        let split = BevelCurveProfile::from_points_with_handles(&[
-            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
-            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
-            (0.60, 0.55, BevelHandle::Vector, BevelHandle::Vector),
-            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
-            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
-        ]);
+        let split = split_net();
         assert_widget_chain(
             &split.widget_chain(1),
             &[(0.10, 0.60), (0.00, 1.00)],
@@ -33929,6 +33930,320 @@ mod tests {
             &curl_back.widget_chain(1),
             &[(0.9, 0.5), (0.1, 0.5)],
             "curl-back net segments = 1 (the obtuse middle segment)",
+        );
+    }
+
+    /// The guide's all-auto **LATE_TURN** net (`E = 3`), the driver of §8.6.3.1(4).4's stride
+    /// worked example.
+    fn late_turn_net() -> BevelCurveProfile {
+        BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Auto),
+            (0.85, 0.10, BevelHandle::Auto),
+            (0.20, 0.35, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Auto),
+        ])
+    }
+
+    /// The guide's **split** net (`E = 4`): curvature on the two *outer* control segments only,
+    /// so its `segments = 2` chain is a sub-budget **jump** past `P₁` and `P₂`.
+    fn split_net() -> BevelCurveProfile {
+        BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
+            (0.60, 0.55, BevelHandle::Vector, BevelHandle::Vector),
+            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ])
+    }
+
+    /// The **split** net with `P₂` moved from `(0.60, 0.55)` to `(0.30, 0.45)` and nothing else
+    /// changed — §8.6.3.1(4).4's second, model-free arm. `P₂` is the one control point the
+    /// `segments = 2` chain *jumps*, so both nets' `target` chains stay pointwise identical
+    /// (segments `1` and `2` are straight chords in both, scoring `turn = 0`, and the top-2 cut
+    /// is `{0, 3}` either way with the tie strictly inside the discarded block), while
+    /// `doubled[doubled_resolution / 2] = P₂` moves `0.30` in widget `x`.
+    fn split_net_moved_p2() -> BevelCurveProfile {
+        BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
+            (0.30, 0.45, BevelHandle::Vector, BevelHandle::Vector),
+            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ])
+    }
+
+    /// A profile cell that embeds the widget frame isometrically, so a chain's widget
+    /// coordinates read straight off the emitted positions: `a_axis = mid − start` and
+    /// `b_axis = mid − end` are the two unit axes, the cell origin `start + end − mid` is the
+    /// world origin, and there is no projection. A widget sample `(x, y)` reaching the cell as
+    /// `(u, v) = (x, y)` therefore lands at `(y, x, 0)`. Being a similarity also makes 3-D
+    /// chord lengths equal widget-frame ones, which is what lets the §8.2.2.1.1 read-back's
+    /// guide-quoted widget numbers be asserted as positions.
+    fn widget_frame_cell() -> ProfileCell {
+        ProfileCell::from_control_points(Vec3::X, Vec3::Y, Vec3::new(1.0, 1.0, 0.0))
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4: a profile read at any resolution other than the operation's own
+    /// `segments` is an **index stride of the `doubled` chain**, never a fresh run of the
+    /// evaluation model at that resolution. The two are different tables because a custom
+    /// chain's per-`n` budget partition is recomputed from scratch and so is **not**
+    /// refinement-consistent — unlike the analytic superellipse's even-arc-length spacing,
+    /// where every other sample of the `2m` chain *is* the `m` chain and the distinction is
+    /// invisible.
+    ///
+    /// Driven at a **non-power-of-two** `segments = 5` (`doubled_resolution = 8`), where the
+    /// cascade's middle round asks for `m = 4` and the coarse control net asks for `m = 2`.
+    /// Both rows are quoted from the guide's worked table; the `m = 4` pair differs by `0.197`
+    /// in widget `x` at `k = 2`, which is not a rounding difference.
+    #[test]
+    fn custom_profile_intermediate_read_strides_the_doubled_chain() {
+        let late_turn = late_turn_net();
+        let chains = CustomChains::new(&late_turn, 5);
+        assert_eq!(chains.doubled_resolution, 8, "max(pow2 >= 5, 4)");
+
+        assert_widget_chain(
+            &chains.widget_chain_at(4),
+            &[
+                (1.0, 0.0),
+                (0.85, 0.10),
+                (0.397_32, 0.224_63),
+                (0.084_97, 0.548_38),
+                (0.0, 1.0),
+            ],
+            "the m = 4 cascade round reads doubled strided by 2",
+        );
+        // The chain the same curve returns when asked for `n = 4` directly — what a third
+        // resample would have produced, and what the round must *not* read.
+        assert_widget_chain(
+            &late_turn.widget_chain(4),
+            &[
+                (1.0, 0.0),
+                (0.85, 0.10),
+                (0.200_00, 0.350_00),
+                (0.061_34, 0.652_62),
+                (0.0, 1.0),
+            ],
+            "the fresh n = 4 resample",
+        );
+        assert!(
+            (chains.widget_chain_at(4)[2].0 - late_turn.widget_chain(4)[2].0).abs() > 0.19,
+            "the strided and freshly-resampled m = 4 chains are 0.197 apart in widget x",
+        );
+
+        // The coarse control net's read (`m = 2`) strides by 4 at `segments >= 3`, landing on
+        // `doubled[4]`. A fresh `n = 2` resample would instead return this net's sub-budget
+        // chain, whose interior sample is `(0.20, 0.35)`.
+        assert_widget_chain(
+            &chains.widget_chain_at(2),
+            &[(1.0, 0.0), (0.397_32, 0.224_63), (0.0, 1.0)],
+            "the coarse net reads doubled strided by 4",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4's **branch**, and the one segment count at which it is
+    /// observable. The stride rule's `m == segments` arm *wins*, so the [V-ADJ] coarse control
+    /// net — a profile read at `m = 2` (§8.5.5.5(a)) — takes `target[1]` at `segments == 2` and
+    /// the strided `doubled[doubled_resolution / 2]` at every `segments >= 3`. On the split net
+    /// those two points are `0.50` apart in widget `x`, so this is not a coincidence to be
+    /// collapsed: coding the strided arm unconditionally is wrong on **every** two-segment
+    /// custom bevel (≈1753 canonical position quanta of cap apex) and right everywhere else.
+    ///
+    /// Asserted twice over: on the served chain, and on the `RingChainProfile::raw_positions(2)`
+    /// call the fill actually makes.
+    #[test]
+    fn custom_profile_coarse_net_mid_takes_the_target_chain_at_two_segments() {
+        let split = split_net();
+
+        let at_two = CustomChains::new(&split, 2);
+        assert_eq!(at_two.doubled_resolution, 4, "the floor of 4, not segments");
+        assert_widget_chain(
+            &at_two.widget_chain_at(2),
+            &[(1.0, 0.0), (0.10, 0.60), (0.0, 1.0)],
+            "segments = 2: the m == segments arm serves the target chain",
+        );
+        // The rival the branch must decline, and the gap it would open.
+        assert_widget_chain(
+            &at_two.doubled,
+            &[
+                (1.0, 0.0),
+                (0.90, 0.40),
+                (0.60, 0.55),
+                (0.10, 0.60),
+                (0.0, 1.0),
+            ],
+            "doubled is this net's own five control points at n = 4 = E",
+        );
+        assert!(
+            (at_two.doubled[2].0 - at_two.widget_chain_at(2)[1].0).abs() > 0.49,
+            "the strided mid would sit 0.50 away in widget x: {:?} vs {:?}",
+            at_two.doubled[2],
+            at_two.widget_chain_at(2)[1],
+        );
+
+        // `segments = 3` shares this net's `doubled_resolution = 4`, so the *same* `m = 2` read
+        // takes the other arm and lands on `doubled[2]`.
+        let at_three = CustomChains::new(&split, 3);
+        assert_eq!(at_three.doubled_resolution, 4);
+        assert_widget_chain(
+            &at_three.widget_chain_at(2),
+            &[(1.0, 0.0), (0.60, 0.55), (0.0, 1.0)],
+            "segments = 3: the m = 2 read strides",
+        );
+
+        // The same branch through the fill's own call. The widget-frame cell sends a chain
+        // sample `(x, y)` to `(y, x, 0)`, and the §8.6.3.1(6) mirror leaves a chain's middle
+        // sample where it is, so the two mids are `(0.60, 0.10, 0)` and `(0.55, 0.60, 0)`.
+        let cell = widget_frame_cell();
+        let mid_of = |chains: &CustomChains| {
+            RingChainProfile::Cell {
+                cell,
+                profile: 0.5,
+                custom: Some(chains),
+            }
+            .raw_positions(2)[1]
+        };
+        let expect_mid = |got: Vec3, want: Vec3, what: &str| {
+            assert!(
+                (got - want).length() < 1.0e-4,
+                "{what}: coarse mid {got:?} != {want:?}",
+            );
+        };
+        expect_mid(
+            mid_of(&at_two),
+            Vec3::new(0.60, 0.10, 0.0),
+            "segments = 2 coarse mid is target[1]",
+        );
+        expect_mid(
+            mid_of(&at_three),
+            Vec3::new(0.55, 0.60, 0.0),
+            "segments = 3 coarse mid is doubled[2]",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4 row 6 / §8.2.2.1.1's **Scope**: every **non-[V-ADJ]** sector
+    /// emits `target[k]` **raw** at every `segments` — the poly-filled / tri-fanned terminal
+    /// (§8.3.0.2), the two-sector weld (§8.3.0.3), the cutoff fill (§8.3), the single-segment
+    /// strip (§7.6) and the terminal far-end cross-section (§8.2.2.1). Those are exactly the
+    /// sites that request [`ChainEmission::Raw`]; the chord read-back belongs to a [V-ADJ]
+    /// cap's boundary emission and to nothing else.
+    ///
+    /// A rim that *equals* the raw chain proves nothing about whether the read-back ran, so the
+    /// driver is chosen where it moves loudly: the split net's `segments = 2` chain is a
+    /// sub-budget jump past two control points that `doubled` traverses, so the two chord-fraction
+    /// distributions disagree grossly rather than subtly. Its single interior sample sits at
+    /// widget `(0.10, 0.60)` raw and reads back at `(0.14628, 0.59536)` — `4.65e-2` apart.
+    #[test]
+    fn custom_profile_non_adjacency_sector_emits_the_raw_target_chain() {
+        let split = split_net();
+        let chains = CustomChains::new(&split, 2);
+        let cell = widget_frame_cell();
+
+        let raw = cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Raw);
+        let emitted = cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Resampled);
+        assert_eq!(raw.len(), 3);
+        assert_eq!(emitted.len(), 3);
+        for (index, (r, e)) in raw.iter().zip(emitted.iter()).enumerate() {
+            if index == 0 || index == 2 {
+                assert!(
+                    (*r - *e).length() < 1.0e-6,
+                    "the two chain ends are the boundverts under either emission",
+                );
+            }
+        }
+        assert!(
+            (raw[1] - Vec3::new(0.60, 0.10, 0.0)).length() < 1.0e-4,
+            "the raw arm is target[1] verbatim, got {:?}",
+            raw[1],
+        );
+        assert!(
+            (emitted[1] - Vec3::new(0.595_36, 0.146_28, 0.0)).length() < 1.0e-4,
+            "the [V-ADJ] arm reads target's chord fraction off doubled, got {:?}",
+            emitted[1],
+        );
+        assert!(
+            (raw[1] - emitted[1]).length() > 4.5e-2,
+            "the driver must actually move the sample, else the arms are indistinguishable",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4: the emitted [V-ADJ] rim is **not a function of `target` alone**.
+    /// Two curves that produce the *same* chain at `segments` and different `doubled` chains
+    /// emit the same raw sector and a **different** cap rim — which is what pins the read-back's
+    /// source polyline as the `doubled` chain rather than a re-read of `target` (a read-back
+    /// against `target` itself would be the identity, and both arms would agree).
+    ///
+    /// The guide's six-point net at `segments = 5 = E`: every control segment gets exactly one
+    /// advance, so the handles are irrelevant to `target` and the all-vector and all-auto nets
+    /// share it pointwise. Their `doubled` chains (`doubled_resolution = 8`) differ. The
+    /// all-vector net's rim is additionally the read-back's *identity* — every sample lies on
+    /// the straight control polyline, and chord length along a straight run is additive — which
+    /// is why every earlier all-vector fixture reported nothing. Its `doubled` **interior** is
+    /// not derivable (an all-vector net scores `turn = 0` on every segment, routing the whole
+    /// remainder through the undefined tie order), so nothing here asserts it.
+    #[test]
+    fn custom_profile_cap_rim_reads_the_doubled_chain_not_only_the_target() {
+        let net = [
+            (1.0, 0.0),
+            (0.85, 0.10),
+            (0.60, 0.18),
+            (0.35, 0.30),
+            (0.12, 0.60),
+            (0.0, 1.0),
+        ];
+        let all_vector = BevelCurveProfile::from_points(
+            &net.iter()
+                .map(|&(x, y)| (x, y, BevelHandle::Vector))
+                .collect::<Vec<_>>(),
+        );
+        let all_auto = BevelCurveProfile::from_points(
+            &net.iter()
+                .map(|&(x, y)| (x, y, BevelHandle::Auto))
+                .collect::<Vec<_>>(),
+        );
+        let vector_chains = CustomChains::new(&all_vector, 5);
+        let auto_chains = CustomChains::new(&all_auto, 5);
+        assert_widget_chain(&vector_chains.target, &net, "all-vector target, n = 5 = E");
+        assert_widget_chain(&auto_chains.target, &net, "all-auto target, n = 5 = E");
+        assert_eq!(vector_chains.doubled_resolution, 8);
+
+        let cell = widget_frame_cell();
+        let emit =
+            |chains: &CustomChains, emission| cell.chain_positions(5, 0.5, Some(chains), emission);
+        let raw_of = |chains: &CustomChains| emit(chains, ChainEmission::Raw);
+        let rim_of = |chains: &CustomChains| emit(chains, ChainEmission::Resampled);
+
+        // Row 6: a non-[V-ADJ] sector reads `target` only, so the two nets are indistinguishable
+        // there even though their `doubled` chains differ.
+        for (index, (a, b)) in raw_of(&vector_chains)
+            .iter()
+            .zip(raw_of(&auto_chains).iter())
+            .enumerate()
+        {
+            assert!(
+                (*a - *b).length() < 1.0e-6,
+                "raw sample {index} must not see the doubled chain: {a:?} vs {b:?}",
+            );
+        }
+
+        // The piecewise-linear net's rim is the read-back's identity; the curved one's is not.
+        let vector_raw = raw_of(&vector_chains);
+        let vector_rim = rim_of(&vector_chains);
+        for (index, (r, e)) in vector_raw.iter().zip(vector_rim.iter()).enumerate() {
+            assert!(
+                (*r - *e).length() < 1.0e-5,
+                "an all-vector net resamples to itself at sample {index}: {r:?} vs {e:?}",
+            );
+        }
+        let auto_rim = rim_of(&auto_chains);
+        let moved = vector_rim
+            .iter()
+            .zip(auto_rim.iter())
+            .map(|(a, b)| (*a - *b).length())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            moved > 1.0e-4,
+            "the two caps share a target chain and must still emit different rims, \
+             widest separation {moved}",
         );
     }
 
@@ -34085,7 +34400,7 @@ mod tests {
     fn custom_profile_fullness_f1_excludes_the_last_endpoint() {
         let line = BevelCurveProfile::preset_line();
         // chain = [(0,1),(0.5,0.5),(1,0)]; sum over i=0,1 of (u+v) = 1 + 1 = 2; /(2·2) = 0.5.
-        assert!((line.fullness_f1(2) - 0.5).abs() < 1.0e-6);
+        assert!((CustomChains::new(&line, 2).fullness - 0.5).abs() < 1.0e-6);
 
         let poly = BevelCurveProfile::from_points(&[
             (1.0, 0.0, BevelHandle::Vector),
@@ -34093,7 +34408,7 @@ mod tests {
             (0.0, 1.0, BevelHandle::Vector),
         ]);
         // chain = [(0,1),(0.25,0.5),(1,0)]; sum over i=0,1 = 1 + 0.75 = 1.75; /(4) = 0.4375.
-        assert!((poly.fullness_f1(2) - 0.4375).abs() < 1.0e-6);
+        assert!((CustomChains::new(&poly, 2).fullness - 0.4375).abs() < 1.0e-6);
     }
 
     /// BEVEL.md §8.5.5.5(f.3) F1 on the **`n < E` sub-budget branch** (§8.6.3.1(4).3), the
@@ -34106,17 +34421,12 @@ mod tests {
     /// the `(0, 1)` corner, as a pinned-endpoint chain would, leaves `1 + 1 = 2` and `0.5`.
     #[test]
     fn custom_profile_fullness_f1_reads_the_unpinned_sub_budget_chain_start() {
-        let split = BevelCurveProfile::from_points_with_handles(&[
-            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
-            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
-            (0.60, 0.55, BevelHandle::Vector, BevelHandle::Vector),
-            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
-            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
-        ]);
+        let split = split_net();
+        let chains = CustomChains::new(&split, 2);
         assert!(
-            (split.fullness_f1(2) - 0.425).abs() < 1.0e-6,
+            (chains.fullness - 0.425).abs() < 1.0e-6,
             "F1 on the sub-budget branch: got {}",
-            split.fullness_f1(2),
+            chains.fullness,
         );
     }
 
@@ -34125,6 +34435,11 @@ mod tests {
     /// superellipse does — the custom sampler only reshapes the boundary ring and the
     /// centre fullness (law F1), never the topology. The resulting mesh differs in vertex
     /// *positions* from the superellipse-circle bevel, proving the custom sampler is wired.
+    ///
+    /// This net is all-vector with straight chords, so `target[1]` and
+    /// `doubled[doubled_resolution / 2]` are the *same point* and the apex below reads the same
+    /// under either arm of §8.6.3.1(4).4's stride rule. The schedule is discriminated by
+    /// `bevel_custom_profile_split_net_two_segment_apex_takes_the_target_chain_mid` instead.
     #[test]
     fn bevel_custom_profile_vertex_cube_corner_two_segments_builds_general_grid() {
         let curve = BevelCurveProfile::from_points(&[
@@ -34169,18 +34484,7 @@ mod tests {
         // diagonal axis; **one** unmasked (custom chains are not sharpened) subdivision round
         // with γ_3 = 0.065247584 pulls it to 0.90251. The corner is symmetric on the body
         // diagonal, so the apex sits at `(0.90251, −0.90251, −0.90251)`.
-        let apex = custom_mesh
-            .vert_keys()
-            .into_iter()
-            .map(|v| custom_mesh.vertex_position(v))
-            .find(|p| {
-                // The welded apex sits on the corner's body diagonal (`|x| = |y| = |z|`),
-                // strictly inside the cube, off the corner `v` and off every cap rim vert.
-                (p.x.abs() - p.y.abs()).abs() < 1.0e-3
-                    && (p.x.abs() - p.z.abs()).abs() < 1.0e-3
-                    && p.x.abs() < 0.99
-            })
-            .expect("the welded body-diagonal apex");
+        let apex = cube_corner_welded_apex(&custom_mesh);
         let expected_apex = Vec3::new(0.902_51, -0.902_51, -0.902_51);
         assert!(
             (apex - expected_apex).length() < 2.0e-5,
@@ -34213,6 +34517,140 @@ mod tests {
                 .all(|sp| (*cp - *sp).length() > 1.0e-4)
         });
         assert!(differs, "the custom cap lands verts the superellipse-circle cap does not");
+    }
+
+    /// The welded apex of a bevelled cube corner (BEVEL.md §8.5.5.5(e)): the one vertex on the
+    /// corner's body diagonal (`|x| = |y| = |z|`) strictly inside the cube — off the original
+    /// corner and off every cap rim vert.
+    fn cube_corner_welded_apex(mesh: &LoopMesh) -> Vec3 {
+        mesh.vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .find(|p| {
+                (p.x.abs() - p.y.abs()).abs() < 1.0e-3
+                    && (p.x.abs() - p.z.abs()).abs() < 1.0e-3
+                    && p.x.abs() < 0.99
+            })
+            .expect("the welded body-diagonal apex")
+    }
+
+    /// Bevels `mesh_add_cube`'s `(1, −1, −1)` corner with `curve` at `segments = 2`,
+    /// `offset = 0.25`, vertex mode, and returns the mesh.
+    fn custom_bevel_cube_corner_two_segments(curve: &BevelCurveProfile) -> LoopMesh {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Vertices,
+                profile_type: BevelProfileType::Custom(curve),
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        mesh
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4's `segments = 2` branch, **end to end on a whole mesh**. This is
+    /// the one segment count at which the [V-ADJ] coarse control net's row of the attribution
+    /// table changes answers, and the cap apex is where that answer becomes geometry — so the
+    /// chain-level pin above (which stops at the served mid) is not on its own enough.
+    ///
+    /// The guide works the case out in full. On the split net (`E = 4`) at `segments = 2`,
+    /// `doubled_resolution = 4`, the coarse mid is `target[1] = (0.10, 0.60)` and the rival
+    /// `doubled[doubled_resolution / 2] = (0.60, 0.55)` — `0.50` apart in widget `x`. Feeding
+    /// each candidate through §8.5.5.5(a) → (e) — coarse net, the custom centre-fullness blend
+    /// at law **F1** `= (1 + 0 + 0.10 + 0.60) / 4 = 0.425`, one doubling round's face points /
+    /// innermost edge points / extraordinary-centre stencil at `γ₃ = 0.065247584` with (c)'s
+    /// three-tap curvature *sharpening* declined (as a custom profile requires), then (d)'s
+    /// down-resample keeping the subdivided centre verbatim — predicts `0.899683` from
+    /// `target[1]` and `0.917210` from `doubled[2]`. F1 is identical under either candidate, so
+    /// the whole gap is attributable to the mid alone. All three sectors are cyclic images of
+    /// one another about the corner diagonal, so the apex is diagonal: `(a, −a, −a)`.
+    ///
+    /// **How the discrimination was confirmed.** Deleting `widget_chain_at`'s
+    /// `requested_resolution == self.segments` arm — the strided-everywhere reading — moves this
+    /// apex to `0.91721` per coordinate: `1.75e-2` away, ≈1753 canonical position quanta, three
+    /// orders of magnitude outside the `2e-5` tolerance asserted here. That deletion was made
+    /// locally and this test failed with exactly that value before it was reverted.
+    ///
+    /// The second, **model-free** arm rides along and needs none of the stencil: move the one
+    /// control point the `segments = 2` chain jumps (`P₂`) and the two nets' `target` chains stay
+    /// pointwise identical while `doubled[2]` moves `0.30`. So they must land the *same* apex —
+    /// impossible if the coarse mid came from `doubled` — and, because the emitted rim really
+    /// does read `doubled` (§8.2.2.1.1), *different* meshes overall.
+    #[test]
+    fn bevel_custom_profile_split_net_two_segment_apex_takes_the_target_chain_mid() {
+        let split = split_net();
+        let chains = CustomChains::new(&split, 2);
+        assert_eq!(chains.doubled_resolution, 4, "the floor of 4, not 2·segments");
+        assert!(
+            (chains.fullness - 0.425).abs() < 1.0e-6,
+            "law F1 over target: got {}",
+            chains.fullness,
+        );
+
+        let mesh = custom_bevel_cube_corner_two_segments(&split);
+        let (vertices, edges, faces) = counts(&mesh);
+        assert_eq!(
+            (vertices, edges, faces),
+            (14, 21, 9),
+            "the general grid, welded apex, no central polygon",
+        );
+
+        let apex = cube_corner_welded_apex(&mesh);
+        let from_target_mid = Vec3::new(0.899_683, -0.899_683, -0.899_683);
+        let from_doubled_mid = Vec3::new(0.917_210, -0.917_210, -0.917_210);
+        assert!(
+            (apex - from_target_mid).length() < 2.0e-5,
+            "the coarse mid is target[1]: apex {apex:?}, want {from_target_mid:?}",
+        );
+        assert!(
+            (apex - from_doubled_mid).length() > 1.0e-2,
+            "and it is emphatically not doubled[2]'s apex {from_doubled_mid:?}",
+        );
+
+        // The model-free arm: same target chain, `doubled[2]` moved 0.30 in widget x.
+        let moved = split_net_moved_p2();
+        let moved_chains = CustomChains::new(&moved, 2);
+        assert_widget_chain(
+            &moved_chains.target,
+            &[(1.00, 0.00), (0.10, 0.60), (0.00, 1.00)],
+            "moving the jumped-over P2 leaves the target chain alone",
+        );
+        assert!(
+            (moved_chains.doubled[2].0 - chains.doubled[2].0 + 0.30).abs() < 1.0e-6,
+            "doubled[2] moved 0.30 in widget x: {:?} vs {:?}",
+            moved_chains.doubled[2],
+            chains.doubled[2],
+        );
+
+        let moved_mesh = custom_bevel_cube_corner_two_segments(&moved);
+        let moved_apex = cube_corner_welded_apex(&moved_mesh);
+        assert!(
+            (moved_apex - apex).length() < 2.0e-6,
+            "two nets sharing a target chain share an apex: {moved_apex:?} vs {apex:?}",
+        );
+        // …but not a rim: §8.2.2.1.1's read-back does source the doubled chain.
+        let widest = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .map(|p| {
+                moved_mesh
+                    .vert_keys()
+                    .into_iter()
+                    .map(|w| (moved_mesh.vertex_position(w) - p).length())
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            widest > 1.0e-3,
+            "the two rims must differ — the emitted chain reads doubled, gap {widest}",
+        );
     }
 
     /// A planar valence-4 corner whose beveled spoke's two disk-flanking legs are
@@ -34307,6 +34745,105 @@ mod tests {
         assert!(
             custom_mesh.face_keys().len() < super_mesh.face_keys().len(),
             "the un-fan drops the total face count below the superellipse fan",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4 row 6 / §8.2.2.1.1's **Scope**: the terminal cross-section
+    /// (§8.2.2.1, §8.3.0.2) emits its chain **raw**. It is not a [V-ADJ] cap boundary, so the
+    /// chord read-back against the `doubled` chain must not run there. Nothing else in the
+    /// module pins the emission the terminal *site* requests — the chain-level tests exercise
+    /// both arms of `chain_positions` in isolation — so flipping that request to a resampled
+    /// emission would otherwise leave every custom-profile test green.
+    ///
+    /// The driver is the guide's pair of nets that **share `target` and differ in `doubled`**
+    /// (§8.6.3.1(4).4's model-free arm): the split net, and the same net with the jumped-over
+    /// `P₂` moved. At `segments = 2` both `target` chains are `(1,0) (0.10,0.60) (0,1)` while
+    /// their `doubled` chains differ at exactly the strided index, and the guide quotes the pair
+    /// of *resampled* rim mids as widget `(0.14628, 0.59536)` and `(0.14036, 0.56976)` —
+    /// `2.6e-2` in the widest widget component, so the declined arm moves loudly.
+    ///
+    /// A terminal's only curve-dependent mints are its chain interiors: the two strip verts come
+    /// off the offset and the flanking-leg directions, and the lone leg vert slides `offset·√2`
+    /// (§8.3.0.1). So the two bevels minting the *same* positions is exactly the statement that
+    /// both chains were emitted raw. The `late_turn_net` control — a third net whose `target` mid
+    /// is a genuinely different point — shows the comparison is sensitive to chain interiors at
+    /// all, rather than passing because nothing curve-dependent got minted.
+    ///
+    /// **How the discrimination was confirmed.** Switching the terminal builder's own
+    /// `ChainEmission::Raw` request to `Resampled` was done locally: exactly two of the seven
+    /// minted positions moved — the two terminals' chain interiors, the strip and leg verts
+    /// untouched as claimed — and the pair separated by `1.9e-3` world, so this test failed
+    /// before the change was reverted.
+    #[test]
+    fn bevel_custom_profile_terminal_emits_the_raw_target_chain() {
+        let split = split_net();
+        let moved = split_net_moved_p2();
+        assert_widget_chain(
+            &CustomChains::new(&moved, 2).target,
+            &[(1.00, 0.00), (0.10, 0.60), (0.00, 1.00)],
+            "the two nets share their segments = 2 target chain",
+        );
+
+        // The resampled arm the terminal must decline separates the pair by 2.6e-2 widget.
+        let cell = widget_frame_cell();
+        let resampled_mid = |curve: &BevelCurveProfile| {
+            let chains = CustomChains::new(curve, 2);
+            cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Resampled)[1]
+        };
+        assert!(
+            (resampled_mid(&split) - Vec3::new(0.595_36, 0.146_28, 0.0)).length() < 1.0e-4,
+            "split net resampled mid: got {:?}",
+            resampled_mid(&split),
+        );
+        assert!(
+            (resampled_mid(&moved) - Vec3::new(0.569_76, 0.140_36, 0.0)).length() < 1.0e-4,
+            "moved-P2 net resampled mid: got {:?}",
+            resampled_mid(&moved),
+        );
+
+        let terminal_mints = |curve: &BevelCurveProfile| {
+            let (mut mesh, edge) = noncollinear_valence4_fan();
+            let result = mesh.bevel(
+                &[edge.into()],
+                BevelOptions {
+                    offset: 0.25,
+                    segments: 2,
+                    affect: BevelAffect::Edges,
+                    profile_type: BevelProfileType::Custom(curve),
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let mut positions: Vec<Vec3> =
+                result.verts.iter().map(|&v| mesh.vertex_position(v)).collect();
+            positions.sort_by(|a, b| {
+                a.x.total_cmp(&b.x)
+                    .then(a.y.total_cmp(&b.y))
+                    .then(a.z.total_cmp(&b.z))
+            });
+            positions
+        };
+        let widest_gap = |left: &[Vec3], right: &[Vec3]| {
+            assert_eq!(left.len(), right.len(), "both bevels mint the same count");
+            left.iter()
+                .zip(right.iter())
+                .map(|(a, b)| (*a - *b).length())
+                .fold(0.0_f32, f32::max)
+        };
+
+        let split_mints = terminal_mints(&split);
+        let moved_mints = terminal_mints(&moved);
+        assert!(
+            widest_gap(&split_mints, &moved_mints) < 1.0e-6,
+            "the terminal chains are raw target[k], so the doubled chains cannot reach them: \
+             {split_mints:?} vs {moved_mints:?}",
+        );
+
+        let control = terminal_mints(&late_turn_net());
+        assert!(
+            widest_gap(&split_mints, &control) > 1.0e-2,
+            "a net with a different target mid must move the mints — else the equality above \
+             is vacuous",
         );
     }
 
@@ -41518,7 +42055,7 @@ impl ProfileCell {
         &self,
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
         emission: ChainEmission,
     ) -> Vec<Vec3> {
         let raw = self.raw_chain_positions(segments, profile, custom);
@@ -41528,6 +42065,9 @@ impl ProfileCell {
         if emission == ChainEmission::Raw {
             return raw;
         }
+        // The source polyline is the profile at `doubled_resolution` — for a custom curve
+        // literally §8.6.3.1(4).4's `doubled` chain, which the stride rule hands back at
+        // stride 1 rather than re-running the evaluation model a third time.
         let source_segments = boundary_source_resolution(segments);
         if source_segments == segments {
             return raw;
@@ -41537,14 +42077,19 @@ impl ProfileCell {
     }
 
     /// The chain's raw (un-resampled) `segments + 1` profile samples: the two ring
-    /// boundverts and the `SUPERELLIPSE` cell coordinates between them. This is the
+    /// boundverts and the cross-section cell coordinates between them. This is the
     /// coarse control chain the fill's centre stencil reads (§8.5.5.5(d)); the emitted
     /// rim is `chain_positions`' resample of it (§8.2.2.1.1).
+    ///
+    /// `segments` here is a *requested resolution*, not necessarily the operation's own: the
+    /// [V-ADJ] cascade asks for `2, 4, 8, …`. A custom profile therefore answers through
+    /// §8.6.3.1(4).4's schedule (`CustomChains::chain_at`), which knows the operation's count
+    /// and so can tell the `m == segments` arm from the strided one.
     fn raw_chain_positions(
         &self,
         segments: u32,
         profile: f32,
-        custom: Option<&BevelCurveProfile>,
+        custom: Option<&CustomChains>,
     ) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
@@ -41579,9 +42124,14 @@ impl ProfileCell {
                 // profile, where the diagonal symmetry makes the bit a no-op; only an
                 // asymmetric custom net exposes it. Regime A — edge bevels — would seed
                 // and parity-walk the bit instead; that path is unbuilt.)
-                Some(curve) => curve.sample_chain(segments, true),
+                Some(chains) => chains.chain_at(segments, true),
                 None => superellipse_chain(profile, segments),
             };
+            debug_assert_eq!(
+                cells.len(),
+                segments as usize + 1,
+                "a chain holds one sample per segment boundary",
+            );
             for &(u, v) in cells.iter().take(segments as usize).skip(1) {
                 positions.push(self.sample(u, v));
             }
@@ -41593,7 +42143,7 @@ impl ProfileCell {
     /// §8.2.2.1.1 at `segments = 2`: the chord-fraction resample of the single interior
     /// sample against the doubled (4-segment) profile. Identity on a symmetric cell
     /// (`f = 0.5` lands on `Q_2`); the skew pushes `f` toward the shorter leg.
-    fn segment2_boundary_resample(&self, profile: f32, custom: Option<&BevelCurveProfile>) -> Vec3 {
+    fn segment2_boundary_resample(&self, profile: f32, custom: Option<&CustomChains>) -> Vec3 {
         self.chain_positions(2, profile, custom, ChainEmission::Resampled)[1]
     }
 
@@ -41631,12 +42181,140 @@ enum ChainEmission {
 /// profile is materialised at `next power of two ≥ max(4, segments)` — **not** at
 /// `2·segments`. It equals `segments` exactly at `4, 8, 16, …`, where no down-resample
 /// runs and the emitted chain is the raw chain.
+///
+/// This is also §8.6.3.1(4).4's `doubled_resolution`, and the formula **already carries**
+/// the floor of `4` — a custom profile must not apply it a second time.
 fn boundary_source_resolution(segments: u32) -> u32 {
     let mut resolution = 4;
     while resolution < segments {
         resolution *= 2;
     }
     resolution
+}
+
+/// The custom-profile fullness law **F1** (BEVEL.md §8.5.5.5(f.3)) over a widget-frame chain:
+/// `(1 / (2·n)) · Σ_{i=0}^{n-1} (x_i + y_i)`. The sum **includes** index `0` and **excludes**
+/// index `n`, and the divisor is `2·n`, not `2·(n+1)`.
+///
+/// F1 is defined over the **widget** chain, unmirrored — attribution row 5 / §8.5.5.5(f.3) —
+/// which is what this takes. The §8.6.3.1(5) axis swap is harmless either way, since `x + y`
+/// is symmetric in its two arguments. The §8.6.3.1(6) mirror is *not*: it would be harmless
+/// only on the `n ≥ E` corner-to-corner branch, where the two endpoints the mirror exchanges
+/// both carry `x + y = 1` and the sum's asymmetric treatment of them cannot bite. On the
+/// `n < E` sub-chain (§8.6.3.1(4).3) the ends need not be the widget corners at all — the
+/// LATE_TURN net's `n = 2` chain ends carry `0.95` and `1.0` — so applying the mirror there
+/// *would* move F1. Hence: read the widget chain, never a mirrored one.
+///
+/// The chain is the one at the operation's own `segments` — §8.6.3.1(4).4 row 5 — never a
+/// strided read of the doubled chain.
+fn custom_fullness_f1(chain: &[(f32, f32)], segments: u32) -> f32 {
+    let n = segments.max(1) as usize;
+    debug_assert_eq!(
+        chain.len(),
+        n + 1,
+        "F1 sums the chain built at its own `segments`",
+    );
+    let sum: f32 = chain.iter().take(n).map(|&(x, y)| x + y).sum();
+    sum / (2.0 * n as f32)
+}
+
+/// The **two** custom sample chains a bevel materialises per profile, plus the schedule that
+/// decides which of them every downstream read is served (BEVEL.md §8.6.3.1(4).4).
+///
+/// The evaluation model of §8.6.3.1(1)–(4).3 runs exactly **twice** per operation — once at
+/// the operation's own `segments` (`target`) and once at `doubled_resolution` (`doubled`) —
+/// and every read at any *other* resolution `m` is an **index stride** of `doubled`, never a
+/// third run of the model at `m`. The [V-ADJ] cascade visits `2 → 4 → … →
+/// doubled_resolution` (§8.5.5.5(c)) and the coarse control net is a read at `m = 2`, so the
+/// distinction is reached on most segment counts.
+///
+/// It is invisible on the analytic superellipse, whose even-arc-length spacing is
+/// *refinement-consistent* — every other sample of the `2m` chain **is** the `m` chain — so
+/// striding and re-evaluating agree there exactly. A custom chain is not
+/// refinement-consistent: §8.6.3.1(4).1's budget is an integer partition over control
+/// segments recomputed from scratch for each `n`, so halving `n` can move samples onto
+/// entirely different control segments.
+///
+/// Both chains are held in the **widget** frame. The §8.6.3.1(5) axis swap and the (6)
+/// handedness mirror are per-read cell-mapping decisions, while the stride indexes the
+/// profile's *own* resolution — so the stride must be taken first, on widget indices.
+struct CustomChains<'c> {
+    curve: &'c BevelCurveProfile,
+    /// The chain at `n = segments`.
+    target: Vec<(f32, f32)>,
+    /// The chain at `n = doubled_resolution`: the source polyline of every strided read and
+    /// of the §8.2.2.1.1 chord read-back.
+    doubled: Vec<(f32, f32)>,
+    segments: u32,
+    doubled_resolution: u32,
+    /// Law **F1** over `target`, cached: it depends only on the curve and the operation's
+    /// `segments`, both fixed for the whole operation (§8.5.5.5(f.3)).
+    fullness: f32,
+}
+
+impl<'c> CustomChains<'c> {
+    fn new(curve: &'c BevelCurveProfile, segments: u32) -> Self {
+        let doubled_resolution = boundary_source_resolution(segments);
+        let target = curve.widget_chain(segments);
+        // The two counts coincide at an exact power of two `≥ 4` and **nowhere else** — in
+        // particular not at `segments = 2`, where the floor of `4` leaves a two-segment custom
+        // bevel carrying two genuinely different tables.
+        let doubled = if doubled_resolution == segments {
+            target.clone()
+        } else {
+            curve.widget_chain(doubled_resolution)
+        };
+        let fullness = custom_fullness_f1(&target, segments);
+        CustomChains {
+            curve,
+            target,
+            doubled,
+            segments,
+            doubled_resolution,
+            fullness,
+        }
+    }
+
+    /// The widget-frame chain a read at `requested_resolution` is served, per §8.6.3.1(4).4's
+    /// stride rule: `target[k]` when the request equals the operation's own `segments`, else
+    /// `doubled[k·(doubled_resolution / requested_resolution)]`.
+    ///
+    /// **The `requested_resolution == segments` arm wins, and that priority is load-bearing at
+    /// exactly one count.** The [V-ADJ] coarse control net is a read at resolution `2`
+    /// (§8.5.5.5(a)), so at `segments == 2` it must be served `target[1]` — *not*
+    /// `doubled[doubled_resolution / 2]`. The two expressions denote **different points**
+    /// there: on the guide's split net they sit `0.5` apart in widget `x`, worth ≈1753
+    /// canonical position quanta of cap apex. At every `segments ≥ 3` the same read takes the
+    /// stride arm, and at an exact power of two `≥ 4` both arms are one table, so the ordering
+    /// cannot be observed at all. Coding the stride arm unconditionally is therefore wrong on
+    /// *every* two-segment custom bevel and right everywhere else — which is precisely the
+    /// shape of defect a suite built on `segments ∈ {4, 8}` cannot see.
+    fn widget_chain_at(&self, requested_resolution: u32) -> Vec<(f32, f32)> {
+        if requested_resolution == self.segments {
+            return self.target.clone();
+        }
+        let stride = (self.doubled_resolution / requested_resolution.max(1)) as usize;
+        if stride == 0 || stride * requested_resolution as usize != self.doubled_resolution as usize
+        {
+            // Every resolution the operator asks for is a power of two `≤ doubled_resolution`,
+            // so the stride divides exactly and no interpolation ever happens here.
+            debug_assert!(
+                false,
+                "resolution {requested_resolution} is off the doubling schedule of {}",
+                self.doubled_resolution,
+            );
+            return self.curve.widget_chain(requested_resolution);
+        }
+        (0..=requested_resolution as usize)
+            .map(|k| self.doubled[k * stride])
+            .collect()
+    }
+
+    /// The chain a read at `requested_resolution` is served, mapped into the profile cell's
+    /// `(u, v)` (§8.6.3.1(5)) with the §8.6.3.1(6) handedness bit applied.
+    fn chain_at(&self, requested_resolution: u32, reverse: bool) -> Vec<(f32, f32)> {
+        widget_chain_to_cell(&self.widget_chain_at(requested_resolution), reverse)
+    }
 }
 
 /// The normalised chord fractions of a polyline (`0` at the first point, `1` at the
@@ -42930,9 +43608,9 @@ enum RingChainProfile<'c> {
     Cell {
         cell: ProfileCell,
         profile: f32,
-        /// The custom curve this cell samples its chain from (BEVEL.md §8.6.3), or
-        /// `None` for the analytic superellipse family.
-        custom: Option<&'c BevelCurveProfile>,
+        /// The custom curve's two chains and their read schedule (BEVEL.md §8.6.3 /
+        /// §8.6.3.1(4).4), or `None` for the analytic superellipse family.
+        custom: Option<&'c CustomChains<'c>>,
     },
     Arc {
         b1: Vec3,
@@ -42952,6 +43630,11 @@ impl RingChainProfile<'_> {
     /// resolution, and — at `segments = 2` — the raw coarse `(i, 0, 1)` control point the
     /// extraordinary-centre stencil consumes (§8.5.5.5, "the centre stencil consumes the
     /// raw coarse profile mids").
+    ///
+    /// The argument is a *requested resolution*, and for a custom curve the three roles are
+    /// served by §8.6.3.1(4).4's schedule rather than by three fresh resamples: the
+    /// intermediate cascade rounds and the `m = 2` coarse read stride the doubled chain,
+    /// while a read at the operation's own count returns the target chain.
     fn raw_positions(&self, segments: u32) -> Vec<Vec3> {
         match *self {
             RingChainProfile::Cell {
@@ -43360,8 +44043,9 @@ const ADJ_FULLNESS_CIRCLE: [f32; 12] = [
 /// from the boundvert centroid toward the original corner `v`. It is a fit constant of the
 /// profile and the segment count (separately for even and odd), not a per-vertex solve.
 ///
-/// Three branches, tested in order (law **F2** then **F3**; the custom-profile law **F1**
-/// has no filled path yet):
+/// Three branches, tested in order — laws **F2** then **F3**. Law **F1** is never one of
+/// them: a custom profile's fullness is [`custom_fullness_f1`] over its own chain, and the
+/// general fill selects that *instead of* calling this function at all:
 ///
 /// - the straight chord (`r = 1`) is exactly `0` — the cap is planar and its centre sits on
 ///   the boundvert centroid;
