@@ -4923,8 +4923,17 @@ impl LoopMesh {
     /// so the corner is a section of tube (a constant cross-section) rather than a rounded
     /// corner. Its fill is a two-step post-pass: build the ordinary base grid — the same
     /// octant / general dispatch this junction would take had the pipe test not fired
-    /// ([`build_adj_fill_base`], step 1) — then re-plant every interior grid vert onto that
-    /// constant cross-section (step 2). Every non-pipe junction runs the base grid alone.
+    /// ([`build_adj_fill_base`], step 1) — then re-plant the net's index-canonical `j >= 1`
+    /// slots onto that constant cross-section (step 2). That slot block is *not* the same
+    /// set as "the verts this fill allocated": through the net's seam aliasing it also
+    /// reaches the second half of every ring chain ([`Self::replant_pipe_rim_window`]).
+    /// Every non-pipe junction runs the base grid alone.
+    ///
+    /// Step 2's domain being the net's slots also decides what happens when step 1 declines:
+    /// no net, no slots, so **neither** replant half runs. That case is not exotic — the
+    /// general ring at a curved exponent is documented as unfilled ([`Self::build_adj_fill_base`]) —
+    /// and the rim half is the one that matters there, since those verts are shared with the
+    /// arriving strips and moving them with no cap to justify it distorts the junction.
     ///
     /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`); the
     /// axis and the cross-section shape are recovered from the chains at fill time, since
@@ -4958,19 +4967,96 @@ impl LoopMesh {
         // Only the base fill's own interior grid verts are appended to `result.verts` — the
         // rim (boundvert ring + chain samples) is reused from the strips and never pushed
         // here (§8.5.5). So every vert added from this point is a §8.5.2 index-canonical
-        // interior vert, already deduplicated by the grid's canon map, hence eligible for
-        // the replant exactly once.
+        // slot with `j >= 1` *and* `k >= 1`, already deduplicated by the grid's canon map.
+        // That is only half the replant's domain: the canonical block's `k = 0` column is a
+        // ring chain, reached below.
         let interior_start = result.verts.len();
-        self.build_adj_fill_base(cut, chains, segments, profile, material, templates, result);
+        let net_emitted =
+            self.build_adj_fill_base(cut, chains, segments, profile, material, templates, result);
         let Some((pipe_axis, profile_cell)) = pipe else {
             return;
         };
+        // Step 2 is a post-pass over **the net's** canonical slots, so a junction whose base
+        // dispatch declined to tile anything (an out-of-scope exponent / ring, a degenerate
+        // chain, a singular corner map) has no slots for it to walk — and in particular no
+        // licence to move the rim, which at that point is still the strips' own §8.2.2.1.1
+        // read-back with no cap to justify displacing it. Gating on step 1's outcome is what
+        // makes the ordering rule structural instead of a comment.
+        if !net_emitted {
+            return;
+        }
         let exponent = profile_to_exponent(profile);
         for index in interior_start..result.verts.len() {
             let vertex = result.verts[index];
             let base = self.vertex_position(vertex);
             let replanted = pipe_cross_section_replant(base, pipe_axis, &profile_cell, exponent);
             self.set_vertex_position(vertex, replanted);
+        }
+        self.replant_pipe_rim_window(
+            cut,
+            chains,
+            segments as usize,
+            pipe_axis,
+            &profile_cell,
+            exponent,
+        );
+    }
+
+    /// Replant the ring-chain rim samples the canonical slot walk reaches (BEVEL.md
+    /// §8.5.5.5(f.6.1)).
+    ///
+    /// The `k = 0` column of sub-patch `i` is not interior at all — through the net's seam
+    /// aliasing it *is* ring chain `i − 1`, walked backwards from `B_i` — so the replant's
+    /// `j >= 1` block writes through to the strict second half of every chain
+    /// ([`pipe_replant_rim_window`]), while the first half keeps the chord point
+    /// §8.2.2.1.1's read-back left it at. Sample `k` and sample `n − k` are mirror partners
+    /// and exactly one of the pair moves, so a symmetric tube's cap is deliberately **not**
+    /// mirror-symmetric; replanting the whole rim (or none of it) gives the prettier uniform
+    /// cap and is wrong.
+    ///
+    /// Runs after [`Self::build_adj_fill_base`], and only when it actually tiled a net: the
+    /// order is part of the rule (replanting first would let the read-back re-pin the rim on
+    /// top of it), and a declined base has no slots to walk at all.
+    ///
+    /// Each sector's chain is resolved through [`Self::sector_chain`] and walked from the
+    /// same boundvert [`Self::oriented_chain`] walks it from, so the samples this touches are
+    /// the ones [`Self::adj_grid_vert`] hands out for the net's `k = 0` column — the two must
+    /// index the same chain the same way or the window means nothing.
+    fn replant_pipe_rim_window(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: usize,
+        pipe_axis: Vec3,
+        profile_cell: &ProfileCell,
+        exponent: f32,
+    ) {
+        let window = pipe_replant_rim_window(segments);
+        if window.is_empty() {
+            return;
+        }
+        let sectors = cut.boundverts.len();
+        for sector in 0..sectors {
+            let start = cut.boundverts[sector];
+            let Some(chain) = self.sector_chain(cut, chains, sector) else {
+                continue;
+            };
+            // A chain that did not sample to `segments + 1` verts carries no net slot to
+            // alias onto, so the walk never reaches it. Redundant now that the caller only
+            // runs this on an emitted net — every base builder refuses a short chain outright
+            // — but the window means nothing without it, so it stays local to the walk.
+            if chain.interior.len() + 2 != segments + 1 {
+                continue;
+            }
+            for sample in window.clone() {
+                let Some(vertex) = chain.oriented_sample(start, sample) else {
+                    continue;
+                };
+                let base = self.vertex_position(vertex);
+                let replanted =
+                    pipe_cross_section_replant(base, pipe_axis, profile_cell, exponent);
+                self.set_vertex_position(vertex, replanted);
+            }
         }
     }
 
@@ -5050,8 +5136,12 @@ impl LoopMesh {
     /// chord) at the cube corner; circular and flat at the general ring. The square /
     /// square-in grids (§8.5.5.5(f.4)/(f.5)) and the curved *general* ring stay unfilled.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
-    /// dispatch — with the cross-section replant applied by the [`build_adj_fill`] wrapper
-    /// as a post-pass.
+    /// dispatch — with the cross-section replant applied by the [`Self::build_adj_fill`]
+    /// wrapper as a post-pass.
+    ///
+    /// Returns whether a net was actually tiled. Every out-of-scope ring, degenerate chain
+    /// and singular corner map below leaves the junction untouched, and the pipe post-pass
+    /// keys on that: its domain is the net's slots, so no net means nothing to walk.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_base(
         &mut self,
@@ -5062,7 +5152,7 @@ impl LoopMesh {
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let count = cut.boundverts.len();
         // The cube-corner closed-form sphere snap (§8.5.5.3) exists only at a
         // valence-3 orthonormal equal-offset corner; a valence-`s` (`s ≠ 3`)
@@ -5070,7 +5160,7 @@ impl LoopMesh {
         // (§8.5.5.5(e)/(f)), routed once the tri-corner trigger declines. Fewer than
         // three boundverts is not a fillable corner.
         if count < 3 {
-            return;
+            return false;
         }
         // §8.5.5.5(f.1) step 3: the symmetric equal-offset *orthonormal* cube corner at a
         // smooth exponent — every `r` bar the two squares, the flat chamfer (`r = 1`)
@@ -5097,23 +5187,21 @@ impl LoopMesh {
         // ring here. Odd `segments` and custom profiles fall through.
         if exponent == PROFILE_SQUARE_EXPONENT && count >= 3 && segments >= 2 && segments % 2 == 0
         {
-            self.build_adj_fill_square_ring(
+            return self.build_adj_fill_square_ring(
                 cut, chains, segments, profile, material, templates, result,
             );
-            return;
         }
 
         if !self.adj_tri_corner_trigger(cut, profile) {
             if exponent != 2.0 && exponent != 1.0 {
-                return;
+                return false;
             }
             match segments {
-                0 | 1 => return,
+                0 | 1 => return false,
                 _ => {
-                    self.build_adj_fill_general_nonsymmetric(
+                    return self.build_adj_fill_general_nonsymmetric(
                         cut, chains, segments, profile, material, templates, result,
                     );
-                    return;
                 }
             }
         }
@@ -5123,7 +5211,7 @@ impl LoopMesh {
         // guard). `segments ≥ 3` takes the unit-octant subdivided grid.
         // `segments < 2` has no interior to fill.
         match segments {
-            0 | 1 => return,
+            0 | 1 => return false,
             2 => {}
             _ => {
                 // §8.5.5.5(f.5): the tri-corner **square** grid is three flat unit squares
@@ -5131,15 +5219,13 @@ impl LoopMesh {
                 // `segments` — even+`s≥3` was already claimed by step 1's parallel-offset ring
                 // above — so it always leaves the central-triangle hole the odd centre fills.
                 if exponent == PROFILE_SQUARE_EXPONENT {
-                    self.build_adj_fill_square_tricorner(
+                    return self.build_adj_fill_square_tricorner(
                         cut, chains, segments, profile, material, templates, result,
                     );
-                    return;
                 }
-                self.build_adj_fill_octant(
+                return self.build_adj_fill_octant(
                     cut, chains, segments, profile, material, templates, result,
                 );
-                return;
             }
         }
 
@@ -5147,17 +5233,12 @@ impl LoopMesh {
         // chain that *starts* at B_i (B_i → B_{i+1}).
         let mut interior_of_sector: Vec<VertexKey> = Vec::with_capacity(count);
         for k in 0..count {
-            let start = cut.boundverts[k];
-            let next = cut.boundverts[(k + 1) % count];
-            let chain = chains.iter().find(|c| {
-                c.endpoint == cut.vertex
-                    && ((c.start == start && c.end == next) || (c.start == next && c.end == start))
-            });
+            let chain = self.sector_chain(cut, chains, k);
             match chain.and_then(|c| c.interior.first().copied()) {
                 Some(interior) => interior_of_sector.push(interior),
                 // A degenerate sector with no interior sample (collinear chain) is
                 // outside the forced cube-corner regime; skip the whole fill.
-                None => return,
+                None => return false,
             }
         }
 
@@ -5234,7 +5315,7 @@ impl LoopMesh {
         } else if exponent != 2.0 {
             match self.unit_octant(cut) {
                 Some(octant) => octant.to_world(Vec3::splat(3.0_f32.powf(-1.0 / exponent))),
-                None => return,
+                None => return false,
             }
         } else {
             let on_surface = [
@@ -5303,6 +5384,7 @@ impl LoopMesh {
             result.faces.push(face);
             self.collect_face_edges(face, result);
         }
+        true
     }
 
     /// Build a junction's **inner-miter** boundvert ring and its cross-section chains
@@ -6619,6 +6701,11 @@ impl LoopMesh {
     /// the `fullness = 0` seed (§8.5.5.5(e) / (f.3) law **F2**). This is the shared
     /// core of the general non-symmetric junction fill and the miter cap fills (§8.9.5.3):
     /// the only per-caller difference is where the chains come from.
+    ///
+    /// Returns whether a grid was tiled; a malformed ring (too few sectors, a chain that
+    /// did not sample to `segments + 1`) leaves the junction untouched and reports `false`,
+    /// which is what lets the §8.5.5.5(f.6) pipe post-pass tell "there is a net" from
+    /// "there is not".
     #[allow(clippy::too_many_arguments)]
     fn emit_general_adj_fill(
         &mut self,
@@ -6637,7 +6724,7 @@ impl LoopMesh {
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let sectors = chain_of.len();
         let seg = segments as usize;
         let half = seg / 2;
@@ -6647,13 +6734,13 @@ impl LoopMesh {
             || sector_representatives.len() != sectors
             || centre_column_representatives.len() != sectors
         {
-            return;
+            return false;
         }
         for chain in chain_of {
             // A chain that did not sample to `seg + 1` verts is outside scope; skip the
             // whole fill rather than emit a torn patch.
             if chain.len() != seg + 1 {
-                return;
+                return false;
             }
         }
 
@@ -6734,7 +6821,7 @@ impl LoopMesh {
                 interior_blend,
                 result,
             );
-            return;
+            return true;
         }
 
         // §8.5.5.5(e) / §8.5.5.5(f.3) law **F2**: the straight-chord cap that reaches here —
@@ -6789,6 +6876,7 @@ impl LoopMesh {
             interior_blend,
             result,
         );
+        true
     }
 
     /// The (incoming, outgoing) edges of `face` meeting at `vertex` in the face's
@@ -6849,7 +6937,7 @@ impl LoopMesh {
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let sectors = cut.boundverts.len(); // 3 (guarded by the caller)
         let seg = segments as usize;
         let half = seg / 2;
@@ -6865,13 +6953,13 @@ impl LoopMesh {
                 // A sector that did not sample to `seg + 1` verts (a collinear /
                 // degenerate chain) is outside the forced cube-corner regime; skip
                 // the whole fill rather than emit a torn patch.
-                _ => return,
+                _ => return false,
             }
         }
 
         let octant = match self.unit_octant(cut) {
             Some(octant) => octant,
-            None => return,
+            None => return false,
         };
 
         // Stage 4 on the rim. The snap is the fill's own **grid-level** step and runs
@@ -6945,6 +7033,7 @@ impl LoopMesh {
             None,
             result,
         );
+        true
     }
 
     /// The affine `unit_to_corner` map of this tri-corner junction (BEVEL.md §8.5.2 /
@@ -6999,12 +7088,12 @@ impl LoopMesh {
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let sectors = cut.boundverts.len();
         let seg = segments as usize;
         let half = seg / 2;
         if sectors < 3 || seg < 2 || seg % 2 != 0 {
-            return;
+            return false;
         }
 
         let mut chain_of: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
@@ -7013,7 +7102,7 @@ impl LoopMesh {
                 Some(chain) if chain.len() == seg + 1 => chain_of.push(chain),
                 // A sector that did not sample to `seg + 1` verts (a collinear / degenerate
                 // chain) is outside scope; skip the whole fill rather than emit a torn patch.
-                _ => return,
+                _ => return false,
             }
         }
 
@@ -7092,6 +7181,7 @@ impl LoopMesh {
             None,
             result,
         );
+        true
     }
 
     /// Build the **tri-corner** square [V-ADJ] fill — the three flat unit squares of
@@ -7113,27 +7203,27 @@ impl LoopMesh {
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let _ = profile;
         let sectors = cut.boundverts.len(); // 3 (guarded by the caller)
         let seg = segments as usize;
         let half = seg / 2;
         let even = seg % 2 == 0;
         if sectors != 3 || seg < 3 {
-            return;
+            return false;
         }
 
         let mut chain_of: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
         for i in 0..sectors {
             match self.oriented_chain(cut, chains, i) {
                 Some(chain) if chain.len() == seg + 1 => chain_of.push(chain),
-                _ => return,
+                _ => return false,
             }
         }
 
         let octant = match self.unit_octant(cut) {
             Some(octant) => octant,
-            None => return,
+            None => return false,
         };
 
         let sector_representatives = cut.resolve_sector_representatives(templates);
@@ -7157,6 +7247,7 @@ impl LoopMesh {
             None,
             result,
         );
+        true
     }
 
     /// Build the rounded adjacency-grid fill for a **general non-symmetric**
@@ -7200,7 +7291,7 @@ impl LoopMesh {
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
-    ) {
+    ) -> bool {
         let sectors = cut.boundverts.len();
         let seg = segments as usize;
 
@@ -7214,7 +7305,7 @@ impl LoopMesh {
                 // A sector that did not sample to `seg + 1` verts (a collinear /
                 // degenerate chain) is outside scope; skip the whole fill rather
                 // than emit a torn patch.
-                _ => return,
+                _ => return false,
             }
         }
 
@@ -7229,7 +7320,7 @@ impl LoopMesh {
                     profile,
                     custom: None,
                 }),
-                None => return,
+                None => return false,
             }
         }
 
@@ -7261,7 +7352,7 @@ impl LoopMesh {
             None,
             None,
             result,
-        );
+        )
     }
 
     /// Tile one valence-`s` adjacency grid from its rim chains and an `interior` rule
@@ -7647,6 +7738,31 @@ impl LoopMesh {
         self.collect_face_edges(face, result);
     }
 
+    /// The chain spanning sector `i`'s boundvert pair at this junction (BEVEL.md §8.2.2) —
+    /// the one edge-end chain of `cut.vertex` whose two named ends are `B_i` and `B_{i+1}`,
+    /// in whichever sense it was sampled. `None` when no chain spans the pair.
+    ///
+    /// The single place the sector → chain lookup lives. Every reader of a sector's rim has
+    /// to agree on *which* chain a sector index names — the net's `k = 0` column
+    /// ([`Self::adj_grid_vert`], via [`Self::oriented_chain`]) and the §8.5.5.5(f.6.1) rim
+    /// replant index the same chain from the same boundvert, and a second copy of this
+    /// predicate is exactly how those two would drift apart.
+    fn sector_chain<'c>(
+        &self,
+        cut: &JunctionCut,
+        chains: &'c [EdgeEndChain],
+        i: usize,
+    ) -> Option<&'c EdgeEndChain> {
+        let count = cut.boundverts.len();
+        let start = cut.boundverts[i];
+        let end = cut.boundverts[(i + 1) % count];
+        chains.iter().find(|chain| {
+            chain.endpoint == cut.vertex
+                && ((chain.start == start && chain.end == end)
+                    || (chain.start == end && chain.end == start))
+        })
+    }
+
     /// The profile chain of sector `i` at this junction, oriented from its opening
     /// boundvert `B_i` (BEVEL.md §8.2.2). `None` when no chain spans the sector's
     /// boundvert pair.
@@ -7656,14 +7772,7 @@ impl LoopMesh {
         chains: &[EdgeEndChain],
         i: usize,
     ) -> Option<Vec<VertexKey>> {
-        let count = cut.boundverts.len();
-        let start = cut.boundverts[i];
-        let end = cut.boundverts[(i + 1) % count];
-        let chain = chains.iter().find(|c| {
-            c.endpoint == cut.vertex
-                && ((c.start == start && c.end == end) || (c.start == end && c.end == start))
-        })?;
-        Some(chain.oriented_from(start))
+        Some(self.sector_chain(cut, chains, i)?.oriented_from(cut.boundverts[i]))
     }
 
     /// One boundvert's down-pushed corner-vert position (BEVEL.md §8.3.3): `B_k`
@@ -7735,18 +7844,7 @@ impl LoopMesh {
         chains: &[EdgeEndChain],
         k: usize,
     ) -> Option<ProfileCell> {
-        let count = cut.boundverts.len();
-        let next = (k + 1) % count;
-        let start_boundvert = cut.boundverts[k];
-        let end_boundvert = cut.boundverts[next];
-        chains
-            .iter()
-            .find(|c| {
-                c.endpoint == cut.vertex
-                    && ((c.start == start_boundvert && c.end == end_boundvert)
-                        || (c.start == end_boundvert && c.end == start_boundvert))
-            })
-            .and_then(|chain| chain.cell)
+        self.sector_chain(cut, chains, k).and_then(|chain| chain.cell)
     }
 
     /// A junction vertex's outward surface normal: the summed plane normals of its
@@ -13038,6 +13136,23 @@ impl EdgeEndChain {
             samples.reverse();
         }
         samples
+    }
+
+    /// Sample `index` of the walk that begins at `first` (either endpoint), without
+    /// materialising [`EdgeEndChain::oriented_from`]'s vector. `None` past the last sample.
+    fn oriented_sample(&self, first: VertexKey, index: usize) -> Option<VertexKey> {
+        let count = self.interior.len() + 2;
+        if index >= count {
+            return None;
+        }
+        let index = if self.start == first { index } else { count - 1 - index };
+        if index == 0 {
+            Some(self.start)
+        } else if index == count - 1 {
+            Some(self.end)
+        } else {
+            self.interior.get(index - 1).copied()
+        }
     }
 }
 
@@ -20338,6 +20453,19 @@ mod tests {
         segments: u32,
         method: BevelVmeshMethod,
     ) -> (LoopMesh, BevelResult) {
+        tented_grid_pipe_profile(beveled_spokes, offset, segments, method, 0.5)
+    }
+
+    /// The same tented pipe at a chosen `profile`. The circular default (`0.5`) is what the
+    /// filled-pipe tests use; a curved exponent (`0.7`) is how the **general** ring is driven
+    /// out of the fill's scope while leaving the pipe predicate itself untouched.
+    fn tented_grid_pipe_profile(
+        beveled_spokes: &[usize],
+        offset: f32,
+        segments: u32,
+        method: BevelVmeshMethod,
+        profile: f32,
+    ) -> (LoopMesh, BevelResult) {
         let mut mesh = LoopMesh::new();
         let verts: Vec<VertexKey> = [
             [0.0, 0.0, 0.0],
@@ -20372,6 +20500,7 @@ mod tests {
                 affect: BevelAffect::Edges,
                 segments,
                 vmesh_method: method,
+                profile,
                 ..Default::default()
             },
         );
@@ -20690,6 +20819,335 @@ mod tests {
             (tented_pipe_cyl_distance(central, offset) - offset).abs() < 1.0e-4,
             "the seg-3 valence-4 central vert is re-planted onto the tube cross-section",
         );
+    }
+
+    /// §8.5.5.5(f.6.1): the replant's rim window is the strict **second half** of every
+    /// ring chain, `⌊n/2⌋ + 1 ..= n − 1`, with the same index range at both parities — the
+    /// guide's derived table. Empty at `segments <= 2`; never an endpoint (those are the
+    /// boundverts); never the even-`segments` chain midpoint `n/2` (that slot sits at
+    /// `j = 0`, outside the canonical `j >= 1` block).
+    #[test]
+    fn pipe_replant_rim_window_is_the_second_half_of_every_chain() {
+        let table: [(usize, &[usize]); 9] = [
+            (1, &[]),
+            (2, &[]),
+            (3, &[2]),
+            (4, &[3]),
+            (5, &[3, 4]),
+            (6, &[4, 5]),
+            (7, &[4, 5, 6]),
+            (8, &[5, 6, 7]),
+            (9, &[5, 6, 7, 8]),
+        ];
+        for (segments, expected) in table {
+            let window: Vec<usize> = pipe_replant_rim_window(segments).collect();
+            assert_eq!(
+                window, expected,
+                "the (f.6.1) rim window at segments = {segments}",
+            );
+            assert_eq!(
+                window.len(),
+                (segments + 1) / 2 - 1,
+                "per-chain count is ⌈n/2⌉ − 1 at segments = {segments}",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6.1): the window is not an independent rule — it is the image of §8.5.2's
+    /// canonical `j >= 1` block under the net's own `k = 0` seam alias
+    /// `(i, j, 0) == (i − 1, 0, n − j)`, the very index `adj_grid_vert` resolves a `k = 0`
+    /// slot through. Re-deriving it from the canonical `j` range at both parities is what
+    /// keeps the two readings from drifting apart.
+    #[test]
+    fn pipe_replant_rim_window_is_the_canonical_j_block_under_the_seam_alias() {
+        for segments in 2..=9usize {
+            let half = segments / 2;
+            // Odd `n`: `j` runs `1 ..= ⌊n/2⌋`. Even `n`: the `j = n/2` row is a relabelled
+            // neighbour (only its welded centre is canonical), so `j` runs `1 ..= n/2 − 1`.
+            let last_j = if segments % 2 == 0 { half - 1 } else { half };
+            let mut reached: Vec<usize> = (1..=last_j).map(|j| segments - j).collect();
+            reached.sort_unstable();
+            assert_eq!(
+                reached,
+                pipe_replant_rim_window(segments).collect::<Vec<_>>(),
+                "the rim slots the canonical `j >= 1` block aliases onto at segments = {segments}",
+            );
+        }
+    }
+
+    /// The ring-chain samples sitting at one pipe station of the valence-4 tented pipe,
+    /// ordered along the chain's `y` extent. Both the transverse chains' far-end verts and
+    /// the flat skirt share the station plane, so the cross-section cylinder filters them
+    /// out — every vert of the axial chain lies within the tube radius, the rest do not.
+    fn tented_pipe_station_samples(mesh: &LoopMesh, station_x: f32, offset: f32) -> Vec<Vec3> {
+        let mut samples: Vec<Vec3> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|vertex| mesh.vertex_position(vertex))
+            .filter(|position| (position.x - station_x).abs() < 1.0e-5)
+            .filter(|position| tented_pipe_cyl_distance(*position, offset) <= offset + 1.0e-5)
+            .collect();
+        samples.sort_by(|a, b| a.y.partial_cmp(&b.y).expect("finite positions"));
+        samples
+    }
+
+    /// §8.5.5.5(f.6.1): the replant moves exactly one of each mirror pair `(k, n − k)`, so a
+    /// symmetric tube's pipe cap is **not** mirror-symmetric — the count of stranded verts
+    /// within the replant's footprint (the two pipe stations, which is all the replant can
+    /// reach, being a projection *into* each vert's own station plane) is exactly
+    /// `4·(⌈n/2⌉ − 1)`.
+    ///
+    /// Two independent exemptions make it vanish: **(A)** at `segments = 2` the window is
+    /// empty, and **(B)** at `segments ∈ {4, 8, …}` the rim is raw, so the replant is the
+    /// identity on it. Neither implies the other. An implementation that replants the whole
+    /// rim — or none of it — reports zero breaks at *every* count and fails this ladder.
+    #[test]
+    fn pipe_replant_window_breaks_the_tube_mirror_by_four_per_moved_sample() {
+        let offset = 0.2;
+        for segments in 2..=9u32 {
+            let (mesh, _result) =
+                tented_grid_pipe(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj);
+            let station: Vec<Vec3> = [1.0 - offset, 1.0 + offset]
+                .into_iter()
+                .flat_map(|station_x| tented_pipe_station_samples(&mesh, station_x, offset))
+                .collect();
+            // Three rows of this ladder expect zero breaks, so pin the footprint itself:
+            // both stations must hold their whole pipe-edge chain, or a fixture that stopped
+            // producing a cap (or a filter that stopped matching) would satisfy them vacuously.
+            assert_eq!(
+                station.len(),
+                2 * (segments as usize + 1),
+                "both pipe stations hold their whole chain at segments = {segments}",
+            );
+            let stranded = station
+                .iter()
+                .filter(|position| {
+                    let mirrored = Vec3::new(position.x, 2.0 - position.y, position.z);
+                    !station
+                        .iter()
+                        .any(|other| (*other - mirrored).length() < 1.0e-5)
+                })
+                .count();
+            let raw_rim = segments >= 4 && segments.is_power_of_two();
+            let expected = if raw_rim {
+                0
+            } else {
+                4 * ((segments as usize + 1) / 2 - 1)
+            };
+            assert_eq!(
+                stranded, expected,
+                "mirror breaks within the replant footprint at segments = {segments}",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6): step 2 walks **the net's** canonical slots, so a pipe junction whose
+    /// base dispatch (step 1) declined to tile anything has no slots at all and *neither*
+    /// replant half may run. The rim half is the one with teeth: those samples are shared
+    /// with the arriving strips, and moving them with no cap emitted just distorts the
+    /// junction.
+    ///
+    /// The reachable fixture is a **valence-4 pipe at a curved exponent** (`profile = 0.7`,
+    /// `r ≈ 3.89`): the tri-corner trigger wants three boundverts and this ring has four, and
+    /// the general ring at a curved exponent is documented as unfilled — so the base declines
+    /// while the pipe predicate itself still fires.
+    ///
+    /// The whole tent is symmetric about `y = 1` and the §8.2.2.1.1 read-back respects that
+    /// mirror; the replant is exactly what breaks it (the ladder above counts the breaks). So
+    /// "every vert still has its mirror partner" is the statement that the rim sits precisely
+    /// where the read-back left it.
+    #[test]
+    fn declined_pipe_base_leaves_the_rim_where_the_read_back_put_it() {
+        let offset = 0.2;
+        for segments in [3u32, 5] {
+            let (filled, _) =
+                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.5);
+            let (declined, _) =
+                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.7);
+            assert!(
+                declined.face_keys().len() < filled.face_keys().len(),
+                "the curved-exponent general ring emits no cap, so the base declined \
+                 (segments = {segments})",
+            );
+
+            let positions: Vec<Vec3> = declined
+                .vert_keys()
+                .into_iter()
+                .map(|vertex| declined.vertex_position(vertex))
+                .collect();
+            for position in &positions {
+                let mirrored = Vec3::new(position.x, 2.0 - position.y, position.z);
+                assert!(
+                    positions
+                        .iter()
+                        .any(|other| (*other - mirrored).length() < 1.0e-5),
+                    "the declined junction's rim keeps the read-back's mirror symmetry; \
+                     {position:?} has no partner (segments = {segments})",
+                );
+            }
+        }
+    }
+
+    /// §8.5.5.5(f.6.1): the rim window and the net's `k = 0` column must name the **same
+    /// verts**. The window is the image of §8.5.2's canonical `j >= 1` block under the seam
+    /// alias `(i, j, 0) == (i − 1, 0, n − j)`, so the set of keys `adj_grid_vert` hands out
+    /// for `k = 0` over that block has to equal the set the replant's window walks — pinning
+    /// the derivation against the code that *resolves* a slot, not against itself.
+    ///
+    /// Set equality is the right statement (and all this can see): the footprint is a union
+    /// over sub-patches, so which *sub-patch* reaches a given chain is not observable here,
+    /// while the alias index — the half of the chain that moves — is.
+    #[test]
+    fn pipe_replant_rim_window_touches_exactly_the_net_k0_column() {
+        for segments in 2..=9usize {
+            for sectors in [3usize, 4] {
+                let mut mesh = LoopMesh::new();
+                // One distinct vert per chain sample, so key equality is index equality.
+                let chain_of: Vec<Vec<VertexKey>> = (0..sectors)
+                    .map(|i| {
+                        (0..=segments)
+                            .map(|k| mesh.create_vertex(Vec3::new(i as f32, k as f32, 0.0)))
+                            .collect()
+                    })
+                    .collect();
+
+                let half = segments / 2;
+                let even = segments % 2 == 0;
+                // §8.5.2's canonical `j` range: `1 ..= ⌊n/2⌋` at odd `n`, and `1 ..= n/2 − 1`
+                // at even `n` (the `j = n/2` row is a relabelled neighbour there).
+                let last_j = if even { half - 1 } else { half };
+                let interior = AdjInterior::Blend {
+                    corners: &[],
+                    anchor: Vec3::ZERO,
+                };
+                let mut grid = std::collections::HashMap::new();
+                let mut result = BevelResult::default();
+                let mut emitter: std::collections::HashSet<VertexKey> =
+                    std::collections::HashSet::new();
+                for i in 0..sectors {
+                    for j in 1..=last_j {
+                        emitter.insert(mesh.adj_grid_vert(
+                            i, j, 0, half, segments, sectors, even, &chain_of, &interior, None,
+                            None, &mut grid, &mut result,
+                        ));
+                    }
+                }
+
+                let mut replanted: std::collections::HashSet<VertexKey> =
+                    std::collections::HashSet::new();
+                for chain in &chain_of {
+                    for sample in pipe_replant_rim_window(segments) {
+                        replanted.insert(chain[sample]);
+                    }
+                }
+
+                assert_eq!(
+                    emitter.len(),
+                    sectors * last_j,
+                    "the canonical `k = 0` block has one distinct vert per (sector, j) \
+                     (segments = {segments}, sectors = {sectors})",
+                );
+                assert_eq!(
+                    emitter, replanted,
+                    "the replant window walks the net's `k = 0` column exactly \
+                     (segments = {segments}, sectors = {sectors})",
+                );
+            }
+        }
+    }
+
+    /// The replant reads its samples one at a time rather than materialising the sector's
+    /// oriented chain, which is only sound if the two agree index-for-index from **either**
+    /// end — the `k = 0` column is walked from the far boundvert, so the reversed sense is
+    /// the one that carries the §8.5.5.5(f.6.1) window.
+    #[test]
+    fn oriented_sample_indexes_the_oriented_chain() {
+        let mut mesh = LoopMesh::new();
+        let verts: Vec<VertexKey> = (0..5)
+            .map(|i| mesh.create_vertex(Vec3::new(i as f32, 0.0, 0.0)))
+            .collect();
+        let edge = mesh.create_edge([verts[0], verts[4]], EdgeCreateFlags::NONE);
+        let chain = EdgeEndChain {
+            edge,
+            endpoint: verts[0],
+            start: verts[0],
+            interior: verts[1..4].to_vec(),
+            end: verts[4],
+            side_label: SideLabel::Unlabelled,
+            cell: None,
+        };
+        for first in [verts[0], verts[4]] {
+            let oriented = chain.oriented_from(first);
+            for (index, &expected) in oriented.iter().enumerate() {
+                assert_eq!(
+                    chain.oriented_sample(first, index),
+                    Some(expected),
+                    "sample {index} of the walk from {first:?}",
+                );
+            }
+            assert_eq!(chain.oriented_sample(first, oriented.len()), None);
+        }
+    }
+
+    /// §8.5.5.5(f.6.1): *which* half moves. On each pipe-edge chain the replanted samples
+    /// are a contiguous run touching one boundvert — the chain's far end in the net's ring
+    /// order — while the other half keeps the chord point §8.2.2.1.1's read-back left it
+    /// strictly inside the cross-section. The ring order walks *around* the junction, so the
+    /// two pipe-edge chains are traversed in opposite senses and the two stations replant
+    /// **opposite** ends: that is the axial mirror break, and it is why replanting the whole
+    /// rim (every sample on the curve) or none of it (none on the curve) both diverge.
+    ///
+    /// Odd `segments` only, so that neither exemption applies and the chain has no midpoint
+    /// sample to sit outside the window while still being a fixed point of the read-back.
+    #[test]
+    fn pipe_replant_window_moves_one_contiguous_end_of_each_pipe_edge_chain() {
+        let offset = 0.2;
+        for segments in [3u32, 5, 7, 9] {
+            let seg = segments as usize;
+            let (mesh, _result) =
+                tented_grid_pipe(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj);
+            let mut high_y_end_moved = Vec::with_capacity(2);
+            for station_x in [1.0 - offset, 1.0 + offset] {
+                let samples = tented_pipe_station_samples(&mesh, station_x, offset);
+                assert_eq!(
+                    samples.len(),
+                    seg + 1,
+                    "the station holds the whole pipe-edge chain (segments = {segments})",
+                );
+                let on_curve: Vec<bool> = samples
+                    .iter()
+                    .map(|position| {
+                        (tented_pipe_cyl_distance(*position, offset) - offset).abs() < 1.0e-5
+                    })
+                    .collect();
+                assert!(
+                    on_curve[0] && on_curve[seg],
+                    "both boundverts sit on the cross-section (segments = {segments})",
+                );
+                let interior = &on_curve[1..seg];
+                assert_eq!(
+                    interior.iter().filter(|moved| **moved).count(),
+                    (seg + 1) / 2 - 1,
+                    "⌈n/2⌉ − 1 samples replanted onto the cross-section (segments = {segments})",
+                );
+                let moved_at_high_y = interior[interior.len() - 1];
+                // One run touching an end ⟺ the flags are monotone in walk order.
+                let contiguous = interior
+                    .windows(2)
+                    .all(|pair| pair[0] == pair[1] || pair[1] == moved_at_high_y);
+                assert!(
+                    contiguous,
+                    "the replanted samples form one run touching a boundvert \
+                     (segments = {segments}, station x = {station_x}): {interior:?}",
+                );
+                high_y_end_moved.push(moved_at_high_y);
+            }
+            assert_ne!(
+                high_y_end_moved[0], high_y_end_moved[1],
+                "the two pipe-edge chains are walked in opposite senses, so they replant \
+                 opposite ends (segments = {segments})",
+            );
+        }
     }
 
     /// §8.3.4.1 + §8.5.5.5(f.6): the CUTOFF pipe override delegates its connected fill to
@@ -43894,6 +44352,18 @@ fn pipe_cross_section_replant(
 
     let snapped = snap_to_unit_superellipsoid(Vec3::new(u, v, 0.0), exponent);
     origin + snapped.x * a_axis + snapped.y * b_axis
+}
+
+/// The ring-chain rim samples the §8.5.5.5(f.6) replant reaches (BEVEL.md §8.5.5.5(f.6.1)).
+///
+/// The replant's domain is the net's index-canonical `j >= 1` slot block (§8.5.2), and the
+/// net's seam aliasing `(i, j, 0) == (i - 1, 0, n - j)` makes the `k = 0` column of every
+/// sub-patch *be* a ring chain rather than interior. Working both parities of the canonical
+/// `j` range through that alias gives the same index window either way — the chain's strict
+/// **second half** `⌊n/2⌋ + 1 ..= n − 1`, never its first half and never either endpoint
+/// (those are the boundverts). Empty at `segments <= 2`.
+fn pipe_replant_rim_window(segments: usize) -> std::ops::Range<usize> {
+    (segments / 2 + 1)..segments
 }
 
 /// The generating profile of one ring edge of a [V-ADJ] cap (BEVEL.md §8.5.5.5(a)),
