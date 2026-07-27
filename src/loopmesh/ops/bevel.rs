@@ -20625,6 +20625,70 @@ mod tests {
         );
     }
 
+    /// §8.5.5.5(f.6.2): a vert coincident with a projected control point must replant onto
+    /// that cell **corner**, not near it. Its exact cell coordinates are `(1, 0)`, and branch
+    /// R's `r`-norm amplifies whatever residue the cell-coordinate solve leaves in the
+    /// coordinate that should be zero by `ε^r` — a violent *expansion* at a concave exponent,
+    /// so a single-precision solve's few ulps become a percent-scale inward shrink. The
+    /// corner-coincident verts are the ones the replant is the identity on, so the whole
+    /// sweep of stations along the axis-parallel line through `end` must come back unmoved.
+    ///
+    /// The identity claim needs a companion, because a corner-coincident `base` lies on the
+    /// projected chord and is therefore a fixed point of all three degenerate exits too — the
+    /// claim would read as satisfied with the curved branch never entered. Every exit returns
+    /// a point *of* that chord, so a second probe on the same cell landing clear of it is the
+    /// proof that the superellipse snap is what held the corner.
+    #[test]
+    fn pipe_replant_holds_corner_coincident_verts_at_a_deep_concave_exponent() {
+        let exponent = profile_to_exponent(0.02);
+        let offset = 0.2_f32;
+        // A cross-section in the `z = 0` plane with the pipe along `z`, so every station
+        // projection is an exact translation and the *only* rounding left is the solve's own
+        // `start + end - mid` cancellation — the channel (f.6.2) names. The control points sit
+        // far from the origin relative to `offset`, which is what makes that cancellation bite.
+        let mut worst_shrink = 0.0_f32;
+        let mut worst_chord_clearance = f32::INFINITY;
+        for step in 0..16 {
+            let corner = Vec3::new(1.3 + 0.37 * step as f32, -0.45 - 0.11 * step as f32, 0.0);
+            let sweep = 0.19 * step as f32;
+            let start = corner + offset * Vec3::new(sweep.cos(), sweep.sin(), 0.0);
+            let end = corner + offset * Vec3::new(sweep.sin(), -sweep.cos(), 0.0);
+            let cell = ProfileCell::from_control_points(start, end, corner);
+            for station_step in 0..4 {
+                // On the axis-parallel line through `end`: the cross-section is constant along
+                // the pipe, so `end` projects onto this vert at *every* station, whose cell
+                // coordinates are therefore the `(1, 0)` corner exactly.
+                let station = -0.75 + 0.5 * station_step as f32;
+                let base = Vec3::new(end.x, end.y, station);
+                let replanted = pipe_cross_section_replant(base, Vec3::Z, &cell, exponent);
+                worst_shrink = worst_shrink.max((replanted - base).length() / offset);
+
+                // Same cell, same station, but the `(1, 1)` corner — off the chord, so only the
+                // curved branch can produce its answer. A concave exponent pulls it well onto
+                // the `origin` side of `start'–end'` (`2^(-1/r)` along each axis, about half an
+                // offset clear at this profile); every degenerate exit would leave it *on* the
+                // chord.
+                let off_corner = Vec3::new(corner.x, corner.y, station);
+                let bulged = pipe_cross_section_replant(off_corner, Vec3::Z, &cell, exponent);
+                let projected_start = Vec3::new(start.x, start.y, station);
+                let projected_end = Vec3::new(end.x, end.y, station);
+                let chord_point = closest_point_on_segment(bulged, projected_start, projected_end);
+                worst_chord_clearance =
+                    worst_chord_clearance.min((bulged - chord_point).length() / offset);
+            }
+        }
+        assert!(
+            worst_chord_clearance > 0.25,
+            "the curved branch never ran — the off-corner probe stayed within \
+             {worst_chord_clearance} cell units of the chord that every degenerate exit returns, \
+             so the corner-coincident claim below would hold vacuously",
+        );
+        assert!(
+            worst_shrink < 1.0e-4,
+            "corner-coincident replant shrank inward by {worst_shrink} cell units",
+        );
+    }
+
     /// §8.5.5.5(f.6): the replant discriminator is junction planarity. A flat junction's
     /// cross-section control points are coplanar (the base grid is already correct → decline);
     /// a genuine tube's wrap out of any one plane (→ replant).
@@ -44561,11 +44625,58 @@ fn pipe_cross_section_replant(
     if determinant.abs() <= f32::EPSILON {
         return closest_point_on_segment(base, start, end);
     }
-    let ap = a_axis.dot(offset);
-    let bp = b_axis.dot(offset);
-    let u = (ap * bb - bp * ab) / determinant;
-    let v = (aa * bp - ab * ap) / determinant;
+    // §8.5.5.5(f.6.2): at a vert coincident with a projected control point the cell coordinate
+    // that should be `0` is reached by *cancellation*, so it arrives as a solve residue rather
+    // than as a written zero — and the snap's `r`-norm raises it to the power `r`, which for a
+    // concave exponent is a violent expansion, not a contraction (`(10⁻⁷)^0.354 ≈ 3.5·10⁻³`,
+    // a percent-scale inward shrink of a vert the replant should not move at all). The residue
+    // is manufactured by the `start + end - mid` origin formation, whose terms are world-scale
+    // while their combination is cell-scale. Carrying the solve in double precision — station
+    // projection included, since a tilted axis at a distant station cancels there too — drives
+    // the residue from `10⁻⁷` to `10⁻¹⁶`, and the same power law then shrinks its footprint by
+    // `(10⁻⁹)^r`.
+    //
+    // The widening is scoped to the solve: the three exits above keep classifying on their own
+    // single-precision quantities, so which of them fires is exactly what it was. The remaining
+    // `wide_determinant` test is a divide guard, not a second classifier — it catches a triple
+    // that cleared the single-precision determinant exit yet lands the double-precision
+    // determinant at (or within one single-precision epsilon of) zero. It buys no accuracy in
+    // that sliver: the fallback recomputes the same expression nine decades *less* accurately,
+    // so where the wide determinant is untrustworthy the narrow one is more so. Its only
+    // service is keeping the division defined, and it is kept for that alone.
+    let wide_axis = pipe_axis.as_dvec3().normalize_or_zero();
+    let wide_base = base.as_dvec3();
+    let to_wide_station =
+        |point: Vec3| point.as_dvec3() - (point.as_dvec3() - wide_base).dot(wide_axis) * wide_axis;
+    let wide_start = to_wide_station(cell.start);
+    let wide_end = to_wide_station(cell.end);
+    let wide_mid = to_wide_station(cell.mid);
+    let wide_a_axis = wide_mid - wide_start;
+    let wide_b_axis = wide_mid - wide_end;
+    let wide_offset = wide_base - (wide_start + wide_end - wide_mid);
+    let wide_aa = wide_a_axis.dot(wide_a_axis);
+    let wide_ab = wide_a_axis.dot(wide_b_axis);
+    let wide_bb = wide_b_axis.dot(wide_b_axis);
+    let wide_determinant = wide_aa * wide_bb - wide_ab * wide_ab;
+    let (u, v) = if wide_determinant.abs() > f32::EPSILON as f64 {
+        let wide_ap = wide_a_axis.dot(wide_offset);
+        let wide_bp = wide_b_axis.dot(wide_offset);
+        (
+            ((wide_ap * wide_bb - wide_bp * wide_ab) / wide_determinant) as f32,
+            ((wide_aa * wide_bp - wide_ab * wide_ap) / wide_determinant) as f32,
+        )
+    } else {
+        let ap = a_axis.dot(offset);
+        let bp = b_axis.dot(offset);
+        (
+            (ap * bb - bp * ab) / determinant,
+            (aa * bp - ab * ap) / determinant,
+        )
+    };
 
+    // The third cell coordinate is identically zero by construction — the station plane is
+    // *defined* to pass through `base` — so it is written, never computed (§8.5.5.5(f.6)):
+    // a literal zero has no rounding for the `r`-norm to amplify.
     let snapped = snap_to_unit_superellipsoid(Vec3::new(u, v, 0.0), exponent);
     origin + snapped.x * a_axis + snapped.y * b_axis
 }
