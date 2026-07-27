@@ -438,9 +438,9 @@ pub struct BevelOptions<'a> {
     pub mark_sharp: bool,
     /// How a multi-edge junction's corner patch is filled at `segments ≥ 2`
     /// (BEVEL.md §1.2 / §8.3). Only consulted for `affect = Edges`,
-    /// `segments ≥ 2`. Defaults to `Adj` (the rounded grid), implemented at the
-    /// default circular profile for the cube corner (any `segments`) and the
-    /// general valence-`s` corner (BEVEL.md §8.5 / §8.5.5.5). The `Cutoff`
+    /// `segments ≥ 2`. Defaults to `Adj` (the rounded grid), implemented at every
+    /// smooth exponent for the cube corner (any `segments`) and the general
+    /// valence-`s` corner (BEVEL.md §8.5 / §8.5.5.5). The `Cutoff`
     /// flat-cut fill is implemented for the multi-edge junction at the default
     /// profile (BEVEL.md §8.2 / §8.3).
     pub vmesh_method: BevelVmeshMethod,
@@ -3318,9 +3318,9 @@ impl LoopMesh {
 
         // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
         // adjacency grid (§8.5), per `vmesh_method`. ADJ fills the cube corner (any
-        // `segments`) and the general valence-`s` corner at the default circular
-        // profile (§8.5.5.5); only the deferred profile / pipe variants of
-        // §8.5.5.5(f) take no ADJ fill yet.
+        // `segments`) and the general valence-`s` corner at every **smooth** exponent
+        // (§8.5.5.5, and (f.1) step 4's ungated fullness grid); only the square /
+        // square-in variants of §8.5.5.5(f.4)/(f.5) take no ADJ fill yet.
         for cut in &junction_cuts {
             // §8.3.0.3: the fill kind is chosen by the ring's boundvert count, not by the
             // beveled-edge count and not by `vmesh_method`. A two-boundvert ring bounds a
@@ -4931,9 +4931,10 @@ impl LoopMesh {
     ///
     /// Step 2's domain being the net's slots also decides what happens when step 1 declines:
     /// no net, no slots, so **neither** replant half runs. That case is not exotic — the
-    /// general ring at a curved exponent is documented as unfilled ([`Self::build_adj_fill_base`]) —
-    /// and the rim half is the one that matters there, since those verts are shared with the
-    /// arriving strips and moving them with no cap to justify it distorts the junction.
+    /// square / square-in grids are unfilled on this route
+    /// ([`Self::build_adj_fill_base`]) — and the rim half is the one that matters there,
+    /// since those verts are shared with the arriving strips and moving them with no cap to
+    /// justify it distorts the junction.
     ///
     /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`); the
     /// axis and the cross-section shape are recovered from the chains at fill time, since
@@ -5133,8 +5134,11 @@ impl LoopMesh {
     ///   welded centre vertex and a central `s`-gon for every `s`.
     ///
     /// Scope this cycle: every **smooth** exponent (circular, curved, and the straight
-    /// chord) at the cube corner; circular and flat at the general ring. The square /
-    /// square-in grids (§8.5.5.5(f.4)/(f.5)) and the curved *general* ring stay unfilled.
+    /// chord) at the cube corner *and* at the general ring — §8.5.5.5(f.1) step 4 has no
+    /// exponent gate. The square grids of (f.5) run on their own routes (step 1's
+    /// parallel-offset ring, the tri-corner three squares); a square exponent on **odd**
+    /// `segments` at a general ring, and square-in at a general ring, are the one tracked
+    /// gap — see step 4's comment below.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
     /// dispatch — with the cross-section replant applied by the [`Self::build_adj_fill`]
     /// wrapper as a post-pass.
@@ -5168,10 +5172,13 @@ impl LoopMesh {
         // unit-octant grid at `segments ≥ 3`. Every other junction — a valence-`s` (`s ≠ 3`)
         // corner, or an oblique / irregular-ring valence-3 corner (§7.6.6, e.g. a reflex
         // sector whose dihedral fold fails the tri-corner test) — routes to the general
-        // fullness-relaxation grid of (a)–(e), which loopmesh fills at the circular
-        // (`r = 2`) and straight-chord (`r = 1`, the `fullness = 0` planar specialisation,
-        // §8.3.0.2.1) exponents. The general ring at a *curved* exponent, and the square /
-        // square-in / pipe grids at any ring, stay unfilled (§8.5.5.5(f.4)/(f.5)/(f.6)).
+        // fullness-relaxation grid of (a)–(e), which loopmesh fills at **every smooth**
+        // exponent: the circle (`r = 2`), the straight chord (`r = 1`, the `fullness = 0`
+        // planar specialisation, §8.3.0.2.1) and the whole genuinely curved band on either
+        // side of them. The **pipe** grid (§8.5.5.5(f.6)) is built too — its base grid is
+        // this dispatch, with the cross-section replant applied as a post-pass. Only the
+        // two square sentinels stay unfilled here, the tracked gap spelled out at step 4
+        // below (§8.5.5.5(f.4)/(f.5)).
         // The general fill runs even at `segments = 2`: it subdivides its coarse net once
         // before resampling (§8.5.5.5(d)), so a declined-tri-corner `segments = 2` ring
         // gets the centre-vertex pinwheel cap rather than an unfilled hole. Only
@@ -5193,7 +5200,27 @@ impl LoopMesh {
         }
 
         if !self.adj_tri_corner_trigger(cut, profile) {
-            if exponent != 2.0 && exponent != 1.0 {
+            // §8.5.5.5(f.1) step 4 carries **no exponent gate**: every *smooth* exponent —
+            // the circle, the straight chord, and the whole genuinely curved band between
+            // and beyond them — takes the general fullness grid of (a)–(e). The exponent
+            // enters that grid only twice, and both entries are already exponent-generic:
+            // through the [S]-sampled boundary chains the stencil re-pins against, and
+            // through the (f.3) `fullness` centre seed (law **F3** for a curved `r`). There
+            // is no snap on this fill at all, so nothing here needs a closed form.
+            //
+            // The two **square** sentinels stay out as a **tracked gap**, not as a routing
+            // decision. What actually arrives at this predicate is a *square* exponent on
+            // **odd** `segments` at a non-tri-corner ring (step 1 above already consumed
+            // square + `count ≥ 3` + even `segments`, and the tri-corner trigger consumed
+            // the valence-3 square) and *square-in* on a general ring under edge bevel —
+            // and neither is covered by (f.5)'s two constructions (the even-`n`
+            // parallel-offset ring; the valence-3 odd tri-corner squares) or by (f.4a)'s
+            // valence-3 weld. Per (f.1) both should take step 4's grid right here; loopmesh
+            // declines them, and the A/B arms
+            // `bevel_edge_general_ring_square_{in_exponent,exponent_odd_segments}_declines_across_rings`
+            // pin that decline against the reference, which fills. Widening the gate is its
+            // own row and its own cycle.
+            if exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0 {
                 return false;
             }
             match segments {
@@ -7251,8 +7278,8 @@ impl LoopMesh {
     }
 
     /// Build the rounded adjacency-grid fill for a **general non-symmetric**
-    /// (oblique / irregular-ring) valence-`s` junction at the default circular
-    /// profile and equal offsets (BEVEL.md §8.5.5.5). Where the cube corner leaned
+    /// (oblique / irregular-ring) valence-`s` junction at any **smooth** exponent and
+    /// equal offsets (BEVEL.md §8.5.5.5). Where the cube corner leaned
     /// on a closed-form sphere snap (§8.5.5.3, only an orthonormal equal-offset
     /// corner has a sphere of radius `offset`), this corner has no such sphere, so
     /// the cap is placed by two general mechanisms instead:
@@ -7260,7 +7287,8 @@ impl LoopMesh {
     /// - **centre-fullness blend (§8.5.5.5(b)):** the central control vertex is
     ///   `centroid + fullness·(v − centroid)`, blending the boundvert centroid
     ///   toward the original corner `v`. `fullness` is a profile/segment fit scalar
-    ///   (the circular default tabulated near `0.55–0.65`), not a per-vertex solve;
+    ///   (the circular default tabulated near `0.55–0.65`; the (f.3) law **F3**
+    ///   regression everywhere else, signed and unbounded), not a per-vertex solve;
     /// - **subdivision-relaxation interior (§8.5.5.5(c)):** the coarse `segments = 2`
     ///   control net is refined by repeated cubic (Catmull–Clark, Sabin-modified)
     ///   rounds — at least one, even at `segments = 2` — each re-pinning the chain
@@ -7278,9 +7306,9 @@ impl LoopMesh {
     /// pointedly does **not** lie on the cube-corner sphere — the positive signal
     /// that the general relaxation path, not the §8.5.1 snap, produced it.
     ///
-    /// Scope (§8.5.5.5): irregular rings, oblique corners, valence `s`, default
-    /// circular profile, equal offsets. The pipe / square / square-in profile grids
-    /// and the per-offset numeric `fullness` refit stay deferred (§8.5.5.5(f)).
+    /// Scope (§8.5.5.5): irregular rings, oblique corners, valence `s`, every smooth
+    /// exponent (§8.5.5.5(f.1) step 4 gates on none), equal offsets. The square /
+    /// square-in profile grids stay deferred (§8.5.5.5(f.4)/(f.5)).
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_general_nonsymmetric(
         &mut self,
@@ -7327,8 +7355,9 @@ impl LoopMesh {
         // §8.5.5.5(b) / §8.3.0.2.1: the flat straight-chord profile (`r = 1`) is the
         // `fullness = 0` planar specialisation — the cap lies in the boundvert ring
         // plane with no bulge toward the corner `v` and no extraordinary-centre
-        // relaxation. Every other filled profile (the circular default) keeps the
-        // tabulated fullness seed and relaxes.
+        // relaxation. Every other *smooth* exponent keeps the (f.3) fullness seed — the
+        // table is consulted only for the circular `r = 2` at `segments ≤ 11`, everything
+        // else is law F3's regression in the raw `profile` scalar — and relaxes.
         let flat = profile_to_exponent(profile) == 1.0;
         let sector_representatives = cut.resolve_sector_representatives(templates);
         let centre_column_representatives = cut.resolve_centre_column_representatives(templates);
@@ -20947,10 +20976,12 @@ mod tests {
     /// with the arriving strips, and moving them with no cap emitted just distorts the
     /// junction.
     ///
-    /// The reachable fixture is a **valence-4 pipe at a curved exponent** (`profile = 0.7`,
-    /// `r ≈ 3.89`): the tri-corner trigger wants three boundverts and this ring has four, and
-    /// the general ring at a curved exponent is documented as unfilled — so the base declines
-    /// while the pipe predicate itself still fires.
+    /// The reachable fixture is a **valence-4 pipe at the square-in sentinel**
+    /// (`profile = 0`, `r = 0`): the tri-corner trigger wants three boundverts and this ring
+    /// has four, and square-in takes a grid of its own (§8.5.5.5(f.4)) that this route does
+    /// not build — so the base declines while the pipe predicate itself still fires. (Until
+    /// the curved general ring landed, `profile = 0.7` reached the same state; it now fills
+    /// through step 4's fullness grid, so it is no longer a declining fixture.)
     ///
     /// The whole tent is symmetric about `y = 1` and the §8.2.2.1.1 read-back respects that
     /// mirror; the replant is exactly what breaks it (the ladder above counts the breaks). So
@@ -20963,10 +20994,10 @@ mod tests {
             let (filled, _) =
                 tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.5);
             let (declined, _) =
-                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.7);
+                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.0);
             assert!(
                 declined.face_keys().len() < filled.face_keys().len(),
-                "the curved-exponent general ring emits no cap, so the base declined \
+                "the square-in general ring emits no cap, so the base declined \
                  (segments = {segments})",
             );
 
@@ -26771,8 +26802,10 @@ mod tests {
 
     /// Bevel the four slant edges of the square pyramid's apex with the ADJ vmesh at an
     /// explicit `segments` / `profile`: a **general, non-tri-corner** ring (valence `s = 4`),
-    /// so the tri-corner family of §8.5.5.5(f.1) step 3 never applies to it.
-    fn pyramid_apex_adj(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+    /// so the tri-corner family of §8.5.5.5(f.1) step 3 never applies to it. The third
+    /// return is the apex junction's boundvert count — one per beveled edge, with no outer
+    /// miter in scope — which is the `s` of §8.5.5.5(e)'s parity law.
+    fn pyramid_apex_adj(segments: u32, profile: f32) -> (LoopMesh, BevelResult, usize) {
         let mut mesh = LoopMesh::new();
         let [apex, b0, b1, b2, b3] = square_pyramid(&mut mesh);
         let slants = [
@@ -26792,50 +26825,233 @@ mod tests {
                 ..Default::default()
             },
         );
-        (mesh, result)
+        (mesh, result, slants.len())
     }
 
-    /// The **general ring** at a curved exponent is still declined (BEVEL.md §8.5.5.5(f) —
-    /// the profile-grid variants are distilled for the tri-corner family; the curved general
-    /// ring's `fullness` refit is not yet filled). The decline is a clean one, and that is
-    /// what this pins: the valence-4 pyramid apex at `profile = 0.7` emits **no** cap face,
-    /// leaves every through-strip and rebuilt face standing, and the mesh stays valid — the
-    /// junction is simply left open. The circular run of the same corner is the contrast: it
-    /// takes the fullness cap of (a)–(e) and fills, with an otherwise identical face set.
-    #[test]
-    fn adj_general_ring_declines_curved_profile_cleanly() {
-        let apex_cap_faces = |mesh: &LoopMesh, result: &BevelResult| -> usize {
-            result
-                .faces
-                .iter()
-                .filter(|&&f| {
-                    mesh.face_vert_keys(f)
+    /// The cap the pyramid apex's [V-ADJ] fill emitted, selected **topologically**: a result
+    /// face every edge of which is shared only with other result faces. Each arriving strip
+    /// lands its terminal cross-section *on* the rebuilt originals, so every strip quad has
+    /// an edge against surviving geometry; the cap's own edges are its rim chains (shared
+    /// with the strips) and its interior. No world-space threshold, so a taller pyramid or a
+    /// larger offset cannot silently drop cap faces from the filter.
+    fn pyramid_apex_cap(mesh: &LoopMesh, result: &BevelResult) -> (Vec<FaceKey>, Vec<VertexKey>) {
+        let new_faces: std::collections::HashSet<FaceKey> =
+            result.faces.iter().copied().collect();
+        let faces: Vec<FaceKey> = result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| {
+                mesh.face_edge_keys(face).iter().all(|&edge| {
+                    mesh.edge_face_keys(edge)
                         .iter()
-                        .all(|&v| mesh.vertex_position(v).z > 0.6)
+                        .all(|side| new_faces.contains(side))
                 })
-                .count()
+            })
+            .collect();
+        let mut seen: std::collections::HashSet<VertexKey> = std::collections::HashSet::new();
+        let mut verts = Vec::new();
+        for &face in &faces {
+            for vertex in mesh.face_vert_keys(face) {
+                if seen.insert(vertex) {
+                    verts.push(vertex);
+                }
+            }
+        }
+        (faces, verts)
+    }
+
+    /// The cap's genuinely **interior** verts: those on no ring chain, i.e. those whose every
+    /// incident face is a cap face. The rim — the boundverts and their [S] chain samples — is
+    /// shared with the arriving strips and the rebuilt originals, and it moves with `profile`
+    /// through the §8.6.1 cross-section for reasons that have nothing to do with `fullness`.
+    /// Only these verts are placed by the (f.3) centre seed and the relaxation it drives.
+    fn pyramid_apex_cap_interior(mesh: &LoopMesh, result: &BevelResult) -> Vec<VertexKey> {
+        let (faces, verts) = pyramid_apex_cap(mesh, result);
+        let cap: std::collections::HashSet<FaceKey> = faces.into_iter().collect();
+        verts
+            .into_iter()
+            .filter(|&vertex| {
+                mesh.vert_face_keys(vertex)
+                    .iter()
+                    .all(|face| cap.contains(face))
+            })
+            .collect()
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) **step 4**: the general (non-tri-corner) ring's fullness grid
+    /// carries **no exponent gate**. Every smooth exponent — the circle, the straight chord,
+    /// and the whole genuinely curved band on either side of them — builds the same
+    /// (a)–(e) grid; the exponent enters only through the [S]-sampled boundary chains and
+    /// through the (f.3) `fullness` centre seed, never through a snap or a closed form. So
+    /// the valence-4 pyramid apex fills its cap at a *curved* `r` exactly as it does at the
+    /// circular default, with the same topology.
+    ///
+    /// The counts are §8.5.5.5(e)'s parity law read over `s` sectors, with
+    /// `half = segments / 2`:
+    ///
+    /// ```text
+    ///    even segments (welded apex)      faces  s·half²
+    ///                                     verts  s·(half+1)² − s·(half+1) + 1
+    ///    odd segments (central s-gon)     faces  s·half² + s·half + 1
+    ///                                     verts  s·(half+1)²
+    /// ```
+    ///
+    /// The even law's `−s·(half+1) + 1` is the `s` shared spokes running from each ring
+    /// chain's midpoint to the one welded centre; the odd cap shares nothing, its sectors
+    /// being bridged by seam strips and closed by a single central `s`-gon (a quad at
+    /// `s = 4`, which is why the whole cap is quads at either parity here).
+    #[test]
+    fn adj_general_ring_curved_exponent_fills_the_step4_fullness_grid() {
+        for profile in [0.1_f32, 0.7] {
+            let exponent = profile_to_exponent(profile);
+            assert!(
+                exponent != 1.0
+                    && exponent != 2.0
+                    && exponent != 0.0
+                    && exponent != PROFILE_SQUARE_EXPONENT,
+                "profile {profile} is a genuinely curved exponent (r = {exponent})",
+            );
+        }
+
+        for segments in [2u32, 3, 4, 5] {
+            let sectors = pyramid_apex_adj(segments, 0.5).2;
+            let half = segments as usize / 2;
+            let (expected_faces, expected_verts) = if segments % 2 == 0 {
+                (
+                    sectors * half * half,
+                    sectors * (half + 1) * (half + 1) - sectors * (half + 1) + 1,
+                )
+            } else {
+                (
+                    sectors * half * half + sectors * half + 1,
+                    sectors * (half + 1) * (half + 1),
+                )
+            };
+
+            // The concave (`r < 1`) and convex (`r > 2`) bands, and the circular default as
+            // the control: all three build the same grid.
+            for profile in [0.1_f32, 0.5, 0.7] {
+                let (mesh, result, _) = pyramid_apex_adj(segments, profile);
+                mesh.validate_topology();
+                let (faces, verts) = pyramid_apex_cap(&mesh, &result);
+                assert_eq!(
+                    faces.len(),
+                    expected_faces,
+                    "cap face count at segments = {segments}, profile = {profile}",
+                );
+                assert_eq!(
+                    verts.len(),
+                    expected_verts,
+                    "cap vert count at segments = {segments}, profile = {profile}",
+                );
+                for &face in &faces {
+                    assert_eq!(
+                        mesh.face_vert_keys(face).len(),
+                        4,
+                        "every valence-4 cap face is a quad — the odd parity's central \
+                         `s`-gon included (segments = {segments}, profile = {profile})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(b) + (f.3): on the general ring the *only* thing the exponent does
+    /// to the cap's **interior** is set `fullness`, and `fullness` is a signed blend of the
+    /// boundvert centroid toward the original corner `v`. Its **sign** is observable as the
+    /// side on which the interior leaves the cap's own **rim** — the boundverts and the [S]
+    /// chain samples between them:
+    ///
+    /// - `profile = 0.25` (`r = 1`, law **F2**'s exact `0`) → rim and interior alike lie in
+    ///   the boundvert ring plane, which is the planarity witness the other arms lean on;
+    /// - `profile < 0.25` (`r < 1`, law **F3** turning negative) → every interior vert drops
+    ///   strictly **below the lowest rim vert**;
+    /// - `profile > 0.25` (`r > 1`, positive fullness) → every interior vert rises strictly
+    ///   **above the highest rim vert**, and the top keeps rising with `profile`.
+    ///
+    /// Measured against the rim, not against the flat ring plane, and on the interior verts
+    /// only. The rim itself moves with `profile` through the §8.6.1 cross-section for reasons
+    /// that have nothing to do with `fullness` — a concave rim sags below the boundvert plane
+    /// on its own — so "the cap left the ring plane" is no evidence at all that `fullness` was
+    /// consulted. Overshooting the *whole rim* is: with the seed pinned at `0` the relaxation
+    /// settles the interior **between** the rim's extremes. That is what makes the concave arm
+    /// here the one that catches a `[0, 1]` clamp of law F3 — the exact failure (f.3) warns
+    /// about, since it states outright that `fullness` is not confined to that interval.
+    #[test]
+    fn adj_general_ring_curved_fullness_sign_drives_the_cap_interior_past_its_rim() {
+        // The cap's rim and interior `z`, split apart.
+        let sample = |segments: u32, profile: f32| -> (Vec<f32>, Vec<f32>) {
+            let (mesh, result, _) = pyramid_apex_adj(segments, profile);
+            mesh.validate_topology();
+            let (_, cap) = pyramid_apex_cap(&mesh, &result);
+            let interior: std::collections::HashSet<VertexKey> =
+                pyramid_apex_cap_interior(&mesh, &result)
+                    .into_iter()
+                    .collect();
+            assert!(!interior.is_empty(), "the cap has an interior to measure");
+            let mut rim_z = Vec::new();
+            let mut interior_z = Vec::new();
+            for vertex in cap {
+                let z = mesh.vertex_position(vertex).z;
+                if interior.contains(&vertex) {
+                    interior_z.push(z);
+                } else {
+                    rim_z.push(z);
+                }
+            }
+            assert!(!rim_z.is_empty(), "the cap has a rim to measure against");
+            (rim_z, interior_z)
         };
+        let low = |zs: &[f32]| zs.iter().copied().fold(f32::MAX, f32::min);
+        let high = |zs: &[f32]| zs.iter().copied().fold(f32::MIN, f32::max);
 
-        let (curved_mesh, curved) = pyramid_apex_adj(3, 0.7);
-        curved_mesh.validate_topology();
-        assert_eq!(
-            apex_cap_faces(&curved_mesh, &curved),
-            0,
-            "a curved exponent at a non-tri-corner ring emits no cap at all",
-        );
+        for segments in [3u32, 4] {
+            assert_eq!(adj_fullness(0.25, segments), 0.0);
+            let (flat_rim, flat_interior) = sample(segments, 0.25);
+            let flat: Vec<f32> = flat_rim.iter().chain(flat_interior.iter()).copied().collect();
+            assert!(
+                high(&flat) - low(&flat) < 1.0e-5,
+                "the `r = 1` cap is planar, rim and interior alike (segments = {segments})",
+            );
 
-        let (circular_mesh, circular) = pyramid_apex_adj(3, 0.5);
-        circular_mesh.validate_topology();
-        let filled = apex_cap_faces(&circular_mesh, &circular);
-        assert!(filled > 0, "the circular general ring does fill its cap");
+            assert!(
+                adj_fullness(0.1, segments) < 0.0,
+                "F3 turns negative below the chamfer (segments = {segments})",
+            );
+            let (rim, interior) = sample(segments, 0.1);
+            assert!(
+                high(&interior) < low(&rim) - 1.0e-3,
+                "the concave interior sinks past the whole rim, not merely with it \
+                 (interior ≤ {}, rim ≥ {}, segments = {segments})",
+                high(&interior),
+                low(&rim),
+            );
 
-        // Everything but the cap survives the decline: the curved run's face set is the
-        // circular run's minus exactly the cap it declined to build.
-        assert_eq!(
-            curved.faces.len(),
-            circular.faces.len() - filled,
-            "the through-strips and rebuilt faces are untouched by the decline",
-        );
+            assert!(
+                adj_fullness(0.7, segments) > 1.0,
+                "F3 runs past 1 on a bulging profile (segments = {segments})",
+            );
+            let (rim, interior) = sample(segments, 0.7);
+            assert!(
+                low(&interior) > high(&rim) + 1.0e-3,
+                "the convex interior bulges past the whole rim toward `v` \
+                 (interior ≥ {}, rim ≤ {}, segments = {segments})",
+                low(&interior),
+                high(&rim),
+            );
+
+            // …and the bulge grows with the profile right across the curved band, the
+            // circular default sitting inside it rather than bounding it.
+            let tops: Vec<f32> = [0.3_f32, 0.5, 0.7]
+                .into_iter()
+                .map(|profile| high(&sample(segments, profile).1))
+                .collect();
+            assert!(
+                tops.windows(2).all(|pair| pair[0] < pair[1]),
+                "interior height rises with `profile` (segments = {segments}, tops {tops:?})",
+            );
+        }
     }
 
     /// The **square** exponent now fills via the tri-corner family (§8.5.5.5(f.5)'s three flat
@@ -26963,7 +27179,7 @@ mod tests {
         };
 
         for (segments, expected_quads) in [(2_u32, 4_usize), (4, 16)] {
-            let (mesh, result) = pyramid_apex_adj(segments, 0.97);
+            let (mesh, result, _) = pyramid_apex_adj(segments, 0.97);
             mesh.validate_topology();
 
             let cap = cap_faces(&mesh, &result);
@@ -27012,7 +27228,7 @@ mod tests {
 
         for segments in [2_u32, 4] {
             let half = (segments / 2) as usize;
-            let (mesh, result) = pyramid_apex_adj(segments, 0.97);
+            let (mesh, result, _) = pyramid_apex_adj(segments, 0.97);
 
             let on_slant = result
                 .verts
