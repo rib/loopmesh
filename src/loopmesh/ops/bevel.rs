@@ -220,7 +220,8 @@ pub struct BevelCurveProfile {
 impl BevelCurveProfile {
     /// Build a custom profile from a list of `(x, y, handle)` control points in the
     /// widget frame; the given handle kind is applied to both sides of each point. The
-    /// list runs corner-to-corner (default start `(1, 0)`, end `(0, 1)`).
+    /// list runs corner-to-corner (default start `(1, 0)`, end `(0, 1)`). `Free` /
+    /// `Aligned` fall back to `Auto` here, as in [`Self::from_points_with_handles`].
     pub fn from_points(points: &[(f32, f32, BevelHandle)]) -> Self {
         BevelCurveProfile {
             points: points
@@ -237,6 +238,34 @@ impl BevelCurveProfile {
         }
     }
 
+    /// Build a custom profile whose control points carry a **different handle kind per
+    /// side** — `(x, y, arriving, leaving)`, the arriving handle governing the segment that
+    /// ends at the point and the leaving one the segment that starts there (BEVEL.md
+    /// §8.6.3.1(1)). A segment counts as curved when *either* of its two bordering handles
+    /// is non-vector, so per-side kinds are the only way to build a net that mixes straight
+    /// and curved control segments.
+    ///
+    /// `Free` / `Aligned` carry an **explicit** handle location in the reference authoring
+    /// model, and this constructor has nowhere to put one: it supplies no location, so
+    /// §8.6.3.1(2)'s fallback fires and both kinds evaluate as `Auto`. They still differ
+    /// from `Vector` for the curved/straight classification of §8.6.3.1(4), which reads the
+    /// kind and not the location.
+    pub fn from_points_with_handles(points: &[(f32, f32, BevelHandle, BevelHandle)]) -> Self {
+        BevelCurveProfile {
+            points: points
+                .iter()
+                .map(|&(x, y, arriving, leaving)| BevelCurvePoint {
+                    x,
+                    y,
+                    h1: arriving,
+                    h2: leaving,
+                    h1_loc: None,
+                    h2_loc: None,
+                })
+                .collect(),
+        }
+    }
+
     /// The **line** preset (BEVEL.md §8.6.3.1(3)): two auto points `(1, 0)` and `(0, 1)`.
     /// With the phantom-endpoint rule the auto handles fall on the line, so the evaluated
     /// segment is the straight diagonal chord — identical to the superellipse `r = 1`
@@ -245,13 +274,22 @@ impl BevelCurveProfile {
         Self::from_points(&[(1.0, 0.0, BevelHandle::Auto), (0.0, 1.0, BevelHandle::Auto)])
     }
 
-    /// The custom profile's `segments + 1` sample chain in the profile **cell** frame
-    /// `(u_k, v_k)` (BEVEL.md §8.6.3.1): resample the control-point Bézier at even
-    /// parameter (step 4), then apply the fixed axis swap `u = y`, `v = x` (step 5). The
-    /// ends are pinned to the cell ring corners `(0, 1)` / `(1, 0)`. `reverse` is the
-    /// §8.6.3.1(6) handedness bit (see [`widget_chain_to_cell`]); it is a no-op on a
+    /// The custom profile's sample chain in the profile **cell** frame `(u_k, v_k)`
+    /// (BEVEL.md §8.6.3.1): resample the control-point Bézier at even parameter (step 4),
+    /// then apply the fixed axis swap `u = y`, `v = x` (step 5). `reverse` is the
+    /// §8.6.3.1(6) handedness bit (see `widget_chain_to_cell`); it is a no-op on a
     /// diagonal-symmetric chain and only observable for an asymmetric control net.
-    fn sample_chain(&self, segments: u32, reverse: bool) -> Vec<(f32, f32)> {
+    ///
+    /// The ends are the cell ring corners `(0, 1)` / `(1, 0)` **only when** the chain runs
+    /// corner-to-corner, i.e. on the `segments >= E` branch; below the control-segment
+    /// count the sub-chain of §8.6.3.1(4).3 starts and ends wherever the surviving
+    /// segments do, and nothing pins them. The ring fill overwrites index `0` and the last
+    /// index with the sector's boundverts either way, so only the interior samples reach
+    /// geometry.
+    ///
+    /// Public for an out-of-tree parity harness that pins the chain directly; no in-tree
+    /// caller needs it outside this module's own tests.
+    pub fn sample_chain(&self, segments: u32, reverse: bool) -> Vec<(f32, f32)> {
         widget_chain_to_cell(&self.widget_chain(segments), reverse)
     }
 
@@ -272,9 +310,19 @@ impl BevelCurveProfile {
     /// The evaluated Bézier sample chain in the widget's `(x, y)` frame (BEVEL.md
     /// §8.6.3.1(2)/(4)): resolve every point's handle positions, split the `segments`
     /// budget across the control-point segments, and sample each segment at even Bézier
-    /// parameter. The result has `segments + 1` entries, ends pinned to the first / last
-    /// control point.
-    fn widget_chain(&self, segments: u32) -> Vec<(f32, f32)> {
+    /// parameter. The result has `max(segments, 1) + 1` entries — a zero-segment request
+    /// still yields the two-sample chord, since there is no chain shorter than one advance.
+    ///
+    /// The chain runs from the first control point to the last **only when every segment
+    /// receives an advance** — the `segments >= E` branch — and that shape is a
+    /// consequence of the fill, never a forced overwrite. Below the control-segment count
+    /// §8.6.3.1(4).3's sub-chain fires: each selected segment holds exactly one advance,
+    /// every sample is a control point, neither end is pinned, and a run of skipped
+    /// segments is a jump rather than a coarse walk.
+    ///
+    /// Public for an out-of-tree parity harness that pins the chain directly; no in-tree
+    /// caller needs it outside this module's own tests.
+    pub fn widget_chain(&self, segments: u32) -> Vec<(f32, f32)> {
         let n = segments.max(1) as usize;
         let points = &self.points;
         // A degenerate (< 2 point) definition has no segment to sample: fall back to the
@@ -302,20 +350,20 @@ impl BevelCurveProfile {
             let c1 = handles[seg].right;
             let c2 = handles[seg + 1].left;
             let p3 = (points[seg + 1].x, points[seg + 1].y);
-            let first = if chain.is_empty() { 0 } else { 1 };
-            for step in first..=m {
+            for step in 0..=m {
                 let t = step as f32 / m as f32;
-                chain.push(cubic_bezier(p0, c1, c2, p3, t));
+                let sample = cubic_bezier(p0, c1, c2, p3, t);
+                match chain.last_mut() {
+                    // §8.6.3.1(4).2: consecutive contributions share one chain slot, and
+                    // the incoming `t = 0` sample overwrites the outgoing `t = 1` one
+                    // unconditionally — curve adjacency is never consulted, which is what
+                    // turns a skipped run into a jump on the sub-budget branch.
+                    Some(shared) if step == 0 => *shared = sample,
+                    _ => chain.push(sample),
+                }
             }
         }
-        if chain.is_empty() {
-            chain.push((points[0].x, points[0].y));
-        }
-        // Guard the exact endpoint pins against float drift in the Bézier evaluation.
-        let last = points.len() - 1;
-        chain[0] = (points[0].x, points[0].y);
-        let end = chain.len() - 1;
-        chain[end] = (points[last].x, points[last].y);
+        debug_assert_eq!(chain.len(), n + 1);
         chain
     }
 
@@ -33612,10 +33660,13 @@ mod tests {
 
     /// BEVEL.md §8.6.3.1(4).1: the leftover budget goes to the **sharpest** control segments
     /// first (descending `turn`), not the flattest. Pinned on the guide's mirror pair of
-    /// all-auto four-point nets, whose per-segment allotments are quoted from the guide's
-    /// worked table — the mirror is what makes this conclusive: "lowest index wins" would
-    /// explain EARLY_TURN alone, "highest index wins" LATE_TURN alone, and the inverted
-    /// measure (`π − turn`) gets both backwards.
+    /// all-auto four-point nets — the mirror is what makes this conclusive: "lowest index
+    /// wins" would explain EARLY_TURN alone, "highest index wins" LATE_TURN alone, and the
+    /// inverted measure (`π − turn`) gets both backwards.
+    ///
+    /// The `n = 3, 4, 5` allotments are quoted from the guide's worked table; the `n = 1`
+    /// pair is derived from the same section's `n < E` clause (a top-1 cut of the same
+    /// ranking), not quoted.
     #[test]
     fn custom_profile_leftover_budget_goes_to_the_sharpest_control_segment() {
         let allotments = |net: &[(f32, f32)], n: usize| -> Vec<usize> {
@@ -33630,8 +33681,16 @@ mod tests {
         let late_turn = [(1.0, 0.0), (0.85, 0.10), (0.20, 0.35), (0.0, 1.0)];
         let early_turn = [(1.0, 0.0), (0.35, 0.20), (0.10, 0.85), (0.0, 1.0)];
 
-        assert_eq!(allotments(&late_turn, 3), vec![1, 1, 1], "no remainder to rank");
-        assert_eq!(allotments(&early_turn, 3), vec![1, 1, 1], "no remainder to rank");
+        assert_eq!(
+            allotments(&late_turn, 3),
+            vec![1, 1, 1],
+            "no remainder to rank"
+        );
+        assert_eq!(
+            allotments(&early_turn, 3),
+            vec![1, 1, 1],
+            "no remainder to rank"
+        );
 
         // One leftover advance: it lands on the sharpest segment, which is the *last* one
         // for LATE_TURN — so a winner of index 0 here is the inverted measure.
@@ -33645,6 +33704,232 @@ mod tests {
         // The `n < E` branch ranks the same way: the single advance goes to the sharpest.
         assert_eq!(allotments(&late_turn, 1), vec![0, 0, 1]);
         assert_eq!(allotments(&early_turn, 1), vec![1, 0, 0]);
+    }
+
+    /// Assert a widget chain against a hard-coded expectation from the guide's tables.
+    fn assert_widget_chain(got: &[(f32, f32)], want: &[(f32, f32)], what: &str) {
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{what}: chain length {got:?} != {want:?}"
+        );
+        for (k, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g.0 - w.0).abs() < 1.0e-4 && (g.1 - w.1).abs() < 1.0e-4,
+                "{what}: sample {k} {g:?} != {w:?} (chain {got:?})",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1's sub-budget cut ranks over **every** control segment, straight
+    /// ones included. On the guide's mixed net (`E = 4`, only two curved segments, turns
+    /// `0° / 19.04° / 2.20° / 0°`) a curved-only cut hands out just two advances at
+    /// `segments = 3`, and the short chain that follows becomes a ring with the wrong vertex
+    /// count — no panic, no signal. Chains quoted from the guide's worked table; the
+    /// `segments = 3` row is deliberately length-only, because the cut lands inside the tie
+    /// block of the two `0°` segments and §8.6.3.1(4).1 does not define that order.
+    #[test]
+    fn custom_profile_sub_budget_cut_reaches_into_straight_control_segments() {
+        let mixed = BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.80, 0.05, BevelHandle::Vector, BevelHandle::Auto),
+            (0.50, 0.40, BevelHandle::Auto, BevelHandle::Auto),
+            (0.15, 0.85, BevelHandle::Auto, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ]);
+
+        assert_widget_chain(
+            &mixed.widget_chain(1),
+            &[(0.80, 0.05), (0.50, 0.40)],
+            "mixed net segments = 1",
+        );
+        assert_widget_chain(
+            &mixed.widget_chain(2),
+            &[(0.80, 0.05), (0.50, 0.40), (0.15, 0.85)],
+            "mixed net segments = 2",
+        );
+        // The under-fill case: `curved_count = 2 < 3 < E = 4`.
+        assert_eq!(
+            mixed.widget_chain(3).len(),
+            4,
+            "the top-3 cut must take a straight segment to reach segments + 1 samples",
+        );
+        assert_widget_chain(
+            &mixed.widget_chain(4),
+            &[
+                (1.00, 0.00),
+                (0.80, 0.05),
+                (0.50, 0.40),
+                (0.15, 0.85),
+                (0.00, 1.00),
+            ],
+            "mixed net segments = 4 (n = E, corner-to-corner)",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).3: on the sub-budget branch neither chain end is pinned, and a
+    /// run of skipped segments is a **jump** — the control points between two non-adjacent
+    /// selected segments never appear. All chains quoted from the guide's reference tables.
+    #[test]
+    fn custom_profile_sub_budget_chain_has_no_forced_endpoints() {
+        let all_auto = |net: &[(f32, f32)]| {
+            BevelCurveProfile::from_points(
+                &net.iter()
+                    .map(|&(x, y)| (x, y, BevelHandle::Auto))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // Turn order 0 < 1 < 2, so the top-2 cut is {1, 2} and the start corner drops out.
+        let late_turn = all_auto(&[(1.0, 0.0), (0.85, 0.10), (0.20, 0.35), (0.0, 1.0)]);
+        assert_widget_chain(
+            &late_turn.widget_chain(2),
+            &[(0.85, 0.10), (0.20, 0.35), (0.00, 1.00)],
+            "LATE_TURN segments = 2",
+        );
+        assert_widget_chain(
+            &late_turn.widget_chain(1),
+            &[(0.20, 0.35), (0.00, 1.00)],
+            "LATE_TURN segments = 1",
+        );
+        // The mirror: turn order 2 < 1 < 0, top-2 cut is {0, 1}, and the *end* corner drops.
+        let early_turn = all_auto(&[(1.0, 0.0), (0.35, 0.20), (0.10, 0.85), (0.0, 1.0)]);
+        assert_widget_chain(
+            &early_turn.widget_chain(2),
+            &[(1.00, 0.00), (0.35, 0.20), (0.10, 0.85)],
+            "EARLY_TURN segments = 2",
+        );
+
+        // The split net: curvature on the two *outer* control segments only (turns
+        // `24.70° / 0° / 0° / 35.13°`), so the top-2 cut is the non-adjacent {0, 3} and the
+        // chain steps straight from P0 to P3 — P1 and P2 never appear.
+        let split = BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
+            (0.60, 0.55, BevelHandle::Vector, BevelHandle::Vector),
+            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ]);
+        assert_widget_chain(
+            &split.widget_chain(1),
+            &[(0.10, 0.60), (0.00, 1.00)],
+            "split net segments = 1",
+        );
+        assert_widget_chain(
+            &split.widget_chain(2),
+            &[(1.00, 0.00), (0.10, 0.60), (0.00, 1.00)],
+            "split net segments = 2 (the jump)",
+        );
+        assert_widget_chain(
+            &split.widget_chain(4),
+            &[
+                (1.00, 0.00),
+                (0.90, 0.40),
+                (0.60, 0.55),
+                (0.10, 0.60),
+                (0.00, 1.00),
+            ],
+            "split net segments = 4 (n = E, corner-to-corner)",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1's normalisation convention. The `turn` measure normalises both
+    /// tangents before reading the chord angle, and the zero vector normalises to itself, so
+    /// **exactly one** zero tangent scores a fixed `π/3 = 60°` — near the top of the ranking
+    /// — while **both** zero score `0°`, its bottom. Reading the degenerate case as `0°`
+    /// (an `atan2` on the raw inputs) inverts the ranking for exactly those segments.
+    ///
+    /// The `60°` half runs on the supports preset's own control path, which §8.6.3.1(3)
+    /// gives at `points = 5` as `(1,0) · (0.85355,0.85355) · (0.5,1) · (0.5,1) · (0,1)` with
+    /// vector handles at index 0, 3 and 4 and auto at 1 and 2. Its duplicated point leaves a
+    /// zero-length segment whose arrival tangent is zero and whose departure is not; the
+    /// four turns are `28.88° / 28.88° / 60° / 0°`.
+    #[test]
+    fn custom_profile_degenerate_tangent_ranking_follows_the_chord_convention() {
+        let arc = 0.5 + 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        let supports = BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (
+                1.0 - 0.5 * (1.0 - std::f32::consts::FRAC_1_SQRT_2),
+                arc,
+                BevelHandle::Auto,
+                BevelHandle::Auto,
+            ),
+            (0.5, 1.0, BevelHandle::Auto, BevelHandle::Auto),
+            (0.5, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ]);
+
+        // segments = 1: the top-1 cut is the degenerate segment 2, so the whole chain is the
+        // coincident pair. Under the `0°` reading it would take segment 0 and return
+        // (1, 0) (0.85355, 0.85355) instead — a completely different chain.
+        assert_widget_chain(
+            &supports.widget_chain(1),
+            &[(0.5, 1.0), (0.5, 1.0)],
+            "supports segments = 1",
+        );
+        // segments = 3: the end shoulder is uniquely lowest-ranked, so the cut is {0, 1, 2}
+        // whatever the three above it do among themselves — the chain starts at the widget
+        // corner (1, 0) but stops short of (0, 1).
+        assert_widget_chain(
+            &supports.widget_chain(3),
+            &[(1.0, 0.0), (0.85355, 0.85355), (0.5, 1.0), (0.5, 1.0)],
+            "supports segments = 3",
+        );
+
+        // Both tangents zero: a duplicated control point carrying **vector** handles on both
+        // facing sides makes the departure zero as well, and the difference chord is 0. Here
+        // the net has five control points, so E = 4 and the segments are 0..=3. Segment 2 is
+        // the coincident one; segments 0 and 1 measure 13.28° each and segments 2 and 3
+        // measure 0°. At segments = 2 the cut is therefore {0, 1} — tie-free at its boundary
+        // — and the chain is the first three control points. Scoring the duplicate 60° would
+        // put it in the cut and start the chain at (0.4, 0.4) instead.
+        let duplicated = BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Auto),
+            (0.7, 0.1, BevelHandle::Auto, BevelHandle::Auto),
+            (0.4, 0.4, BevelHandle::Auto, BevelHandle::Vector),
+            (0.4, 0.4, BevelHandle::Vector, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Auto, BevelHandle::Vector),
+        ]);
+        assert_widget_chain(
+            &duplicated.widget_chain(2),
+            &[(1.0, 0.0), (0.7, 0.1), (0.4, 0.4)],
+            "duplicated-point net segments = 2",
+        );
+        // segments = 1 sits inside the 13.28° tie between segments 0 and 1, so only the
+        // tie-independent fact is asserted: the cut does not take the coincident segment.
+        let single = duplicated.widget_chain(1);
+        assert_eq!(single.len(), 2);
+        assert!(
+            single[0] != single[1],
+            "the both-zero segment must not outrank a genuinely curved one: {single:?}",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1's **obtuse arm**. When the two endpoint tangents point more
+    /// than a right angle apart the turn is read off the *sum* chord as
+    /// `π − 2·asin(|d̂ + â| / 2)` — exactly one input negated. Negating both leaves the
+    /// difference chord untouched and yields `π − turn`, a clean rank inversion of exactly
+    /// the obtuse segments and nothing else. Every other custom-profile net in this module
+    /// is acute throughout and would pass either way.
+    ///
+    /// The curl-back net puts its two outer points on opposite sides of the middle chord,
+    /// so the middle segment doubles back: the three turns are `85° / 170° / 85°`. The
+    /// top-1 cut is therefore the middle segment, uniquely and tie-free, and the chain is
+    /// its two control points. Under the `π − turn` misreading the turns read
+    /// `95° / 10° / 95°` and the cut takes an outer segment instead.
+    #[test]
+    fn custom_profile_obtuse_turn_outranks_its_acute_flanks() {
+        let curl_back = BevelCurveProfile::from_points(&[
+            (0.604_557, 0.447_914, BevelHandle::Auto),
+            (0.9, 0.5, BevelHandle::Auto),
+            (0.1, 0.5, BevelHandle::Auto),
+            (0.395_443, 0.447_914, BevelHandle::Auto),
+        ]);
+        assert_widget_chain(
+            &curl_back.widget_chain(1),
+            &[(0.9, 0.5), (0.1, 0.5)],
+            "curl-back net segments = 1 (the obtuse middle segment)",
+        );
     }
 
     /// BEVEL.md §8.6.3.1(6) the handedness rule: for an asymmetric control net the `reverse`
@@ -33809,6 +34094,30 @@ mod tests {
         ]);
         // chain = [(0,1),(0.25,0.5),(1,0)]; sum over i=0,1 = 1 + 0.75 = 1.75; /(4) = 0.4375.
         assert!((poly.fullness_f1(2) - 0.4375).abs() < 1.0e-6);
+    }
+
+    /// BEVEL.md §8.5.5.5(f.3) F1 on the **`n < E` sub-budget branch** (§8.6.3.1(4).3), the
+    /// only place the un-pinned `chain[0]` is observable: F1 sums `i = 0 ..= n-1` and so
+    /// reads `chain[0]` directly, while the ring fill that overwrites it never runs here.
+    ///
+    /// The split net at `segments = 2` takes the non-adjacent {0, 3} cut, giving the widget
+    /// chain `(1,0) (0.10,0.60) (0,1)` — cell `(0,1) (0.60,0.10) (1,0)`. The sum over
+    /// `i = 0, 1` is `1.00 + 0.70 = 1.70`, so F1 = `1.70 / 4 = 0.425`. Forcing `chain[0]` to
+    /// the `(0, 1)` corner, as a pinned-endpoint chain would, leaves `1 + 1 = 2` and `0.5`.
+    #[test]
+    fn custom_profile_fullness_f1_reads_the_unpinned_sub_budget_chain_start() {
+        let split = BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.90, 0.40, BevelHandle::Auto, BevelHandle::Vector),
+            (0.60, 0.55, BevelHandle::Vector, BevelHandle::Vector),
+            (0.10, 0.60, BevelHandle::Vector, BevelHandle::Auto),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ]);
+        assert!(
+            (split.fullness_f1(2) - 0.425).abs() < 1.0e-6,
+            "F1 on the sub-budget branch: got {}",
+            split.fullness_f1(2),
+        );
     }
 
     /// BEVEL.md §8.6.3 / §8.11: a `profile_type = CUSTOM` vertex bevel of a cube corner
@@ -41490,7 +41799,9 @@ fn resolve_handle_side(
     is_left: bool,
 ) -> (f32, f32) {
     match kind {
-        BevelHandle::Free | BevelHandle::Aligned => explicit.unwrap_or_else(|| auto_handle(p, prev, next, is_left)),
+        BevelHandle::Free | BevelHandle::Aligned => {
+            explicit.unwrap_or_else(|| auto_handle(p, prev, next, is_left))
+        }
         BevelHandle::Vector => {
             let neighbour = if is_left { prev } else { next };
             (
@@ -41551,8 +41862,10 @@ fn cubic_bezier(
 /// Map a widget-frame `(x, y)` chain into the profile cell frame (BEVEL.md §8.6.3.1(5)/(6)).
 ///
 /// The `reverse` handedness bit (§8.6.3.1(6)) selects which physical ring corner an
-/// asymmetric profile's shape-start ties to. Both endpoints stay pinned to the ring corners
-/// either way; only the interior handedness differs.
+/// asymmetric profile's shape-start ties to. The mapping itself pins nothing: it relabels
+/// axes and index order, so whatever the chain's two ends were in the widget frame they
+/// stay (the ring corners only when the chain ran corner-to-corner). The *ring fill*
+/// overwrites both ends with the sector's boundverts regardless.
 /// - `reverse = false` (forward): sample `k` → `(u_k, v_k) = (y_k, x_k)`, the plain axis
 ///   swap — shape-start (widget `(1, 0)`) ties to `B_k`.
 /// - `reverse = true` (mirrored): sample `k` → `(u_k, v_k) = (x_(N−k), y_(N−k))`, i.e. the
@@ -41587,39 +41900,65 @@ fn distribute_budget(
     }
     let is_curved = |s: usize| all_curved || curved[s];
 
-    // Turn magnitude per segment (BEVEL.md §8.6.3.1(4).1) — used only to rank the leftover
-    // remainder. Both tangents point the way the curve travels along the segment: departure
-    // runs from the start point to its right handle, arrival runs from the end point's left
-    // handle *into* the end point. Taken that way a straight chord scores ≈ 0 and a sharper
-    // bend scores larger, up to π; heading the arrival at the handle instead inverts the
-    // whole ranking (it yields exactly π − turn on every segment).
+    // Turn magnitude per segment (BEVEL.md §8.6.3.1(4).1). Both tangents point the way the
+    // curve travels along the segment: departure runs from the start point to its right
+    // handle, arrival runs from the end point's left handle *into* the end point. Taken
+    // that way a straight chord scores ≈ 0 and a sharper bend scores larger, up to π;
+    // heading the arrival at the handle instead inverts the whole ranking (it yields
+    // exactly π − turn on every segment).
+    //
+    // The measure normalises **first** and then reads the angle off a chord between the two
+    // unit vectors, splitting on the sign of their dot with the boundary inclusive on the
+    // acute arm. That is not an equivalent restatement of `acos(dot/(|d|·|a|))`: a
+    // zero-length tangent normalises to the zero vector, which lands on `dot = 0` and so
+    // takes the acute arm, giving the difference chord the surviving unit vector's own
+    // length. Exactly one zero tangent therefore scores a fixed π/3 — near the *top* of the
+    // ranking, not the bottom — while both zero score 0.
     let turn = |s: usize| -> f32 {
         let start = (points[s].x, points[s].y);
         let end = (points[s + 1].x, points[s + 1].y);
         let departure = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
         let arrival = (end.0 - handles[s + 1].left.0, end.1 - handles[s + 1].left.1);
-        let departure_length =
-            (departure.0 * departure.0 + departure.1 * departure.1).sqrt();
-        let arrival_length = (arrival.0 * arrival.0 + arrival.1 * arrival.1).sqrt();
-        if departure_length == 0.0 || arrival_length == 0.0 {
-            return 0.0;
+        let unit = |v: (f32, f32)| {
+            let length = (v.0 * v.0 + v.1 * v.1).sqrt();
+            if length == 0.0 {
+                (0.0, 0.0)
+            } else {
+                (v.0 / length, v.1 / length)
+            }
+        };
+        let departure_unit = unit(departure);
+        let arrival_unit = unit(arrival);
+        let dot = departure_unit.0 * arrival_unit.0 + departure_unit.1 * arrival_unit.1;
+        let half_chord = |chord: (f32, f32)| {
+            (0.5 * (chord.0 * chord.0 + chord.1 * chord.1).sqrt())
+                .clamp(-1.0, 1.0)
+                .asin()
+        };
+        if dot >= 0.0 {
+            2.0 * half_chord((
+                departure_unit.0 - arrival_unit.0,
+                departure_unit.1 - arrival_unit.1,
+            ))
+        } else {
+            std::f32::consts::PI
+                - 2.0
+                    * half_chord((
+                        departure_unit.0 + arrival_unit.0,
+                        departure_unit.1 + arrival_unit.1,
+                    ))
         }
-        ((departure.0 * arrival.0 + departure.1 * arrival.1)
-            / (departure_length * arrival_length))
-            .clamp(-1.0, 1.0)
-            .acos()
     };
 
-    // Curved segments ranked sharpest-first (descending `turn`) — the order the leftover
-    // remainder is handed out in. Equal-`turn` order is left undefined by §8.6.3.1(4).1, so
-    // the index fallback below is arbitrary, not a parity claim.
-    let mut ranked: Vec<usize> = (0..segment_count).filter(|&s| is_curved(s)).collect();
-    ranked.sort_by(|&a, &b| {
-        turn(b)
-            .partial_cmp(&turn(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    // Every segment ranked sharpest-first (descending `turn`), scored once rather than once
+    // per comparison. Equal-`turn` order is *not* derivable — §8.6.3.1(4).1 states the
+    // reference resolves it through an ordering that is neither total nor stable — so the
+    // ascending-index fallback below is an arbitrary deterministic choice, not a parity
+    // claim. It is reached routinely: every straight segment scores exactly 0, so whenever
+    // `curved_count < n < segment_count` the sub-budget cut necessarily falls inside a tie
+    // block, and an all-vector net ties everywhere.
+    let mut ranked: Vec<(f32, usize)> = (0..segment_count).map(|s| (turn(s), s)).collect();
+    ranked.sort_by(|&(turn_a, a), &(turn_b, b)| turn_b.total_cmp(&turn_a).then(a.cmp(&b)));
 
     let mut budget = vec![0usize; segment_count];
     if n >= segment_count {
@@ -41630,12 +41969,24 @@ fn distribute_budget(
         for s in 0..segment_count {
             budget[s] = if is_curved(s) { per } else { 1 };
         }
-        for &s in ranked.iter().take(leftover) {
+        // The remainder is what the even split left over *among the curved segments*, so
+        // only they are offered it; the straight ones are already at their reserved one.
+        // This is not equivalent to walking the unfiltered ranking: a curved segment can
+        // score exactly 0 too (collinear auto handles), so a straight segment can outrank
+        // one on a `total_cmp` tie-break and take an advance the filtered walk would give
+        // elsewhere. The two readings can only differ inside such a 0-scored tie block,
+        // which §8.6.3.1(4).1 leaves undefined; the filter is the closer reading of "split
+        // the remaining budget evenly among the curved segments".
+        for &(_, s) in ranked.iter().filter(|&&(_, s)| is_curved(s)).take(leftover) {
             budget[s] += 1;
         }
     } else {
-        // Not enough budget for every segment: one sample each to the `n` most-curved.
-        for &s in ranked.iter().take(n) {
+        // §8.6.3.1(4).1's sub-budget branch: a plain top-`n` cut of the same ranking over
+        // **every** segment, straight ones included, with no reservation and exactly one
+        // advance each. Restricting the cut to the curved segments hands out fewer than `n`
+        // advances once `curved_count < n`, and the short chain that follows becomes a ring
+        // with the wrong vertex count — silently.
+        for &(_, s) in ranked.iter().take(n) {
             budget[s] = 1;
         }
     }
