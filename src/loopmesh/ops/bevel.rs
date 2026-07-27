@@ -1050,10 +1050,18 @@ struct OverrideCapPlan {
 }
 
 /// The closest point on the segment `[a, b]` to `p` (clamped to the segment ends).
+///
+/// The only guard is against a segment of exactly zero length, which has no direction to
+/// project onto. It is deliberately *not* an epsilon: `length_squared` is a length², so any
+/// fixed floor on it is a floor on the caller's world scale — `f32::EPSILON` would answer
+/// `a` for every segment shorter than `3.4e-4`, which at a small bevel offset is every
+/// segment there is. Nothing else needs a floor: the parameter is clamped to `[0, 1]`, so a
+/// denominator small enough to overflow the quotient still lands on the nearer end, which
+/// is the answer a degenerate segment wants.
 fn closest_point_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     let axis = b - a;
     let length_squared = axis.length_squared();
-    if length_squared <= f32::EPSILON {
+    if length_squared == 0.0 {
         return a;
     }
     let t = ((p - a).dot(axis) / length_squared).clamp(0.0, 1.0);
@@ -20625,13 +20633,96 @@ mod tests {
         );
     }
 
+    /// §8.5.5.5(f.6): the chord fallback has to survive a collinear cross-section whose
+    /// collinearity is only *exact in the real numbers* — the resolution half of the
+    /// degeneracy floor (`REPLANT_INPUT_ULP_RATIO`), which the shape half cannot supply.
+    ///
+    /// The sibling fallback test above uses small integer coordinates, where the three control
+    /// points are collinear bit-for-bit and a shape-only floor would do. A real flat-chamfer
+    /// pipe is not so lucky: the control points arrive as `f32` **world** positions, so a `mid`
+    /// lying exactly on the `start`–`end` chord in the reals still stores a sagitta of a few
+    /// ulps of its own coordinate. Against the shape half alone that noise reads as a curve —
+    /// at world `10³` and `offset = 10⁻²` it stands up to ~33× `REPLANT_CELL_SHAPE_RATIO ·
+    /// extent` — and the replant builds a sliver cell out of storage rounding and takes the
+    /// curved branch on a profile the guide calls a chord.
+    #[test]
+    fn pipe_replant_takes_the_chord_on_a_collinear_cell_stored_in_world_coordinates() {
+        let offset = 0.01_f32;
+        let mut worst_sagitta_ratio = 0.0_f64;
+        for step in 0..8 {
+            // Far from the origin relative to `offset`, and off every coordinate direction, so
+            // that laying the three points down in `f32` genuinely rounds.
+            let hub = Vec3::new(
+                1013.0 + 7.3 * step as f32,
+                -742.0 - 3.1 * step as f32,
+                311.0 + 1.7 * step as f32,
+            );
+            let along = Vec3::new(
+                0.61 + 0.09 * step as f32,
+                0.77 - 0.05 * step as f32,
+                0.19 + 0.13 * step as f32,
+            )
+            .normalize();
+            let start = hub;
+            let end = hub + 2.0 * offset * along;
+            // Collinear in the reals — `mid` is a point *of* the chord — and stored in `f32`.
+            let mid = start + (0.37 + 0.05 * step as f32) * (end - start);
+            let cell = ProfileCell::from_control_points(start, end, mid);
+
+            // How far the stored `mid` misses the stored chord, against the shape-only floor
+            // that would have to judge it: this is the term under test.
+            let span = (end - start).as_dvec3();
+            let sagitta = (mid - start).as_dvec3().cross(span).length() / span.length();
+            let shape_floor = REPLANT_CELL_SHAPE_RATIO
+                * (mid - start).as_dvec3().length().max((mid - end).as_dvec3().length());
+            worst_sagitta_ratio = worst_sagitta_ratio.max(sagitta / shape_floor);
+
+            for exponent in [2.0_f32, profile_to_exponent(0.02)] {
+                // A probe well off the chord, at a station away from the control points' own.
+                let axis = Vec3::new(0.2, -0.14, 0.97).normalize();
+                let sideways = along.cross(axis).normalize();
+                let base = mid + 4.0 * offset * axis + 0.8 * offset * sideways;
+
+                let replanted = pipe_cross_section_replant(base, axis, &cell, exponent);
+                let projected_start = start - (start - base).dot(axis) * axis;
+                let projected_end = end - (end - base).dot(axis) * axis;
+                let chord = closest_point_on_segment(base, projected_start, projected_end);
+                // The two branches are told apart by *where along* the chord the answer sits,
+                // not by its distance from the chord line: the sliver cell's two axes are
+                // near-antiparallel, so even the curved branch's answer is within a quantum of
+                // the line, but its `(u, v)` solve divides the probe's off-axis component by a
+                // near-zero determinant and lands it up to two thirds of a cell away along it.
+                // The 0.05-cell threshold is ~8 `f32` world quanta here — four times the
+                // read-back rounding the chord answer itself carries, and well inside the
+                // departure the curved branch produces.
+                let departure = (replanted - chord).length() / offset;
+                assert!(
+                    departure < 0.05,
+                    "the replant slid {departure} cell units along a collinear cross-section at \
+                     world magnitude {} — the stored-sagitta noise was read as a curve",
+                    hub.abs().max_element(),
+                );
+            }
+        }
+        assert!(
+            worst_sagitta_ratio > 3.0,
+            "no cell in the sweep stores a sagitta clear of the shape-only floor (worst \
+             {worst_sagitta_ratio}× it), so the chord assertions above would hold on the shape \
+             half alone and this test pins nothing",
+        );
+    }
+
     /// §8.5.5.5(f.6.2): a vert coincident with a projected control point must replant onto
     /// that cell **corner**, not near it. Its exact cell coordinates are `(1, 0)`, and branch
     /// R's `r`-norm amplifies whatever residue the cell-coordinate solve leaves in the
     /// coordinate that should be zero by `ε^r` — a violent *expansion* at a concave exponent,
     /// so a single-precision solve's few ulps become a percent-scale inward shrink. The
     /// corner-coincident verts are the ones the replant is the identity on, so the whole
-    /// sweep of stations along the axis-parallel line through `end` must come back unmoved.
+    /// sweep of stations along the axis-parallel line through `end` must come back unmoved —
+    /// and, centred, **bit-for-bit** unmoved. Every cell in the sweep is rotated by its own
+    /// angle, so this is the exactness claim of the axis-aligned companion test at arbitrary
+    /// cell orientation: the solve reads `u = determinant/determinant` and
+    /// `v = aa·ab − ab·aa`, both exact for any orientation once `end'` is the origin.
     ///
     /// The identity claim needs a companion, because a corner-coincident `base` lies on the
     /// projected chord and is therefore a fixed point of all three degenerate exits too — the
@@ -20646,7 +20737,6 @@ mod tests {
         // projection is an exact translation and the *only* rounding left is the solve's own
         // `start + end - mid` cancellation — the channel (f.6.2) names. The control points sit
         // far from the origin relative to `offset`, which is what makes that cancellation bite.
-        let mut worst_shrink = 0.0_f32;
         let mut worst_chord_clearance = f32::INFINITY;
         for step in 0..16 {
             let corner = Vec3::new(1.3 + 0.37 * step as f32, -0.45 - 0.11 * step as f32, 0.0);
@@ -20660,8 +20750,12 @@ mod tests {
                 // coordinates are therefore the `(1, 0)` corner exactly.
                 let station = -0.75 + 0.5 * station_step as f32;
                 let base = Vec3::new(end.x, end.y, station);
-                let replanted = pipe_cross_section_replant(base, Vec3::Z, &cell, exponent);
-                worst_shrink = worst_shrink.max((replanted - base).length() / offset);
+                assert_eq!(
+                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    base,
+                    "corner-coincident replant moved a rotated cell's corner (step {step}, \
+                     station {station})",
+                );
 
                 // Same cell, same station, but the `(1, 1)` corner — off the chord, so only the
                 // curved branch can produce its answer. A concave exponent pulls it well onto
@@ -20681,12 +20775,117 @@ mod tests {
             worst_chord_clearance > 0.25,
             "the curved branch never ran — the off-corner probe stayed within \
              {worst_chord_clearance} cell units of the chord that every degenerate exit returns, \
-             so the corner-coincident claim below would hold vacuously",
+             so the corner-coincident claim above would hold vacuously",
         );
-        assert!(
-            worst_shrink < 1.0e-4,
-            "corner-coincident replant shrank inward by {worst_shrink} cell units",
-        );
+    }
+
+    /// A right-angle cross-section cell of extent `offset`, planted at `hub` in the `z = 0`
+    /// plane with the pipe running along `z`. Its `(1, 1)` cell corner is `hub` itself, so a
+    /// probe there is the one point every degenerate exit would answer differently: the curve
+    /// carries it well clear of the `start'–end'` chord, every fallback leaves it on the chord.
+    fn right_angle_cross_section(hub: Vec3, offset: f32) -> ProfileCell {
+        ProfileCell::from_control_points(
+            hub + offset * Vec3::X,
+            hub + offset * Vec3::Y,
+            hub,
+        )
+    }
+
+    /// §8.5.5.5(f.6): the replant's degeneracy exits are **scale-free**, so a pipe keeps a
+    /// genuinely curved cross-section at any bevel offset.
+    ///
+    /// The cell-coordinate solve's determinant is `|a_axis × b_axis|²` (Lagrange), a **length⁴**
+    /// quantity: a right-angle cell of extent `L` reads `L⁴`. An absolute floor on it is
+    /// therefore a floor on the *offset* — an `f32::EPSILON` one fires for every `L` below
+    /// `(1.19e-7)^(1/4) ≈ 0.0186` — and every vert of such a bevel would take the chord
+    /// fallback, collapsing the profile to a flat chamfer with no diagnostic. Judged on the
+    /// cell's own `sin θ` instead, the same junction takes the same branch at every scale and
+    /// the replanted shape is exactly similar.
+    #[test]
+    fn pipe_replant_cross_section_stays_curved_at_a_small_offset() {
+        let hub = Vec3::new(1.1, -0.7, 0.0);
+        for exponent in [2.0_f32, profile_to_exponent(0.02)] {
+            let mut reference_shape = None;
+            for offset in [1.0_f32, 0.2, 0.01, 0.001] {
+                let cell = right_angle_cross_section(hub, offset);
+                let station = 0.35;
+                let base = Vec3::new(hub.x, hub.y, station);
+                let replanted = pipe_cross_section_replant(base, Vec3::Z, &cell, exponent);
+
+                let projected_start = Vec3::new(cell.start.x, cell.start.y, station);
+                let projected_end = Vec3::new(cell.end.x, cell.end.y, station);
+                let chord = closest_point_on_segment(replanted, projected_start, projected_end);
+                let clearance = (replanted - chord).length() / offset;
+                assert!(
+                    clearance > 0.2,
+                    "at offset {offset} (exponent {exponent}) the replant answered \
+                     {clearance} cell units off the chord — the curved branch declined and \
+                     the cross-section collapsed to a flat chamfer",
+                );
+
+                // Similar at every scale: the cell-relative answer is offset-independent.
+                let shape = (replanted - base) / offset;
+                match reference_shape {
+                    None => reference_shape = Some(shape),
+                    Some(reference) => assert!(
+                        (shape - reference).length() < 1.0e-3,
+                        "the replanted shape is not scale-free: {shape:?} at offset {offset} \
+                         against {reference:?} at offset 1",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// §8.5.5.5(f.6.2): with the cell solve **centred** on the vert being replanted, the
+    /// corner-coincident class is not merely "within a quantum" of the identity — it *is* the
+    /// identity, bit for bit, at every world magnitude.
+    ///
+    /// A vert on the axis-parallel line through a projected control point has exact cell
+    /// coordinates `(1, 0)`, and the guide says the replant leaves it where it is. Taken off
+    /// the world origin the solve reaches that `0` by cancelling world-magnitude terms
+    /// (`base − (start' + end' − mid')`), so it arrives as a solve residue that the `r`-norm
+    /// then expands by `ε^r`; taken off `base`, every term is cell-scale, the projected control
+    /// point lands at the origin exactly, and the solve returns `1` and `0` with no residue at
+    /// all. The world-magnitude ladder is the point of the test: the uncentred form drifts with
+    /// it, the centred form does not.
+    ///
+    /// The exactness is **centring's** doing and this test pins centring, not precision — it
+    /// passes unchanged with the routine's `f64` widening removed. The widening is kept for the
+    /// separate reason the routine's doc gives, and no test pins that.
+    #[test]
+    fn pipe_replant_is_the_exact_identity_on_corner_coincident_verts() {
+        let exponent = profile_to_exponent(0.02);
+        let offset = 0.2_f32;
+        for world in [1.3_f32, 50.0, 1000.0] {
+            let hub = Vec3::new(world, -0.6 * world, 0.0);
+            let cell = right_angle_cross_section(hub, offset);
+            for station_step in 0..4 {
+                let station = -0.75 + 0.5 * station_step as f32;
+                // The axis-parallel line through `end`: the cross-section is constant along the
+                // pipe, so `end` projects onto this vert at every station.
+                let base = Vec3::new(cell.end.x, cell.end.y, station);
+                assert_eq!(
+                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    base,
+                    "corner-coincident vert moved at world magnitude {world}, station {station}",
+                );
+                // Same for the other projected control point.
+                let base = Vec3::new(cell.start.x, cell.start.y, station);
+                assert_eq!(
+                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    base,
+                    "corner-coincident vert moved at world magnitude {world}, station {station}",
+                );
+                // Non-vacuity: the same cell at the same station moves an off-corner vert.
+                let off_corner = Vec3::new(hub.x, hub.y, station);
+                let bulged = pipe_cross_section_replant(off_corner, Vec3::Z, &cell, exponent);
+                assert!(
+                    (bulged - off_corner).length() > 0.1 * offset,
+                    "the replant is the identity everywhere — the corner claim is vacuous",
+                );
+            }
+        }
     }
 
     /// §8.5.5.5(f.6): the replant discriminator is junction planarity. A flat junction's
@@ -42342,6 +42541,37 @@ const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
 /// §8.3.0.3 weld plane and each profile's existing projection plane are tested against.
 const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
 
+/// Shape half of the §8.5.5.5(f.6) replant's degeneracy floor: the smallest **sagitta**
+/// (distance from the projected `mid` to the `start'–end'` chord) the replant still reads
+/// as a cell, as a fraction of the cell's **longer** axis. Only for a near-isotropic cell is
+/// that the same thing as a `sin θ` floor on the two axes; for an anisotropic one it fires at
+/// a considerably larger `sin θ`, which is the wanted behaviour.
+///
+/// It has to be a ratio of lengths rather than a floor on the determinant, because by
+/// Lagrange the determinant **is** `|a_axis × b_axis|²` — a length⁴ quantity. A fixed floor
+/// on it is therefore a floor on the bevel *offset*: a right-angle cell of extent `L` reads
+/// `L⁴`, so an `f32::EPSILON` floor diverts every vert of a bevel below `offset ≈ 0.019` to
+/// the chord, silently flattening the curved cross-section into a chamfer with no diagnostic.
+///
+/// The dimensionless quotient `determinant / (aa · bb)` would be scale-free too, and is the
+/// shape the rework was asked for; this ships the sagitta instead. That quotient is `sin²θ`,
+/// a *pure angle*, and an angle is not what the curve-versus-chord decision turns on: an
+/// anisotropic cell (`|a_axis| ≫ |b_axis|`) has a sagitta near `|b_axis| · sin θ`, so it can
+/// hold a perfectly healthy angle while its curve departs from its chord by less than the
+/// inputs resolve. The sagitta measures that departure directly, and so also covers the
+/// near-parallel case, where the same anisotropy makes the angle quotient the less
+/// informative of the two.
+const REPLANT_CELL_SHAPE_RATIO: f64 = 1.0e-4;
+
+/// Resolution half of the same floor, as a fraction of the control points' **world**
+/// magnitude — the part a pure ratio cannot supply. The three control points arrive as
+/// single-precision world positions, so a `mid` that lies exactly on the chord (a
+/// collapsed profile, which §8.5.5.5(f.6) names as the routine flat-chamfer case) still
+/// stores a sagitta of a few ulps of its own world coordinate. Below that the cell's shape
+/// is not resolvable from its inputs at all, and a ratio-only floor would read the storage
+/// noise as a curve and build a sliver cell out of it.
+const REPLANT_INPUT_ULP_RATIO: f64 = 4.0 * f32::EPSILON as f64;
+
 /// **Dimensionless** out-of-plane ratio below which a junction's cross-section control
 /// points are treated as coplanar — the §8.5.5.5(f.6) flat-vs-tube gate. The predicate
 /// divides each point's signed plane distance by the junction's characteristic size
@@ -44589,96 +44819,104 @@ fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
 /// (a pipe through a flat-chamfer profile takes the second): a cross-section degenerated
 /// to a single point (`start' == end'`), and one degenerated to the straight chord
 /// `start'–end'` (collinear projected control points).
+///
+/// Everything below is carried **relative to `base`**, and that framing is the whole
+/// numeric content of the routine (§8.5.5.5(f.6.2)). The station projection, the two cell
+/// axes and the coordinate solve are all differences of world positions that lie within an
+/// `offset` of each other, so taking them off `base` first makes every intermediate
+/// cell-scale and leaves no large-magnitude cancellation anywhere. Written off the world
+/// origin instead, `base − (start' + end' − mid')` cancels world-magnitude terms down to a
+/// cell-magnitude answer, and the residue it manufactures is not a rounding one can shrug
+/// at: it lands in the cell coordinate that should be zero at a vert coincident with a
+/// projected control point, and the snap's `r`-norm raises that coordinate to the power
+/// `r`, which for a concave exponent is a violent expansion rather than a contraction
+/// (`(10⁻⁷)^0.354 ≈ 3.5·10⁻³` — a percent-scale inward shrink of a vert the replant is
+/// supposed to be the identity on). Centred, the identity
+/// `base − (start' + end' − mid') ≡ (base − mid') + (mid' − start') + (mid' − end')` holds
+/// term by term at cell scale, and the corner-coincident case comes out *exactly*: the
+/// solve reads `(u, v) = (1, 0)` bit-for-bit and the reconstruction returns `base`
+/// unchanged. That exactness is centring's doing alone and would survive a single-precision
+/// solve.
+///
+/// Double precision on top of it buys **authorship, not residue**, exactly as (f.6.2) says.
+/// Off a coordinate direction the residue is *input-borne*: a grid vert stored in `f32`
+/// cannot lie exactly on a tilted axis line through a control point, so the vert arrives
+/// already carrying `ε ≈ ulp(world)/offset ≈ 4·10⁻⁷` of cell coordinate — the amplification
+/// band (f.6.2) budgets for, which no internal precision closes (measured: the drift is the
+/// same to within one quantum with the widening removed). What the widening does buy is that
+/// the answer we emit is the exact-arithmetic answer *for the inputs as stored*, which inside
+/// that band differs from the single-precision answer by tens of quanta; being the
+/// reproducible one of the two is worth having. Nothing below pins it — the tests pass with
+/// the widening removed.
 fn pipe_cross_section_replant(
     base: Vec3,
     pipe_axis: Vec3,
     cell: &ProfileCell,
     exponent: f32,
 ) -> Vec3 {
-    let axis = pipe_axis.normalize_or_zero();
-    let to_station = |point: Vec3| point - (point - base).dot(axis) * axis;
+    let axis = pipe_axis.as_dvec3().normalize_or_zero();
+    let base_position = base.as_dvec3();
+    let to_station = |point: Vec3| {
+        let from_base = point.as_dvec3() - base_position;
+        from_base - from_base.dot(axis) * axis
+    };
     let start = to_station(cell.start);
     let end = to_station(cell.end);
     let mid = to_station(cell.mid);
+    let to_world = |station_relative: DVec3| (base_position + station_relative).as_vec3();
 
-    // Degenerate: the cross-section is a single point — every vert replants onto it.
-    if (end - start).length() <= COLLINEAR_MID_TOLERANCE {
-        return start;
-    }
     let a_axis = mid - start;
     let b_axis = mid - end;
+    let span = end - start;
+
+    // The floor both degeneracy exits are judged against: a length in the cell's own frame,
+    // part shape ratio and part input resolution (see the two constants).
+    let world_magnitude = cell
+        .start
+        .abs()
+        .max(cell.mid.abs())
+        .max(cell.end.abs())
+        .max(base.abs())
+        .max_element() as f64;
+    let resolution = REPLANT_CELL_SHAPE_RATIO * a_axis.length().max(b_axis.length())
+        + REPLANT_INPUT_ULP_RATIO * world_magnitude;
+
+    // Degenerate: the cross-section is a single point — every vert replants onto it.
+    if span.length() <= resolution {
+        return to_world(start);
+    }
     // Degenerate: the projected control points are collinear (a flat-chamfer cross-section),
     // so the curve is the chord `start'–end'` and the vert replants onto its nearest point.
-    if a_axis.cross(b_axis).length() <= COLLINEAR_MID_TOLERANCE {
-        return closest_point_on_segment(base, start, end);
-    }
-
-    // `base` in the planar cell's `(u, v)` frame (§8.2.2.1): solve
-    // `base − origin = u·a_axis + v·b_axis` by the 2×2 normal equations. `base` and the two
-    // axes are coplanar (the station plane), so the projection error is zero.
-    let origin = start + end - mid;
-    let offset = base - origin;
+    // `|a_axis × b_axis|` is `|span|` times the sagitta, so this is the sagitta test.
     let aa = a_axis.dot(a_axis);
     let ab = a_axis.dot(b_axis);
     let bb = b_axis.dot(b_axis);
     let determinant = aa * bb - ab * ab;
-    if determinant.abs() <= f32::EPSILON {
-        return closest_point_on_segment(base, start, end);
+    if determinant <= resolution * resolution * span.length_squared() {
+        let along = (-start).dot(span) / span.length_squared();
+        return to_world(start + span * along.clamp(0.0, 1.0));
     }
-    // §8.5.5.5(f.6.2): at a vert coincident with a projected control point the cell coordinate
-    // that should be `0` is reached by *cancellation*, so it arrives as a solve residue rather
-    // than as a written zero — and the snap's `r`-norm raises it to the power `r`, which for a
-    // concave exponent is a violent expansion, not a contraction (`(10⁻⁷)^0.354 ≈ 3.5·10⁻³`,
-    // a percent-scale inward shrink of a vert the replant should not move at all). The residue
-    // is manufactured by the `start + end - mid` origin formation, whose terms are world-scale
-    // while their combination is cell-scale. Carrying the solve in double precision — station
-    // projection included, since a tilted axis at a distant station cancels there too — drives
-    // the residue from `10⁻⁷` to `10⁻¹⁶`, and the same power law then shrinks its footprint by
-    // `(10⁻⁹)^r`.
-    //
-    // The widening is scoped to the solve: the three exits above keep classifying on their own
-    // single-precision quantities, so which of them fires is exactly what it was. The remaining
-    // `wide_determinant` test is a divide guard, not a second classifier — it catches a triple
-    // that cleared the single-precision determinant exit yet lands the double-precision
-    // determinant at (or within one single-precision epsilon of) zero. It buys no accuracy in
-    // that sliver: the fallback recomputes the same expression nine decades *less* accurately,
-    // so where the wide determinant is untrustworthy the narrow one is more so. Its only
-    // service is keeping the division defined, and it is kept for that alone.
-    let wide_axis = pipe_axis.as_dvec3().normalize_or_zero();
-    let wide_base = base.as_dvec3();
-    let to_wide_station =
-        |point: Vec3| point.as_dvec3() - (point.as_dvec3() - wide_base).dot(wide_axis) * wide_axis;
-    let wide_start = to_wide_station(cell.start);
-    let wide_end = to_wide_station(cell.end);
-    let wide_mid = to_wide_station(cell.mid);
-    let wide_a_axis = wide_mid - wide_start;
-    let wide_b_axis = wide_mid - wide_end;
-    let wide_offset = wide_base - (wide_start + wide_end - wide_mid);
-    let wide_aa = wide_a_axis.dot(wide_a_axis);
-    let wide_ab = wide_a_axis.dot(wide_b_axis);
-    let wide_bb = wide_b_axis.dot(wide_b_axis);
-    let wide_determinant = wide_aa * wide_bb - wide_ab * wide_ab;
-    let (u, v) = if wide_determinant.abs() > f32::EPSILON as f64 {
-        let wide_ap = wide_a_axis.dot(wide_offset);
-        let wide_bp = wide_b_axis.dot(wide_offset);
-        (
-            ((wide_ap * wide_bb - wide_bp * wide_ab) / wide_determinant) as f32,
-            ((wide_aa * wide_bp - wide_ab * wide_ap) / wide_determinant) as f32,
-        )
-    } else {
-        let ap = a_axis.dot(offset);
-        let bp = b_axis.dot(offset);
-        (
-            (ap * bb - bp * ab) / determinant,
-            (aa * bp - ab * ap) / determinant,
-        )
-    };
+
+    // `base` in the planar cell's `(u, v)` frame (§8.2.2.1): solve
+    // `base − origin = u·a_axis + v·b_axis` by the 2×2 normal equations, with the origin's
+    // `start' + end' − mid'` folded into the centred right-hand side. `base` and the two axes
+    // are coplanar (the station plane), so the projection error is zero. The exit above is the
+    // divide guard as well as the classifier: it compares `determinant` against a product of
+    // squares, which is `>= 0`, so passing it leaves `determinant` strictly positive outright.
+    // That is why there is exactly one solve and one answer. (Cauchy–Schwarz is what makes the
+    // determinant non-negative in exact arithmetic, and so is what licenses testing it with no
+    // `.abs()`; it is an upper bound and proves nothing about the divide.)
+    let cell_offset = mid - start - end;
+    let a_projection = a_axis.dot(cell_offset);
+    let b_projection = b_axis.dot(cell_offset);
+    let u = (a_projection * bb - b_projection * ab) / determinant;
+    let v = (aa * b_projection - ab * a_projection) / determinant;
 
     // The third cell coordinate is identically zero by construction — the station plane is
     // *defined* to pass through `base` — so it is written, never computed (§8.5.5.5(f.6)):
     // a literal zero has no rounding for the `r`-norm to amplify.
-    let snapped = snap_to_unit_superellipsoid(Vec3::new(u, v, 0.0), exponent);
-    origin + snapped.x * a_axis + snapped.y * b_axis
+    let snapped = snap_to_unit_superellipsoid(Vec3::new(u as f32, v as f32, 0.0), exponent);
+    to_world(mid + (snapped.x as f64 - 1.0) * a_axis + (snapped.y as f64 - 1.0) * b_axis)
 }
 
 /// The ring-chain rim samples the §8.5.5.5(f.6) replant reaches (BEVEL.md §8.5.5.5(f.6.1)).
