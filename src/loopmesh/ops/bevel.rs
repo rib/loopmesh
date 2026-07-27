@@ -19307,6 +19307,156 @@ mod tests {
         }
     }
 
+    /// The unsnapped `r = 2·ln(2) / ln(1/profile)` of BEVEL.md §8.6.2, so the snap tests
+    /// below can say what the map would have returned without its snap table.
+    fn raw_profile_exponent(profile: f32) -> f32 {
+        2.0 * std::f32::consts::LN_2 / (1.0 / profile).ln()
+    }
+
+    /// BEVEL.md §8.6.2 `#exponent-snap`: the whole snap table, in the order the guide
+    /// states it. Exactly one entry is tested on `profile` — the wide `profile ≥ 0.95`
+    /// square gate; the circle, line and square-in entries are all tested on the raw
+    /// exponent, and the circle / line windows exist so `r == 2.0` / `r == 1.0` are
+    /// reachable as **exact** float equalities for the `==`-keyed branches downstream.
+    ///
+    /// The anchors `profile = 0.5` / `0.25` alone would not pin those two windows: in
+    /// f32 the raw map already lands on exactly `2.0` / `1.0` there, so both branches
+    /// could be deleted and the anchors would still pass. The off-anchor samples are
+    /// the ones that hold the windows open.
+    #[test]
+    fn profile_to_exponent_follows_the_snap_table() {
+        let raw = raw_profile_exponent;
+
+        for profile in [0.95_f32, 0.96, 0.99, 1.0] {
+            assert_eq!(
+                profile_to_exponent(profile),
+                PROFILE_SQUARE_EXPONENT,
+                "profile {profile} is inside the wide square gate",
+            );
+        }
+        assert_ne!(
+            profile_to_exponent(0.949),
+            PROFILE_SQUARE_EXPONENT,
+            "the square gate opens at 0.95, not below it",
+        );
+
+        assert_eq!(profile_to_exponent(0.5), 2.0, "circle is exact");
+        assert_eq!(profile_to_exponent(0.25), 1.0, "line is exact");
+        assert_eq!(profile_to_exponent(0.0), 0.0, "square-in sentinel");
+
+        for (profile, special) in [(0.50001_f32, 2.0_f32), (0.2500086, 1.0)] {
+            assert_ne!(
+                raw(profile),
+                special,
+                "profile {profile} must sit off the anchor for this to test the snap",
+            );
+            assert!(
+                (raw(profile) - special).abs() < PROFILE_EXPONENT_SNAP,
+                "profile {profile} is inside the {special} window: r_raw = {}",
+                raw(profile),
+            );
+            assert_eq!(
+                profile_to_exponent(profile),
+                special,
+                "profile {profile} snaps onto {special} exactly",
+            );
+        }
+
+        for profile in [0.1_f32, 0.3, 0.7, 0.9] {
+            let exponent = profile_to_exponent(profile);
+            assert_eq!(exponent, raw(profile), "profile {profile} is not snapped");
+            assert!(exponent > 0.0 && exponent < PROFILE_SQUARE_EXPONENT);
+        }
+    }
+
+    /// BEVEL.md §8.6.2 `#exponent-snap`: the square-in entry is a **razor on `r_raw`**,
+    /// not a band on `profile`. `r_raw = 2·ln(2) / ln(1/profile)` decays so slowly that
+    /// no **normal** positive `profile` reaches `1e-4` — at `profile = 1e-4` it is still
+    /// `≈ 0.151`, three decades above the razor, and even at the smallest normal it is
+    /// `≈ 0.0159` — so square-in is reached at `profile = 0` and everything normal above
+    /// it stays genuinely curved. (Only the subnormals below `≈2.94e-39` also reach it,
+    /// where `1/profile` overflows to `+inf`; the sentinel is the right answer there.)
+    ///
+    /// A `profile`-side gate (`profile ≤ 1e-4 → r := 0`) would collapse this whole
+    /// window onto the sentinel, and with it the leg-linear chain and the (f.4b) arm of
+    /// the [V-ADJ] grid. The exponent equalities below are what fail if one returns.
+    #[test]
+    fn profile_to_exponent_square_in_razor_is_on_the_raw_exponent() {
+        let raw = raw_profile_exponent;
+
+        let mut previous = 0.0_f32;
+        for (profile, expected) in [
+            (1.0e-5_f32, 0.1204_f32),
+            (3.0e-5, 0.1331),
+            (5.0e-5, 0.1400),
+            (9.0e-5, 0.1488),
+            (1.0e-4, 0.1505),
+        ] {
+            let exponent = profile_to_exponent(profile);
+            assert_eq!(
+                exponent,
+                raw(profile),
+                "profile {profile} keeps its curved exponent",
+            );
+            assert!(
+                (exponent - expected).abs() < 1.0e-3,
+                "profile {profile} maps to r ≈ {expected}, got {exponent}",
+            );
+            assert!(exponent > previous, "the map stays monotonic in profile");
+            previous = exponent;
+
+            // The consequence downstream: a curved `r` runs the chord-equalisation
+            // solver, whose lone `segments = 2` sample sits just off the origin on the
+            // diagonal — where the square-in sentinel's leg-linear chain puts the sharp
+            // corner `(0, 0)` itself.
+            let sample = superellipse_chain(profile, 2)[1];
+            assert!(
+                sample.0 > 0.0 && sample.1 > 0.0,
+                "profile {profile} is not the square-in corner: {sample:?}",
+            );
+            assert!(sample.0 < 0.05 && sample.1 < 0.05, "but is deeply concave");
+        }
+
+        assert_eq!(
+            superellipse_chain(0.0, 2)[1],
+            (0.0, 0.0),
+            "`profile = 0` alone is the square-in corner",
+        );
+    }
+
+    /// `profile_to_exponent` is **total**: every `f32`, in-domain or not, maps to a
+    /// finite exponent, so the `r`-keyed consumers (the ring sampler, the `== 1.0` /
+    /// `== 2.0` branches) never see a NaN. Off-domain inputs — `-0.0`, negatives, NaN —
+    /// take the square-in limit, which is an *implementer-invented* choice: BEVEL.md
+    /// §8.6.2 states no rule off `[0, 1]`, and picking one only keeps the map total.
+    ///
+    /// This is a property of the exponent alone, **not** of the operator. The centre
+    /// fullness ([`adj_fullness`], §8.5.5.5(f.3)) evaluates its regression on the raw
+    /// `profile` scalar, so `profile = NaN` still yields a NaN fullness seed; nothing
+    /// here contains that, and containing it would mean sanitising `profile` where
+    /// [`BevelOptions`] is read, not here.
+    #[test]
+    fn profile_to_exponent_is_finite_off_the_unit_interval() {
+        for profile in [0.0_f32, -0.0, -0.5, f32::NAN, f32::NEG_INFINITY] {
+            assert_eq!(
+                profile_to_exponent(profile),
+                0.0,
+                "profile {profile} takes the square-in limit",
+            );
+        }
+        assert_eq!(profile_to_exponent(f32::INFINITY), PROFILE_SQUARE_EXPONENT);
+        for profile in [1.0e-30_f32, 1.0e-6, 0.5, 0.94] {
+            assert!(
+                profile_to_exponent(profile).is_finite(),
+                "profile {profile} maps to a finite exponent",
+            );
+        }
+
+        // The scope of the guarantee, pinned so the docstring above cannot rot into a
+        // crate-wide NaN-safety claim.
+        assert!(adj_fullness(f32::NAN, 2).is_nan());
+    }
+
     /// BEVEL.md §8.6.2 / §8.6.4: the flat profile (`profile = 0.25`, `r = 1`) is the
     /// straight chord `u + v = 1`, so even spacing is even linear interpolation. At
     /// `segments = 2` the lone interior sample is the chord midpoint `(0.5, 0.5)`.
@@ -44245,7 +44395,19 @@ fn profile_to_exponent(profile: f32) -> f32 {
     if profile >= 0.95 {
         return PROFILE_SQUARE_EXPONENT;
     }
-    if profile <= PROFILE_EXPONENT_SNAP {
+    // The square-in razor below is on the *raw exponent*, never on `profile`: `r_raw`
+    // decays so slowly that no **normal** positive `profile` trips it, so square-in is
+    // reached at `profile = 0` and — via the reciprocal overflowing to `+inf`, which
+    // drives `r_raw` to `0` — at the subnormals below `≈2.94e-39`, which is the same
+    // answer the sentinel wants there anyway.
+    //
+    // `+0.0` needs no guard of its own (`1/+0 = +inf`, `ln(+inf) = +inf`, `r_raw = 0`,
+    // razor fires). What the guard is actually for is everything the reciprocal path
+    // turns into a NaN: `-0.0` gives `-inf` and `ln` of that is NaN, plain negatives
+    // give a negative reciprocal and likewise, and a NaN `profile` propagates straight
+    // through. Sending all of them to the square-in limit is an implementer choice —
+    // BEVEL.md §8.6.2 states no rule off `[0, 1]` — picked so the exponent is total.
+    if !(profile > 0.0) {
         return 0.0;
     }
     let exponent = 2.0 * std::f32::consts::LN_2 / (1.0 / profile).ln();
