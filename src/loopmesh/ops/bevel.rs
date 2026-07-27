@@ -3326,9 +3326,9 @@ impl LoopMesh {
 
         // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
         // adjacency grid (§8.5), per `vmesh_method`. ADJ fills the cube corner (any
-        // `segments`) and the general valence-`s` corner at every **smooth** exponent
-        // (§8.5.5.5, and (f.1) step 4's ungated fullness grid); only the square /
-        // square-in variants of §8.5.5.5(f.4)/(f.5) take no ADJ fill yet.
+        // `segments`) and the general valence-`s` corner at every exponent (§8.5.5.5, and
+        // (f.1) step 4's ungated fullness grid); §8.5.5.5(f.4a)'s square-in weld — the
+        // tri-corner ring's own construction — is the one variant with no ADJ fill yet.
         for cut in &junction_cuts {
             // §8.3.0.3: the fill kind is chosen by the ring's boundvert count, not by the
             // beveled-edge count and not by `vmesh_method`. A two-boundvert ring bounds a
@@ -3678,8 +3678,6 @@ impl LoopMesh {
         // corner — its edges and faces are about to be consumed by the re-stitch — so it is
         // captured now and carried on the cut for the fill-time routing decision.
         let dihedral_band_deviation = self.junction_dihedral_band_deviation(vertex, &corners);
-        let dihedral_band_ok =
-            dihedral_band_deviation.is_some_and(|d| d <= std::f32::consts::FRAC_PI_4);
 
         junction_cuts.push(JunctionCut {
             vertex,
@@ -3689,7 +3687,6 @@ impl LoopMesh {
             central_representative,
             sector_representatives,
             centre_column_representatives,
-            dihedral_band_ok,
             dihedral_band_deviation,
             pipe_override,
             opening_edge_directions,
@@ -4890,29 +4887,43 @@ impl LoopMesh {
     /// (a fold past `3·π/4`, the wrong near-flat count, or a signed sum outside the `±π/4`
     /// window) drops the corner through to the general grid of §8.5.5.5.
     fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32) -> bool {
-        if cut.boundverts.len() != 3 {
-            return false;
-        }
         let exponent = profile_to_exponent(profile);
         // §8.5.5.5(f.1): the tri-corner family admits three exponents — the smooth octant
         // grid (f.2), and the two closed forms. The **square** sentinel takes (f.5)'s three
-        // flat unit squares, and is admitted here on a *tighter* total-angle band (`π/16`,
-        // not `π/4`): three flat planes visibly kink at an only-approximately-orthonormal
-        // corner. The square-in sentinel (`r → 0`) stays out — it takes the degenerate weld
-        // path, not filled on this route.
+        // flat unit squares, and is admitted here on the *tighter* total-angle band: three
+        // flat planes visibly kink at an only-approximately-orthonormal corner. The
+        // square-in sentinel (`r → 0`) stays out — it takes the degenerate weld path, not
+        // filled on this route.
         if exponent == PROFILE_SQUARE_EXPONENT {
-            let vertex = self.vertex_position(cut.vertex);
-            let meet_points = [
-                self.vertex_position(cut.boundverts[0]),
-                self.vertex_position(cut.boundverts[1]),
-                self.vertex_position(cut.boundverts[2]),
-            ];
-            let square_band = cut
-                .dihedral_band_deviation
-                .is_some_and(|deviation| deviation <= std::f32::consts::PI / 16.0);
-            return tri_corner_meet_geometry(vertex, &meet_points) || square_band;
+            return self.adj_tri_corner_shape(cut, TRI_CORNER_BAND_SQUARE);
         }
         if !adj_octant_exponent(exponent) {
+            return false;
+        }
+        self.adj_tri_corner_shape(cut, TRI_CORNER_BAND_SMOOTH)
+    }
+
+    /// The exponent-free half of the §8.5.1 trigger: whether the ring's *shape* is one
+    /// the tri-corner family owns, on the smooth band.
+    ///
+    /// Split out because [`Self::adj_tri_corner_trigger`] answers `false` for the
+    /// **square-in** sentinel unconditionally — that exponent's tri-corner member is the
+    /// §8.5.5.5(f.4a) degenerate weld, not a grid — so the dispatch still needs to ask
+    /// "would this corner have been the weld's?" without the exponent in the way.
+    fn adj_tri_corner_geometry(&self, cut: &JunctionCut) -> bool {
+        self.adj_tri_corner_shape(cut, TRI_CORNER_BAND_SMOOTH)
+    }
+
+    /// Whether the ring's *shape* is one the tri-corner family owns (BEVEL.md §8.5.1 /
+    /// §7.6.6): three boundverts, admitted either by the position-only meet geometry or by
+    /// the per-edge dihedral band, whose total-angle window is the caller's to choose.
+    ///
+    /// The window ([`TRI_CORNER_BAND_SMOOTH`] / [`TRI_CORNER_BAND_SQUARE`]) is the only thing
+    /// that varies across the trigger's arms, so the construction lives here once; the
+    /// meet-geometry half ([`tri_corner_meet_geometry`], described on
+    /// [`Self::adj_tri_corner_trigger`]) is band-free.
+    fn adj_tri_corner_shape(&self, cut: &JunctionCut, band_tolerance: f32) -> bool {
+        if cut.boundverts.len() != 3 {
             return false;
         }
         let vertex = self.vertex_position(cut.vertex);
@@ -4921,7 +4932,10 @@ impl LoopMesh {
             self.vertex_position(cut.boundverts[1]),
             self.vertex_position(cut.boundverts[2]),
         ];
-        tri_corner_meet_geometry(vertex, &meet_points) || cut.dihedral_band_ok
+        tri_corner_meet_geometry(vertex, &meet_points)
+            || cut
+                .dihedral_band_deviation
+                .is_some_and(|deviation| deviation <= band_tolerance)
     }
 
     /// The rounded adjacency-grid fill at one junction, with the §8.5.5.5(f.6) **pipe**
@@ -4938,15 +4952,18 @@ impl LoopMesh {
     /// Every non-pipe junction runs the base grid alone.
     ///
     /// Step 2's domain being the net's slots also decides what happens when step 1 declines:
-    /// no net, no slots, so **neither** replant half runs. That case is not exotic — the
-    /// square / square-in grids are unfilled on this route
-    /// ([`Self::build_adj_fill_base`]) — and the rim half is the one that matters there,
-    /// since those verts are shared with the arriving strips and moving them with no cap to
-    /// justify it distorts the junction.
+    /// no net, no slots, so **neither** replant half runs. That case is not exotic — a
+    /// degenerate chain, a singular corner map, the square-in weld's ring, or either square
+    /// sentinel at a junction this wrapper *would* have replanted
+    /// ([`Self::build_adj_fill_base`]) all reach it — and the rim half is the one that
+    /// matters there, since those verts are shared with the arriving strips and moving them
+    /// with no cap to justify it distorts the junction.
     ///
     /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`); the
     /// axis and the cross-section shape are recovered from the chains at fill time, since
-    /// the original corner's edge directions are gone by now.
+    /// the original corner's edge directions are gone by now. The base is told whether the
+    /// replant will actually follow, not merely whether the flag is set — the two differ at
+    /// a planar junction, and the sentinel decline is keyed on the former.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill(
         &mut self,
@@ -4980,8 +4997,16 @@ impl LoopMesh {
         // That is only half the replant's domain: the canonical block's `k = 0` column is a
         // ring chain, reached below.
         let interior_start = result.verts.len();
-        let net_emitted =
-            self.build_adj_fill_base(cut, chains, segments, profile, material, templates, result);
+        let net_emitted = self.build_adj_fill_base(
+            cut,
+            chains,
+            pipe.is_some(),
+            segments,
+            profile,
+            material,
+            templates,
+            result,
+        );
         let Some((pipe_axis, profile_cell)) = pipe else {
             return;
         };
@@ -5141,15 +5166,19 @@ impl LoopMesh {
     ///   valence-generic. The even/odd centre parity (§8.5.5.5(e)) decides between a
     ///   welded centre vertex and a central `s`-gon for every `s`.
     ///
-    /// Scope this cycle: every **smooth** exponent (circular, curved, and the straight
-    /// chord) at the cube corner *and* at the general ring — §8.5.5.5(f.1) step 4 has no
-    /// exponent gate. The square grids of (f.5) run on their own routes (step 1's
-    /// parallel-offset ring, the tri-corner three squares); a square exponent on **odd**
-    /// `segments` at a general ring, and square-in at a general ring, are the one tracked
-    /// gap — see step 4's comment below.
+    /// Scope: every exponent at the general ring — §8.5.5.5(f.1) step 4 has no exponent
+    /// gate, so the two square sentinels take that grid there as well (a square exponent
+    /// on **odd** `segments`, which (f.5)'s lattice never sees, and square-in on any ring
+    /// the (f.4a) weld does not own). The square grids of (f.5) keep their own routes
+    /// (step 1's parallel-offset ring, the tri-corner three squares). Two junctions are
+    /// still declined: square-in at a tri-corner-eligible corner, whose fill is (f.4a)'s
+    /// degenerate weld, and either square sentinel where `pipe_replant_follows` — see
+    /// step 4's comment below.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
     /// dispatch — with the cross-section replant applied by the [`Self::build_adj_fill`]
-    /// wrapper as a post-pass.
+    /// wrapper as a post-pass. `pipe_replant_follows` is that wrapper's verdict on whether
+    /// the post-pass will run at all, which at a **planar** §8.3.4.1 junction is `false`
+    /// even though the cut's `pipe_override` flag is set.
     ///
     /// Returns whether a net was actually tiled. Every out-of-scope ring, degenerate chain
     /// and singular corner map below leaves the junction untouched, and the pipe post-pass
@@ -5159,6 +5188,7 @@ impl LoopMesh {
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
+        pipe_replant_follows: bool,
         segments: u32,
         profile: f32,
         material: i32,
@@ -5180,13 +5210,14 @@ impl LoopMesh {
         // unit-octant grid at `segments ≥ 3`. Every other junction — a valence-`s` (`s ≠ 3`)
         // corner, or an oblique / irregular-ring valence-3 corner (§7.6.6, e.g. a reflex
         // sector whose dihedral fold fails the tri-corner test) — routes to the general
-        // fullness-relaxation grid of (a)–(e), which loopmesh fills at **every smooth**
-        // exponent: the circle (`r = 2`), the straight chord (`r = 1`, the `fullness = 0`
-        // planar specialisation, §8.3.0.2.1) and the whole genuinely curved band on either
-        // side of them. The **pipe** grid (§8.5.5.5(f.6)) is built too — its base grid is
-        // this dispatch, with the cross-section replant applied as a post-pass. Only the
-        // two square sentinels stay unfilled here, the tracked gap spelled out at step 4
-        // below (§8.5.5.5(f.4)/(f.5)).
+        // fullness-relaxation grid of (a)–(e), which loopmesh fills at **every** exponent:
+        // the circle (`r = 2`), the straight chord (`r = 1`, the `fullness = 0` planar
+        // specialisation, §8.3.0.2.1), the whole genuinely curved band on either side of
+        // them, and — step 4 gating on no exponent at all — the two square sentinels.
+        // The **pipe** grid (§8.5.5.5(f.6)) is built too — its base grid is this dispatch,
+        // with the cross-section replant applied as a post-pass. The lone decline is
+        // square-in on a tri-corner-eligible ring, which owes (f.4a)'s weld; see step 4
+        // below.
         // The general fill runs even at `segments = 2`: it subdivides its coarse net once
         // before resampling (§8.5.5.5(d)), so a declined-tri-corner `segments = 2` ring
         // gets the centre-vertex pinwheel cap rather than an unfilled hole. Only
@@ -5208,27 +5239,58 @@ impl LoopMesh {
         }
 
         if !self.adj_tri_corner_trigger(cut, profile) {
-            // §8.5.5.5(f.1) step 4 carries **no exponent gate**: every *smooth* exponent —
-            // the circle, the straight chord, and the whole genuinely curved band between
-            // and beyond them — takes the general fullness grid of (a)–(e). The exponent
-            // enters that grid only twice, and both entries are already exponent-generic:
-            // through the [S]-sampled boundary chains the stencil re-pins against, and
-            // through the (f.3) `fullness` centre seed (law **F3** for a curved `r`). There
-            // is no snap on this fill at all, so nothing here needs a closed form.
+            // §8.5.5.5(f.1) step 4 carries **no exponent gate**: the circle, the straight
+            // chord, and the whole genuinely curved band between and beyond them all take
+            // the general fullness grid of (a)–(e). The exponent enters that grid only
+            // twice, and both entries are already exponent-generic: through the [S]-sampled
+            // boundary chains the stencil re-pins against, and through the (f.3) `fullness`
+            // centre seed. There is no snap on this fill at all, so nothing here needs a
+            // closed form.
             //
-            // The two **square** sentinels stay out as a **tracked gap**, not as a routing
-            // decision. What actually arrives at this predicate is a *square* exponent on
-            // **odd** `segments` at a non-tri-corner ring (step 1 above already consumed
-            // square + `count ≥ 3` + even `segments`, and the tri-corner trigger consumed
-            // the valence-3 square) and *square-in* on a general ring under edge bevel —
-            // and neither is covered by (f.5)'s two constructions (the even-`n`
-            // parallel-offset ring; the valence-3 odd tri-corner squares) or by (f.4a)'s
-            // valence-3 weld. Per (f.1) both should take step 4's grid right here; loopmesh
-            // declines them, and the A/B arms
-            // `bevel_edge_general_ring_square_{in_exponent,exponent_odd_segments}_declines_across_rings`
-            // pin that decline against the reference, which fills. Widening the gate is its
-            // own row and its own cycle.
-            if exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0 {
+            // "No exponent gate" is meant literally, and the two **square** sentinels
+            // arrive here too. Step 1 above consumed square + `count ≥ 3` + even
+            // `segments` (the (f.5) parallel-offset ring) and the tri-corner trigger
+            // consumed the valence-3 square (the (f.5) three flat squares), so what
+            // reaches this point at a square exponent is **odd** `segments` on a
+            // non-tri-corner ring — which (f.5) itself says its lattice never sees
+            // ("not reached on odd `segments` at all") and which therefore belongs to
+            // step 4 like any other ring. Square-in reaches it whenever the corner is
+            // not the (f.4a) weld's, and (f.4b) states that grid outright: the ordinary
+            // (a)–(e) topology with the ring sampled as the concave profile and the
+            // centre seeded by law F3's **negative** fullness. Both fall out of the two
+            // exponent-generic entries above; neither needs a construction of its own.
+            //
+            // Two declines are left, and neither is about step 4's grid.
+            //
+            // (1) Square-in at a corner the tri-corner family owns — step 3's
+            //     `EXP_SQUARE_IN` row, the (f.4a) degenerate weld, whose sectors' chains
+            //     are *identified* pairwise and which has no interior grid at all. That
+            //     is a different object from this one (it deletes the ring quads this
+            //     builds), it is not built yet, and the trigger cannot report it because
+            //     it refuses square-in outright — hence the geometric re-ask.
+            if exponent == 0.0 && self.adj_tri_corner_geometry(cut) {
+                return false;
+            }
+            // (2) Either sentinel at a pipe junction **whose replant will actually run**.
+            //     (f.1) step 2 outranks step 4 there: the grid is built and then re-planted
+            //     onto the constant cross-section (f.6), and that replant resolves each vert
+            //     through (f.2)'s snap — whose sentinel arm is **branch S**, an axis push in
+            //     the clamped unit square plus the (f.6) `land_on_corner` override, keyed on
+            //     the net's own `(i, j, k)` slots. Neither is built
+            //     ([`snap_to_unit_superellipsoid`] carries branches C and R only), and the
+            //     `r`-norm stands in for neither: at `r = 0` its norm diverges and collapses
+            //     the whole cap to a point. Emitting a grid this route would immediately
+            //     mis-place is worse than leaving the junction as it is, so the genuine 3-D
+            //     tube keeps today's decline until branch S lands with the slot walk it needs.
+            //
+            //     The gate is the caller's replant verdict, **not** the §8.3.4.1
+            //     `pipe_override` flag: that predicate is the broader of the two and also
+            //     fires on the flat/planar anti-parallel and wire-disk junctions, where
+            //     `pipe_cross_section` declines and no replant follows. There the base grid
+            //     is already the constant cross-section, correctly placed (§8.5.5.5(f.6)) —
+            //     step 4's grid is not merely acceptable but the right answer — so declining
+            //     it would protect a post-pass that was never going to run.
+            if (exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0) && pipe_replant_follows {
                 return false;
             }
             match segments {
@@ -7314,9 +7376,14 @@ impl LoopMesh {
     /// pointedly does **not** lie on the cube-corner sphere — the positive signal
     /// that the general relaxation path, not the §8.5.1 snap, produced it.
     ///
-    /// Scope (§8.5.5.5): irregular rings, oblique corners, valence `s`, every smooth
-    /// exponent (§8.5.5.5(f.1) step 4 gates on none), equal offsets. The square /
-    /// square-in profile grids stay deferred (§8.5.5.5(f.4)/(f.5)).
+    /// Scope (§8.5.5.5): irregular rings, oblique corners, valence `s`, every exponent
+    /// (§8.5.5.5(f.1) step 4 gates on none — the two square sentinels included, since
+    /// their closed forms belong to the *tri-corner* and even-`segments` routes, not to
+    /// this one), equal offsets. At square-in this is step 4's grid unchanged: same
+    /// topology, ring sampled as the two concave legs, centre seeded by law **F3**'s
+    /// negative fullness. ((f.4b) spells that same construction out, but for *vertex* mode,
+    /// where it is the only square-in route; this builder serves both modes, and in edge
+    /// mode it is reached whenever the (f.4a) weld's ring test declines.)
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_general_nonsymmetric(
         &mut self,
@@ -13235,17 +13302,16 @@ struct JunctionCut {
     /// between this and the next boundvert's reps. Unread at even `segments` (no centre
     /// column) and under vertex bevel (the caller supplies its own next-boundvert reps).
     centre_column_representatives: Vec<FaceTemplate>,
-    /// Whether the original corner cleared the §8.5.1 **dihedral-band** gate (BEVEL.md
-    /// §8.5.1 / §7.6.6): three boundverts, a per-edge signed-dihedral band (no edge folded
-    /// past `3·π/4`, exactly `edgecount − 3` near-flat, signed sum within `π/4` of `3·π/2`).
-    /// Captured here — before the re-stitch consumes the vertex — because by fill time the
-    /// corner's edges and faces are gone. It admits the tri-corner cube-corner cap for an
+    /// The original corner's §8.5.1 **dihedral-band** verdict (BEVEL.md §8.5.1 / §7.6.6):
+    /// the band's raw **total-angle deviation** from `3·π/2`, or `None` on a hard-fail (an
+    /// edge folded past `3·π/4`, or a near-flat count other than `edgecount − 3`). Captured
+    /// here — before the re-stitch consumes the vertex — because by fill time the corner's
+    /// edges and faces are gone. The deviation is carried raw rather than pre-thresholded
+    /// because the window is the *caller's*: it admits the tri-corner cube-corner cap for an
     /// **oblique / absorbed-leg / reflex** corner that the position-only meet-geometry test
-    /// (equal spokes, 60° octant) would decline; the reflex-agnostic split of §7.6.6.
-    dihedral_band_ok: bool,
-    /// The band's raw **total-angle deviation** from `3·π/2` (or `None` on a hard-fail),
-    /// captured alongside `dihedral_band_ok` so a **square** exponent can re-test it against
-    /// the tighter `π/16` window the three-flat-squares grid demands (BEVEL.md §8.5.5.5(f.1)).
+    /// (equal spokes, 60° octant) would decline — the reflex-agnostic split of §7.6.6 — and a
+    /// **square** exponent tests it against the tighter [`TRI_CORNER_BAND_SQUARE`] window the
+    /// three-flat-squares grid demands (§8.5.5.5(f.1)).
     dihedral_band_deviation: Option<f32>,
     /// Whether this junction takes the §8.3.4.1 **pipe override**: a `CUTOFF` ring of 3 or 4
     /// boundverts carrying an exactly anti-parallel opposite pair of beveled spokes (two
@@ -13254,7 +13320,7 @@ struct JunctionCut {
     /// the all-quad adjacency grid (§8.5) over the *cutoff*-configured profile chains instead
     /// of the per-sector cut faces + bottom n-gon. Read from the *original* corner — the
     /// beveled-edge directions and incident-face normals are gone by fill time — so it is
-    /// captured here alongside `dihedral_band_ok`.
+    /// captured here alongside `dihedral_band_deviation`.
     pipe_override: bool,
     /// Per sector `k` (disk order), the **pristine** unit direction of `opening_edges[k]`
     /// out of `vertex` (BEVEL.md §8.5.5.5(f.5)). The square parallel-offset grid's centreline
@@ -21240,10 +21306,15 @@ mod tests {
     /// junction.
     ///
     /// The reachable fixture is a **valence-4 pipe at the square-in sentinel**
-    /// (`profile = 0`, `r = 0`): the tri-corner trigger wants three boundverts and this ring
-    /// has four, and square-in takes a grid of its own (§8.5.5.5(f.4)) that this route does
-    /// not build — so the base declines while the pipe predicate itself still fires. (Until
-    /// the curved general ring landed, `profile = 0.7` reached the same state; it now fills
+    /// (`profile = 0`, `r = 0`). Not because the general ring cannot build a square-in cap —
+    /// step 4 does, at every ring the (f.4a) weld does not own — but because the *replant*
+    /// that would follow it here resolves each vert through (f.2)'s **branch S**, the
+    /// sentinels' axis snap plus (f.6)'s `land_on_corner` override, which loopmesh does not
+    /// have; so the base deliberately declines at either square sentinel on a junction whose
+    /// replant will actually run, rather than hand the post-pass a grid it would mis-place.
+    /// That is the genuine 3-D tube alone — a *planar* §8.3.4.1 pipe replants nothing and
+    /// keeps its grid ([`sentinel_pipe_decline_is_scoped_to_the_three_d_tube`]). (Until the
+    /// curved general ring landed, `profile = 0.7` reached the same state; it now fills
     /// through step 4's fullness grid, so it is no longer a declining fixture.)
     ///
     /// The whole tent is symmetric about `y = 1` and the §8.2.2.1.1 read-back respects that
@@ -21277,6 +21348,98 @@ mod tests {
                         .any(|other| (*other - mirrored).length() < 1.0e-5),
                     "the declined junction's rim keeps the read-back's mirror symmetry; \
                      {position:?} has no partner (segments = {segments})",
+                );
+            }
+        }
+    }
+
+    /// A planar §8.3.4.1 pipe: the flat `spokes`-triangle fan with an anti-parallel opposite
+    /// pair (and, at four spokes, two of them) beveled. Same predicate as the tented tube,
+    /// but the whole junction lies in `z = 0`, so `pipe_cross_section` declines it and no
+    /// (f.6) replant follows.
+    fn planar_fan_pipe_profile(
+        beveled_spokes: &[usize],
+        offset: f32,
+        segments: u32,
+        profile: f32,
+    ) -> LoopMesh {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        let geom: Vec<GeomKey> = beveled_spokes
+            .iter()
+            .map(|&k| mesh.query_edge_exists(centre, rim[k]).expect("spoke").into())
+            .collect();
+        mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                profile,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        mesh
+    }
+
+    /// §8.5.5.5(f.1) step 4 vs (f.6): the square / square-in decline at a pipe exists to keep
+    /// a grid away from a replant that would resolve it through (f.2)'s unbuilt **branch S**.
+    /// So it must be scoped to the junctions that actually replant — the genuine 3-D tube.
+    ///
+    /// The §8.3.4.1 `pipe_override` predicate is the broader of the two: it also fires on the
+    /// **planar** anti-parallel configuration, where the whole junction lies in one plane, the
+    /// base grid already *is* the constant cross-section, and `pipe_cross_section` returns
+    /// `None` so no post-pass runs at all. Declining there protects nothing and drops a cap
+    /// the guide calls correct. The circular control fixes the expected topology: step 4's
+    /// grid is exponent-generic in its counts, so a filled sentinel matches it exactly.
+    ///
+    /// `segments` stays **odd**: the square sentinel on even `segments` is claimed by step 1's
+    /// (f.5) parallel-offset ring before the carve-out is ever consulted, so it would not
+    /// distinguish the two junctions.
+    #[test]
+    fn sentinel_pipe_decline_is_scoped_to_the_three_d_tube() {
+        let offset = 0.2;
+        for segments in [3u32, 5] {
+            for sentinel in [0.0_f32, 0.97] {
+                // Spokes `1/4/7/10` are two anti-parallel pairs (valence 4); `1/7` is one
+                // pair and `4` a transverse passenger (valence 3).
+                for spokes in [&[1usize, 4, 7, 10][..], &[1, 7, 4][..]] {
+                    let control = planar_fan_pipe_profile(spokes, offset, segments, 0.5);
+                    let filled = planar_fan_pipe_profile(spokes, offset, segments, sentinel);
+                    assert_eq!(
+                        (
+                            filled.vert_keys().len(),
+                            filled.edge_keys().len(),
+                            filled.face_keys().len(),
+                        ),
+                        (
+                            control.vert_keys().len(),
+                            control.edge_keys().len(),
+                            control.face_keys().len(),
+                        ),
+                        "the planar pipe keeps step 4's grid at profile {sentinel} \
+                         (spokes {spokes:?}, segments = {segments})",
+                    );
+                }
+
+                let (tube_control, _) = tented_grid_pipe_profile(
+                    &[3, 5, 7, 1],
+                    offset,
+                    segments,
+                    BevelVmeshMethod::Adj,
+                    0.5,
+                );
+                let (tube, _) = tented_grid_pipe_profile(
+                    &[3, 5, 7, 1],
+                    offset,
+                    segments,
+                    BevelVmeshMethod::Adj,
+                    sentinel,
+                );
+                assert!(
+                    tube.face_keys().len() < tube_control.face_keys().len(),
+                    "the 3-D tube still declines at profile {sentinel} (segments = {segments})",
                 );
             }
         }
@@ -26230,7 +26393,6 @@ mod tests {
             centre_column_representatives: Vec::new(),
             // The synthetic cuts carry no real corner, so the band verdict is inert here;
             // the geometry test alone decides these assertions.
-            dihedral_band_ok: false,
             dihedral_band_deviation: None,
             pipe_override: false,
             opening_edge_directions: Vec::new(),
@@ -27317,6 +27479,191 @@ mod tests {
         }
     }
 
+    /// Bevel the three slant edges of a regular triangular cone's apex. A **valence-3** ring
+    /// the §8.5.1 tri-corner test **refuses**: the three legs meet at a shallow, far-from-
+    /// orthonormal corner whose signed dihedral sum sits well outside the `±π/4` window
+    /// around `3·π/2`, so §8.5.5.5(f.1) sends it to step 4's general grid — including its
+    /// square-in arm, which a tri-corner-eligible ring would owe the (f.4a) weld instead.
+    fn tripod_cone_adj(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::new(0.0, 0.0, 2.0));
+        let base: Vec<VertexKey> = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.866, 0.0),
+            Vec3::new(-0.5, -0.866, 0.0),
+        ]
+        .into_iter()
+        .map(|position| mesh.create_vertex(position))
+        .collect();
+        for i in 0..3 {
+            mesh.face_create_verts(&[apex, base[i], base[(i + 1) % 3]], FaceCreateFlags::NONE);
+        }
+        mesh.face_create_verts(&[base[0], base[2], base[1]], FaceCreateFlags::NONE);
+        let slants: Vec<GeomKey> = base
+            .iter()
+            .map(|&b| mesh.query_edge_exists(apex, b).expect("slant edge").into())
+            .collect();
+        let result = mesh.bevel(
+            &slants,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// §8.5.5.5(e)'s parity law over `s` sectors — the count the general grid produces at
+    /// `segments` — as `(faces, verts)` of the whole cap.
+    fn adj_general_ring_parity_counts(sectors: usize, segments: u32) -> (usize, usize) {
+        let half = segments as usize / 2;
+        if segments % 2 == 0 {
+            (
+                sectors * half * half,
+                sectors * (half + 1) * (half + 1) - sectors * (half + 1) + 1,
+            )
+        } else {
+            (
+                sectors * half * half + sectors * half + 1,
+                sectors * (half + 1) * (half + 1),
+            )
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) step 4 gates on **no** exponent, and the **square** sentinel is
+    /// not an exception at a general ring. Step 1 claims the square ring only at *even*
+    /// `segments` (the (f.5) parallel-offset lattice) and step 3 claims the valence-3 square
+    /// (the three flat unit squares), so **odd** `segments` on a general ring reaches step 4 —
+    /// and (f.5) says so from its own side: its lattice "is not reached on odd `segments` at
+    /// all", which leaves the ordinary (a)–(e) grid as the only construction that owns it.
+    ///
+    /// Both parities therefore land §8.5.5.5(e)'s counts, and the even arm is the control that
+    /// attributes the odd arm to step 4 rather than to the exponent: the two routes are
+    /// different constructions (parallel offsets vs fullness relaxation) that agree on
+    /// topology and differ only in placement.
+    #[test]
+    fn adj_general_ring_square_exponent_odd_segments_fills_the_step4_grid() {
+        for profile in [0.95_f32, 0.97] {
+            assert_eq!(
+                profile_to_exponent(profile),
+                PROFILE_SQUARE_EXPONENT,
+                "profile {profile} snaps to the square sentinel (§8.6.2)",
+            );
+            // Odd: the new step-4 arm. Even: step 1's parallel-offset ring, unchanged.
+            for segments in [2u32, 3, 4, 5, 7] {
+                let (mesh, result, sectors) = pyramid_apex_adj(segments, profile);
+                mesh.validate_topology();
+                let (faces, verts) = pyramid_apex_cap(&mesh, &result);
+                assert_eq!(
+                    (faces.len(), verts.len()),
+                    adj_general_ring_parity_counts(sectors, segments),
+                    "cap counts at segments = {segments}, profile = {profile}",
+                );
+                for &face in &faces {
+                    assert_eq!(
+                        mesh.face_vert_keys(face).len(),
+                        4,
+                        "every valence-4 cap face is a quad, the odd centre's `s`-gon included \
+                         (segments = {segments}, profile = {profile})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.4b): **square-in** on a ring the (f.4a) weld does not own is the
+    /// ordinary general grid — same topology as every other exponent's — with the concave
+    /// profile entering through two knobs only: the boundary ring is sampled as the two
+    /// straight legs (§8.6.4), and the centre is seeded by law **F3** at `profile = 0`, which
+    /// is **negative** and so places the coarse centre on the far side of the boundvert
+    /// centroid from `v`.
+    ///
+    /// The sign is what makes the cap a notch, and it is observable the same way the concave
+    /// band's is: the interior leaves the cap's whole **rim** behind, rather than settling
+    /// between its extremes as a zeroed (or clamped) seed would.
+    #[test]
+    fn adj_general_ring_square_in_fills_the_f4b_grid() {
+        assert_eq!(
+            profile_to_exponent(0.0),
+            0.0,
+            "square-in is the `r = 0` sentinel"
+        );
+        for segments in [2u32, 3, 4, 5] {
+            assert!(
+                adj_fullness(0.0, segments) < 0.0,
+                "law F3 at `profile = 0` is negative (segments = {segments})",
+            );
+            let (mesh, result, sectors) = pyramid_apex_adj(segments, 0.0);
+            mesh.validate_topology();
+            let (faces, verts) = pyramid_apex_cap(&mesh, &result);
+            assert_eq!(
+                (faces.len(), verts.len()),
+                adj_general_ring_parity_counts(sectors, segments),
+                "cap counts at segments = {segments}",
+            );
+
+            let interior: std::collections::HashSet<VertexKey> =
+                pyramid_apex_cap_interior(&mesh, &result)
+                    .into_iter()
+                    .collect();
+            assert!(!interior.is_empty(), "the cap has an interior to measure");
+            let (mut rim_low, mut interior_high) = (f32::MAX, f32::MIN);
+            for vertex in verts {
+                let z = mesh.vertex_position(vertex).z;
+                if interior.contains(&vertex) {
+                    interior_high = interior_high.max(z);
+                } else {
+                    rim_low = rim_low.min(z);
+                }
+            }
+            assert!(
+                interior_high < rim_low - 1.0e-3,
+                "the negative fullness notches the whole interior below the rim \
+                 (interior ≤ {interior_high}, rim ≥ {rim_low}, segments = {segments})",
+            );
+        }
+    }
+
+    /// The square-in dispatch splits on the **ring**, not on the exponent (BEVEL.md
+    /// §8.5.5.5(f.1) steps 3 and 4): a valence-3 corner the tri-corner test fires on owes the
+    /// (f.4a) degenerate weld — identified leg chains, no interior grid, at most one central
+    /// `s`-gon — while every other ring owes step 4's grid. The weld is a different object
+    /// from the grid (it *deletes* the ring quads the grid builds), so routing one to the
+    /// other is a whole-mesh count divergence, not a placement one.
+    ///
+    /// loopmesh has the grid and not the weld, so this pins the boundary from both sides: the
+    /// orthonormal cube corner emits no cap at all, and the tripod cone's apex — same
+    /// valence, tri-corner test refused — fills with §8.5.5.5(e)'s counts.
+    #[test]
+    fn adj_square_in_fills_every_ring_the_f4a_weld_does_not_own() {
+        for segments in [2u32, 3] {
+            let (mesh, result) = cube_corner_adj_profile(segments, 0.0);
+            mesh.validate_topology();
+            assert_eq!(
+                curved_corner_grid_faces(&mesh, &result).len(),
+                0,
+                "the tri-corner ring owes the (f.4a) weld, which is not built (segments = \
+                 {segments})",
+            );
+
+            let (cone_mesh, cone) = tripod_cone_adj(segments, 0.0);
+            cone_mesh.validate_topology();
+            // Topological cap selection, not a ball around the corner: the negative
+            // square-in fullness places the interior *past* `v`, so a radius tuned to the
+            // rounded cap's extent would drop the very faces this is counting.
+            let (cap, _) = pyramid_apex_cap(&cone_mesh, &cone);
+            assert_eq!(
+                cap.len(),
+                adj_general_ring_parity_counts(3, segments).0,
+                "the tri-corner-refused ring takes step 4's grid (segments = {segments})",
+            );
+        }
+    }
+
     /// The **square** exponent now fills via the tri-corner family (§8.5.5.5(f.5)'s three flat
     /// unit squares), while **square-in** (`r → 0`, the degenerate weld, (f.4)) is still
     /// declined here. Both are still refused *by the octant grid* — a square exponent must
@@ -27544,7 +27891,6 @@ mod tests {
             central_representative: FaceTemplate::default(),
             sector_representatives: Vec::new(),
             centre_column_representatives: Vec::new(),
-            dihedral_band_ok: false,
             dihedral_band_deviation: None,
             pipe_override: false,
             opening_edge_directions: directions.clone(),
@@ -43644,6 +43990,15 @@ const PROFILE_SQUARE_EXPONENT: f32 = 1.0e4;
 /// Tolerance for snapping the computed exponent onto the special values that
 /// carry closed-form spacing shortcuts (BEVEL.md §8.6.2).
 const PROFILE_EXPONENT_SNAP: f32 = 1.0e-4;
+
+/// How far the corner's signed dihedral sum may sit from `3·π/2` and still take the
+/// §8.5.1 tri-corner family at a **smooth** exponent (BEVEL.md §8.5.5.5(f.1)).
+const TRI_CORNER_BAND_SMOOTH: f32 = std::f32::consts::FRAC_PI_4;
+
+/// The tighter window the **square** sentinel's three flat unit squares demand
+/// (BEVEL.md §8.5.5.5(f.1)/(f.5)): three flat planes visibly kink at an
+/// only-approximately-orthonormal corner, where a curved cap would not.
+const TRI_CORNER_BAND_SQUARE: f32 = std::f32::consts::PI / 16.0;
 
 /// The distance a valence-≥4 terminal's non-`E`-adjacent leg vert slides along its
 /// leg (BEVEL.md §8.3.0.1). The base is the beveled edge's **specified** (unreconciled)
