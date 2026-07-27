@@ -19229,6 +19229,131 @@ mod tests {
         }
     }
 
+    /// BEVEL.md §8.6.4 step 5: a **concave** exponent (`profile < 0.25`) is chord-equalised
+    /// on its reflection through the anti-diagonal `u + v = 1`, and the finished chain is
+    /// pushed back through that reflection before emission. So every emitted sample lies on
+    /// the true superellipse `u^r + v^r = 1` — the working curve, which does not, never
+    /// reaches the ring. The `segments = 4` chain is the guide's worked witness; the
+    /// diagonal sample is `(√profile, √profile)`, not its complement.
+    #[test]
+    fn superellipse_chain_concave_is_un_mapped_onto_the_true_curve() {
+        let profile = 0.1_f32;
+        let r = profile_to_exponent(profile);
+
+        for segments in 2..=7 {
+            let chain = superellipse_chain(profile, segments);
+            for (k, &(u, v)) in chain.iter().enumerate() {
+                assert!(
+                    (u.powf(r) + v.powf(r) - 1.0).abs() < 1.0e-4,
+                    "segments {segments} sample {k} = ({u}, {v}) is off u^r + v^r = 1",
+                );
+            }
+            let chords: Vec<f32> = (0..segments as usize)
+                .map(|k| cell_chord(chain[k], chain[k + 1]))
+                .collect();
+            let spread = chords.iter().cloned().fold(0.0_f32, f32::max)
+                - chords.iter().cloned().fold(f32::INFINITY, f32::min);
+            assert!(spread < 1.0e-4, "segments {segments} chords {chords:?}");
+        }
+
+        let chain = superellipse_chain(profile, 4);
+        for (k, expected) in [
+            (1, (0.09565, 0.62923)),
+            (2, (0.31623, 0.31623)),
+            (3, (0.62923, 0.09565)),
+        ] {
+            assert!(
+                (chain[k].0 - expected.0).abs() < 1.0e-4 && (chain[k].1 - expected.1).abs() < 1.0e-4,
+                "worked witness at k = {k}: got {:?}, want {expected:?}",
+                chain[k],
+            );
+        }
+
+        // The sharpest single test (§8.6.4's fingerprint): at `segments = 2` the lone
+        // interior sample IS the diagonal one, so a missing un-map shows there in closed
+        // form — `√profile` against its complement `1 − √profile`.
+        let sharp = superellipse_chain(profile, 2)[1];
+        let root = profile.sqrt();
+        assert!((sharp.0 - root).abs() < 1.0e-5 && (sharp.1 - root).abs() < 1.0e-5);
+        assert!(
+            (sharp.0 - (1.0 - root)).abs() > 0.3,
+            "not the working-curve crossing",
+        );
+    }
+
+    /// BEVEL.md §8.6.4 (#concave-unmap-fingerprint): `A(u,v) − (u,v) = (1 − u − v)·(1,1)`, so
+    /// the anti-diagonal un-map fixes exactly the chord `u + v = 1` — which a concave profile
+    /// meets only at its two pinned corners. Hence `segments = 1` is the *only* count where
+    /// the un-map is invisible, and every interior sample of every longer chain sits strictly
+    /// inside the chord (so every one of them moves).
+    #[test]
+    fn superellipse_chain_concave_un_map_is_a_fixed_point_only_at_segments_one() {
+        let profile = 0.1_f32;
+        let single = superellipse_chain(profile, 1);
+        assert_eq!(single, vec![(0.0, 1.0), (1.0, 0.0)]);
+        for &corner in single.iter() {
+            assert_eq!(anti_diagonal(corner), corner, "A fixes the ring corners");
+        }
+
+        for segments in 2..=6 {
+            let chain = superellipse_chain(profile, segments);
+            for k in 1..segments as usize {
+                let (u, v) = chain[k];
+                assert!(
+                    u + v < 1.0 - 1.0e-3,
+                    "segments {segments} sample {k} = ({u}, {v}) is off the chord, so it moves",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.6.1 (#not-a-branch): `1 − superellipse_v(1 − u, r)` is the anti-diagonal
+    /// reflection of the superellipse — a *different curve*, not a stability rewrite of it.
+    /// `working_v` is that curve for `r < 1` and the superellipse itself for `r > 1`.
+    #[test]
+    fn working_curve_is_the_anti_diagonal_reflection_below_one() {
+        let r = profile_to_exponent(0.1);
+        assert!(r < 1.0);
+        let u = 0.09565_f32;
+        assert!((superellipse_v(u, r) - 0.62923).abs() < 1.0e-4);
+        assert!((working_v(u, r) - (1.0 - superellipse_v(1.0 - u, r))).abs() < 1.0e-6);
+        // The two disagree by more than half the cell — they are not two spellings of one.
+        assert!((working_v(u, r) - superellipse_v(u, r)).abs() > 0.3);
+
+        // Above the line exponent the solver walks the superellipse itself.
+        let convex = profile_to_exponent(0.7);
+        assert!(convex > 1.0);
+        for u in [0.1_f32, 0.4, 0.75] {
+            assert_eq!(working_v(u, convex), superellipse_v(u, convex));
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(c) (#refinement-consistent-exponents): even-**chord** spacing is
+    /// refinement-consistent at exactly four exponents — line, circle, square, square-in —
+    /// so only there does a stride of the `2m` chain equal a fresh solve at `m`. That is why
+    /// the [V-ADJ] cascade must stride its one doubled chain rather than resample per round,
+    /// and why a circular-only test can never discover the rule.
+    #[test]
+    fn even_chord_spacing_is_refinement_consistent_only_at_the_polyline_exponents() {
+        let stride_matches = |profile: f32| {
+            let dense = superellipse_chain(profile, 8);
+            let coarse = superellipse_chain(profile, 4);
+            (0..=4).all(|k| cell_chord(dense[2 * k], coarse[k]) < 1.0e-5)
+        };
+        for &profile in &[0.25_f32, 0.5, 1.0, 0.0] {
+            assert!(
+                stride_matches(profile),
+                "refinement-consistent at {profile}",
+            );
+        }
+        for &profile in &[0.3_f32, 0.7, 0.9, 0.1] {
+            assert!(
+                !stride_matches(profile),
+                "NOT refinement-consistent at {profile}",
+            );
+        }
+    }
+
     /// BEVEL.md §8.6: `profile = 0.5` (the default) reproduces the §8.3.6 circular
     /// arc sample at the cutoff chain interior — no regression from routing the
     /// chain through the general sampler.
@@ -25841,6 +25966,123 @@ mod tests {
                     .count(),
                 0,
                 "the un-pre-scaled centre is never emitted",
+            );
+        }
+    }
+
+    /// A vertex bevel of the cube's `(1, −1, −1)` corner through the [V-ADJ] general grid —
+    /// the §8.5.5.5(c) symmetry driver. Every result vert is cap.
+    fn cube_corner_vertex_cap(segments: u32, profile: f32) -> Vec<Vec3> {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Vertices,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .collect()
+    }
+
+    /// How far the vert set falls short of being closed under `map`: the worst distance from
+    /// an image back to the nearest member of the set.
+    fn symmetry_defect(verts: &[Vec3], map: impl Fn(Vec3) -> Vec3) -> f32 {
+        verts
+            .iter()
+            .map(|&p| {
+                let image = map(p);
+                verts
+                    .iter()
+                    .map(|&other| (other - image).length())
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// The 3-fold rotation cycling the corner's three axes `+x → −y → −z → +x`, and the
+    /// reflection swapping two of them. Both are exact symmetries of the *input* cube.
+    fn corner_rotation(p: Vec3) -> Vec3 {
+        Vec3::new(-p.z, -p.x, p.y)
+    }
+    fn corner_mirror(p: Vec3) -> Vec3 {
+        Vec3::new(p.x, p.z, p.y)
+    }
+
+    /// BEVEL.md §8.5.5.5(c) (#half-chain-mask): the `(−1/6, +4/3, −1/6)` sharpening tap
+    /// prepares only chain indices `1 ..= N_in/2`. The rest of the chain is the *next*
+    /// sector's `k = 0` column storage (`(i, 0, k) ≡ (i+1, N_in − k, 0)`), which the mask
+    /// pass never writes. The consequence is a grid property, not a curve one, and it is
+    /// the fastest observable there is: the cap of a perfectly symmetric corner comes out
+    /// rotationally symmetric but **not** mirror-symmetric.
+    ///
+    /// The distinction is inert at `N_in = 2` — the coarse chain's lone interior sample sits
+    /// exactly at `k = N_in/2` — so the first round is symmetric and the asymmetry first
+    /// bites in the second (`N_in = 4`, where `k = 3` escapes): invisible at `segments ≤ 4`,
+    /// live from `segments = 5`.
+    #[test]
+    fn adj_cap_half_chain_mask_leaves_the_cap_rotational_but_not_mirror_symmetric() {
+        // One round (N_in = 2): the mask covers the whole chain either way.
+        for profile in [0.5_f32, 0.7] {
+            let verts = cube_corner_vertex_cap(4, profile);
+            assert!(symmetry_defect(&verts, corner_rotation) < 1.0e-5);
+            assert!(
+                symmetry_defect(&verts, corner_mirror) < 1.0e-5,
+                "segments = 4 is inside the mask's inert range",
+            );
+        }
+
+        // Two rounds (segments = 8): `k = 3` of the second round's input chain escapes.
+        let verts = cube_corner_vertex_cap(8, 0.5);
+        assert!(
+            symmetry_defect(&verts, corner_rotation) < 1.0e-5,
+            "the cap stays rotationally symmetric",
+        );
+        assert!(
+            symmetry_defect(&verts, corner_mirror) > 1.0e-3,
+            "the cap is NOT mirror-symmetric; masking the whole chain would make it so",
+        );
+
+        // The guide's witness vertex is present and its mirror image is absent.
+        let witness = Vec3::new(0.97929, -0.98941, -0.87331);
+        let nearest = |target: Vec3| {
+            verts
+                .iter()
+                .map(|&p| (p - target).length())
+                .fold(f32::INFINITY, f32::min)
+        };
+        assert!(nearest(witness) < 1.0e-4, "witness present");
+        assert!(
+            nearest(corner_mirror(witness)) > 1.0e-3,
+            "its mirror absent",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(c): at the three **polyline** exponents the half-vs-whole masking
+    /// choice is inert — at the line every second difference vanishes so the tap itself is
+    /// zero, and at square / square-in the one bending sample sits at `k = N_in/2` and so is
+    /// inside the masked half at every (always even) cascade resolution. The cap is
+    /// therefore fully mirror-symmetric there even at `segments = 8`.
+    ///
+    /// This is not licence to skip the tap at those exponents: the square chains' corner
+    /// sample *is* moved by it.
+    #[test]
+    fn adj_cap_half_chain_mask_is_inert_at_the_polyline_exponents() {
+        for profile in [0.0_f32, 0.25, 1.0] {
+            let verts = cube_corner_vertex_cap(8, profile);
+            assert!(symmetry_defect(&verts, corner_rotation) < 1.0e-5);
+            assert!(
+                symmetry_defect(&verts, corner_mirror) < 1.0e-5,
+                "polyline exponent {profile} keeps the cap mirror-symmetric",
             );
         }
     }
@@ -42228,12 +42470,12 @@ fn custom_fullness_f1(chain: &[(f32, f32)], segments: u32) -> f32 {
 /// doubled_resolution` (§8.5.5.5(c)) and the coarse control net is a read at `m = 2`, so the
 /// distinction is reached on most segment counts.
 ///
-/// It is invisible on the analytic superellipse, whose even-arc-length spacing is
-/// *refinement-consistent* — every other sample of the `2m` chain **is** the `m` chain — so
-/// striding and re-evaluating agree there exactly. A custom chain is not
-/// refinement-consistent: §8.6.3.1(4).1's budget is an integer partition over control
-/// segments recomputed from scratch for each `n`, so halving `n` can move samples onto
-/// entirely different control segments.
+/// The distinction is **not** custom-only. Even-**chord** spacing is refinement-consistent
+/// at exactly four exponents — line, circle, square, square-in — so an analytic chain at any
+/// other exponent is two different chains under the two readings too (§8.5.5.5(c)); a
+/// circular-only suite cannot see it. A custom chain is worse still: §8.6.3.1(4).1's budget
+/// is an integer partition over control segments recomputed from scratch for each `n`, so
+/// halving `n` can move samples onto entirely different control segments.
 ///
 /// Both chains are held in the **widget** frame. The §8.6.3.1(5) axis swap and the (6)
 /// handedness mirror are per-read cell-mapping decisions, while the stride indexes the
@@ -42698,8 +42940,10 @@ fn profile_to_exponent(profile: f32) -> f32 {
 }
 
 /// One quadrant of the superellipse `u^r + v^r = 1` solved for `v` at a given
-/// `u ∈ [0, 1]` (BEVEL.md §8.6.1). The mirror form is used for `r < 1` to keep
-/// the evaluation numerically stable near the endpoints.
+/// `u ∈ [0, 1]` (BEVEL.md §8.6.1). Single-valued and `u ↔ v` symmetric at
+/// **every** `r`; the concave band `r < 1` is no exception and gets no separate
+/// branch here — `1 − superellipse_v(1 − u, r)` is a *different curve* (the
+/// anti-diagonal reflection), and it lives in `working_v` below.
 fn superellipse_v(u: f32, r: f32) -> f32 {
     let u = u.clamp(0.0, 1.0);
     // Square-in sentinel (`r → 0`, BEVEL.md §8.6.1): the curve collapses to the
@@ -42708,11 +42952,31 @@ fn superellipse_v(u: f32, r: f32) -> f32 {
     if r <= 0.0 {
         return if u <= 0.0 { 1.0 } else { 0.0 };
     }
-    if r >= 1.0 {
-        (1.0 - u.powf(r)).max(0.0).powf(1.0 / r)
+    (1.0 - u.powf(r)).max(0.0).powf(1.0 / r)
+}
+
+/// The curve the even-chord solver actually walks (BEVEL.md §8.6.4). For `r > 1`
+/// it is the superellipse itself; for `r < 1` it is the superellipse's reflection
+/// through the **anti-diagonal** `u + v = 1`, whose gradient stays inside
+/// `[−1, 1]` on the solved half where the concave original's does not.
+///
+/// This is a change of coordinates, not a rewrite: everything the solver produces
+/// for `r < 1` is in *working* coordinates and must be pushed back through
+/// [`anti_diagonal`] before it is emitted.
+fn working_v(u: f32, r: f32) -> f32 {
+    if r > 1.0 {
+        superellipse_v(u, r)
     } else {
-        1.0 - (1.0 - (1.0 - u).powf(r)).max(0.0).powf(1.0 / r)
+        1.0 - superellipse_v(1.0 - u, r)
     }
+}
+
+/// The anti-diagonal reflection `A(u, v) = (1 − v, 1 − u)` (BEVEL.md §8.6.4).
+/// An isometry and its own inverse; it fixes both ring corners, so it preserves a
+/// chain's index order — unlike the centre point reflection `(1 − u, 1 − v)`,
+/// which lands on the same curve but reverses the chain end-for-end.
+fn anti_diagonal(point: (f32, f32)) -> (f32, f32) {
+    (1.0 - point.1, 1.0 - point.0)
 }
 
 /// The straight-chord length between two cell points.
@@ -42813,31 +43077,47 @@ fn superellipse_chain_legs(square: bool, segments: u32, chain: &mut [(f32, f32)]
 }
 
 /// The general even-chord spacing solver (BEVEL.md §8.6.4) for exponents without
-/// a closed-form shortcut. A fixed-point chord-equalisation re-walks the curve
-/// placing each next sample a target chord-distance from the previous, then snaps
-/// the result symmetric about the `u = v` diagonal (the diagonal crossing point
-/// `m = (1/2)^(1/r)` becomes the central sample at even `segments`). Writes the
-/// interior `(u_k, v_k)` into `chain[1 ..= segments-1]`.
+/// a closed-form shortcut. Only the half-chain from the start corner up to — but
+/// excluding — the `u = v` diagonal is solved (indices `0 ..= last_solved`); the
+/// second half is its `u = v` mirror and, at even `segments`, the central sample
+/// is the closed-form diagonal crossing `(m, m)`.
+///
+/// Every step runs in **working** coordinates ([`working_v`]): for `r > 1` those
+/// are the real ones, for `r < 1` they are the anti-diagonal reflection. The
+/// finished chain is pushed back through [`anti_diagonal`] in that case, as the
+/// very last act — the `u = v` half-fill happens first, on working coordinates.
+/// Writes the interior `(u_k, v_k)` into `chain[1 ..= segments-1]`.
 fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
     let n = segments as usize;
-    let diagonal = if r > 0.0 { 0.5_f32.powf(1.0 / r) } else { 0.0 };
+    let concave = r < 1.0;
+    // The WORKING curve's `u = v` crossing. `A` fixes that diagonal setwise, so
+    // un-mapping `(m, m)` lands on the real curve's crossing `(1/2)^(1/r)` either
+    // way — but the solver measures its closing chord against the working one.
+    let real_diagonal = 0.5_f32.powf(1.0 / r);
+    let working_diagonal = if concave {
+        1.0 - real_diagonal
+    } else {
+        real_diagonal
+    };
 
-    // Seed: linear spacing in `u` over the whole quadrant (BEVEL.md §8.6.4 step 2;
-    // a deliberately cheap start the equalisation corrects).
-    let mut samples: Vec<(f32, f32)> = (0..=n)
-        .map(|k| {
-            let u = k as f32 / segments as f32;
-            (u, superellipse_v(u, r))
+    // Stop one short of the diagonal sample: at even `segments` index `n/2` IS
+    // `(m, m)`, supplied in closed form and never solved for (BEVEL.md §8.6.4
+    // step 1).
+    let last_solved = n.div_ceil(2) - 1;
+
+    // Seed: linear spacing in `u` over `[0, m]` (BEVEL.md §8.6.4 step 2).
+    let mut samples: Vec<(f32, f32)> = (0..=last_solved)
+        .map(|i| {
+            let u = i as f32 * (2.0 * working_diagonal / segments as f32);
+            (u, working_v(u, r))
         })
         .collect();
     samples[0] = (0.0, 1.0);
-    samples[n] = (1.0, 0.0);
 
-    // Advance from `prev` by chord-distance `target` along the curve toward
-    // `u = 1`: a bracketed search for `u_next` with
-    // `‖(u_next, sev(u_next)) − prev‖ = target` (BEVEL.md §8.6.4 step 3). The
-    // chord grows monotonically with `u`, so a bisection on `[u_prev, 1]` is
-    // robust; if `target` can't be reached the sample clamps to the end corner.
+    // Advance from `prev` by chord-distance `target` along the working curve
+    // toward `u = 1` (BEVEL.md §8.6.4 step 3). The chord grows monotonically with
+    // `u`, so a bisection on `[u_prev, 1]` is robust; if `target` cannot be
+    // reached the sample clamps to the end corner.
     let advance = |prev: (f32, f32), target: f32| -> (f32, f32) {
         if cell_chord((1.0, 0.0), prev) <= target {
             return (1.0, 0.0);
@@ -42846,52 +43126,72 @@ fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
         let mut hi = 1.0_f32;
         for _ in 0..60 {
             let mid = 0.5 * (lo + hi);
-            if cell_chord((mid, superellipse_v(mid, r)), prev) > target {
+            if cell_chord((mid, working_v(mid, r)), prev) > target {
                 hi = mid;
             } else {
                 lo = mid;
             }
         }
         let u = 0.5 * (lo + hi);
-        (u, superellipse_v(u, r))
+        (u, working_v(u, r))
     };
 
-    // Fixed-point equalisation: average the current chords, re-walk at that
-    // target, repeat until the chord spread is negligible (BEVEL.md §8.6.4
-    // step 3/4).
-    for _ in 0..64 {
-        let target = (0..n)
-            .map(|k| cell_chord(samples[k], samples[k + 1]))
-            .sum::<f32>()
-            / segments as f32;
-        let mut next = samples.clone();
-        for k in 1..n {
-            next[k] = advance(next[k - 1], target);
-        }
-        next[0] = (0.0, 1.0);
-        next[n] = (1.0, 0.0);
-
-        let mut spread = 0.0_f32;
-        for k in 0..n {
-            spread = spread.max((cell_chord(next[k], next[k + 1]) - target).abs());
-        }
-        samples = next;
-        if spread < 1.0e-7 {
+    // Fixed-point equalisation over the solved half, capped at 10 sweeps
+    // (BEVEL.md §8.6.4 step 4). The closing term ties the last solved sample to
+    // the diagonal: the whole chord to `(m, m)` at even `segments`, and at odd
+    // `segments` the perpendicular distance to `u = v` — half the straddling
+    // chord, so that at convergence the straddle itself matches `target_chord`.
+    for _ in 0..10 {
+        let last = samples[last_solved];
+        let closing = if n % 2 == 0 {
+            cell_chord((working_diagonal, working_diagonal), last)
+        } else {
+            (last.1 - last.0).abs() * std::f32::consts::FRAC_1_SQRT_2
+        };
+        if last_solved == 0 {
             break;
         }
-    }
+        let interior: Vec<f32> = (0..last_solved)
+            .map(|i| cell_chord(samples[i], samples[i + 1]))
+            .collect();
+        let chord_count = if n % 2 == 0 {
+            last_solved as f32 + 1.0
+        } else {
+            last_solved as f32 + 0.5
+        };
+        let target_chord = (interior.iter().sum::<f32>() + closing) / chord_count;
 
-    // Snap exactly symmetric about `u = v` (BEVEL.md §8.6.4 step 1/5): the second
-    // half is the reflection of the first; the exact centre (even `segments`) is
-    // the diagonal crossing `(m, m)`.
-    for k in 1..n {
-        if 2 * k > n {
-            samples[k] = (samples[n - k].1, samples[n - k].0);
-        } else if 2 * k == n {
-            samples[k] = (diagonal, diagonal);
+        // The spread is taken over the INTERIOR chords only — the ones this sweep
+        // measured, before the re-walk equalises them by construction — while
+        // `target_chord` is the average that also carries the closing term. That
+        // asymmetry is the whole content of the test (BEVEL.md §8.6.4 step 4).
+        let converged = interior
+            .iter()
+            .all(|d| (d - target_chord).abs() < 1.0e-7);
+        if converged {
+            break;
+        }
+
+        for i in 1..=last_solved {
+            samples[i] = advance(samples[i - 1], target_chord);
         }
     }
-    chain[1..n].copy_from_slice(&samples[1..n]);
+
+    let mut full = vec![(0.0_f32, 0.0_f32); n + 1];
+    full[..=last_solved].copy_from_slice(&samples);
+    for i in 0..=last_solved {
+        full[n - i] = (samples[i].1, samples[i].0);
+    }
+    if n % 2 == 0 {
+        full[n / 2] = (working_diagonal, working_diagonal);
+    }
+
+    if concave {
+        for point in full.iter_mut() {
+            *point = anti_diagonal(*point);
+        }
+    }
+    chain[1..n].copy_from_slice(&full[1..n]);
 }
 
 /// The point on the first line (`p0 + t·d0`) nearest the second line
@@ -43793,17 +44093,30 @@ impl AdjNet {
     /// discrete Laplacian is subtracted, so each sample is pulled a sixth *away* from the
     /// mean of its two chain neighbours. It touches only what the interior relaxes
     /// against; the boundary the net stores, and the rim the fill emits, are never masked.
+    ///
+    /// **The tap reaches only the FIRST HALF of each chain** — indices `1 ..= half`, where
+    /// `half = N_in/2` at this round's *input* resolution (§8.5.5.5(c)). That bound is a
+    /// property of the net's **storage**, not of the profile: only `k ≤ half` lives in
+    /// sector `i`'s own `j = 0` row, while `k > half` is the same slot as sector `i + 1`'s
+    /// `k = 0` column (`(i, 0, k) ≡ (i+1, N_in − k, 0)`), which this pass never writes. So
+    /// the finished cap is rotationally symmetric but **not** mirror-symmetric, even on a
+    /// perfectly symmetric corner — masking the whole chain gives a prettier, wrong answer.
+    /// Inert at `half == 1`, where the lone interior sample already sits at `k = half`.
+    ///
+    /// Every tap reads the round's unmodified input chain and writes elsewhere (a Jacobi
+    /// sweep): with the masked range a contiguous run, an ascending in-place update would
+    /// compound the sharpening along it.
     fn sharpened(&self) -> AdjNet {
         // §8.5.5.5(c): "A custom profile is not masked at all" — the chain feeds the
         // interior stencil verbatim, so the sharpening three-tap is suppressed.
         if !self.mask_boundary {
             return self.clone();
         }
+        let half = self.half;
         let mut input = self.clone();
         for chain in input.chains.iter_mut() {
             let raw = chain.clone();
-            let last = raw.len() - 1;
-            for k in 1..last {
+            for k in 1..=half {
                 chain[k] = raw[k] - (1.0 / 6.0) * (raw[k - 1] + raw[k + 1] - 2.0 * raw[k]);
             }
         }
@@ -43962,6 +44275,14 @@ fn adj_interior_axis(
 /// — **at least once, even at `segments = 2`** — until the chain resolution reaches
 /// `next power of two ≥ max(4, segments)`, re-pinning each round's boundary from the ring
 /// chains' own profiles at that round's resolution.
+///
+/// **Each round's boundary is an index stride of the ONE chain built at
+/// `doubled_resolution`, never a fresh sampler call at the round's own resolution**
+/// (§8.5.5.5(c) / §8.6.3.1(4).4). Even-chord spacing is refinement-consistent at exactly
+/// four exponents — line, circle, square, square-in — so on any other exponent the two
+/// readings are different chains, and only the stride is the operator's. Every cascade
+/// resolution divides `doubled_resolution`, so the stride is exact and nothing is
+/// interpolated.
 fn adj_relaxed_net(
     boundverts: &[Vec3],
     mids: &[Vec3],
@@ -43975,11 +44296,20 @@ fn adj_relaxed_net(
     // — no sharpening tap. The analytic superellipse chains are masked.
     let mask_boundary = !profiles.iter().any(RingChainProfile::is_custom);
     let mut net = AdjNet::coarse(boundverts, mids, centre, mask_boundary);
+    let source: Vec<Vec<Vec3>> = profiles
+        .iter()
+        .map(|profile| profile.raw_positions(target))
+        .collect();
     while (2 * net.half as u32) < target {
         let resolution = 4 * net.half as u32;
-        let next_chains = profiles
+        let stride = (target / resolution) as usize;
+        let next_chains = source
             .iter()
-            .map(|profile| profile.raw_positions(resolution))
+            .map(|chain| {
+                (0..=resolution as usize)
+                    .map(|k| chain[k * stride])
+                    .collect()
+            })
             .collect();
         net = net.subdivide(next_chains, gamma_s);
     }
@@ -44155,3 +44485,4 @@ fn intersect_line_plane(
     let t = (plane_point - point).dot(plane_normal) / denominator;
     Some(point + direction * t)
 }
+
