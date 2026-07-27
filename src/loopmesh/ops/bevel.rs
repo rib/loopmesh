@@ -33610,6 +33610,43 @@ mod tests {
         }
     }
 
+    /// BEVEL.md §8.6.3.1(4).1: the leftover budget goes to the **sharpest** control segments
+    /// first (descending `turn`), not the flattest. Pinned on the guide's mirror pair of
+    /// all-auto four-point nets, whose per-segment allotments are quoted from the guide's
+    /// worked table — the mirror is what makes this conclusive: "lowest index wins" would
+    /// explain EARLY_TURN alone, "highest index wins" LATE_TURN alone, and the inverted
+    /// measure (`π − turn`) gets both backwards.
+    #[test]
+    fn custom_profile_leftover_budget_goes_to_the_sharpest_control_segment() {
+        let allotments = |net: &[(f32, f32)], n: usize| -> Vec<usize> {
+            let profile = BevelCurveProfile::from_points(
+                &net.iter()
+                    .map(|&(x, y)| (x, y, BevelHandle::Auto))
+                    .collect::<Vec<_>>(),
+            );
+            let handles = profile.resolved_handles();
+            distribute_budget(&profile.points, &handles, n)
+        };
+        let late_turn = [(1.0, 0.0), (0.85, 0.10), (0.20, 0.35), (0.0, 1.0)];
+        let early_turn = [(1.0, 0.0), (0.35, 0.20), (0.10, 0.85), (0.0, 1.0)];
+
+        assert_eq!(allotments(&late_turn, 3), vec![1, 1, 1], "no remainder to rank");
+        assert_eq!(allotments(&early_turn, 3), vec![1, 1, 1], "no remainder to rank");
+
+        // One leftover advance: it lands on the sharpest segment, which is the *last* one
+        // for LATE_TURN — so a winner of index 0 here is the inverted measure.
+        assert_eq!(allotments(&late_turn, 4), vec![1, 1, 2]);
+        assert_eq!(allotments(&early_turn, 4), vec![2, 1, 1]);
+
+        // Two leftover advances: sharpest, then next-sharpest.
+        assert_eq!(allotments(&late_turn, 5), vec![1, 2, 2]);
+        assert_eq!(allotments(&early_turn, 5), vec![2, 2, 1]);
+
+        // The `n < E` branch ranks the same way: the single advance goes to the sharpest.
+        assert_eq!(allotments(&late_turn, 1), vec![0, 0, 1]);
+        assert_eq!(allotments(&early_turn, 1), vec![1, 0, 0]);
+    }
+
     /// BEVEL.md §8.6.3.1(6) the handedness rule: for an asymmetric control net the `reverse`
     /// bit mirrors every interior sample across the cell diagonal `u = v` and reverses index
     /// order, so the classic `0.375` ↔ `0.625` flip appears. The two endpoints stay pinned.
@@ -41550,27 +41587,36 @@ fn distribute_budget(
     }
     let is_curved = |s: usize| all_curved || curved[s];
 
-    // Curvature per segment: the angle between the two bordering inward handle directions
-    // (BEVEL.md §8.6.3.1(4)) — used only to hand out the leftover remainder.
-    let curvature = |s: usize| -> f32 {
+    // Turn magnitude per segment (BEVEL.md §8.6.3.1(4).1) — used only to rank the leftover
+    // remainder. Both tangents point the way the curve travels along the segment: departure
+    // runs from the start point to its right handle, arrival runs from the end point's left
+    // handle *into* the end point. Taken that way a straight chord scores ≈ 0 and a sharper
+    // bend scores larger, up to π; heading the arrival at the handle instead inverts the
+    // whole ranking (it yields exactly π − turn on every segment).
+    let turn = |s: usize| -> f32 {
         let start = (points[s].x, points[s].y);
         let end = (points[s + 1].x, points[s + 1].y);
-        let d1 = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
-        let d2 = (handles[s + 1].left.0 - end.0, handles[s + 1].left.1 - end.1);
-        let l1 = (d1.0 * d1.0 + d1.1 * d1.1).sqrt();
-        let l2 = (d2.0 * d2.0 + d2.1 * d2.1).sqrt();
-        if l1 == 0.0 || l2 == 0.0 {
+        let departure = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
+        let arrival = (end.0 - handles[s + 1].left.0, end.1 - handles[s + 1].left.1);
+        let departure_length =
+            (departure.0 * departure.0 + departure.1 * departure.1).sqrt();
+        let arrival_length = (arrival.0 * arrival.0 + arrival.1 * arrival.1).sqrt();
+        if departure_length == 0.0 || arrival_length == 0.0 {
             return 0.0;
         }
-        ((d1.0 * d2.0 + d1.1 * d2.1) / (l1 * l2)).clamp(-1.0, 1.0).acos()
+        ((departure.0 * arrival.0 + departure.1 * arrival.1)
+            / (departure_length * arrival_length))
+            .clamp(-1.0, 1.0)
+            .acos()
     };
 
-    // Curved segments ranked most-curved first (ties by lower index) — the order the
-    // leftover remainder is handed out in.
+    // Curved segments ranked sharpest-first (descending `turn`) — the order the leftover
+    // remainder is handed out in. Equal-`turn` order is left undefined by §8.6.3.1(4).1, so
+    // the index fallback below is arbitrary, not a parity claim.
     let mut ranked: Vec<usize> = (0..segment_count).filter(|&s| is_curved(s)).collect();
     ranked.sort_by(|&a, &b| {
-        curvature(b)
-            .partial_cmp(&curvature(a))
+        turn(b)
+            .partial_cmp(&turn(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
