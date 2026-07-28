@@ -2039,6 +2039,8 @@ impl LoopMesh {
                 central_representative,
                 apex_blend.as_ref(),
                 Some(&interior_blend),
+                // Vertex mode never reaches the §8.3.4.1 pipe test, so nothing reads the walk.
+                &mut AdjNetSlots::off(),
                 &mut result,
             );
         }
@@ -4962,18 +4964,22 @@ impl LoopMesh {
     ///
     /// Step 2's domain being the net's slots also decides what happens when step 1 declines:
     /// no net, no slots, so **neither** replant half runs. That case is not exotic — a
-    /// degenerate chain, a singular corner map, the square-in weld's ring, or either square
-    /// sentinel at a junction this wrapper *would* have replanted
-    /// ([`Self::build_adj_fill_base`]) all reach it — and the rim half is the one that
-    /// matters there, since those verts are shared with the arriving strips and moving them
-    /// with no cap to justify it distorts the junction.
+    /// degenerate chain, a singular corner map, or the square-in weld's ring all reach it —
+    /// and the rim half is the one that matters there, since those verts are shared with the
+    /// arriving strips and moving them with no cap to justify it distorts the junction.
     ///
     /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`), and so
     /// is the axis; the cross-section shape is the pipe boundvert's own profile, read back
-    /// off its chain. The base is told whether the replant will resolve verts **through the
-    /// station cell** — which a planar junction never does, since there the projected control
-    /// triple is collinear at every station and the placement is (f.6) step 4's chord clamp.
-    /// The sentinel decline is keyed on that narrower verdict, not on the flag.
+    /// off its chain.
+    ///
+    /// **One junction the pipe test does not get.** (f.1) tests its four steps *in order*, and
+    /// the order is load-bearing: a square profile at a pipe corner satisfies both the square
+    /// and the pipe test, and the square grid wins. So step 1's parallel-offset ring
+    /// ([`adj_square_ring_claims`]) is asked here, before the pipe, and a junction it claims
+    /// never enters step 2 at all — its (f.5) grid stands with no post-pass over it. That
+    /// verdict is computed once, up front, rather than left to the step-1 branch inside the
+    /// base dispatch, so the replant and the routing cannot disagree about which grid is being
+    /// built.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill(
         &mut self,
@@ -4996,7 +5002,14 @@ impl LoopMesh {
         // identity on a circular profile (the cross-section never leaves the band) and moves
         // real verts on a concave one, so "flat ⇒ the replant is inert" holds only for the
         // former and is not a reason to decline.
-        let pipe = if cut.pipe_override {
+        //
+        // (f.1) step 1 is asked first and outranks the pipe test: a square profile at a pipe
+        // corner satisfies both, and the square grid wins, so the (f.5) parallel-offset ring is
+        // never post-passed. One verdict serves both the routing and the replant.
+        let exponent = profile_to_exponent(profile);
+        let pipe = if cut.pipe_override
+            && !adj_square_ring_claims(exponent, cut.boundverts.len(), segments)
+        {
             self.pipe_cross_section(cut, chains)
         } else {
             None
@@ -5007,17 +5020,24 @@ impl LoopMesh {
         // slot with `j >= 1` *and* `k >= 1`, already deduplicated by the grid's canon map.
         // That is only half the replant's domain: the canonical block's `k = 0` column is a
         // ring chain, reached below.
+        //
+        // The slot walk (f.6.1) asks an implementation to drive the replant off is recorded
+        // only when one will actually run, so every other junction pays a branch per interior
+        // vert and no allocation.
         let interior_start = result.verts.len();
+        let mut slots = match pipe {
+            Some(_) => AdjNetSlots::recording(),
+            None => AdjNetSlots::off(),
+        };
         let net_emitted = self.build_adj_fill_base(
             cut,
             chains,
-            pipe.is_some_and(|cross_section| {
-                cross_section.placement == StationPlacement::Cell
-            }),
+            pipe.is_some(),
             segments,
             profile,
             material,
             templates,
+            &mut slots,
             result,
         );
         let Some(pipe) = pipe else {
@@ -5032,12 +5052,30 @@ impl LoopMesh {
         if !net_emitted {
             return;
         }
-        let exponent = profile_to_exponent(profile);
+        debug_assert_eq!(
+            slots.len(),
+            result.verts.len() - interior_start,
+            "the slot walk and the minted interior verts must stay in step",
+        );
         for index in interior_start..result.verts.len() {
             let vertex = result.verts[index];
             let base = self.vertex_position(vertex);
-            let replanted =
-                pipe_cross_section_replant(base, pipe.axis, &pipe.cell, pipe.placement, exponent);
+            // §8.5.5.5(f.6.1): the `land_on_corner` override is a property of the vert's
+            // canonical net slot, so it needs the walk's own `(i, j, k)` and not the mint
+            // order it happens to arrive in.
+            let land_on_corner = slots
+                .slot(index - interior_start)
+                .is_some_and(|slot| {
+                    pipe_replant_lands_on_corner(slot, segments as usize, pipe.sectors)
+                });
+            let replanted = pipe_cross_section_replant(
+                base,
+                pipe.axis,
+                &pipe.cell,
+                pipe.placement,
+                exponent,
+                land_on_corner,
+            );
             self.set_vertex_position(vertex, replanted);
         }
         self.replant_pipe_rim_window(cut, chains, segments as usize, &pipe, exponent);
@@ -5093,12 +5131,16 @@ impl LoopMesh {
                     continue;
                 };
                 let base = self.vertex_position(vertex);
+                // Every slot this half reaches sits in the net's `k = 0` column, and
+                // §8.5.5.5(f.6.1)'s `land_on_corner` rule wants `k = ⌊n/2⌋` — which `k = 0`
+                // is not at any `segments ≥ 2`. So the rim never lands on the corner.
                 let replanted = pipe_cross_section_replant(
                     base,
                     pipe.axis,
                     &pipe.cell,
                     pipe.placement,
                     exponent,
+                    false,
                 );
                 self.set_vertex_position(vertex, replanted);
             }
@@ -5138,7 +5180,7 @@ impl LoopMesh {
     ) -> Option<PipeCrossSection> {
         // The spoke scan indexes the directions; its answer indexes the edges.
         debug_assert_eq!(cut.opening_edges.len(), cut.opening_edge_directions.len());
-        let (pipe_edge_index, _collinear_opposite) =
+        let (pipe_edge_index, collinear_opposite) =
             pipe_boundvert_spokes(&cut.opening_edge_directions)?;
         let axis = cut.opening_edge_directions[pipe_edge_index].normalize_or_zero();
         let pipe_edge = cut.opening_edges[pipe_edge_index];
@@ -5147,10 +5189,16 @@ impl LoopMesh {
             .filter(|chain| chain.endpoint == cut.vertex)
             .find(|chain| chain.edge == pipe_edge)
             .and_then(|chain| chain.cell)?;
+        // The **two pipe boundverts** §8.5.5.5(f.6.1)'s `land_on_corner` rule names: the pair
+        // whose own edges are the collinear spokes. A boundvert's own edge closes its sector,
+        // so each sector index is one ring step behind its edge index.
+        let count = cut.opening_edge_directions.len();
+        let sector_of = |edge_index: usize| (edge_index + count - 1) % count;
         Some(PipeCrossSection {
             axis,
             cell,
             placement: pipe_station_placement(axis, &cell),
+            sectors: (sector_of(pipe_edge_index), sector_of(collinear_opposite)),
         })
     }
 
@@ -5178,17 +5226,16 @@ impl LoopMesh {
     /// gate, so the two square sentinels take that grid there as well (a square exponent
     /// on **odd** `segments`, which (f.5)'s lattice never sees, and square-in on any ring
     /// the (f.4a) weld does not own). The square grids of (f.5) keep their own routes
-    /// (step 1's parallel-offset ring, the tri-corner three squares). Two junctions are
+    /// (step 1's parallel-offset ring, the tri-corner three squares). One junction is
     /// still declined: square-in at a tri-corner-eligible corner, whose fill is (f.4a)'s
-    /// degenerate weld, and either square sentinel where `pipe_replant_follows` — see
-    /// step 4's comment below.
+    /// degenerate weld — and `pipe_claims_junction` exempts it, because (f.1) tests the pipe
+    /// at step 2, one step *before* the row that weld belongs to.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
-    /// dispatch — with the cross-section replant applied by the [`Self::build_adj_fill`]
-    /// wrapper as a post-pass. `pipe_cell_replant_follows` is that wrapper's verdict on
-    /// whether the post-pass will resolve verts through a **station cell**, which at a
-    /// **planar** §8.3.4.1 junction is `false` even though the replant runs there: its
-    /// projected control triple is collinear at every station, so the placement is (f.6)
-    /// step 4's chord clamp and (f.2)'s snap is never reached.
+    /// dispatch, including the tri-corner shortcut, so a valence-3 pipe's base is the octant
+    /// grid or (f.5)'s three squares rather than the fullness grid — with the cross-section
+    /// replant applied by the [`Self::build_adj_fill`] wrapper as a post-pass at **every**
+    /// exponent, the two sentinels included: the wrapper resolves each vert through (f.2)'s
+    /// branch S there.
     ///
     /// Returns whether a net was actually tiled. Every out-of-scope ring, degenerate chain
     /// and singular corner map below leaves the junction untouched, and the pipe post-pass
@@ -5198,11 +5245,12 @@ impl LoopMesh {
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
-        pipe_cell_replant_follows: bool,
+        pipe_claims_junction: bool,
         segments: u32,
         profile: f32,
         material: i32,
         templates: &TemplateBank,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let count = cut.boundverts.len();
@@ -5241,10 +5289,9 @@ impl LoopMesh {
         // squares below (its even-`n` weld is unreachable, (f.5)'s blockquote). With no outer
         // miter in scope the boundvert count equals the beveled-edge count, so it gates the
         // ring here. Odd `segments` and custom profiles fall through.
-        if exponent == PROFILE_SQUARE_EXPONENT && count >= 3 && segments >= 2 && segments % 2 == 0
-        {
+        if adj_square_ring_claims(exponent, count, segments) {
             return self.build_adj_fill_square_ring(
-                cut, chains, segments, profile, material, templates, result,
+                cut, chains, segments, profile, material, templates, slots, result,
             );
         }
 
@@ -5270,47 +5317,32 @@ impl LoopMesh {
             // centre seeded by law F3's **negative** fullness. Both fall out of the two
             // exponent-generic entries above; neither needs a construction of its own.
             //
-            // Two declines are left, and neither is about step 4's grid.
+            // One decline is left, and it is not about step 4's grid: square-in at a corner
+            // the tri-corner family owns — step 3's `EXP_SQUARE_IN` row, the (f.4a)
+            // degenerate weld, whose sectors' chains are *identified* pairwise and which has
+            // no interior grid at all. That is a different object from this one (it deletes
+            // the ring quads this builds), it is not built yet, and the trigger cannot report
+            // it because it refuses square-in outright — hence the geometric re-ask.
             //
-            // (1) Square-in at a corner the tri-corner family owns — step 3's
-            //     `EXP_SQUARE_IN` row, the (f.4a) degenerate weld, whose sectors' chains
-            //     are *identified* pairwise and which has no interior grid at all. That
-            //     is a different object from this one (it deletes the ring quads this
-            //     builds), it is not built yet, and the trigger cannot report it because
-            //     it refuses square-in outright — hence the geometric re-ask.
-            if exponent == 0.0 && self.adj_tri_corner_geometry(cut) {
-                return false;
-            }
-            // (2) Either sentinel at a pipe junction **whose replant will build a station
-            //     cell**.
-            //     (f.1) step 2 outranks step 4 there: the grid is built and then re-planted
-            //     onto the constant cross-section (f.6), and that replant resolves each vert
-            //     through (f.2)'s snap — whose sentinel arm is **branch S**, an axis push in
-            //     the clamped unit square plus the (f.6) `land_on_corner` override, keyed on
-            //     the net's own `(i, j, k)` slots. Neither is built
-            //     ([`snap_to_unit_superellipsoid`] carries branches C and R only), and the
-            //     `r`-norm stands in for neither: at `r = 0` its norm diverges and collapses
-            //     the whole cap to a point. Emitting a grid this route would immediately
-            //     mis-place is worse than leaving the junction as it is, so the genuine 3-D
-            //     tube keeps today's decline until branch S lands with the slot walk it needs.
+            // A **pipe** junction is exempt, and that is dispatch order rather than leniency:
+            // step 2 is tested before step 3, so a pipe never reaches the weld's row at all.
+            // What it builds instead is the grid step 4 would have built *including step 4's
+            // own tri-corner shortcut* — and that shortcut excludes square-in explicitly, so a
+            // valence-3 square-in tube lands on the ordinary (a)–(e) grid and is then
+            // re-planted onto its constant cross-section.
             //
-            //     The gate is the caller's *cell*-path verdict, and it is narrower than both
-            //     the §8.3.4.1 `pipe_override` flag and "a replant follows". A **planar**
-            //     junction replants too, but its projected control triple is collinear at
-            //     every station, so (f.6) step 4's chord clamp places every vert and the
-            //     unbuilt branch S is never reached. Declining there would drop step 4's grid
-            //     — which is the right base for that clamp — to protect a snap that was never
-            //     going to be called.
-            if (exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0)
-                && pipe_cell_replant_follows
-            {
+            // A pipe at either **square** sentinel is likewise no longer declined: the replant
+            // now has the branch it needs — (f.2)'s branch S, the axis push in the clamped unit
+            // square plus the `land_on_corner` override keyed on the net's own `(i, j, k)`
+            // slots — where before it would have resolved through a divergent `r`-norm.
+            if exponent == 0.0 && !pipe_claims_junction && self.adj_tri_corner_geometry(cut) {
                 return false;
             }
             match segments {
                 0 | 1 => return false,
                 _ => {
                     return self.build_adj_fill_general_nonsymmetric(
-                        cut, chains, segments, profile, material, templates, result,
+                        cut, chains, segments, profile, material, templates, slots, result,
                     );
                 }
             }
@@ -5330,11 +5362,11 @@ impl LoopMesh {
                 // above — so it always leaves the central-triangle hole the odd centre fills.
                 if exponent == PROFILE_SQUARE_EXPONENT {
                     return self.build_adj_fill_square_tricorner(
-                        cut, chains, segments, profile, material, templates, result,
+                        cut, chains, segments, profile, material, templates, slots, result,
                     );
                 }
                 return self.build_adj_fill_octant(
-                    cut, chains, segments, profile, material, templates, result,
+                    cut, chains, segments, profile, material, templates, slots, result,
                 );
             }
         }
@@ -5378,13 +5410,14 @@ impl LoopMesh {
                         for k in 0..count {
                             let arc_mid =
                                 (UNIT_AXES[k] + UNIT_AXES[(k + 1) % count]).normalize();
-                            let placed =
-                                octant.to_world(snap_to_unit_superellipsoid(arc_mid, exponent));
+                            let placed = octant
+                                .to_world(snap_to_unit_superellipsoid(arc_mid, exponent, false));
                             self.set_vertex_position(interior_of_sector[k], placed);
                         }
                         Some(octant.to_world(snap_to_unit_superellipsoid(
                             Vec3::splat((1.0_f32 / 3.0).sqrt()),
                             exponent,
+                            false,
                         )))
                     }
                     // A degenerate four-point map cannot build the cube-corner cap; fall back
@@ -5452,6 +5485,10 @@ impl LoopMesh {
         // §5.2.4: not yet minted from the corner.
         let apex = self.create_vertex(apex_position);
         result.verts.push(apex);
+        // The pinwheel's one interior vert is the net's welded apex `(0, 1, 1)` — the
+        // `segments = 2` instance of §8.5.2's canonical `(0, h, h)`. Recording it keeps the
+        // slot walk aligned with `result.verts` on this closed-form path too.
+        slots.record((0, 1, 1));
 
         // §8.5.3: one pinwheel quad per sector, all sharing the apex. Sector i's
         // quad is B_i → (i,0,1) → apex → (i−1,0,1).
@@ -6702,6 +6739,7 @@ impl LoopMesh {
             // defaults.
             None,
             None,
+            &mut AdjNetSlots::off(),
             result,
         );
     }
@@ -6793,6 +6831,8 @@ impl LoopMesh {
             central_representative,
             None,
             None,
+            // A miter ring is not a §8.3.4.1 pipe, so no post-pass reads the slot walk.
+            &mut AdjNetSlots::off(),
             result,
         );
     }
@@ -6833,6 +6873,7 @@ impl LoopMesh {
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let sectors = chain_of.len();
@@ -6929,6 +6970,7 @@ impl LoopMesh {
                 central_representative,
                 apex_blend,
                 interior_blend,
+                slots,
                 result,
             );
             return true;
@@ -6984,6 +7026,7 @@ impl LoopMesh {
             central_representative,
             apex_blend,
             interior_blend,
+            slots,
             result,
         );
         true
@@ -7046,6 +7089,7 @@ impl LoopMesh {
         profile: f32,
         material: i32,
         templates: &TemplateBank,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let sectors = cut.boundverts.len(); // 3 (guarded by the caller)
@@ -7085,7 +7129,7 @@ impl LoopMesh {
         for chain in &chain_of {
             for &sample in chain.iter().take(seg).skip(1) {
                 let unit = octant.to_octant(self.vertex_position(sample));
-                let snapped = octant.to_world(snap_to_unit_superellipsoid(unit, exponent));
+                let snapped = octant.to_world(snap_to_unit_superellipsoid(unit, exponent, false));
                 self.set_vertex_position(sample, snapped);
             }
         }
@@ -7141,6 +7185,7 @@ impl LoopMesh {
             // apex and interior are the isomorphism-invariant closed forms of §8.5.5.5(f.2).
             None,
             None,
+            slots,
             result,
         );
         true
@@ -7197,6 +7242,7 @@ impl LoopMesh {
         profile: f32,
         material: i32,
         templates: &TemplateBank,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let sectors = cut.boundverts.len();
@@ -7289,6 +7335,7 @@ impl LoopMesh {
             central_representative,
             None,
             None,
+            slots,
             result,
         );
         true
@@ -7312,6 +7359,7 @@ impl LoopMesh {
         profile: f32,
         material: i32,
         templates: &TemplateBank,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let _ = profile;
@@ -7355,6 +7403,7 @@ impl LoopMesh {
             central_representative,
             None,
             None,
+            slots,
             result,
         );
         true
@@ -7406,6 +7455,7 @@ impl LoopMesh {
         profile: f32,
         material: i32,
         templates: &TemplateBank,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> bool {
         let sectors = cut.boundverts.len();
@@ -7468,6 +7518,7 @@ impl LoopMesh {
             // defaults.
             None,
             None,
+            slots,
             result,
         )
     }
@@ -7493,6 +7544,7 @@ impl LoopMesh {
         central_representative: FaceTemplateRef<'_>,
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) {
         debug_assert_eq!(
@@ -7517,7 +7569,7 @@ impl LoopMesh {
                 for cell_k in 0..half {
                     let a = self.adj_grid_vert(
                         i, cell_j, cell_k, half, seg, sectors, even, chain_of, interior, apex_blend,
-                        interior_blend, &mut grid, result,
+                        interior_blend, &mut grid, slots, result,
                     );
                     let b = self.adj_grid_vert(
                         i,
@@ -7532,6 +7584,7 @@ impl LoopMesh {
                         apex_blend,
                         interior_blend,
                         &mut grid,
+                        slots,
                         result,
                     );
                     let c = self.adj_grid_vert(
@@ -7547,6 +7600,7 @@ impl LoopMesh {
                         apex_blend,
                         interior_blend,
                         &mut grid,
+                        slots,
                         result,
                     );
                     let d = self.adj_grid_vert(
@@ -7562,6 +7616,7 @@ impl LoopMesh {
                         apex_blend,
                         interior_blend,
                         &mut grid,
+                        slots,
                         result,
                     );
                     self.emit_patch_face(
@@ -7596,11 +7651,11 @@ impl LoopMesh {
             for r in 0..=half {
                 column.push(self.adj_grid_vert(
                     i, r, half, half, seg, sectors, even, chain_of, interior, apex_blend,
-                    interior_blend, &mut grid, result,
+                    interior_blend, &mut grid, slots, result,
                 ));
                 row.push(self.adj_grid_vert(
                     next, half, r, half, seg, sectors, even, chain_of, interior, apex_blend,
-                    interior_blend, &mut grid, result,
+                    interior_blend, &mut grid, slots, result,
                 ));
             }
             for r in 0..half {
@@ -7618,7 +7673,7 @@ impl LoopMesh {
         for i in 0..sectors {
             central.push(self.adj_grid_vert(
                 i, half, half, half, seg, sectors, even, chain_of, interior, apex_blend,
-                interior_blend, &mut grid, result,
+                interior_blend, &mut grid, slots, result,
             ));
         }
         // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
@@ -7650,6 +7705,7 @@ impl LoopMesh {
         apex_blend: Option<&ApexBlend>,
         interior_blend: Option<&AdjInteriorBlend<'_>>,
         grid: &mut std::collections::HashMap<(usize, usize, usize), VertexKey>,
+        slots: &mut AdjNetSlots,
         result: &mut BevelResult,
     ) -> VertexKey {
         // `j = 0` is the chain `i` boundary (from `B_i`); `k = 0` is the chain
@@ -7713,6 +7769,7 @@ impl LoopMesh {
             },
         };
         result.verts.push(vertex);
+        slots.record(canon);
         grid.insert(canon, vertex);
         vertex
     }
@@ -21649,6 +21706,7 @@ mod tests {
             cell,
             pipe_station_placement(pipe_axis, cell),
             exponent,
+            false,
         )
     }
 
@@ -22128,17 +22186,21 @@ mod tests {
     /// order of magnitude looser than the replant's own degeneracy floor, so a junction wobbling
     /// out of plane by (say) `3e-4` of its size was classified planar — the sentinel let a
     /// square-in grid through — while every station's own test found a cell and ran the snap.
-    /// At `profile = 0` that is not a small mis-placement: the snap's `r`-norm diverges and the
-    /// whole cap collapses onto the cell's `(0, 0)` corner.
     ///
-    /// The ladder straddles the floor (`REPLANT_CELL_SHAPE_RATIO`, `1e-4` of the cell's extent)
-    /// and the probe is far out of the chord's span, so the two branches answer differently:
-    /// the chord clamps the probe to the band edge, the cell path at `r = 0` sends it to the
-    /// projected `start' + end' − mid'` corner, which for this cell is the band's *centre*.
+    /// The ladder straddles the floor (`REPLANT_CELL_SHAPE_RATIO`, `1e-4` of the cell's extent).
+    /// The probe sits **inside** the chord's span and off the square-in walls, which is the only
+    /// place the two branches disagree at `r = 0`: the chord is the identity there, while
+    /// (f.2)'s branch S pushes the probe onto the nearer of the two cell edges through the
+    /// `(0, 0)` corner. Outside the span they agree by construction — those walls end at the
+    /// chord's own endpoints — so a probe far out of the band cannot see the seam at all.
+    ///
+    /// The probe's cell coordinates are `(u, v) = (0.25, 0.75)`: `u` is the nearer wall, so
+    /// branch S sends it to `(0, 0.75)`, a quarter of the way from `start'` toward the corner,
+    /// at transverse `0.15` against the chord's identity `0.10`.
     #[test]
     fn pipe_station_placement_is_the_branch_the_replant_takes() {
         let offset = 0.2;
-        let probe = Vec3::new(-4.0 * offset, -0.0667, 0.0);
+        let probe = Vec3::new(0.5 * offset, -0.0667, 0.0);
         let mut seen_chord = false;
         let mut seen_cell = false;
         for wobble in [0.0_f32, 1.0e-6, 1.0e-5, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 0.1] {
@@ -22149,17 +22211,17 @@ mod tests {
                 StationPlacement::Chord => {
                     seen_chord = true;
                     assert!(
-                        (replanted.x + offset).abs() < 1.0e-6,
-                        "wobble {wobble} was classified chord but the replant did not clamp \
-                         to the band edge: {replanted:?}",
+                        (replanted.x - 0.5 * offset).abs() < 1.0e-6,
+                        "wobble {wobble} was classified chord but the replant moved a probe \
+                         already inside the chord's span: {replanted:?}",
                     );
                 }
                 StationPlacement::Cell => {
                     seen_cell = true;
                     assert!(
-                        replanted.x.abs() < 1.0e-6,
-                        "wobble {wobble} was classified cell but the replant did not take the \
-                         `r = 0` corner: {replanted:?}",
+                        (replanted.x - 0.75 * offset).abs() < 1.0e-6,
+                        "wobble {wobble} was classified cell but the replant did not take \
+                         branch S's nearer square-in wall: {replanted:?}",
                     );
                 }
                 StationPlacement::Point => panic!("the cross-section spans the band"),
@@ -22300,6 +22362,139 @@ mod tests {
         );
     }
 
+    /// §8.5.5.5(f.6.1)'s `land_on_corner` rule, as the slot predicate it is stated as: for
+    /// **even** `segments`, the canonical slots with `k = ⌊n/2⌋` that either sit in one of the
+    /// two pipe boundverts' sectors or sit at `(i = 0, j = ⌊n/2⌋)` — the welded apex. Odd
+    /// `segments` set it nowhere.
+    ///
+    /// The three neighbouring readings all differ on this table: gating on `j` instead of `k`
+    /// swaps the seam column for the ring row, dropping the parity test fires the rule on the
+    /// odd cap's central `s`-gon corners, and dropping the sector test admits the whole
+    /// `k = ⌊n/2⌋` column instead of two sectors' worth of it.
+    #[test]
+    fn pipe_replant_lands_on_corner_is_the_even_half_slot_rule() {
+        // Sectors 0 and 2 are the pipe boundverts' (a valence-4 ring with the collinear pair
+        // opposite each other); 1 and 3 are transverse.
+        let pipe = (0usize, 2usize);
+
+        // Odd `segments` never set it, anywhere on the net.
+        for segments in [3usize, 5, 7] {
+            let half = segments / 2;
+            for sector in 0..4 {
+                for ring in 0..=half {
+                    for along in 0..=half {
+                        assert!(
+                            !pipe_replant_lands_on_corner((sector, ring, along), segments, pipe),
+                            "odd `segments` set the flag at ({sector}, {ring}, {along})",
+                        );
+                    }
+                }
+            }
+        }
+
+        for segments in [2usize, 4, 6, 8] {
+            let half = segments / 2;
+            for sector in 0..4 {
+                for ring in 1..=half {
+                    for along in 0..=half {
+                        let expected = along == half
+                            && (sector == pipe.0
+                                || sector == pipe.1
+                                || (sector == 0 && ring == half));
+                        assert_eq!(
+                            pipe_replant_lands_on_corner((sector, ring, along), segments, pipe),
+                            expected,
+                            "the flag at ({sector}, {ring}, {along}), segments = {segments}",
+                        );
+                    }
+                }
+            }
+            // The apex `(0, h, h)` is in, whichever sector the pipe boundverts fell on...
+            assert!(pipe_replant_lands_on_corner((0, half, half), segments, (1, 3)));
+            // ...and a transverse sector's own `k = h` column is out.
+            if half >= 2 {
+                assert!(!pipe_replant_lands_on_corner((1, 1, half), segments, pipe));
+                assert!(pipe_replant_lands_on_corner((2, 1, half), segments, pipe));
+            }
+        }
+    }
+
+    /// §8.5.5.5(f.6) step 3 at the two sentinels: the replant resolves each vert through
+    /// (f.2)'s **branch S**, so a 3-D tube's cap lands on the square cross-section's walls —
+    /// and on its corner where `land_on_corner` says so.
+    ///
+    /// The cell is the quarter cross-section of `pipe_replant_snaps_interior_onto_cross_section`
+    /// (`start = (0,1,0)`, `end = (0,0,1)`, `mid = (0,1,1)`, pipe axis `x`), whose cell frame is
+    /// exactly the `y–z` unit square: `(1,1)` is `mid`, `(1,0)` is `end`, `(0,1)` is `start` and
+    /// `(0,0)` is the corner `start + end − mid`, the origin. The probe at cell coordinates
+    /// `(u, v) = (0.3, 0.8)` therefore has a hand-checkable image under each of the four
+    /// combinations, and the station `x = 5` survives all four.
+    #[test]
+    fn pipe_replant_sentinel_cross_section_lands_on_the_cell_walls() {
+        let cell = ProfileCell::from_control_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        );
+        let probe = Vec3::new(5.0, 0.8, 0.3);
+        assert_eq!(
+            pipe_station_placement(Vec3::X, &cell),
+            StationPlacement::Cell,
+            "the tube's projected control triple spans a cell",
+        );
+        let replant = |exponent: f32, corner: bool| {
+            pipe_cross_section_replant(
+                probe,
+                Vec3::X,
+                &cell,
+                StationPlacement::Cell,
+                exponent,
+                corner,
+            )
+        };
+        let square = PROFILE_SQUARE_EXPONENT;
+        let square_in = 0.0_f32;
+
+        // `square`: `v = 0.8` is the nearer of the two outer walls, so the probe rides out to
+        // `v = 1` — the cell edge `start–mid` — keeping `u`.
+        let wall = replant(square, false);
+        assert!(
+            (wall - Vec3::new(5.0, 1.0, 0.3)).length() < 1.0e-6,
+            "square pushes onto the nearer outer wall: {wall:?}",
+        );
+        // ...and `land_on_corner` takes it all the way to the cell's `(1, 1)` corner, `mid`.
+        let corner = replant(square, true);
+        assert!(
+            (corner - Vec3::new(5.0, 1.0, 1.0)).length() < 1.0e-6,
+            "square + `land_on_corner` lands on `mid`: {corner:?}",
+        );
+
+        // `square-in`: the walls are the other pair, so `u = 0.3` is the nearer one and the
+        // probe drops onto the cell edge `corner–start`.
+        let inner_wall = replant(square_in, false);
+        assert!(
+            (inner_wall - Vec3::new(5.0, 0.8, 0.0)).length() < 1.0e-6,
+            "square-in pushes onto the nearer inner wall: {inner_wall:?}",
+        );
+        // ...and the override lands on `start + end − mid`, here the cross-section's own origin.
+        let inner_corner = replant(square_in, true);
+        assert!(
+            (inner_corner - Vec3::new(5.0, 0.0, 0.0)).length() < 1.0e-6,
+            "square-in + `land_on_corner` lands on `start + end − mid`: {inner_corner:?}",
+        );
+
+        // Not a norm: the `r`-norm reading would send both sentinels to the same place (the
+        // `r = 0` one to the origin for *every* vert), and the four images above are distinct.
+        for (left, right) in [
+            (wall, corner),
+            (wall, inner_wall),
+            (corner, inner_corner),
+            (inner_wall, inner_corner),
+        ] {
+            assert!((left - right).length() > 0.1, "{left:?} vs {right:?}");
+        }
+    }
+
     /// §8.5.5.5(f.6.1): the replant's rim window is the strict **second half** of every
     /// ring chain, `⌊n/2⌋ + 1 ..= n − 1`, with the same index range at both parities — the
     /// guide's derived table. Empty at `segments <= 2`; never an endpoint (those are the
@@ -22420,56 +22615,211 @@ mod tests {
         }
     }
 
-    /// §8.5.5.5(f.6): step 2 walks **the net's** canonical slots, so a pipe junction whose
-    /// base dispatch (step 1) declined to tile anything has no slots at all and *neither*
-    /// replant half may run. The rim half is the one with teeth: those samples are shared
-    /// with the arriving strips, and moving them with no cap emitted just distorts the
-    /// junction.
+    /// §8.5.5.5(f.6.1): the `land_on_corner` override, read off the finished mesh.
     ///
-    /// The reachable fixture is a **valence-4 pipe at the square-in sentinel**
-    /// (`profile = 0`, `r = 0`). Not because the general ring cannot build a square-in cap —
-    /// step 4 does, at every ring the (f.4a) weld does not own — but because the *replant*
-    /// that would follow it here resolves each vert through (f.2)'s **branch S**, the
-    /// sentinels' axis snap plus (f.6)'s `land_on_corner` override, which loopmesh does not
-    /// have; so the base deliberately declines at either square sentinel on a junction whose
-    /// replant will actually run, rather than hand the post-pass a grid it would mis-place.
-    /// That is the genuine 3-D tube alone — a *planar* §8.3.4.1 pipe replants nothing and
-    /// keeps its grid ([`sentinel_pipe_decline_is_scoped_to_the_three_d_tube`]). (Until the
-    /// curved general ring landed, `profile = 0.7` reached the same state; it now fills
-    /// through step 4's fullness grid, so it is no longer a declining fixture.)
+    /// At a **square-in** exponent the profile degenerates onto the two cell edges through
+    /// §8.2.2.1's `(0, 0)` corner `start + end − mid`, so branch S's two walls are those edges
+    /// and their meeting point is that corner. On the tented tube the corner has a name: the
+    /// two cross-section legs are the offset skirts, `mid` is the ridge point, and
+    /// `start' + end' − mid'` is the **cross-section cylinder's own axis** — the ridge point
+    /// reflected through the chord's midpoint, at `offset·√2` below it. So a slot that lands on
+    /// the corner lands *exactly on the tube axis*, and a slot that lands on a wall does not.
     ///
-    /// The whole tent is symmetric about `y = 1` and the §8.2.2.1.1 read-back respects that
-    /// mirror; the replant is exactly what breaks it (the ladder above counts the breaks). So
-    /// "every vert still has its mirror partner" is the statement that the rim sits precisely
-    /// where the read-back left it.
+    /// The rule is `k = ⌊n/2⌋` **and even `segments`**, in one of the two pipe boundverts'
+    /// sectors or at the welded apex `(0, ⌊n/2⌋, ⌊n/2⌋)`. Counting the canonical interior slots
+    /// that satisfy it gives `2·(⌊n/2⌋ − 1) + 1` — two sectors' worth of the `k = ⌊n/2⌋` column
+    /// (`j = 1 … ⌊n/2⌋ − 1`) plus the apex — and **zero** at odd `segments`. That ladder is what
+    /// this asserts, and it separates the flag from every neighbouring reading: computing it at
+    /// both parities gives `⌊n/2⌋`-many extra hits at odd counts, dropping the sector test gives
+    /// `s·(⌊n/2⌋ − 1) + 1`, and dropping the flag altogether gives none at all.
+    ///
+    /// The count is taken **strictly inside the two pipe boundverts' stations**, because the
+    /// chains crossing the pipe edges put their own `n/2` sample on the corner at those two
+    /// stations at every even count, replant or no replant, and the tube's two far terminal
+    /// caps sit on the axis as well.
     #[test]
-    fn declined_pipe_base_leaves_the_rim_where_the_read_back_put_it() {
+    fn pipe_square_in_tube_lands_the_corner_slots_on_the_cross_section_axis() {
         let offset = 0.2;
-        for segments in [3u32, 5] {
-            let (filled, _) =
-                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.5);
-            let (declined, _) =
-                tented_grid_pipe_profile(&[3, 5, 7, 1], offset, segments, BevelVmeshMethod::Adj, 0.0);
-            assert!(
-                declined.face_keys().len() < filled.face_keys().len(),
-                "the square-in general ring emits no cap, so the base declined \
-                 (segments = {segments})",
-            );
-
-            let positions: Vec<Vec3> = declined
-                .vert_keys()
-                .into_iter()
-                .map(|vertex| declined.vertex_position(vertex))
-                .collect();
-            for position in &positions {
-                let mirrored = Vec3::new(position.x, 2.0 - position.y, position.z);
-                assert!(
-                    positions
-                        .iter()
-                        .any(|other| (*other - mirrored).length() < 1.0e-5),
-                    "the declined junction's rim keeps the read-back's mirror symmetry; \
-                     {position:?} has no partner (segments = {segments})",
+        // (spokes, the pipe boundverts' own station offset from the junction).
+        for (spokes, station) in [(&[3usize, 5, 7][..], 0.1_f32), (&[3, 5, 7, 1][..], 0.2)] {
+            for segments in 2..=8u32 {
+                let (mesh, result) =
+                    tented_grid_pipe_profile(spokes, offset, segments, BevelVmeshMethod::Adj, 0.0);
+                let on_axis: Vec<Vec3> = result
+                    .verts
+                    .iter()
+                    .map(|&vertex| mesh.vertex_position(vertex))
+                    .filter(|position| (position.x - 1.0).abs() < station - 1.0e-4)
+                    .filter(|position| tented_pipe_cyl_distance(*position, offset) < 1.0e-5)
+                    .collect();
+                let half = segments as usize / 2;
+                let expected = if segments % 2 == 0 {
+                    2 * (half - 1) + 1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    on_axis.len(),
+                    expected,
+                    "corner-override slots on the tube axis (spokes {spokes:?}, \
+                     segments = {segments})",
                 );
+                // *Which* two sectors, not merely how many. The two pipe boundverts' `k = h`
+                // columns run **along** the tube, so their slots sit at distinct stations
+                // straddling the junction, and only the welded apex is at the junction's own.
+                // Naming the transverse sectors instead — the same count, one ring step away —
+                // collapses every one of them onto the junction's station.
+                let at_junction_station = on_axis
+                    .iter()
+                    .filter(|position| (position.x - 1.0).abs() < 1.0e-5)
+                    .count();
+                assert_eq!(
+                    at_junction_station,
+                    expected.min(1),
+                    "only the welded apex sits at the junction's own station \
+                     (spokes {spokes:?}, segments = {segments})",
+                );
+                for position in &on_axis {
+                    let mirrored = Vec3::new(2.0 - position.x, position.y, position.z);
+                    assert!(
+                        on_axis
+                            .iter()
+                            .any(|other| (*other - mirrored).length() < 1.0e-5),
+                        "the corner slots straddle the junction symmetrically; {position:?} \
+                         has no partner (spokes {spokes:?}, segments = {segments})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// §8.5.5.5(f.1) step 1 vs step 2 — the dispatch order, as a predicate.
+    ///
+    /// A square profile at a pipe corner satisfies **both** tests, and the square grid wins: a
+    /// junction step 1 claims never enters step 2, so no (f.6) post-pass runs over its
+    /// parallel-offset grid. The gate is the exponent, at least three beveled edges (which,
+    /// with no outer miter in scope, is the boundvert count) and an even `segments ≥ 2`.
+    ///
+    /// This is pinned as a predicate rather than off a mesh on purpose. Branch S is very nearly
+    /// **idempotent** on the (f.5) lattice — that grid already lies on the square cross-section,
+    /// and the corner slots already sit at the cell's `(1, 1)` corner — so suppressing the
+    /// post-pass moves the tented tube's verts by roughly one ulp. The ordering is real and the
+    /// guide states it; it is simply not observable in a position comparison here.
+    #[test]
+    fn square_ring_outranks_the_pipe_test_at_an_even_segment_count() {
+        let square = PROFILE_SQUARE_EXPONENT;
+        let square_in = 0.0_f32;
+        let circle = 2.0_f32;
+        assert!(adj_square_ring_claims(square, 3, 2));
+        assert!(adj_square_ring_claims(square, 4, 8));
+        // Odd `segments` falls through to the pipe, and so does the square-in sentinel and
+        // every smooth exponent.
+        assert!(!adj_square_ring_claims(square, 4, 3));
+        assert!(!adj_square_ring_claims(square, 4, 0));
+        assert!(!adj_square_ring_claims(square_in, 4, 4));
+        assert!(!adj_square_ring_claims(circle, 4, 4));
+        // A two-boundvert ring is not the (f.5) ring's, whatever the parity.
+        assert!(!adj_square_ring_claims(square, 2, 4));
+
+        // The grid the claim routes to survives: (f.5)'s even-`n` parallel-offset ring welds its
+        // innermost vert at the corner `v` exactly, which the tented tube's junction puts at
+        // `(1, 1, 1)`.
+        for segments in [2u32, 4, 6] {
+            let (mesh, _result) = tented_grid_pipe_profile(
+                &[3, 5, 7, 1],
+                0.2,
+                segments,
+                BevelVmeshMethod::Adj,
+                0.97,
+            );
+            assert!(
+                mesh_holds_position(&mesh, Vec3::new(1.0, 1.0, 1.0)),
+                "the (f.5) ring's even-`n` weld keeps `v` at segments = {segments}",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.1) step 2 + (f.2) branch S: the genuine 3-D tube **fills** at both square
+    /// sentinels. It used to decline — the base refused to hand a grid to a replant that had no
+    /// sentinel branch to resolve it with — and branch S is what removes that refusal.
+    ///
+    /// The census is the statement: step 4's grid (and step 1's ring, and the tri-corner
+    /// squares) are exponent-generic in their counts, so a filled sentinel matches the circular
+    /// control exactly, `V` for `V`. Positions are not: the sentinel caps are a different shape
+    /// from the circular one and from each other, which is what keeps the census claim from
+    /// being satisfiable by a backend that silently fell back to the circle.
+    ///
+    /// The planar §8.3.4.1 pipe is carried alongside as the contrast that always held: it takes
+    /// (f.6) step 4's chord clamp at every station, never reaches branch S, and keeps step 4's
+    /// grid at every exponent.
+    #[test]
+    fn pipe_sentinel_tube_retiles_instead_of_declining() {
+        let offset = 0.2;
+        for sentinel in [0.0_f32, 0.97] {
+            for spokes in [&[3usize, 5, 7][..], &[3, 5, 7, 1][..]] {
+                for segments in 2..=8u32 {
+                    let (control, _) = tented_grid_pipe_profile(
+                        spokes,
+                        offset,
+                        segments,
+                        BevelVmeshMethod::Adj,
+                        0.5,
+                    );
+                    let (tube, _) = tented_grid_pipe_profile(
+                        spokes,
+                        offset,
+                        segments,
+                        BevelVmeshMethod::Adj,
+                        sentinel,
+                    );
+                    assert_eq!(
+                        (
+                            tube.vert_keys().len(),
+                            tube.edge_keys().len(),
+                            tube.face_keys().len(),
+                        ),
+                        (
+                            control.vert_keys().len(),
+                            control.edge_keys().len(),
+                            control.face_keys().len(),
+                        ),
+                        "the 3-D tube fills at profile {sentinel} (spokes {spokes:?}, \
+                         segments = {segments})",
+                    );
+                    // Non-vacuity: the sentinel cap is a different object from the circular one.
+                    let moved = tube.vert_keys().into_iter().any(|vertex| {
+                        !mesh_holds_position(&control, tube.vertex_position(vertex))
+                    });
+                    assert!(
+                        moved,
+                        "the sentinel cap differs from the circular control at profile \
+                         {sentinel} (spokes {spokes:?}, segments = {segments})",
+                    );
+                }
+            }
+        }
+
+        // The planar pipe never reached branch S and never declined; it still matches.
+        for segments in [3u32, 5] {
+            for sentinel in [0.0_f32, 0.97] {
+                for spokes in [&[1usize, 4, 7, 10][..], &[1, 7, 4][..]] {
+                    let control = planar_fan_pipe_profile(spokes, offset, segments, 0.5);
+                    let filled = planar_fan_pipe_profile(spokes, offset, segments, sentinel);
+                    assert_eq!(
+                        (
+                            filled.vert_keys().len(),
+                            filled.edge_keys().len(),
+                            filled.face_keys().len(),
+                        ),
+                        (
+                            control.vert_keys().len(),
+                            control.edge_keys().len(),
+                            control.face_keys().len(),
+                        ),
+                        "the planar pipe keeps step 4's grid at profile {sentinel} \
+                         (spokes {spokes:?}, segments = {segments})",
+                    );
+                }
             }
         }
     }
@@ -22502,70 +22852,6 @@ mod tests {
         );
         mesh.validate_topology();
         mesh
-    }
-
-    /// §8.5.5.5(f.1) step 4 vs (f.6): the square / square-in decline at a pipe exists to keep
-    /// a grid away from a replant that would resolve it through (f.2)'s unbuilt **branch S**.
-    /// So it must be scoped to the junctions that actually replant — the genuine 3-D tube.
-    ///
-    /// The §8.3.4.1 `pipe_override` predicate is the broader of the two, and so is "a replant
-    /// follows": the **planar** anti-parallel configuration replants too, but its profile
-    /// plane contains the pipe axis, so the projected control triple is collinear at every
-    /// station and (f.6) step 4's chord clamp places every vert with no cell — hence no
-    /// branch S — in sight. Declining there protects nothing and drops the very grid the
-    /// clamp is applied to. The circular control fixes the expected topology: step 4's grid
-    /// is exponent-generic in its counts, so a filled sentinel matches it exactly (the clamp
-    /// moves verts, never counts — [`planar_pipe_square_in_clamps_the_replant_window`]).
-    ///
-    /// `segments` stays **odd**: the square sentinel on even `segments` is claimed by step 1's
-    /// (f.5) parallel-offset ring before the carve-out is ever consulted, so it would not
-    /// distinguish the two junctions.
-    #[test]
-    fn sentinel_pipe_decline_is_scoped_to_the_three_d_tube() {
-        let offset = 0.2;
-        for segments in [3u32, 5] {
-            for sentinel in [0.0_f32, 0.97] {
-                // Spokes `1/4/7/10` are two anti-parallel pairs (valence 4); `1/7` is one
-                // pair and `4` a transverse passenger (valence 3).
-                for spokes in [&[1usize, 4, 7, 10][..], &[1, 7, 4][..]] {
-                    let control = planar_fan_pipe_profile(spokes, offset, segments, 0.5);
-                    let filled = planar_fan_pipe_profile(spokes, offset, segments, sentinel);
-                    assert_eq!(
-                        (
-                            filled.vert_keys().len(),
-                            filled.edge_keys().len(),
-                            filled.face_keys().len(),
-                        ),
-                        (
-                            control.vert_keys().len(),
-                            control.edge_keys().len(),
-                            control.face_keys().len(),
-                        ),
-                        "the planar pipe keeps step 4's grid at profile {sentinel} \
-                         (spokes {spokes:?}, segments = {segments})",
-                    );
-                }
-
-                let (tube_control, _) = tented_grid_pipe_profile(
-                    &[3, 5, 7, 1],
-                    offset,
-                    segments,
-                    BevelVmeshMethod::Adj,
-                    0.5,
-                );
-                let (tube, _) = tented_grid_pipe_profile(
-                    &[3, 5, 7, 1],
-                    offset,
-                    segments,
-                    BevelVmeshMethod::Adj,
-                    sentinel,
-                );
-                assert!(
-                    tube.face_keys().len() < tube_control.face_keys().len(),
-                    "the 3-D tube still declines at profile {sentinel} (segments = {segments})",
-                );
-            }
-        }
     }
 
     /// Whether `mesh` carries a vertex at `position`, to the `1e-5` position quantum.
@@ -22738,7 +23024,7 @@ mod tests {
                     for j in 1..=last_j {
                         emitter.insert(mesh.adj_grid_vert(
                             i, j, 0, half, segments, sectors, even, &chain_of, &interior, None,
-                            None, &mut grid, &mut result,
+                            None, &mut grid, &mut AdjNetSlots::off(), &mut result,
                         ));
                     }
                 }
@@ -28347,14 +28633,14 @@ mod tests {
     fn adj_octant_snap_branches_on_the_exponent() {
         let overshoot = Vec3::new(0.9, 0.5, -0.02);
 
-        let circular = snap_to_unit_superellipsoid(overshoot, 2.0);
+        let circular = snap_to_unit_superellipsoid(overshoot, 2.0, false);
         assert!((circular.length() - 1.0).abs() < 1.0e-6, "unit-norm");
         assert!(
             circular.z < 0.0,
             "the circular branch keeps the negative component"
         );
 
-        let curved = snap_to_unit_superellipsoid(overshoot, profile_to_exponent(0.7));
+        let curved = snap_to_unit_superellipsoid(overshoot, profile_to_exponent(0.7), false);
         assert!(
             curved.is_finite(),
             "the curved branch clamps rather than NaN-ing"
@@ -28366,7 +28652,67 @@ mod tests {
 
         // A point already on the surface is a fixed point of either branch.
         let on_surface = Vec3::splat(3.0_f32.powf(-1.0 / exponent));
-        assert!((snap_to_unit_superellipsoid(on_surface, exponent) - on_surface).length() < 1.0e-6);
+        assert!(
+            (snap_to_unit_superellipsoid(on_surface, exponent, false) - on_surface).length()
+                < 1.0e-6
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(f.2) **branch S** — the sentinels' axis snap, which is not a norm and
+    /// is not a limit of branch R.
+    ///
+    /// The rule is stated in the *clamped unit square*: clamp both in-plane coordinates into
+    /// `[0, 1]`, then push onto the **nearer** of the two walls the sentinel names — `u == 1` /
+    /// `v == 1` at `square` (the profile bulges out to the cell's `(1, 1)` corner), `u == 0` /
+    /// `v == 0` at `square-in` (it bows away, onto the cell edges through the `(0, 0)` corner).
+    /// `land_on_corner` overrides that choice and lands on **both** walls at once; without it a
+    /// pipe's square cross-section folds into a wedge.
+    ///
+    /// Two things the branch must *not* do, both checked here: it must not reach for the
+    /// `r`-norm (at `r = 0` that diverges and collapses the whole cross-section to a point, and
+    /// at `r = 1e4` every `a^r` overflows or flushes in `f32`), and it must leave the other two
+    /// branches' `land_on_corner` handling alone — the flag exists for this branch only.
+    #[test]
+    fn superellipsoid_snap_sentinel_branch_pushes_onto_the_nearer_wall() {
+        let square = PROFILE_SQUARE_EXPONENT;
+        let square_in = 0.0_f32;
+        let snap = |u: f32, v: f32, exponent: f32, corner: bool| {
+            snap_to_unit_superellipsoid(Vec3::new(u, v, 0.0), exponent, corner)
+        };
+
+        // `square`: the nearer of `u == 1` / `v == 1`.
+        assert_eq!(snap(0.8, 0.3, square, false), Vec3::new(1.0, 0.3, 0.0));
+        assert_eq!(snap(0.3, 0.8, square, false), Vec3::new(0.3, 1.0, 0.0));
+        // `square-in`: the nearer of `u == 0` / `v == 0` — the other pair, not the same one.
+        assert_eq!(snap(0.3, 0.8, square_in, false), Vec3::new(0.0, 0.8, 0.0));
+        assert_eq!(snap(0.8, 0.3, square_in, false), Vec3::new(0.8, 0.0, 0.0));
+
+        // `land_on_corner` takes both walls, at either sentinel.
+        assert_eq!(snap(0.8, 0.3, square, true), Vec3::new(1.0, 1.0, 0.0));
+        assert_eq!(snap(0.3, 0.8, square_in, true), Vec3::ZERO);
+
+        // The clamp runs first, so a coordinate outside the cell is folded onto the square's
+        // own edge before the walls are compared — never raised to a power.
+        assert_eq!(snap(-0.3, 0.4, square, false), Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(snap(-0.3, 0.4, square_in, false), Vec3::new(0.0, 0.4, 0.0));
+        assert_eq!(snap(0.5, 1.6, square, false), Vec3::new(0.5, 1.0, 0.0));
+        assert_eq!(snap(0.5, 1.6, square_in, false), Vec3::new(0.0, 1.0, 0.0));
+
+        // A point already on a wall is a fixed point, so the snap is safe to apply to a rim
+        // sample the chain sampler already put there.
+        for (u, v, exponent) in [(1.0, 0.4, square), (0.0, 0.4, square_in)] {
+            assert_eq!(snap(u, v, exponent, false), Vec3::new(u, v, 0.0));
+        }
+
+        // The other two branches ignore the flag entirely.
+        let off_surface = Vec3::new(0.9, 0.5, 0.2);
+        for exponent in [2.0_f32, profile_to_exponent(0.7), 1.0] {
+            assert_eq!(
+                snap_to_unit_superellipsoid(off_surface, exponent, true),
+                snap_to_unit_superellipsoid(off_surface, exponent, false),
+                "`land_on_corner` is branch S's alone (r = {exponent})",
+            );
+        }
     }
 
     /// BEVEL.md §8.5.5.5(f.1) step 3 + (f.2): the **flat chamfer** (`profile = 0.25`,
@@ -46090,7 +46436,7 @@ impl AdjInterior<'_> {
                 let along_chain = axis[i][k];
                 let along_previous = resolution - axis[previous][segments - j];
                 let unit = net.sample(i, along_previous, along_chain);
-                octant.to_world(snap_to_unit_superellipsoid(unit, *exponent))
+                octant.to_world(snap_to_unit_superellipsoid(unit, *exponent, false))
             }
             AdjInterior::Parallel {
                 starts, vertex, ..
@@ -46297,14 +46643,35 @@ fn adj_octant_prescale(exponent: f32, segments: u32) -> f32 {
 ///   past a sector seam); the unclamped normalise keeps that sign, leaving the vert a hair
 ///   outside its sector rather than exactly on the seam. Clamping first would move those
 ///   verts — and the circular corner's positions are pinned;
+/// - **the two square sentinels** take an **axis snap in the clamped unit square**, not a norm
+///   at all: at `r = 1e4` every `a^r` overflows or flushes in `f32`, so the curved closed form
+///   is numerically dead there, and at `r = 0` the `r`-norm diverges and would collapse the
+///   whole cross-section to a point. The snap pushes the clamped point onto the nearer of the
+///   two walls the sentinel names — `x == 1` / `y == 1` for `square` (the profile bulges out
+///   to the cell's `(1, 1)` corner, the junction vertex) and `x == 0` / `y == 0` for
+///   `square-in` (it bows away, onto the cell edges through `start + end − mid`). This branch
+///   is strictly **2-D**: it is not a limit of the curved one, and its only caller is the
+///   §8.5.5.5(f.6) pipe replant, which snaps inside a station plane and hands over a written
+///   zero third coordinate;
 /// - **every other (curved) exponent** must clamp into the octant first, because a negative
 ///   base raised to a fractional power is `NaN`. The clamp is a *necessity of the general
 ///   exponent*, not a shared step, and it folds an overshooting vert onto the seam plane.
 ///
-/// (The third branch — the axis snap the square exponents take — is 2-D and reached only
-/// from the pipe post-pass, which is not filled; the square grids never come through here.)
+/// `land_on_corner` is §8.5.5.5(f.6)'s "land on the square's *corner*, not on the nearer wall"
+/// override. It exists for the sentinel branch alone — the circular and curved branches ignore
+/// it — and without it the pipe's square cross-section collapses into a wedge. Which verts set
+/// it is the replant's business ([`pipe_replant_lands_on_corner`]).
 ///
-/// A vert already on the surface is a fixed point in either branch, so the snap is safe to
+/// **Which grids reach which branch.** The three 3-D grid paths (the octant cap and the two
+/// pinwheel closed forms) never hold a square exponent — §8.5.5.5(f.1) hands those to (f.5)'s
+/// closed forms before the grid is built — so they only ever exercise the circular and curved
+/// branches and pass `land_on_corner = false`. The *square* grids of (f.5) do reach this
+/// routine, but only through the (f.6) replant that post-passes them, and only at the one
+/// count each can carry: step 3's three flat unit squares are odd-`segments` only, and step 1's
+/// parallel-offset ring outranks the pipe test outright ([`adj_square_ring_claims`]), so no
+/// replant follows it at all.
+///
+/// A vert already on the surface is a fixed point in every branch, so the snap is safe to
 /// apply unconditionally to the boundverts and to any rim sample that happens to be exact.
 /// The curved branch divides through by the leading coordinate before taking the powers:
 /// the two forms agree in exact arithmetic, but only this one keeps the intermediate
@@ -46312,9 +46679,12 @@ fn adj_octant_prescale(exponent: f32, segments: u32) -> f32 {
 /// annihilates every coordinate, which is the one degenerate case the branch guards; past
 /// that guard the leading coordinate of `scaled` is exactly `1`, so the `r`-norm is `≥ 1`
 /// and the division is safe.
-fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
+fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32, land_on_corner: bool) -> Vec3 {
     if exponent == 2.0 {
         return unit.normalize_or_zero();
+    }
+    if exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0 {
+        return snap_to_unit_square_walls(unit, exponent == 0.0, land_on_corner);
     }
     let clamped = Vec3::new(unit.x.max(0.0), unit.y.max(0.0), unit.z.max(0.0));
     let leading = clamped.x.max(clamped.y).max(clamped.z);
@@ -46325,6 +46695,119 @@ fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
     let norm = (scaled.x.powf(exponent) + scaled.y.powf(exponent) + scaled.z.powf(exponent))
         .powf(1.0 / exponent);
     scaled / norm
+}
+
+/// The sentinel arm of [`snap_to_unit_superellipsoid`] (BEVEL.md §8.5.5.5(f.2), branch S): an
+/// **axis snap inside the clamped unit square**, in the plane the §8.5.5.5(f.6) replant works
+/// in. `inward` selects the square-in sentinel's walls (`u == 0` / `v == 0`, the cell edges
+/// through the `(0, 0)` corner `start + end − mid`) over the square sentinel's (`u == 1` /
+/// `v == 1`, the two edges meeting at the cell's `(1, 1)` corner, which is the junction vertex).
+///
+/// Clamp first, then push onto the **nearer** wall — or onto both, landing exactly on the
+/// square's corner, when the caller's slot carries §8.5.5.5(f.6)'s `land_on_corner`. Snapping
+/// to one wall there would fold the pipe's square cross-section into a wedge.
+///
+/// Strictly 2-D: the third coordinate is a written zero at the one caller, and there is no
+/// third wall for it to be pushed onto. At an exact tie the `u` wall wins; the guide's "the
+/// nearer of the walls" leaves the tie open, both answers lie on the target square, and the
+/// choice has to be *some* fixed one for the fill to be deterministic.
+fn snap_to_unit_square_walls(unit: Vec3, inward: bool, land_on_corner: bool) -> Vec3 {
+    debug_assert!(
+        unit.z == 0.0,
+        "the sentinel snap is 2-D; its third coordinate is written, never computed",
+    );
+    let mut u = unit.x.clamp(0.0, 1.0);
+    let mut v = unit.y.clamp(0.0, 1.0);
+    let (wall, nearer_is_u) = if inward {
+        (0.0, u <= v)
+    } else {
+        (1.0, 1.0 - u <= 1.0 - v)
+    };
+    if land_on_corner || nearer_is_u {
+        u = wall;
+    }
+    if land_on_corner || !nearer_is_u {
+        v = wall;
+    }
+    Vec3::new(u, v, 0.0)
+}
+
+/// Whether §8.5.5.5(f.1) **step 1** claims this junction for (f.5)'s planar parallel-offset
+/// ring grid: the `square` sentinel, at least three beveled edges, and an even `segments ≥ 2`.
+///
+/// Step 1 outranks step 2, and the ordering is part of the dispatch — "a square profile at a
+/// pipe corner satisfies both the square and pipe tests, **and the square grid wins**". So this
+/// is asked twice: once by [`LoopMesh::build_adj_fill_base`] to route the grid, and once by
+/// [`LoopMesh::build_adj_fill`] to suppress the (f.6) replant that would otherwise post-pass it.
+/// A junction the ring claims never enters step 2 at all.
+///
+/// With no outer miter in scope the boundvert count equals the beveled-edge count, which is
+/// what lets the ring's gate read the ring.
+fn adj_square_ring_claims(exponent: f32, boundverts: usize, segments: u32) -> bool {
+    exponent == PROFILE_SQUARE_EXPONENT && boundverts >= 3 && segments >= 2 && segments % 2 == 0
+}
+
+/// The §8.5.5.5(f.6) replant's `land_on_corner` override for one canonical net slot, per
+/// (f.6.1)'s "what an implementation must do": for **even** `segments` it is set on the slots
+/// with `k = ⌊n/2⌋` that either sit in one of the two pipe boundverts' sectors, or sit at
+/// `(i = 0, j = ⌊n/2⌋)` — the welded apex. Odd `segments` never set it.
+///
+/// It is computed for every exponent and consumed only by the sentinel branch of
+/// [`snap_to_unit_superellipsoid`], so computing it unconditionally and computing it only under
+/// that branch agree.
+fn pipe_replant_lands_on_corner(
+    slot: (usize, usize, usize),
+    segments: usize,
+    pipe_sectors: (usize, usize),
+) -> bool {
+    if segments % 2 != 0 {
+        return false;
+    }
+    let (sector, ring, along) = slot;
+    let half = segments / 2;
+    if along != half {
+        return false;
+    }
+    sector == pipe_sectors.0 || sector == pipe_sectors.1 || (sector == 0 && ring == half)
+}
+
+/// The canonical §8.5.2 slot `(i, j, k)` of every interior grid vert a [V-ADJ] fill mints, in
+/// mint order — the net's own index vocabulary, recorded so the §8.5.5.5(f.6) pipe post-pass
+/// can drive itself off the slot walk rather than off "the vertices this fill allocated"
+/// ((f.6.1), "what an implementation must do"). The distinction has teeth: `land_on_corner` is
+/// stated over `(i, j, k)` and is unrecoverable from a vertex key.
+///
+/// Recording is **off** unless a replant will actually run, so every other junction pays one
+/// branch per interior vert and no allocation.
+#[derive(Default)]
+struct AdjNetSlots {
+    walk: Option<Vec<(usize, usize, usize)>>,
+}
+
+impl AdjNetSlots {
+    fn off() -> Self {
+        Self::default()
+    }
+
+    fn recording() -> Self {
+        Self {
+            walk: Some(Vec::new()),
+        }
+    }
+
+    fn record(&mut self, slot: (usize, usize, usize)) {
+        if let Some(walk) = &mut self.walk {
+            walk.push(slot);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.walk.as_ref().map_or(0, Vec::len)
+    }
+
+    fn slot(&self, index: usize) -> Option<(usize, usize, usize)> {
+        self.walk.as_ref()?.get(index).copied()
+    }
 }
 
 /// The §8.5.5.5(f.6) replant's shape at one pipe junction: the pipe axis, the pipe
@@ -46341,6 +46824,11 @@ struct PipeCrossSection {
     /// snap; a planar junction, whose profile plane contains the pipe axis, is
     /// [`StationPlacement::Chord`].
     placement: StationPlacement,
+    /// The **two pipe boundverts**' sector indices — the boundverts whose own edges are the
+    /// collinear pair. §8.5.5.5(f.6.1)'s `land_on_corner` rule is stated over them, and a
+    /// boundvert's own edge is the one *closing* its sector, so sector `i` owns edge `i + 1`
+    /// and the two sectors are one ring step behind the two edge indices.
+    sectors: (usize, usize),
 }
 
 /// The §8.3.4.1 **pipe boundvert**'s two collinear spokes, as indices into the ring's
@@ -46472,6 +46960,8 @@ fn pipe_station_placement(pipe_axis: Vec3, cell: &ProfileCell) -> StationPlaceme
 /// `base` is then read into that planar cell's `(u, v)` frame, snapped onto the §8.6.1
 /// superellipse `u^r + v^r = 1` there (the §8.5.5.5(f.2) surface snap with a zero third
 /// octant coordinate, so only its 2-D behaviour is exercised), and carried back out.
+/// `land_on_corner` is the slot's (f.6.1) override, live only under the snap's sentinel
+/// branch; it is this routine's one per-vert input beyond `base`.
 ///
 /// Two shapes admit no curve and collapse to a nearest-point rule, and both are routine
 /// (a pipe through a flat-chamfer profile takes the second): a cross-section degenerated
@@ -46512,6 +47002,7 @@ fn pipe_cross_section_replant(
     cell: &ProfileCell,
     placement: StationPlacement,
     exponent: f32,
+    land_on_corner: bool,
 ) -> Vec3 {
     let axis = pipe_axis.as_dvec3().normalize_or_zero();
     let base_position = base.as_dvec3();
@@ -46569,7 +47060,8 @@ fn pipe_cross_section_replant(
     // The third cell coordinate is identically zero by construction — the station plane is
     // *defined* to pass through `base` — so it is written, never computed (§8.5.5.5(f.6)):
     // a literal zero has no rounding for the `r`-norm to amplify.
-    let snapped = snap_to_unit_superellipsoid(Vec3::new(u as f32, v as f32, 0.0), exponent);
+    let snapped =
+        snap_to_unit_superellipsoid(Vec3::new(u as f32, v as f32, 0.0), exponent, land_on_corner);
     to_world(mid + (snapped.x as f64 - 1.0) * a_axis + (snapped.y as f64 - 1.0) * b_axis)
 }
 
