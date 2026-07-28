@@ -4959,11 +4959,12 @@ impl LoopMesh {
     /// matters there, since those verts are shared with the arriving strips and moving them
     /// with no cap to justify it distorts the junction.
     ///
-    /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`); the
-    /// axis and the cross-section shape are recovered from the chains at fill time, since
-    /// the original corner's edge directions are gone by now. The base is told whether the
-    /// replant will actually follow, not merely whether the flag is set — the two differ at
-    /// a planar junction, and the sentinel decline is keyed on the former.
+    /// The pipe predicate is the §8.3.4.1 one captured on the cut (`pipe_override`), and so
+    /// is the axis; the cross-section shape is the pipe boundvert's own profile, read back
+    /// off its chain. The base is told whether the replant will resolve verts **through the
+    /// station cell** — which a planar junction never does, since there the projected control
+    /// triple is collinear at every station and the placement is (f.6) step 4's chord clamp.
+    /// The sentinel decline is keyed on that narrower verdict, not on the flag.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill(
         &mut self,
@@ -4977,14 +4978,15 @@ impl LoopMesh {
     ) {
         // §8.5.5.5(f.6): a pipe junction re-plants its interior grid verts once the base
         // grid exists. The predicate rides the cut (same test as the §8.3.4.1 cutoff
-        // override); the axis + profile are read back from the chains below.
+        // override); the axis + profile are recovered below.
         //
-        // The §8.3.4.1 predicate is broader than the (f.6) *replant*: it also fires on the
-        // flat/planar anti-parallel and wire-disk junctions the CUTOFF override was built
-        // for. There the whole junction lies in one plane and the base ADJ grid is already
-        // the constant cross-section, correctly placed — the replant must not move a vert.
-        // `pipe_cross_section` declines (returns `None`) for such a planar junction, so only
-        // a genuine 3-D tube reaches the replant below.
+        // A **planar** §8.3.4.1 junction — the flat anti-parallel / wire-disk configuration
+        // the CUTOFF override was built for — replants like any other pipe: its profile plane
+        // contains the pipe axis, so the projected control triple is collinear at every
+        // station and every vert in the domain takes step 4's chord clamp. That clamp is the
+        // identity on a circular profile (the cross-section never leaves the band) and moves
+        // real verts on a concave one, so "flat ⇒ the replant is inert" holds only for the
+        // former and is not a reason to decline.
         let pipe = if cut.pipe_override {
             self.pipe_cross_section(cut, chains)
         } else {
@@ -5000,14 +5002,16 @@ impl LoopMesh {
         let net_emitted = self.build_adj_fill_base(
             cut,
             chains,
-            pipe.is_some(),
+            pipe.is_some_and(|cross_section| {
+                cross_section.placement == StationPlacement::Cell
+            }),
             segments,
             profile,
             material,
             templates,
             result,
         );
-        let Some((pipe_axis, profile_cell)) = pipe else {
+        let Some(pipe) = pipe else {
             return;
         };
         // Step 2 is a post-pass over **the net's** canonical slots, so a junction whose base
@@ -5023,17 +5027,11 @@ impl LoopMesh {
         for index in interior_start..result.verts.len() {
             let vertex = result.verts[index];
             let base = self.vertex_position(vertex);
-            let replanted = pipe_cross_section_replant(base, pipe_axis, &profile_cell, exponent);
+            let replanted =
+                pipe_cross_section_replant(base, pipe.axis, &pipe.cell, pipe.placement, exponent);
             self.set_vertex_position(vertex, replanted);
         }
-        self.replant_pipe_rim_window(
-            cut,
-            chains,
-            segments as usize,
-            pipe_axis,
-            &profile_cell,
-            exponent,
-        );
+        self.replant_pipe_rim_window(cut, chains, segments as usize, &pipe, exponent);
     }
 
     /// Replant the ring-chain rim samples the canonical slot walk reaches (BEVEL.md
@@ -5061,8 +5059,7 @@ impl LoopMesh {
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: usize,
-        pipe_axis: Vec3,
-        profile_cell: &ProfileCell,
+        pipe: &PipeCrossSection,
         exponent: f32,
     ) {
         let window = pipe_replant_rim_window(segments);
@@ -5087,63 +5084,65 @@ impl LoopMesh {
                     continue;
                 };
                 let base = self.vertex_position(vertex);
-                let replanted =
-                    pipe_cross_section_replant(base, pipe_axis, profile_cell, exponent);
+                let replanted = pipe_cross_section_replant(
+                    base,
+                    pipe.axis,
+                    &pipe.cell,
+                    pipe.placement,
+                    exponent,
+                );
                 self.set_vertex_position(vertex, replanted);
             }
         }
     }
 
-    /// Recover a §8.5.5.5(f.6) pipe junction's axis and the pipe boundvert's profile cell
-    /// from its chains (BEVEL.md §8.5.5.5(f.6)).
+    /// Recover a §8.5.5.5(f.6) pipe junction's axis, the pipe boundvert's profile cell, and
+    /// which of the two placements every station will take (BEVEL.md §8.5.5.5(f.6)).
     ///
-    /// The two collinear pipe edges are crossed by two chains, and their cells' projection
-    /// directions ride those two collinear edges — so they share a common line (the profile
-    /// cell stores the edge's *line* direction, which is the same for both pipe edges even
-    /// though the two spokes leave `v` in opposite senses). That line is the pipe axis, and
-    /// either chain's cell is the constant tube cross-section: a uniform pipe presents the
-    /// same cross-section from both ends, and the cell reflection that swaps its two ring
-    /// corners leaves the superellipse snap invariant, so the two are interchangeable for
-    /// the replant. `None` when no such pair is recoverable (e.g. a flat-chamfer
-    /// cross-section whose projection direction collapsed to zero), which is outside the
-    /// circular / curved scope this post-pass fills.
+    /// The **axis** is §8.3.4.1's own: the line shared by the pipe boundvert's spoke and its
+    /// collinear opposite ([`pipe_boundvert_spokes`]), taken off the pristine directions the
+    /// cut captured with the pipe verdict. It is deliberately not read back off a cell's
+    /// projection direction — that field is the crossed edge's line only until §8.2.2.1's
+    /// degenerate-`mid` rescue repoints it at the rescued *plane normal*, which at a planar
+    /// junction is the one direction under which the flat cross-section would falsely
+    /// survive projection.
     ///
-    /// `None` also when the junction is **planar** — every cross-section control point in one
-    /// plane. That is the flat §8.3.4.1 configuration (an anti-parallel opposite-pair or a
-    /// wire-disk junction), where the base ADJ grid is already the constant cross-section
-    /// and the replant would collapse a correctly-placed 2-D fill onto a single chord. Only a
-    /// genuine 3-D tube — whose cross-section wraps out of any one plane — replants (f.6). The
-    /// axis a rescued planar cell reports (§8.2.2.1, its `projection_dir` becomes the
-    /// rescued *plane normal*, not the spoke line) is exactly the direction under which the
-    /// cross-section would falsely survive projection, so the geometric planarity test — not
-    /// that axis — is the reliable gate.
+    /// The **shape** is the pipe boundvert's own profile: the chain that crosses its own
+    /// (pipe) edge. Only a pipe-edge chain spans the cross-section — the two boundverts
+    /// flanking a *transverse* edge sit at the same transverse coordinate and differ only in
+    /// station, so the projection that forgets the station carries both onto one point.
+    ///
+    /// `station_cell_placement` is [`pipe_station_placement`]'s verdict on that cell: whether
+    /// the replant builds a station cell at all, or takes one of step 4's collapses at every
+    /// station. A **planar** junction is the standard instance of the latter (§8.3.4.1's flat
+    /// anti-parallel / wire-disk configuration): its whole cross-section lies in one plane
+    /// that contains the pipe axis, and a plane containing the projection direction has a line
+    /// for its image. The clamp still runs there — on a concave profile it moves real verts —
+    /// but nothing downstream needs the cell path.
+    ///
+    /// `None` when no anti-parallel pair or no pipe-edge chain is recoverable, which leaves
+    /// the base grid standing.
     fn pipe_cross_section(
         &self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
-    ) -> Option<(Vec3, ProfileCell)> {
-        let cells: Vec<ProfileCell> = chains
+    ) -> Option<PipeCrossSection> {
+        // The spoke scan indexes the directions; its answer indexes the edges.
+        debug_assert_eq!(cut.opening_edges.len(), cut.opening_edge_directions.len());
+        let (pipe_edge_index, _collinear_opposite) =
+            pipe_boundvert_spokes(&cut.opening_edge_directions)?;
+        let axis = cut.opening_edge_directions[pipe_edge_index].normalize_or_zero();
+        let pipe_edge = cut.opening_edges[pipe_edge_index];
+        let cell = chains
             .iter()
             .filter(|chain| chain.endpoint == cut.vertex)
-            .filter_map(|chain| chain.cell)
-            .filter(|cell| cell.projection_dir.length_squared() > f32::EPSILON)
-            .collect();
-        if junction_cross_sections_are_coplanar(&cells) {
-            return None;
-        }
-        // The §7.6.2 near-collinear window (2°) the pipe test itself uses; the two pipe-edge
-        // cells share the axis *line*, so match on `|dot|` (either sense).
-        let collinear_cos = (2.0_f32.to_radians()).cos();
-        for i in 0..cells.len() {
-            let axis_i = cells[i].projection_dir.normalize();
-            for j in (i + 1)..cells.len() {
-                let axis_j = cells[j].projection_dir.normalize();
-                if axis_i.dot(axis_j).abs() >= collinear_cos {
-                    return Some((axis_i, cells[i]));
-                }
-            }
-        }
-        None
+            .find(|chain| chain.edge == pipe_edge)
+            .and_then(|chain| chain.cell)?;
+        Some(PipeCrossSection {
+            axis,
+            cell,
+            placement: pipe_station_placement(axis, &cell),
+        })
     }
 
     /// Dispatch the rounded adjacency-grid fill at one junction (BEVEL.md §8.5).
@@ -5176,9 +5175,11 @@ impl LoopMesh {
     /// step 4's comment below.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
     /// dispatch — with the cross-section replant applied by the [`Self::build_adj_fill`]
-    /// wrapper as a post-pass. `pipe_replant_follows` is that wrapper's verdict on whether
-    /// the post-pass will run at all, which at a **planar** §8.3.4.1 junction is `false`
-    /// even though the cut's `pipe_override` flag is set.
+    /// wrapper as a post-pass. `pipe_cell_replant_follows` is that wrapper's verdict on
+    /// whether the post-pass will resolve verts through a **station cell**, which at a
+    /// **planar** §8.3.4.1 junction is `false` even though the replant runs there: its
+    /// projected control triple is collinear at every station, so the placement is (f.6)
+    /// step 4's chord clamp and (f.2)'s snap is never reached.
     ///
     /// Returns whether a net was actually tiled. Every out-of-scope ring, degenerate chain
     /// and singular corner map below leaves the junction untouched, and the pipe post-pass
@@ -5188,7 +5189,7 @@ impl LoopMesh {
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
-        pipe_replant_follows: bool,
+        pipe_cell_replant_follows: bool,
         segments: u32,
         profile: f32,
         material: i32,
@@ -5271,7 +5272,8 @@ impl LoopMesh {
             if exponent == 0.0 && self.adj_tri_corner_geometry(cut) {
                 return false;
             }
-            // (2) Either sentinel at a pipe junction **whose replant will actually run**.
+            // (2) Either sentinel at a pipe junction **whose replant will build a station
+            //     cell**.
             //     (f.1) step 2 outranks step 4 there: the grid is built and then re-planted
             //     onto the constant cross-section (f.6), and that replant resolves each vert
             //     through (f.2)'s snap — whose sentinel arm is **branch S**, an axis push in
@@ -5283,14 +5285,16 @@ impl LoopMesh {
             //     mis-place is worse than leaving the junction as it is, so the genuine 3-D
             //     tube keeps today's decline until branch S lands with the slot walk it needs.
             //
-            //     The gate is the caller's replant verdict, **not** the §8.3.4.1
-            //     `pipe_override` flag: that predicate is the broader of the two and also
-            //     fires on the flat/planar anti-parallel and wire-disk junctions, where
-            //     `pipe_cross_section` declines and no replant follows. There the base grid
-            //     is already the constant cross-section, correctly placed (§8.5.5.5(f.6)) —
-            //     step 4's grid is not merely acceptable but the right answer — so declining
-            //     it would protect a post-pass that was never going to run.
-            if (exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0) && pipe_replant_follows {
+            //     The gate is the caller's *cell*-path verdict, and it is narrower than both
+            //     the §8.3.4.1 `pipe_override` flag and "a replant follows". A **planar**
+            //     junction replants too, but its projected control triple is collinear at
+            //     every station, so (f.6) step 4's chord clamp places every vert and the
+            //     unbuilt branch S is never reached. Declining there would drop step 4's grid
+            //     — which is the right base for that clamp — to protect a snap that was never
+            //     going to be called.
+            if (exponent == PROFILE_SQUARE_EXPONENT || exponent == 0.0)
+                && pipe_cell_replant_follows
+            {
                 return false;
             }
             match segments {
@@ -8035,20 +8039,9 @@ impl LoopMesh {
         }
 
         // Condition 2: some pair of spokes is exactly anti-parallel through `vertex` — the
-        // ray out of `v` along one is the reverse of the ray out along the other. The §7.6.2
-        // near-collinear window is 2°, so the two directions meet at ≥ 178° (`cos ≤ −cos 2°`).
-        let near_collinear_cos = (2.0_f32.to_radians()).cos();
-        let mut pipe_axis: Option<Vec3> = None;
-        'pairs: for i in 0..count {
-            for j in (i + 1)..count {
-                if spoke_directions[i].dot(spoke_directions[j]) <= -near_collinear_cos {
-                    pipe_axis = Some(spoke_directions[i]);
-                    break 'pairs;
-                }
-            }
-        }
-        let pipe_axis = match pipe_axis {
-            Some(axis) => axis,
+        // ray out of `v` along one is the reverse of the ray out along the other.
+        let pipe_axis = match pipe_boundvert_spokes(&spoke_directions) {
+            Some((own, _)) => spoke_directions[own],
             None => return false,
         };
 
@@ -14159,6 +14152,27 @@ mod tests {
         let rim: Vec<VertexKey> = (0..spokes)
             .map(|k| {
                 let angle = std::f32::consts::TAU * (k as f32) / (spokes as f32);
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+        for k in 0..spokes {
+            let next = (k + 1) % spokes;
+            mesh.face_create_verts(&[centre, rim[k], rim[next]], FaceCreateFlags::NONE);
+        }
+        (mesh, centre, rim)
+    }
+
+    /// [`planar_fan`] rotated so that spoke `1` sits on `+x`: the frame §8.5.5.5(f.6)'s
+    /// worked planar-pipe case states its figures in. At `spokes = 12` the beveled set
+    /// `1 / 4 / 7 / 10` is then the four spokes at `0° / 90° / 180° / 270°`, so the pipe
+    /// axis and the clamped transverse direction are coordinate directions and the guide's
+    /// numbers can be read off a position directly.
+    fn planar_fan_axis_aligned(spokes: usize) -> (LoopMesh, VertexKey, Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let rim: Vec<VertexKey> = (0..spokes)
+            .map(|k| {
+                let angle = std::f32::consts::TAU * (k as f32 - 1.0) / (spokes as f32);
                 mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
             })
             .collect();
@@ -20568,6 +20582,89 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.3.4.1 condition 2 is a **ring-distance-2** test — "among three *consecutive*
+    /// ring members, the first and third have collinear edges" — so at `s = 4` a pair that is
+    /// anti-parallel but ring-**adjacent** does not name a pipe, and the ordinary cut faces
+    /// stand.
+    ///
+    /// Spokes `0 / 1 / 2 / 6` of the 12-fan sit at `−30° / 0° / 30° / 150°`: the only
+    /// anti-parallel pair is `−30°`/`150°`, which is adjacent in the ring (the other three
+    /// spokes are all on one side of it). The two distance-2 pairs — `−30°/30°` and `0°/150°` —
+    /// are not collinear, so the junction declines.
+    ///
+    /// This is a **count-bearing** distinction, not a placement one: the override would route
+    /// this junction to the adjacency grid *plus* `(segments − 1)·s` loose leftovers, so
+    /// `V`, `E` and `F` all move with the verdict. The sibling test above declines for a
+    /// different reason (no anti-parallel pair at all), which is why it cannot see this.
+    #[test]
+    fn cutoff_pipe_override_declines_on_a_ring_adjacent_pair() {
+        let (mesh, _result) = bevel_flat_fan_cutoff(&[0, 1, 2, 6], 0.2, 2);
+
+        let histogram = face_side_histogram(&mesh);
+        assert!(
+            histogram.get(&5).copied().unwrap_or(0) > 0,
+            "a ring-adjacent anti-parallel `s = 4` ring keeps its cut pentagons: {histogram:?}",
+        );
+        assert_eq!(
+            loose_vertex_count(&mesh),
+            0,
+            "an ordinary (non-override) cutoff ring mints no loose leftover verts",
+        );
+
+        // Non-vacuity: the *same* fan, the same spoke count, the same offset and segments —
+        // with the anti-parallel pair moved to ring distance 2 — does take the override, so
+        // the decline above is the ring distance and nothing else.
+        let (retiled, _result) = bevel_flat_fan_cutoff(&[0, 1, 6, 7], 0.2, 2);
+        assert_eq!(
+            face_side_histogram(&retiled).get(&5).copied().unwrap_or(0),
+            0,
+            "the distance-2 pair re-tiles the ring as the all-quad grid",
+        );
+        assert_eq!(
+            loose_vertex_count(&retiled),
+            4,
+            "`(segments − 1)·s = 1·4` loose leftover verts on the re-tiled ring",
+        );
+    }
+
+    /// BEVEL.md §8.3.4.1 condition 2 / §8.5.5.5(f.6): *which* pair a two-pair ring names.
+    ///
+    /// A flat 4-way cross carries two anti-parallel pairs, and the guide's worked (f.6) case
+    /// pins the answer for the fan whose ring walk starts at the `0°` spoke: "the ring walk
+    /// names the `90°/270°` pair as the axis". Under §8.2.2's association — boundvert `B_k`'s
+    /// own profile chain is `B_k → B_(k+1)`, crossing the edge that *closes* sector `k` —
+    /// boundvert `0` tests spokes `1` and `3`, which is that pair. Picking the other one yields
+    /// the same cap rotated a quarter turn, and the only thing that catches it is a positional
+    /// figure, so the choice is pinned here directly rather than through a cap fingerprint.
+    #[test]
+    fn pipe_boundvert_spokes_names_the_ring_walks_pair() {
+        // The ring walk's directions on the worked fan: `0° / 90° / 180° / 270°`.
+        let cross = [Vec3::X, Vec3::Y, -Vec3::X, -Vec3::Y];
+        assert_eq!(
+            pipe_boundvert_spokes(&cross),
+            Some((1, 3)),
+            "the two-pair ring names the `90°/270°` pair, so the pipe axis is `y`",
+        );
+        // Valence 3: one pair plus a transverse passenger, and every rotation of the ring names
+        // the same axis line — at `s = 3` the distance-2 scan and an any-pair scan coincide.
+        for rotation in 0..3 {
+            let mut ring = [Vec3::X, -Vec3::X, Vec3::Y];
+            ring.rotate_left(rotation);
+            let (own, opposite) = pipe_boundvert_spokes(&ring).expect("the collinear pair");
+            assert!(
+                ring[own].dot(ring[opposite]) < -0.99,
+                "rotation {rotation} named a non-collinear pair",
+            );
+        }
+        // Ring-adjacent anti-parallel spokes at `s = 4` are not a pipe (see the override test):
+        // `0°/180°` are adjacent in this ring, and neither distance-2 pair is collinear.
+        let adjacent = [0.0_f32, 30.0, 60.0, 180.0].map(|degrees| {
+            let radians = degrees.to_radians();
+            Vec3::new(radians.cos(), radians.sin(), 0.0)
+        });
+        assert_eq!(pipe_boundvert_spokes(&adjacent), None);
+    }
+
     /// A flat 3×3 quad grid (9 verts, 4 quads). The centre vertex (index 4) has four faced
     /// spokes; beveling its left (→3), right (→5) and up (→7) spokes plants a `s = 3` pipe:
     /// left/right collinear through the centre, up transverse, every incident face in the
@@ -20788,6 +20885,19 @@ mod tests {
             .expect("the pipe fill created cap verts")
     }
 
+    /// [`pipe_cross_section_replant`] with the junction's placement resolved off the cell and
+    /// the axis, exactly as [`LoopMesh::pipe_cross_section`] resolves it once per junction
+    /// before walking the domain.
+    fn replant(base: Vec3, pipe_axis: Vec3, cell: &ProfileCell, exponent: f32) -> Vec3 {
+        pipe_cross_section_replant(
+            base,
+            pipe_axis,
+            cell,
+            pipe_station_placement(pipe_axis, cell),
+            exponent,
+        )
+    }
+
     /// §8.5.5.5(f.6): the replant snaps an interior grid vert onto its station's profile
     /// curve — a point off the curve is projected on, the station (position along the pipe
     /// axis) is preserved, and a point already on the curve is a fixed point (idempotent).
@@ -20800,7 +20910,7 @@ mod tests {
             Vec3::new(0.0, 1.0, 1.0),
         );
         // A point off the arc at station `x = 5`, on the `(0,1,1)` diagonal.
-        let replanted = pipe_cross_section_replant(Vec3::new(5.0, 2.0, 2.0), Vec3::X, &cell, 2.0);
+        let replanted = replant(Vec3::new(5.0, 2.0, 2.0), Vec3::X, &cell, 2.0);
         let expected = Vec3::new(5.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
         assert!(
             (replanted - expected).length() < 1.0e-5,
@@ -20814,7 +20924,7 @@ mod tests {
             "lands on the unit-radius cross-section circle",
         );
         // Idempotent: re-planting a vert already on the curve does not move it.
-        let again = pipe_cross_section_replant(replanted, Vec3::X, &cell, 2.0);
+        let again = replant(replanted, Vec3::X, &cell, 2.0);
         assert!((again - replanted).length() < 1.0e-6, "replant is idempotent on the curve");
     }
 
@@ -20831,7 +20941,7 @@ mod tests {
             Vec3::new(1.0, 1.0, 0.0),
             Vec3::new(0.0, 2.0, 0.0),
         );
-        let collapsed = pipe_cross_section_replant(Vec3::new(4.0, 9.0, 9.0), Vec3::X, &point_cell, 2.0);
+        let collapsed = replant(Vec3::new(4.0, 9.0, 9.0), Vec3::X, &point_cell, 2.0);
         assert!(
             (collapsed - Vec3::new(4.0, 1.0, 0.0)).length() < 1.0e-5,
             "a point cross-section captures the vert at its station: {collapsed:?}",
@@ -20842,11 +20952,97 @@ mod tests {
             Vec3::new(0.0, 3.0, 0.0),
             Vec3::new(0.0, 2.0, 0.0),
         );
-        let onto_chord = pipe_cross_section_replant(Vec3::new(0.0, 5.0, 4.0), Vec3::X, &chord_cell, 2.0);
+        let onto_chord = replant(Vec3::new(0.0, 5.0, 4.0), Vec3::X, &chord_cell, 2.0);
         assert!(
             (onto_chord - Vec3::new(0.0, 3.0, 0.0)).length() < 1.0e-5,
             "a chord cross-section clamps the vert onto the segment end: {onto_chord:?}",
         );
+    }
+
+    /// The §8.5.5.5(f.6) planar junction's cross-section: a chord across the pipe edge in the
+    /// junction plane, with the junction vertex as the profile's `mid` (§8.2.2.1's tier-1
+    /// rescue). The pipe axis is `y`, so the clamped transverse coordinate is `x` and the
+    /// chord spans `[−offset, +offset]` — the frame (f.6)'s worked case states its figures in.
+    fn planar_pipe_cell(offset: f32) -> ProfileCell {
+        ProfileCell::from_control_points(
+            Vec3::new(offset, offset, 0.0),
+            Vec3::new(-offset, offset, 0.0),
+            Vec3::ZERO,
+        )
+    }
+
+    /// §8.5.5.5(f.6) step 4's second fallback at a **planar** junction, which is where it is
+    /// the ordinary case rather than an error path: the profile plane contains the pipe axis,
+    /// so the projected control triple is collinear at every station and every vert replants
+    /// onto the closed chord `start'–end'`.
+    ///
+    /// In the station frame that separates into three independent statements — the along-axis
+    /// coordinate is untouched (the station plane moves *with* the vert), the out-of-plane
+    /// component is dropped, and the transverse one is clamped into the chord's span. The
+    /// profile here is emphatically **not** flagged linear (its own unprojected triple spans a
+    /// cell: `mid` is the junction vertex, an offset clear of the chord), so an implementation
+    /// that reaches the chord only through that flag declines every clamp it owes.
+    #[test]
+    fn pipe_replant_planar_junction_clamps_transverse_and_keeps_the_station() {
+        let offset = 0.2;
+        let cell = planar_pipe_cell(offset);
+        assert!(
+            !cell.collinear,
+            "the planar junction's profile is a genuine curve, not a flagged-linear chord",
+        );
+
+        for exponent in [0.0_f32, profile_to_exponent(0.1), 2.0, PROFILE_SQUARE_EXPONENT] {
+            // Outside the band: transverse clamped to the near end, station preserved.
+            let outside = Vec3::new(-2.0 * offset, -0.0667, 0.0);
+            let clamped = replant(outside, Vec3::Y, &cell, exponent);
+            assert!(
+                (clamped - Vec3::new(-offset, -0.0667, 0.0)).length() < 1.0e-6,
+                "an out-of-band vert clamps to the chord end at its own station: {clamped:?}",
+            );
+            // Inside the band: the nearest point of the segment is the vert's own transverse
+            // coordinate, so the clamp is the identity there.
+            let inside = Vec3::new(0.5 * offset, 0.42, 0.0);
+            let unmoved = replant(inside, Vec3::Y, &cell, exponent);
+            assert!(
+                (unmoved - inside).length() < 1.0e-6,
+                "an in-band vert is left where the base grid put it: {unmoved:?}",
+            );
+            // Off the junction plane: the out-of-plane component is dropped (the chord lies in
+            // the plane, so its nearest point does), while the station survives.
+            let lifted = Vec3::new(0.5 * offset, 0.42, 0.05);
+            let dropped = replant(lifted, Vec3::Y, &cell, exponent);
+            assert!(
+                (dropped - inside).length() < 1.0e-6,
+                "the out-of-plane component is dropped, the station kept: {dropped:?}",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6): the fallback is *the nearest point of the closed segment*, so the two
+    /// chord bounds are never assumed ordered — which end carries the larger transverse
+    /// coordinate is decided by the ring walk's direction, and a `clamp(x, lo, hi)` handed
+    /// `lo > hi` panics in Rust. Reversing the cell's two ring corners must therefore return
+    /// the same point, not a panic and not the other end.
+    #[test]
+    fn pipe_replant_chord_clamp_is_orientation_free() {
+        let offset = 0.2;
+        let forward = planar_pipe_cell(offset);
+        let reversed = ProfileCell::from_control_points(forward.end, forward.start, forward.mid);
+        for transverse in [-3.0_f32, -1.0, -0.5, 0.0, 0.25, 1.0, 7.0] {
+            let base = Vec3::new(transverse * offset, 0.13, 0.0);
+            let along_walk = replant(base, Vec3::Y, &forward, 0.0);
+            let against_walk = replant(base, Vec3::Y, &reversed, 0.0);
+            assert!(
+                (along_walk - against_walk).length() < 1.0e-6,
+                "the closed-segment clamp does not depend on endpoint order at \
+                 transverse {transverse}: {along_walk:?} vs {against_walk:?}",
+            );
+            assert!(
+                along_walk.x.abs() <= offset + 1.0e-6,
+                "the clamp lands inside the chord span at transverse {transverse}: \
+                 {along_walk:?}",
+            );
+        }
     }
 
     /// §8.5.5.5(f.6): the chord fallback has to survive a collinear cross-section whose
@@ -20899,7 +21095,7 @@ mod tests {
                 let sideways = along.cross(axis).normalize();
                 let base = mid + 4.0 * offset * axis + 0.8 * offset * sideways;
 
-                let replanted = pipe_cross_section_replant(base, axis, &cell, exponent);
+                let replanted = replant(base, axis, &cell, exponent);
                 let projected_start = start - (start - base).dot(axis) * axis;
                 let projected_end = end - (end - base).dot(axis) * axis;
                 let chord = closest_point_on_segment(base, projected_start, projected_end);
@@ -20967,7 +21163,7 @@ mod tests {
                 let station = -0.75 + 0.5 * station_step as f32;
                 let base = Vec3::new(end.x, end.y, station);
                 assert_eq!(
-                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    replant(base, Vec3::Z, &cell, exponent),
                     base,
                     "corner-coincident replant moved a rotated cell's corner (step {step}, \
                      station {station})",
@@ -20979,7 +21175,7 @@ mod tests {
                 // offset clear at this profile); every degenerate exit would leave it *on* the
                 // chord.
                 let off_corner = Vec3::new(corner.x, corner.y, station);
-                let bulged = pipe_cross_section_replant(off_corner, Vec3::Z, &cell, exponent);
+                let bulged = replant(off_corner, Vec3::Z, &cell, exponent);
                 let projected_start = Vec3::new(start.x, start.y, station);
                 let projected_end = Vec3::new(end.x, end.y, station);
                 let chord_point = closest_point_on_segment(bulged, projected_start, projected_end);
@@ -21026,7 +21222,7 @@ mod tests {
                 let cell = right_angle_cross_section(hub, offset);
                 let station = 0.35;
                 let base = Vec3::new(hub.x, hub.y, station);
-                let replanted = pipe_cross_section_replant(base, Vec3::Z, &cell, exponent);
+                let replanted = replant(base, Vec3::Z, &cell, exponent);
 
                 let projected_start = Vec3::new(cell.start.x, cell.start.y, station);
                 let projected_end = Vec3::new(cell.end.x, cell.end.y, station);
@@ -21082,20 +21278,20 @@ mod tests {
                 // pipe, so `end` projects onto this vert at every station.
                 let base = Vec3::new(cell.end.x, cell.end.y, station);
                 assert_eq!(
-                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    replant(base, Vec3::Z, &cell, exponent),
                     base,
                     "corner-coincident vert moved at world magnitude {world}, station {station}",
                 );
                 // Same for the other projected control point.
                 let base = Vec3::new(cell.start.x, cell.start.y, station);
                 assert_eq!(
-                    pipe_cross_section_replant(base, Vec3::Z, &cell, exponent),
+                    replant(base, Vec3::Z, &cell, exponent),
                     base,
                     "corner-coincident vert moved at world magnitude {world}, station {station}",
                 );
                 // Non-vacuity: the same cell at the same station moves an off-corner vert.
                 let off_corner = Vec3::new(hub.x, hub.y, station);
-                let bulged = pipe_cross_section_replant(off_corner, Vec3::Z, &cell, exponent);
+                let bulged = replant(off_corner, Vec3::Z, &cell, exponent);
                 assert!(
                     (bulged - off_corner).length() > 0.1 * offset,
                     "the replant is the identity everywhere — the corner claim is vacuous",
@@ -21104,120 +21300,141 @@ mod tests {
         }
     }
 
-    /// §8.5.5.5(f.6): the replant discriminator is junction planarity. A flat junction's
-    /// cross-section control points are coplanar (the base grid is already correct → decline);
-    /// a genuine tube's wrap out of any one plane (→ replant).
+    /// The §8.5.5.5(f.6) planar cross-section, tilted out of the pipe axis' plane by
+    /// `wobble` — a fraction of the cell's own extent. At `wobble = 0` the profile plane
+    /// contains the axis (`y`) and the projected triple is collinear; raising it lifts `mid`
+    /// off that plane and re-inflates the projected cell, sagitta `wobble · offset`.
+    fn near_planar_pipe_cell(offset: f32, wobble: f32) -> ProfileCell {
+        ProfileCell::from_control_points(
+            Vec3::new(offset, offset, 0.0),
+            Vec3::new(-offset, offset, 0.0),
+            Vec3::new(0.0, 0.0, wobble * offset),
+        )
+    }
+
+    /// §8.5.5.5(f.6): the criterion separating the replant's placements is the *local* one the
+    /// guide states — the projected triple is collinear exactly when the profile plane through
+    /// `start`, `mid`, `end` is parallel to the pipe direction. A planar junction's cell takes
+    /// the chord, a tube's takes the cell path, and a cross-section that projects to a point
+    /// takes the point collapse.
     #[test]
-    fn pipe_coplanar_junction_gates_the_replant() {
-        // Two sectors of a flat junction: both arcs sit in the `z = 0` plane.
-        let flat = [
-            ProfileCell::from_control_points(
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(0.8, 0.8, 0.0),
-            ),
-            ProfileCell::from_control_points(
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(-1.0, 0.0, 0.0),
-                Vec3::new(-0.8, 0.8, 0.0),
-            ),
-        ];
-        assert!(
-            junction_cross_sections_are_coplanar(&flat),
-            "a flat junction's cross-sections are coplanar, so the replant declines",
+    fn pipe_station_placement_reads_the_cell_against_the_axis() {
+        assert_eq!(
+            pipe_station_placement(Vec3::Y, &planar_pipe_cell(0.2)),
+            StationPlacement::Chord,
+            "the planar junction's profile plane contains the pipe axis",
         );
-        // A tented tube: the second sector lifts its arc to `z = 1`, out of the first's plane.
-        let tube = [
-            ProfileCell::from_control_points(
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(0.8, 0.8, 0.0),
-            ),
-            ProfileCell::from_control_points(
-                Vec3::new(0.0, 1.0, 1.0),
-                Vec3::new(-1.0, 0.0, 1.0),
-                Vec3::new(-0.8, 0.8, 1.0),
-            ),
-        ];
-        assert!(
-            !junction_cross_sections_are_coplanar(&tube),
-            "a genuine tube wraps its cross-section out of any one plane, so the replant fires",
+        assert_eq!(
+            pipe_station_placement(Vec3::Z, &right_angle_cross_section(Vec3::new(1.1, -0.7, 0.0), 0.2)),
+            StationPlacement::Cell,
+            "a tube's cross-section survives projection along its axis",
+        );
+        // `start` and `end` differ only along the axis, so both project onto one station point.
+        let point_cell = ProfileCell::from_control_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        );
+        assert_eq!(
+            pipe_station_placement(Vec3::X, &point_cell),
+            StationPlacement::Point,
         );
     }
 
-    /// A flat valence-4 junction, uniformly scaled: both sectors' arcs sit in `z = 0`, with one
-    /// control point lifted by a construction residual proportional to the extent (a `5e-7`
-    /// fraction — orders below the relative gate, two orders *above* the old absolute `1e-4`
-    /// floor once the extent reaches `1e4`). The whole junction is offset off the origin so the
-    /// centred/`f64` fit is exercised against a non-zero absolute position.
-    fn flat_at(scale: f32) -> [ProfileCell; 2] {
-        let residual = 5.0e-7_f32 * scale;
-        let bias = Vec3::new(0.3 * scale, -0.2 * scale, 0.0);
-        [
-            ProfileCell::from_control_points(
-                Vec3::new(scale, 0.0, 0.0) + bias,
-                Vec3::new(0.0, scale, 0.0) + bias,
-                Vec3::new(0.8 * scale, 0.8 * scale, 0.0) + bias,
-            ),
-            ProfileCell::from_control_points(
-                Vec3::new(0.0, scale, 0.0) + bias,
-                Vec3::new(-scale, 0.0, 0.0) + bias,
-                Vec3::new(-0.8 * scale, 0.8 * scale, residual) + bias,
-            ),
-        ]
-    }
-
-    /// A tented tube, uniformly scaled: the second sector lifts its whole arc to `z = scale`, so
-    /// the cross-section wraps out of any one plane by a fixed fraction of its own size.
-    fn tube_at(scale: f32) -> [ProfileCell; 2] {
-        let bias = Vec3::new(0.3 * scale, -0.2 * scale, 0.0);
-        [
-            ProfileCell::from_control_points(
-                Vec3::new(scale, 0.0, 0.0) + bias,
-                Vec3::new(0.0, scale, 0.0) + bias,
-                Vec3::new(0.8 * scale, 0.8 * scale, 0.0) + bias,
-            ),
-            ProfileCell::from_control_points(
-                Vec3::new(0.0, scale, scale) + bias,
-                Vec3::new(-scale, 0.0, scale) + bias,
-                Vec3::new(-0.8 * scale, 0.8 * scale, scale) + bias,
-            ),
-        ]
-    }
-
-    /// §8.5.5.5(f.6) planarity is scale-invariant: a genuinely flat junction stays classified
-    /// coplanar (predicate `true`) across a wide radius band. The point of the centred/`f64`/
-    /// Newell rewrite is that radius 12+ no longer false-fires the replant — the residual no
-    /// longer grows with extent past the relative tolerance.
+    /// §8.5.5.5(f.6): the placement verdict is **scale-free**, so the same junction shape takes
+    /// the same branch at every bevel offset. The determinant it judges is a length⁴ quantity,
+    /// so an absolute floor on it would be a floor on the *offset* — every small bevel would
+    /// read as a flat chamfer, and every large flat one as a tube.
     #[test]
-    fn pipe_flat_junction_stays_coplanar_across_scales() {
-        for scale in [0.01_f32, 0.1, 1.0, 12.0, 100.0, 1.0e3, 1.0e4] {
-            assert!(
-                junction_cross_sections_are_coplanar(&flat_at(scale)),
-                "a flat junction stays coplanar at scale {scale}",
+    fn pipe_station_placement_is_scale_free() {
+        for scale in [0.001_f32, 0.01, 0.1, 1.0, 12.0, 100.0, 1.0e3, 1.0e4] {
+            let bias = Vec3::new(0.3 * scale, -0.2 * scale, 0.0);
+            let planar = ProfileCell::from_control_points(
+                Vec3::new(scale, scale, 0.0) + bias,
+                Vec3::new(-scale, scale, 0.0) + bias,
+                bias,
+            );
+            assert_eq!(
+                pipe_station_placement(Vec3::Y, &planar),
+                StationPlacement::Chord,
+                "a flat junction keeps the chord clamp at scale {scale}",
+            );
+            assert_eq!(
+                pipe_station_placement(Vec3::Z, &right_angle_cross_section(bias, scale)),
+                StationPlacement::Cell,
+                "a genuine tube keeps the cell path at scale {scale}",
             );
         }
     }
 
-    /// §8.5.5.5(f.6) planarity does not blind the gate to real pipes: a genuine tube stays
-    /// classified non-coplanar (predicate `false`) across the same radius band, since its
-    /// out-of-plane wrap is a fixed fraction of its own size at every scale.
+    /// §8.5.5.5(f.6): the verdict the (f.1) step-4 sentinel reads and the branch the replant
+    /// takes are **one** predicate, so they cannot disagree on a near-planar junction.
+    ///
+    /// This is the seam that a second, junction-wide planarity fit opened. Its tolerance was an
+    /// order of magnitude looser than the replant's own degeneracy floor, so a junction wobbling
+    /// out of plane by (say) `3e-4` of its size was classified planar — the sentinel let a
+    /// square-in grid through — while every station's own test found a cell and ran the snap.
+    /// At `profile = 0` that is not a small mis-placement: the snap's `r`-norm diverges and the
+    /// whole cap collapses onto the cell's `(0, 0)` corner.
+    ///
+    /// The ladder straddles the floor (`REPLANT_CELL_SHAPE_RATIO`, `1e-4` of the cell's extent)
+    /// and the probe is far out of the chord's span, so the two branches answer differently:
+    /// the chord clamps the probe to the band edge, the cell path at `r = 0` sends it to the
+    /// projected `start' + end' − mid'` corner, which for this cell is the band's *centre*.
     #[test]
-    fn pipe_tube_stays_non_coplanar_across_scales() {
-        for scale in [0.01_f32, 0.1, 1.0, 12.0, 100.0, 1.0e3, 1.0e4] {
-            assert!(
-                !junction_cross_sections_are_coplanar(&tube_at(scale)),
-                "a genuine tube stays non-coplanar at scale {scale}",
-            );
+    fn pipe_station_placement_is_the_branch_the_replant_takes() {
+        let offset = 0.2;
+        let probe = Vec3::new(-4.0 * offset, -0.0667, 0.0);
+        let mut seen_chord = false;
+        let mut seen_cell = false;
+        for wobble in [0.0_f32, 1.0e-6, 1.0e-5, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 0.1] {
+            let cell = near_planar_pipe_cell(offset, wobble);
+            let placement = pipe_station_placement(Vec3::Y, &cell);
+            let replanted = replant(probe, Vec3::Y, &cell, 0.0);
+            match placement {
+                StationPlacement::Chord => {
+                    seen_chord = true;
+                    assert!(
+                        (replanted.x + offset).abs() < 1.0e-6,
+                        "wobble {wobble} was classified chord but the replant did not clamp \
+                         to the band edge: {replanted:?}",
+                    );
+                }
+                StationPlacement::Cell => {
+                    seen_cell = true;
+                    assert!(
+                        replanted.x.abs() < 1.0e-6,
+                        "wobble {wobble} was classified cell but the replant did not take the \
+                         `r = 0` corner: {replanted:?}",
+                    );
+                }
+                StationPlacement::Point => panic!("the cross-section spans the band"),
+            }
+            // The station survives either way, so it cannot be what tells the branches apart.
+            assert!((replanted.y - probe.y).abs() < 1.0e-6, "station preserved at {wobble}");
         }
+        assert!(
+            seen_chord && seen_cell,
+            "the wobble ladder must straddle the floor, or the agreement claim is vacuous",
+        );
+        // The seam the old two-predicate shape opened, named: a junction well inside a `1e-3`
+        // relative planarity tolerance is *not* inside the replant's own, and the sentinel now
+        // sees exactly that.
+        assert_eq!(
+            pipe_station_placement(Vec3::Y, &near_planar_pipe_cell(offset, 3.0e-4)),
+            StationPlacement::Cell,
+        );
     }
 
-    /// BUG-1 regression (BEVEL.md §8.5.5.5(f.6) vs §8.3.4.1): a **flat/planar**
-    /// opposite-spokes junction trips the §8.3.4.1 pipe predicate, but its base ADJ grid is
-    /// already the constant cross-section — the (f.6) replant must be a no-op. The flat
-    /// valence-4 fan is 4-fold symmetric about the origin, so its interior verts stay in
-    /// `z = 0` and their centroid sits on the origin; the regression dragged every interior
-    /// vert onto a single boundvert chord, clustering them off-centre.
+    /// BEVEL.md §8.5.5.5(f.6) vs §8.3.4.1: a **flat/planar** opposite-spokes junction trips
+    /// the §8.3.4.1 pipe predicate and does replant, but at the default circular profile its
+    /// whole cross-section stays inside the `±offset` band, so the chord clamp is the identity
+    /// and the base grid stands. The flat valence-4 fan is 4-fold symmetric about the origin,
+    /// so its interior verts stay in `z = 0` and their centroid sits on the origin; the
+    /// regression this pins dragged every interior vert onto a single boundvert chord,
+    /// clustering them off-centre. It is deliberately *not* the pin for whether the clamp
+    /// runs — at this profile it cannot see the difference
+    /// ([`planar_pipe_circular_clamp_is_the_identity_and_square_in_is_not`]).
     #[test]
     fn planar_pipe_override_leaves_the_flat_grid_unmoved() {
         let offset = 0.2;
@@ -21505,15 +21722,15 @@ mod tests {
 
     /// A planar §8.3.4.1 pipe: the flat `spokes`-triangle fan with an anti-parallel opposite
     /// pair (and, at four spokes, two of them) beveled. Same predicate as the tented tube,
-    /// but the whole junction lies in `z = 0`, so `pipe_cross_section` declines it and no
-    /// (f.6) replant follows.
+    /// but the whole junction lies in `z = 0`, so its profile plane contains the pipe axis
+    /// and the (f.6) replant is the chord clamp at every station rather than the cell path.
     fn planar_fan_pipe_profile(
         beveled_spokes: &[usize],
         offset: f32,
         segments: u32,
         profile: f32,
     ) -> LoopMesh {
-        let (mut mesh, centre, rim) = planar_fan(12);
+        let (mut mesh, centre, rim) = planar_fan_axis_aligned(12);
         let geom: Vec<GeomKey> = beveled_spokes
             .iter()
             .map(|&k| mesh.query_edge_exists(centre, rim[k]).expect("spoke").into())
@@ -21537,12 +21754,14 @@ mod tests {
     /// a grid away from a replant that would resolve it through (f.2)'s unbuilt **branch S**.
     /// So it must be scoped to the junctions that actually replant — the genuine 3-D tube.
     ///
-    /// The §8.3.4.1 `pipe_override` predicate is the broader of the two: it also fires on the
-    /// **planar** anti-parallel configuration, where the whole junction lies in one plane, the
-    /// base grid already *is* the constant cross-section, and `pipe_cross_section` returns
-    /// `None` so no post-pass runs at all. Declining there protects nothing and drops a cap
-    /// the guide calls correct. The circular control fixes the expected topology: step 4's
-    /// grid is exponent-generic in its counts, so a filled sentinel matches it exactly.
+    /// The §8.3.4.1 `pipe_override` predicate is the broader of the two, and so is "a replant
+    /// follows": the **planar** anti-parallel configuration replants too, but its profile
+    /// plane contains the pipe axis, so the projected control triple is collinear at every
+    /// station and (f.6) step 4's chord clamp places every vert with no cell — hence no
+    /// branch S — in sight. Declining there protects nothing and drops the very grid the
+    /// clamp is applied to. The circular control fixes the expected topology: step 4's grid
+    /// is exponent-generic in its counts, so a filled sentinel matches it exactly (the clamp
+    /// moves verts, never counts — [`planar_pipe_square_in_clamps_the_replant_window`]).
     ///
     /// `segments` stays **odd**: the square sentinel on even `segments` is claimed by step 1's
     /// (f.5) parallel-offset ring before the carve-out is ever consulted, so it would not
@@ -21592,6 +21811,136 @@ mod tests {
                     "the 3-D tube still declines at profile {sentinel} (segments = {segments})",
                 );
             }
+        }
+    }
+
+    /// Whether `mesh` carries a vertex at `position`, to the `1e-5` position quantum.
+    fn mesh_holds_position(mesh: &LoopMesh, position: Vec3) -> bool {
+        mesh.vert_keys()
+            .into_iter()
+            .any(|vertex| (mesh.vertex_position(vertex) - position).abs().max_element() < 1.0e-5)
+    }
+
+    /// §8.5.5.5(f.6)'s worked planar case, at its own figures. A flat 12-spoke fan beveled on
+    /// four (valence 4) or three (valence 3) spokes at `offset = 0.2`, `profile = 0`
+    /// (square-in), read in the frame the guide states: the pipe axis is a coordinate
+    /// direction, and the clamped transverse coordinate is the other one.
+    ///
+    /// At a square-in exponent the profile degenerates onto the two cell edges through
+    /// §8.2.2.1's `(0, 0)` corner `start + end − mid`, which — the rescue having put `mid` at
+    /// the junction vertex — sits at `±2·offset` transverse on the two chains crossing the
+    /// **transverse** beveled edges. So the base grid leaves slots outside the `±offset`
+    /// band, and the replant clamps them back to the band edge *exactly* while the along-axis
+    /// coordinate survives to the last float. That one-coordinate-agrees-one-does-not shape is
+    /// the whole fingerprint of getting this wrong.
+    ///
+    /// The clamp is gated by [(f.6.1)]'s replant window like the cell path, so at
+    /// `segments = 3` only **one slot per chain** moves: of the four out-of-band slots, two
+    /// come back and two stay put, leaving the cap *less* symmetric than the fixture. A
+    /// whole-grid clamp moves all four and looks tidier.
+    ///
+    /// **Where each row's numbers come from.** Row 1 is the guide's own worked figure. The
+    /// other two are the same construction re-run, not readings off the implementation:
+    ///
+    /// - The chain crossing a transverse edge runs between the two boundverts flanking that
+    ///   edge; at square-in the profile degenerates onto the two cell edges through the `(0,0)`
+    ///   corner `start + end − mid`, which — the rescue having put `mid` at the junction vertex
+    ///   — is the junction vertex reflected through the chord's midpoint. On the valence-4 fan
+    ///   that corner is at `(∓0.4, 0)`, on the valence-3 fan at `(0, +0.4)`: `±2·offset`
+    ///   transverse either way.
+    /// - The `[S]` sampler walks that two-leg polyline uniformly, so sample `k` of `n` sits at
+    ///   cell coordinate `u = 1 − 2k/n` along the first leg. `n = 3` puts sample 1 at `u = 1/3`
+    ///   (the guide's own row), `n = 4` puts it at `u = 1/2` — i.e. at the leg's midpoint,
+    ///   `corner + ½·(start − corner)`, which for the valence-4 fan is `(−0.3, −0.1)`.
+    /// - The clamp then replaces the transverse coordinate by the nearest end of `[−0.2, 0.2]`
+    ///   and leaves the along-axis one alone, which is every row's second column.
+    ///
+    /// *Which* of the corner's two legs the (f.6.1) window reaches is the ring walk's, and only
+    /// that is a snapshot — the valence-4 rows pin the unreached leg explicitly below.
+    #[test]
+    fn planar_pipe_square_in_clamps_the_replant_window() {
+        let offset = 0.2;
+        // (spokes, segments, out-of-band slot, its clamped image). Valence 4 names the
+        // `90°/270°` pair as the axis, so its transverse coordinate is `x`; valence 3 has only
+        // the `0°/180°` pair, so its transverse coordinate is `y`.
+        let worked: [(&[usize], u32, Vec3, Vec3); 3] = [
+            (
+                &[1, 4, 7, 10],
+                3,
+                Vec3::new(-1.0 / 3.0, -1.0 / 15.0, 0.0),
+                Vec3::new(-offset, -1.0 / 15.0, 0.0),
+            ),
+            (
+                &[1, 4, 7, 10],
+                4,
+                Vec3::new(-0.3, -0.1, 0.0),
+                Vec3::new(-offset, -0.1, 0.0),
+            ),
+            (
+                &[1, 7, 4],
+                3,
+                Vec3::new(-1.0 / 15.0, 1.0 / 3.0, 0.0),
+                Vec3::new(-1.0 / 15.0, offset, 0.0),
+            ),
+        ];
+        for (spokes, segments, out_of_band, clamped) in worked {
+            let mesh = planar_fan_pipe_profile(spokes, offset, segments, 0.0);
+            assert!(
+                mesh_holds_position(&mesh, clamped),
+                "the replant clamped {out_of_band:?} onto the chord at {clamped:?} \
+                 (spokes {spokes:?}, segments = {segments})",
+            );
+            assert!(
+                !mesh_holds_position(&mesh, out_of_band),
+                "no vert is left outside the ±offset band at {out_of_band:?} \
+                 (spokes {spokes:?}, segments = {segments})",
+            );
+        }
+
+        // The window's other half: at valence 4, `segments = 3`, the four out-of-band slots are
+        // a single orbit of the fixture's own symmetry, and the window `{2}` admits one per
+        // chain — so the two the walk does *not* reach must still be sitting outside the band.
+        let mesh = planar_fan_pipe_profile(&[1, 4, 7, 10], offset, 3, 0.0);
+        for stranded in [
+            Vec3::new(1.0 / 3.0, -1.0 / 15.0, 0.0),
+            Vec3::new(-1.0 / 3.0, 1.0 / 15.0, 0.0),
+        ] {
+            assert!(
+                mesh_holds_position(&mesh, stranded),
+                "the replant window leaves {stranded:?} outside the band — clamping the whole \
+                 grid instead would return all four slots and over-symmetrise the cap",
+            );
+        }
+    }
+
+    /// §8.5.5.5(f.6): at a **circular** profile the planar junction's clamp is the identity —
+    /// the cross-section never leaves the `±offset` band, so every slot's nearest point on the
+    /// chord is the slot itself — while at a **concave** one it moves real verts. The
+    /// observable is the fixture's own 4-fold symmetry: the circular cap keeps it, the
+    /// square-in cap does not, because the (f.6.1) window admits one of each mirror pair.
+    ///
+    /// This is also why a check run at `profile = 0.5` cannot tell "the clamp ran" from "the
+    /// clamp was skipped", and is the wrong place to pin the planar replant.
+    #[test]
+    fn planar_pipe_circular_clamp_is_the_identity_and_square_in_is_not() {
+        let offset = 0.2;
+        let quarter_turn = |position: Vec3| Vec3::new(-position.y, position.x, position.z);
+        let symmetric = |mesh: &LoopMesh| {
+            mesh.vert_keys().into_iter().all(|vertex| {
+                mesh_holds_position(mesh, quarter_turn(mesh.vertex_position(vertex)))
+            })
+        };
+        for segments in [3u32, 5] {
+            assert!(
+                symmetric(&planar_fan_pipe_profile(&[1, 4, 7, 10], offset, segments, 0.5)),
+                "the circular planar pipe's clamp is inert, so the cap keeps the fixture's \
+                 4-fold symmetry (segments = {segments})",
+            );
+            assert!(
+                !symmetric(&planar_fan_pipe_profile(&[1, 4, 7, 10], offset, segments, 0.0)),
+                "the square-in planar pipe's clamp reaches one of each mirror pair, so the cap \
+                 breaks that symmetry (segments = {segments})",
+            );
         }
     }
 
@@ -43068,19 +43417,6 @@ const REPLANT_CELL_SHAPE_RATIO: f64 = 1.0e-4;
 /// noise as a curve and build a sliver cell out of it.
 const REPLANT_INPUT_ULP_RATIO: f64 = 4.0 * f32::EPSILON as f64;
 
-/// **Dimensionless** out-of-plane ratio below which a junction's cross-section control
-/// points are treated as coplanar — the §8.5.5.5(f.6) flat-vs-tube gate. The predicate
-/// divides each point's signed plane distance by the junction's characteristic size
-/// (its spanning extent off the origin), so the test is *scale-relative*: a genuine tube
-/// wraps its cross-section out of any plane by a fraction of the offset (order 0.1 of the
-/// junction's own size), while a flat §8.3.4.1 junction is coplanar to machine precision,
-/// so the two are separated by orders of magnitude and this ratio sits comfortably
-/// between them **at every offset**. An absolute world-unit floor would instead misfire
-/// at extreme offsets — a genuinely flat junction accumulates out-of-plane construction
-/// residual proportional to its extent, which crosses any fixed floor once the offset is
-/// large enough, wrongly re-firing the replant on a flat junction.
-const COPLANAR_JUNCTION_RELATIVE_TOLERANCE: f32 = 1.0e-3;
-
 /// (Anti)parallel tolerance on two unit plane **normals** for the §8.3.0.3 weld
 /// override's per-profile coplanarity skip: a profile whose projection plane already is
 /// the weld plane keeps its own normal.
@@ -45237,87 +45573,138 @@ fn snap_to_unit_superellipsoid(unit: Vec3, exponent: f32) -> Vec3 {
     scaled / norm
 }
 
-/// Whether every cross-section control point at a junction lies in one plane (BEVEL.md
-/// §8.5.5.5(f.6)) — the discriminator between the two junctions the §8.3.4.1 pipe predicate
-/// conflates:
+/// The §8.5.5.5(f.6) replant's shape at one pipe junction: the pipe axis, the pipe
+/// boundvert's cross-section cell, and which of (f.6)'s two placements every station takes.
+#[derive(Clone, Copy)]
+struct PipeCrossSection {
+    axis: Vec3,
+    cell: ProfileCell,
+    /// Which of (f.6)'s placements every vert in the domain takes. One value serves the whole
+    /// junction because the criterion is a property of the cell and the axis alone — the
+    /// station projection is an affine map, so it cannot vary from station to station — and
+    /// it is what both the (f.1) step-4 sentinel and the per-vert replant read. A
+    /// [`StationPlacement::Cell`] here is the only placement that reaches (f.2)'s surface
+    /// snap; a planar junction, whose profile plane contains the pipe axis, is
+    /// [`StationPlacement::Chord`].
+    placement: StationPlacement,
+}
+
+/// The §8.3.4.1 **pipe boundvert**'s two collinear spokes, as indices into the ring's
+/// per-sector spoke directions (BEVEL.md §8.3.4.1 condition 2 / §8.5.5.5(f.6)). The first
+/// returned index is the pipe boundvert's *own* edge; the second is its collinear opposite.
+/// Their shared line is the pipe axis. The §7.6.2 near-collinear window is 2°, so the two
+/// rays out of `v` meet at ≥ 178° (`cos ≤ −cos 2°`).
 ///
-/// - a **flat/planar** anti-parallel or wire-disk junction (coplanar): the base ADJ grid is
-///   already the constant cross-section, so the replant must decline;
-/// - a **genuine 3-D tube** (non-coplanar): its cross-section wraps out of any one plane, so
-///   the replant re-tiles the base grid onto it.
+/// The scan is over **boundverts**, not over spoke pairs, because that is the unit
+/// §8.3.4.1's condition is stated in: three *consecutive* boundverts whose edges' first and
+/// third are collinear, naming the first of the three. A boundvert's own edge is the one its
+/// own profile chain crosses — chain `B_i → B_(i+1)` (§8.2.2), which crosses the edge
+/// *closing* sector `i` — so boundvert `i` tests edges `i + 1` and `i + 3`.
 ///
-/// Planarity is used rather than "does the cross-section survive projection along the
-/// reported axis", because a rescued planar cell reports its *plane normal* as the axis
-/// (§8.2.2.1) — the one direction under which the flat cross-section would falsely survive.
-/// The junction's geometric planarity does not depend on that reported axis at all.
+/// That association is what makes (f.6) coherent rather than a labelling preference: the
+/// replant's shape is the pipe boundvert's **own** profile, and (f.6) puts that profile's
+/// chord endpoints at the pipe edge's two offsets on either side of the axis. Only under
+/// this reading does the named boundvert's own chain cross a *pipe* edge; under the other,
+/// it crosses a transverse edge, whose two boundverts share a transverse coordinate and
+/// differ only in station, so the projection that forgets the station collapses its
+/// cross-section to a single point.
 ///
-/// The test is **classification-preserving** across scale, not bit-identical: it separates a
-/// flat §8.3.4.1 junction from a genuine 3-D tube at every offset from ~0.01 to ~1e4. To hold
-/// that classification steady at large offsets — where a flat junction's construction residual
-/// grows with its extent and `f32` cancellation in `point − origin` grows with it too — the fit
-/// is centred and carried in `f64`:
+/// The distinction is invisible until a ring carries **two** collinear pairs — the flat
+/// 4-way cross — where it selects which pair is the axis and which is spanned by the
+/// cross-section.
 ///
-/// - deviations are measured off the point set's **centroid**, so conditioning no longer hinges
-///   on which point is first or on the junction's absolute world offset;
-/// - the centroid, the plane normal, and the deviation test all accumulate in `f64`, so the
-///   near-coplanar residual does not inflate through catastrophic cancellation at scale;
-/// - the normal is an area-weighted **Newell** consensus over the ordered point loop, not a
-///   single spanning pair, so no one ill-conditioned pair can set the plane. For a coplanar set
-///   every consecutive edge cross-product is parallel to the plane normal, so the Newell sum is
-///   exactly perpendicular to the plane regardless of loop ordering.
+/// **The scan is not over all `C(count, 2)` spoke pairs, and at `count == 4` that is
+/// count-bearing.** Reading §8.3.4.1's condition as *three consecutive* ring members makes it
+/// a ring-**distance-2** test: at `count == 3` every pair is at distance 2 (the three
+/// rotations name the same three pairs, and any of them yields the same axis line), but at
+/// `count == 4` the four ring-*adjacent* pairs are not tested at all. A valence-4 junction
+/// whose only anti-parallel pair is adjacent in the ring — e.g. beveled spokes at
+/// `0°, 30°, 60°, 180°` on a flat fan — therefore reports `None`, and the §8.3.4.1 override
+/// declines a junction an any-pair scan would have re-tiled. That is a change in `V`, `E` and
+/// `F`, not in positions ([`cutoff_pipe_override_declines_on_a_ring_adjacent_pair`]).
+fn pipe_boundvert_spokes(directions: &[Vec3]) -> Option<(usize, usize)> {
+    let near_collinear_cos = (2.0_f32.to_radians()).cos();
+    let count = directions.len();
+    (0..count)
+        .map(|boundvert| ((boundvert + 1) % count, (boundvert + 3) % count))
+        .find(|&(own, opposite)| {
+            own != opposite && directions[own].dot(directions[opposite]) <= -near_collinear_cos
+        })
+}
+
+/// Which of the §8.5.5.5(f.6) replant's three placements a pipe junction takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StationPlacement {
+    /// Step 4's first collapse: `start'` and `end'` coincide, so the cross-section is a
+    /// single point and every vert replants onto it.
+    Point,
+    /// Step 4's second collapse: the projected control triple is collinear, so the
+    /// cross-section is the closed chord `start'–end'` and every vert replants onto the
+    /// nearest point *of that segment*. The ordinary case at a planar §8.3.4.1 junction.
+    Chord,
+    /// Step 3: the projected triple spans a cell, so each vert resolves through the (f.2)
+    /// surface snap.
+    Cell,
+}
+
+/// Which placement (f.6)'s replant takes at a pipe junction, for the whole junction at once
+/// (BEVEL.md §8.5.5.5(f.6) steps 3–4).
 ///
-/// The comparison stays dimensionless — each deviation is judged against the junction's
-/// characteristic size (its greatest centroid offset) — so the threshold means the same fraction
-/// of extent at every scale.
-fn junction_cross_sections_are_coplanar(cells: &[ProfileCell]) -> bool {
-    let points: Vec<Vec3> = cells
-        .iter()
-        .flat_map(|cell| [cell.start, cell.end, cell.mid])
-        .collect();
-    if points.len() < 4 {
-        return true;
+/// The guide's criterion is **local and station-independent**: the projected triple is
+/// collinear exactly when the profile plane through `start`, `mid`, `end` is parallel to the
+/// pipe direction, since a plane containing the projection direction has a line for its image.
+/// The station projection differs from station to station only by a translation, and a
+/// translation moves no shape, so one verdict serves every vert in the domain — which is what
+/// lets the (f.1) step-4 sentinel ask this question *before* the base grid exists and get the
+/// answer the replant will act on. Deciding the two with separate predicates (say a
+/// junction-wide coplanarity fit for the sentinel and this test for the replant) puts a seam
+/// between them wherever their tolerances disagree, and a junction that falls in the seam
+/// gets a grid emitted for a placement that is not the one it takes.
+///
+/// The two collapses are judged against one floor, a length in the cell's own frame that is
+/// part shape ratio and part input resolution (see [`REPLANT_CELL_SHAPE_RATIO`] and
+/// [`REPLANT_INPUT_ULP_RATIO`]). It deliberately does **not** read the vert being replanted:
+/// a floor that moved with `base` would make the classification station-dependent again, in
+/// the one place where the guide says it cannot be.
+///
+/// Planarity is read off the cell's own control points rather than off `projection_dir`,
+/// because a rescued planar cell reports its *plane normal* there (§8.2.2.1) — the one
+/// direction under which a flat cross-section would falsely survive projection.
+///
+/// Being junction-wide, this is resolved **once** per pipe junction and carried on
+/// [`PipeCrossSection`]; the per-vert replant is handed the answer rather than re-deriving it
+/// for every slot it walks.
+fn pipe_station_placement(pipe_axis: Vec3, cell: &ProfileCell) -> StationPlacement {
+    let axis = pipe_axis.as_dvec3().normalize_or_zero();
+    let flatten = |offset: DVec3| offset - offset.dot(axis) * axis;
+    let a_axis = flatten(cell.mid.as_dvec3() - cell.start.as_dvec3());
+    let b_axis = flatten(cell.mid.as_dvec3() - cell.end.as_dvec3());
+    let span = flatten(cell.end.as_dvec3() - cell.start.as_dvec3());
+
+    let world_magnitude = cell
+        .start
+        .abs()
+        .max(cell.mid.abs())
+        .max(cell.end.abs())
+        .max_element() as f64;
+    let resolution = REPLANT_CELL_SHAPE_RATIO * a_axis.length().max(b_axis.length())
+        + REPLANT_INPUT_ULP_RATIO * world_magnitude;
+
+    if span.length() <= resolution {
+        return StationPlacement::Point;
     }
-    let deviations: Vec<DVec3> = {
-        let centroid = points
-            .iter()
-            .fold(DVec3::ZERO, |acc, &point| acc + point.as_dvec3())
-            / points.len() as f64;
-        points
-            .iter()
-            .map(|&point| point.as_dvec3() - centroid)
-            .collect()
-    };
-    // Characteristic size: the junction's greatest offset off its centroid. The out-of-plane
-    // deviation scales with this extent (roughly with the offset), so planarity is judged
-    // *relative* to it rather than against an absolute world-unit floor — otherwise a flat
-    // junction's extent-proportional construction residual would cross a fixed floor at large
-    // offsets and wrongly re-fire the replant.
-    let characteristic = deviations
-        .iter()
-        .map(|deviation| deviation.length())
-        .fold(0.0_f64, f64::max);
-    // All points coincident ⇒ trivially coplanar (a collapsed cross-section).
-    if characteristic <= COLLINEAR_MID_TOLERANCE as f64 {
-        return true;
+    // `|a_axis × b_axis|` is `|span|` times the sagitta, so the determinant test is the
+    // sagitta test. Cauchy–Schwarz makes it non-negative in exact arithmetic, which is what
+    // licenses testing it with no `.abs()`; it proves nothing about the divide the cell path
+    // then performs — that is settled by the strict inequality here, which clears the floor
+    // by eight orders before the solve is reached.
+    let aa = a_axis.dot(a_axis);
+    let ab = a_axis.dot(b_axis);
+    let bb = b_axis.dot(b_axis);
+    if aa * bb - ab * ab <= resolution * resolution * span.length_squared() {
+        return StationPlacement::Chord;
     }
-    // Newell area-weighted normal over the centred point loop.
-    let mut normal = DVec3::ZERO;
-    for i in 0..deviations.len() {
-        let current = deviations[i];
-        let next = deviations[(i + 1) % deviations.len()];
-        normal.x += (current.y - next.y) * (current.z + next.z);
-        normal.y += (current.z - next.z) * (current.x + next.x);
-        normal.z += (current.x - next.x) * (current.y + next.y);
-    }
-    // Every point collinear (or the loop's signed area cancels) ⇒ a vanishing normal relative to
-    // the junction's own squared extent ⇒ trivially coplanar (a degenerate cross-section chord).
-    if normal.length() <= COLLINEAR_MID_TOLERANCE as f64 * characteristic * characteristic {
-        return true;
-    }
-    let normal = normal / normal.length();
-    deviations.iter().all(|deviation| {
-        deviation.dot(normal).abs() <= COPLANAR_JUNCTION_RELATIVE_TOLERANCE as f64 * characteristic
-    })
+    StationPlacement::Cell
 }
 
 /// Re-plant one interior grid vert onto a pipe junction's constant cross-section
@@ -45369,6 +45756,7 @@ fn pipe_cross_section_replant(
     base: Vec3,
     pipe_axis: Vec3,
     cell: &ProfileCell,
+    placement: StationPlacement,
     exponent: f32,
 ) -> Vec3 {
     let axis = pipe_axis.as_dvec3().normalize_or_zero();
@@ -45386,43 +45774,38 @@ fn pipe_cross_section_replant(
     let b_axis = mid - end;
     let span = end - start;
 
-    // The floor both degeneracy exits are judged against: a length in the cell's own frame,
-    // part shape ratio and part input resolution (see the two constants).
-    let world_magnitude = cell
-        .start
-        .abs()
-        .max(cell.mid.abs())
-        .max(cell.end.abs())
-        .max(base.abs())
-        .max_element() as f64;
-    let resolution = REPLANT_CELL_SHAPE_RATIO * a_axis.length().max(b_axis.length())
-        + REPLANT_INPUT_ULP_RATIO * world_magnitude;
-
-    // Degenerate: the cross-section is a single point — every vert replants onto it.
-    if span.length() <= resolution {
-        return to_world(start);
-    }
-    // Degenerate: the projected control points are collinear (a flat-chamfer cross-section),
-    // so the curve is the chord `start'–end'` and the vert replants onto its nearest point.
-    // `|a_axis × b_axis|` is `|span|` times the sagitta, so this is the sagitta test.
-    let aa = a_axis.dot(a_axis);
-    let ab = a_axis.dot(b_axis);
-    let bb = b_axis.dot(b_axis);
-    let determinant = aa * bb - ab * ab;
-    if determinant <= resolution * resolution * span.length_squared() {
-        let along = (-start).dot(span) / span.length_squared();
-        return to_world(start + span * along.clamp(0.0, 1.0));
+    // `placement` is [`pipe_station_placement`]'s junction-wide verdict, resolved once by the
+    // caller — the same value the (f.1) step-4 sentinel read. Re-deciding it here from the
+    // centred projections would be a second predicate on the same question.
+    match placement {
+        // Degenerate: the cross-section is a single point — every vert replants onto it.
+        StationPlacement::Point => return to_world(start),
+        // Degenerate: the projected control points are collinear (a flat-chamfer
+        // cross-section, and the ordinary case at a planar junction), so the curve is the
+        // chord `start'–end'` and the vert replants onto its nearest point. The segment is
+        // closed, so this is a clamp and not a projection.
+        StationPlacement::Chord => {
+            let along = (-start).dot(span) / span.length_squared();
+            return to_world(start + span * along.clamp(0.0, 1.0));
+        }
+        StationPlacement::Cell => {}
     }
 
     // `base` in the planar cell's `(u, v)` frame (§8.2.2.1): solve
     // `base − origin = u·a_axis + v·b_axis` by the 2×2 normal equations, with the origin's
     // `start' + end' − mid'` folded into the centred right-hand side. `base` and the two axes
-    // are coplanar (the station plane), so the projection error is zero. The exit above is the
-    // divide guard as well as the classifier: it compares `determinant` against a product of
-    // squares, which is `>= 0`, so passing it leaves `determinant` strictly positive outright.
-    // That is why there is exactly one solve and one answer. (Cauchy–Schwarz is what makes the
-    // determinant non-negative in exact arithmetic, and so is what licenses testing it with no
-    // `.abs()`; it is an upper bound and proves nothing about the divide.)
+    // are coplanar (the station plane), so the projection error is zero. The classifier is the
+    // divide guard as well: a `Cell` verdict means the determinant cleared a floor that is
+    // itself a product of squares, by eight orders, and these centred axes differ from the
+    // ones it judged only by the rounding of a common translation.
+    let aa = a_axis.dot(a_axis);
+    let ab = a_axis.dot(b_axis);
+    let bb = b_axis.dot(b_axis);
+    let determinant = aa * bb - ab * ab;
+    debug_assert!(
+        determinant > 0.0,
+        "a `Cell` placement's centred determinant collapsed",
+    );
     let cell_offset = mid - start - end;
     let a_projection = a_axis.dot(cell_offset);
     let b_projection = b_axis.dot(cell_offset);
