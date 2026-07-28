@@ -8858,18 +8858,17 @@ impl LoopMesh {
             None => return endpoint,
         };
 
-        let sector_plane = match self.sector_plane_normal(face) {
-            Some(normal) => SectorPlane::Face(normal),
-            None => SectorPlane::NoFaceNormal {
-                reference: self.vertex_normal(vertex).normalize_or_zero(),
-            },
-        };
         let placement = terminal_leg_meet(TerminalLegMeet {
             endpoint,
             edge_out,
             leg_out,
+            // The far endpoints, so regime 1's doubled-back slide can take §4.1's guard:
+            // that clamp measures against the length of the edge actually being slid
+            // along, which the unit directions above no longer carry.
+            edge_far: self.edge_far_position(edge, vertex),
+            leg_far: self.edge_far_position(leg, vertex),
             leg_precedes_edge,
-            sector_plane,
+            sector_plane: SectorPlane::Face(self.sector_plane_normal(face)),
             offset,
         });
 
@@ -8914,20 +8913,23 @@ impl LoopMesh {
         }
     }
 
-    /// §7.5.1's **per-sector** quantity: the unit plane normal of the single face
+    /// §7.5.1's **per-sector** quantity: the plane normal of the single face
     /// filling the sector the meet is computed in. Never hoisted out of the per-sector
     /// loop and never averaged — the whole of §7.8 is the case where a mis-wound sector
     /// face and any endpoint-wide surrogate for it disagree.
     ///
-    /// `None` means the face's plane normal is **degenerate** (zero-area / fully
-    /// collinear boundary). It is *not* §7.5.1's "the sector has no face" condition:
-    /// `face` is a `FaceKey`, and both call paths pass one of the beveled edge's two
-    /// radial faces, so a face-less sector cannot reach here at all. The face-less case
-    /// is representable one level down, in `SectorPlane::NoFaceNormal`, and is
-    /// currently unreachable from the mesh side.
-    fn sector_plane_normal(&self, face: FaceKey) -> Option<Vec3> {
-        let normal = self.face_plane_normal(face);
-        (normal.length() > f32::EPSILON).then(|| normal.normalize())
+    /// The face's normal is taken **directly** — §7.5.1's source 1 does not inspect what
+    /// it took — so a **zero-area** face yields the zero vector rather than a substitute.
+    /// That is not a defect to be repaired one level up: the regime-1 push builds its
+    /// perpendicular in this plane, and a zero plane normal is what collapses the push
+    /// onto the endpoint. Falling through to the vertex normal here would be §7.5.1's
+    /// source 3, which is reserved for a sector with **no face at all** — a condition
+    /// this signature cannot express, since `face` is a `FaceKey` and both call paths
+    /// pass one of the beveled edge's two radial faces. That face-less case is
+    /// representable one level down, in `SectorPlane::NoFaceNormal`, and is currently
+    /// unreachable from the mesh side.
+    fn sector_plane_normal(&self, face: FaceKey) -> Vec3 {
+        self.face_newell_normal(face).unwrap_or(Vec3::ZERO)
     }
 
     /// §7.5.1 "surface normal at the terminal" / §8.8 junction `n_v`: the outward
@@ -9239,7 +9241,14 @@ impl LoopMesh {
             // perpendicular leg to take. This is the one branch of the meet ladder
             // that degenerates into a plain slide, so it — unlike the line solves
             // below — takes §4.1's guard rather than §7.5.2's span clamp.
-            return self.slide_along_incident_edge(vertex, sector.bounding_edges[0], offset);
+            //
+            // The slide runs along the **second** flanking edge (§7.6.2's doubled-back
+            // bullet), the one whose direction was taken out of `v`. Not the first, not
+            // the beveled one, not the shorter: the second. Both halves of that matter —
+            // the two edges are only near-collinear, so the first gives a visibly
+            // different direction, and §4.1's clamp measures against *this* edge's
+            // length, so a wrong pick lands `5e-5` short of the wrong vertex.
+            return self.slide_along_incident_edge(vertex, sector.bounding_edges[1], offset);
         }
 
         // Build the two offset lines as point-plus-direction (§7.6.2 "Building the
@@ -9456,6 +9465,38 @@ impl LoopMesh {
             });
         }
 
+        // §7.6.2's three-source precedence for the ladder's plane normal, each source
+        // tried only when the previous one is unavailable:
+        //
+        //   1. the sector's own nominated face — the face just forward of the first
+        //      flanking edge — taken **directly**. It does not inspect what it took, so
+        //      a zero-area face's zero normal flows straight through and collapses the
+        //      straight-through push onto `v`; substituting an axis there pushes a whole
+        //      `offset` off-axis instead. Available for cases 1 and 2, where one face
+        //      fills the sector.
+        //   2. otherwise (case 3, no single face fills the sector) the mean of the
+        //      forward-face normals over the same walk the face-drop uses. The divisor is
+        //      inert — only the sum's direction survives the cross and normalisation —
+        //      so the contributions are summed unweighted and left un-averaged.
+        //   3. otherwise the vertex normal, when no face in the span contributes one.
+        let sector_normal = if has_out_of_plane {
+            let mut accumulated = Vec3::ZERO;
+            let mut contributors = 0_usize;
+            for &face in &faces {
+                if let Some(normal) = self.face_newell_normal(face) {
+                    accumulated += normal;
+                    contributors += 1;
+                }
+            }
+            if contributors == 0 {
+                self.vertex_normal(vertex).normalize_or_zero()
+            } else {
+                accumulated
+            }
+        } else {
+            self.face_newell_normal(face_first).unwrap_or(Vec3::ZERO)
+        };
+
         Some(SectorLayout {
             dir_first,
             dir_second,
@@ -9463,6 +9504,7 @@ impl LoopMesh {
             perp_second,
             normal_first,
             normal_second,
+            sector_normal,
             drop_candidates,
             non_planar: has_out_of_plane,
         })
@@ -9582,18 +9624,15 @@ impl LoopMesh {
         if common == Vec3::ZERO {
             return vertex_position;
         }
-        let normal = layout.normal_first;
-        let mut perpendicular = common.cross(normal);
-        let length = perpendicular.length();
-        if length <= f32::EPSILON {
-            // The averaged direction lies along the plane normal: reuse the first
-            // line's already-oriented perpendicular rather than a degenerate cross.
-            perpendicular = layout.perp_first;
-        } else {
-            perpendicular /= length;
-            if perpendicular.dot(layout.perp_first) < 0.0 {
-                perpendicular = -perpendicular;
-            }
+        // The perpendicular has **no rescue**: what absorbs a degenerate input is the
+        // zero-returning normalisation itself (§7.6.2), not a substitute normal. When the
+        // cross vanishes — which on this branch always means a zero sector normal, since
+        // `common` cannot cancel here — the push scales the zero vector and the meet lands
+        // exactly on `v`. That is the reference's answer for a zero-area sector face, and
+        // rescuing it instead moves the boundvert by a whole `offset`.
+        let mut perpendicular = normalise_at_direction_floor(common.cross(layout.sector_normal));
+        if perpendicular.dot(layout.perp_first) < 0.0 {
+            perpendicular = -perpendicular;
         }
         let cos_half = ((1.0 + cos_dir) * 0.5).max(0.0).sqrt();
         let distance = if cos_half > f32::EPSILON {
@@ -9780,18 +9819,26 @@ impl LoopMesh {
     /// §4.1's overshoot guard.
     ///
     /// Every on-edge slide in the edge-bevel builders goes through here. The two
-    /// **meet** solves (the terminal leg meet of §7.5.1 and the junction meet of
+    /// **line solves** (the terminal leg meet of §7.5.1 and the junction meet of
     /// §7.6.2) deliberately do not: they take a distance along no edge, so there
     /// is nothing to hand this, and their overshoot is §7.5.2's span clamp — which
-    /// snaps *onto* the endpoint where this lands short of it.
+    /// snaps *onto* the endpoint where this lands short of it. Their shared
+    /// near-collinear ladder is the exception that proves it: its doubled-back branch
+    /// solves no lines and *is* a plain slide, so it comes here (at a terminal, via
+    /// `slide_along_edge` directly) and lands short like any other.
     fn slide_along_incident_edge(&self, vertex: VertexKey, edge: EdgeKey, distance: f32) -> Vec3 {
-        let [a, b] = self.edge_vert_keys(edge);
-        let far = if a == vertex { b } else { a };
         slide_along_edge(
             self.vertex_position(vertex),
-            self.vertex_position(far),
+            self.edge_far_position(edge, vertex),
             distance,
         )
+    }
+
+    /// The position of `edge`'s **other** endpoint, seen from `vertex` — the `far` every
+    /// §4.1 slide is measured against.
+    fn edge_far_position(&self, edge: EdgeKey, vertex: VertexKey) -> Vec3 {
+        let [a, b] = self.edge_vert_keys(edge);
+        self.vertex_position(if a == vertex { b } else { a })
     }
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
@@ -14431,6 +14478,12 @@ struct SectorLayout {
     perp_second: Vec3,
     normal_first: Vec3,
     normal_second: Vec3,
+    /// §7.6.2's plane normal for the **near-collinear ladder** only — a different
+    /// quantity from the sign-fixed `normal_first`/`normal_second` the offset lines are
+    /// built about, resolved by the guide's three-source precedence and, at source 1,
+    /// taken *directly* from the sector's own face. A zero-area face therefore hands
+    /// over the zero vector instead of a substitute.
+    sector_normal: Vec3,
     /// The §7.6.2 face-drop walk, in disk order (one entry per sector face, starting
     /// at the face just forward of `g_k`).
     drop_candidates: Vec<DropCandidate>,
@@ -34320,6 +34373,158 @@ mod tests {
         );
     }
 
+    /// A flat closed fan about `v = (0,0,0)` whose spokes `A = (−2,0,0)` and
+    /// `B = (−3,0.02,0)` leave `v` `0.382°` apart, so the sector they flank is a
+    /// near-zero-area sliver (`θ_dir ≈ 179.618°`) — the only doubled-back sector in the
+    /// fan. `C = (1,0,0)` and the unbeveled leg `D = (0,−1,0)` close it. The two sliver
+    /// spokes deliberately differ in **length** (`2` vs `3.00007`) as well as in bearing,
+    /// so sliding along the wrong one of the pair is visible twice over: in the direction,
+    /// and in the length §4.1's clamp is measured against.
+    fn sliver_sector_fan() -> (LoopMesh, VertexKey, [VertexKey; 4]) {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let a = mesh.create_vertex(Vec3::new(-2.0, 0.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(-3.0, 0.02, 0.0));
+        let c = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let d = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        // Disk order by bearing at `v`: C (0°), B (179.045°), A (180°), D (270°).
+        mesh.face_create_verts(&[v, c, b], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, b, a], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, a, d], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, d, c], FaceCreateFlags::NONE);
+        (mesh, v, [a, b, c, d])
+    }
+
+    /// BEVEL.md §7.6.2's doubled-back bullet: the slide runs along the **second** flanking
+    /// edge of the ordered pair — the disk successor, whose direction was taken out of `v`
+    /// — and *not* the first. Both halves of that are asserted, because §4.1's clamp reads
+    /// the second edge's far endpoint: at `offset = 0.5` the two candidates differ only in
+    /// direction, and at `offset = 2.5` they differ in whether the clamp fires at all
+    /// (`A` is `2` long, `B` is `3.00042`).
+    ///
+    /// The disk walk's direction is not canonical, so the expectation is stated against
+    /// `bounding_edges[1]` rather than against `A` or `B` by name — which is exactly the
+    /// rule, and is what the guide's winding-reversal witness pins.
+    #[test]
+    fn junction_doubled_back_meet_slides_along_the_second_flanking_edge() {
+        let (mesh, v, [a, b, c, _d]) = sliver_sector_fan();
+        let v_pos = mesh.vertex_position(v);
+        let spokes: Vec<EdgeKey> = [a, b, c]
+            .iter()
+            .map(|&far| mesh.query_edge_exists(v, far).expect("beveled spoke"))
+            .collect();
+        let is_beveled = |edge: EdgeKey| spokes.contains(&edge);
+
+        let corners = mesh.vertex_bevel_corner_ring(v, &is_beveled);
+        let edge_a = mesh.query_edge_exists(v, a).expect("spoke A");
+        let edge_b = mesh.query_edge_exists(v, b).expect("spoke B");
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| {
+                s.bounding_edges.len() == 2
+                    && s.bounding_edges.contains(&edge_a)
+                    && s.bounding_edges.contains(&edge_b)
+            })
+            .expect("the A↔B sliver sector");
+
+        let first = sector.bounding_edges[0];
+        let second = sector.bounding_edges[1];
+        for offset in [0.5_f32, 2.5] {
+            let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+            let along_second = mesh.slide_along_incident_edge(v, second, offset);
+            let along_first = mesh.slide_along_incident_edge(v, first, offset);
+            assert!(
+                (meet - along_second).length() < 1.0e-6,
+                "at offset {offset} the doubled-back meet must slide along the second \
+                 flanking edge: {meet:?} vs {along_second:?}",
+            );
+            assert!(
+                (along_second - along_first).length() > 1.0e-3,
+                "fixture sanity: the two candidate edges must give different answers",
+            );
+        }
+
+        // Past both spokes' lengths the clamp certainly fires, and it lands `5e-5` short
+        // of the **second** edge's far endpoint. The two spokes are a whole unit apart in
+        // length, so a slide clamped against the first would miss by ~1.
+        let second_length = (mesh.edge_far_position(second, v) - v_pos).length();
+        let first_length = (mesh.edge_far_position(first, v) - v_pos).length();
+        let travelled = (mesh.solve_meet_point(v, v_pos, &sector, 5.0) - v_pos).length();
+        assert!(
+            (travelled - (second_length - SLIDE_CLAMP_GAP)).abs() < 1.0e-5,
+            "the doubled-back slide is clamped against the *second* edge's length \
+             ({second_length}), travelled {travelled}",
+        );
+        assert!(
+            (first_length - second_length).abs() > 0.5,
+            "fixture sanity: the two spokes' lengths must discriminate the clamp target",
+        );
+    }
+
+    /// BEVEL.md §7.6.2's `#zero-area-sector-collapse`: source 1 of the ladder's normal
+    /// takes the sector's own face normal **directly**, so a zero-area face hands over the
+    /// zero vector, `common × sector_normal` is zero, the zero-returning normalisation
+    /// leaves it zero, and the straight-through push lands the boundvert **exactly on
+    /// `v`**. Substituting an axis (or the vertex normal, or a neighbour's) instead moves
+    /// it a whole `offset` off-axis — the failure mode this pins.
+    ///
+    /// Four collinear verts on the `x` axis, closed by two zero-area triangles sharing
+    /// `{v, right}`: beveling `{v, right}` and `{v, left}` makes the sector between them
+    /// straight through (`θ_dir = 0`) with a zero-area sector face.
+    #[test]
+    fn junction_zero_area_sector_push_collapses_onto_the_vertex() {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let right = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let left = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let far_right = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        mesh.face_create_verts(&[v, right, left], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, right, far_right], FaceCreateFlags::NONE);
+
+        let v_pos = mesh.vertex_position(v);
+        let edge_right = mesh.query_edge_exists(v, right).expect("E");
+        let edge_left = mesh
+            .query_edge_exists(v, left)
+            .expect("the collinear spoke");
+        let is_beveled = |edge: EdgeKey| edge == edge_right || edge == edge_left;
+
+        let corners = mesh.vertex_bevel_corner_ring(v, &is_beveled);
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| {
+                s.bounding_edges.len() == 2
+                    && s.bounding_edges.contains(&edge_right)
+                    && s.bounding_edges.contains(&edge_left)
+            })
+            .expect("the straight-through sector");
+        let layout = mesh
+            .sector_layout(v, v_pos, &sector)
+            .expect("a two-flank sector has a layout");
+
+        assert_eq!(
+            layout.sector_normal,
+            Vec3::ZERO,
+            "the ladder's normal is the zero-area face's own, taken directly",
+        );
+
+        let offset = 0.1;
+        let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+        assert!(
+            meet.is_finite(),
+            "a zero normal must not produce a non-finite coordinate, got {meet:?}",
+        );
+        assert_eq!(
+            meet, v_pos,
+            "the straight-through push collapses exactly onto `v`",
+        );
+        // The rescued reading — an axis substituted for the degenerate face normal —
+        // would land a whole `offset` away, which is what the assertion above excludes.
+        assert!(
+            (meet - v_pos).length() < offset * 0.5,
+            "a rescued normal would push the full offset off-axis",
+        );
+    }
+
     /// A hexagonal bipyramid: 6 rim verts on the unit circle at `z = 0`, a top apex
     /// `(0,0,1)` and a bottom apex `(0,0,-1)`, closed by 12 triangles. Each rim vert
     /// is a valence-4 terminal (one top spoke, two rim edges, one bottom spoke).
@@ -43255,6 +43460,8 @@ mod tests {
             endpoint,
             edge_out,
             leg_out,
+            edge_far: endpoint + edge_out,
+            leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
             sector_plane,
             offset,
@@ -43327,8 +43534,9 @@ mod tests {
     /// product, oriented by the fallback reference.
     ///
     /// This pins the *function's* behaviour, not a state the operator can reach today:
-    /// `terminal_strip_vert` only ever produces `NoFaceNormal` from a degenerate sector
-    /// face plane, never from §7.5.1's genuinely face-less sector.
+    /// `terminal_strip_vert` is always handed one of `E`'s radial faces, and a
+    /// **degenerate** one of those stays a `Face` carrying the zero normal (§7.5.1's
+    /// source 1 is a direct take) rather than falling through to here.
     #[test]
     fn terminal_leg_meet_shallow_direction_angle_falls_through_without_a_sector_plane_normal() {
         let offset = 0.25;
@@ -43554,6 +43762,8 @@ mod tests {
                     endpoint,
                     edge_out,
                     leg_out,
+                    edge_far: endpoint + edge_out,
+                    leg_far: endpoint + leg_out,
                     leg_precedes_edge,
                     sector_plane: SectorPlane::Face(sector_normal),
                     offset,
@@ -43571,6 +43781,185 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The doubled-back half of regime 1 is a **plain on-edge slide**, so it routes
+    /// through §4.1's shared primitive like every other slide in the operator — and the
+    /// clamp is therefore measured against the length of the edge actually slid along,
+    /// the pair's **second** member. §7.5.2's span clamp stays out of it (it is armed on
+    /// a *meet*, and regime 1 solves no lines), so this is the guard.
+    ///
+    /// The frame gives `E` length `0.3` and the leg length `1.0`, and asks for `0.5`: with
+    /// the leg first the slide runs along `E` and overshoots, landing `5e-5` short of `E`'s
+    /// far end; with `E` first it runs along the leg and fits, sliding the full `0.5`. One
+    /// offset, one geometry, two landings — which is what makes the clamp's target visible.
+    #[test]
+    fn terminal_doubled_back_slide_is_clamped_against_the_second_edge() {
+        let offset = 0.5;
+        let endpoint = Vec3::new(-1.0, 2.0, 0.5);
+        let sector_normal = Vec3::new(0.0, 0.55, 1.0).normalize();
+        let edge_length = 0.3;
+        let leg_length = 1.0;
+        for direction_angle_deg in [178.1_f32, 179.5, 180.0] {
+            let alpha = direction_angle_deg.to_radians();
+            let edge_out = Vec3::X;
+            let leg_out = Vec3::new(-alpha.cos(), alpha.sin(), 0.0);
+            let edge_far = endpoint + edge_out * edge_length;
+            let leg_far = endpoint + leg_out * leg_length;
+            for (leg_precedes_edge, second_out, second_length) in
+                [(true, edge_out, edge_length), (false, leg_out, leg_length)]
+            {
+                let placement = terminal_leg_meet(TerminalLegMeet {
+                    endpoint,
+                    edge_out,
+                    leg_out,
+                    edge_far,
+                    leg_far,
+                    leg_precedes_edge,
+                    sector_plane: SectorPlane::Face(sector_normal),
+                    offset,
+                })
+                .position();
+
+                let travelled = if offset > second_length {
+                    second_length - SLIDE_CLAMP_GAP
+                } else {
+                    offset
+                };
+                let expected = endpoint + second_out * travelled;
+                assert!(
+                    (placement - expected).length() < 1.0e-6,
+                    "at {direction_angle_deg}° (leg first = {leg_precedes_edge}) the slide \
+                     should land at {expected:?}, got {placement:?}",
+                );
+                // The clamp lands *short* of the far endpoint by the absolute gap — it
+                // does not snap onto it, which is the §7.5.2 rule for a different family.
+                if offset > second_length {
+                    let far = endpoint + second_out * second_length;
+                    assert!(
+                        ((far - placement).length() - SLIDE_CLAMP_GAP).abs() < 1.0e-7,
+                        "the clamped slide must stop exactly {SLIDE_CLAMP_GAP} short of \
+                         the second edge's far endpoint",
+                    );
+                }
+            }
+        }
+    }
+
+    /// BEVEL.md §7.6.2's `#zero-area-sector-collapse`, on the terminal side of the same
+    /// ladder: §7.5.1's `reference` takes the sector face's normal **directly**, so a
+    /// zero-area face hands over the zero vector, the cross with the common direction is
+    /// zero, and the zero-returning normalisation leaves the straight-through push with
+    /// nothing to scale — the strip vert stays **exactly on the endpoint**.
+    ///
+    /// The likeliest mis-implementation is not a rescued normal but a non-finite
+    /// coordinate, so finiteness is asserted separately from the position.
+    #[test]
+    fn terminal_zero_area_sector_push_collapses_onto_the_endpoint() {
+        let offset = 0.25;
+        let endpoint = Vec3::new(0.3, -0.7, 1.1);
+        let edge_out = Vec3::X;
+        for direction_angle_deg in [0.0_f32, 1.0, 1.9] {
+            let alpha = direction_angle_deg.to_radians();
+            let leg_out = Vec3::new(-alpha.cos(), alpha.sin(), 0.0);
+            let placement = leg_meet(
+                endpoint,
+                edge_out,
+                leg_out,
+                SectorPlane::Face(Vec3::ZERO),
+                offset,
+            );
+
+            assert!(
+                placement.is_finite(),
+                "a zero-area sector face must not produce a non-finite coordinate at \
+                 {direction_angle_deg}°, got {placement:?}",
+            );
+            assert_eq!(
+                placement, endpoint,
+                "at {direction_angle_deg}° the collapsed push must stay on the endpoint",
+            );
+
+            // With a usable sector plane the same frame pushes a whole `offset` out —
+            // which is the distance a rescued normal would put between the two readings.
+            let rescued = leg_meet(
+                endpoint,
+                edge_out,
+                leg_out,
+                SectorPlane::Face(Vec3::Z),
+                offset,
+            );
+            assert!(
+                (rescued - endpoint).length() > offset * 0.9,
+                "fixture sanity: a substituted normal would move the strip vert",
+            );
+        }
+    }
+
+    /// The whole of BEVEL.md §7.6.2's near-collinear ladder, driven through the operator
+    /// on the degenerate strip the `#zero-area-sector-collapse` pin names: four collinear
+    /// verts closed by two **zero-area** triangles sharing `{v0, v1}`. Beveling that edge
+    /// gives each endpoint one doubled-back sector and one straight-through sector — the
+    /// split "What varies within one vertex" describes — so both halves of the ladder run
+    /// on one mesh, and both faces being zero-area collapses both pushes:
+    ///
+    /// ```text
+    ///    at v = (0,0,0):   slide → (0.1, 0, 0)   push → (0, 0, 0)   ← ON v
+    ///    at v = (2,0,0):   slide → (1.9, 0, 0)   push → (2, 0, 0)   ← ON v
+    /// ```
+    ///
+    /// The two collapsed verts land on the original coordinates, so the mesh is easy to
+    /// misread as "the endpoints survived" — they did not; they were consumed and replaced
+    /// by strip verts that happen to land there. A rescued normal reads `(0, ±0.1, 0)` and
+    /// `(2, ±0.1, 0)` instead, one whole offset off-axis, with `V`/`E`/`F` unchanged —
+    /// which is what the off-axis assertion below excludes.
+    #[test]
+    fn bevel_edge_zero_area_collinear_strip_collapses_both_pushes_onto_the_endpoints() {
+        let mut mesh = LoopMesh::new();
+        let v0 = mesh.create_vertex(Vec3::ZERO);
+        let v1 = mesh.create_vertex(Vec3::new(2.0, 0.0, 0.0));
+        let left_ear = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let right_ear = mesh.create_vertex(Vec3::new(3.0, 0.0, 0.0));
+        mesh.face_create_verts(&[v0, v1, left_ear], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v1, v0, right_ear], FaceCreateFlags::NONE);
+        let beveled = mesh.query_edge_exists(v0, v1).expect("the shared edge");
+
+        mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset: 0.1,
+                segments: 1,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let positions: Vec<Vec3> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|vertex| mesh.vertex_position(vertex))
+            .collect();
+        assert!(
+            positions.iter().all(|p| p.is_finite()),
+            "the collapsed pushes must not emit a non-finite coordinate: {positions:?}",
+        );
+        for expected in [
+            Vec3::new(0.1, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(1.9, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ] {
+            assert!(
+                positions.iter().any(|&p| (p - expected).length() < 1.0e-5),
+                "the ladder should place a vert at {expected:?}; got {positions:?}",
+            );
+        }
+        assert!(
+            positions
+                .iter()
+                .all(|p| p.y.abs() < 1.0e-5 && p.z.abs() < 1.0e-5),
+            "a collapsed push moves nothing off the common line; got {positions:?}",
+        );
     }
 
     fn distance_from_line(point: Vec3, base: Vec3, direction: Vec3) -> f32 {
@@ -43595,6 +43984,8 @@ mod tests {
             endpoint,
             edge_out,
             leg_out,
+            edge_far: endpoint + edge_out,
+            leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
@@ -43604,6 +43995,8 @@ mod tests {
             endpoint,
             edge_out,
             leg_out,
+            edge_far: endpoint + edge_out,
+            leg_far: endpoint + leg_out,
             leg_precedes_edge: false,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
@@ -43658,6 +44051,8 @@ mod tests {
             endpoint,
             edge_out,
             leg_out,
+            edge_far: endpoint + edge_out,
+            leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
             sector_plane: SectorPlane::Face(sector_normal),
             offset,
@@ -44593,6 +44988,22 @@ const SLIDE_CLAMP_GAP: f32 = 5.0e-5;
 /// rather than emitting a non-finite coordinate.
 const SLIDE_DIRECTION_FLOOR_SQ: f32 = 1.0e-35;
 
+/// BEVEL.md §7.6.2's document-wide `normalise`: the unit vector, or the **zero**
+/// vector at or below the shared direction floor. Never a non-finite coordinate, and
+/// never a substituted axis — a caller that scales this by a distance therefore
+/// leaves its base point exactly where it was, which is the derived (not stipulated)
+/// answer for a degenerate input on both halves of the near-collinear ladder.
+///
+/// The floor is [`SLIDE_DIRECTION_FLOOR_SQ`], stated on the squared length, and it is
+/// the same constant §4.1 states for the slide direction.
+fn normalise_at_direction_floor(vector: Vec3) -> Vec3 {
+    if vector.length_squared() > SLIDE_DIRECTION_FLOOR_SQ {
+        vector.normalize()
+    } else {
+        Vec3::ZERO
+    }
+}
+
 /// The one shared slide primitive (BEVEL.md §4.1): place a vertex `distance` from
 /// `vertex` along the edge running to `far`.
 ///
@@ -44919,6 +45330,7 @@ fn degenerate_terminal_placement(
     endpoint: Vec3,
     first_dir: Vec3,
     second_dir: Vec3,
+    second_far: Vec3,
     direction_angle: f32,
     sector_normal: Vec3,
     offset: f32,
@@ -44928,18 +45340,26 @@ fn degenerate_terminal_placement(
         // one another, so the chamfer runs into a zero-area sliver with no wedge to
         // bisect. The meet sits on the common line, slid out along the *second* edge —
         // there is no perpendicular component to take.
-        return endpoint + second_dir.normalize_or_zero() * offset;
+        //
+        // This is a plain on-edge slide, so it goes through §4.1's shared primitive and
+        // inherits the whole of it: the strict overshoot trigger against the *second*
+        // edge's own length, the absolute `5e-5` landing, the sub-gap reflection and the
+        // land-on-the-endpoint regime at the direction floor. It is exempt from §7.5.2's
+        // span clamp (which is armed on a meet, and no meet ran here) but not from this
+        // one.
+        return slide_along_edge(endpoint, second_far, offset);
     }
 
     // Straight through: both offset lines get pushed the same way and land on top of
     // each other, so the meet goes square to the common direction instead.
+    //
+    // No rescue guards the cross product: the zero-returning normalisation is what
+    // absorbs a degenerate input, so a zero sector normal — which is exactly what a
+    // **zero-area** sector face hands over, source 1 being a direct take — scales the
+    // push by the zero vector and leaves the strip vert on the endpoint. Substituting an
+    // axis or the vertex normal there would push it a full `offset` off-axis instead.
     let common_direction = first_dir + second_dir;
-    let perpendicular = common_direction.cross(sector_normal).normalize_or_zero();
-    if perpendicular == Vec3::ZERO {
-        // The edges run square to the sector's own plane, so the plane names no
-        // sideways direction to push along. Degenerate input, not a reachable regime.
-        return endpoint;
-    }
+    let perpendicular = normalise_at_direction_floor(common_direction.cross(sector_normal));
     endpoint + perpendicular * (offset / (direction_angle * 0.5).cos())
 }
 
@@ -44948,10 +45368,12 @@ fn degenerate_terminal_placement(
 /// *are* the same vector, and without one there is no candidate plane normal at all —
 /// only a reference for the sign test.
 ///
-/// `NoFaceNormal` covers two things §7.5.1 keeps separate but which land on the same
-/// path: the guide's genuine face-less sector, and a sector face whose plane normal is
-/// degenerate. Only the latter is reachable from `terminal_strip_vert`, whose `face`
-/// argument is always one of `E`'s two radial faces.
+/// `NoFaceNormal` is §7.5.1's genuinely face-less sector, and only that. A sector face
+/// whose plane normal is **degenerate** does *not* come here: source 1 takes the face's
+/// normal directly, zero and all, so it stays a `Face` — the fallback is keyed on the
+/// sector having no face, not on the normal being usable. Nothing reaches this variant
+/// from `terminal_strip_vert`, whose `face` argument is always one of `E`'s two radial
+/// faces.
 #[derive(Clone, Copy)]
 enum SectorPlane {
     Face(Vec3),
@@ -44974,6 +45396,12 @@ struct TerminalLegMeet {
     endpoint: Vec3,
     edge_out: Vec3,
     leg_out: Vec3,
+    /// `E`'s far endpoint, and the leg's. Only regime 1's doubled-back slide reads
+    /// them — every other placement here is a line solve, which needs the directions
+    /// alone — but that slide is a §4.1 slide like any other, so it is clamped against
+    /// the length of whichever of the two it runs along.
+    edge_far: Vec3,
+    leg_far: Vec3,
     leg_precedes_edge: bool,
     sector_plane: SectorPlane,
     offset: f32,
@@ -45018,6 +45446,8 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         endpoint,
         edge_out,
         leg_out,
+        edge_far,
+        leg_far,
         leg_precedes_edge,
         sector_plane,
         offset,
@@ -45038,6 +45468,10 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
 
     let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
     let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
+    // The doubled-back slide runs along the pair's **second** member, so that is the
+    // edge §4.1's clamp is measured against — `E` on the (leg, E) side and the leg
+    // itself on the (E, leg) side.
+    let second_far = if leg_precedes_edge { edge_far } else { leg_far };
 
     // §7.5.1 regime 1 (near-degenerate direction angle): no meet plane is well defined,
     // so neither offset line is built and no line solve runs. §7.5.1 returns this ahead
@@ -45047,6 +45481,7 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
             endpoint,
             first_dir,
             second_dir,
+            second_far,
             direction_angle,
             // The sector normal, in regime 1's own role: the plane the perpendicular is
             // built *in*. The face-less fallback is already folded into `reference()`.
@@ -45080,6 +45515,7 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
                     endpoint,
                     first_dir,
                     second_dir,
+                    second_far,
                     direction_angle,
                     sector_plane.reference(),
                     offset,
@@ -45133,6 +45569,7 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
             endpoint,
             first_dir,
             second_dir,
+            second_far,
             direction_angle,
             sector_plane.reference(),
             offset,
