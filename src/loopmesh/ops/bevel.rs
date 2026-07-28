@@ -3350,8 +3350,9 @@ impl LoopMesh {
         // Phase 4: the junction fill — flat cut (§8.3.2 / §8.3.4) or rounded
         // adjacency grid (§8.5), per `vmesh_method`. ADJ fills the cube corner (any
         // `segments`) and the general valence-`s` corner at every exponent (§8.5.5.5, and
-        // (f.1) step 4's ungated fullness grid); §8.5.5.5(f.4a)'s square-in weld — the
-        // tri-corner ring's own construction — is the one variant with no ADJ fill yet.
+        // (f.1) step 4's ungated fullness grid). §8.5.5.5(f.4a)'s square-in weld is filled
+        // here too, and is the one variant that tiles no net: its chains were *identified* at
+        // layout time, so all that is left is the odd-`segments` central `s`-gon.
         for cut in &junction_cuts {
             // §8.3.0.3: the fill kind is chosen by the ring's boundvert count, not by the
             // beveled-edge count and not by `vmesh_method`. A two-boundvert ring bounds a
@@ -3598,6 +3599,72 @@ impl LoopMesh {
             emission
         };
 
+        // §8.5.1 / §7.6.6: the dihedral-band verdict must be read from the *original*
+        // corner — its edges and faces are about to be consumed by the re-stitch — so it is
+        // captured now and carried on the cut for the fill-time routing decision.
+        let dihedral_band_deviation = self.junction_dihedral_band_deviation(vertex, &corners);
+
+        // §8.5.5.5(f.4a): the **edge-mode square-in weld**. At a tri-corner-eligible ring the
+        // concave profile's two straight legs make consecutive sectors' chains coincide, and
+        // the fill *identifies* them rather than leaving two coincident samples: sector `i`'s
+        // first half, walking in from `B_i`, **is** sector `i−1`'s second half walking out to
+        // it. The verdict is taken here — one phase before the fill — because the strips are
+        // laid over the chains, so the identification has to already be in place when they
+        // are built; and it rides the cut afterwards so the fill's central-`s`-gon step and
+        // this layout cannot disagree about which junction welded.
+        //
+        // The gate is (f.1) step 3's, in its order — the ring's three sectors first, then the
+        // dispatch keys: `emission` names the fill method (the
+        // §8.2.2.1.1 chord resample is the [V-ADJ] cap's own boundary emission, so only an
+        // ADJ junction asks for it); step 3 is edge-bevel only; step 2's pipe is tested
+        // before step 3, so a pipe junction never reaches the weld's row; and the exponent
+        // row is the exact `r = 0` sentinel. Vertex mode falls through to (f.4b)'s ordinary
+        // general grid, which is a *different object* — it keeps the ring quads this deletes.
+        // (`affect` and `emission` are documentary here rather than live — this path is only
+        // reached with both already pinned — but they are step 3's dispatch made legible and
+        // are kept for that.)
+        //
+        // Step 3 keys on **valence**, and its predicate is three-valued: it must *fire*, and
+        // *doesn't apply* is not the same answer. A ring whose three sectors are octant-shaped
+        // but whose junction carries extra unbeveled in-plane edges — so the **edge** count
+        // exceeds three — is "doesn't apply", and that answer reaches the tri-corner family
+        // only through step 4's shortcut, whose own gate excludes `EXP_SQUARE_IN`. At
+        // square-in it therefore lands on the general grid, not here. The boundvert count
+        // alone cannot see the difference: a sector absorbs its in-plane passenger, and
+        // neither half of the shape test refuses one — the meet geometry reads three
+        // boundverts and `v`, which the passenger does not move, and the band asks for
+        // exactly `edgecount − 3` near-flat edges, which one passenger at valence 4 supplies.
+        // So the edge count is asked for separately, and only exactly three fires.
+        let three_sector_ring: Option<[Vec3; 3]> = (count == 3).then(|| {
+            [
+                self.vertex_position(boundverts[0]),
+                self.vertex_position(boundverts[1]),
+                self.vertex_position(boundverts[2]),
+            ]
+        });
+        let square_in_weld = three_sector_ring
+            .filter(|ring| {
+                segments >= 2
+                    && affect == BevelAffect::Edges
+                    && emission == ChainEmission::Resampled
+                    && !pipe_override
+                    && profile_to_exponent(profile) == 0.0
+                    && junction_incident_edges(&corners).len() == 3
+                    && tri_corner_shape_admits(
+                        vertex_position,
+                        ring,
+                        dihedral_band_deviation,
+                        TRI_CORNER_BAND_SMOOTH,
+                    )
+            })
+            // The layout's own frame origin `c`, resolved here rather than at fill time: the
+            // legs are stated in octant coordinates and mapped through it, and the `s`-gon
+            // that closes them at odd `n` needs the same point as its winding anchor. Two
+            // phases deriving it independently could disagree — and a fill-time derivation is
+            // allowed to *decline*, which after a completed weld would leave the legs meeting
+            // nowhere: an open boundary in a closed mesh.
+            .map(|ring| unit_octant_origin(ring, vertex_position));
+
         if count == 2 {
             // §8.3.0.3: a two-boundvert ring bounds no region — the two sectors' chains
             // span the *same* boundvert pair in opposite directions. They are welded into
@@ -3613,6 +3680,18 @@ impl LoopMesh {
                 profile,
                 chains,
                 cross_welds,
+                result,
+            );
+        } else if let Some(anchor) = square_in_weld {
+            self.build_square_in_weld_chains(
+                vertex,
+                &boundverts,
+                &opening_edges,
+                &corners,
+                is_beveled,
+                segments,
+                anchor,
+                chains,
                 result,
             );
         } else {
@@ -3699,11 +3778,6 @@ impl LoopMesh {
             })
             .collect();
 
-        // §8.5.1 / §7.6.6: the dihedral-band verdict must be read from the *original*
-        // corner — its edges and faces are about to be consumed by the re-stitch — so it is
-        // captured now and carried on the cut for the fill-time routing decision.
-        let dihedral_band_deviation = self.junction_dihedral_band_deviation(vertex, &corners);
-
         junction_cuts.push(JunctionCut {
             vertex,
             boundverts,
@@ -3714,6 +3788,7 @@ impl LoopMesh {
             centre_column_representatives,
             dihedral_band_deviation,
             pipe_override,
+            square_in_weld,
             opening_edge_directions,
             opening_edge_tips,
         });
@@ -3820,6 +3895,136 @@ impl LoopMesh {
             side_label: SideLabel::Unlabelled,
             cell: Some(second),
         });
+    }
+
+    /// Lay a §8.5.5.5(f.4a) square-in junction's chains as `s` **welded legs**.
+    ///
+    /// At `r = 0` the cross-section between two boundverts is not an arc at all: it runs in
+    /// along one axis to the corner's inner point and back out along the other, so sector
+    /// `i`'s chain lies on the two axes bounding that sector rather than between them. In
+    /// octant coordinates, with `h = ⌊n/2⌋` and the step
+    ///
+    /// ```text
+    ///    b  =  2 / n                     (n even)
+    ///       =  2 / (2·h + √2)            (n odd)
+    ///
+    ///    (i, 0, k)      =  (1 − k·b) · e_i          0 <= k <= h
+    ///    (i, 0, n − k)  =  (1 − k·b) · e_{i+1}
+    /// ```
+    ///
+    /// where `b` is §8.6.4 step 3's closing-chord term solved on two straight unit legs.
+    ///
+    /// The layout is built **in the octant and mapped once**, as (f.1) legislates for every
+    /// tri-corner grid: under the affine `unit_to_corner` the axis point `e_i` is `B_i` and
+    /// the octant origin is the frame's `c` (`anchor`), so the whole chain is the straight run
+    /// `c + (1 − k·b)·(B_i − c)`. Reading the two sectors' own 3-D cross-sections and merging
+    /// their views of a shared leg vertex instead would agree only on a symmetric corner: on
+    /// the oblique / absorbed-leg / reflex ring the band deliberately admits (§7.6.6) the two
+    /// readings genuinely differ, and any merge of them invents a third point that is on
+    /// neither leg.
+    ///
+    /// The topology is the other half, and the whole point: `(i, 0, k)` **is the same vertex
+    /// as** `(i − 1, 0, n − k)` for `k <= h`, not a coincident twin. So each boundvert grows one
+    /// inward *leg* of `h` verts, minted once and shared by the two chains meeting there;
+    /// both arriving strips terminate on it and every leg edge lands on exactly two faces,
+    /// one per strip. On **even** `n` the innermost sample of every leg is the octant origin,
+    /// so the identification closes transitively over all `s` legs onto a single vertex and
+    /// the corner needs no fill face at all. On **odd** `n` no sample reaches the origin and
+    /// the `s` innermost verts are left for the fill's one central `s`-gon.
+    ///
+    /// The legs are spaced at (f.4a)'s printed `b` — the **raw** closed form — and not at a
+    /// §8.2.2.1.1 chord read-back of it. §8.2.2.1.1's gate part (i) is a question about the
+    /// *fill's* doubling cascade — reach `segments` from a 2-segment control cage by doubling
+    /// and, if that overshoots, resampling back down — and the weld runs no such cascade: it
+    /// has no cage, no doubling round and no interior, and (f.4a) states the layout in closed
+    /// form at `n` directly. Nor is there a later step that would restore the closed form: the
+    /// snap that does so for the tri-corner family's other members has no 3-D branch at
+    /// square-in ((f.2)'s branch S is 2-D and pipe-only). So a read-back here would move the
+    /// legs with nothing to put them back, and (f.4a)'s odd-`n` step — the whole point of the
+    /// `√2` bookkeeping — could never be observed: these chords are equal by construction, so a
+    /// chord fraction degenerates to an even-arclength split, i.e. exactly `b = 2/n` at every
+    /// parity (identity at even `n`, and at `n = 3` it would drag the first leg sample from
+    /// `0.41421·(B_i − c)` to `0.33333·(B_i − c)`). The guide does not state this exemption; it
+    /// is inferred from the resample's own scope and from the absence of a restoring snap.
+    #[allow(clippy::too_many_arguments)]
+    fn build_square_in_weld_chains(
+        &mut self,
+        vertex: VertexKey,
+        boundverts: &[VertexKey],
+        opening_edges: &[EdgeKey],
+        corners: &[VertexCorner],
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        segments: u32,
+        anchor: Vec3,
+        chains: &mut Vec<EdgeEndChain>,
+        result: &mut BevelResult,
+    ) {
+        let sectors = boundverts.len();
+        let n = segments as usize;
+        let half = n / 2;
+
+        let mut cells: Vec<ProfileCell> = Vec::with_capacity(sectors);
+        for k in 0..sectors {
+            let next = (k + 1) % sectors;
+            let crossing = opening_edges[next];
+            let rescue = self.mid_rescue(vertex, crossing, corners, is_beveled);
+            cells.push(self.derive_profile_cell(boundverts[k], boundverts[next], crossing, rescue));
+        }
+
+        let even = n % 2 == 0;
+        let step = square_in_weld_leg_step(segments);
+        let mut origin: Option<VertexKey> = None;
+        let mut legs: Vec<Vec<VertexKey>> = Vec::with_capacity(sectors);
+        for &boundvert in boundverts {
+            let axis = self.vertex_position(boundvert) - anchor;
+            let mut leg: Vec<VertexKey> = Vec::with_capacity(half);
+            for k in 1..=half {
+                if even && k == half {
+                    // `1 − ⌊n/2⌋·b` is exactly zero at even `n`, so every leg's innermost
+                    // sample is the octant origin and the pairwise identification closes
+                    // transitively over all `s` legs onto one vertex.
+                    let shared = match origin {
+                        Some(shared) => shared,
+                        None => {
+                            // §5.2.4: not yet minted from the corner.
+                            let shared = self.create_vertex(anchor);
+                            result.verts.push(shared);
+                            origin = Some(shared);
+                            shared
+                        }
+                    };
+                    leg.push(shared);
+                    continue;
+                }
+                let position = anchor + (1.0 - k as f32 * step) * axis;
+                // §5.2.4: not yet minted from the corner.
+                let welded = self.create_vertex(position);
+                result.verts.push(welded);
+                leg.push(welded);
+            }
+            legs.push(leg);
+        }
+
+        for i in 0..sectors {
+            let next = (i + 1) % sectors;
+            let mut interior: Vec<VertexKey> = Vec::with_capacity(n - 1);
+            for k in 1..n {
+                interior.push(if k <= half {
+                    legs[i][k - 1]
+                } else {
+                    legs[next][n - k - 1]
+                });
+            }
+            chains.push(EdgeEndChain {
+                edge: opening_edges[next],
+                endpoint: vertex,
+                start: boundverts[i],
+                interior,
+                end: boundverts[next],
+                side_label: SideLabel::Unlabelled,
+                cell: Some(cells[i]),
+            });
+        }
     }
 
     /// Classify the §8.3.0.3 **cross** weld and capture its donor legs, off the pristine
@@ -4925,17 +5130,6 @@ impl LoopMesh {
         self.adj_tri_corner_shape(cut, TRI_CORNER_BAND_SMOOTH)
     }
 
-    /// The exponent-free half of the §8.5.1 trigger: whether the ring's *shape* is one
-    /// the tri-corner family owns, on the smooth band.
-    ///
-    /// Split out because [`Self::adj_tri_corner_trigger`] answers `false` for the
-    /// **square-in** sentinel unconditionally — that exponent's tri-corner member is the
-    /// §8.5.5.5(f.4a) degenerate weld, not a grid — so the dispatch still needs to ask
-    /// "would this corner have been the weld's?" without the exponent in the way.
-    fn adj_tri_corner_geometry(&self, cut: &JunctionCut) -> bool {
-        self.adj_tri_corner_shape(cut, TRI_CORNER_BAND_SMOOTH)
-    }
-
     /// Whether the ring's *shape* is one the tri-corner family owns (BEVEL.md §8.5.1 /
     /// §7.6.6): three boundverts, admitted either by the position-only meet geometry or by
     /// the per-edge dihedral band, whose total-angle window is the caller's to choose.
@@ -4954,10 +5148,12 @@ impl LoopMesh {
             self.vertex_position(cut.boundverts[1]),
             self.vertex_position(cut.boundverts[2]),
         ];
-        tri_corner_meet_geometry(vertex, &meet_points)
-            || cut
-                .dihedral_band_deviation
-                .is_some_and(|deviation| deviation <= band_tolerance)
+        tri_corner_shape_admits(
+            vertex,
+            &meet_points,
+            cut.dihedral_band_deviation,
+            band_tolerance,
+        )
     }
 
     /// The rounded adjacency-grid fill at one junction, with the §8.5.5.5(f.6) **pipe**
@@ -5237,10 +5433,11 @@ impl LoopMesh {
     /// gate, so the two square sentinels take that grid there as well (a square exponent
     /// on **odd** `segments`, which (f.5)'s lattice never sees, and square-in on any ring
     /// the (f.4a) weld does not own). The square grids of (f.5) keep their own routes
-    /// (step 1's parallel-offset ring, the tri-corner three squares). One junction is
-    /// still declined: square-in at a tri-corner-eligible corner, whose fill is (f.4a)'s
-    /// degenerate weld — and `pipe_claims_junction` exempts it, because (f.1) tests the pipe
-    /// at step 2, one step *before* the row that weld belongs to.
+    /// (step 1's parallel-offset ring, the tri-corner three squares), and square-in at a
+    /// corner the tri-corner predicate *fires* on takes (f.4a)'s degenerate weld from the
+    /// step-4 branch below — a fill that emits at most one face and no net at all.
+    /// `pipe_claims_junction` never coincides with that weld, because (f.1) tests the pipe at
+    /// step 2, one step *before* the row the weld belongs to.
     /// The **pipe** grid (§8.5.5.5(f.6)) *is* built here — its base grid is this very
     /// dispatch, including the tri-corner shortcut, so a valence-3 pipe's base is the octant
     /// grid or (f.5)'s three squares rather than the fullness grid — with the cross-section
@@ -5248,9 +5445,11 @@ impl LoopMesh {
     /// exponent, the two sentinels included: the wrapper resolves each vert through (f.2)'s
     /// branch S there.
     ///
-    /// Returns whether a net was actually tiled. Every out-of-scope ring, degenerate chain
-    /// and singular corner map below leaves the junction untouched, and the pipe post-pass
-    /// keys on that: its domain is the net's slots, so no net means nothing to walk.
+    /// Returns whether this fill left **interior net slots to replant**. Every out-of-scope
+    /// ring, degenerate chain and singular corner map below leaves the junction untouched and
+    /// answers `false`; so does the (f.4a) weld, which does emit a face but tiles no net. The
+    /// pipe post-pass keys on that: its domain is the net's slots, so no slots means nothing
+    /// to walk.
     #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_base(
         &mut self,
@@ -5284,9 +5483,9 @@ impl LoopMesh {
         // specialisation, §8.3.0.2.1), the whole genuinely curved band on either side of
         // them, and — step 4 gating on no exponent at all — the two square sentinels.
         // The **pipe** grid (§8.5.5.5(f.6)) is built too — its base grid is this dispatch,
-        // with the cross-section replant applied as a post-pass. The lone decline is
-        // square-in on a tri-corner-eligible ring, which owes (f.4a)'s weld; see step 4
-        // below.
+        // with the cross-section replant applied as a post-pass. The one ring that takes
+        // neither grid is square-in where the tri-corner predicate *fires*: it owes (f.4a)'s
+        // weld, which has no interior at all; see step 4 below.
         // The general fill runs even at `segments = 2`: it subdivides its coarse net once
         // before resampling (§8.5.5.5(d)), so a declined-tri-corner `segments = 2` ring
         // gets the centre-vertex pinwheel cap rather than an unfilled hole. Only
@@ -5328,26 +5527,32 @@ impl LoopMesh {
             // centre seeded by law F3's **negative** fullness. Both fall out of the two
             // exponent-generic entries above; neither needs a construction of its own.
             //
-            // One decline is left, and it is not about step 4's grid: square-in at a corner
-            // the tri-corner family owns — step 3's `EXP_SQUARE_IN` row, the (f.4a)
-            // degenerate weld, whose sectors' chains are *identified* pairwise and which has
-            // no interior grid at all. That is a different object from this one (it deletes
-            // the ring quads this builds), it is not built yet, and the trigger cannot report
-            // it because it refuses square-in outright — hence the geometric re-ask.
+            // One ring is not step 4's at all: square-in at a corner the tri-corner family
+            // owns — step 3's `EXP_SQUARE_IN` row, the (f.4a) degenerate weld, whose sectors'
+            // chains are *identified* pairwise and which has no interior grid whatsoever. That
+            // is a different object from this one (it deletes the ring quads this builds), and
+            // the trigger cannot report it because it refuses square-in outright — hence the
+            // verdict riding the cut from chain-layout time, where the identification was made.
             //
-            // A **pipe** junction is exempt, and that is dispatch order rather than leniency:
-            // step 2 is tested before step 3, so a pipe never reaches the weld's row at all.
-            // What it builds instead is the grid step 4 would have built *including step 4's
-            // own tri-corner shortcut* — and that shortcut excludes square-in explicitly, so a
-            // valence-3 square-in tube lands on the ordinary (a)–(e) grid and is then
-            // re-planted onto its constant cross-section.
+            // A **pipe** junction never carries that verdict, and that is dispatch order
+            // rather than leniency: step 2 is tested before step 3, so a pipe never reaches the
+            // weld's row at all. What it builds instead is the grid step 4 would have built
+            // *including step 4's own tri-corner shortcut* — and that shortcut excludes
+            // square-in explicitly, so a valence-3 square-in tube lands on the ordinary
+            // (a)–(e) grid and is then re-planted onto its constant cross-section.
             //
-            // A pipe at either **square** sentinel is likewise no longer declined: the replant
+            // A pipe at either **square** sentinel is likewise not declined: the replant
             // now has the branch it needs — (f.2)'s branch S, the axis push in the clamped unit
             // square plus the `land_on_corner` override keyed on the net's own `(i, j, k)`
             // slots — where before it would have resolved through a divergent `r`-norm.
-            if exponent == 0.0 && !pipe_claims_junction && self.adj_tri_corner_geometry(cut) {
-                return false;
+            debug_assert!(
+                !(cut.square_in_weld.is_some() && pipe_claims_junction),
+                "(f.1) tests the pipe one step before the weld's row",
+            );
+            if let Some(anchor) = cut.square_in_weld {
+                return self.build_adj_fill_square_in_weld(
+                    cut, chains, segments, anchor, material, templates, result,
+                );
             }
             match segments {
                 0 | 1 => return false,
@@ -7352,6 +7557,72 @@ impl LoopMesh {
         true
     }
 
+    /// Close a §8.5.5.5(f.4a) square-in weld — the **entire** face output of a square-in
+    /// tri-corner, which is at most one polygon.
+    ///
+    /// The chains were already laid as `s` welded legs at layout time
+    /// ([`Self::build_square_in_weld_chains`]), so there is no interior grid and no ring
+    /// quad to emit here: the arriving strips already meet along every leg edge. What is
+    /// left is the parity of §8.5.5.5(e), read off the legs:
+    ///
+    /// - **even** `segments`: the innermost sample of every leg is the octant origin, one
+    ///   shared vertex, so the legs meet at a point and the corner is already complete —
+    ///   **zero** faces;
+    /// - **odd** `segments`: no sample reaches the origin, so the `s` innermost leg verts
+    ///   `(i, 0, ⌊n/2⌋)` are distinct and exactly **one** central `s`-gon closes the hole.
+    ///
+    /// The face-winding `anchor` is the octant origin's image — the notch bottom the legs run
+    /// down to, and the one point guaranteed to sit on the solid side of a concave cap. It
+    /// rides the cut from **layout** time, where the legs were mapped through it, rather than
+    /// being re-derived here through the full corner frame: that frame's conditioning guard
+    /// answers a different question (is the map invertible), and a decline from it at this
+    /// point would be unrecoverable — the chains welded a phase ago, so at odd `segments` the
+    /// `s` legs would meet nowhere and the corner would be left open in a closed mesh.
+    ///
+    /// This fill emits **no** interior net, so it cannot leave a net slot to replant and
+    /// answers `false` to its caller's question. (A pipe junction cannot reach this row
+    /// anyway — (f.1) tests the pipe one step earlier.)
+    #[allow(clippy::too_many_arguments)]
+    fn build_adj_fill_square_in_weld(
+        &mut self,
+        cut: &JunctionCut,
+        chains: &[EdgeEndChain],
+        segments: u32,
+        anchor: Vec3,
+        material: i32,
+        templates: &TemplateBank,
+        result: &mut BevelResult,
+    ) -> bool {
+        let sectors = cut.boundverts.len();
+        let seg = segments as usize;
+        if seg < 2 || seg % 2 == 0 {
+            return false;
+        }
+        let half = seg / 2;
+
+        // Invariant, not a guard on input: the same phase that decided this junction welds
+        // laid one chain per sector, each holding one vert per segment boundary.
+        let mut central: Vec<VertexKey> = Vec::with_capacity(sectors);
+        for i in 0..sectors {
+            let chain = self
+                .oriented_chain(cut, chains, i)
+                .expect("a welded junction has one chain per sector");
+            assert_eq!(
+                chain.len(),
+                seg + 1,
+                "a welded chain holds one vert per segment boundary",
+            );
+            central.push(chain[half]);
+        }
+
+        // §6.6.1: the centre `s`-gon is a ring-spanning face — its corners span the whole
+        // boundvert ring — so it takes the ring-spanning donor, exactly as the general grid's
+        // odd centre does.
+        let central_representative = templates.resolve(cut.central_representative);
+        self.emit_patch_face(&central, anchor, material, central_representative, result);
+        false
+    }
+
     /// Build the **tri-corner** square [V-ADJ] fill — the three flat unit squares of
     /// BEVEL.md §8.5.5.5(f.5) (valence 3, square profile). In octant coordinates it is closed
     /// form, with **no subdivision and no snap**: sector `i`'s grid is the face of the unit
@@ -8170,14 +8441,7 @@ impl LoopMesh {
         }
         let vertex_position = self.vertex_position(vertex);
 
-        let mut edges: Vec<EdgeKey> = Vec::with_capacity(corners.len() + 1);
-        for corner in corners {
-            for edge in [corner.incoming_edge, corner.outgoing_edge] {
-                if !edges.contains(&edge) {
-                    edges.push(edge);
-                }
-            }
-        }
+        let edges = junction_incident_edges(corners);
         let edgecount = edges.len();
         if edgecount < 3 {
             return None;
@@ -13924,6 +14188,20 @@ struct JunctionCut {
     /// beveled-edge directions and incident-face normals are gone by fill time — so it is
     /// captured here alongside `dihedral_band_deviation`.
     pipe_override: bool,
+    /// `Some(c)` when this junction's chains were laid as the §8.5.5.5(f.4a) **square-in
+    /// weld** (`build_square_in_weld_chains`): edge bevel, the `r = 0` sentinel, no pipe, and
+    /// a tri-corner ring the predicate *fires* on (valence 3, not merely three boundverts).
+    /// The layout is a phase-1 decision — the strips are built over the chains, so the
+    /// pairwise identification has to precede them — and the fill's only remaining job is the
+    /// odd-`segments` central `s`-gon, so both halves read the one verdict rather than
+    /// re-deriving it and risking disagreement.
+    ///
+    /// The payload is that layout's own frame origin `c` ([`unit_octant_origin`]): the point
+    /// the legs were mapped through, and the winding anchor the `s`-gon needs. Carried rather
+    /// than re-derived for the same reason the verdict is — and because a fill-time
+    /// derivation is allowed to *decline*, which after a completed weld would leave the
+    /// corner open.
+    square_in_weld: Option<Vec3>,
     /// Per sector `k` (disk order), the **pristine** unit direction of `opening_edges[k]`
     /// out of `vertex` (BEVEL.md §8.5.5.5(f.5)). The square parallel-offset grid's centreline
     /// seeds are line-line meets on these beveled edges, but the edges themselves are consumed
@@ -14464,6 +14742,45 @@ fn corner_verts_coincide(positions: &[Vec3]) -> bool {
 /// place a convex fold on the positive axis — pinned so the beveled cube corner sums to
 /// `+3·π/2`, the band's centre.
 const TRI_CORNER_CONVEX_SIGN: f32 = -1.0;
+
+/// The junction's distinct incident edges, in corner-walk order (BEVEL.md §7.6.2): every
+/// corner contributes its incoming and outgoing edge and the pair-shared ones collapse, so a
+/// closed fan yields one entry per spoke. This is the count the §8.5.1 band means by
+/// `edgecount`, and the **valence** §8.5.5.5(f.1) step 3 keys on — which is *not* the
+/// boundvert count, since a sector absorbs any unbeveled in-plane leg running through it.
+fn junction_incident_edges(corners: &[VertexCorner]) -> Vec<EdgeKey> {
+    let mut edges: Vec<EdgeKey> = Vec::with_capacity(corners.len() + 1);
+    for corner in corners {
+        for edge in [corner.incoming_edge, corner.outgoing_edge] {
+            if !edges.contains(&edge) {
+                edges.push(edge);
+            }
+        }
+    }
+    edges
+}
+
+/// The exponent-free half of the §8.5.1 tri-corner test, on raw inputs: three boundverts
+/// admitted either by the position-only meet geometry or by the per-edge dihedral band,
+/// whose total-angle window is the caller's to choose (BEVEL.md §8.5.1 / §7.6.6).
+///
+/// Taken on positions rather than on a [`JunctionCut`] because the §8.5.5.5(f.4a) weld has
+/// to ask the same question during chain layout, one phase before any cut exists.
+///
+/// Note this answers the *shape* question only. It cannot distinguish (f.1)'s *fires* from
+/// its *doesn't apply*: both readings pass here, and the two are separated by the junction's
+/// **edge** count ([`junction_incident_edges`]), which callers that need the distinction test
+/// alongside.
+fn tri_corner_shape_admits(
+    vertex_position: Vec3,
+    meet_points: &[Vec3],
+    dihedral_band_deviation: Option<f32>,
+    band_tolerance: f32,
+) -> bool {
+    meet_points.len() == 3
+        && (tri_corner_meet_geometry(vertex_position, meet_points)
+            || dihedral_band_deviation.is_some_and(|deviation| deviation <= band_tolerance))
+}
 
 /// The §8.5.1 forced-tri-corner geometry test on three meet-point positions
 /// (BEVEL.md §8.5.5.3): equal spoke length and a mutually-60° convex octant
@@ -28825,6 +29142,7 @@ mod tests {
             // the geometry test alone decides these assertions.
             dihedral_band_deviation: None,
             pipe_override: false,
+            square_in_weld: None,
             opening_edge_directions: Vec::new(),
             opening_edge_tips: Vec::new(),
         };
@@ -30118,26 +30436,366 @@ mod tests {
         }
     }
 
+    /// The world position of the cube-corner driver's octant origin — the image of the
+    /// unit octant's origin under `unit_to_corner`, and so the notch bottom every
+    /// §8.5.5.5(f.4a) leg walks down toward. It is the corner-surface centre `c`, not `v`.
+    fn square_in_weld_origin() -> Vec3 {
+        Vec3::new(0.75, -0.75, -0.75)
+    }
+
+    /// The cube-corner driver's three boundverts, in no particular ring order: the §7.6.2
+    /// meet points of the three beveled spokes at `offset = 0.25`.
+    fn square_in_weld_boundverts() -> [Vec3; 3] {
+        [
+            Vec3::new(0.75, -0.75, -1.0),
+            Vec3::new(1.0, -0.75, -0.75),
+            Vec3::new(0.75, -1.0, -0.75),
+        ]
+    }
+
+    /// The junction's whole welded ring: every result vert inside the corner ball, which at
+    /// a square-in weld is the `s` boundverts plus their inward legs and nothing else — the
+    /// weld has no interior.
+    fn square_in_weld_ring(mesh: &LoopMesh, result: &BevelResult) -> Vec<VertexKey> {
+        result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| {
+                (mesh.vertex_position(v) - square_in_weld_origin()).length() <= 0.25 + 1.0e-4
+            })
+            .collect()
+    }
+
+    fn square_in_weld_vert_at(
+        mesh: &LoopMesh,
+        result: &BevelResult,
+        position: Vec3,
+    ) -> Option<VertexKey> {
+        let mut hits = result
+            .verts
+            .iter()
+            .copied()
+            .filter(|&v| (mesh.vertex_position(v) - position).length() < 1.0e-4);
+        let first = hits.next();
+        assert!(hits.next().is_none(), "at most one vertex at {position:?}");
+        first
+    }
+
+    /// The step BEVEL.md §8.5.5.5(f.4a) prints, quoted rather than re-derived: `b = 2/n` at
+    /// even `n`, `b = 2/(2·⌊n/2⌋ + √2)` at odd `n` — the closed form of §8.6.4 step 3's
+    /// closing-chord term on two straight unit legs.
+    fn square_in_weld_step(segments: u32) -> f32 {
+        let half = (segments / 2) as f32;
+        if segments % 2 == 0 {
+            2.0 / segments as f32
+        } else {
+            2.0 / (2.0 * half + std::f32::consts::SQRT_2)
+        }
+    }
+
+    /// The §8.5.5.5(f.4a) weld's winding anchor has to be **total**. It is fixed at layout
+    /// time, where the chains are welded, so no later phase may decline it: at odd `segments`
+    /// the `s` legs are closed by exactly one central `s`-gon, and a fill that skipped it
+    /// would leave a genuine boundary in a closed mesh.
+    ///
+    /// `unit_octant_origin` is the frame's translation alone — an affine combination of the
+    /// four points — so it agrees with the conditioned frame's origin wherever that frame
+    /// exists and still answers where `UnitOctant::from_corner` refuses. That refusal is about
+    /// invertibility, a question the weld never asks: it only maps *forward*.
+    #[test]
+    fn unit_octant_origin_is_total_where_the_frame_is_not() {
+        let vertex = Vec3::new(1.0, -1.0, -1.0);
+        let ring = square_in_weld_boundverts();
+        let frame = UnitOctant::from_corner(ring, vertex).expect("the driver's corner is sound");
+        assert!(
+            (frame.origin() - unit_octant_origin(ring, vertex)).length() <= 1.0e-6,
+            "the translation is the frame's origin",
+        );
+        assert!(
+            (unit_octant_origin(ring, vertex) - square_in_weld_origin()).length() <= 1.0e-6,
+            "and it is the driver's notch bottom `c`",
+        );
+
+        // Two coincident boundverts make two of the frame's three columns equal, so the
+        // normalised determinant is zero and the frame is refused.
+        let collapsed = [ring[0], ring[0], ring[2]];
+        assert!(
+            UnitOctant::from_corner(collapsed, vertex).is_none(),
+            "the singular frame declines",
+        );
+        assert!(
+            unit_octant_origin(collapsed, vertex).is_finite(),
+            "the anchor does not",
+        );
+    }
+
+    /// The §8.5.5.8 driver's corner carrying one extra **in-plane passenger** edge: the same
+    /// cube, the same three beveled spokes, but the `y = −1` face split along its `v → v_5`
+    /// diagonal so the junction's edge count is four while its ring is still three sectors
+    /// (the passenger is absorbed by the sector it runs through).
+    ///
+    /// The split is exactly coplanar, so the passenger's dihedral is zero and the §8.5.1 band
+    /// counts it as the one near-flat edge `edgecount − 3` allows at valence 4 — the corner is
+    /// *not* refused. Neither is its shape: the three boundverts and `v` are where they were,
+    /// so the position-only meet geometry fires too. What the corner is, in §8.5.5.5(f.1)'s
+    /// three-valued reading, is **doesn't apply**.
+    fn cube_corner_in_plane_passenger_adj(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        let corners = [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ];
+        let vert: Vec<VertexKey> = corners.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let mut edge_of = |mesh: &mut LoopMesh, a: usize, b: usize| {
+            mesh.create_edge([vert[a], vert[b]], EdgeCreateFlags::NONE)
+        };
+        let e01 = edge_of(&mut mesh, 0, 1);
+        let e12 = edge_of(&mut mesh, 1, 2);
+        let e23 = edge_of(&mut mesh, 2, 3);
+        let e30 = edge_of(&mut mesh, 3, 0);
+        let e45 = edge_of(&mut mesh, 4, 5);
+        let e56 = edge_of(&mut mesh, 5, 6);
+        let e67 = edge_of(&mut mesh, 6, 7);
+        let e74 = edge_of(&mut mesh, 7, 4);
+        let e04 = edge_of(&mut mesh, 0, 4);
+        let e15 = edge_of(&mut mesh, 1, 5);
+        let e26 = edge_of(&mut mesh, 2, 6);
+        let e37 = edge_of(&mut mesh, 3, 7);
+        let passenger = edge_of(&mut mesh, 0, 5);
+
+        let mut face_of = |mesh: &mut LoopMesh, ring: &[usize], edges: &[EdgeKey]| {
+            let ring: Vec<VertexKey> = ring.iter().map(|&i| vert[i]).collect();
+            mesh.face_create(&ring, edges, FaceCreateFlags::NONE);
+        };
+        face_of(&mut mesh, &[0, 1, 2, 3], &[e01, e12, e23, e30]);
+        face_of(&mut mesh, &[1, 5, 6, 2], &[e15, e56, e26, e12]);
+        face_of(&mut mesh, &[5, 4, 7, 6], &[e45, e74, e67, e56]);
+        face_of(&mut mesh, &[4, 0, 3, 7], &[e04, e30, e37, e74]);
+        face_of(&mut mesh, &[3, 2, 6, 7], &[e23, e26, e67, e37]);
+        // The `y = −1` face, split along the diagonal out of the beveled corner.
+        face_of(&mut mesh, &[0, 4, 5], &[e04, e45, passenger]);
+        face_of(&mut mesh, &[0, 5, 1], &[passenger, e15, e01]);
+
+        let result = mesh.bevel(
+            &[e01.into(), e30.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// The driver's cube under a shear along `x` by `y`, beveled at the same corner: a
+    /// valence-3 junction whose three spokes are no longer mutually orthonormal.
+    ///
+    /// The shear is linear, so every face stays a planar parallelogram and the solid stays
+    /// closed — but the corner's three sector angles now differ, so its boundverts sit at
+    /// unequal spoke lengths and the position-only meet geometry declines it. The signed
+    /// dihedrals still sum well inside the band, so §8.5.1 admits it anyway: this is the
+    /// **oblique** member of §7.6.6 that the band exists for, and the one place the weld's
+    /// two sectors genuinely disagree about where a shared leg vertex lies.
+    fn sheared_cube_corner_adj(
+        segments: u32,
+        profile: f32,
+        shear: f32,
+    ) -> (LoopMesh, BevelResult, Vec3) {
+        let mut mesh = LoopMesh::new();
+        let place = |x: f32, y: f32, z: f32| Vec3::new(x + shear * y, y, z);
+        let corners = [
+            place(1.0, -1.0, -1.0),
+            place(-1.0, -1.0, -1.0),
+            place(-1.0, 1.0, -1.0),
+            place(1.0, 1.0, -1.0),
+            place(1.0, -1.0, 1.0),
+            place(-1.0, -1.0, 1.0),
+            place(-1.0, 1.0, 1.0),
+            place(1.0, 1.0, 1.0),
+        ];
+        let vert: Vec<VertexKey> = corners.iter().map(|&p| mesh.create_vertex(p)).collect();
+        let mut edge_of = |mesh: &mut LoopMesh, a: usize, b: usize| {
+            mesh.create_edge([vert[a], vert[b]], EdgeCreateFlags::NONE)
+        };
+        let e01 = edge_of(&mut mesh, 0, 1);
+        let e12 = edge_of(&mut mesh, 1, 2);
+        let e23 = edge_of(&mut mesh, 2, 3);
+        let e30 = edge_of(&mut mesh, 3, 0);
+        let e45 = edge_of(&mut mesh, 4, 5);
+        let e56 = edge_of(&mut mesh, 5, 6);
+        let e67 = edge_of(&mut mesh, 6, 7);
+        let e74 = edge_of(&mut mesh, 7, 4);
+        let e04 = edge_of(&mut mesh, 0, 4);
+        let e15 = edge_of(&mut mesh, 1, 5);
+        let e26 = edge_of(&mut mesh, 2, 6);
+        let e37 = edge_of(&mut mesh, 3, 7);
+
+        let mut face_of = |mesh: &mut LoopMesh, ring: &[usize], edges: &[EdgeKey]| {
+            let ring: Vec<VertexKey> = ring.iter().map(|&i| vert[i]).collect();
+            mesh.face_create(&ring, edges, FaceCreateFlags::NONE);
+        };
+        face_of(&mut mesh, &[0, 1, 2, 3], &[e01, e12, e23, e30]);
+        face_of(&mut mesh, &[1, 5, 6, 2], &[e15, e56, e26, e12]);
+        face_of(&mut mesh, &[5, 4, 7, 6], &[e45, e74, e67, e56]);
+        face_of(&mut mesh, &[4, 0, 3, 7], &[e04, e30, e37, e74]);
+        face_of(&mut mesh, &[3, 2, 6, 7], &[e23, e26, e67, e37]);
+        face_of(&mut mesh, &[0, 4, 5, 1], &[e04, e45, e15, e01]);
+
+        let result = mesh.bevel(
+            &[e01.into(), e30.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result, corners[0])
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1)'s third subtlety, on the corner that can actually see it: the
+    /// (f.4a) layout is built **in octant coordinates and affinely mapped to the corner once**,
+    /// like any other tri-corner grid. So every leg sample lies exactly on the straight run
+    /// `c + (1 − k·b)·(B_i − c)`, where `c` is the frame origin `(B_0 + B_1 + B_2 − v)/2`.
+    ///
+    /// On the symmetric cube corner that is indistinguishable from reading each sector's own
+    /// 3-D cross-section and merging the two views of a shared leg vertex — the two agree
+    /// there algebraically. On the **oblique** ring the band deliberately admits (§7.6.6) they
+    /// do not: the two sectors' notch bottoms are different points, and a merge of them lands
+    /// on neither leg. This is that ring, and it is pinned to the octant model exactly.
+    #[test]
+    fn adj_square_in_weld_legs_are_the_octant_layout_on_an_oblique_ring() {
+        for segments in [3u32, 4] {
+            let (mesh, result, vertex) = sheared_cube_corner_adj(segments, 0.0, 0.25);
+            mesh.validate_topology();
+
+            // The corner's own verts: the ring is the only new geometry within half a bevel
+            // width of `v`. Its boundverts are the three that still lie on an original face
+            // plane — one per sector — while every leg runs off its plane toward `c`. Spoke
+            // *length* would not separate them here: that is precisely what the shear breaks.
+            let nearby: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .filter(|&p| (p - vertex).length() <= 0.5)
+                .collect();
+            let on_plane = |normal: Vec3, offset: f32| -> Vec3 {
+                let hits: Vec<Vec3> = nearby
+                    .iter()
+                    .copied()
+                    .filter(|&p| (normal.dot(p) - offset).abs() <= 1.0e-4)
+                    .collect();
+                assert_eq!(hits.len(), 1, "one boundvert per original face plane");
+                hits[0]
+            };
+            let ring = [
+                on_plane(Vec3::Z, -1.0),
+                on_plane(Vec3::Y, -1.0),
+                on_plane(Vec3::new(1.0, -0.25, 0.0), 1.0),
+            ];
+
+            assert!(
+                !tri_corner_meet_geometry(vertex, &ring),
+                "the oblique corner is admitted by the band alone (segments = {segments})",
+            );
+
+            let centre = (ring[0] + ring[1] + ring[2] - vertex) * 0.5;
+            let step = square_in_weld_step(segments);
+            for boundvert in ring {
+                for k in 1..=(segments as usize / 2) {
+                    assert_position_present(
+                        &nearby,
+                        centre + (1.0 - k as f32 * step) * (boundvert - centre),
+                        &format!("octant leg sample k = {k} at segments = {segments}"),
+                    );
+                }
+            }
+
+            assert_eq!(
+                result
+                    .faces
+                    .iter()
+                    .filter(|&&f| {
+                        mesh.face_vert_keys(f)
+                            .iter()
+                            .all(|&v| (mesh.vertex_position(v) - vertex).length() <= 0.5)
+                    })
+                    .count(),
+                usize::from(segments % 2 == 1),
+                "the oblique ring still welds (segments = {segments})",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1)'s three-valued tri-corner predicate, on the answer that is
+    /// easiest to get backwards: step 3 needs the predicate to **fire**, and *doesn't apply*
+    /// is a different answer that reaches the tri-corner family only through step 4's
+    /// shortcut — whose own gate excludes `EXP_SQUARE_IN`. So a valence-**4** junction with
+    /// three beveled spokes and one in-plane passenger takes step 4's general grid at
+    /// square-in, not the (f.4a) weld, even though its ring is a perfect three-sector octant
+    /// and the band admits it.
+    ///
+    /// The two arms are the same corner, the same exponent and the same offsets, differing
+    /// only by one coplanar diagonal — and they land different *counts*, which is what makes
+    /// the distinction observable rather than cosmetic.
+    #[test]
+    fn adj_square_in_in_plane_passenger_takes_the_grid_not_the_weld() {
+        for segments in [2u32, 3] {
+            let (welded, weld_result) = cube_corner_adj_profile(segments, 0.0);
+            welded.validate_topology();
+            assert_eq!(
+                curved_corner_grid_faces(&welded, &weld_result).len(),
+                usize::from(segments % 2 == 1),
+                "control: valence 3 fires, so the weld owns the corner (segments = {segments})",
+            );
+
+            let (mesh, result) = cube_corner_in_plane_passenger_adj(segments, 0.0);
+            mesh.validate_topology();
+            let cap = curved_corner_grid_faces(&mesh, &result);
+            assert_eq!(
+                cap.len(),
+                adj_general_ring_parity_counts(3, segments).0,
+                "the passenger makes the predicate *not apply*, so step 4's grid fills the \
+                 corner (segments = {segments})",
+            );
+            assert!(
+                mesh.vertex_count() > welded.vertex_count(),
+                "the grid keeps the ring quads the weld deletes (segments = {segments})",
+            );
+        }
+    }
+
     /// The square-in dispatch splits on the **ring**, not on the exponent (BEVEL.md
-    /// §8.5.5.5(f.1) steps 3 and 4): a valence-3 corner the tri-corner test fires on owes the
+    /// §8.5.5.5(f.1) steps 3 and 4): a valence-3 corner the tri-corner test fires on takes the
     /// (f.4a) degenerate weld — identified leg chains, no interior grid, at most one central
-    /// `s`-gon — while every other ring owes step 4's grid. The weld is a different object
+    /// `s`-gon — while every other ring takes step 4's grid. The weld is a different object
     /// from the grid (it *deletes* the ring quads the grid builds), so routing one to the
     /// other is a whole-mesh count divergence, not a placement one.
     ///
-    /// loopmesh has the grid and not the weld, so this pins the boundary from both sides: the
-    /// orthonormal cube corner emits no cap at all, and the tripod cone's apex — same
-    /// valence, tri-corner test refused — fills with §8.5.5.5(e)'s counts.
+    /// Pins the boundary from both sides: the orthonormal cube corner welds, and the tripod
+    /// cone's apex — same valence, tri-corner test refused — fills with §8.5.5.5(e)'s counts.
     #[test]
-    fn adj_square_in_fills_every_ring_the_f4a_weld_does_not_own() {
+    fn adj_square_in_weld_owns_the_tri_corner_ring_and_the_grid_owns_the_rest() {
         for segments in [2u32, 3] {
             let (mesh, result) = cube_corner_adj_profile(segments, 0.0);
             mesh.validate_topology();
             assert_eq!(
                 curved_corner_grid_faces(&mesh, &result).len(),
-                0,
-                "the tri-corner ring owes the (f.4a) weld, which is not built (segments = \
-                 {segments})",
+                usize::from(segments % 2 == 1),
+                "the weld's entire face output is the odd parity's one central `s`-gon \
+                 (segments = {segments})",
             );
 
             let (cone_mesh, cone) = tripod_cone_adj(segments, 0.0);
@@ -30154,12 +30812,170 @@ mod tests {
         }
     }
 
-    /// The **square** exponent now fills via the tri-corner family (§8.5.5.5(f.5)'s three flat
-    /// unit squares), while **square-in** (`r → 0`, the degenerate weld, (f.4)) is still
-    /// declined here. Both are still refused *by the octant grid* — a square exponent must
+    /// BEVEL.md §8.5.5.5(f.4a): the weld emits **no ring quads at all**, and the parity of
+    /// §8.5.5.5(e) decides whether it emits anything. Even `segments` — the innermost sample
+    /// of every leg is the octant origin, the legs meet at a point, and the fill is complete
+    /// with **zero** faces. Odd `segments` — no sample reaches the origin, so `s` distinct
+    /// innermost verts are closed by exactly **one** central `s`-gon, a triangle at `s = 3`.
+    ///
+    /// The ring's vert count is the identification made visible: `s` boundverts plus `s`
+    /// legs of `⌊n/2⌋` verts, the innermost of which collapse onto one shared vertex at even
+    /// `n`. An implementation that merely placed the two sectors' samples coincidently would
+    /// carry `s·(n−1)` chain verts here instead.
+    #[test]
+    fn adj_square_in_weld_closes_the_corner_with_at_most_one_central_ngon() {
+        for segments in [2u32, 3, 4, 5] {
+            let (mesh, result) = cube_corner_adj_profile(segments, 0.0);
+            mesh.validate_topology();
+            let half = segments as usize / 2;
+            let even = segments % 2 == 0;
+
+            let cap = curved_corner_grid_faces(&mesh, &result);
+            assert_eq!(
+                cap.len(),
+                usize::from(!even),
+                "no ring quads; one central `s`-gon iff odd (segments = {segments})",
+            );
+            if let Some(&face) = cap.first() {
+                assert_eq!(
+                    mesh.face_vert_keys(face).len(),
+                    3,
+                    "the central `s`-gon is a triangle at the cube corner (segments = \
+                     {segments})",
+                );
+            }
+
+            let ring = square_in_weld_ring(&mesh, &result);
+            let expected = if even { 3 * half + 1 } else { 3 * (half + 1) };
+            assert_eq!(
+                ring.len(),
+                expected,
+                "welded ring verts at segments = {segments}",
+            );
+
+            // Welded, not merely coincident: every ring edge lands on exactly two faces, so
+            // the corner is closed even where the fill emitted nothing.
+            for &vertex in &ring {
+                for edge in mesh.iter_disk_edges(vertex) {
+                    assert_eq!(
+                        mesh.edge_face_keys(edge).len(),
+                        2,
+                        "the welded ring leaves no boundary (segments = {segments})",
+                    );
+                }
+            }
+
+            let origin = square_in_weld_vert_at(&mesh, &result, square_in_weld_origin());
+            assert_eq!(
+                origin.is_some(),
+                even,
+                "only even `n` lands a sample on the octant origin (segments = {segments})",
+            );
+
+            // Whole-mesh counts, which is where the weld is actually visible: fewer verts
+            // than an un-welded ring (pairwise identification) and, at odd `n`, one more
+            // face (the corner closes). The cube starts at 8 / 12 / 6 and stays closed, so
+            // V − E + F = 2 throughout.
+            let counts = (mesh.vertex_count(), mesh.edge_count(), mesh.face_count());
+            let expected = match segments {
+                2 => (17, 27, 12),
+                3 => (22, 36, 16),
+                4 => (26, 42, 18),
+                _ => (31, 51, 22),
+            };
+            assert_eq!(counts, expected, "whole mesh at segments = {segments}");
+            assert_eq!(
+                counts.0 + counts.2 - counts.1,
+                2,
+                "the beveled cube stays closed (segments = {segments})",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.4a)'s welding rule — `(i, 0, k)` **is the same vertex as**
+    /// `(i−1, 0, n−k)` for `k <= ⌊n/2⌋` — read off the finished mesh.
+    ///
+    /// A leg vert therefore belongs to *both* strips that meet at its boundvert (four quads,
+    /// two per strip) rather than to one, and at even `n` the identification closes
+    /// transitively over all `s` legs: the octant origin is one vertex carrying `2·s` edges
+    /// and `2·s` faces. Two coincident verts would each carry half of that.
+    #[test]
+    fn adj_square_in_weld_identifies_consecutive_sectors_chains() {
+        let (mesh, result) = cube_corner_adj_profile(4, 0.0);
+        mesh.validate_topology();
+
+        let origin = square_in_weld_vert_at(&mesh, &result, square_in_weld_origin())
+            .expect("even `n` welds every leg's innermost sample at the octant origin");
+        assert_eq!(
+            mesh.iter_disk_edges(origin).count(),
+            6,
+            "the octant origin carries one leg edge and one strip rail per sector",
+        );
+        assert_eq!(
+            mesh.vert_face_keys(origin).len(),
+            6,
+            "two quads from each of the three arriving strips",
+        );
+
+        let step = square_in_weld_step(4);
+        for boundvert in square_in_weld_boundverts() {
+            let leg = square_in_weld_origin() + (1.0 - step) * (boundvert - square_in_weld_origin());
+            let leg = square_in_weld_vert_at(&mesh, &result, leg)
+                .expect("one mid-leg vert per boundvert, not two coincident ones");
+            assert_eq!(
+                mesh.vert_face_keys(leg).len(),
+                4,
+                "a mid-leg vert takes two quads from each of the two strips meeting at its \
+                 boundvert",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.4a)'s chain layout, quoted: sector `i`'s first half is
+    /// `(1 − k·b)·e_i` for `0 <= k <= ⌊n/2⌋`, with `b = 2/n` at even `n` and
+    /// `b = 2/(2·⌊n/2⌋ + √2)` at odd `n`. Under `unit_to_corner` the unit axis point `e_i`
+    /// is `B_i` and the octant origin is the corner-surface centre, so each leg is the
+    /// straight run `B_i → c` sampled at those parameters.
+    ///
+    /// The odd step is strictly smaller than the even one (`√2 > 2·½`), which is what leaves
+    /// room for the single corner-cutting chord across the turn — so no odd chain is every
+    /// other sample of the doubled even one.
+    #[test]
+    fn adj_square_in_weld_leg_spacing_is_the_closing_chord_step() {
+        for segments in [2u32, 3, 4, 5] {
+            let step = square_in_weld_step(segments);
+            let half = segments as usize / 2;
+            let (mesh, result) = cube_corner_adj_profile(segments, 0.0);
+            let positions: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect();
+            for boundvert in square_in_weld_boundverts() {
+                for k in 1..=half {
+                    let expected = square_in_weld_origin()
+                        + (1.0 - k as f32 * step) * (boundvert - square_in_weld_origin());
+                    assert_position_present(
+                        &positions,
+                        expected,
+                        &format!("leg sample k = {k} at segments = {segments}"),
+                    );
+                }
+            }
+            if segments % 2 == 1 {
+                assert!(
+                    step < 2.0 / segments as f32,
+                    "the odd step is the tighter one (segments = {segments})",
+                );
+            }
+        }
+    }
+
+    /// Both **square** sentinels are refused *by the octant grid* — a square exponent must
     /// never reach it, since `r = 1e4` makes branch R's powers numerically dead ((f.2)'s snap
-    /// note) — they take their own closed forms from the same tri-corner branch. Square-in's
-    /// decline is clean: the cube corner builds its strips, emits no cap, and stays valid.
+    /// note) — and take closed forms of their own from the same tri-corner branch: the
+    /// square exponent fills with (f.5)'s three flat unit squares, square-in with (f.4a)'s
+    /// weld, whose entire face output at odd `segments` is one central `s`-gon.
     #[test]
     fn adj_cube_corner_square_exponents_route_off_the_octant_grid() {
         assert!(
@@ -30172,26 +30988,27 @@ mod tests {
         );
 
         // §8.5.5.5(f.5): the square profile at a valence-3 cube corner, odd `segments`, builds
-        // the three flat unit squares (a cap), no longer an unfilled hole.
+        // the three flat unit squares.
         let (square_mesh, square) = cube_corner_adj_profile(3, 0.99);
         square_mesh.validate_topology();
         assert!(
             !curved_corner_grid_faces(&square_mesh, &square).is_empty(),
-            "the square profile now builds a three-flat-squares cap",
+            "the square profile builds a three-flat-squares cap",
         );
 
-        // Square-in stays declined: strips only, junction left open, still valid.
+        // §8.5.5.5(f.4a): square-in welds. No ring quads, so the 3·3 strip quads plus the one
+        // central triangle are the whole result.
         let (square_in_mesh, square_in) = cube_corner_adj_profile(3, 0.0);
         square_in_mesh.validate_topology();
         assert_eq!(
             curved_corner_grid_faces(&square_in_mesh, &square_in).len(),
-            0,
-            "square-in emits no cap face",
+            1,
+            "square-in's fill is the central `s`-gon alone",
         );
         assert_eq!(
             square_in.faces.len(),
-            9,
-            "square-in: all 3·3 beveled-edge strip quads are still built",
+            10,
+            "square-in: all 3·3 beveled-edge strip quads plus the central triangle",
         );
     }
 
@@ -30383,6 +31200,7 @@ mod tests {
             centre_column_representatives: Vec::new(),
             dihedral_band_deviation: None,
             pipe_override: false,
+            square_in_weld: None,
             opening_edge_directions: directions.clone(),
             opening_edge_tips: tips,
         };
@@ -48400,14 +49218,18 @@ enum ChainEmission {
     /// those is a cap — the distinction is invisible on a symmetric cell, where the
     /// resample is the identity, and worth ≈25 quanta on a skewed one.
     Raw,
-    /// The chord-fraction resample (§8.2.2.1.1 steps 1–3), run at every `segments` on
-    /// **every** ring-edge chain of **every** [V-ADJ] cap — the plain junction ring, the
-    /// outer miter's arc, its flanking cross-sections, and its interior-sector strips
-    /// (§8.9.5.1 / §8.9.5.2). No chain-kind test, no skew test, no cap-kind test: steps
-    /// 1–3 are safe to run unconditionally, returning the sample unchanged wherever the
-    /// gate says it should not move. Whether the emitted sample is then projected back
-    /// onto the profile curve is a *grid-level* decision the fill makes (step 4), not a
-    /// chain-level one.
+    /// The chord-fraction resample (§8.2.2.1.1 steps 1–3), run at every `segments` on every
+    /// **sampled** ring-edge chain of a [V-ADJ] cap — the plain junction ring, the outer
+    /// miter's arc, its flanking cross-sections, and its interior-sector strips (§8.9.5.1 /
+    /// §8.9.5.2). No chain-kind test and no skew test: steps 1–3 are safe to run
+    /// unconditionally, returning the sample unchanged wherever the gate says it should not
+    /// move. Whether the emitted sample is then projected back onto the profile curve is a
+    /// *grid-level* decision the fill makes (step 4), not a chain-level one.
+    ///
+    /// "Sampled" is the scope, and §8.5.5.5(f.4a)'s square-in weld is the one cap outside it:
+    /// its ring is not sampled from a cross-section at all but stated in closed form at `n`,
+    /// so there is no source polyline to read chord fractions off — see
+    /// [`LoopMesh::build_square_in_weld_chains`].
     Resampled,
 }
 
@@ -49636,6 +50458,32 @@ struct UnitOctant {
     translation: Vec3,
 }
 
+/// The image of the unit octant's origin under §8.5.2's `unit_to_corner` — the frame's
+/// translation `(B_0 + B_1 + B_2 − v)/2`, i.e. the corner surface's centre `c`.
+///
+/// Split out from [`UnitOctant::from_corner`] because it is the one part of the frame that
+/// needs **no** conditioning: it is a plain affine combination of the four points, where the
+/// linear columns have to be invertible before anything may be read back through them. A
+/// caller that only maps *forward* — §8.5.5.5(f.4a)'s legs, `c + (1 − k·b)·(B_i − c)`, and
+/// the winding anchor of the `s`-gon that closes them — must not be refused by a guard that
+/// exists for the inverse.
+fn unit_octant_origin(boundverts: [Vec3; 3], vertex: Vec3) -> Vec3 {
+    (boundverts[0] + boundverts[1] + boundverts[2] - vertex) * 0.5
+}
+
+/// BEVEL.md §8.5.5.5(f.4a)'s leg step `b`, quoted: `2/n` at even `n`, `2/(2·⌊n/2⌋ + √2)` at
+/// odd `n` — the closed-form solution of §8.6.4 step 3's closing-chord term on two straight
+/// unit legs. The odd step is the tighter one (`√2 > 2·½`), which is what leaves room for the
+/// single corner-cutting chord across the turn.
+fn square_in_weld_leg_step(segments: u32) -> f32 {
+    let half = (segments / 2) as f32;
+    if segments % 2 == 0 {
+        2.0 / segments as f32
+    } else {
+        2.0 / (2.0 * half + std::f32::consts::SQRT_2)
+    }
+}
+
 impl UnitOctant {
     fn from_corner(boundverts: [Vec3; 3], vertex: Vec3) -> Option<UnitOctant> {
         let [b0, b1, b2] = boundverts;
@@ -49673,7 +50521,7 @@ impl UnitOctant {
         Some(UnitOctant {
             linear,
             inverse: linear.inverse(),
-            translation: (b0 + b1 + b2 - vertex) * 0.5,
+            translation: unit_octant_origin(boundverts, vertex),
         })
     }
 
