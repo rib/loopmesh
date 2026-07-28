@@ -3238,6 +3238,7 @@ impl LoopMesh {
                         offset,
                         segments,
                         profile,
+                        custom,
                         junction_emission,
                         &mut templates,
                         &mut chains,
@@ -3378,6 +3379,7 @@ impl LoopMesh {
                         &chains,
                         segments,
                         options.profile,
+                        custom,
                         material,
                         &templates,
                         result,
@@ -3406,6 +3408,7 @@ impl LoopMesh {
                         &chains,
                         segments,
                         options.profile,
+                        custom,
                         material,
                         &templates,
                         result,
@@ -3530,6 +3533,7 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        custom: Option<&CustomChains>,
         emission: ChainEmission,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
@@ -3616,13 +3620,19 @@ impl LoopMesh {
         // The gate is (f.1) step 3's, in its order — the ring's three sectors first, then the
         // dispatch keys: `emission` names the fill method (the
         // §8.2.2.1.1 chord resample is the [V-ADJ] cap's own boundary emission, so only an
-        // ADJ junction asks for it); step 3 is edge-bevel only; step 2's pipe is tested
-        // before step 3, so a pipe junction never reaches the weld's row; and the exponent
-        // row is the exact `r = 0` sentinel. Vertex mode falls through to (f.4b)'s ordinary
-        // general grid, which is a *different object* — it keeps the ring quads this deletes.
-        // (`affect` and `emission` are documentary here rather than live — this path is only
-        // reached with both already pinned — but they are step 3's dispatch made legible and
-        // are kept for that.)
+        // ADJ junction asks for it); step 3 is edge-bevel only and refuses a **custom**
+        // profile outright, before any geometry, so a hand-drawn curve never welds; step 2's
+        // pipe is tested before step 3, so a pipe junction never reaches the weld's row; and
+        // the exponent row is the exact `r = 0` sentinel. Vertex mode falls through to
+        // (f.4b)'s ordinary general grid, which is a *different object* — it keeps the ring
+        // quads this deletes.
+        //
+        // `affect` alone is documentary — this path is only reached under an edge bevel — and
+        // is kept because it makes step 3's dispatch legible. `emission` is **live**: it is
+        // `Raw` under a `Cutoff` vmesh, and a `Cutoff` junction reaches here unchanged, so
+        // dropping the conjunct would lay welded chains under a §8.3 flat cut, which owes no
+        // weld at all. `custom` is live for the same reason — a custom bevel reaches here on
+        // whatever exponent its untouched `profile` slider resolves to, `r = 0` included.
         //
         // Step 3 keys on **valence**, and its predicate is three-valued: it must *fire*, and
         // *doesn't apply* is not the same answer. A ring whose three sectors are octant-shaped
@@ -3647,6 +3657,7 @@ impl LoopMesh {
                 segments >= 2
                     && affect == BevelAffect::Edges
                     && emission == ChainEmission::Resampled
+                    && custom.is_none()
                     && !pipe_override
                     && profile_to_exponent(profile) == 0.0
                     && junction_incident_edges(&corners).len() == 3
@@ -3701,13 +3712,18 @@ impl LoopMesh {
                 let next = (k + 1) % count;
                 let crossing = opening_edges[next];
                 let rescue = self.mid_rescue(vertex, crossing, &corners, is_beveled);
+                // §8.6.3.1(4).4's per-consumer table: a junction sector's ring is the cap's
+                // own boundary, so a custom curve supplies it — read back off the `doubled`
+                // chain under `Resampled` (the [V-ADJ] cap rim) and raw off `target` under
+                // `Raw` (the §8.3 cutoff fill). Both arms live in `chain_positions`; what
+                // this call site owes is the curve itself.
                 let (interior, cell) = self.build_chain_between(
                     boundverts[k],
                     boundverts[next],
                     crossing,
                     segments,
                     profile,
-                    None,
+                    custom,
                     rescue,
                     None,
                     chain_emission,
@@ -3807,6 +3823,13 @@ impl LoopMesh {
     /// the override is what makes the two samplings coincide, rather than papering over a
     /// difference by averaging. The merge below is BMesh's defensive midpoint — it does
     /// real work only in the fallback where the override was abandoned.
+    ///
+    /// **Known gap — no custom awareness (§8.6.3).** Both chains are sampled from the analytic
+    /// family off `profile` alone; no custom chain reaches here, so an edge-mode bevel through a
+    /// hand-drawn curve emits a superellipse cross-section at its two-boundvert welds while
+    /// emitting the curve everywhere else in the same operation. One of the three sites still
+    /// owed the threading, with [`LoopMesh::mint_pipe_override_loose_verts`] and
+    /// [`pipe_cross_section_replant`]; tracked on its own parity-matrix row.
     #[allow(clippy::too_many_arguments)]
     fn build_welded_chain(
         &mut self,
@@ -5041,6 +5064,12 @@ impl LoopMesh {
     /// each lands on its profile midpoint (coincident with the ADJ mid-edge ring node);
     /// at `segments ≥ 3` the cutoff samples differ from the ADJ interior samples and the
     /// leftovers sit at their own distinct positions. E and F are untouched.
+    ///
+    /// **Known gap — no custom awareness (§8.6.3).** The leftovers are recomputed from the
+    /// analytic arc off `profile` alone, so under a hand-drawn curve they land on the
+    /// superellipse the slider names rather than on the curve the fill used. Positions only —
+    /// the count is topological and correct either way. One of the three sites still owed the
+    /// threading, with [`LoopMesh::build_welded_chain`] and [`pipe_cross_section_replant`].
     fn mint_pipe_override_loose_verts(
         &mut self,
         cut: &JunctionCut,
@@ -5113,7 +5142,18 @@ impl LoopMesh {
     /// test declines; a reflex sector is not itself a disqualifier — only failing the band
     /// (a fold past `3·π/4`, the wrong near-flat count, or a signed sum outside the `±π/4`
     /// window) drops the corner through to the general grid of §8.5.5.5.
-    fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32) -> bool {
+    ///
+    /// `custom` is the predicate's **refusal** arm (§8.5.5.5(f.1), the three-valued predicate):
+    /// a custom profile is refused outright, before any offset or dihedral is looked at, because
+    /// the superellipsoid the whole family snaps onto has no meaning for a hand-drawn curve. It
+    /// is a *refusal*, not a "doesn't apply", so step 4's shortcut back into the family honours
+    /// it too — which this gate serves by being the one predicate both routes ask. The other
+    /// unconditional refusal, vertex mode, is structural here: no vertex-mode fill reaches this
+    /// call at all.
+    fn adj_tri_corner_trigger(&self, cut: &JunctionCut, profile: f32, custom: bool) -> bool {
+        if custom {
+            return false;
+        }
         let exponent = profile_to_exponent(profile);
         // §8.5.5.5(f.1): the tri-corner family admits three exponents — the smooth octant
         // grid (f.2), and the two closed forms. The **square** sentinel takes (f.5)'s three
@@ -5194,6 +5234,7 @@ impl LoopMesh {
         chains: &[EdgeEndChain],
         segments: u32,
         profile: f32,
+        custom: Option<&CustomChains>,
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
@@ -5215,7 +5256,7 @@ impl LoopMesh {
         // never post-passed. One verdict serves both the routing and the replant.
         let exponent = profile_to_exponent(profile);
         let pipe = if cut.pipe_override
-            && !adj_square_ring_claims(exponent, cut.boundverts.len(), segments)
+            && !adj_square_ring_claims(exponent, cut.boundverts.len(), segments, custom.is_some())
         {
             self.pipe_cross_section(cut, chains)
         } else {
@@ -5242,6 +5283,7 @@ impl LoopMesh {
             pipe.is_some(),
             segments,
             profile,
+            custom,
             material,
             templates,
             &mut slots,
@@ -5458,6 +5500,7 @@ impl LoopMesh {
         pipe_claims_junction: bool,
         segments: u32,
         profile: f32,
+        custom: Option<&CustomChains>,
         material: i32,
         templates: &TemplateBank,
         slots: &mut AdjNetSlots,
@@ -5498,14 +5541,15 @@ impl LoopMesh {
         // *every* such ring — a valence-3 square+even ring never reaches the three flat
         // squares below (its even-`n` weld is unreachable, (f.5)'s blockquote). With no outer
         // miter in scope the boundvert count equals the beveled-edge count, so it gates the
-        // ring here. Odd `segments` and custom profiles fall through.
-        if adj_square_ring_claims(exponent, count, segments) {
+        // ring here. Odd `segments` and custom profiles fall through — the latter through
+        // step 1's own `not a custom profile` conjunct, which the gate now carries.
+        if adj_square_ring_claims(exponent, count, segments, custom.is_some()) {
             return self.build_adj_fill_square_ring(
                 cut, chains, segments, profile, material, templates, slots, result,
             );
         }
 
-        if !self.adj_tri_corner_trigger(cut, profile) {
+        if !self.adj_tri_corner_trigger(cut, profile, custom.is_some()) {
             // §8.5.5.5(f.1) step 4 carries **no exponent gate**: the circle, the straight
             // chord, and the whole genuinely curved band between and beyond them all take
             // the general fullness grid of (a)–(e). The exponent enters that grid only
@@ -5545,6 +5589,12 @@ impl LoopMesh {
             // now has the branch it needs — (f.2)'s branch S, the axis push in the clamped unit
             // square plus the `land_on_corner` override keyed on the net's own `(i, j, k)`
             // slots — where before it would have resolved through a divergent `r`-norm.
+            //
+            // A **custom** profile reaches this point at *every* ring, orthonormal cube corner
+            // included: the tri-corner predicate refuses it outright and step 1 excludes it, so
+            // (f.1) leaves it exactly one destination. Its `r` is whatever the untouched
+            // `profile` slider happens to resolve to and is read by nothing here — the curve
+            // supplies the boundary chains and law F1 supplies the centre seed.
             debug_assert!(
                 !(cut.square_in_weld.is_some() && pipe_claims_junction),
                 "(f.1) tests the pipe one step before the weld's row",
@@ -5558,7 +5608,7 @@ impl LoopMesh {
                 0 | 1 => return false,
                 _ => {
                     return self.build_adj_fill_general_nonsymmetric(
-                        cut, chains, segments, profile, material, templates, slots, result,
+                        cut, chains, segments, profile, custom, material, templates, slots, result,
                     );
                 }
             }
@@ -7735,6 +7785,7 @@ impl LoopMesh {
         chains: &[EdgeEndChain],
         segments: u32,
         profile: f32,
+        custom: Option<&CustomChains>,
         material: i32,
         templates: &TemplateBank,
         slots: &mut AdjNetSlots,
@@ -7766,7 +7817,7 @@ impl LoopMesh {
                 Some(cell) => profiles.push(RingChainProfile::Cell {
                     cell,
                     profile,
-                    custom: None,
+                    custom,
                 }),
                 None => return false,
             }
@@ -7777,8 +7828,11 @@ impl LoopMesh {
         // plane with no bulge toward the corner `v` and no extraordinary-centre
         // relaxation. Every other *smooth* exponent keeps the (f.3) fullness seed — the
         // table is consulted only for the circular `r = 2` at `segments ≤ 11`, everything
-        // else is law F3's regression in the raw `profile` scalar — and relaxes.
-        let flat = profile_to_exponent(profile) == 1.0;
+        // else is law F3's regression in the raw `profile` scalar — and relaxes. Law **F1**
+        // (custom) is tested *before* F2, so a custom curve never takes the flat branch even
+        // when the untouched `profile` slider happens to sit at the line exponent — the curve,
+        // not the slider, is the cross-section.
+        let flat = profile_to_exponent(profile) == 1.0 && custom.is_none();
         let sector_representatives = cut.resolve_sector_representatives(templates);
         let centre_column_representatives = cut.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(cut.central_representative);
@@ -7788,7 +7842,7 @@ impl LoopMesh {
             &profiles,
             segments,
             profile,
-            None,
+            custom,
             flat,
             None,
             material,
@@ -23527,16 +23581,21 @@ mod tests {
         let square = PROFILE_SQUARE_EXPONENT;
         let square_in = 0.0_f32;
         let circle = 2.0_f32;
-        assert!(adj_square_ring_claims(square, 3, 2));
-        assert!(adj_square_ring_claims(square, 4, 8));
+        assert!(adj_square_ring_claims(square, 3, 2, false));
+        assert!(adj_square_ring_claims(square, 4, 8, false));
         // Odd `segments` falls through to the pipe, and so does the square-in sentinel and
         // every smooth exponent.
-        assert!(!adj_square_ring_claims(square, 4, 3));
-        assert!(!adj_square_ring_claims(square, 4, 0));
-        assert!(!adj_square_ring_claims(square_in, 4, 4));
-        assert!(!adj_square_ring_claims(circle, 4, 4));
+        assert!(!adj_square_ring_claims(square, 4, 3, false));
+        assert!(!adj_square_ring_claims(square, 4, 0, false));
+        assert!(!adj_square_ring_claims(square_in, 4, 4, false));
+        assert!(!adj_square_ring_claims(circle, 4, 4, false));
         // A two-boundvert ring is not the (f.5) ring's, whatever the parity.
-        assert!(!adj_square_ring_claims(square, 2, 4));
+        assert!(!adj_square_ring_claims(square, 2, 4, false));
+        // Step 1's own `not a custom profile` conjunct: a custom bevel still carries a
+        // `profile` slider, so a caller that resolves the exponent from it can hand this gate
+        // the square sentinel — and every such ring falls through to step 4.
+        assert!(!adj_square_ring_claims(square, 3, 2, true));
+        assert!(!adj_square_ring_claims(square, 4, 8, true));
 
         // The grid the claim routes to survives: (f.5)'s even-`n` parallel-offset ring welds its
         // innermost vert at the corner `v` exactly, which the tented tube's junction puts at
@@ -29158,36 +29217,46 @@ mod tests {
             ],
         );
         assert!(
-            mesh.adj_tri_corner_trigger(&cube, 0.5),
+            mesh.adj_tri_corner_trigger(&cube, 0.5, false),
             "default-profile cube corner fires the §8.5.1 trigger",
         );
         // §8.5.5.5(f.1) step 3: the *smooth* member of the tri-corner family is every
         // exponent that is neither square nor square-in — the circle and the whole curved
         // band alike, both of which the unit-octant grid of (f.2) builds.
         assert!(
-            mesh.adj_tri_corner_trigger(&cube, 0.7),
+            mesh.adj_tri_corner_trigger(&cube, 0.7, false),
             "a curved (bulging) profile fires the tri-corner family (§8.5.5.5(f.2))",
         );
         assert!(
-            mesh.adj_tri_corner_trigger(&cube, 0.3),
+            mesh.adj_tri_corner_trigger(&cube, 0.3, false),
             "a curved (near-linear) profile fires it too",
         );
         assert!(
-            mesh.adj_tri_corner_trigger(&cube, 0.99),
+            mesh.adj_tri_corner_trigger(&cube, 0.99, false),
             "the square exponent now fires the tri-corner family — the three flat unit squares \
              of §8.5.5.5(f.5) (odd `segments`; even is claimed by the parallel-offset ring)",
         );
         assert!(
-            !mesh.adj_tri_corner_trigger(&cube, 0.0),
+            !mesh.adj_tri_corner_trigger(&cube, 0.0, false),
             "square-in takes the degenerate weld (§8.5.5.5(f.4)), still declined here",
         );
         // The straight chord is *not* an exception: (f.1) step 3's smooth arm is every `r`
         // bar the two squares, and (f.2)'s own apex table lists `r = 1` (the flat chamfer
         // plane) as a member. It builds the octant grid like any other smooth exponent.
         assert!(
-            mesh.adj_tri_corner_trigger(&cube, 0.25),
+            mesh.adj_tri_corner_trigger(&cube, 0.25, false),
             "the straight chord (`r = 1`) is a smooth member too (§8.5.5.5(f.1) step 3)",
         );
+        // §8.5.5.5(f.1)'s three-valued predicate: a custom profile is an unconditional
+        // *refusal*, checked before any geometry — so the very corner every smooth exponent
+        // above fires on is declined at each of them once the curve is in play.
+        for profile in [0.0_f32, 0.25, 0.3, 0.5, 0.7, 0.99] {
+            assert!(
+                !mesh.adj_tri_corner_trigger(&cube, profile, true),
+                "a custom profile is refused outright at profile {profile} \
+                 (§8.5.5.5(f.1) step 1 / the three-valued predicate)",
+            );
+        }
 
         // Unequal offset: one spoke is twice as long, so the lengths differ.
         let unequal = make_cut(
@@ -29199,7 +29268,7 @@ mod tests {
             ],
         );
         assert!(
-            !mesh.adj_tri_corner_trigger(&unequal, 0.5),
+            !mesh.adj_tri_corner_trigger(&unequal, 0.5, false),
             "unequal offsets decline the §8.5.1 trigger",
         );
 
@@ -29213,7 +29282,7 @@ mod tests {
             ],
         );
         assert!(
-            !mesh.adj_tri_corner_trigger(&flat, 0.5),
+            !mesh.adj_tri_corner_trigger(&flat, 0.5, false),
             "non-right-angle corner declines the §8.5.1 trigger",
         );
     }
@@ -30774,6 +30843,217 @@ mod tests {
                 mesh.vertex_count() > welded.vertex_count(),
                 "the grid keeps the ring quads the weld deletes (segments = {segments})",
             );
+        }
+    }
+
+    /// The §8.5.5.8 driver's corner, beveled through a **custom** curve instead of the
+    /// analytic family. The `profile` scalar is still supplied — a custom bevel carries one,
+    /// and the whole point of the arms below is that nothing on this path may read it.
+    fn cube_corner_adj_custom(
+        segments: u32,
+        profile: f32,
+        curve: &BevelCurveProfile,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                profile_type: BevelProfileType::Custom(curve),
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1): **a custom profile never takes the tri-corner family at all.**
+    /// The predicate refuses it outright — one of the two unconditional refusals, checked
+    /// before any offset or dihedral is examined — and step 1 excludes it too, so the only
+    /// destination (f.1) leaves it is step 4's general fullness grid. Step 4's own shortcut
+    /// back into the family honours the same refusal, so there is no way around.
+    ///
+    /// The orthonormal cube corner is the sharpest place to pin this, because it is the one
+    /// ring that fires *every* arm of the family: at the square-in sentinel it would take the
+    /// (f.4a) weld (no interior at all, at most one central triangle) and at the circle it
+    /// would take (f.2)'s unit-octant grid. Under a custom curve both must give way to the
+    /// §8.5.5.5(e) parity counts — and the two contrast arms below show they otherwise would.
+    #[test]
+    fn custom_profile_refuses_the_tri_corner_family_at_the_cube_corner() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        for segments in [2u32, 3, 4, 5] {
+            let (faces, verts) = adj_general_ring_parity_counts(3, segments);
+
+            // The two exponents the family would otherwise claim: the square-in sentinel
+            // (step 3's `EXP_SQUARE_IN` row) and the circular default (its `otherwise` arm).
+            for profile in [0.0_f32, 0.5] {
+                let (mesh, result) = cube_corner_adj_custom(segments, profile, &curve);
+                mesh.validate_topology();
+                let cap = curved_corner_grid_faces(&mesh, &result);
+                assert_eq!(
+                    cap.len(),
+                    faces,
+                    "custom at profile {profile} takes step 4's grid \
+                     (segments = {segments})",
+                );
+                assert_eq!(
+                    curved_corner_grid_verts(&mesh, &result).len(),
+                    verts,
+                    "…and its full §8.5.5.5(e) vert parity (segments = {segments})",
+                );
+            }
+
+            // Non-vacuity, from both of the arms the refusal displaces. The weld's entire
+            // face output is the odd parity's one central `s`-gon; the octant grid carries
+            // the same *counts* as step 4's grid, so the contrast there is positional and is
+            // the business of the chain arm below.
+            let (welded, weld_result) = cube_corner_adj_profile(segments, 0.0);
+            assert_eq!(
+                curved_corner_grid_faces(&welded, &weld_result).len(),
+                usize::from(segments % 2 == 1),
+                "control: the analytic square-in corner welds (segments = {segments})",
+            );
+            assert!(
+                faces > usize::from(segments % 2 == 1),
+                "…and the grid the custom curve takes is a different object",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.6.3 / §8.6.3.1(4).4 row 3: a [V-ADJ] junction sector's emitted rim is the
+    /// **custom curve's** chain, not the superellipse the `profile` slider would name. On an
+    /// all-vector control net at `segments = 2` the §8.2.2.1.1 read-back reduces to the
+    /// identity (`n ≥ E`, every sample on the straight control polyline), so the lone interior
+    /// sample of each ring chain is the control point itself, mapped through §8.2.2.1's cell.
+    ///
+    /// Worked for the `{0,1}` chain of the §8.5.5.8 driver. Its two boundverts are the §7.6.2
+    /// meets `(0.75, −1, −0.75)` — the chain's `start` — and `(0.75, −0.75, −1)`, its `end`;
+    /// the on-edge foot is `(0.75, −1, −1)`, so the cell is `a_axis = mid − start =
+    /// (0, 0, −0.25)`, i.e. the `z` direction, and `b_axis = mid − end = (0, −0.25, 0)`, about
+    /// the origin `start + end − mid = (0.75, −0.75, −0.75)`.
+    ///
+    /// The read takes §8.6.3.1(6)'s `reverse = true` branch ([`custom_chain_reverse_bit`]),
+    /// which reads the chain from the far end with the axis swap **dropped** — so there is no
+    /// swap here, and at `segments = 2` reversing a three-sample chain leaves the lone interior
+    /// sample where it was. The widget control point `(x, y) = (0.5, 0.25)` therefore enters the
+    /// cell as `(u, v) = (0.5, 0.25)` unchanged, at
+    /// `origin + 0.5·a_axis + 0.25·b_axis = (0.75, −0.8125, −0.875)` — where the circle would
+    /// put `(√2/2, √2/2)`, `(0.75, −0.92678, −0.92678)`. The two are 0.08 world apart, so this
+    /// separates the control net from the analytic family outright rather than by a tolerance.
+    #[test]
+    fn custom_profile_edge_junction_chain_rides_the_control_net_not_the_circle() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let control_point = Vec3::new(0.75, -0.8125, -0.875);
+        let circle = Vec3::new(0.75, -0.92678, -0.92678);
+
+        for profile in [0.0_f32, 0.5] {
+            let (mesh, result) = cube_corner_adj_custom(2, profile, &curve);
+            mesh.validate_topology();
+            let ring: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&vertex| mesh.vertex_position(vertex))
+                .filter(|position| (position.x - 0.75).abs() <= 1.0e-4)
+                .collect();
+            assert_position_present(
+                &ring,
+                control_point,
+                &format!("the `{{0,1}}` chain's custom sample at profile {profile}"),
+            );
+            assert!(
+                ring.iter().all(|p| (*p - circle).length() > 1.0e-3),
+                "no sample sits on the circular cross-section the slider names \
+                 (profile = {profile})",
+            );
+        }
+    }
+
+    /// The two arms above, stated as the invariant behind them (BEVEL.md §8.6.3): a custom
+    /// profile "bypasses §8.6.2 and §8.6.4 entirely and supplies its chain directly", and
+    /// every rule that would otherwise consult the exponent — (f.1) steps 1 and 3, the (f.3)
+    /// `fullness` law, whose custom branch **F1** is tested before F2's line/circle closed
+    /// forms — is keyed on the *type*. The whole mesh must therefore be invariant under the
+    /// slider. The fixture's three beveled edges *do* run out to terminals at their far ends
+    /// (`(−1, −1, −1)`, `(1, 1, −1)`, `(1, −1, 1)`), so the terminal fill is live here — but the
+    /// operator's one genuinely `profile_type`-keyed positional rule lives there and keys on the
+    /// *type* too: `terminal_leg_slide_distance` takes the `√2` leg slide for **any** custom
+    /// profile, whatever the scalar reads. So the terminals are slider-invariant under a fixed
+    /// custom curve alongside everything else, rather than being absent.
+    ///
+    /// Sweeping the four snapped sentinels plus a genuinely curved value makes this a real
+    /// gate: before the refusal landed, `profile = 0.0` welded, `0.25` went flat and `0.5`
+    /// built the octant grid, so three of these five arms disagreed with each other.
+    #[test]
+    fn custom_profile_output_is_independent_of_the_superellipse_slider() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        for segments in [2u32, 3, 4] {
+            let (baseline_mesh, baseline) = cube_corner_adj_custom(segments, 0.5, &curve);
+            let reference: Vec<Vec3> = baseline
+                .verts
+                .iter()
+                .map(|&vertex| baseline_mesh.vertex_position(vertex))
+                .collect();
+            for profile in [0.0_f32, 0.25, 0.7, 0.99] {
+                let (mesh, result) = cube_corner_adj_custom(segments, profile, &curve);
+                mesh.validate_topology();
+                assert_eq!(
+                    (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                    (
+                        baseline_mesh.vertex_count(),
+                        baseline_mesh.edge_count(),
+                        baseline_mesh.face_count()
+                    ),
+                    "the slider cannot move a custom bevel's census \
+                     (profile = {profile}, segments = {segments})",
+                );
+                let moved: Vec<Vec3> = result
+                    .verts
+                    .iter()
+                    .map(|&vertex| mesh.vertex_position(vertex))
+                    .collect();
+                // The position check below is one-directional containment, so a `moved` list
+                // that lost an entry — two output verts collapsed onto one — would pass it.
+                // The census above cannot stand in: it counts the whole mesh, not how much of
+                // it the bevel claims as its own output.
+                assert_eq!(
+                    moved.len(),
+                    reference.len(),
+                    "the slider cannot change how many verts the bevel emits \
+                     (profile = {profile}, segments = {segments})",
+                );
+                for position in &moved {
+                    assert!(
+                        reference
+                            .iter()
+                            .any(|candidate| (*candidate - *position).length() <= 1.0e-5),
+                        "…nor a single one of its positions ({position:?} at \
+                         profile = {profile}, segments = {segments})",
+                    );
+                }
+            }
         }
     }
 
@@ -49155,29 +49435,11 @@ impl ProfileCell {
             // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
             // bypassing the superellipse exponent / even-arc-length solve entirely.
             let cells = match custom {
-                // §8.6.3.1(6) Regime B (vertex bevels): a cap sector runs no
-                // orientation walk — there is no beveled edge to traverse — so every
-                // sector of the cap shares **one uniform handedness** bit. Per
-                // §8.6.3.1(6) that bit's *value* is deliberately not universal: it is a
-                // winding-dependent quantity fixed by the rotational sense in which the
-                // implementation itself feeds each sector's `start`/`end` pair into the
-                // cell. The guide's worked rim-mid table is computed under its own
-                // *canonical* forward-feed winding (the `reverse = false` reading);
-                // loopmesh constructs each cap sector's `start`/`end` in the
-                // index-reversed **mirror** of that canonical order, so it needs the
-                // **complementary** constant `true` to land the same rim positions —
-                // chord fraction 0.375 along `B_k → B_(k+1)`, not the mirrored 0.625.
-                // Pinned by the cross-backend A/B arm
-                // `bevel_custom_profile_vertex_cube_corner_two_segments` and the in-crate
-                // test `custom_profile_vertex_cap_orientation_forms_symmetry_orbit`. Do
-                // **NOT** revert this to `false`: §8.6.3.1(6) does not endorse either
-                // literal, and its table is stated under the guide's canonical winding,
-                // not loopmesh's mirror feed order — `false` mirror-flips every sector to
-                // the wrong 0.625 fraction. (Invisible for a symmetric superellipse/line
-                // profile, where the diagonal symmetry makes the bit a no-op; only an
-                // asymmetric custom net exposes it. Regime A — edge bevels — would seed
-                // and parity-walk the bit instead; that path is unbuilt.)
-                Some(chains) => chains.chain_at(segments, true),
+                // The §8.6.3.1(6) handedness bit is uniform across every consumer here —
+                // vertex-bevel cap sectors *and* edge-mode junction sectors alike. See
+                // [`custom_chain_reverse_bit`], which records why that constant is right for
+                // Regime B and known wrong for Regime A.
+                Some(chains) => chains.chain_at(segments, custom_chain_reverse_bit()),
                 None => superellipse_chain(profile, segments),
             };
             debug_assert_eq!(
@@ -49601,6 +49863,52 @@ fn cubic_bezier(
         w0 * p0.0 + w1 * c1.0 + w2 * c2.0 + w3 * p3.0,
         w0 * p0.1 + w1 * c1.1 + w2 * c2.1 + w3 * p3.1,
     )
+}
+
+/// The §8.6.3.1(6) handedness bit loopmesh feeds **every** custom chain read, in both of the
+/// section's regimes. It takes no argument because it distinguishes none — that uniformity is
+/// the whole content of this function, and half of it is a known divergence.
+///
+/// **Regime B — vertex-bevel cap sectors: the constant is right.** A cap sector runs no
+/// orientation walk (there is no beveled edge to traverse), so §8.6.3.1(6) gives the whole cap
+/// *one* uniform bit, and deliberately declines to name its value: the value is winding-
+/// dependent, fixed by the rotational sense in which an implementation feeds each sector's
+/// `start`/`end` pair into the cell. §8.6.3.1(6)'s worked rim-mid table is stated under its own
+/// canonical forward-feed winding (the `reverse = false` reading), and loopmesh builds each cap
+/// sector's `start`/`end` in the index-reversed **mirror** of that order, so it needs the
+/// **complementary** constant to land the same rim positions — chord fraction 0.375 along
+/// `B_k → B_(k+1)`, not the mirrored 0.625. Do **not** "simplify" this to `false`: that
+/// mirror-flips every cap sector onto the wrong fraction. Pinned by the in-crate
+/// `custom_profile_vertex_cap_orientation_forms_symmetry_orbit` and cross-backend by
+/// `bevel_custom_profile_vertex_cube_corner_two_segments`.
+///
+/// **Regime A — edge-mode junction sectors: the constant is known WRONG, and deliberately left
+/// so.** Since the custom curve was threaded into the junction chains, edge bevels read this
+/// too, and §8.6.3.1(6) Regime A does not admit a constant: each run of beveled edges takes one
+/// A.2 seed determination and every sector in the run derives its bit by A.3's walk parity. At a
+/// mutually-orthogonal beveled-valence-3 junction, A.1's cross-vertex contest admits **no**
+/// continuation — every other spoke's `dot` is exactly `0` and only strictly-positive dots are
+/// candidates — so by **A.4** the three spokes are three separate runs with three *independent*
+/// seed determinations. One constant cannot be three independent determinations.
+///
+/// Measured on the cube corner over the three spokes of one corner, `segments 2..=10`, both
+/// slider ends: the first sector agrees exactly and the other two are each the **mirror** of the
+/// reference (the cell's two widget axes exchanged) at every count. As `is_start_side` around
+/// the ring the reference reads `true/false/false` where this reads `true/true/true`, so
+/// loopmesh's corner cap comes out 3-fold symmetric about the corner diagonal and the
+/// reference's is not (`segments = 2` seed vert: `(0.81476, −0.81476, −0.81476)` here against
+/// `(0.81476, −0.80503, −0.82450)`).
+///
+/// This is a **pre-existing edge-mode defect** that threading the custom curve merely made
+/// observable — the superellipse is diagonal-symmetric, so the bit is a no-op on every analytic
+/// profile and no analytic arm can see it. It is tracked as its own parity-matrix row rather
+/// than patched here, because the fix carries an open question of its own: A.2 takes the seed
+/// from "a fixed one of the edge's two ends" without saying which, and reading it at the `v0`
+/// end reproduces the reference on two of the three spokes but not the third, which lands on
+/// A.2's exact-`z`-tie clause. Its cross-backend pin is the runnable `#[ignore]`d arm
+/// `bevel_edge_tri_corner_ring_custom_profile_junction_handedness_across_all_three_sectors_cube_corner`.
+fn custom_chain_reverse_bit() -> bool {
+    true
 }
 
 /// Map a widget-frame `(x, y)` chain into the profile cell frame (BEVEL.md §8.6.3.1(5)/(6)).
@@ -50682,7 +50990,8 @@ fn snap_to_unit_square_walls(unit: Vec3, inward: bool, land_on_corner: bool) -> 
 }
 
 /// Whether §8.5.5.5(f.1) **step 1** claims this junction for (f.5)'s planar parallel-offset
-/// ring grid: the `square` sentinel, at least three beveled edges, and an even `segments ≥ 2`.
+/// ring grid: the `square` sentinel, **not a custom profile**, at least three beveled edges,
+/// and an even `segments ≥ 2`.
 ///
 /// Step 1 outranks step 2, and the ordering is part of the dispatch — "a square profile at a
 /// pipe corner satisfies both the square and pipe tests, **and the square grid wins**". So this
@@ -50690,10 +50999,20 @@ fn snap_to_unit_square_walls(unit: Vec3, inward: bool, land_on_corner: bool) -> 
 /// [`LoopMesh::build_adj_fill`] to suppress the (f.6) replant that would otherwise post-pass it.
 /// A junction the ring claims never enters step 2 at all.
 ///
+/// `custom` is step 1's own `not a custom profile` conjunct, and it is not the same test as the
+/// tri-corner predicate's refusal even though both exclude the same profiles: a custom curve has
+/// no superellipse exponent at all, so it can never *reach* the square sentinel by value — the
+/// conjunct is what keeps a caller that resolves `exponent` from the `profile` slider (which a
+/// custom bevel still carries) from routing the ring here on a scalar the curve does not use.
+///
 /// With no outer miter in scope the boundvert count equals the beveled-edge count, which is
 /// what lets the ring's gate read the ring.
-fn adj_square_ring_claims(exponent: f32, boundverts: usize, segments: u32) -> bool {
-    exponent == PROFILE_SQUARE_EXPONENT && boundverts >= 3 && segments >= 2 && segments % 2 == 0
+fn adj_square_ring_claims(exponent: f32, boundverts: usize, segments: u32, custom: bool) -> bool {
+    exponent == PROFILE_SQUARE_EXPONENT
+        && !custom
+        && boundverts >= 3
+        && segments >= 2
+        && segments % 2 == 0
 }
 
 /// The §8.5.5.5(f.6) replant's `land_on_corner` override for one canonical net slot, per
@@ -50916,6 +51235,18 @@ fn pipe_station_placement(pipe_axis: Vec3, cell: &ProfileCell) -> StationPlaceme
 /// (a pipe through a flat-chamfer profile takes the second): a cross-section degenerated
 /// to a single point (`start' == end'`), and one degenerated to the straight chord
 /// `start'–end'` (collinear projected control points).
+///
+/// **Known gap — no custom awareness (§8.6.3).** The solve is keyed on `exponent` and re-solves
+/// the cross-section in the analytic superellipse frame; it takes no custom chain and cannot.
+/// That is newly reachable: (f.1) sends a custom profile to the general grid "or on the pipe
+/// post-pass over it", and [`adj_square_ring_claims`]'s `not a custom profile` conjunct means a
+/// custom bevel whose untouched slider happens to read `≥ 0.95` no longer has the square ring
+/// claim the junction and suppress this replant. So `profile ≥ 0.95` + a pipe junction + even
+/// `segments` under a hand-drawn curve now replants onto the superellipse the slider names
+/// rather than onto the curve — a positional divergence, no topology in it. This is the **third**
+/// of the sites where the custom curve is not yet threaded, alongside [`LoopMesh::build_welded_chain`]
+/// and [`LoopMesh::mint_pipe_override_loose_verts`]; it carries its own parity-matrix row and is
+/// deliberately not fixed here.
 ///
 /// Everything below is carried **relative to `base`**, and that framing is the whole
 /// numeric content of the routine (§8.5.5.5(f.6.2)). The station projection, the two cell
