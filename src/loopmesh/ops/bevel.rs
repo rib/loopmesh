@@ -9213,42 +9213,35 @@ impl LoopMesh {
         let dir_first = layout.dir_first;
         let dir_second = layout.dir_second;
 
-        // §7.6.2 parallel/anti-parallel ladder, gated on the **direction angle**
-        // `θ_dir` under the convention that fixes which branch is which: the first
-        // edge's direction is taken *into* `v`, the second's *out* of `v`. Both
-        // `dir_first`/`dir_second` are stored pointing *out* of `v`, so the into-`v`
-        // first direction is `-dir_first` and `cos θ_dir = (-dir_first) · dir_second`.
+        // §7.6.2's near-collinear ladder, gated on the **direction angle** `θ_dir` under
+        // the convention that fixes which branch is which: the first edge's direction is
+        // taken *into* `v`, the second's *out* of `v`. Both `dir_first`/`dir_second` are
+        // stored pointing *out* of `v`, so the into-`v` first direction is `-dir_first`.
         //
         // This convention is load-bearing: two collinear beveled edges running
         // straight *through* `v` (rays out of `v` pointing *opposite* ways) fold onto
-        // the *same* into/out vector, so `θ_dir → 0` — the **PARALLEL** branch, whose
+        // the *same* into/out vector, so `θ_dir → 0` — the straight-through branch, whose
         // perpendicular push lands the boundvert one offset out along the sector's
-        // leg. The anti-parallel slide is reserved for the genuine double-back
+        // leg. The doubled-back slide is reserved for the genuine double-back
         // (`θ_dir → 180°`: both edges leaving `v` the same way, a zero-area sliver).
         // Dispatching on the raw ray angle `dir_first · dir_second` swaps the two —
         // it sends the straight-through config to the slide, which puts the boundvert
         // on the wrong axis (along the edges instead of perpendicular to them).
-        let cos_dir = (-dir_first).dot(dir_second).clamp(-1.0, 1.0);
-        if cos_dir >= 1.0 - MEET_ANGLE_TOLERANCE {
-            // Directions nearly parallel (θ_dir ≈ 0), the straight-through corner:
-            // the two offset lines coincide, so push out perpendicular to both edges
-            // by `offset / cos(θ_dir/2)` (→ `offset` as θ_dir → 0).
-            return self.parallel_meet(vertex_position, &layout, offset, cos_dir);
-        }
-        if cos_dir <= -1.0 + MEET_ANGLE_TOLERANCE {
-            // Directions nearly anti-parallel (θ_dir ≈ 180°), the doubled-back corner:
-            // slide along the common edge line by the offset; there is no
-            // perpendicular leg to take. This is the one branch of the meet ladder
-            // that degenerates into a plain slide, so it — unlike the line solves
-            // below — takes §4.1's guard rather than §7.5.2's span clamp.
-            //
-            // The slide runs along the **second** flanking edge (§7.6.2's doubled-back
-            // bullet), the one whose direction was taken out of `v`. Not the first, not
-            // the beveled one, not the shorter: the second. Both halves of that matter —
-            // the two edges are only near-collinear, so the first gives a visibly
-            // different direction, and §4.1's clamp measures against *this* edge's
-            // length, so a wrong pick lands `5e-5` short of the wrong vertex.
-            return self.slide_along_incident_edge(vertex, sector.bounding_edges[1], offset);
+        //
+        // The band is the same `EPS_ANG` §7.5.1's regime 1 takes, on the same quantity;
+        // both halves of the ladder then share one closed form in
+        // `degenerate_meet_placement`, the doubled-back arm sliding along `bounding_edges[1]`
+        // — the pair's second member, whose far position `far_second` is.
+        let direction_angle = direction_angle_between(-dir_first, dir_second);
+        if is_degenerate_direction_angle(direction_angle) {
+            return degenerate_meet_placement(
+                vertex_position,
+                layout.far_first,
+                layout.far_second,
+                direction_angle,
+                layout.sector_normal,
+                offset,
+            );
         }
 
         // Build the two offset lines as point-plus-direction (§7.6.2 "Building the
@@ -9306,6 +9299,8 @@ impl LoopMesh {
         let edge_second = sector.bounding_edges[1];
         let dir_first = self.edge_direction_from(edge_first, vertex, vertex_position)?;
         let dir_second = self.edge_direction_from(edge_second, vertex, vertex_position)?;
+        let far_first = self.edge_far_position(edge_first, vertex);
+        let far_second = self.edge_far_position(edge_second, vertex);
 
         // The sector's face run, in disk order: f0 (just past g_k) … f_last (just
         // before g_(k+1)). `corners` is `[(g_k,f0),(leg1,f1),…,(g_(k+1),f_last)]`,
@@ -9326,6 +9321,10 @@ impl LoopMesh {
 
         let face_first = *faces.first()?;
         let face_last = *faces.last()?;
+        // Newell over `face_first` feeds two readings a few lines apart — the offset-line
+        // sign reference (`+Z`-rescued) and the ladder's source-1 normal (raw) — and it
+        // allocates, so it is taken once.
+        let newell_first = self.face_newell_normal(face_first);
 
         // Classify the sector into the three §7.6.2 cases by the in-between edges:
         // out-of-plane (silhouette) legs are the ones whose flanking faces are not
@@ -9399,7 +9398,7 @@ impl LoopMesh {
             // centroid sits on the convex complement of the sector), so orient both
             // perpendiculars directly by the sign-fixed edge-span normal via the
             // §7.6.2 right/left convention (`g_k`'s right side, `g_(k+1)`'s left).
-            let face_normal = self.face_plane_normal(face_first);
+            let face_normal = newell_first.unwrap_or(Vec3::Z);
             let edge_span = dir_first.cross(dir_second);
             let edge_span_unit = edge_span.normalize_or_zero();
             let planar = edge_span_unit == Vec3::ZERO
@@ -9494,12 +9493,14 @@ impl LoopMesh {
                 accumulated
             }
         } else {
-            self.face_newell_normal(face_first).unwrap_or(Vec3::ZERO)
+            newell_first.unwrap_or(Vec3::ZERO)
         };
 
         Some(SectorLayout {
             dir_first,
             dir_second,
+            far_first,
+            far_second,
             perp_first,
             perp_second,
             normal_first,
@@ -9603,44 +9604,6 @@ impl LoopMesh {
             perpendicular = -perpendicular;
         }
         perpendicular
-    }
-
-    /// §7.6.2 parallel special case (θ_dir ≈ 0, the straight-through corner): the
-    /// two offset lines coincide, so place the meet straight out from `v`
-    /// perpendicular to both edges, a distance `offset / cos(θ_dir/2)` along the
-    /// common direction's in-plane perpendicular. `cos_dir` is `cos θ_dir` in the
-    /// dispatch convention (first edge into `v`, second out of `v`), so the common
-    /// direction is `(-dir_first) + dir_second` — for two collinear edges running
-    /// straight through `v` these two into/out vectors coincide, giving a well-defined
-    /// common direction where the raw out-of-`v` sum would cancel to zero.
-    fn parallel_meet(
-        &self,
-        vertex_position: Vec3,
-        layout: &SectorLayout,
-        offset: f32,
-        cos_dir: f32,
-    ) -> Vec3 {
-        let common = (-layout.dir_first + layout.dir_second).normalize_or_zero();
-        if common == Vec3::ZERO {
-            return vertex_position;
-        }
-        // The perpendicular has **no rescue**: what absorbs a degenerate input is the
-        // zero-returning normalisation itself (§7.6.2), not a substitute normal. When the
-        // cross vanishes — which on this branch always means a zero sector normal, since
-        // `common` cannot cancel here — the push scales the zero vector and the meet lands
-        // exactly on `v`. That is the reference's answer for a zero-area sector face, and
-        // rescuing it instead moves the boundvert by a whole `offset`.
-        let mut perpendicular = normalise_at_direction_floor(common.cross(layout.sector_normal));
-        if perpendicular.dot(layout.perp_first) < 0.0 {
-            perpendicular = -perpendicular;
-        }
-        let cos_half = ((1.0 + cos_dir) * 0.5).max(0.0).sqrt();
-        let distance = if cos_half > f32::EPSILON {
-            offset / cos_half
-        } else {
-            offset
-        };
-        vertex_position + perpendicular * distance
     }
 
     /// §7.6.2 face-drop: a skew-line midpoint floats off the surface, so project it
@@ -14474,6 +14437,11 @@ enum LineMeet {
 struct SectorLayout {
     dir_first: Vec3,
     dir_second: Vec3,
+    /// The two flanking edges' far endpoints, in the pair's own order. The ladder's
+    /// straight-through push sums the **raw** directions — which telescope to
+    /// `far_second − far_first` — and its doubled-back slide runs to `far_second`.
+    far_first: Vec3,
+    far_second: Vec3,
     perp_first: Vec3,
     perp_second: Vec3,
     normal_first: Vec3,
@@ -34374,17 +34342,22 @@ mod tests {
     }
 
     /// A flat closed fan about `v = (0,0,0)` whose spokes `A = (−2,0,0)` and
-    /// `B = (−3,0.02,0)` leave `v` `0.382°` apart, so the sector they flank is a
-    /// near-zero-area sliver (`θ_dir ≈ 179.618°`) — the only doubled-back sector in the
+    /// `B = (−3,0.05,0)` leave `v` `0.955°` apart, so the sector they flank is a
+    /// near-zero-area sliver (`θ_dir ≈ 179.045°`) — the only doubled-back sector in the
     /// fan. `C = (1,0,0)` and the unbeveled leg `D = (0,−1,0)` close it. The two sliver
-    /// spokes deliberately differ in **length** (`2` vs `3.00007`) as well as in bearing,
+    /// spokes deliberately differ in **length** (`2` vs `3.00042`) as well as in bearing,
     /// so sliding along the wrong one of the pair is visible twice over: in the direction,
     /// and in the length §4.1's clamp is measured against.
+    ///
+    /// The `0.955°` bearing gap is the interesting part of the band and not a free choice:
+    /// it sits *outside* a `cos θ ≥ 1 − 1e-4` reading of `EPS_ANG` (which is only `0.81°`)
+    /// and inside §7.6.2's stated `2°`, so the fixture is unreachable at all under the
+    /// narrower gate — see `junction_ladder_fires_across_the_whole_two_degree_band`.
     fn sliver_sector_fan() -> (LoopMesh, VertexKey, [VertexKey; 4]) {
         let mut mesh = LoopMesh::new();
         let v = mesh.create_vertex(Vec3::ZERO);
         let a = mesh.create_vertex(Vec3::new(-2.0, 0.0, 0.0));
-        let b = mesh.create_vertex(Vec3::new(-3.0, 0.02, 0.0));
+        let b = mesh.create_vertex(Vec3::new(-3.0, 0.05, 0.0));
         let c = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
         let d = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
         // Disk order by bearing at `v`: C (0°), B (179.045°), A (180°), D (270°).
@@ -34458,6 +34431,239 @@ mod tests {
         assert!(
             (first_length - second_length).abs() > 0.5,
             "fixture sanity: the two spokes' lengths must discriminate the clamp target",
+        );
+    }
+
+    /// BEVEL.md §7.6.2 states one `EPS_ANG = 2°` for **both** halves of the ladder, and
+    /// the junction half must read that same band. Stating it as a tolerance in *cosine*
+    /// units — `cos θ_dir ≥ 1 − 1e-4` — is the same rule at only `0.81°`, and it hands the
+    /// `0.81°–2°` window to the general two-line solve. That is not a quanta-scale
+    /// difference: in that window the two offset lines are near-coincident, so their
+    /// crossing runs off to tens of units on a unit-scale fan.
+    ///
+    /// `sliver_sector_fan`'s doubled-back sector sits at `θ_dir ≈ 179.045°`, i.e. `0.955°`
+    /// from the `180°` end — inside the guide's band and outside the cosine reading — so it
+    /// is exactly the window's witness.
+    #[test]
+    fn junction_ladder_fires_across_the_whole_two_degree_band() {
+        let (mesh, v, [a, b, c, _d]) = sliver_sector_fan();
+        let v_pos = mesh.vertex_position(v);
+        let spokes: Vec<EdgeKey> = [a, b, c]
+            .iter()
+            .map(|&far| mesh.query_edge_exists(v, far).expect("beveled spoke"))
+            .collect();
+        let is_beveled = |edge: EdgeKey| spokes.contains(&edge);
+
+        let corners = mesh.vertex_bevel_corner_ring(v, &is_beveled);
+        let edge_a = mesh.query_edge_exists(v, a).expect("spoke A");
+        let edge_b = mesh.query_edge_exists(v, b).expect("spoke B");
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| {
+                s.bounding_edges.len() == 2
+                    && s.bounding_edges.contains(&edge_a)
+                    && s.bounding_edges.contains(&edge_b)
+            })
+            .expect("the A↔B sliver sector");
+        let layout = mesh
+            .sector_layout(v, v_pos, &sector)
+            .expect("a two-flank sector has a layout");
+
+        let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+        let from_anti_parallel = std::f32::consts::PI - direction_angle;
+        assert!(
+            from_anti_parallel > 0.0141 && from_anti_parallel < MEET_DIRECTION_EPS_ANGLE,
+            "fixture must sit in the 0.81°–2° window, got {}° from anti-parallel",
+            from_anti_parallel.to_degrees(),
+        );
+        // The narrower reading, spelled out: `cos θ_dir ≤ −1 + 1e-4` does not fire here.
+        let cos_dir = (-layout.dir_first).dot(layout.dir_second);
+        assert!(
+            cos_dir > -1.0 + 1.0e-4,
+            "fixture sanity: the cosine-units gate must miss this sector, cos = {cos_dir}",
+        );
+
+        let offset = 0.5_f32;
+        let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+        let along_second = mesh.slide_along_incident_edge(v, sector.bounding_edges[1], offset);
+        assert!(
+            (meet - along_second).length() < 1.0e-6,
+            "the ladder must claim the whole 2° band, got {meet:?}",
+        );
+        assert!(
+            (meet - v_pos).length() <= offset + 1.0e-6,
+            "a ladder placement never travels further than the offset, got {meet:?}",
+        );
+
+        // What the general solve does with the same sector, which is what the narrow gate
+        // would have returned: two near-coincident offset lines crossing far off the fan.
+        let extrapolated = match intersect_lines(
+            &Line {
+                point: v_pos + layout.perp_first * offset,
+                direction: layout.dir_first,
+            },
+            &Line {
+                point: v_pos + layout.perp_second * offset,
+                direction: layout.dir_second,
+            },
+        ) {
+            LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+            LineMeet::Collinear => panic!("the near-coincident lines still solve as a crossing"),
+        };
+        assert!(
+            (extrapolated - v_pos).length() > 10.0,
+            "fixture sanity: the general solve must visibly extrapolate here, got \
+             {extrapolated:?}",
+        );
+    }
+
+    /// A flat closed fan about `v = (0,0,0)` whose two beveled spokes `P = (1,0,0)` and
+    /// `Q = (−2, 0.052, 0)` run *through* `v` to within `1.489°` of straight — inside
+    /// §7.6.2's `2°` band and outside a `0.81°` cosine reading of it. The unbeveled legs
+    /// `U = (0,1,0)` and `L = (0,−1,0)` split it into an upper and a lower sector, and the
+    /// two spokes differ in length (`1` vs `2.00068`) so the straight-through push's **raw**
+    /// direction sum leans measurably off the unit sum.
+    fn near_collinear_junction_fan() -> (LoopMesh, VertexKey, [VertexKey; 4]) {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let p = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let q = mesh.create_vertex(Vec3::new(-2.0, 0.052, 0.0));
+        let u = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let l = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        mesh.face_create_verts(&[v, p, u], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, u, q], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, q, l], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, l, p], FaceCreateFlags::NONE);
+        (mesh, v, [p, q, u, l])
+    }
+
+    /// The junction sector flanked by two beveled spokes, in the pair's disk order.
+    fn sector_between(
+        mesh: &LoopMesh,
+        v: VertexKey,
+        beveled: &[EdgeKey],
+        first: EdgeKey,
+        second: EdgeKey,
+    ) -> Sector {
+        let is_beveled = |edge: EdgeKey| beveled.contains(&edge);
+        sector_split(&mesh.vertex_bevel_corner_ring(v, &is_beveled), &is_beveled)
+            .into_iter()
+            .find(|s| s.bounding_edges == [first, second])
+            .expect("the requested sector, in the requested disk order")
+    }
+
+    /// BEVEL.md §7.6.2, straight-through half: the common direction is the sum of the
+    /// pair's **raw**, full-length directions — which telescopes to `far_second −
+    /// far_first` — not of their unit versions. Summing unit vectors is the natural-looking
+    /// simplification and it discards the lean toward the longer flank.
+    ///
+    /// The fan's spokes are `1` and `2.00068` long and `1.489°` apart, so at
+    /// `offset = 0.25` the raw sum lands the boundvert at `(0.0043330, 0.2499835, 0)` where
+    /// the unit sum gives `(0.0032494, 0.2500000, 0)` — `0.0010837` apart, **108 quanta** of
+    /// the canonical `1e-5` grid. Two conditions each hide the lean and this fixture avoids
+    /// both: equal flank lengths (the two sums then differ only by scale) and an exactly
+    /// zero direction angle (parallel vectors sum to one direction however they are scaled).
+    ///
+    /// The same `1.489°` is inside §7.6.2's `2°` band and outside a `0.81°` cosine reading
+    /// of it, so a narrowed band shows up here too — as a boundvert about ten units out.
+    #[test]
+    fn junction_straight_through_push_sums_raw_directions_not_unit_ones() {
+        let (mesh, v, [p, q, u, _l]) = near_collinear_junction_fan();
+        let v_pos = mesh.vertex_position(v);
+        let edge_p = mesh.query_edge_exists(v, p).expect("spoke P");
+        let edge_q = mesh.query_edge_exists(v, q).expect("spoke Q");
+        let sector = sector_between(&mesh, v, &[edge_p, edge_q], edge_p, edge_q);
+        assert!(
+            sector
+                .corners
+                .iter()
+                .any(|&(edge, _)| Some(edge) == mesh.query_edge_exists(v, u)),
+            "fixture sanity: the (P, Q) sector is the upper one, spanning the `U` leg",
+        );
+
+        let offset = 0.25_f32;
+        let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+        let by_raw_sum = Vec3::new(0.0043330, 0.2499835, 0.0);
+        let by_unit_sum = Vec3::new(0.0032494, 0.25, 0.0);
+        assert!(
+            (meet - by_raw_sum).length() < 1.0e-5,
+            "the push must sum the raw directions, landing {by_raw_sum:?}, got {meet:?}",
+        );
+        assert!(
+            (meet - by_unit_sum).length() > 1.0e-3,
+            "the unit-vector sum is the failure mode, and it is 108 quanta away",
+        );
+        assert!(
+            (by_raw_sum - by_unit_sum).length() > 1.0e-3,
+            "fixture sanity: unequal flank lengths and a nonzero direction angle are what \
+             make the two sums differ at all",
+        );
+    }
+
+    /// BEVEL.md §7.6.2: `sector_normal` is used *"exactly as the three sources hand it
+    /// over — not re-normalised, not sign-fixed, not rescued"*, and the cross order
+    /// `common × sector_normal` **alone** points the push into the sector. Re-orienting the
+    /// result against a face-**centroid** reference is a different rule that agrees on
+    /// convex sectors and point-reflects the boundvert through `v` — `2d` away — where it
+    /// does not.
+    ///
+    /// The discriminating fixture is a sector whose forward face is concave enough that its
+    /// centroid falls on the far side of the flanking spoke's line: `f0 = [v, P, (3,−3),
+    /// (4,−3), (4,4), U]` opens upward at `v` but averages to `(2, −1/6, 0)`. The
+    /// straight-through push belongs at `(0, +0.25, 0)`, in the upper sector with the `U`
+    /// leg; the centroid heuristic sends it to `(0, −0.25, 0)`, out of the sector entirely.
+    #[test]
+    fn junction_straight_through_push_takes_the_cross_order_not_the_face_centroid() {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let p = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let q = mesh.create_vertex(Vec3::new(-1.0, 0.0, 0.0));
+        let u = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let l = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        let lobe_low = mesh.create_vertex(Vec3::new(3.0, -3.0, 0.0));
+        let lobe_out = mesh.create_vertex(Vec3::new(4.0, -3.0, 0.0));
+        let lobe_high = mesh.create_vertex(Vec3::new(4.0, 4.0, 0.0));
+        mesh.face_create_verts(
+            &[v, p, lobe_low, lobe_out, lobe_high, u],
+            FaceCreateFlags::NONE,
+        );
+        mesh.face_create_verts(&[v, u, q], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, q, l], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, l, p], FaceCreateFlags::NONE);
+
+        let v_pos = mesh.vertex_position(v);
+        let edge_p = mesh.query_edge_exists(v, p).expect("spoke P");
+        let edge_q = mesh.query_edge_exists(v, q).expect("spoke Q");
+        let sector = sector_between(&mesh, v, &[edge_p, edge_q], edge_p, edge_q);
+        let layout = mesh
+            .sector_layout(v, v_pos, &sector)
+            .expect("a two-flank sector has a layout");
+
+        let concave_face = sector.corners[0].1;
+        assert!(
+            mesh.face_center_of_mass(concave_face).y < 0.0,
+            "fixture sanity: the sector's forward face must average below `v`'s upper half",
+        );
+        assert!(
+            layout.perp_first.y < 0.0,
+            "fixture sanity: the centroid heuristic must point out of the sector, got {:?}",
+            layout.perp_first,
+        );
+
+        let offset = 0.25_f32;
+        let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+        assert!(
+            (meet - Vec3::new(0.0, offset, 0.0)).length() < 1.0e-6,
+            "the push follows `common × sector_normal` into the sector, got {meet:?}",
+        );
+        // The sign-fixed reading is the point reflection through `v`, `2 × offset` away.
+        assert!(
+            (meet - Vec3::new(0.0, -offset, 0.0)).length() > offset,
+            "a centroid sign-fix would reflect the boundvert through `v`",
+        );
+        assert!(
+            meet.y * mesh.vertex_position(u).y > 0.0,
+            "the boundvert must land on the same side as the sector's own leg",
         );
     }
 
@@ -43740,6 +43946,62 @@ mod tests {
         }
     }
 
+    /// BEVEL.md §7.6.2's raw-sum rule, on the terminal half of the same ladder: the common
+    /// direction is the sum of the pair's **raw** directions (first taken into the
+    /// endpoint, second out of it), which telescopes to `second_far − first_far`. Summing
+    /// the unit directions instead drops the lean toward the longer flank.
+    ///
+    /// The frame is the guide's own oracle pin: flanking lengths `2` and `3.00042`, bearings
+    /// `0.955°` apart. At `offset = 0.5` the raw sum puts the strip vert `0.00500` off the
+    /// axis where the unit sum puts it `0.00417` — **83 quanta** of the canonical `1e-5`
+    /// grid, from a direction angle under one degree; at `offset = 6` the same choice moves
+    /// it from `0.0600` to `0.0500`, a thousand quanta. Neither offset is clamped: regime 1
+    /// returns ahead of §7.5.2's span clamp and the straight-through half slides along
+    /// nothing, so the push is free to run past both flanks' lengths.
+    #[test]
+    fn terminal_straight_through_push_sums_raw_directions_not_unit_ones() {
+        let endpoint = Vec3::ZERO;
+        let direction_angle = 0.955_f32.to_radians();
+        let leg_out = Vec3::new(-1.0, 0.0, 0.0);
+        let edge_out = Vec3::new(direction_angle.cos(), direction_angle.sin(), 0.0);
+        let leg_far = endpoint + leg_out * 2.0;
+        let edge_far = endpoint + edge_out * 3.00042;
+
+        for (offset, raw_x, unit_x) in [
+            (0.5_f32, 0.0050006_f32, 0.0041671_f32),
+            (6.0, 0.0600078, 0.0500050),
+        ] {
+            let placement = terminal_leg_meet(TerminalLegMeet {
+                endpoint,
+                edge_out,
+                leg_out,
+                edge_far,
+                leg_far,
+                leg_precedes_edge: true,
+                sector_plane: SectorPlane::Face(Vec3::Z),
+                offset,
+            })
+            .position();
+
+            assert!(
+                (placement.x - raw_x).abs() < 1.0e-5,
+                "at offset {offset} the raw sum puts the strip vert {raw_x} off the axis, \
+                 got {placement:?}",
+            );
+            assert!(
+                (placement.x - unit_x).abs() > 5.0e-4,
+                "at offset {offset} the unit-vector sum ({unit_x}) is the failure mode",
+            );
+            // The push is square to the common direction and `offset / cos(θ_dir/2)` long,
+            // whichever sum built it — so the lean is the *only* thing under test here.
+            assert!(
+                ((placement - endpoint).length() - offset / (direction_angle * 0.5).cos()).abs()
+                    < 1.0e-5,
+                "the push distance must stay `offset / cos(θ_dir/2)`",
+            );
+        }
+    }
+
     /// §7.5.1 regime 1, doubled-back half: the two edges leave the endpoint the same way
     /// and lie back on one another, enclosing a zero-area sliver with no wedge to bisect.
     /// The meet sits **on the common line**, slid out along the *second* edge of the pair
@@ -45182,13 +45444,6 @@ fn subsweep_is_good(dir_first: Vec3, dir_second: Vec3, vertex_normal: Vec3) -> b
         && opening_angle < std::f32::consts::PI - LOOP_SLIDE_ANGLE_BAND
 }
 
-/// Angle tolerance (in `cos θ` units) for the §7.6.2 parallel / anti-parallel
-/// special cases: when the two flanking edge directions are within this of being
-/// parallel (`cos θ ≈ 1`) or anti-parallel (`cos θ ≈ −1`) the line-line solve is
-/// bypassed for the closed-form ladder placement. Matches the crate-local `1e-4`
-/// convention used elsewhere in this file.
-const MEET_ANGLE_TOLERANCE: f32 = 1.0e-4;
-
 /// Coplanarity tolerance (on the dot of two face normals) for the §7.6.2 sector
 /// classification: an in-between leg is out-of-plane (silhouette) when its two
 /// flanking face normals differ from ±1 by more than this.
@@ -45265,6 +45520,17 @@ const COPLANAR_NORMAL_TOLERANCE: f32 = 1.0e-4;
 /// one-sided formula.
 fn terminal_direction_angle(edge_out: Vec3, leg_out: Vec3, leg_precedes_edge: bool) -> f32 {
     let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
+    direction_angle_between(first_dir, second_dir)
+}
+
+/// The §7.6.2 / §7.5.1 **direction** angle of an already-bound pair: `first_dir` taken
+/// *into* the shared vertex, `second_dir` taken *out* of it. Near `0` the two flanks run
+/// straight *through* the vertex; near `π` they double back on one another.
+///
+/// Read off `atan2(|cross|, dot)` rather than `acos(dot)` so it stays conditioned at both
+/// ends of the range — which is where the whole ladder lives — and so the caller need not
+/// hand over unit vectors.
+fn direction_angle_between(first_dir: Vec3, second_dir: Vec3) -> f32 {
     first_dir
         .cross(second_dir)
         .length()
@@ -45288,25 +45554,29 @@ fn terminal_meet_directions(
     }
 }
 
-/// §7.5.1 regime 1's angular band: within `EPS_ANG` of `0` (the two edges run
-/// straight through the endpoint) or of `π` (they double back on each other).
-/// Neither offset line is well defined there, so no line solve runs at all.
+/// The §7.6.2 ladder's band, shared by the junction sector meet and §7.5.1's regime 1:
+/// within `EPS_ANG` of `0` (the two flanks run straight through the vertex) or of `π`
+/// (they double back on each other). Neither offset line is well defined there, so no
+/// line solve runs at all. Both tests are strict, and the two bands are disjoint.
 fn is_degenerate_direction_angle(direction_angle: f32) -> bool {
-    direction_angle < TERMINAL_DIRECTION_EPS_ANGLE
-        || direction_angle > std::f32::consts::PI - TERMINAL_DIRECTION_EPS_ANGLE
+    direction_angle < MEET_DIRECTION_EPS_ANGLE
+        || direction_angle > std::f32::consts::PI - MEET_DIRECTION_EPS_ANGLE
 }
 
 /// §7.5.1 regime 2's angular band: at least `EPS_ANG` (outside the near-degenerate
 /// band, which has no meet plane at all) and strictly under `SMALL_ANG`.
 fn is_shallow_direction_angle(direction_angle: f32) -> bool {
-    (TERMINAL_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
+    (MEET_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
 }
 
-/// §7.5.1 regime 1 / §7.6.2's "parallel and anti-parallel special cases": the two
-/// closed-form placements for a terminal whose direction angle leaves no meet plane.
-/// `first_dir` / `second_dir` are §7.5.1's bound pair (`terminal_meet_directions`), and
-/// `offset` is the larger of the two sides' offsets — at a terminal the leg carries `0`,
-/// so it is always the beveled edge's.
+/// §7.6.2's "parallel and anti-parallel special cases" — the near-collinear ladder — as
+/// **one** closed form serving both the junction sector meet and §7.5.1's regime 1. The
+/// two halves differ only in the pair they are handed, so they must not differ in the
+/// arithmetic; a second expression of this is how the two drift apart.
+///
+/// `far_first` / `far_second` are the two flanking edges' far endpoints in the pair's own
+/// order, and `offset` is the larger of the two sides' offsets — at a terminal the leg
+/// carries `0`, so it is always the beveled edge's.
 ///
 /// The band is split at `π/2` because that is where the two closed forms swap which
 /// component survives: below it the directions still enclose a wedge whose bisector is
@@ -45315,52 +45585,69 @@ fn is_shallow_direction_angle(direction_angle: f32) -> bool {
 /// π − EPS_ANG]` reaches here, so any split strictly inside that gap picks out the same
 /// two halves; `π/2` is simply the one that names them by which end of `[0, π]` the
 /// angle is nearer.
-///
-/// On the **parallel** half only, which side of the surface the perpendicular pushes to
-/// is **not** decided by a sign test. `cross(common_dir, sector_normal)` is the same
-/// construction the line-solve regimes use for their offset-line perpendiculars
-/// (`cross(first_dir, n)` and `cross(second_dir, n)`, which the common direction is the
-/// sum of), so in the limit the push agrees with the offset line the crossing case would
-/// have built and the two bands join without a discontinuity — as
-/// `d = offset / cos(θ_dir/2)` is the crossing case's `t / sin(θ_wedge/2)` written in the
-/// supplementary angle. The argument does **not** carry to the anti-parallel half, where
-/// `first_dir ≈ −second_dir` makes the sum degenerate and names no direction at all;
-/// that half returns from the `> π/2` arm before any of this runs.
-fn degenerate_terminal_placement(
-    endpoint: Vec3,
-    first_dir: Vec3,
-    second_dir: Vec3,
-    second_far: Vec3,
+fn degenerate_meet_placement(
+    vertex_position: Vec3,
+    far_first: Vec3,
+    far_second: Vec3,
     direction_angle: f32,
     sector_normal: Vec3,
     offset: f32,
 ) -> Vec3 {
     if direction_angle > std::f32::consts::FRAC_PI_2 {
-        // Doubled back: the two edges leave the endpoint the same way and lie back on
-        // one another, so the chamfer runs into a zero-area sliver with no wedge to
-        // bisect. The meet sits on the common line, slid out along the *second* edge —
-        // there is no perpendicular component to take.
+        // Doubled back: the two edges leave the vertex the same way and lie back on one
+        // another, so the chamfer runs into a zero-area sliver with no wedge to bisect.
+        // The meet sits on the common line, slid out along the *second* edge — there is
+        // no perpendicular component to take.
         //
         // This is a plain on-edge slide, so it goes through §4.1's shared primitive and
         // inherits the whole of it: the strict overshoot trigger against the *second*
         // edge's own length, the absolute `5e-5` landing, the sub-gap reflection and the
-        // land-on-the-endpoint regime at the direction floor. It is exempt from §7.5.2's
+        // land-on-the-vertex regime at the direction floor. It is exempt from §7.5.2's
         // span clamp (which is armed on a meet, and no meet ran here) but not from this
         // one.
-        return slide_along_edge(endpoint, second_far, offset);
+        return slide_along_edge(vertex_position, far_second, offset);
     }
 
-    // Straight through: both offset lines get pushed the same way and land on top of
-    // each other, so the meet goes square to the common direction instead.
-    //
-    // No rescue guards the cross product: the zero-returning normalisation is what
-    // absorbs a degenerate input, so a zero sector normal — which is exactly what a
-    // **zero-area** sector face hands over, source 1 being a direct take — scales the
-    // push by the zero vector and leaves the strip vert on the endpoint. Substituting an
-    // axis or the vertex normal there would push it a full `offset` off-axis instead.
-    let common_direction = first_dir + second_dir;
-    let perpendicular = normalise_at_direction_floor(common_direction.cross(sector_normal));
-    endpoint + perpendicular * (offset / (direction_angle * 0.5).cos())
+    straight_through_push(
+        vertex_position,
+        far_second - far_first,
+        sector_normal,
+        direction_angle,
+        offset,
+    )
+}
+
+/// The straight-through half of the §7.6.2 ladder: both offset lines get pushed the same
+/// way and land on top of each other, so the meet goes square to the common direction,
+/// `offset / cos(θ_dir/2)` out.
+///
+/// `common_raw` is the **raw** sum of the pair's two bound directions — the first taken
+/// *into* the vertex, the second *out* of it — which telescopes to `far_second −
+/// far_first`. Normalising the two before adding is the natural-looking simplification
+/// and it is wrong: the raw sum leans toward the longer flank, and on flanks of length
+/// `2` and `3.00042` less than a degree apart that lean is 83 quanta of the canonical
+/// `1e-5` grid at `offset = 0.5`, a thousand at `offset = 6`.
+///
+/// `sector_normal` is used exactly as its three sources hand it over — not re-normalised,
+/// not sign-fixed, not rescued — and the cross order `common × normal` alone points the
+/// push *into* the sector. Steering it by a face-centroid reference instead point-reflects
+/// the meet through the vertex, `2d` away, wherever the two disagree: a reflex sector
+/// face's centroid sits on the sector's convex complement. Nor is there any degenerate
+/// rescue — what absorbs a degenerate input is the zero-returning normalisation itself, so
+/// a zero-area sector face's zero normal collapses the push exactly onto the vertex, where
+/// a substituted axis would push a whole `offset` off-axis.
+///
+/// The distance is the crossing case's `t / sin(θ_wedge/2)` written in the supplementary
+/// angle, so the branch joins the general solve in the limit rather than stepping.
+fn straight_through_push(
+    vertex_position: Vec3,
+    common_raw: Vec3,
+    sector_normal: Vec3,
+    direction_angle: f32,
+    offset: f32,
+) -> Vec3 {
+    let perpendicular = normalise_at_direction_floor(common_raw.cross(sector_normal));
+    vertex_position + perpendicular * (offset / (direction_angle * 0.5).cos())
 }
 
 /// The §7.5.1 per-sector orientation input, in the one shape that cannot state the
@@ -45467,20 +45754,24 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
     }
 
     let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
-    let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
-    // The doubled-back slide runs along the pair's **second** member, so that is the
-    // edge §4.1's clamp is measured against — `E` on the (leg, E) side and the leg
-    // itself on the (E, leg) side.
-    let second_far = if leg_precedes_edge { edge_far } else { leg_far };
+    // The pair's far endpoints in the pair's own order. The straight-through push sums
+    // the **raw** directions, which telescope to `second_far − first_far`, and the
+    // doubled-back slide runs along the pair's **second** member — so that is also the
+    // edge §4.1's clamp is measured against: `E` on the (leg, E) side and the leg itself
+    // on the (E, leg) side.
+    let (first_far, second_far) = if leg_precedes_edge {
+        (leg_far, edge_far)
+    } else {
+        (edge_far, leg_far)
+    };
 
     // §7.5.1 regime 1 (near-degenerate direction angle): no meet plane is well defined,
     // so neither offset line is built and no line solve runs. §7.5.1 returns this ahead
     // of the §7.5.2 clamp, so it is reported as clamp-ineligible — see `TerminalPlacement`.
     if is_degenerate_direction_angle(direction_angle) {
-        return TerminalPlacement::Degenerate(degenerate_terminal_placement(
+        return TerminalPlacement::Degenerate(degenerate_meet_placement(
             endpoint,
-            first_dir,
-            second_dir,
+            first_far,
             second_far,
             direction_angle,
             // The sector normal, in regime 1's own role: the plane the perpendicular is
@@ -45511,10 +45802,9 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
                 // Collinear to floating-point exactness — deep inside regime 1's band, so
                 // the dispatch above has already taken it. Kept as a division guard, and
                 // routed to the same placement so it cannot answer differently.
-                return TerminalPlacement::Degenerate(degenerate_terminal_placement(
+                return TerminalPlacement::Degenerate(degenerate_meet_placement(
                     endpoint,
-                    first_dir,
-                    second_dir,
+                    first_far,
                     second_far,
                     direction_angle,
                     sector_plane.reference(),
@@ -45565,10 +45855,9 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         // band edge, since the two lines' directions *are* the two edge directions.
         // Regime 1's placement is the right answer for a pair with no isolated crossing,
         // and it carries regime 1's clamp exemption with it for the same reason.
-        None => TerminalPlacement::Degenerate(degenerate_terminal_placement(
+        None => TerminalPlacement::Degenerate(degenerate_meet_placement(
             endpoint,
-            first_dir,
-            second_dir,
+            first_far,
             second_far,
             direction_angle,
             sector_plane.reference(),
@@ -45577,16 +45866,23 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
     }
 }
 
-/// §7.5.1 `EPS_ANG` — the near-degenerate band half-width (2°, in radians). A terminal
-/// direction angle within this of `0` or of `π` leaves no well-defined meet plane at
-/// all, and §7.5.1 gives that band its own regime 1 (push out along the common
-/// perpendicular / slide along the common line — `degenerate_terminal_placement`).
+/// `EPS_ANG` — the near-degenerate band half-width (2°, in radians). A direction angle
+/// within this of `0` or of `π` leaves no well-defined meet plane at all, and the ladder
+/// gives that band its own closed forms (push out along the common perpendicular / slide
+/// along the common line — `degenerate_meet_placement`).
 ///
-/// The bound is what keeps regimes 2 and 3 reachable only on the bands they describe:
-/// without it, `< SMALL_ANG` would swallow the whole near-collinear band into regime 2,
-/// and the `> π − EPS_ANG` band would reach regime 3's `edge_out × leg_out` — the short,
-/// direction-unstable cross product regime 2 already exists to avoid.
-const TERMINAL_DIRECTION_EPS_ANGLE: f32 = 0.034_906_6;
+/// §7.6.2 states this constant for **both** halves of the ladder, so the junction sector
+/// meet and §7.5.1's regime 1 read the one value. Stating the junction's band as a
+/// tolerance in *cosine* units instead is the same rule at `0.81°`, which hands the
+/// `0.81°–2°` window to the general two-line solve — and there the two offset lines are
+/// near-coincident, so the solve extrapolates the boundvert tens of units out on a
+/// unit-scale fan.
+///
+/// The bound is also what keeps §7.5.1's regimes 2 and 3 reachable only on the bands they
+/// describe: without it, `< SMALL_ANG` would swallow the whole near-collinear band into
+/// regime 2, and the `> π − EPS_ANG` band would reach regime 3's `edge_out × leg_out` —
+/// the short, direction-unstable cross product regime 2 already exists to avoid.
+const MEET_DIRECTION_EPS_ANGLE: f32 = 0.034_906_6;
 
 /// §7.5.1 `SMALL_ANG` — the shallow/ordinary threshold (10°, in radians) on the
 /// terminal **direction** angle. Below it (and only with a usable sector face normal)
