@@ -8845,26 +8845,17 @@ impl LoopMesh {
         offset: f32,
     ) -> Vec3 {
         let endpoint = self.vertex_position(vertex);
-        // Outward unit directions of `E` and the leg from the endpoint. §7.5.4: a
-        // zero-length `E` has no direction, so `edge_out` is the zero vector and flows into
-        // `terminal_leg_meet` unchanged — its degenerate guard collapses the meet onto the
-        // endpoint rather than a special branch here. The leg always has a direction (the
-        // close plan admits only legs that do).
-        let edge_out = self
-            .edge_direction_from(edge, vertex, endpoint)
-            .unwrap_or(Vec3::ZERO);
-        let leg_out = match self.edge_direction_from(leg, vertex, endpoint) {
-            Some(dir) => dir,
-            None => return endpoint,
-        };
+        // The meet reads both flanks off their far endpoints — the raw, full-length
+        // directions §7.5.1 binds, and the lengths regime 1's slide clamp measures
+        // against. §7.5.4: a zero-length `E` flows through unchanged and the meet's own
+        // degenerate guard collapses it onto the endpoint, rather than a special branch
+        // here. A directionless *leg* has no line to meet at all.
+        if self.edge_direction_from(leg, vertex, endpoint).is_none() {
+            return endpoint;
+        }
 
         let placement = terminal_leg_meet(TerminalLegMeet {
             endpoint,
-            edge_out,
-            leg_out,
-            // The far endpoints, so regime 1's doubled-back slide can take §4.1's guard:
-            // that clamp measures against the length of the edge actually being slid
-            // along, which the unit directions above no longer carry.
             edge_far: self.edge_far_position(edge, vertex),
             leg_far: self.edge_far_position(leg, vertex),
             leg_precedes_edge,
@@ -9244,38 +9235,56 @@ impl LoopMesh {
             );
         }
 
-        // Build the two offset lines as point-plus-direction (§7.6.2 "Building the
-        // two offset lines"). The base point is `v` pushed perpendicular to the
-        // edge, into the sector face, by `offset`; the direction is the edge's own.
+        // Build the two offset lines (§7.6.2 "Building the two offset lines"). The base
+        // point is `v` pushed perpendicular to the edge, into the sector face, by
+        // `offset`; the direction is the edge's own.
+        //
+        // Both directions are the **raw**, full-length flank vectors, each with the sign
+        // the §7.6.2 convention gives it — the first taken *into* `v`, the second *out* of
+        // it. The solve steps each base point along its direction to form the line's second
+        // point (§7.6.2 "The arithmetic of the two-line solve"), and that step is a rounded
+        // addition: stepping the other way rounds differently and costs a quantum at about
+        // one shallow station in a thousand. The base points themselves are already right —
+        // the perpendiculars were built on the *outward* rays with the cross order flipped
+        // per role, which is the same computation bit for bit.
         let line_first = Line {
             point: vertex_position + layout.perp_first * offset,
-            direction: dir_first,
+            direction: vertex_position - layout.far_first,
         };
         let line_second = Line {
             point: vertex_position + layout.perp_second * offset,
-            direction: dir_second,
+            direction: layout.far_second - vertex_position,
         };
 
-        // The §7.6.2 face-drop runs for **case-3 (non-planar) sectors only**. Whether
-        // the two case-3 offset lines happen to come out skew or exactly crossing is a
-        // floating-point knife-edge — either way the provisional meet floats above the
-        // surface and must be projected onto the first in-wedge sector face. Gating the
-        // drop on the skew/crossing classification (rather than on planarity) leaves a
-        // clean crossing lifted above an in-wedge face: correct where no face is in-wedge
-        // (the crossing stands, e.g. a reflex meet whose bisector lands on a rim vertex),
-        // wrong where one is (e.g. an even-absorbed-leg reflex sector whose bisector falls
-        // inside a straddle face — the crossing must drop onto it, §8.9.2 / §8.9.2.2).
-        // Case 1/2 planar sectors never reach `non_planar`, so their in-plane crossing is
-        // returned untouched.
+        // §7.6.2's face-drop gate, stated on the **sector** and not on the solve's
+        // outcome: out-of-plane in-between edges *and* both flanking offsets `> 0`.
+        // Whether the two case-3 offset lines happen to come out skew or exactly
+        // crossing is a floating-point knife-edge — either way the provisional meet
+        // floats above the surface and must be projected onto the first in-wedge sector
+        // face. Reading the gate off the classification instead leaves a clean crossing
+        // lifted above an in-wedge face: correct where no face is in-wedge (the crossing
+        // stands, e.g. a reflex meet whose bisector lands on a rim vertex), wrong where
+        // one is (e.g. an even-absorbed-leg reflex sector whose bisector falls inside a
+        // straddle face — the crossing must drop onto it, §8.9.2 / §8.9.2.2).
+        //
+        // The other half of the same statement is what a **planar** sector does with a
+        // skew pair: §7.6.2's "face-drop does not run" reading, which is the
+        // closest-approach point on the *first* line — no midpoint, no projection. A
+        // planar case-1/2 sector reaching `Skew` at all is `LINE_COPLANARITY_TOLERANCE`
+        // being an absolute bound on a triple product that grows with the flanking
+        // lengths, so it is reachable on a large mesh even where the sector's own
+        // geometry is exactly coplanar.
+        let face_drop_runs = layout.non_planar && offset > 0.0;
         match intersect_lines(&line_first, &line_second) {
-            LineMeet::Crossing(point) if layout.non_planar => {
-                self.drop_onto_sector_face(vertex_position, &layout, point, offset)
+            LineMeet::Crossing(point) if face_drop_runs => {
+                self.drop_onto_sector_face(vertex_position, &layout, point)
             }
             LineMeet::Crossing(point) => point,
             LineMeet::Collinear => line_first.point,
-            LineMeet::Skew(midpoint) => {
-                self.drop_onto_sector_face(vertex_position, &layout, midpoint, offset)
+            LineMeet::Skew { midpoint, .. } if face_drop_runs => {
+                self.drop_onto_sector_face(vertex_position, &layout, midpoint)
             }
+            LineMeet::Skew { on_first, .. } => on_first,
         }
     }
 
@@ -9301,6 +9310,14 @@ impl LoopMesh {
         let dir_second = self.edge_direction_from(edge_second, vertex, vertex_position)?;
         let far_first = self.edge_far_position(edge_first, vertex);
         let far_second = self.edge_far_position(edge_second, vertex);
+        // The offset lines are built from the **raw**, full-length flank vectors, not the
+        // unit ones (§7.6.2 "The arithmetic of the two-line solve"). Unitising them first
+        // is the natural-looking simplification and it moves the boundvert by a canonical
+        // quantum on 4.7% of shallow planar sectors. The unit `dir_*` above stay in use for
+        // the quantities that are genuinely about *direction* — the ladder's angle dispatch,
+        // the sector's edge-span classification and the face-drop wedges.
+        let raw_first = far_first - vertex_position;
+        let raw_second = far_second - vertex_position;
 
         // The sector's face run, in disk order: f0 (just past g_k) … f_last (just
         // before g_(k+1)). `corners` is `[(g_k,f0),(leg1,f1),…,(g_(k+1),f_last)]`,
@@ -9384,43 +9401,38 @@ impl LoopMesh {
                 }
                 None => self.face_plane_normal(face_last),
             };
-            let perp_first = normalise_at_direction_floor(normal_first.cross(dir_first));
-            let perp_second = normalise_at_direction_floor(dir_second.cross(normal_second));
+            let perp_first = normalise_at_direction_floor(normal_first.cross(raw_first));
+            let perp_second = normalise_at_direction_floor(raw_second.cross(normal_second));
             (normal_first, normal_second, perp_first, perp_second)
         } else {
             // Cases 1 and 2: one shared sector plane. Its normal is the cross product
-            // of the two flanking beveled-edge directions at `v` (the plane those
-            // edges span), *not* the shared face's own supporting normal, sign-fixed
-            // against the sector's first face read in the walk's sense. The two
-            // diverge on a non-planar single-face sector — e.g. a reflex apex whose
-            // wide face wraps a far vertex that tilts its area normal off the
-            // edge-span plane.
+            // of the two **raw** flanking beveled-edge vectors at `v` (the plane those
+            // edges span), unitised, then sign-fixed against the sector's first face
+            // read in the walk's sense — from which nothing but the sign is taken.
             //
-            // A **planar** sector has no usable span to fix: the cross is parallel to
-            // the face normal (so the two rules coincide up to sign) or, on a degenerate
-            // (anti-)parallel flank pair, vanishes outright. Take the face's own normal
-            // there — in the walk's sense, which is where the sign the span would have
-            // carried comes from instead.
+            // The span is the answer **unconditionally**, on a planar sector as much as
+            // on a bent one. There is no coplanarity test here, by design: on a flat
+            // sector the unit span and the face's own unit normal are the same
+            // *direction* and different `f32` vectors — the face's is summed over
+            // vertices the two flanks never touch — and substituting one for the other
+            // moves the in-face perpendicular, hence the base points, hence the
+            // boundvert, by an ulp. That ulp survives into the multi-segment profile
+            // grid and the inner miter. It is also nearly invisible on an axis-aligned
+            // sector plane (both spellings collapse to a signed unit axis), which is
+            // why the gate that used to sit here read as harmless.
             //
-            // This gate is on **coplanarity** of the span with the face, not on the
-            // flanks' direction angle: §7.6.2's shallow-direction-angle exception
-            // (`θ_dir < SMALL_ANG = 10°`, where the short cross swings under
-            // perturbation) is a different predicate over a different quantity, and it
-            // is **not** implemented here. Its cone is also tight — `MEET_PLANAR_TOLERANCE`
-            // admits only ~0.81° of tilt — so a *near*-planar sector at an ordinary
-            // `θ_dir` takes the face normal where the edge span would differ, by up to
-            // `offset × 0.014`. Pre-existing and unmeasured; noted, not fixed here.
+            // The one face-normal substitution §7.6.2 does license in this branch is the
+            // shallow **direction-angle** exception (`θ_dir < SMALL_ANG = 10°`, where the
+            // short cross swings under perturbation) — a predicate on the flanks' angle,
+            // not on the span's alignment with anything. It is **not** implemented here.
             let face_normal = newell_first.unwrap_or(Vec3::Z);
             let reference = walk_first.map_or(face_normal, |(_, walk_normal)| walk_normal);
-            let edge_span = dir_first.cross(dir_second);
-            let edge_span_unit = edge_span.normalize_or_zero();
-            let planar = edge_span_unit == Vec3::ZERO
-                || edge_span_unit.dot(face_normal).abs() >= 1.0 - MEET_PLANAR_TOLERANCE;
-            let normal = if planar {
-                reference
-            } else {
-                orient_normal(edge_span, reference)
-            };
+            // Cross order is free: swapping it negates every component exactly, and the
+            // sign fix undoes the flip identically.
+            let edge_span = raw_first.cross(raw_second);
+            // `orient_normal` carries the only fallback the span needs: a zero-length
+            // cross (an (anti-)parallel flank pair) hands back the reference.
+            let normal = orient_normal(edge_span, reference);
             // Each perpendicular is the pure right-of-`g_k` / left-of-`g_(k+1)`
             // rotation about that normal: its sign comes from the edge's **role** in
             // the sector — forward flank versus backward flank — and never from the
@@ -9428,8 +9440,8 @@ impl LoopMesh {
             // different rule that agrees on a convex sector and inverts wherever the
             // sector's face is reflex at `v` (the centroid then sits on the sector's
             // convex complement), reflecting the meet through `v` at `2 × offset`.
-            let perp_first = normalise_at_direction_floor(normal.cross(dir_first));
-            let perp_second = normalise_at_direction_floor(dir_second.cross(normal));
+            let perp_first = normalise_at_direction_floor(normal.cross(raw_first));
+            let perp_second = normalise_at_direction_floor(raw_second.cross(normal));
             (normal, normal, perp_first, perp_second)
         };
 
@@ -9590,18 +9602,16 @@ impl LoopMesh {
     /// onto the first in-walk sector face whose plane projection lands inside that
     /// face's angular wedge at `v` (the in-wedge predicate). If no face projection
     /// is in-wedge, the midpoint stands.
+    ///
+    /// Whether the drop runs at all — §7.6.2's "out-of-plane in-between edges *and*
+    /// both flanking offsets `> 0`" — is the caller's gate, stated once at the single
+    /// call site so the two halves of that conjunction cannot drift apart.
     fn drop_onto_sector_face(
         &self,
         vertex_position: Vec3,
         layout: &SectorLayout,
         midpoint: Vec3,
-        offset: f32,
     ) -> Vec3 {
-        // The drop only runs when both flanking offsets are positive (a zero-offset
-        // side is the §8.7 degenerate handled by its own guard, not here).
-        if offset <= 0.0 {
-            return midpoint;
-        }
         // Walk the sector's edges in disk order starting at the flanking beveled edge
         // `g_k` itself (not the first in-between leg), advancing up to — but not
         // including — `g_(k+1)`, and take the face just forward of each. The projection
@@ -9786,6 +9796,12 @@ impl LoopMesh {
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
     /// degenerate (zero-length) edge.
+    ///
+    /// Unitised by §7.6.2's shared `normalise` arithmetic — one `sqrt`, one scalar
+    /// reciprocal, three multiplies. These directions reach the offset lines through
+    /// both sector-normal recipes (the case-1/2 edge span, the case-3 corner crosses),
+    /// so the per-component-division spelling would leave the guide's normalisation
+    /// axis half-migrated one frame above the base points.
     fn edge_direction_from(
         &self,
         edge: EdgeKey,
@@ -9796,7 +9812,7 @@ impl LoopMesh {
         let far = if a == vertex { b } else { a };
         let segment = self.vertex_position(far) - vertex_position;
         let length = segment.length();
-        (length > f32::EPSILON).then(|| segment / length)
+        (length > f32::EPSILON).then(|| segment * (1.0 / length))
     }
 
     /// Re-stitch every face incident to a consumed endpoint (BEVEL.md §7.4 /
@@ -10707,6 +10723,14 @@ impl LoopMesh {
     /// (near-zero area). `face_plane_normal` substitutes `Vec3::Z` for the `None`
     /// case; the §8.9.1 reflex reference (`reflex_reference_normal`) instead uses it
     /// to fall through to the next candidate in the forward → back → `n_v` chain.
+    ///
+    /// The unitisation is §7.6.2's shared `normalise` **arithmetic** — one `sqrt`, one
+    /// scalar reciprocal, three multiplies — not three per-component divisions. This is
+    /// directly upstream of the offset lines (a case-1/2 sign reference, §7.5.1's
+    /// regime-2 plane normal outright), and the guide's `2.5%`-of-shallow-sectors
+    /// normalisation axis is measured on exactly that spelling. The **floor** stays this
+    /// function's own — it reports `None` where the shared helper would report the zero
+    /// vector, and callers key on that distinction.
     fn face_newell_normal(&self, face: FaceKey) -> Option<Vec3> {
         let verts = self.face_vert_keys(face);
         let mut normal = Vec3::ZERO;
@@ -10721,7 +10745,7 @@ impl LoopMesh {
         if length <= f32::EPSILON {
             None
         } else {
-            Some(normal / length)
+            Some(normal * (1.0 / length))
         }
     }
 
@@ -14394,7 +14418,10 @@ fn sector_split(corners: &[VertexCorner], is_beveled: &dyn Fn(EdgeKey) -> bool) 
     sectors
 }
 
-/// An offset line in point-plus-direction form (BEVEL.md §7.6.2).
+/// An offset line (BEVEL.md §7.6.2), carried as its base point and the raw step to its
+/// second point. §7.6.2 states the line as **two points**, and `solve_two_lines` forms
+/// that second point and re-derives the direction from it — so `direction` here is the
+/// step, not a pre-normalised heading, and its magnitude and sign are both observable.
 struct Line {
     point: Vec3,
     direction: Vec3,
@@ -14407,8 +14434,12 @@ enum LineMeet {
     Crossing(Vec3),
     /// The lines coincide — caller picks a defined on-line point.
     Collinear,
-    /// The lines are skew — the midpoint of their two closest points.
-    Skew(Vec3),
+    /// The lines are skew. §7.6.2 gives the skew outcome **two** readings and the
+    /// caller picks by the face-drop's own gate, not by the classification: with the
+    /// drop running it consumes `midpoint` as a provisional meet, and with the drop
+    /// not running the answer is `on_first`, the closest-approach point on the first
+    /// line — "no midpoint, no projection".
+    Skew { on_first: Vec3, midpoint: Vec3 },
 }
 
 /// The per-sector geometry a §7.6.2 meet consumes (built by `sector_layout`): the
@@ -14459,12 +14490,18 @@ struct DropCandidate {
 
 /// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
 /// consistent local sector normal for a case-3 offset-line perpendicular.
+///
+/// The unitisation is §7.6.2's shared `normalise` arithmetic (one reciprocal scaled
+/// into three components, never three divisions): this normal is what the offset-line
+/// perpendicular is rotated about, so its last bits reach the base points and land on
+/// the guide's normalisation axis. The floor stays this function's own — a degenerate
+/// candidate falls back to the reference rather than to the zero vector.
 fn orient_normal(candidate: Vec3, reference: Vec3) -> Vec3 {
     let length = candidate.length();
     if length <= f32::EPSILON {
         return reference;
     }
-    let unit = candidate / length;
+    let unit = candidate * (1.0 / length);
     if unit.dot(reference) < 0.0 {
         -unit
     } else {
@@ -14472,71 +14509,144 @@ fn orient_normal(candidate: Vec3, reference: Vec3) -> Vec3 {
     }
 }
 
+/// The three outcomes of the two-line solve, in the shape the solve actually produces
+/// them (BEVEL.md §7.6.2 "The arithmetic of the two-line solve").
+enum LineSolve {
+    /// `direction_cross` is **exactly** zero: no isolated crossing exists.
+    Parallel,
+    /// The lines meet — a parameter along the **first** line, so the answer lies on
+    /// that line rather than between two near-coincident readings.
+    Crossing(Vec3),
+    /// The lines pass without meeting: the closest point on the first line, plus the
+    /// common-perpendicular offset that separates the two closest points. The point on
+    /// the second line is `on_first − gap`, and their midpoint is `on_first − gap/2`.
+    Skew { on_first: Vec3, gap: Vec3 },
+}
+
+/// The crossing of two coplanar lines as a parameter along the **first** one, in
+/// BEVEL.md §7.6.2's own names:
+///
+/// ```text
+///    along  =  dot(between_bases × dir_second, direction_cross)
+///              ───────────────────────────────────────────────
+///                 dot(direction_cross, direction_cross)
+///
+///    meet   =  base_first + dir_first · along
+/// ```
+///
+/// This spelling is not interchangeable with a `2 × 2` Gram solve, nor with averaging a
+/// closest point taken on each line. All three are the same value in exact arithmetic
+/// and three different values in `f32`; on a near-parallel pair the placement of the
+/// cancellation is what decides the last bit, and the last bit is a canonical quantum.
+/// `direction_cross` is the caller's own `dir_first × dir_second`, passed in so the
+/// crossing branch does not form it twice; it must be that product and not a re-scaled
+/// or re-signed stand-in.
+fn crossing_along_first(
+    base_first: Vec3,
+    dir_first: Vec3,
+    between_bases: Vec3,
+    dir_second: Vec3,
+    direction_cross: Vec3,
+) -> Vec3 {
+    let along =
+        between_bases.cross(dir_second).dot(direction_cross) / direction_cross.dot(direction_cross);
+    base_first + dir_first * along
+}
+
+/// The two-line solve of BEVEL.md §7.6.2, in the guide's stated arithmetic.
+///
+/// Each line is carried as **two points** — its base and a tip one raw direction along
+/// it — and the direction the solve consumes is re-derived as their difference. That
+/// round trip is not the identity in `f32`, and skipping it (carrying point-plus-
+/// direction straight through) moves the meet by a canonical quantum on about one
+/// shallow station in a thousand. The caller therefore owes this routine a **raw**,
+/// full-length direction with the sign the §7.6.2 convention gives it — into the
+/// junction vertex for the first line, out of it for the second — because the tip is a
+/// rounded sum and stepping the other way rounds differently.
+///
+/// Both classification tests are the guide's: an **exact** `== 0` on
+/// `|direction_cross|²` for the parallel bail (a small epsilon there would divert
+/// nearly-but-not-quite-parallel lines into the degenerate answer, which is a far
+/// larger error than the rounding this arithmetic is about), and an **absolute** bound
+/// on the **un-normalised** `coplanarity` triple product for crossing-versus-skew. The
+/// latter is deliberately not a distance or an angle: it scales with both directions'
+/// lengths.
+fn solve_two_lines(first: &Line, second: &Line) -> LineSolve {
+    let base_first = first.point;
+    let tip_first = base_first + first.direction;
+    let base_second = second.point;
+    let tip_second = base_second + second.direction;
+
+    let dir_first = tip_first - base_first;
+    let dir_second = tip_second - base_second;
+    let direction_cross = dir_first.cross(dir_second);
+    if direction_cross.dot(direction_cross) == 0.0 {
+        return LineSolve::Parallel;
+    }
+
+    let between_bases = base_second - base_first;
+    let coplanarity = between_bases.dot(direction_cross);
+    if coplanarity.abs() <= LINE_COPLANARITY_TOLERANCE {
+        return LineSolve::Crossing(crossing_along_first(
+            base_first,
+            dir_first,
+            between_bases,
+            dir_second,
+            direction_cross,
+        ));
+    }
+
+    // Skew: slide the whole second line along the common perpendicular until the two are
+    // coplanar, re-derive its two points (and hence its direction) there, run the same
+    // crossing formula, and carry the answer back by the same offset.
+    let gap = direction_cross
+        * ((base_first - base_second).dot(direction_cross) / direction_cross.dot(direction_cross));
+    let moved_base = base_second + gap;
+    let moved_direction = (tip_second + gap) - moved_base;
+    let moved_cross = dir_first.cross(moved_direction);
+    if moved_cross.dot(moved_cross) == 0.0 {
+        return LineSolve::Parallel;
+    }
+    let on_first = crossing_along_first(
+        base_first,
+        dir_first,
+        moved_base - base_first,
+        moved_direction,
+        moved_cross,
+    );
+    LineSolve::Skew { on_first, gap }
+}
+
 /// The closest-approach **pair** of two lines: one point on each, in the order the
-/// lines were passed. `None` when the pair is (anti)parallel and no unique pair exists.
+/// lines were passed. `None` when the pair is exactly parallel and no unique pair
+/// exists.
 ///
 /// Callers pick which of the two they want; there is no project-wide convention.
 /// §7.5.1's terminal leg meet takes the point on the *first* line, §7.6.2's face-drop
-/// path takes the midpoint (see `intersect_lines`).
-///
-/// Both directions are taken as given, so `LINE_PARALLEL_TOLERANCE` is compared against
-/// a determinant that scales with `|first|²·|second|²`. `line_line_nearest_on_first`
-/// wraps this with unit directions, which makes the same tolerance a bound on `sin θ`.
+/// path takes the midpoint (see `intersect_lines`). A crossing pair meets, so the two
+/// points are the one meet — which is the same slot the skew outcome fills with its
+/// point on the first line, not a different answer.
 fn closest_approach(first: &Line, second: &Line) -> Option<(Vec3, Vec3)> {
-    let first_direction = first.direction;
-    let second_direction = second.direction;
-    let base_separation = first.point - second.point;
-    let first_length_squared = first_direction.dot(first_direction);
-    let direction_alignment = first_direction.dot(second_direction);
-    let second_length_squared = second_direction.dot(second_direction);
-    let first_projection = first_direction.dot(base_separation);
-    let second_projection = second_direction.dot(base_separation);
-    let denominator =
-        first_length_squared * second_length_squared - direction_alignment * direction_alignment;
-    if denominator.abs() <= LINE_PARALLEL_TOLERANCE {
-        return None;
+    match solve_two_lines(first, second) {
+        LineSolve::Parallel => None,
+        LineSolve::Crossing(meet) => Some((meet, meet)),
+        LineSolve::Skew { on_first, gap } => Some((on_first, on_first - gap)),
     }
-    let first_parameter = (direction_alignment * second_projection
-        - second_length_squared * first_projection)
-        / denominator;
-    let second_parameter = (first_length_squared * second_projection
-        - direction_alignment * first_projection)
-        / denominator;
-    Some((
-        first.point + first_direction * first_parameter,
-        second.point + second_direction * second_parameter,
-    ))
 }
 
-/// Intersect two lines in 3-D by closest approach (BEVEL.md §7.6.2). Returns the
-/// crossing point when they meet, `Collinear` when they coincide, and the
-/// closest-points midpoint when they are skew.
+/// Intersect two lines in 3-D (BEVEL.md §7.6.2). Returns the crossing point when they
+/// meet, `Collinear` when no isolated crossing exists, and **both** of §7.6.2's skew
+/// readings when they pass without meeting — the point on the first line and the
+/// closest-points midpoint — because which one is the answer is the *caller's* gate
+/// (whether the face-drop runs), not a property of the solve.
 fn intersect_lines(first: &Line, second: &Line) -> LineMeet {
-    let Some((closest_first, closest_second)) = closest_approach(first, second) else {
-        // Parallel lines: distinguish coincident (the offset between the two base
-        // points lies along the shared direction) from a true parallel pair. The
-        // parallel-pair case is reached as a fallback only — the §7.6.2 ladder
-        // normally diverts near-parallel edges before the line solve.
-        let direction = first.direction;
-        let base_separation = first.point - second.point;
-        let length_squared = direction.dot(direction);
-        let across = if length_squared > f32::EPSILON {
-            base_separation - direction * (direction.dot(base_separation) / length_squared)
-        } else {
-            base_separation
-        };
-        if across.length() <= LINE_COINCIDENT_TOLERANCE {
-            return LineMeet::Collinear;
-        }
-        // Treat a genuine parallel pair as skew with the midpoint of the two base
-        // points; the drop step recovers a surface point if one is in-wedge.
-        return LineMeet::Skew((first.point + second.point) * 0.5);
-    };
-    let gap = closest_first - closest_second;
-    if gap.length() <= LINE_COINCIDENT_TOLERANCE {
-        LineMeet::Crossing((closest_first + closest_second) * 0.5)
-    } else {
-        LineMeet::Skew((closest_first + closest_second) * 0.5)
+    match solve_two_lines(first, second) {
+        LineSolve::Parallel => LineMeet::Collinear,
+        LineSolve::Crossing(meet) => LineMeet::Crossing(meet),
+        LineSolve::Skew { on_first, gap } => LineMeet::Skew {
+            on_first,
+            midpoint: on_first - gap * 0.5,
+        },
     }
 }
 
@@ -34519,13 +34629,884 @@ mod tests {
                 direction: layout.dir_second,
             },
         ) {
-            LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+            LineMeet::Crossing(point) | LineMeet::Skew { midpoint: point, .. } => point,
             LineMeet::Collinear => panic!("the near-coincident lines still solve as a crossing"),
         };
         assert!(
             (extrapolated - v_pos).length() > 10.0,
             "fixture sanity: the general solve must visibly extrapolate here, got \
              {extrapolated:?}",
+        );
+    }
+
+    /// BEVEL.md §7.6.2's worked station, rebuilt from the guide's own description: a flat
+    /// closed fan about `v = (0,0,0)` whose beveled flanks `C = (2, −flank_drop, 0)` and
+    /// `A = (−2, 0, 0)` bound a **reflex** planar sector of normal `+z`, at a direction
+    /// angle of `atan(flank_drop / 2)` — `2.29061°` at `flank_drop = 0.08`, just outside
+    /// the `2°` ladder band, so the general two-line solve is what runs.
+    ///
+    /// The reflex sector is filled by the single quad `v → C → X → A`, which makes it a
+    /// §7.6.2 **case-1** sector (no in-between edges); the unbeveled leg `L = (0,−1,0)`
+    /// splits the opposite side into two triangles so the fan is closed.
+    fn reflex_flank_fan(flank_drop: f32) -> (LoopMesh, VertexKey, [VertexKey; 3]) {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let c = mesh.create_vertex(Vec3::new(2.0, -flank_drop, 0.0));
+        let a = mesh.create_vertex(Vec3::new(-2.0, 0.0, 0.0));
+        let x = mesh.create_vertex(Vec3::new(0.0, 3.0, 0.0));
+        let l = mesh.create_vertex(Vec3::new(0.0, -1.0, 0.0));
+        mesh.face_create_verts(&[v, c, x, a], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, a, l], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, l, c], FaceCreateFlags::NONE);
+        (mesh, v, [c, a, l])
+    }
+
+    /// The reflex (case-1, planar) sector of [`reflex_flank_fan`], with `C` first and `A`
+    /// second — the order §7.6.2's worked station states, `C` taken *into* `v` and `A`
+    /// *out* of it.
+    fn reflex_flank_sector(flank_drop: f32) -> (LoopMesh, VertexKey, Sector) {
+        let (mesh, v, [c, a, _l]) = reflex_flank_fan(flank_drop);
+        let edge_c = mesh.query_edge_exists(v, c).expect("flank C");
+        let edge_a = mesh.query_edge_exists(v, a).expect("flank A");
+        let is_beveled = |edge: EdgeKey| edge == edge_c || edge == edge_a;
+        let corners = mesh.vertex_bevel_corner_ring(v, &is_beveled);
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| s.bounding_edges == vec![edge_c, edge_a])
+            .expect("the reflex C→A sector, in the guide's stated order");
+        (mesh, v, sector)
+    }
+
+    /// The canonical comparison grid quantises positions at `1e-5` (MESH_COMPARISON.md,
+    /// "Tolerance is a grid, not a metric"), which is the resolution every one of
+    /// §7.6.2's arithmetic axes is measured in.
+    fn canonical_quanta(coordinate: f32) -> i64 {
+        (coordinate / 1.0e-5).round() as i64
+    }
+
+    /// §7.6.2's worked station, evaluated from the guide's closed form rather than from
+    /// any backend: with `d = flank_drop`, `L = sqrt(4 + d²)` and the sector normal `+z`,
+    /// the two offset lines' exact crossing is
+    /// `x = offset · (d/L − 2(1 − 2/L)/d)`, `y = offset`, `z = 0`.
+    fn worked_station_crossing_x(flank_drop: f64, offset: f64) -> f64 {
+        let length = (4.0 + flank_drop * flank_drop).sqrt();
+        offset * (flank_drop / length - 2.0 * (1.0 - 2.0 / length) / flank_drop)
+    }
+
+    /// §7.6.2's three worked stations, evaluated on [`reflex_flank_fan`] rebuilt from the
+    /// guide's own description of them. All three sit **just outside** the `2°` ladder
+    /// band, where the two-line solve is ill-conditioned enough that algebraically
+    /// identical spellings land on different sides of the canonical grid's rounding
+    /// boundary — so the quantised `x` is the whole assertion.
+    ///
+    /// The expected quanta are the guide's, not a measurement: `1499`, `4725`, `673`. Two
+    /// of the three are on the *far* side of the exact-arithmetic rounding (the closed
+    /// form gives `4725.505` and `673.501`), which is the guide's point that accuracy is
+    /// not the argument — these are simply the values the stated arithmetic produces.
+    #[test]
+    fn junction_planar_case1_meet_mirrors_the_guides_worked_stations() {
+        for (flank_drop, offset, expected_quanta) in [
+            (0.08_f32, 0.75_f32, 1499_i64),
+            (0.317, 0.60, 4725),
+            (0.077, 0.35, 673),
+        ] {
+            let (mesh, vertex, sector) = reflex_flank_sector(flank_drop);
+            let vertex_position = mesh.vertex_position(vertex);
+            let layout = mesh
+                .sector_layout(vertex, vertex_position, &sector)
+                .expect("a two-flank sector has a layout");
+
+            let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+            assert!(
+                !is_degenerate_direction_angle(direction_angle),
+                "fixture sanity: {}° must sit outside the ladder band, or the general \
+                 solve never runs",
+                direction_angle.to_degrees(),
+            );
+            assert!(
+                !layout.non_planar,
+                "fixture sanity: the reflex sector must classify as planar case 1",
+            );
+            assert_eq!(
+                layout.sector_normal,
+                Vec3::Z,
+                "fixture sanity: the sector plane is `+z`",
+            );
+
+            let meet = mesh.solve_meet_point(vertex, vertex_position, &sector, offset);
+            assert_eq!(meet.y, offset, "the second offset line is `y = offset`");
+            assert_eq!(
+                meet.z, 0.0,
+                "a planar `z = 0` sector cannot leave the plane"
+            );
+            assert_eq!(
+                canonical_quanta(meet.x),
+                expected_quanta,
+                "flank_drop {flank_drop} at offset {offset}: got {} quanta ({meet:?})",
+                f64::from(meet.x) / 1.0e-5,
+            );
+
+            let exact = worked_station_crossing_x(f64::from(flank_drop), f64::from(offset));
+            assert!(
+                (f64::from(meet.x) - exact).abs() < 0.25e-5,
+                "the solve must still track the closed form to well under a quantum: \
+                 {} vs {} quanta",
+                f64::from(meet.x) / 1.0e-5,
+                exact / 1.0e-5,
+            );
+        }
+    }
+
+    /// The Gram `2 × 2` solve, in **both** of the variants §7.6.2's mirroring table gives
+    /// the solve axis its two rows for — read at the first line's parameter (the `4.2%`
+    /// row) and averaged over both lines' closest points (the `3.9%` row) — each shown to
+    /// move the boundvert a whole quantum at one station of this fixture family.
+    ///
+    /// The station is `flank_drop = 0.074` at `offset = 1.0`: a direction angle of
+    /// `2.119°`, just outside the ladder band like the guide's own three, whose closed
+    /// form is `1849.367` quanta. That is `0.13` of a quantum below the `1849.5` rounding
+    /// boundary — the same order of margin as the guide's `1499.4005` station, which is
+    /// what makes the station able to say anything at all. The stated arithmetic lands
+    /// `1849.404` and both Gram spellings land past the tie (`1849.519` and `1849.552`).
+    ///
+    /// Neither Gram variant parts *any* of the guide's own three stations: at `1499` the
+    /// point-on-first spelling reads `1499.479` and rounds the same way. A sweep of this
+    /// family (3600 stations over `flank_drop ∈ [0.07, 0.426]`, `offset ∈ [0.2, 2.15]`)
+    /// parts on `2.9%` for the point-on-first variant and `3.2%` for the averaged one —
+    /// the same order as the guide's `4.2%` / `3.9%` on its own different sweep.
+    #[test]
+    fn junction_planar_case1_meet_discriminates_both_gram_spellings() {
+        let (mesh, vertex, sector) = reflex_flank_sector(0.074);
+        let vertex_position = mesh.vertex_position(vertex);
+        let offset = 1.0_f32;
+        let layout = mesh
+            .sector_layout(vertex, vertex_position, &sector)
+            .expect("a two-flank sector has a layout");
+        let dir_first = -(layout.far_first - vertex_position);
+        let dir_second = layout.far_second - vertex_position;
+        let base_first = vertex_position + layout.perp_first * offset;
+        let base_second = vertex_position + layout.perp_second * offset;
+
+        let separation = base_first - base_second;
+        let along_first = dir_first.dot(dir_first);
+        let alignment = dir_first.dot(dir_second);
+        let along_second = dir_second.dot(dir_second);
+        let first_projection = dir_first.dot(separation);
+        let second_projection = dir_second.dot(separation);
+        let denominator = along_first * along_second - alignment * alignment;
+        let first_parameter =
+            (alignment * second_projection - along_second * first_projection) / denominator;
+        let second_parameter =
+            (along_first * second_projection - alignment * first_projection) / denominator;
+        let gram_on_first = base_first + dir_first * first_parameter;
+        let gram_midpoint = (gram_on_first + (base_second + dir_second * second_parameter)) * 0.5;
+
+        let meet = mesh.solve_meet_point(vertex, vertex_position, &sector, offset);
+        assert_eq!(
+            canonical_quanta(meet.x),
+            1849,
+            "the cross-product form lands at {} quanta",
+            f64::from(meet.x) / 1.0e-5,
+        );
+        assert_eq!(
+            canonical_quanta(gram_on_first.x),
+            1850,
+            "fixture sanity: the Gram point-on-first spelling must cross the tie, it is at \
+             {} quanta",
+            f64::from(gram_on_first.x) / 1.0e-5,
+        );
+        assert_eq!(
+            canonical_quanta(gram_midpoint.x),
+            1850,
+            "fixture sanity: the Gram midpoint spelling must cross the tie, it is at {} \
+             quanta",
+            f64::from(gram_midpoint.x) / 1.0e-5,
+        );
+    }
+
+    /// The two contrast spellings §7.6.2 names, each shown to *move* the boundvert at the
+    /// station the guide measured it at. Without this the pins above would pass for a
+    /// half-migrated solve that happened to agree on these three sectors.
+    ///
+    /// The guide's own figures: the midpoint spelling lands on `1500` where the stated
+    /// arithmetic lands on `1499`, and unitising the flanking directions before building
+    /// the offset lines lands on `674` / `4726` where the raw ones land on `673` / `4725`.
+    #[test]
+    fn junction_planar_case1_meet_discriminates_the_carriage_and_the_solve() {
+        let station = |flank_drop: f32, offset: f32| {
+            let (mesh, vertex, sector) = reflex_flank_sector(flank_drop);
+            let vertex_position = mesh.vertex_position(vertex);
+            let layout = mesh
+                .sector_layout(vertex, vertex_position, &sector)
+                .expect("a two-flank sector has a layout");
+            let raw_first = layout.far_first - vertex_position;
+            let raw_second = layout.far_second - vertex_position;
+            let first_base = vertex_position + layout.perp_first * offset;
+            let second_base = vertex_position + layout.perp_second * offset;
+            (
+                mesh.solve_meet_point(vertex, vertex_position, &sector, offset),
+                layout.sector_normal,
+                raw_first,
+                raw_second,
+                first_base,
+                second_base,
+                vertex_position,
+            )
+        };
+
+        // The solve axis: the Gram `2 × 2` system solved on both lines and averaged, which
+        // is the same algebra and a different computation.
+        let (meet, _, raw_first, raw_second, first_base, second_base, _) = station(0.08, 0.75);
+        let midpoint_spelling = {
+            let a = -raw_first;
+            let b = raw_second;
+            let separation = first_base - second_base;
+            let along_first = a.dot(a);
+            let alignment = a.dot(b);
+            let along_second = b.dot(b);
+            let first_projection = a.dot(separation);
+            let second_projection = b.dot(separation);
+            let denominator = along_first * along_second - alignment * alignment;
+            let first_parameter =
+                (alignment * second_projection - along_second * first_projection) / denominator;
+            let second_parameter =
+                (along_first * second_projection - alignment * first_projection) / denominator;
+            ((first_base + a * first_parameter) + (second_base + b * second_parameter)) * 0.5
+        };
+        // Read the margins before trusting this pair. The stated arithmetic lands at
+        // `1499.440` quanta, `0.060` clear of the `1499.5` boundary. The midpoint
+        // spelling lands at `1499.49994` — its `f32` quotient by `1e-5` is *exactly*
+        // `1499.5`, so it rounds away from zero to `1500` on a margin of `1e-4` of a
+        // quantum. It is a genuine discriminator and a knife-edge one: any unrelated
+        // last-bit change to the perpendiculars can flip it, and a flip here is not by
+        // itself evidence of a regression. `..._discriminates_both_gram_spellings` above
+        // is the robust station for this axis (margins `0.13` and `0.019`); this one is
+        // kept because it is the contrast the guide itself quotes.
+        assert_eq!(canonical_quanta(meet.x), 1499);
+        assert_eq!(
+            canonical_quanta(midpoint_spelling.x),
+            1500,
+            "fixture sanity: the midpoint spelling must land on the other side of the tie",
+        );
+
+        // The carriage axis: unit flanking directions into the perpendiculars *and* into
+        // the offset lines' second points, with the solve untouched.
+        for (flank_drop, offset, unit_quanta) in
+            [(0.077_f32, 0.35_f32, 674_i64), (0.317, 0.60, 4726)]
+        {
+            let (meet, normal, raw_first, raw_second, _, _, vertex_position) =
+                station(flank_drop, offset);
+            let unit_first = raw_first.normalize();
+            let unit_second = raw_second.normalize();
+            let unit_carriage = intersect_lines(
+                &Line {
+                    point: vertex_position
+                        + normalise_at_direction_floor(normal.cross(unit_first)) * offset,
+                    direction: -unit_first,
+                },
+                &Line {
+                    point: vertex_position
+                        + normalise_at_direction_floor(unit_second.cross(normal)) * offset,
+                    direction: unit_second,
+                },
+            );
+            let LineMeet::Crossing(unit_meet) = unit_carriage else {
+                panic!("the unit carriage still solves as a crossing");
+            };
+            assert_eq!(canonical_quanta(meet.x), unit_quanta - 1);
+            assert_eq!(
+                canonical_quanta(unit_meet.x),
+                unit_quanta,
+                "fixture sanity: unitising the flanks must move this station a quantum",
+            );
+        }
+    }
+
+    /// The apex of [`single_face_reflex_junction`] with all three spokes beveled, and
+    /// its three sectors keyed by their flank pair: `(first, second)` in §7.6.2's own
+    /// order, the first flank read *into* `v` and the second *out* of it.
+    ///
+    /// Both convex sectors here are planar and **tilted** — which is the whole point of
+    /// the station. On an axis-aligned sector plane the edge span and the face's own
+    /// normal both collapse onto a signed unit axis and agree to the bit almost always
+    /// (`0.8%` of a sweep, against `17.2%` on randomly oriented planes), so a fixture
+    /// built in one coordinate plane is structurally blind to which of the two the
+    /// implementation picks.
+    fn tilted_apex_sectors() -> (LoopMesh, VertexKey, [(EdgeKey, EdgeKey); 3], Vec<Sector>) {
+        let (mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
+        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
+        let sectors = sector_split(&corners, &is_beveled);
+        (mesh, apex, [(va, vb), (vb, vc), (vc, va)], sectors)
+    }
+
+    /// §7.6.2 "The edge-span normal, spelled out": on a **planar** case-1 sector the
+    /// sector normal is still the normalised raw edge span, sign-fixed against the
+    /// sector's face — the face's own normal is **not** licensed there. There is no
+    /// coplanarity test in this branch; the only face-normal substitution cases 1 and 2
+    /// allow is the shallow direction-angle exception, and this station's `143.6°` is
+    /// nowhere near it.
+    ///
+    /// The two spellings are the same *direction* on a flat sector and different `f32`
+    /// vectors — the face's is summed over vertices the two flanks never touch — so the
+    /// divergence is **sub-quantum where it is born**: both quantise to the same `19480`
+    /// on the canonical `1e-5` grid. It becomes a canonical divergence only downstream,
+    /// through the multi-segment profile grid and the inner miter. Hence the assertions
+    /// are on `f32` bits.
+    ///
+    /// The guide's oracle figures: the `+x` sector's boundvert at `offset = 0.2`,
+    /// `segments = 1` is `(0.19480430, 0.46936694, 0.60907954)`, and substituting the
+    /// face's own unit normal raises `x` by one ulp to `0x3E477AC8`. On the mirror `−x`
+    /// sector the same substitution moves `y` instead, `0x3EF050DB → 0x3EF050DC` — the
+    /// component it lands in follows the sector's orientation, not the rule.
+    #[test]
+    fn junction_planar_case1_sector_normal_is_the_edge_span_not_the_face_normal() {
+        let (mesh, apex, [minus_x, plus_x, _reflex], sectors) = tilted_apex_sectors();
+        let apex_position = mesh.vertex_position(apex);
+        let offset = 0.2_f32;
+
+        for (flanks, component, stated, face_normal_bits) in [
+            (plus_x, 0_usize, 0x3E47_7AC7_u32, 0x3E47_7AC8_u32),
+            (minus_x, 1, 0x3EF0_50DB, 0x3EF0_50DC),
+        ] {
+            let sector = sectors
+                .iter()
+                .find(|candidate| candidate.bounding_edges == vec![flanks.0, flanks.1])
+                .expect("both convex apex sectors are bounded by two beveled spokes");
+            let layout = mesh
+                .sector_layout(apex, apex_position, sector)
+                .expect("a two-flank sector has a layout");
+            assert!(
+                !layout.non_planar,
+                "fixture sanity: this is a case-1 sector, no in-between legs at all",
+            );
+            let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+            assert!(
+                direction_angle > TERMINAL_DIRECTION_SMALL_ANGLE,
+                "fixture sanity: {}° must clear the shallow exception, which is the one \
+                 branch that *does* take the face normal",
+                direction_angle.to_degrees(),
+            );
+
+            let meet = mesh.solve_meet_point(apex, apex_position, sector, offset);
+            assert_eq!(
+                meet[component].to_bits(),
+                stated,
+                "the normalised raw edge span places the boundvert at {meet:?}",
+            );
+
+            let face_unit = orient_normal(
+                mesh.face_plane_normal(sector.corners[0].1),
+                layout.normal_first,
+            );
+            assert_ne!(
+                face_unit, layout.normal_first,
+                "fixture sanity: on a tilted sector plane the two spellings must part in \
+                 their last bits, or this station proves nothing",
+            );
+            let substituted = meet_with_sector_normal(&mesh, apex, sector, offset, face_unit);
+            assert_eq!(
+                substituted[component].to_bits(),
+                face_normal_bits,
+                "fixture sanity: the face-normal substitution must move this component",
+            );
+        }
+
+        // The +x sector's full boundvert, all three components, as the guide states it.
+        let plus_x_sector = sectors
+            .iter()
+            .find(|candidate| candidate.bounding_edges == vec![plus_x.0, plus_x.1])
+            .expect("the +x apex sector");
+        assert_eq!(
+            mesh.solve_meet_point(apex, apex_position, plus_x_sector, offset),
+            Vec3::new(0.194_804_3, 0.469_366_94, 0.609_079_54),
+        );
+    }
+
+    /// §7.6.2 (c): the span is scaled to unit length **before** it becomes the sector
+    /// normal, and that is not cosmetic even though the perpendicular built from it is
+    /// normalised anyway — `cross(direction, k · span)` and `k · cross(direction, span)`
+    /// differ in their last bits.
+    ///
+    /// And §7.6.2 (a)'s caution, in its concrete form: unitising the two flanks before
+    /// the span cross product is the guess an implementor reaches for first, and at this
+    /// station it reproduces the stated spelling **bit for bit** — so it cannot be what
+    /// moves anything here. Pinning that keeps the station honest about which axis is
+    /// doing the work.
+    #[test]
+    fn junction_planar_case1_edge_span_is_normalised_before_it_becomes_the_sector_normal() {
+        let (mesh, apex, [_minus_x, plus_x, _reflex], sectors) = tilted_apex_sectors();
+        let apex_position = mesh.vertex_position(apex);
+        let offset = 0.2_f32;
+        let sector = sectors
+            .iter()
+            .find(|candidate| candidate.bounding_edges == vec![plus_x.0, plus_x.1])
+            .expect("the +x apex sector");
+        let layout = mesh
+            .sector_layout(apex, apex_position, sector)
+            .expect("a two-flank sector has a layout");
+        let raw_first = layout.far_first - apex_position;
+        let raw_second = layout.far_second - apex_position;
+
+        let unnormalised_span = {
+            let span = raw_first.cross(raw_second);
+            if span.dot(layout.normal_first) < 0.0 {
+                -span
+            } else {
+                span
+            }
+        };
+        assert_eq!(
+            meet_with_sector_normal(&mesh, apex, sector, offset, unnormalised_span)
+                .x
+                .to_bits(),
+            0x3E47_7AC8,
+            "fixture sanity: the un-normalised span must land on the same wrong ulp as \
+             the face-normal substitution",
+        );
+
+        // Same cross product, unit flanks in place of raw ones. §7.6.2 (b) makes the
+        // cross *order* free, so this contrast isolates the flanks alone.
+        let unit_flank_span = orient_normal(
+            layout.dir_first.cross(layout.dir_second),
+            layout.normal_first,
+        );
+        assert_eq!(
+            meet_with_sector_normal(&mesh, apex, sector, offset, unit_flank_span),
+            mesh.solve_meet_point(apex, apex_position, sector, offset),
+            "the unit-flank span agrees bit for bit at this station",
+        );
+    }
+
+    /// The two §7.6.2 offset lines rebuilt exactly as `solve_meet_point` builds them —
+    /// raw flanks, role-signed perpendiculars, second points stepped from the base — but
+    /// about a *substituted* sector normal, so a contrast spelling can be tested one
+    /// quantity deep without touching anything downstream of it.
+    fn meet_with_sector_normal(
+        mesh: &LoopMesh,
+        apex: VertexKey,
+        sector: &Sector,
+        offset: f32,
+        normal: Vec3,
+    ) -> Vec3 {
+        let apex_position = mesh.vertex_position(apex);
+        let layout = mesh
+            .sector_layout(apex, apex_position, sector)
+            .expect("a two-flank sector has a layout");
+        let raw_first = layout.far_first - apex_position;
+        let raw_second = layout.far_second - apex_position;
+        let crossing = intersect_lines(
+            &Line {
+                point: apex_position
+                    + normalise_at_direction_floor(normal.cross(raw_first)) * offset,
+                direction: apex_position - layout.far_first,
+            },
+            &Line {
+                point: apex_position
+                    + normalise_at_direction_floor(raw_second.cross(normal)) * offset,
+                direction: layout.far_second - apex_position,
+            },
+        );
+        match crossing {
+            LineMeet::Crossing(point) | LineMeet::Skew { midpoint: point, .. } => point,
+            LineMeet::Collinear => panic!("the two offset lines cross at this station"),
+        }
+    }
+
+    /// §7.6.2's parallel bail is an **exact** `== 0` on `|a × b|²` — no epsilon anywhere.
+    /// A tolerant bail would divert nearly-but-not-quite-parallel offset lines into the
+    /// `Collinear` recovery, which answers with the first line's *base point* rather than
+    /// with any crossing: a far larger error than the rounding the arithmetic is about.
+    #[test]
+    fn two_line_solve_bails_to_collinear_only_on_an_exact_zero_cross() {
+        let base_first = Vec3::new(0.0, 0.25, 0.0);
+        let base_second = Vec3::ZERO;
+        let direction = Vec3::new(1.0, 0.0, 0.0);
+
+        let exactly_parallel = intersect_lines(
+            &Line {
+                point: base_first,
+                direction,
+            },
+            &Line {
+                point: base_second,
+                direction: direction * 2.0,
+            },
+        );
+        assert!(
+            matches!(exactly_parallel, LineMeet::Collinear),
+            "an exactly parallel pair has no isolated crossing",
+        );
+
+        // A tenth of a milliradian of turn: `sin²θ = 1e-10`, an order of magnitude *under*
+        // any determinant tolerance a solve of this shape would plausibly carry, yet the
+        // cross product is not zero, so the crossing is the answer — far off though it is.
+        let turn = 1.0e-5_f32;
+        let nearly_parallel = intersect_lines(
+            &Line {
+                point: base_first,
+                direction,
+            },
+            &Line {
+                point: base_second,
+                direction: Vec3::new(turn.cos(), turn.sin(), 0.0),
+            },
+        );
+        let LineMeet::Crossing(meet) = nearly_parallel else {
+            panic!("a non-zero cross product must still solve as a crossing");
+        };
+        assert!(
+            meet.x > 1.0e4,
+            "the near-parallel crossing runs far off, and that is the defined answer: \
+             {meet:?}",
+        );
+    }
+
+    /// §7.6.2's `EPS_COPLANAR` is **absolute**, and applied to the **un-normalised**
+    /// triple product, so what it admits scales with the flanking lengths:
+    /// `|coplanarity| = |dir_first|·|dir_second|·sin(θ_dir)·gap`. Scaling both lines'
+    /// *directions* by ten — leaving both base points, the perpendicular gap between the
+    /// lines and the angle between them untouched, so the geometry is literally the same
+    /// pair of lines — multiplies the triple product by a hundred and moves the pair
+    /// across the bound.
+    ///
+    /// This is the axis §7.6.2 warns loudest about ("do not 'improve' it into a
+    /// normalised gap test"), and it is the reason a *planar* sector on a large mesh can
+    /// reach the skew branch on rounding noise alone.
+    #[test]
+    fn two_line_solve_crossing_bound_is_absolute_on_the_raw_triple_product() {
+        let separation = 5.0e-8_f32;
+        let classify = |scale: f32| {
+            let first = Line {
+                point: Vec3::ZERO,
+                direction: Vec3::X * scale,
+            };
+            let second = Line {
+                point: Vec3::new(0.0, 0.0, separation),
+                direction: Vec3::Y * scale,
+            };
+            intersect_lines(&first, &second)
+        };
+
+        assert!(
+            matches!(classify(1.0), LineMeet::Crossing(_)),
+            "at unit direction lengths the triple product is `{separation:e}`, inside the \
+             bound",
+        );
+        assert!(
+            matches!(classify(10.0), LineMeet::Skew { .. }),
+            "ten times the direction lengths is a hundred times the triple product, and \
+             the same geometry classifies as skew",
+        );
+    }
+
+    /// §7.6.2's skew answer solves nothing new: the second line is translated by the
+    /// common-perpendicular `gap` until the pair is coplanar, and the **crossing formula
+    /// is then applied unchanged**, yielding a point on the first line. That is not the
+    /// same computation as reading a Gram `2 × 2` system's first-line parameter, even
+    /// though the two are the same point in exact arithmetic — and on a shallow pair the
+    /// difference is thirteen canonical quanta, well past the "last bit" the crossing
+    /// case's contrasts live at.
+    #[test]
+    fn two_line_solve_skew_answer_is_the_translated_crossing_not_a_gram_closest_pair() {
+        let line_first = Line {
+            point: Vec3::new(0.0, 0.31, 0.0),
+            direction: Vec3::new(2.4, 0.061, 0.0),
+        };
+        let line_second = Line {
+            point: Vec3::new(0.0, 0.0, 0.017),
+            direction: Vec3::new(-1.9, 0.1, 0.0),
+        };
+        let LineSolve::Skew { on_first, .. } = solve_two_lines(&line_first, &line_second) else {
+            panic!("fixture sanity: the pair must classify as skew");
+        };
+
+        // §7.6.2's arithmetic, longhand: translate the second line by `gap`, re-derive
+        // its two points there, and run the crossing formula on the coplanar pair.
+        let by_translation = {
+            let dir_first = (line_first.point + line_first.direction) - line_first.point;
+            let dir_second = (line_second.point + line_second.direction) - line_second.point;
+            let direction_cross = dir_first.cross(dir_second);
+            let gap = direction_cross
+                * ((line_first.point - line_second.point).dot(direction_cross)
+                    / direction_cross.dot(direction_cross));
+            let moved_base = line_second.point + gap;
+            let moved_direction = (line_second.point + line_second.direction + gap) - moved_base;
+            let moved_cross = dir_first.cross(moved_direction);
+            let along = (moved_base - line_first.point)
+                .cross(moved_direction)
+                .dot(moved_cross)
+                / moved_cross.dot(moved_cross);
+            line_first.point + dir_first * along
+        };
+        assert_eq!(
+            on_first, by_translation,
+            "the skew answer must be the translated pair's crossing, bit for bit",
+        );
+
+        // The contrast: the Gram `2 × 2` closest point on the first line, which is the
+        // same point in exact arithmetic and a different one in `f32`.
+        let by_gram = {
+            let a = line_first.direction;
+            let b = line_second.direction;
+            let separation = line_first.point - line_second.point;
+            let denominator = a.dot(a) * b.dot(b) - a.dot(b) * a.dot(b);
+            let parameter =
+                (a.dot(b) * b.dot(separation) - b.dot(b) * a.dot(separation)) / denominator;
+            line_first.point + a * parameter
+        };
+        assert!(
+            (on_first - by_gram).length() > 1.0e-5,
+            "fixture sanity: the Gram spelling must be a measurably different answer \
+             here, it is {} away",
+            (on_first - by_gram).length(),
+        );
+    }
+
+    /// §7.6.2's "Face-drop does not run" reading, on the sector class it applies to: a
+    /// **planar** case-1 sector that the absolute `EPS_COPLANAR` bound classifies as skew
+    /// takes "the closest-approach point on the **first** line — no midpoint, no
+    /// projection".
+    ///
+    /// A planar sector reaches skew only through the previous test's axis: the sector's
+    /// two offset lines are exactly coplanar by construction (both perpendiculars are
+    /// square to the one shared normal), so the triple product is pure `f32` noise — but
+    /// it grows as the cube of the mesh scale, and past about `12 ×` the fixture's own
+    /// size it clears the bound. The gap that noise implies is far below a canonical
+    /// quantum (here it underflows to zero, so the two skew readings coincide bit for
+    /// bit and the *value* cannot discriminate them); what this pins is that the meet is
+    /// taken from the first-line reading and that the face-drop is gated on the sector's
+    /// planarity rather than on the solve's own verdict.
+    #[test]
+    fn junction_planar_sector_skew_reading_is_the_point_on_the_first_line() {
+        // The guide's reflex fan, scaled up until its planar sector's triple product
+        // clears the bound, and tilted off the axes so the coordinates carry the rounding
+        // that produces it at all.
+        let scale = 16.0_f32;
+        let tilt = glam::Quat::from_axis_angle(Vec3::new(1.0, 1.0, 1.0).normalize(), 0.37);
+        let mut mesh = LoopMesh::new();
+        let place = |x: f32, y: f32| tilt * (Vec3::new(x, y, 0.0) * scale);
+        let vertex = mesh.create_vertex(place(0.0, 0.0));
+        let flank_c = mesh.create_vertex(place(2.0, -0.08));
+        let flank_a = mesh.create_vertex(place(-2.0, 0.0));
+        let rim = mesh.create_vertex(place(0.0, 3.0));
+        let leg = mesh.create_vertex(place(0.0, -1.0));
+        mesh.face_create_verts(&[vertex, flank_c, rim, flank_a], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[vertex, flank_a, leg], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[vertex, leg, flank_c], FaceCreateFlags::NONE);
+
+        let edge_c = mesh.query_edge_exists(vertex, flank_c).expect("flank C");
+        let edge_a = mesh.query_edge_exists(vertex, flank_a).expect("flank A");
+        let is_beveled = |edge: EdgeKey| edge == edge_c || edge == edge_a;
+        let corners = mesh.vertex_bevel_corner_ring(vertex, &is_beveled);
+        let sector = sector_split(&corners, &is_beveled)
+            .into_iter()
+            .find(|s| s.bounding_edges == vec![edge_c, edge_a])
+            .expect("the reflex C→A sector");
+
+        let vertex_position = mesh.vertex_position(vertex);
+        let offset = 0.75 * scale;
+        let layout = mesh
+            .sector_layout(vertex, vertex_position, &sector)
+            .expect("a two-flank sector has a layout");
+        assert!(
+            !layout.non_planar,
+            "fixture sanity: the sector must classify as planar case 1, so the face-drop \
+             is gated off",
+        );
+        assert!(
+            !layout.drop_candidates.is_empty(),
+            "fixture sanity: the sector does offer a drop candidate, so gating the drop \
+             off is a choice and not an absence",
+        );
+
+        let line_first = Line {
+            point: vertex_position + layout.perp_first * offset,
+            direction: vertex_position - layout.far_first,
+        };
+        let line_second = Line {
+            point: vertex_position + layout.perp_second * offset,
+            direction: layout.far_second - vertex_position,
+        };
+        let LineMeet::Skew { on_first, .. } = intersect_lines(&line_first, &line_second) else {
+            panic!(
+                "fixture sanity: at {scale}× the fixture's scale the planar sector's own \
+                 rounding must clear the absolute bound",
+            );
+        };
+
+        assert_eq!(
+            mesh.solve_meet_point(vertex, vertex_position, &sector, offset),
+            on_first,
+            "a planar sector's skew pair takes the point on the first line, untouched by \
+             the face-drop",
+        );
+    }
+
+    /// The crossing answer is a parameter along the **first** line, and the skew answer
+    /// fills the same slot: `on_second` is `on_first` carried by the common-perpendicular
+    /// `gap`, and the midpoint `intersect_lines` reports is `on_first − gap/2`. Swapping
+    /// the two lines therefore swaps which line the answer rides — it is not symmetric.
+    #[test]
+    fn two_line_solve_rides_the_first_line_and_reports_a_mutual_skew_pair() {
+        let line_first = Line {
+            point: Vec3::new(0.0, 0.0, 0.0),
+            direction: Vec3::new(2.0, 0.3, 0.0),
+        };
+        let line_second = Line {
+            point: Vec3::new(0.5, -1.0, 0.4),
+            direction: Vec3::new(0.1, 1.7, 0.2),
+        };
+
+        let (on_first, on_second) =
+            closest_approach(&line_first, &line_second).expect("a skew pair");
+        let off_first = (on_first - line_first.point).cross(line_first.direction);
+        let off_second = (on_second - line_second.point).cross(line_second.direction);
+        assert!(
+            off_first.length() < 1.0e-6 && off_second.length() < 1.0e-6,
+            "each closest point must lie on its own line: {off_first:?} / {off_second:?}",
+        );
+        assert!(
+            (on_first - on_second).length() > 1.0e-2,
+            "fixture sanity: the pair must be genuinely skew",
+        );
+
+        let LineMeet::Skew {
+            on_first: reported_on_first,
+            midpoint,
+        } = intersect_lines(&line_first, &line_second)
+        else {
+            panic!("a skew pair must report as skew");
+        };
+        assert_eq!(
+            reported_on_first, on_first,
+            "the skew outcome reports both of §7.6.2's readings, and the first-line one \
+             is the same point `closest_approach` hands back",
+        );
+        assert!(
+            (midpoint - (on_first + on_second) * 0.5).length() < 1.0e-6,
+            "the reported skew point is the midpoint of the mutual pair",
+        );
+
+        let (swapped_first, _) = closest_approach(&line_second, &line_first).expect("a skew pair");
+        assert!(
+            (swapped_first - on_second).length() < 1.0e-5,
+            "swapping the pair order rides the other line — the solve is not symmetric",
+        );
+    }
+
+    /// §7.6.2 "The arithmetic, not just the floor": the shared normalisation guards the
+    /// **squared** length with a **strict** `>`, so a squared length exactly on the floor
+    /// takes the zero branch, and above it the unit vector is one `sqrt`, one scalar
+    /// reciprocal and three multiplies — not three divisions.
+    #[test]
+    fn shared_normalise_scales_by_one_reciprocal_under_a_strict_squared_floor() {
+        // The two spellings differ here in the last bit of two components, which is the
+        // whole of the 2.5%-of-shallow-sectors effect the guide measures.
+        let discriminating = Vec3::new(0.3, 0.7, -1.1);
+        let reciprocal = discriminating * (1.0 / discriminating.length_squared().sqrt());
+        assert_eq!(normalise_at_direction_floor(discriminating), reciprocal);
+        assert_ne!(
+            reciprocal,
+            discriminating / discriminating.length(),
+            "fixture sanity: this vector must actually part the two spellings",
+        );
+
+        // A vector whose squared length is *exactly* the floor. The guard is `>`, so it
+        // takes the zero branch; a `>=` would normalise it.
+        let on_floor = Vec3::new(3.1618642e-18, 5.113861e-20, 0.0);
+        assert_eq!(
+            on_floor.length_squared(),
+            SLIDE_DIRECTION_FLOOR_SQ,
+            "fixture sanity: this vector must sit exactly on the floor",
+        );
+        assert_eq!(normalise_at_direction_floor(on_floor), Vec3::ZERO);
+        assert_ne!(
+            normalise_at_direction_floor(on_floor * 1.0001),
+            Vec3::ZERO,
+            "clear of the floor the normalisation is ordinary",
+        );
+    }
+
+    /// The normalisation axis is a property of the **whole path** into the offset lines,
+    /// not of one helper. §7.6.2 states that every `normalise` in the document is the one
+    /// reciprocal-scaled operation, and its own mirroring table warns that the axes are
+    /// **not monotone** — a half-migration can measure worse on a given fixture than
+    /// doing nothing at all. So each unitisation the base points depend on is checked
+    /// here, on one vector chosen to part the two spellings, rather than only at the
+    /// perpendicular where the axis is measured.
+    ///
+    /// The three above the perpendicular: a face's Newell normal (a case-1/2 sign
+    /// reference, and §7.5.1 regime 2's plane normal outright), an incident edge's unit
+    /// direction (which both sector-normal recipes cross), and the case-3 local normal's
+    /// own orientation step.
+    #[test]
+    fn every_normalisation_above_the_offset_lines_scales_by_one_reciprocal() {
+        // One vector whose two spellings genuinely differ, reused so the test states the
+        // *shape* of each site rather than three unrelated numbers.
+        let parting = Vec3::new(0.3, 0.7, -1.1);
+        let length = parting.length();
+        let reciprocal = parting * (1.0 / length);
+        assert_ne!(
+            reciprocal,
+            parting / length,
+            "fixture sanity: this vector must actually part the two spellings",
+        );
+
+        // `edge_direction_from`, read off a single edge whose far endpoint is `parting`.
+        let mut mesh = LoopMesh::new();
+        let vertex = mesh.create_vertex(Vec3::ZERO);
+        let far = mesh.create_vertex(parting);
+        let apex = mesh.create_vertex(Vec3::new(-0.9, 0.2, 0.4));
+        mesh.face_create_verts(&[vertex, far, apex], FaceCreateFlags::NONE);
+        let edge = mesh.query_edge_exists(vertex, far).expect("the edge");
+        assert_eq!(
+            mesh.edge_direction_from(edge, vertex, Vec3::ZERO),
+            Some(reciprocal),
+        );
+
+        // `face_newell_normal`, on a triangle whose Newell sum is `parting` scaled: the
+        // sum is twice the triangle's area vector, so a triangle in the plane through the
+        // origin square to `parting` produces a normal along it.
+        let normal = mesh.face_newell_normal(mesh.face_keys()[0]).expect("normal");
+        assert_eq!(
+            normal,
+            {
+                let verts = mesh.face_vert_keys(mesh.face_keys()[0]);
+                let mut sum = Vec3::ZERO;
+                for i in 0..verts.len() {
+                    let current = mesh.vertex_position(verts[i]);
+                    let next = mesh.vertex_position(verts[(i + 1) % verts.len()]);
+                    sum.x += (current.y - next.y) * (current.z + next.z);
+                    sum.y += (current.z - next.z) * (current.x + next.x);
+                    sum.z += (current.x - next.x) * (current.y + next.y);
+                }
+                sum * (1.0 / sum.length())
+            },
+            "the Newell normal is the reciprocal-scaled sum",
+        );
+
+        // `orient_normal`, on both branches of its sign fix.
+        assert_eq!(orient_normal(parting, parting), reciprocal);
+        assert_eq!(orient_normal(parting, -parting), -reciprocal);
+    }
+
+    /// §4.1's slide primitive carries the same arithmetic: the direction is the raw edge
+    /// vector scaled by one reciprocal, and the distance is applied to *that*. Spelling it
+    /// `toward_far / length * distance` is a per-component division and a different
+    /// landing point in the last bit.
+    #[test]
+    fn slide_along_edge_scales_by_one_reciprocal() {
+        let vertex = Vec3::ZERO;
+        let far = Vec3::new(0.3, 0.7, -1.1);
+        let distance = 0.0037_f32;
+        let length = far.length();
+        let reciprocal = vertex + far * (1.0 / length) * distance;
+        assert_eq!(slide_along_edge(vertex, far, distance), reciprocal);
+        assert_ne!(
+            reciprocal,
+            vertex + (far / length) * distance,
+            "fixture sanity: this slide must actually part the two spellings",
         );
     }
 
@@ -43732,12 +44713,23 @@ mod tests {
 
     // ---- BEVEL.md §7.5.1 "Three regimes, selected by the direction angle" ----
 
-    /// An independent transcription of §7.5.1's offset-line meet for a **given** plane
-    /// normal: push `E`'s line sideways by `offset` square to `E`, intersect it with the
-    /// zero-offset leg's own line, and resolve a skew pair at the closest-approach point
-    /// on the **first** line (the disk predecessor: the leg when `leg_precedes_edge`,
-    /// else `E`). The regime dispatch is *not* transcribed — the whole point is
-    /// to compare each regime's claimed normal against the placement it must produce.
+    /// §7.5.1's offset-line meet for a **given** plane normal: push `E`'s line sideways
+    /// by `offset` square to `E`, intersect it with the zero-offset leg's own line, and
+    /// resolve a skew pair at the closest-approach point on the **first** line (the disk
+    /// predecessor: the leg when `leg_precedes_edge`, else `E`). The regime dispatch is
+    /// *not* transcribed — the whole point is to compare each regime's claimed normal
+    /// against the placement it must produce.
+    ///
+    /// **What this discriminates, and what it does not.** The solve below is §7.6.2's
+    /// stated arithmetic written out longhand, which is now the *same* arithmetic
+    /// `solve_two_lines` runs — so it is not an independent check of the solve, and
+    /// nothing here would catch the two lines being carried or associated differently in
+    /// both places at once. What it does discriminate is the **plane normal**: each
+    /// caller feeds it a different candidate and asserts which one the implementation
+    /// picked. The longhand is written out rather than borrowed only so the assertions
+    /// can be stated at `1e-5` — at these shallow direction angles a `2 × 2` Gram
+    /// spelling of the same algebra lands a hundred ulps away, which is enough to blur a
+    /// normal-discriminating assertion at that tolerance.
     fn leg_meet_oracle(
         endpoint: Vec3,
         edge_out: Vec3,
@@ -43751,24 +44743,34 @@ mod tests {
             edge_perp = -edge_perp;
         }
         let edge_base = endpoint + edge_perp * offset;
-        let separation = edge_base - endpoint;
-        let along_edge = edge_out.dot(edge_out);
-        let cross_term = edge_out.dot(leg_out);
-        let along_leg = leg_out.dot(leg_out);
-        let edge_projection = edge_out.dot(separation);
-        let leg_projection = leg_out.dot(separation);
-        let denominator = along_edge * along_leg - cross_term * cross_term;
-        let edge_parameter =
-            (cross_term * leg_projection - along_leg * edge_projection) / denominator;
-        let leg_parameter =
-            (along_edge * leg_projection - cross_term * edge_projection) / denominator;
-        let on_edge_line = edge_base + edge_out * edge_parameter;
-        let on_leg_line = endpoint + leg_out * leg_parameter;
-        if leg_precedes_edge {
-            on_leg_line
+        // §7.5.1's binding: the pair's first member taken *into* the endpoint, its
+        // second taken *out* of it.
+        let ((base_first, step_first), (base_second, step_second)) = if leg_precedes_edge {
+            ((endpoint, -leg_out), (edge_base, edge_out))
         } else {
-            on_edge_line
+            ((edge_base, -edge_out), (endpoint, leg_out))
+        };
+        let dir_first = (base_first + step_first) - base_first;
+        let dir_second = (base_second + step_second) - base_second;
+        let direction_cross = dir_first.cross(dir_second);
+        let between_bases = base_second - base_first;
+        let coplanarity = between_bases.dot(direction_cross);
+        if coplanarity.abs() <= 1.0e-6 {
+            let along = between_bases.cross(dir_second).dot(direction_cross)
+                / direction_cross.dot(direction_cross);
+            return base_first + dir_first * along;
         }
+        let gap = direction_cross
+            * ((base_first - base_second).dot(direction_cross)
+                / direction_cross.dot(direction_cross));
+        let moved_base = base_second + gap;
+        let moved_direction = (base_second + step_second + gap) - moved_base;
+        let moved_cross = dir_first.cross(moved_direction);
+        let along = (moved_base - base_first)
+            .cross(moved_direction)
+            .dot(moved_cross)
+            / moved_cross.dot(moved_cross);
+        base_first + dir_first * along
     }
 
     /// The retracted rule, kept only so the tests below can show they discriminate
@@ -43824,8 +44826,6 @@ mod tests {
     ) -> Vec3 {
         terminal_leg_meet(TerminalLegMeet {
             endpoint,
-            edge_out,
-            leg_out,
             edge_far: endpoint + edge_out,
             leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
@@ -44133,8 +45133,6 @@ mod tests {
         ] {
             let placement = terminal_leg_meet(TerminalLegMeet {
                 endpoint,
-                edge_out,
-                leg_out,
                 edge_far,
                 leg_far,
                 leg_precedes_edge: true,
@@ -44182,8 +45180,6 @@ mod tests {
             for (leg_precedes_edge, slide_along) in [(true, edge_out), (false, leg_out)] {
                 let placement = terminal_leg_meet(TerminalLegMeet {
                     endpoint,
-                    edge_out,
-                    leg_out,
                     edge_far: endpoint + edge_out,
                     leg_far: endpoint + leg_out,
                     leg_precedes_edge,
@@ -44233,8 +45229,6 @@ mod tests {
             {
                 let placement = terminal_leg_meet(TerminalLegMeet {
                     endpoint,
-                    edge_out,
-                    leg_out,
                     edge_far,
                     leg_far,
                     leg_precedes_edge,
@@ -44404,8 +45398,6 @@ mod tests {
 
         let leg_first = terminal_leg_meet(TerminalLegMeet {
             endpoint,
-            edge_out,
-            leg_out,
             edge_far: endpoint + edge_out,
             leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
@@ -44415,8 +45407,6 @@ mod tests {
         .position();
         let edge_first = terminal_leg_meet(TerminalLegMeet {
             endpoint,
-            edge_out,
-            leg_out,
             edge_far: endpoint + edge_out,
             leg_far: endpoint + leg_out,
             leg_precedes_edge: false,
@@ -44457,6 +45447,58 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §7.5.1 carries both flanks **raw** — `first_dir = endpoint −
+    /// first.other_end()`, `second_dir = second.other_end() − endpoint`, full length —
+    /// and hands the solve two *points* per line (`first_base`, `first_base +
+    /// first_dir`). There is no terminal exemption from §7.6.2's direction and carriage
+    /// axes; what the terminal owns is only where its *plane normal* comes from.
+    ///
+    /// Every other terminal fixture in this file is built from unit direction vectors
+    /// one length-unit out, where the raw and unit carriages are the same vectors and the
+    /// axis is invisible. This one is deliberately unequal and non-unit — `E` of length
+    /// `2.1` against a leg of `0.3` at a `2.148°` direction angle, the sweep's
+    /// widest-parting station — where the two spellings land `6.7e-6` apart, two thirds
+    /// of a canonical quantum.
+    #[test]
+    fn terminal_leg_meet_carries_the_flanks_raw_and_as_two_points() {
+        let offset = 0.1;
+        let (_, edge_out, leg_out, sector_normal) = shallow_terminal_frame(2.148);
+        let endpoint = Vec3::new(0.3, -0.7, 1.1);
+        let edge_far = endpoint + edge_out * 2.1;
+        let leg_far = endpoint + leg_out * 0.3;
+
+        let placement = terminal_leg_meet(TerminalLegMeet {
+            endpoint,
+            edge_far,
+            leg_far,
+            leg_precedes_edge: true,
+            sector_plane: SectorPlane::Face(sector_normal),
+            offset,
+        })
+        .position();
+
+        let by_raw = leg_meet_oracle(
+            endpoint,
+            edge_far - endpoint,
+            leg_far - endpoint,
+            true,
+            sector_normal,
+            offset,
+        );
+        let by_unit = leg_meet_oracle(endpoint, edge_out, leg_out, true, sector_normal, offset);
+
+        assert_eq!(
+            placement, by_raw,
+            "the terminal meet must be the raw two-point carriage, bit for bit",
+        );
+        assert!(
+            (placement - by_unit).length() > 5.0e-6,
+            "fixture sanity: the unit carriage must be a measurably different answer \
+             here, it is {} away",
+            (placement - by_unit).length(),
+        );
+    }
+
     /// §7.5.2's along-leg projection: `s_leg` is the same number whichever of the two
     /// closest-approach points it is measured from, because the segment joining them is
     /// perpendicular to both line directions and so to `leg_vec` in particular. This is
@@ -44471,8 +45513,6 @@ mod tests {
 
         let on_leg_line = terminal_leg_meet(TerminalLegMeet {
             endpoint,
-            edge_out,
-            leg_out,
             edge_far: endpoint + edge_out,
             leg_far: endpoint + leg_out,
             leg_precedes_edge: true,
@@ -45421,12 +46461,19 @@ const SLIDE_DIRECTION_FLOOR_SQ: f32 = 1.0e-35;
 /// both offset-line perpendiculars in each of the three sector cases, and the ladder's
 /// straight-through push — routes through here, so the floor is stated once.
 ///
-/// The arithmetic is the division the guide writes, `v / |v|`, rather than the
-/// multiply-by-reciprocal spelling; the two agree to within an ulp and the guide is
-/// silent on which, so the literal one is taken.
+/// The arithmetic is stated, not incidental (§7.6.2 "The arithmetic, not just the
+/// floor"): the guarded quantity is the **squared** length, the test is a **strict**
+/// `>` so a squared length exactly on the floor takes the zero branch, and above the
+/// floor the unit vector is a **scaling** — one `sqrt`, one scalar reciprocal,
+/// multiplied into all three components. Spelling it as three per-component divisions
+/// is a different computation (one correctly rounded division each, against one
+/// rounding for the reciprocal plus one per component), and although the two agree to
+/// within an ulp per component, §7.6.2's offset lines feed a solve that amplifies that
+/// ulp into a whole canonical quantum on 2.5% of shallow planar sectors.
 fn normalise_at_direction_floor(vector: Vec3) -> Vec3 {
-    if vector.length_squared() > SLIDE_DIRECTION_FLOOR_SQ {
-        vector / vector.length()
+    let length_squared = vector.length_squared();
+    if length_squared > SLIDE_DIRECTION_FLOOR_SQ {
+        vector * (1.0 / length_squared.sqrt())
     } else {
         Vec3::ZERO
     }
@@ -45466,7 +46513,9 @@ fn slide_along_edge(vertex: Vec3, far: Vec3, distance: f32) -> Vec3 {
     } else {
         distance
     };
-    vertex + (toward_far / edge_length) * clamped
+    // Reciprocal scaling then the step, matching the shared normalisation's arithmetic
+    // (§4.1's primitive, §7.6.2's box) rather than a per-component division.
+    vertex + toward_far * (1.0 / edge_length) * clamped
 }
 
 /// The corner axis `Σ_i normalize(v − A_i)` (BEVEL.md §4.3): the un-normalised
@@ -45847,12 +46896,11 @@ impl SectorPlane {
 /// the endpoint.
 struct TerminalLegMeet {
     endpoint: Vec3,
-    edge_out: Vec3,
-    leg_out: Vec3,
-    /// `E`'s far endpoint, and the leg's. Only regime 1's doubled-back slide reads
-    /// them — every other placement here is a line solve, which needs the directions
-    /// alone — but that slide is a §4.1 slide like any other, so it is clamped against
-    /// the length of whichever of the two it runs along.
+    /// `E`'s far endpoint, and the leg's. Everything §7.5.1 needs of the two flanks is
+    /// read off these: the meet's two **raw** directions (`far − endpoint`, the
+    /// full-length vectors §7.5.1's pseudocode binds), and regime 1's doubled-back
+    /// slide, which is a §4.1 slide like any other and so is clamped against the
+    /// length of whichever of the two it runs along.
     edge_far: Vec3,
     leg_far: Vec3,
     leg_precedes_edge: bool,
@@ -45894,11 +46942,16 @@ impl TerminalPlacement {
 /// §7.5.1's leg meet, before the §7.5.2 span clamp: the beveled edge's offset line
 /// against the zero-offset leg's own line, resolved at their closest approach when the
 /// two pass skew.
+///
+/// Both flanks are carried **raw** — `far − endpoint`, full length — exactly as
+/// §7.5.1's own pseudocode binds them (`first_dir = endpoint − first.other_end()`,
+/// `second_dir = second.other_end() − endpoint`), and the pair is handed to the solve
+/// as two points per line so the round trip through the tip runs here too. There is no
+/// terminal-only exemption from §7.6.2's direction or carriage axes: the terminal meet
+/// differs from the junction only in where its *plane normal* comes from.
 fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
     let TerminalLegMeet {
         endpoint,
-        edge_out,
-        leg_out,
         edge_far,
         leg_far,
         leg_precedes_edge,
@@ -45906,20 +46959,23 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         offset,
     } = meet;
 
+    let edge_raw = edge_far - endpoint;
+    let leg_raw = leg_far - endpoint;
+
     // §7.5.4 zero-direction degenerate guard. A zero-length beveled edge has no direction,
     // so its offset line has zero direction and a base at the endpoint: it is not a line but
     // a single **point** at the endpoint. The meet of a leg line against a point line returns
     // that point, so both boundverts the edge contributes here pin to the endpoint —
     // regardless of the first/second disk-order designation. This must fire *before* the
-    // regime dispatch: the direction-angle test, the unit perpendiculars, and the two-line
-    // meet solve below all build an offset line from the edge direction and would normalize a
+    // regime dispatch: the direction-angle test, the perpendiculars, and the two-line meet
+    // solve below all build an offset line from the edge direction and would normalise a
     // zero vector into NaN (or fall to the regime-1 push, which is for two *well-formed*
     // near-collinear legs, not a directionless edge — §7.5.4 keeps them distinct).
-    if edge_out.length_squared() <= f32::EPSILON {
+    if edge_raw.length() <= f32::EPSILON {
         return TerminalPlacement::Degenerate(endpoint);
     }
 
-    let direction_angle = terminal_direction_angle(edge_out, leg_out, leg_precedes_edge);
+    let direction_angle = terminal_direction_angle(edge_raw, leg_raw, leg_precedes_edge);
     // The pair's far endpoints in the pair's own order. The straight-through push sums
     // the **raw** directions, which telescope to `second_far − first_far`, and the
     // doubled-back slide runs along the pair's **second** member — so that is also the
@@ -45947,6 +47003,8 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         ));
     }
 
+    let (dir_first, dir_second) = terminal_meet_directions(edge_raw, leg_raw, leg_precedes_edge);
+
     // §7.5.1 regime 2 (shallow direction angle): the two edges run near-straight
     // through the endpoint, so their cross product is numerically fragile and can come
     // out almost square to the surface. When the sector has a face, that face's normal
@@ -45958,11 +47016,11 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
         _ => {
             // Regime 3: the LOCAL edge-cross normal, oriented to the surface's outward
             // side — the decisive §7.5.1 departure from §7.3's per-face plane normal.
-            // The cross is sign-ambiguous; the reference picks the outward branch.
-            // `cross(edge_out, leg_out)` is the canonical orientation; the per-side
-            // straddle is set by the offset-push sign below, not by re-deriving the
-            // normal per leg.
-            let mut cross_normal = edge_out.cross(leg_out);
+            // The cross is sign-ambiguous; the reference picks the outward branch. Taken
+            // on the bound pair in §7.5.1's own order, `cross(second_dir, first_dir)`,
+            // and on the raw directions: the sign the pair's order gives it is undone by
+            // the reference test, but the magnitudes are what the normalisation rounds.
+            let cross_normal = dir_second.cross(dir_first);
             let length = cross_normal.length();
             if length <= f32::EPSILON {
                 // Collinear to floating-point exactness — deep inside regime 1's band, so
@@ -45977,44 +47035,46 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
                     offset,
                 ));
             }
-            cross_normal /= length;
-            if cross_normal.dot(sector_plane.reference()) < 0.0 {
-                cross_normal = -cross_normal;
+            let unit_normal = cross_normal * (1.0 / length);
+            if unit_normal.dot(sector_plane.reference()) < 0.0 {
+                -unit_normal
+            } else {
+                unit_normal
             }
-            cross_normal
         }
     };
 
-    // `E`'s offset line is pushed sideways by `offset`, square to `E`, from the local
-    // normal. The sign is the rotational order's alone (see `terminal_strip_vert`):
-    // `E` second in the pair pushes along `E × n`, `E` first pushes against it.
-    let mut edge_perp = edge_out.cross(local_normal).normalize_or_zero();
-    if !leg_precedes_edge {
-        edge_perp = -edge_perp;
-    }
+    // Both offset lines get the one uniform §7.6.2 perpendicular,
+    // `normalise(direction × plane_normal)`, on the pair's bound directions — the first
+    // taken *into* the endpoint, the second *out* of it. The role is what carries the
+    // sign, so `E` second in the pair pushes one way and `E` first the other, with no
+    // separate negation and no per-leg re-derivation of the normal.
+    let perp_first = normalise_at_direction_floor(dir_first.cross(local_normal));
+    let perp_second = normalise_at_direction_floor(dir_second.cross(local_normal));
 
-    // Offset line for `E` (base pushed sideways by `offset`) against the leg's own line
-    // (offset 0 ⇒ base on the endpoint). At a non-planar terminal the two generally pass
-    // skew, and §7.5.1's resolution is to take the closest-approach point on the
-    // **first** line — the pair's disk predecessor — never the midpoint of the pair.
+    // Exactly one of the pair carries the offset; the unbeveled leg carries 0, so its
+    // base point sits on the endpoint whatever its perpendicular came out to be.
     //
-    // So the two terminal strip verts are asymmetric by construction: with the leg first
-    // the meet rides the leg's own line, while with `E` first it rides `E`'s offset line,
-    // laterally `offset` from the leg. Symmetrising this matches on one vert of the two.
-    let line_edge = Line {
-        point: endpoint + edge_perp * offset,
-        direction: edge_out,
-    };
-    let line_leg = Line {
-        point: endpoint,
-        direction: leg_out,
-    };
-    let (line_first, line_second) = if leg_precedes_edge {
-        (&line_leg, &line_edge)
+    // At a non-planar terminal the two lines generally pass skew, and §7.5.1's
+    // resolution is the closest-approach point on the **first** line — the pair's disk
+    // predecessor — never the midpoint of the pair. So the two terminal strip verts are
+    // asymmetric by construction: with the leg first the meet rides the leg's own line,
+    // while with `E` first it rides `E`'s offset line, laterally `offset` from the leg.
+    // Symmetrising this matches on one vert of the two.
+    let (first_offset, second_offset) = if leg_precedes_edge {
+        (0.0, offset)
     } else {
-        (&line_edge, &line_leg)
+        (offset, 0.0)
     };
-    match closest_approach(line_first, line_second) {
+    let line_first = Line {
+        point: endpoint + perp_first * first_offset,
+        direction: dir_first,
+    };
+    let line_second = Line {
+        point: endpoint + perp_second * second_offset,
+        direction: dir_second,
+    };
+    match closest_approach(&line_first, &line_second) {
         Some((on_first, _)) => TerminalPlacement::LineSolve(on_first),
         // The pair came out (anti)parallel to the line solve despite a direction angle
         // outside regime 1's band — reachable only as floating-point slop right at the
@@ -46056,24 +47116,49 @@ const MEET_DIRECTION_EPS_ANGLE: f32 = 0.034_906_6;
 /// sign-fixed edge-cross product is.
 const TERMINAL_DIRECTION_SMALL_ANGLE: f32 = 0.174_532_92;
 
-/// Length tolerance below which the two closest points of two lines are treated as
-/// the same point (a crossing) rather than skew (§7.6.2).
-const LINE_COINCIDENT_TOLERANCE: f32 = 1.0e-5;
+/// §7.6.2's `EPS_COPLANAR` — the bound that separates a crossing from a skew pair,
+/// stated on the **un-normalised** `coplanarity` triple product
+/// `dot(between_bases, direction_cross)` and therefore **absolute**: it scales like
+/// `|dir_first|·|dir_second|·sin(θ_dir)·gap`, so the *gap* it waves through as
+/// "crossing" varies with the geometry — a sector just outside the `2°` band admits
+/// some twenty-five times the gap a right-angled one does. That is deliberate.
+/// Re-expressing it as a normalised gap is a different predicate that flips the branch
+/// on sectors whose flanking edges are long or whose direction angle is shallow.
+///
+/// It is the **only** tolerance in the whole solve: the parallel bail above it is an
+/// exact zero.
+const LINE_COPLANARITY_TOLERANCE: f32 = 1.0e-6;
 
-/// Denominator floor below which the two-line system is treated as parallel
-/// (§7.6.2). `a·c − b²` is the squared sine of the angle between unit directions,
-/// so this is an angular degeneracy guard, not a length.
-const LINE_PARALLEL_TOLERANCE: f32 = 1.0e-7;
+/// Squared-sine floor below which two **unit** directions count as parallel for the
+/// callers that need a tolerant parallel test of their own. The two-line solve's own
+/// bail is an exact zero (§7.6.2); this is the extra guard §8.2.2.1's `mid` solve puts
+/// in front of it, where a near-parallel pair has no useful crossing to report at all.
+///
+/// Read on `length_squared()` of the cross of two **already unitised** directions, so
+/// the bound is `sin²θ` and independent of the inputs' lengths.
+const LINE_PARALLEL_SIN_SQ_TOLERANCE: f32 = 1.0e-7;
+
+/// The §8.5.5.5 mid rescue's own parallel guard, on the **unsquared** `|sin θ|` of its
+/// two unit neighbour directions — a tighter band than
+/// [`LINE_PARALLEL_SIN_SQ_TOLERANCE`] states, and deliberately a separate constant
+/// rather than a shared one read two ways. The guide describes tier 2's failure mode
+/// only as "parallel or non-intersecting offset lines" and pins no number, so the two
+/// callers' bands are a loopmesh choice and are named separately instead of one
+/// constant's doc having to be true of both readings.
+const MID_RESCUE_PARALLEL_SIN_TOLERANCE: f32 = 1.0e-7;
 
 /// `|sin θ|` bound below which two offset lines of the §8.5.5.5(f.5) square-grid
 /// lattice count as **aligned** (parallel-but-distinct *or* coincident). The guide
 /// pins the interior meet to be *routed on directions alone*: once the `k`-th and
 /// `j`-th offset families share a direction — as a sector opens toward flat — the
 /// line-line solve is meaningless (its closest-approach parameters blow up), so the
-/// lattice interpolates the rim row toward the swept centreline instead. Well above
-/// `sqrt(LINE_PARALLEL_TOLERANCE)` (the solver's own parallel floor) so the aligned
-/// band is caught *before* it falls through to the skew / degenerate branch, yet far
-/// tighter than any genuine crossing on a non-degenerate grid.
+/// lattice interpolates the rim row toward the swept centreline instead.
+///
+/// The band has to be caught *here*, by this caller, because the shared solve has no
+/// parallel band of its own to fall into — its bail is an exact zero (§7.6.2), so an
+/// aligned-but-not-bit-identical pair would solve as a crossing tens of units out
+/// rather than reporting `Collinear`. Wide enough to catch that, still far tighter
+/// than any genuine crossing on a non-degenerate grid.
 const OFFSET_LINE_ALIGNED_TOLERANCE: f32 = 1.0e-3;
 
 /// Angular slack (radians) for the §7.6.2 in-wedge face-drop predicate. Per the
@@ -46241,7 +47326,8 @@ impl ProfileCell {
 
         let mut mid = rescue.vertex;
         if let Some((direction_before, direction_after)) = rescue.neighbour_dirs {
-            if direction_before.cross(direction_after).length() <= LINE_PARALLEL_TOLERANCE {
+            if direction_before.cross(direction_after).length() <= MID_RESCUE_PARALLEL_SIN_TOLERANCE
+            {
                 self.collapse();
                 return;
             }
@@ -46256,7 +47342,10 @@ impl ProfileCell {
                 },
             );
             match meet {
-                LineMeet::Crossing(point) | LineMeet::Skew(point) => mid = point,
+                // Not a §7.6.2 sector meet, so §7.6.2's "which of the skew pair" split
+                // does not govern here: the tier-2 bulge wants the point between the two
+                // neighbours' offset lines, which is the midpoint reading.
+                LineMeet::Crossing(point) | LineMeet::Skew { midpoint: point, .. } => mid = point,
                 LineMeet::Collinear => {
                     self.collapse();
                     return;
@@ -47334,8 +48423,10 @@ fn superellipse_chain_general(r: f32, segments: u32, chain: &mut [(f32, f32)]) {
 /// lines are parallel.
 ///
 /// The single solve lives in `closest_approach`; this is the point-and-direction spelling
-/// of it, with both directions unitised first so that `LINE_PARALLEL_TOLERANCE` reads as a
-/// bound on `sin²θ` independent of the inputs' lengths.
+/// of it, with both directions unitised first so that `LINE_PARALLEL_SIN_SQ_TOLERANCE` reads as a
+/// bound on `sin²θ` independent of the inputs' lengths. That bound is this caller's own:
+/// the shared solve bails only on an exact zero (§7.6.2), which would let a
+/// near-parallel pair here report a crossing tens of units away instead of `None`.
 fn line_line_nearest_on_first(
     first_point: Vec3,
     first_direction: Vec3,
@@ -47345,6 +48436,9 @@ fn line_line_nearest_on_first(
     let first_unit = first_direction.normalize_or_zero();
     let second_unit = second_direction.normalize_or_zero();
     if first_unit == Vec3::ZERO || second_unit == Vec3::ZERO {
+        return None;
+    }
+    if first_unit.cross(second_unit).length_squared() <= LINE_PARALLEL_SIN_SQ_TOLERANCE {
         return None;
     }
     closest_approach(
@@ -47709,8 +48803,11 @@ impl AdjInterior<'_> {
                 if aligned {
                     interpolate
                 } else {
+                    // The lattice's own reading of a skew pair is the midpoint between
+                    // the two offset families, not §7.6.2's on-the-first-line answer:
+                    // neither family is privileged here.
                     match intersect_lines(&line_k, &line_j) {
-                        LineMeet::Crossing(point) | LineMeet::Skew(point) => point,
+                        LineMeet::Crossing(point) | LineMeet::Skew { midpoint: point, .. } => point,
                         LineMeet::Collinear => interpolate,
                     }
                 }
