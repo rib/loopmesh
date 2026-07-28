@@ -9322,9 +9322,13 @@ impl LoopMesh {
         let face_first = *faces.first()?;
         let face_last = *faces.last()?;
         // Newell over `face_first` feeds two readings a few lines apart — the offset-line
-        // sign reference (`+Z`-rescued) and the ladder's source-1 normal (raw) — and it
+        // sign reference (`+Z`-rescued) and the ladder's source-1 normal — and it
         // allocates, so it is taken once.
         let newell_first = self.face_newell_normal(face_first);
+        // The walk crosses the sector's first face entering through `g_k`; both branches
+        // below want that corner — case 3 for `g_k`'s own leg, cases 1/2 for the
+        // walk-sense sign reference the role-signed perpendiculars are built about.
+        let walk_first = self.walk_corner(face_first, vertex, edge_first);
 
         // Classify the sector into the three §7.6.2 cases by the in-between edges:
         // out-of-plane (silhouette) legs are the ones whose flanking faces are not
@@ -9362,11 +9366,9 @@ impl LoopMesh {
             // through a boundary leg that no later corner re-reports, so the recorded
             // list starts one edge late and would pair `g_k` with an edge from a
             // different face's corner entirely.
-            let first_leg =
-                self.walk_corner(face_first, vertex, edge_first)
-                    .and_then(|(next_edge, _)| {
-                        self.edge_direction_from(next_edge, vertex, vertex_position)
-                    });
+            let first_leg = walk_first.and_then(|(next_edge, _)| {
+                self.edge_direction_from(next_edge, vertex, vertex_position)
+            });
             let last_leg = between_edges
                 .last()
                 .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
@@ -9382,59 +9384,53 @@ impl LoopMesh {
                 }
                 None => self.face_plane_normal(face_last),
             };
-            let perp_first = normal_first.cross(dir_first).normalize_or_zero();
-            let perp_second = dir_second.cross(normal_second).normalize_or_zero();
+            let perp_first = normalise_at_direction_floor(normal_first.cross(dir_first));
+            let perp_second = normalise_at_direction_floor(dir_second.cross(normal_second));
             (normal_first, normal_second, perp_first, perp_second)
         } else {
             // Cases 1 and 2: one shared sector plane. Its normal is the cross product
             // of the two flanking beveled-edge directions at `v` (the plane those
-            // edges span), *not* the shared face's own supporting normal. When the
-            // two coincide — a planar sector, or a degenerate (anti-)parallel flank
-            // whose cross vanishes — keep the prior face-normal + centroid
-            // construction (bit-identical). When they diverge — a non-planar
-            // single-face sector, e.g. a reflex apex whose wide face wraps a far
-            // vertex that tilts its area normal off the edge-span plane — the
-            // centroid is an unreliable "into the sector" reference (a reflex face's
-            // centroid sits on the convex complement of the sector), so orient both
-            // perpendiculars directly by the sign-fixed edge-span normal via the
-            // §7.6.2 right/left convention (`g_k`'s right side, `g_(k+1)`'s left).
+            // edges span), *not* the shared face's own supporting normal, sign-fixed
+            // against the sector's first face read in the walk's sense. The two
+            // diverge on a non-planar single-face sector — e.g. a reflex apex whose
+            // wide face wraps a far vertex that tilts its area normal off the
+            // edge-span plane.
+            //
+            // A **planar** sector has no usable span to fix: the cross is parallel to
+            // the face normal (so the two rules coincide up to sign) or, on a degenerate
+            // (anti-)parallel flank pair, vanishes outright. Take the face's own normal
+            // there — in the walk's sense, which is where the sign the span would have
+            // carried comes from instead.
+            //
+            // This gate is on **coplanarity** of the span with the face, not on the
+            // flanks' direction angle: §7.6.2's shallow-direction-angle exception
+            // (`θ_dir < SMALL_ANG = 10°`, where the short cross swings under
+            // perturbation) is a different predicate over a different quantity, and it
+            // is **not** implemented here. Its cone is also tight — `MEET_PLANAR_TOLERANCE`
+            // admits only ~0.81° of tilt — so a *near*-planar sector at an ordinary
+            // `θ_dir` takes the face normal where the edge span would differ, by up to
+            // `offset × 0.014`. Pre-existing and unmeasured; noted, not fixed here.
             let face_normal = newell_first.unwrap_or(Vec3::Z);
+            let reference = walk_first.map_or(face_normal, |(_, walk_normal)| walk_normal);
             let edge_span = dir_first.cross(dir_second);
             let edge_span_unit = edge_span.normalize_or_zero();
             let planar = edge_span_unit == Vec3::ZERO
                 || edge_span_unit.dot(face_normal).abs() >= 1.0 - MEET_PLANAR_TOLERANCE;
-            if planar {
-                let perp_first = self.into_face_perpendicular(
-                    dir_first,
-                    face_normal,
-                    face_first,
-                    vertex_position,
-                );
-                let perp_second = self.into_face_perpendicular(
-                    dir_second,
-                    face_normal,
-                    face_last,
-                    vertex_position,
-                );
-                (face_normal, face_normal, perp_first, perp_second)
+            let normal = if planar {
+                reference
             } else {
-                // The §7.6.2 sign-fix reference is the sector's first face read **in the
-                // walk's sense**, not its raw Newell normal. The two perpendiculars below
-                // are the pure right-of-`g_k` / left-of-`g_(k+1)` rotations about the
-                // sector normal, so they are only "into the sector" when the sweep from
-                // `dir_first` to `dir_second` is the *positive* sweep about it — and the
-                // corner ring's chaining direction is arbitrary, so sign-fixing against
-                // the raw face normal inverts both perpendiculars (and hence
-                // point-reflects the meet through `v`) whenever the ring happens to run
-                // against the faces' winding.
-                let reference = self
-                    .walk_corner(face_first, vertex, edge_first)
-                    .map_or(face_normal, |(_, walk_normal)| walk_normal);
-                let normal = orient_normal(edge_span, reference);
-                let perp_first = normal.cross(dir_first).normalize_or_zero();
-                let perp_second = dir_second.cross(normal).normalize_or_zero();
-                (normal, normal, perp_first, perp_second)
-            }
+                orient_normal(edge_span, reference)
+            };
+            // Each perpendicular is the pure right-of-`g_k` / left-of-`g_(k+1)`
+            // rotation about that normal: its sign comes from the edge's **role** in
+            // the sector — forward flank versus backward flank — and never from the
+            // face's interior. Orienting them toward a face **centroid** instead is a
+            // different rule that agrees on a convex sector and inverts wherever the
+            // sector's face is reflex at `v` (the centroid then sits on the sector's
+            // convex complement), reflecting the meet through `v` at `2 × offset`.
+            let perp_first = normalise_at_direction_floor(normal.cross(dir_first));
+            let perp_second = normalise_at_direction_floor(dir_second.cross(normal));
+            (normal, normal, perp_first, perp_second)
         };
 
         // The §7.6.2 face-drop walk, in disk order: the walk edges are `g_k` then each
@@ -9468,11 +9464,18 @@ impl LoopMesh {
         // tried only when the previous one is unavailable:
         //
         //   1. the sector's own nominated face — the face just forward of the first
-        //      flanking edge — taken **directly**. It does not inspect what it took, so
-        //      a zero-area face's zero normal flows straight through and collapses the
-        //      straight-through push onto `v`; substituting an axis there pushes a whole
-        //      `offset` off-axis instead. Available for cases 1 and 2, where one face
-        //      fills the sector.
+        //      flanking edge — taken **directly**: as the face hands it over, *not*
+        //      re-normalised, *not* sign-fixed, and *not* rescued when it is zero. All
+        //      three omissions are load-bearing, and the third is why a zero-area face's
+        //      zero normal flows straight through and collapses the straight-through push
+        //      onto `v` — substituting an axis there pushes a whole `offset` off-axis
+        //      instead. Available for cases 1 and 2, where one face fills the sector.
+        //
+        //      "Not sign-fixed" covers the walk's sense too, and deliberately: unlike the
+        //      offset-line perpendiculars above, whose signs come from the two flanks'
+        //      *roles*, this normal is taken raw. A ring wound against the faces would
+        //      have to be repaired by re-deriving those roles, never by a sign check on
+        //      the normal.
         //   2. otherwise (case 3, no single face fills the sector) the mean of the
         //      forward-face normals over the same walk the face-drop uses. The divisor is
         //      inert — only the sum's direction survives the cross and normalisation —
@@ -9581,29 +9584,6 @@ impl LoopMesh {
         } else {
             None
         }
-    }
-
-    /// The unit in-plane perpendicular to `direction` (in the plane of `normal`)
-    /// pointing toward `face`'s interior. Falls back to the raw cross when the
-    /// edge is parallel to the normal (degenerate, no in-plane perpendicular).
-    fn into_face_perpendicular(
-        &self,
-        direction: Vec3,
-        normal: Vec3,
-        face: FaceKey,
-        vertex_position: Vec3,
-    ) -> Vec3 {
-        let mut perpendicular = direction.cross(normal);
-        let length = perpendicular.length();
-        if length <= f32::EPSILON {
-            return Vec3::ZERO;
-        }
-        perpendicular /= length;
-        let center = self.face_center_of_mass(face);
-        if perpendicular.dot(center - vertex_position) < 0.0 {
-            perpendicular = -perpendicular;
-        }
-        perpendicular
     }
 
     /// §7.6.2 face-drop: a skew-line midpoint floats off the surface, so project it
@@ -14444,6 +14424,12 @@ struct SectorLayout {
     far_second: Vec3,
     perp_first: Vec3,
     perp_second: Vec3,
+    /// The plane normal each offset line's perpendicular is rotated about —
+    /// **direction only; the magnitude is not meaningful and must not be read**. Every
+    /// source happens to hand over a unit vector today (a unit Newell normal, or an
+    /// `orient_normal` result), but the only consumer crosses it with an edge direction
+    /// and normalises, so nothing downstream would notice a raw `sin θ`-magnitude cross.
+    /// Contrast `sector_normal`, whose *zero* magnitude is load-bearing.
     normal_first: Vec3,
     normal_second: Vec3,
     /// §7.6.2's plane normal for the **near-collinear ladder** only — a different
@@ -34223,6 +34209,31 @@ mod tests {
         );
     }
 
+    /// The **superseded** "into the face" perpendicular: the unit in-plane perpendicular
+    /// to `direction` about `normal`, flipped to point toward `face`'s vertex mean. This
+    /// is the heuristic §7.6.2's role-based cross order replaced, and it lives here — and
+    /// only here — as the contrast the sign pins measure the fix against. It agrees with
+    /// the cross order wherever the face is convex at `vertex_position` and inverts
+    /// wherever the face's mean falls on the sector's convex complement.
+    fn centroid_oriented_perpendicular(
+        mesh: &LoopMesh,
+        direction: Vec3,
+        normal: Vec3,
+        face: FaceKey,
+        vertex_position: Vec3,
+    ) -> Vec3 {
+        let mut perpendicular = direction.cross(normal);
+        let length = perpendicular.length();
+        if length <= f32::EPSILON {
+            return Vec3::ZERO;
+        }
+        perpendicular /= length;
+        if perpendicular.dot(mesh.face_center_of_mass(face) - vertex_position) < 0.0 {
+            perpendicular = -perpendicular;
+        }
+        perpendicular
+    }
+
     /// BEVEL.md §7.6.2 case 3, reflex flanking face at the junction vertex, driven
     /// through the **production path** (`vertex_corner_ring` → `sector_split` →
     /// `sector_layout`) rather than a hand-built `Sector`. `v` is a boundary junction
@@ -34317,7 +34328,8 @@ mod tests {
         // The old case-3 heuristic oriented the perpendicular by the face centroid.
         // That centroid sits in the convex complement (below `v`), so its perpendicular
         // lands **outside** the wedge — the sign bug the fix corrects.
-        let centroid_perp = mesh.into_face_perpendicular(
+        let centroid_perp = centroid_oriented_perpendicular(
+            &mesh,
             layout.dir_first,
             layout.normal_first,
             reflex_face,
@@ -34644,9 +34656,28 @@ mod tests {
             mesh.face_center_of_mass(concave_face).y < 0.0,
             "fixture sanity: the sector's forward face must average below `v`'s upper half",
         );
+        // Fixture sanity, measured on the superseded heuristic itself rather than on
+        // `layout.perp_first` — which now carries the role-based cross order and so points
+        // *into* the sector. The two disagree here, which is what makes the fixture
+        // discriminating; at this `θ_dir = 0` the ladder returns before either is read, so
+        // only `junction_planar_sector_perpendicular_takes_the_cross_order_not_the_centroid`
+        // sees the difference in a meet.
+        let centroid_perp = centroid_oriented_perpendicular(
+            &mesh,
+            layout.dir_first,
+            layout.normal_first,
+            concave_face,
+            v_pos,
+        );
         assert!(
-            layout.perp_first.y < 0.0,
-            "fixture sanity: the centroid heuristic must point out of the sector, got {:?}",
+            centroid_perp.y < 0.0,
+            "fixture sanity: the centroid heuristic must point out of the sector, got \
+             {centroid_perp:?}",
+        );
+        assert!(
+            layout.perp_first.y > 0.0,
+            "the offset-line perpendicular is the cross order about the walk-sense normal, \
+             so it points into the sector, got {:?}",
             layout.perp_first,
         );
 
@@ -34664,6 +34695,135 @@ mod tests {
         assert!(
             meet.y * mesh.vertex_position(u).y > 0.0,
             "the boundvert must land on the same side as the sector's own leg",
+        );
+    }
+
+    /// BEVEL.md §7.6.2 *"The sense of the disk walk"*, on the **planar** (case 1/2) sector:
+    /// each offset line's perpendicular is a cross of the sector normal with the edge
+    /// direction whose sign comes from that edge's **role** — forward flank versus backward
+    /// flank — *"never from the face interior"*. Orienting it toward the forward face's
+    /// vertex mean instead agrees on a convex sector and inverts wherever that face is
+    /// reflex at `v`, because the mean then sits on the sector's convex complement.
+    ///
+    /// The discriminating fixture is §7.6.6's **planar reflex junction**: a flat closed fan
+    /// whose forward face is an arrowhead with `v` at its notch (interior angle `240°`), so
+    /// the sector flanked by `v→r` and `v→b` sweeps `280°` through the absorbed leg while
+    /// the arrowhead's far barbs pull its vertex mean straight *down* into the `120°` cone
+    /// the sector excludes. `θ_dir = 100°` puts it well outside the `2°` ladder band, so
+    /// the general two-line solve actually builds both offset lines — which is exactly what
+    /// `junction_straight_through_push_takes_the_cross_order_not_the_face_centroid` cannot
+    /// see, sitting at `θ_dir = 0` where the ladder returns first.
+    ///
+    /// The meet is checked against §7.6.2's own crossing identity `|B − v| = t / sin(θ/2)`
+    /// taken on the **reflex** bisector (§7.6.6: *"their crossing lands on the reflex (far)
+    /// side of `v`"*), and the centroid reading is rebuilt line-for-line so the failure mode
+    /// is stated as a position rather than as a sign: it lands `≈ 2 × offset` away.
+    #[test]
+    fn junction_planar_sector_perpendicular_takes_the_cross_order_not_the_centroid() {
+        let mut mesh = LoopMesh::new();
+        let v = mesh.create_vertex(Vec3::ZERO);
+        let tip = mesh.create_vertex(Vec3::new(0.0, 0.5, 0.0));
+        let r = mesh.create_vertex(Vec3::new(3.46, -2.0, 0.0));
+        let leg = mesh.create_vertex(Vec3::new(-3.46, -2.0, 0.0));
+        let b = mesh.create_vertex(Vec3::new(-1.0, -2.75, 0.0));
+        let arrowhead = mesh.face_create_verts(&[leg, v, r, tip], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, leg, b], FaceCreateFlags::NONE);
+        mesh.face_create_verts(&[v, b, r], FaceCreateFlags::NONE);
+
+        let v_pos = mesh.vertex_position(v);
+        let edge_r = mesh.query_edge_exists(v, r).expect("flank g_k");
+        let edge_b = mesh.query_edge_exists(v, b).expect("flank g_(k+1)");
+        let sector = sector_between(&mesh, v, &[edge_r, edge_b], edge_r, edge_b);
+        let layout = mesh
+            .sector_layout(v, v_pos, &sector)
+            .expect("a two-flank sector has a layout");
+
+        assert_eq!(
+            sector.corners[0].1, arrowhead,
+            "fixture sanity: the sector under test is the one the arrowhead fills — a \
+             wrong-sector regression must read as this, not as a sign flip",
+        );
+        assert!(
+            !layout.non_planar,
+            "fixture sanity: a flat fan is a case-1/2 sector, the branch under test",
+        );
+        let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+        assert!(
+            !is_degenerate_direction_angle(direction_angle),
+            "fixture sanity: θ_dir = {} rad must be outside the ladder band so the general \
+             offset-line solve runs",
+            direction_angle,
+        );
+
+        // Fixture sanity: the forward face really is reflex at `v` and its vertex mean
+        // really does fall on the sector's convex complement, so the two rules disagree.
+        assert!(
+            mesh.face_center_of_mass(arrowhead).y < 0.0,
+            "the arrowhead's barbs pull its mean below `v`, into the excluded cone",
+        );
+        let centroid_perp_first = centroid_oriented_perpendicular(
+            &mesh,
+            layout.dir_first,
+            layout.normal_first,
+            arrowhead,
+            v_pos,
+        );
+        let cross_order_perp_first = layout
+            .normal_first
+            .cross(layout.dir_first)
+            .normalize_or_zero();
+        assert!(
+            centroid_perp_first.dot(cross_order_perp_first) < 0.0,
+            "fixture sanity: the two rules must disagree here, got {centroid_perp_first:?} \
+             against {cross_order_perp_first:?}",
+        );
+        assert!(
+            (layout.perp_first - cross_order_perp_first).length() < 1.0e-6,
+            "`g_k`'s perpendicular is the cross of the walk-sense sector normal with the \
+             edge direction, not the push toward the face's mean: expected \
+             {cross_order_perp_first:?}, got {:?}",
+            layout.perp_first,
+        );
+
+        // §7.6.2's crossing identity on the reflex bisector: the wedge angle is the angle
+        // between the two flanks as rays out of `v`, and the reflex side is the far one.
+        let offset = 0.25_f32;
+        let wedge = layout.dir_first.angle_between(layout.dir_second);
+        let reflex_bisector = -(layout.dir_first + layout.dir_second).normalize();
+        let expected = v_pos + reflex_bisector * (offset / (wedge * 0.5).sin());
+
+        let meet = mesh.solve_meet_point(v, v_pos, &sector, offset);
+        assert!(
+            (meet - expected).length() < 1.0e-5,
+            "the meet is the two offset lines' crossing at {expected:?}, got {meet:?}",
+        );
+
+        // The failure mode, rebuilt: swap `perp_first` for the centroid reading and the
+        // crossing walks a full `2 × offset` off — the parity error this pin exists for.
+        let face_last = sector.corners.last().expect("the sector's last corner").1;
+        let centroid_perp_second = centroid_oriented_perpendicular(
+            &mesh,
+            layout.dir_second,
+            layout.normal_second,
+            face_last,
+            v_pos,
+        );
+        let by_centroid = intersect_lines(
+            &Line {
+                point: v_pos + centroid_perp_first * offset,
+                direction: layout.dir_first,
+            },
+            &Line {
+                point: v_pos + centroid_perp_second * offset,
+                direction: layout.dir_second,
+            },
+        );
+        let LineMeet::Crossing(by_centroid) = by_centroid else {
+            panic!("two coplanar offset lines at a 100° direction angle cross");
+        };
+        assert!(
+            (by_centroid - meet).length() > 2.0 * offset - 1.0e-3,
+            "the centroid heuristic lands `2 × offset` out at {by_centroid:?}",
         );
     }
 
@@ -45257,10 +45417,16 @@ const SLIDE_DIRECTION_FLOOR_SQ: f32 = 1.0e-35;
 /// answer for a degenerate input on both halves of the near-collinear ladder.
 ///
 /// The floor is [`SLIDE_DIRECTION_FLOOR_SQ`], stated on the squared length, and it is
-/// the same constant §4.1 states for the slide direction.
+/// the same constant §4.1 states for the slide direction. Every §7.6.2 normalisation —
+/// both offset-line perpendiculars in each of the three sector cases, and the ladder's
+/// straight-through push — routes through here, so the floor is stated once.
+///
+/// The arithmetic is the division the guide writes, `v / |v|`, rather than the
+/// multiply-by-reciprocal spelling; the two agree to within an ulp and the guide is
+/// silent on which, so the literal one is taken.
 fn normalise_at_direction_floor(vector: Vec3) -> Vec3 {
     if vector.length_squared() > SLIDE_DIRECTION_FLOOR_SQ {
-        vector.normalize()
+        vector / vector.length()
     } else {
         Vec3::ZERO
     }
