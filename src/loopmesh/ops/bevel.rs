@@ -4056,21 +4056,15 @@ impl LoopMesh {
                 vec![(left_leg, strip_left), (right_leg, strip_right)];
             let mut leg_verts: Vec<VertexKey> = Vec::with_capacity(legs.middle.len());
             for &leg in &legs.middle {
-                // The caller planned this terminal before the first mint, so a leg with no
-                // direction is a broken invariant, not an input shape. Skipping it (the old
-                // shape) would record the fill over a leg that got no vert — a partial
-                // close, which §7.5's all-or-nothing rule forbids.
-                let leg_direction = self
-                    .edge_direction_from(leg, vertex, terminal_position)
-                    .expect("the terminal plan admitted only legs with a direction");
                 // §8.3.0.1: the fan pivot slides the spec offset, lengthened by `√2` for a
                 // concave-notch superellipse (`profile < 0.25`) or **any** custom profile so
                 // the fill never cuts into the swept cross-section; every `profile ≥ 0.25`
-                // superellipse shape takes the plain offset.
+                // superellipse shape takes the plain offset. The rule is not
+                // `segments`-gated, and neither is §4.1's guard on the resulting slide.
                 let slide = terminal_leg_slide_distance(offset, profile, custom.is_some());
+                let leg_position = self.slide_along_incident_edge(vertex, leg, slide);
                 // §5.2.1 step 1: minted from the terminal endpoint it belongs to.
-                let leg_vert =
-                    self.mint_bevel_vertex(terminal_position + leg_direction * slide, vertex);
+                let leg_vert = self.mint_bevel_vertex(leg_position, vertex);
                 result.verts.push(leg_vert);
                 leg_verts.push(leg_vert);
                 leg_near.push((leg, leg_vert));
@@ -8521,7 +8515,6 @@ impl LoopMesh {
         rings: &mut BevelRings,
         result: &mut BevelResult,
     ) -> Option<RungEnds> {
-        let vertex_position = self.vertex_position(vertex);
         let legs = self.terminal_close_legs(vertex, edge)?;
         // The two `E`-flanking legs are its disk neighbours, and `face_left` / `face_right`
         // are the two faces they bound with `E` — in the radial order, which says nothing
@@ -8570,11 +8563,11 @@ impl LoopMesh {
             vec![(legs.start_leg, strip_start), (legs.end_leg, strip_end)];
         let mut leg_verts: Vec<VertexKey> = Vec::with_capacity(legs.middle.len());
         for &leg in &legs.middle {
-            let leg_direction = self
-                .edge_direction_from(leg, vertex, vertex_position)
-                .expect("the close plan admitted only legs with a direction");
-            let leg_vert =
-                self.mint_bevel_vertex(vertex_position + leg_direction * leg_slide, vertex);
+            // §7.5 / §4.1: a plain slide, so the lengthened distance meets the
+            // shared primitive's guard — the knee sits at `|leg| / √2` on the
+            // concave / custom branch, well inside the range a caller sweeps.
+            let leg_position = self.slide_along_incident_edge(vertex, leg, leg_slide);
+            let leg_vert = self.mint_bevel_vertex(leg_position, vertex);
             result.verts.push(leg_vert);
             leg_verts.push(leg_vert);
             leg_near.push((leg, leg_vert));
@@ -9243,8 +9236,10 @@ impl LoopMesh {
         if cos_dir <= -1.0 + MEET_ANGLE_TOLERANCE {
             // Directions nearly anti-parallel (θ_dir ≈ 180°), the doubled-back corner:
             // slide along the common edge line by the offset; there is no
-            // perpendicular leg to take.
-            return vertex_position + dir_first * offset;
+            // perpendicular leg to take. This is the one branch of the meet ladder
+            // that degenerates into a plain slide, so it — unlike the line solves
+            // below — takes §4.1's guard rather than §7.5.2's span clamp.
+            return self.slide_along_incident_edge(vertex, sector.bounding_edges[0], offset);
         }
 
         // Build the two offset lines as point-plus-direction (§7.6.2 "Building the
@@ -9778,6 +9773,25 @@ impl LoopMesh {
             leg_direction,
             sin_alpha_before,
         })
+    }
+
+    /// [`slide_along_edge`] addressed by an incident edge rather than by a far
+    /// position: place a vertex `distance` from `vertex` along `edge`, carrying
+    /// §4.1's overshoot guard.
+    ///
+    /// Every on-edge slide in the edge-bevel builders goes through here. The two
+    /// **meet** solves (the terminal leg meet of §7.5.1 and the junction meet of
+    /// §7.6.2) deliberately do not: they take a distance along no edge, so there
+    /// is nothing to hand this, and their overshoot is §7.5.2's span clamp — which
+    /// snaps *onto* the endpoint where this lands short of it.
+    fn slide_along_incident_edge(&self, vertex: VertexKey, edge: EdgeKey, distance: f32) -> Vec3 {
+        let [a, b] = self.edge_vert_keys(edge);
+        let far = if a == vertex { b } else { a };
+        slide_along_edge(
+            self.vertex_position(vertex),
+            self.vertex_position(far),
+            distance,
+        )
     }
 
     /// The unit direction of `edge` pointing away from `vertex`, or `None` for a
@@ -12162,8 +12176,11 @@ impl LoopMesh {
                 Vec::with_capacity(frame.placements.len());
             for placement in &frame.placements {
                 let slide = placement.slide * clamp_factor;
+                // §4.1: the ring vert is a plain slide, so it takes the shared
+                // primitive's overshoot guard — reached here from any
+                // `offset_type`, not just from an over-large `OFFSET`.
                 let ring_position =
-                    ring_vert_position(frame.vertex_position, placement.far_position, slide);
+                    slide_along_edge(frame.vertex_position, placement.far_position, slide);
                 // §5.2.1 step 1: mint from the beveled corner, not from the layer
                 // defaults — the copy *is* the initialisation, and it is what
                 // survives on any layer the blend of step 2 does not write.
@@ -34749,6 +34766,267 @@ mod tests {
         );
     }
 
+    /// A hexagonal corner of radius `0.4` at height `z`. The radius makes every
+    /// circumferential edge exactly `0.4` long, which is the leg length BEVEL.md
+    /// §8.3.0.1's worked slide-clamp table is quoted on.
+    fn hex_tube_corner(corner: usize, z: f32) -> Vec3 {
+        let angle = corner as f32 * std::f32::consts::FRAC_PI_3;
+        Vec3::new(0.4 * angle.cos(), 0.4 * angle.sin(), z)
+    }
+
+    /// A closed hexagonal tube of radius `0.4`, three rings at `z = 0, 1, 2`, side
+    /// faces only. Every middle-ring vertex is a face-bearing **valence-4**
+    /// terminal — two circumferential spokes, two axial — so beveling one middle
+    /// circumferential edge gives each of its endpoints exactly one non-flanking
+    /// leg (the next circumferential edge round), which is the leg vert §8.3.0.1
+    /// lengthens by `√2` and §4.1 then clamps.
+    fn hex_tube_radius_two_fifths() -> (LoopMesh, Vec<Vec<VertexKey>>) {
+        let mut mesh = LoopMesh::new();
+        let rings: Vec<Vec<VertexKey>> = (0..3)
+            .map(|ring| {
+                (0..6)
+                    .map(|corner| mesh.create_vertex(hex_tube_corner(corner, ring as f32)))
+                    .collect()
+            })
+            .collect();
+        for ring in 0..2 {
+            for corner in 0..6 {
+                let next = (corner + 1) % 6;
+                mesh.face_create_verts(
+                    &[
+                        rings[ring][corner],
+                        rings[ring][next],
+                        rings[ring + 1][next],
+                        rings[ring + 1][corner],
+                    ],
+                    FaceCreateFlags::NONE,
+                );
+            }
+        }
+        (mesh, rings)
+    }
+
+    /// Bevel one middle-ring circumferential edge of the hex tube and report the
+    /// mesh plus the `corner 1` terminal's leg geometry: that terminal's original
+    /// position, its non-flanking leg's far endpoint, and the result.
+    fn bevel_hex_tube_middle_edge(
+        offset: f32,
+        profile: f32,
+        segments: u32,
+    ) -> (LoopMesh, BevelResult, Vec3, Vec3) {
+        let (mut mesh, rings) = hex_tube_radius_two_fifths();
+        let beveled = mesh
+            .query_edge_exists(rings[1][0], rings[1][1])
+            .expect("the middle-ring circumferential edge");
+        let terminal = mesh.vertex_position(rings[1][1]);
+        let leg_far = mesh.vertex_position(rings[1][2]);
+        let result = mesh.bevel(
+            &[beveled.into()],
+            BevelOptions {
+                offset,
+                profile,
+                segments,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result, terminal, leg_far)
+    }
+
+    /// The position a slide of `distance` from `from` toward `to` lands on once
+    /// §4.1's guard has clamped it: a fixed `5e-5` short of `to`, not on it.
+    fn clamped_slide_landing(from: Vec3, to: Vec3) -> Vec3 {
+        let toward = to - from;
+        let length = toward.length();
+        from + toward / length * (length - 5.0e-5)
+    }
+
+    /// BEVEL.md §4.1 / §8.3.0.1's knee: the concave (`profile < 0.25`) leg slide is
+    /// `offset·√2`, so on a `0.4`-long leg it overshoots from `offset = 0.283`
+    /// upward. At `offset = 0.35` it wants `0.494975` — well past the leg — and
+    /// §4.1's shared primitive lands the leg vert `5e-5` **short** of the leg's far
+    /// endpoint. Not on the endpoint (that is §7.5.2's span clamp, a different
+    /// guard for a different placement), and not at the un-clamped position `0.095`
+    /// beyond it.
+    #[test]
+    fn terminal_leg_vert_slide_clamps_five_e_minus_five_short_of_the_far_endpoint() {
+        let (mesh, result, terminal, leg_far) = bevel_hex_tube_middle_edge(0.35, 0.0, 1);
+
+        let toward_far = leg_far - terminal;
+        let leg_length = toward_far.length();
+        assert!(
+            (leg_length - 0.4).abs() < 1.0e-5,
+            "the hex tube's circumferential legs are 0.4 long",
+        );
+
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, clamped_slide_landing(terminal, leg_far)),
+            1,
+            "the leg vert lands 5e-5 short of the leg's far endpoint",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, leg_far),
+            0,
+            "and NOT bodily on the endpoint — that is the §7.5.2 span clamp's landing",
+        );
+        let unclamped =
+            terminal + toward_far / leg_length * (0.35 * std::f32::consts::SQRT_2);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, unclamped),
+            0,
+            "nor at the un-clamped `offset·√2` position past the far endpoint",
+        );
+    }
+
+    /// BEVEL.md §4.1 property 3(a): the gap is absolute, so the clamped landing is
+    /// **independent of how badly the slide overshot** — every offset past the knee
+    /// reads the same coordinate while the un-clamped answer keeps running away.
+    /// Below the knee (`offset = 0.28`, wanting `0.39598`) the slide is untouched.
+    #[test]
+    fn terminal_leg_vert_slide_clamp_landing_is_constant_past_the_knee() {
+        let (mesh, result, terminal, leg_far) = bevel_hex_tube_middle_edge(0.28, 0.0, 1);
+        let toward_far = leg_far - terminal;
+        let leg_length = toward_far.length();
+        let below_knee = terminal + toward_far / leg_length * (0.28 * std::f32::consts::SQRT_2);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, below_knee),
+            1,
+            "below the knee the concave slide is not clamped at all",
+        );
+
+        for offset in [0.30_f32, 0.35, 0.39] {
+            let (mesh, result, terminal, leg_far) = bevel_hex_tube_middle_edge(offset, 0.0, 1);
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, clamped_slide_landing(terminal, leg_far)),
+                1,
+                "offset {offset} past the knee reads the same clamped coordinate",
+            );
+        }
+    }
+
+    /// The guard sits in the slide primitive, not in the `segments = 1` close, so
+    /// the multi-segment terminal-chain builder clamps its leg vert identically
+    /// (BEVEL.md §8.3.0.1: the reading is unchanged by `segments`).
+    #[test]
+    fn terminal_leg_vert_slide_clamp_fires_at_segments_two() {
+        let (mesh, result, terminal, leg_far) = bevel_hex_tube_middle_edge(0.35, 0.0, 2);
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, clamped_slide_landing(terminal, leg_far)),
+            1,
+            "the clamp is not segment-count-gated",
+        );
+        assert_eq!(
+            result_has_vert_near(&mesh, &result, leg_far),
+            0,
+            "still short of the endpoint, not on it",
+        );
+    }
+
+    /// BEVEL.md §4.1, "profile is not the only route in": the guard is
+    /// **profile-blind**, and the plainest route to it has no profile in sight — a
+    /// vertex-mode `OFFSET` bevel whose offset simply exceeds the incident edge.
+    /// On the unit cube (edges of length `2`) at the default round profile,
+    /// `offset = 3` with `clamp_overlap` off slides every ring vert to `2 − 5e-5`
+    /// from the corner, not to `3` and not onto the neighbour.
+    #[test]
+    fn vertex_ring_vert_clamps_on_a_plain_offset_overshoot_round_profile() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let corner_position = mesh.vertex_position(corner);
+        let neighbours = [
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+        ];
+
+        let result = mesh.bevel(
+            &[corner.into()],
+            BevelOptions {
+                offset: 3.0,
+                clamp_overlap: false,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        for neighbour in neighbours {
+            assert_eq!(
+                result_has_vert_near(
+                    &mesh,
+                    &result,
+                    clamped_slide_landing(corner_position, neighbour),
+                ),
+                1,
+                "the ring vert toward {neighbour} lands 5e-5 short of it",
+            );
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, neighbour),
+                0,
+                "and not coincident with the neighbour itself",
+            );
+        }
+    }
+
+    /// BEVEL.md §4.1 property 2: the trigger is a **strict** `>`, so a slide that
+    /// resolves to exactly the edge length lands precisely on the far endpoint and
+    /// one representable step above it jumps back by the whole `5e-5` gap.
+    #[test]
+    fn slide_primitive_trigger_is_strict_against_the_edge_length() {
+        let origin = Vec3::ZERO;
+        let far = Vec3::new(0.4, 0.0, 0.0);
+
+        assert_eq!(
+            slide_along_edge(origin, far, 0.4),
+            far,
+            "a slide of exactly the edge length is not clamped",
+        );
+        let just_over = slide_along_edge(origin, far, f32::from_bits(0.4_f32.to_bits() + 1));
+        assert!(
+            ((far.x - just_over.x) - 5.0e-5).abs() < 1.0e-7,
+            "one step above the edge length the vertex jumps back the whole gap",
+        );
+        assert!(
+            (slide_along_edge(origin, far, 40.0).x - just_over.x).abs() < 1.0e-7,
+            "the landing is independent of how far the slide overshot",
+        );
+        assert_eq!(
+            slide_along_edge(origin, far, 0.1),
+            Vec3::new(0.1, 0.0, 0.0),
+            "a slide that fits is untouched",
+        );
+    }
+
+    /// BEVEL.md §4.1 property 4, both degenerate regimes. Strictly between the
+    /// direction floor and the gap the clamped distance goes **negative** and the
+    /// vertex is reflected behind the corner; at or below the direction floor the
+    /// direction collapses and the vertex lands exactly on the corner — never NaN,
+    /// and never reflected.
+    #[test]
+    fn slide_primitive_reflects_on_a_sub_gap_edge_and_pins_a_directionless_one() {
+        let origin = Vec3::ZERO;
+
+        let sub_gap = Vec3::new(2.0e-5, 0.0, 0.0);
+        let reflected = slide_along_edge(origin, sub_gap, 0.1);
+        assert!(
+            (reflected.x - (2.0e-5 - 5.0e-5)).abs() < 1.0e-9,
+            "an edge shorter than the gap reflects the vertex behind the corner, at {reflected:?}",
+        );
+
+        assert_eq!(
+            slide_along_edge(origin, origin, 0.1),
+            origin,
+            "coincident endpoints place the vertex on the corner",
+        );
+        let below_floor = Vec3::new(1.0e-18, 0.0, 0.0);
+        assert_eq!(
+            slide_along_edge(origin, below_floor, 0.1),
+            origin,
+            "so does any separation at or below the squared-length direction floor",
+        );
+    }
+
     /// The `5 × 5` grid with the `(1,1)` quad left out. `(2,2)` keeps all four of its
     /// edges but loses one of its four faces, so its disk is an **open arc**
     /// `[boundary, E, interior, boundary]` — valence 4, three faces, and no cycle.
@@ -44303,17 +44581,53 @@ mod tests {
     }
 }
 
-fn ring_vert_position(vertex: Vec3, far: Vec3, offset: f32) -> Vec3 {
-    // §4: slide `offset` along the edge toward the far endpoint. §4.1: guard the
-    // degenerate overshoot — a non-positive or near-zero edge length cannot host
-    // a slide, so the ring vert stays at the original corner.
-    let direction = far - vertex;
-    let length = direction.length();
-    if length <= f32::EPSILON {
+/// The absolute world-unit gap the §4.1 overshoot guard leaves between a clamped
+/// slide and the edge's far endpoint. Never scaled by the edge length, the
+/// offset, or the model scale — the landing point is position-comparable, so a
+/// relative epsilon here is a divergence.
+const SLIDE_CLAMP_GAP: f32 = 5.0e-5;
+
+/// Floor of the slide direction's normalisation, stated on the **squared** length
+/// (BEVEL.md §4.1). At or below it the two endpoints are the same `f32` point and
+/// there is no direction to slide along, so the placement collapses onto `v`
+/// rather than emitting a non-finite coordinate.
+const SLIDE_DIRECTION_FLOOR_SQ: f32 = 1.0e-35;
+
+/// The one shared slide primitive (BEVEL.md §4.1): place a vertex `distance` from
+/// `vertex` along the edge running to `far`.
+///
+/// Every placement in this operator phrased as "put a vertex a distance `d` from
+/// `v` along edge `e`" routes through here, so the guard lives in one place
+/// instead of on the branch that happens to reach it first. The guard is
+/// **profile-blind**: the concave / custom `√2` leg lengthening (§8.3.0.1) is only
+/// one of the routes that can hand it an overshooting distance — the `WIDTH` /
+/// `DEPTH` re-measurement of §4.3 reaches it from a modest offset on any profile,
+/// as do `PERCENT > 100` and an `OFFSET` longer than the edge.
+///
+/// Three behaviours are separately observable and all fall out of the shape below:
+///
+/// - The trigger is a **strict** `>`: a distance that resolves to exactly the edge
+///   length is left alone and lands the vertex precisely on `far`.
+/// - A clamped vertex lands [`SLIDE_CLAMP_GAP`] **short** of `far`, whatever the
+///   overshoot was — the landing point is constant past the knee. This is *not*
+///   the §7.5.2 span clamp, which snaps a *meet* exactly onto the endpoint with no
+///   gap; the two guards' landing points differ by exactly that gap.
+/// - On an edge shorter than the gap but longer than the direction floor the
+///   clamped distance goes negative and the vertex is **reflected** behind
+///   `vertex`; at or below the direction floor it lands on `vertex` itself.
+fn slide_along_edge(vertex: Vec3, far: Vec3, distance: f32) -> Vec3 {
+    let toward_far = far - vertex;
+    let length_squared = toward_far.length_squared();
+    if length_squared <= SLIDE_DIRECTION_FLOOR_SQ {
         return vertex;
     }
-    let clamped = offset.min(length);
-    vertex + (direction / length) * clamped
+    let edge_length = length_squared.sqrt();
+    let clamped = if distance > edge_length {
+        edge_length - SLIDE_CLAMP_GAP
+    } else {
+        distance
+    };
+    vertex + (toward_far / edge_length) * clamped
 }
 
 /// The corner axis `Σ_i normalize(v − A_i)` (BEVEL.md §4.3): the un-normalised
