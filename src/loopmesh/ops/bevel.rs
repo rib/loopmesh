@@ -3514,7 +3514,7 @@ impl LoopMesh {
         cross_welds: &mut Vec<CrossWeld>,
         result: &mut BevelResult,
     ) {
-        let corners = self.vertex_corner_ring(vertex);
+        let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
         let sectors = sector_split(&corners, is_beveled);
         let vertex_position = self.vertex_position(vertex);
 
@@ -5547,7 +5547,7 @@ impl LoopMesh {
         if segments < 2 || profile_to_exponent(profile) != 2.0 {
             return false;
         }
-        let corners = self.vertex_corner_ring(vertex);
+        let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
         let sectors = sector_split(&corners, is_beveled);
         let sector_count = sectors.len();
         if sector_count < 3 {
@@ -5975,7 +5975,7 @@ impl LoopMesh {
         if mode == BevelMiter::Patch && segments != 2 {
             return false;
         }
-        let corners = self.vertex_corner_ring(vertex);
+        let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
         let sectors = sector_split(&corners, is_beveled);
         let sector_count = sectors.len();
         // §8.9.2: fewer than three beveled edges forces `SHARP`.
@@ -8191,7 +8191,7 @@ impl LoopMesh {
         // Rotational corner ring: each incident face contributes the pair of its
         // two edges meeting at `vertex`. Chain them edge-to-edge into the disk
         // walk order around the vertex.
-        let corners = self.vertex_corner_ring(vertex);
+        let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
 
         // Split the ring into sectors at beveled edges. A sector runs from one
         // beveled edge, through any unbeveled edges and their faces, to the next
@@ -9005,8 +9005,22 @@ impl LoopMesh {
         vertex: VertexKey,
         ring: Vec<VertexCorner>,
     ) -> Vec<VertexCorner> {
+        if self.corner_ring_winding_tally(vertex, &ring) >= 0 {
+            return ring;
+        }
+        reverse_corner_ring(ring)
+    }
+
+    /// The winding ballot of BEVEL.md §7.8.1(a) / §7.6.1.2 step 2, summed over a corner
+    /// ring: `+1` for a corner whose own face leaves `vertex` along the corner's incoming
+    /// edge and arrives along its outgoing one (the §7.6.2 walk sense), `−1` when that face
+    /// carries the pair the other way round, `0` when the corner has no such face.
+    ///
+    /// The ballot reads each corner independently, so it is invariant under rotating the
+    /// ring's origin and negates exactly when the ring is reversed.
+    fn corner_ring_winding_tally(&self, vertex: VertexKey, ring: &[VertexCorner]) -> i32 {
         let mut tally: i32 = 0;
-        for corner in &ring {
+        for corner in ring {
             let Some((arrives_on, leaves_on)) = self.face_corner_edges(corner.face, vertex) else {
                 continue;
             };
@@ -9016,17 +9030,99 @@ impl LoopMesh {
                 tally -= 1;
             }
         }
-        if tally >= 0 {
+        tally
+    }
+
+    /// The junction's **slot array** in the sense of BEVEL.md §7.6.1.2: the corner ring of
+    /// [`vertex_corner_ring`] re-anchored so slot 0 is the origin the guide pins, instead of
+    /// wherever the chained walk's face-order seed happened to land. `is_beveled` is step 1's
+    /// bevel selection.
+    ///
+    /// Only the *origin* is recovered here, because the chained ring already runs in the
+    /// guide's final direction wherever the winding ballot is non-zero: both orientations are
+    /// settled by the same "reverse iff the ballot is strictly negative" rule, and the ballot
+    /// is origin-invariant. The one direction the two can disagree on is a **zero** ballot,
+    /// which the guide resolves toward the walk out of the seed rather than toward whatever
+    /// the chain built, so that case reverses here.
+    ///
+    /// An **open** fan needs neither: both of its ends are radial-1 and so cannot be in the
+    /// selection (§2.1), which puts step 1's seed on an end and leaves step 3's scan falling
+    /// through to the far end — the origin the chained ring already carries.
+    fn vertex_bevel_corner_ring(
+        &self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+    ) -> Vec<VertexCorner> {
+        let ring = self.vertex_corner_ring(vertex);
+        let count = ring.len();
+        if count < 2 {
             return ring;
         }
-        ring.into_iter()
-            .rev()
-            .map(|corner| VertexCorner {
-                incoming_edge: corner.outgoing_edge,
-                face: corner.face,
-                outgoing_edge: corner.incoming_edge,
-            })
-            .collect()
+        let closed = ring[count - 1].outgoing_edge == ring[0].incoming_edge;
+        let trailing_spoke = (!closed).then(|| ring[count - 1].outgoing_edge);
+
+        // Step 1: scan the stored disk order from the anchor. A radial-1 faced spoke outranks
+        // a beveled one and the *last* such wins; failing that, the *first* beveled spoke.
+        let mut seed: Option<EdgeKey> = None;
+        for edge in self.iter_disk_edges(vertex) {
+            let in_array = trailing_spoke == Some(edge)
+                || ring.iter().any(|corner| corner.incoming_edge == edge);
+            if !in_array {
+                continue;
+            }
+            if self.edge_radial_iter(edge).count() == 1 {
+                seed = Some(edge);
+            } else if seed.is_none() && is_beveled(edge) {
+                seed = Some(edge);
+            }
+        }
+        let Some(seed) = seed else {
+            return ring;
+        };
+
+        // Step 2: the walk's first step leaves the seed for whichever of its fan neighbours
+        // comes first in that same stored order.
+        let seed_slot = ring.iter().position(|corner| corner.incoming_edge == seed);
+        let forward_neighbour = seed_slot.map(|slot| ring[slot].outgoing_edge);
+        let backward_neighbour = match seed_slot {
+            Some(0) if !closed => None,
+            Some(slot) => Some(ring[(slot + count - 1) % count].incoming_edge),
+            None => Some(ring[count - 1].incoming_edge),
+        };
+        let stored_rank = |edge: EdgeKey| {
+            self.iter_disk_edges(vertex)
+                .position(|candidate| candidate == edge)
+                .unwrap_or(usize::MAX)
+        };
+        let walk_follows_ring = match (forward_neighbour, backward_neighbour) {
+            (Some(forward), Some(backward)) => stored_rank(forward) < stored_rank(backward),
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
+
+        let mut ring = ring;
+        let mut walk_follows_ring = walk_follows_ring;
+        if !walk_follows_ring && self.corner_ring_winding_tally(vertex, &ring) == 0 {
+            ring = reverse_corner_ring(ring);
+            walk_follows_ring = true;
+        }
+        if !closed {
+            return ring;
+        }
+
+        // An unreversed array leaves the seed in slot 0; a reversed one parks it in the last
+        // slot, so slot 0 is the seed's successor.
+        let seed_slot = ring
+            .iter()
+            .position(|corner| corner.incoming_edge == seed)
+            .unwrap_or(0);
+        let origin_slot = if walk_follows_ring {
+            seed_slot
+        } else {
+            (seed_slot + 1) % count
+        };
+        ring.rotate_left(origin_slot);
+        ring
     }
 
     /// Place a sector's boundvert by the pairwise offset-line meet (BEVEL.md
@@ -13933,22 +14029,54 @@ fn rotational_edge_neighbours(
     Some((predecessor, corners[index].outgoing_edge))
 }
 
+/// Reverse a corner ring, exchanging each spoke's forward and backward flanking faces
+/// along with its slot (BEVEL.md §7.6.1.2, "Reversal carries the flanking-face roles with
+/// it"): the sector lying between a given pair of edges is still that pair's sector
+/// afterwards. Dropping the swap yields an array that is correctly ordered and uniformly
+/// wrong — the meet-point comes out at the point reflection of the right answer, which no
+/// normal-facing check detects.
+fn reverse_corner_ring(ring: Vec<VertexCorner>) -> Vec<VertexCorner> {
+    ring.into_iter()
+        .rev()
+        .map(|corner| VertexCorner {
+            incoming_edge: corner.outgoing_edge,
+            face: corner.face,
+            outgoing_edge: corner.incoming_edge,
+        })
+        .collect()
+}
+
 /// Split a vertex's rotational corner ring into sectors at the beveled edges
 /// (BEVEL.md §7.6.1). Each sector runs from one beveled edge, through any unbeveled
 /// edges/faces, to the next beveled edge, and yields one boundvert. Returns one
 /// `Sector` per gap between consecutive beveled edges in disk order.
+///
+/// `corners` must be the §7.6.1.2 slot array ([`LoopMesh::vertex_bevel_corner_ring`]): the
+/// origin scan below is stated on that array's slot numbering and is off by a whole ring
+/// step on any other.
 fn sector_split(corners: &[VertexCorner], is_beveled: &dyn Fn(EdgeKey) -> bool) -> Vec<Sector> {
     if corners.is_empty() {
         return Vec::new();
     }
-
-    // Find a starting corner whose incoming edge is beveled, so the first sector
-    // opens on a beveled edge. (A closed junction always has ≥ 2 beveled edges.)
-    let start = corners
-        .iter()
-        .position(|c| is_beveled(c.incoming_edge))
-        .unwrap_or(0);
     let count = corners.len();
+
+    // §7.6.1.2 step 3: the first sector opens on the first beveled spoke found scanning from
+    // the array's **last** slot and wrapping — not from slot 0. The two readings part company
+    // exactly when the last slot is beveled, and the resulting one-step rotation is what
+    // hands a two-collinear-pair ring the wrong pipe axis (§8.3.4.1 condition 2).
+    //
+    // An open fan's true last slot is the trailing spoke `corners[count - 1].outgoing_edge`,
+    // which has no corner of its own; being a fan end it is radial-1 and so never in the
+    // selection (§2.1), so the scan falls through it to slot 0.
+    let scan_start = if corners[count - 1].outgoing_edge == corners[0].incoming_edge {
+        count - 1
+    } else {
+        0
+    };
+    let start = (0..count)
+        .map(|step| (scan_start + step) % count)
+        .find(|&slot| is_beveled(corners[slot].incoming_edge))
+        .unwrap_or(0);
 
     let mut sectors: Vec<Sector> = Vec::new();
     let mut current = Sector {
@@ -14141,6 +14269,163 @@ mod tests {
 
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
         (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
+    }
+
+    /// The §7.6.1.2 worked example's slot array, spoke by spoke, on the closed 12-fan the
+    /// guide states it for.
+    ///
+    /// `planar_fan(12)` **is** that fixture — twelve triangles `[hub, rim_k, rim_(k+1)]`
+    /// created in `k` order — so the hub's stored disk order is `2, 1, 3, 4, … 12` (each
+    /// face-create mints its closing edge first, which attaches spoke `2` ahead of spoke
+    /// `1`). Spoke numbers below are the guide's, one-based: spoke `j` is `rim[j - 1]`.
+    ///
+    /// Both arms pin step 1's seed *and* step 2's reversal, which no other test here can
+    /// separate: they differ only in which spoke the selection makes the seed, and the
+    /// arrays they produce are a whole ring step apart.
+    #[test]
+    fn bevel_ring_slot_array_seeds_on_the_stored_order_and_reverses_by_the_ballot() {
+        let (mesh, centre, rim) = planar_fan(12);
+        let spoke_edge = |spoke: usize| {
+            mesh.query_edge_exists(centre, rim[spoke - 1])
+                .expect("spoke exists")
+        };
+        let spoke_number = |edge: EdgeKey| (1..=12).find(|&spoke| spoke_edge(spoke) == edge);
+        let slot_array = |beveled: &[usize]| -> Vec<usize> {
+            let selected: Vec<EdgeKey> = beveled.iter().map(|&s| spoke_edge(s)).collect();
+            let is_beveled = |edge: EdgeKey| selected.contains(&edge);
+            mesh.vertex_bevel_corner_ring(centre, &is_beveled)
+                .iter()
+                .map(|corner| spoke_number(corner.incoming_edge).expect("a hub spoke"))
+                .collect()
+        };
+
+        assert_eq!(
+            mesh.iter_disk_edges(centre)
+                .map(|edge| spoke_number(edge).expect("a hub spoke"))
+                .collect::<Vec<usize>>(),
+            vec![2, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "the fixture's stored disk order is the one the worked example is derived on",
+        );
+
+        // Seed 2: its backward fan neighbour (spoke 1) precedes its forward one (spoke 3) in
+        // the stored order, so the walk runs clockwise, the ballot reverses it, and the seed
+        // lands in the array's last slot.
+        assert_eq!(
+            slot_array(&[1, 2, 7, 8]),
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2],
+        );
+        // Seed 1 (spoke 2 unbeveled): its forward neighbour (spoke 2) precedes its backward
+        // one (spoke 12), so the walk runs counter-clockwise, is *not* reversed, and the seed
+        // stays in slot 0.
+        assert_eq!(
+            slot_array(&[1, 3, 7, 9]),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        );
+    }
+
+    /// BEVEL.md §7.6.1.2 step 3 on the fifteen two-collinear-pair rings of the closed 12-fan:
+    /// the origin scan starts at the slot array's **last** slot and wraps, so `g_0` is not
+    /// simply the lowest-numbered beveled spoke (which misses `1/2/7/8` and `1/6/7/12`) and
+    /// not the first beveled spoke from slot 0 either.
+    ///
+    /// This is the guide's fingerprint table: a correct implementation matches all fifteen.
+    /// Both `g_0` and `g_1` are pinned because `g_1` is the pipe axis §8.3.4.1 condition 2
+    /// returns, and on these rings a one-step rotation of the origin swaps the two candidate
+    /// axes without disturbing anything else.
+    #[test]
+    fn bevel_ring_origin_scans_from_the_slot_arrays_last_slot() {
+        // (beveled diameter pair `{a, b, a+6, b+6}`, expected `g_0`, expected `g_1`).
+        let expected = [
+            ((1, 2), 2, 7),
+            ((1, 3), 1, 3),
+            ((1, 4), 1, 4),
+            ((1, 5), 1, 5),
+            ((1, 6), 12, 1),
+            ((2, 3), 2, 3),
+            ((2, 4), 2, 4),
+            ((2, 5), 2, 5),
+            ((2, 6), 2, 6),
+            ((3, 4), 3, 4),
+            ((3, 5), 3, 5),
+            ((3, 6), 3, 6),
+            ((4, 5), 4, 5),
+            ((4, 6), 4, 6),
+            ((5, 6), 5, 6),
+        ];
+        for ((a, b), origin_spoke, axis_spoke) in expected {
+            let (mesh, centre, rim) = planar_fan(12);
+            let spoke_edge = |spoke: usize| {
+                mesh.query_edge_exists(centre, rim[spoke - 1])
+                    .expect("spoke exists")
+            };
+            let selected: Vec<EdgeKey> = [a, b, a + 6, b + 6].map(spoke_edge).into();
+            let is_beveled = |edge: EdgeKey| selected.contains(&edge);
+            let corners = mesh.vertex_bevel_corner_ring(centre, &is_beveled);
+            let sectors = sector_split(&corners, &is_beveled);
+            assert_eq!(sectors.len(), 4, "one sector per beveled spoke");
+            let spoke_number = |edge: EdgeKey| (1..=12).find(|&spoke| spoke_edge(spoke) == edge);
+            assert_eq!(
+                (
+                    spoke_number(sectors[0].bounding_edges[0]),
+                    spoke_number(sectors[1].bounding_edges[0]),
+                ),
+                (Some(origin_spoke), Some(axis_spoke)),
+                "ring {a}/{b}/{}/{}: g_0 opens B_0's sector and g_1 is the pipe axis",
+                a + 6,
+                b + 6,
+            );
+        }
+    }
+
+    /// BEVEL.md §7.6.1.2's second worked example — the half-disc, where step 1's radial-1
+    /// clause *outranks* its beveled clause and so seeds on a spoke that is not in the
+    /// selection at all.
+    ///
+    /// `open_planar_fan(7, 0)` is that fixture: hub, seven spokes over 180°, six triangles
+    /// created in order. Both fan ends are radial-1, so the seed is the later of them in the
+    /// stored order and the array reverses to run from the other end. Bevelling spokes
+    /// `2 / 4 / 6` then leaves the origin scan genuinely traversing the array — the last slot
+    /// and slot 0 are both unbeveled fan ends — instead of resolving at or beside the seed.
+    #[test]
+    fn bevel_ring_origin_seed_prefers_a_radial_one_spoke_over_a_beveled_one_half_disc() {
+        let (mesh, centre, rim) = open_planar_fan(7, 0);
+        let spoke_edge = |spoke: usize| {
+            mesh.query_edge_exists(centre, rim[spoke - 1])
+                .expect("spoke exists")
+        };
+        let selected: Vec<EdgeKey> = [2, 4, 6].map(spoke_edge).into();
+        let is_beveled = |edge: EdgeKey| selected.contains(&edge);
+        let corners = mesh.vertex_bevel_corner_ring(centre, &is_beveled);
+        let spoke_number = |edge: EdgeKey| (1..=7).find(|&spoke| spoke_edge(spoke) == edge);
+
+        assert_eq!(
+            corners
+                .iter()
+                .map(|corner| spoke_number(corner.incoming_edge).expect("a hub spoke"))
+                .collect::<Vec<usize>>(),
+            vec![1, 2, 3, 4, 5, 6],
+            "the array runs from the end opposite the seed; its trailing slot is spoke 7",
+        );
+        assert_eq!(
+            spoke_number(corners[5].outgoing_edge),
+            Some(7),
+            "spoke 7 is the array's last slot and carries no corner of its own",
+        );
+
+        let sectors = sector_split(&corners, &is_beveled);
+        assert_eq!(
+            sectors.len(),
+            3,
+            "one boundvert per beveled spoke, the gap-spanning sector included",
+        );
+        assert_eq!(
+            (
+                spoke_number(sectors[0].bounding_edges[0]),
+                spoke_number(sectors[1].bounding_edges[0]),
+            ),
+            (Some(2), Some(4)),
+            "both fan ends are unbeveled, so the scan falls through them to spoke 2",
+        );
     }
 
     /// A flat `spokes`-triangle fan around a centre vertex at the origin, rim at unit
@@ -22244,7 +22529,7 @@ mod tests {
         let beveled_edges: Vec<EdgeKey> = beveled.iter().map(|&k| apex_leg[k]).collect();
         let is_beveled = |edge: EdgeKey| beveled_edges.contains(&edge);
         let apex_position = mesh.vertex_position(apex);
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
         let sector_count = sectors.len();
         let mut meets: Vec<Vec3> = Vec::new();
@@ -22491,7 +22776,7 @@ mod tests {
         let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
 
         // Replicate the §8.9.1 classification / §8.9.2 reposition (mode-independent).
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
         let sector_count = sectors.len();
         let mut meets: Vec<Vec3> = Vec::new();
@@ -22582,7 +22867,7 @@ mod tests {
         let (mesh, apex, _rim, [va, vb, vc]) = octagonal_bipyramid();
         let apex_position = mesh.vertex_position(apex);
         let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
         let sector_count = sectors.len();
         let mut meets: Vec<Vec3> = Vec::new();
@@ -23285,7 +23570,7 @@ mod tests {
         let beveled_edges: Vec<EdgeKey> = beveled.iter().map(|&k| apex_leg[k]).collect();
         let is_beveled = |edge: EdgeKey| beveled_edges.contains(&edge);
         let apex_position = mesh.vertex_position(apex);
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
         let sector_count = sectors.len();
         let mut meets: Vec<Vec3> = Vec::new();
@@ -23636,7 +23921,7 @@ mod tests {
         let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
 
         // Replicate the §8.9.1 read-only classification exactly as the operator does.
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
         let sector_count = sectors.len();
         let mut meets: Vec<Vec3> = Vec::new();
@@ -23746,7 +24031,7 @@ mod tests {
         let (mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
         let apex_position = mesh.vertex_position(apex);
         let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
-        let corners = mesh.vertex_corner_ring(apex);
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
         let sectors = sector_split(&corners, &is_beveled);
 
         let mut reflex_meet: Option<Vec3> = None;
@@ -33125,8 +33410,8 @@ mod tests {
         let v_pos = mesh.vertex_position(v);
 
         // The real disk walk and sector split — not a hand-assembled `Sector`.
-        let corners = mesh.vertex_corner_ring(v);
         let is_beveled = |edge: EdgeKey| edge == edge_vr || edge == edge_vb;
+        let corners = mesh.vertex_bevel_corner_ring(v, &is_beveled);
         let sector = sector_split(&corners, &is_beveled)
             .into_iter()
             .find(|s| {
