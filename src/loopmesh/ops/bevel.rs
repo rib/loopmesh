@@ -16539,6 +16539,172 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.2.2.1: a profile cell's degeneracy is an **angle** band — `EPS_ANG =
+    /// 2°` from straight or from folded-back, on the two *normalised* axes — and never a
+    /// floor on the raw cross-product length. An area reading is wrong in both
+    /// directions, and both errors are exercised here.
+    #[test]
+    fn profile_cell_degeneracy_is_a_two_degree_angle_band_not_an_area() {
+        // A cell with `mid` at the origin and axes `a_axis`, `b_axis` enclosing `apex`.
+        let cell_at = |apex_degrees: f32, leg: f32| {
+            let apex = apex_degrees.to_radians();
+            let a_axis = Vec3::new(leg, 0.0, 0.0);
+            let b_axis = Vec3::new(leg * apex.cos(), leg * apex.sin(), 0.0);
+            ProfileCell::from_control_points(-a_axis, -b_axis, Vec3::ZERO)
+        };
+
+        // The §8.9.4.1 flanking cell: `1.31°` from straight on legs of `≈ 0.184`. Its raw
+        // cross is three orders of magnitude above a `1e-6` area floor, so an area-gated
+        // cell never rescues here — the whole of the wide-`spread` miter divergence.
+        let flank = cell_at(180.0 - 1.3079, 0.184);
+        let raw_cross = (flank.mid - flank.start)
+            .cross(flank.mid - flank.end)
+            .length();
+        assert!(
+            (7.0e-4..9.0e-4).contains(&raw_cross),
+            "the near-straight flanking cell carries plenty of raw area: {raw_cross}",
+        );
+        assert!(
+            flank.collinear,
+            "yet it is inside the 2° band, so it rescues"
+        );
+
+        // The contrast arm: `2.84°` from straight is outside the band and keeps its own
+        // `mid`. The band is behavioural, so it must not over-fire either.
+        assert!(
+            !cell_at(180.0 - 2.84, 0.184).collinear,
+            "a 2.84° cell is well clear of the band",
+        );
+        assert!(!cell_at(180.0 - 2.01, 0.184).collinear, "just outside");
+        assert!(cell_at(180.0 - 1.99, 0.184).collinear, "just inside");
+        assert!(cell_at(1.99, 0.184).collinear, "the folded-back half too");
+        assert!(!cell_at(2.01, 0.184).collinear, "and its far side");
+
+        // The other direction: a *small* cell clears an area floor at any angle at all.
+        let small = cell_at(45.0, 1.0e-3);
+        assert!(
+            (small.mid - small.start)
+                .cross(small.mid - small.end)
+                .length()
+                < 1.0e-6,
+            "a 45° cell on 1e-3 legs reads below a 1e-6 area floor",
+        );
+        assert!(!small.collinear, "but 45° is nowhere near the band");
+    }
+
+    /// BEVEL.md §8.9.4.1's worked junction: three beveled edges out of `(0, 0, 1)`, one
+    /// `SHARP` reflex sector whose boundvert `R` stays at its meet point, and two
+    /// `ARC`-mitered sectors whose arc ends are slid `spread = 0.3` out along their edges
+    /// at `offset = 0.015`. The cross-section spanning `R` therefore has one end pinned
+    /// near the junction and one far out along the edge it crosses, which swings the cell
+    /// to `1.31°` from straight — inside §8.2.2.1's `2°` band.
+    ///
+    /// Both of `E`'s disk neighbours are beveled and `s == 3`, so the rescue takes tier 2,
+    /// whose two offset lines are **skew**. The bulge is the closest-approach foot on the
+    /// **first** line — the one anchored at the profile's own `start` — and the rival
+    /// readings sit `0.089` world units away, six times the bevel offset.
+    #[test]
+    fn wide_spread_miter_flank_cell_takes_the_start_anchored_tier2_foot() {
+        let junction = Vec3::new(0.0, 0.0, 1.0);
+        let (edge_left, edge_apex, edge_right) = (
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.4, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        );
+        let sharp_meet = Vec3::new(0.0, -0.0183712, 1.0183712);
+        let arc_start = Vec3::new(-0.1878154, 0.2084076, 0.7974759);
+
+        let mut cell = ProfileCell::new(
+            sharp_meet,
+            arc_start,
+            junction,
+            (edge_left - junction).normalize(),
+        );
+        assert!(
+            (cell.mid - Vec3::new(-0.0936675, 0.0936675, 0.9063325)).length() < 1.0e-5,
+            "the primary `mid` is the on-edge foot of the closest approach",
+        );
+        assert!(cell.collinear, "1.31° from straight is inside the 2° band");
+
+        // Disk order is left, apex, right — so the crossed left edge's predecessor is the
+        // right edge (start side) and its successor is the apex edge (end side).
+        cell.rescue_degenerate_mid(&MidRescue {
+            vertex: junction,
+            neighbour_dirs: Some((
+                (edge_right - junction).normalize(),
+                (edge_apex - junction).normalize(),
+            )),
+        });
+        assert!(!cell.collinear, "tier 2 recovers a frame");
+
+        let on_first = Vec3::new(-0.1676101, -0.1859813, 1.1859814);
+        let on_second = Vec3::new(-0.1878154, -0.2364944, 1.1152630);
+        assert!(
+            (cell.mid - on_first).length() < 1.0e-5,
+            "the bulge is the foot on the line through `start`, got {:?}",
+            cell.mid,
+        );
+        for rival in [on_second, (on_first + on_second) * 0.5] {
+            assert!(
+                (cell.mid - rival).length() > 0.04,
+                "neither the second line's foot nor the skew pair's midpoint",
+            );
+        }
+        assert!(
+            (cell.projection_dir - cell.mid_plane_normal).length() < 1.0e-6,
+            "a rescued profile projects along its own plane normal",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1 `#tier2-start-anchored`: because the boundvert ring is walked in
+    /// one rotational sense, reflecting a junction **swaps** which boundvert is a
+    /// sector's `start`. The mirrored pair of cross-sections therefore builds the *same*
+    /// pair of skew lines and anchors on different members of it, so the emitted frames
+    /// are **not** mirror images — reflecting one gives the other's *second* foot.
+    ///
+    /// The asymmetry is the rule. Symmetrising it (midpoint, or the second line's foot)
+    /// is mirror-symmetric by construction and cannot be right.
+    #[test]
+    fn mirrored_miter_flank_cells_take_different_feet_of_one_skew_pair() {
+        let junction = Vec3::new(0.0, 0.0, 1.0);
+        let (edge_left, edge_apex, edge_right) = (
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.4, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        );
+        let sharp_meet = Vec3::new(0.0, -0.0183712, 1.0183712);
+        let arc_start = Vec3::new(-0.1878154, 0.2084076, 0.7974759);
+        let arc_end = Vec3::new(0.1878154, 0.2084076, 0.7974759);
+        let mirror = |point: Vec3| Vec3::new(-point.x, point.y, point.z);
+
+        let rescued = |start: Vec3, end: Vec3, crossed: Vec3, before: Vec3, after: Vec3| {
+            let mut cell = ProfileCell::new(start, end, junction, (crossed - junction).normalize());
+            assert!(cell.collinear, "both flanking cells sit inside the band");
+            cell.rescue_degenerate_mid(&MidRescue {
+                vertex: junction,
+                neighbour_dirs: Some((
+                    (before - junction).normalize(),
+                    (after - junction).normalize(),
+                )),
+            });
+            cell.mid
+        };
+
+        // `R → A1` crosses the left edge (predecessor right, successor apex); the mirror
+        // sector `B3 → R` crosses the right edge (predecessor apex, successor left).
+        let forward = rescued(sharp_meet, arc_start, edge_left, edge_right, edge_apex);
+        let mirrored = rescued(arc_end, sharp_meet, edge_right, edge_apex, edge_left);
+
+        assert!(
+            (mirrored - Vec3::new(0.1878154, -0.2364944, 1.1152630)).length() < 1.0e-5,
+            "got {mirrored:?}",
+        );
+        assert!(
+            (mirrored - mirror(forward)).length() > 0.04,
+            "a mirror-symmetric fixture does not yield a mirror-symmetric frame",
+        );
+    }
+
     /// BEVEL.md §8.2.2.1's tier-2 gate reads the beveled edge's **rotational** neighbours
     /// — the edges flanking it *around* the vertex — which only the corner ring carries.
     /// The radial structure's own per-vertex edge cycle is linked in insertion order, so
@@ -47267,9 +47433,12 @@ const TANGENT_SINE_EPSILON: f32 = 1.0e-4;
 /// mid-plane is kept instead of snapping.
 const TERMINAL_PLANE_TOLERANCE: f32 = 1.0e-4;
 
-/// Cross-product length below which a profile cell's three control points are treated
-/// as collinear — the §8.2.2.1 degenerate-`mid` condition, and the same floor the
-/// §8.3.0.3 weld plane and each profile's existing projection plane are tested against.
+/// Cross-product length below which the §8.3.0.3 weld plane — and each welded profile's
+/// existing projection plane — is treated as degenerate.
+///
+/// A profile **cell's** own degeneracy is *not* this test: §8.2.2.1 fixes that as an
+/// angle band, [`near_parallel_directions`], because an area floor mis-reads the cell in
+/// both directions.
 const COLLINEAR_MID_TOLERANCE: f32 = 1.0e-6;
 
 /// Shape half of the §8.5.5.5(f.6) replant's degeneracy floor: the smallest **sagitta**
@@ -47373,6 +47542,35 @@ fn is_degenerate_direction_angle(direction_angle: f32) -> bool {
 /// band, which has no meet plane at all) and strictly under `SMALL_ANG`.
 fn is_shallow_direction_angle(direction_angle: f32) -> bool {
     (MEET_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
+}
+
+/// BEVEL.md §8.2.2.1's degeneracy predicate, on **normalised** directions: two
+/// directions are near-parallel iff the angle between them is within `EPS_ANG = 2°` of
+/// `0` or of `π` — the same angular ladder, at the same tolerance, §7.6.2 takes.
+///
+/// This is emphatically **not** a floor on the raw cross-product length. That reading
+/// measures an *area*, so it is scale-dependent and wrong in both directions: far too
+/// tight for a merely near-straight cell with long legs (a `1.31°` cell on legs of
+/// `≈ 0.18` carries a raw cross of `7.7e-4`, three orders above a `1e-6` floor, so an
+/// area-gated cell never rescues where it must), and far too loose for a small one (legs
+/// of `1e-3` clear a `1e-6` floor at any angle at all). `2°` is wide enough to be a
+/// *behavioural* boundary between two visibly different constructions rather than a
+/// round-off guard, so neither end of that error is noise.
+fn near_parallel_directions(first: Vec3, second: Vec3) -> bool {
+    let first_unit = first.normalize_or_zero();
+    let second_unit = second.normalize_or_zero();
+    if first_unit == Vec3::ZERO || second_unit == Vec3::ZERO {
+        return true;
+    }
+    is_degenerate_direction_angle(direction_angle_between(first_unit, second_unit))
+}
+
+/// BEVEL.md §8.2.2.1's `near_collinear` on a profile cell's three control points, with
+/// `apex` — the cell's `mid` — as the corner: the cell's two in-plane axes are
+/// `apex − start` and `apex − end`, so the cell is degenerate exactly when those two are
+/// [near-parallel](near_parallel_directions).
+fn near_collinear_control_points(start: Vec3, apex: Vec3, end: Vec3) -> bool {
+    near_parallel_directions(apex - start, apex - end)
 }
 
 /// §7.6.2's "parallel and anti-parallel special cases" — the near-collinear ladder — as
@@ -47729,15 +47927,6 @@ const LINE_COPLANARITY_TOLERANCE: f32 = 1.0e-6;
 /// the bound is `sin²θ` and independent of the inputs' lengths.
 const LINE_PARALLEL_SIN_SQ_TOLERANCE: f32 = 1.0e-7;
 
-/// The §8.5.5.5 mid rescue's own parallel guard, on the **unsquared** `|sin θ|` of its
-/// two unit neighbour directions — a tighter band than
-/// [`LINE_PARALLEL_SIN_SQ_TOLERANCE`] states, and deliberately a separate constant
-/// rather than a shared one read two ways. The guide describes tier 2's failure mode
-/// only as "parallel or non-intersecting offset lines" and pins no number, so the two
-/// callers' bands are a loopmesh choice and are named separately instead of one
-/// constant's doc having to be true of both readings.
-const MID_RESCUE_PARALLEL_SIN_TOLERANCE: f32 = 1.0e-7;
-
 /// `|sin θ|` bound below which two offset lines of the §8.5.5.5(f.5) square-grid
 /// lattice count as **aligned** (parallel-but-distinct *or* coincident). The guide
 /// pins the interior meet to be *routed on directions alone*: once the `k`-th and
@@ -47875,7 +48064,7 @@ impl ProfileCell {
         let a_axis = mid - start;
         let b_axis = mid - end;
         let cross = a_axis.cross(b_axis);
-        let collinear = cross.length() <= COLLINEAR_MID_TOLERANCE;
+        let collinear = near_parallel_directions(a_axis, b_axis);
         let mid_plane_normal = if collinear {
             Vec3::ZERO
         } else {
@@ -47902,9 +48091,15 @@ impl ProfileCell {
     /// chord, so a planar corner still bevels as a *curve* and not a facet. Tier 2
     /// (only when both of the crossed edge's disk-neighbours are themselves beveled and
     /// the vertex carries `s ≥ 3` beveled edges — then there is no leg plane to stay in)
-    /// takes the bulge from the meet of those two neighbours' offset lines instead.
-    /// Tier 3 — a still-collinear triangle, or a failed tier-2 meet — is the straight
-    /// chord.
+    /// takes the bulge from the meet of those two neighbours' offset lines instead, read
+    /// **start-anchored**: the closest-approach point on the line through this profile's
+    /// own `start`. Tier 3 — a still-collinear triangle, or a failed tier-2 meet — is the
+    /// straight chord.
+    ///
+    /// "Collinear" throughout is §8.2.2.1's `EPS_ANG = 2°` band on the cell's two
+    /// normalised axes, not an area floor: at a wide-`spread` inner miter the flanking
+    /// cells sit a degree or so off straight while still carrying plenty of raw area, and
+    /// they must rescue.
     ///
     /// A successful rescue re-planes the cell: the projection direction switches from the
     /// edge direction to the rescued plane's own normal, so the samples drop orthogonally
@@ -47917,8 +48112,7 @@ impl ProfileCell {
 
         let mut mid = rescue.vertex;
         if let Some((direction_before, direction_after)) = rescue.neighbour_dirs {
-            if direction_before.cross(direction_after).length() <= MID_RESCUE_PARALLEL_SIN_TOLERANCE
-            {
+            if near_parallel_directions(direction_before, direction_after) {
                 self.collapse();
                 return;
             }
@@ -47933,10 +48127,16 @@ impl ProfileCell {
                 },
             );
             match meet {
-                // Not a §7.6.2 sector meet, so §7.6.2's "which of the skew pair" split
-                // does not govern here: the tier-2 bulge wants the point between the two
-                // neighbours' offset lines, which is the midpoint reading.
-                LineMeet::Crossing(point) | LineMeet::Skew { midpoint: point, .. } => mid = point,
+                // The two lines are generally **skew**, and the bulge is the
+                // closest-approach point on the **first** of them — the one anchored at
+                // this profile's own `start`, along the crossed edge's disk-predecessor.
+                // Not the second line's foot, and not the pair's midpoint. Both of those
+                // readings are mirror-symmetric by construction, and the correct answer is
+                // not: reflecting a junction reverses the ring's rotational sense, which
+                // swaps which boundvert is `start`, so a sector and its mirror build the
+                // same pair of skew lines and take *different* feet. The resulting
+                // asymmetry on a symmetric fixture is the rule, not a defect in it.
+                LineMeet::Crossing(point) | LineMeet::Skew { on_first: point, .. } => mid = point,
                 LineMeet::Collinear => {
                     self.collapse();
                     return;
@@ -47944,11 +48144,11 @@ impl ProfileCell {
             }
         }
 
-        let cross = (mid - self.start).cross(mid - self.end);
-        if cross.length() <= COLLINEAR_MID_TOLERANCE {
+        if near_collinear_control_points(self.start, mid, self.end) {
             self.collapse();
             return;
         }
+        let cross = (mid - self.start).cross(mid - self.end);
         self.mid = mid;
         self.mid_plane_normal = cross.normalize();
         self.projection_dir = self.mid_plane_normal;
@@ -48024,7 +48224,7 @@ impl ProfileCell {
     /// points and `mid` their unit-square corner.
     fn from_control_points(start: Vec3, end: Vec3, mid: Vec3) -> Self {
         let cross = (mid - start).cross(mid - end);
-        let collinear = cross.length() <= COLLINEAR_MID_TOLERANCE;
+        let collinear = near_collinear_control_points(start, mid, end);
         ProfileCell {
             start,
             end,
