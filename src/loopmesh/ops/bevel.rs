@@ -2129,7 +2129,10 @@ impl LoopMesh {
                 .collect();
             // §6.6.1: a valence-≥4 terminal's endpoint fill (§7.5) is a ring-spanning fill —
             // it inherits from the rep face of the ring's first boundvert, or from
-            // §6.6.1.4's tie-break winner when the corner carries a seam leg. Either way the
+            // §6.6.1.4's tie-break winner when the corner carries a seam leg. At a terminal
+            // (`s == 1`) §7.6.1.2's scope bullet anchors that first boundvert one step
+            // differently: its sector *closes* at the single beveled spoke, so `B_0`'s own
+            // spoke is the beveled edge itself. Either way the
             // donor is one of the faces the endpoint's own consumption kills. Registered for
             // **both** endpoints of every edge, whatever their valence: a donor capture
             // gated on the shape of the corner is the bug class this bank exists to kill.
@@ -2141,11 +2144,12 @@ impl LoopMesh {
                 .iter()
                 .map(|&edge| {
                     self.edge_vert_keys(edge).map(|endpoint| {
-                        templates.register(self.ring_spanning_donor(
+                        templates.register(self.anchored_ring_spanning_donor(
                             endpoint,
                             &|leg| beveled_set.contains(&leg),
                             options.affect,
                             options.segments,
+                            self.ring_first_boundvert_rep(endpoint, &[edge]),
                             templates.interp_components(),
                         ))
                     })
@@ -3624,13 +3628,15 @@ impl LoopMesh {
         }
 
         // §6.6.1: the odd-`segments` centre n-gon of the [V-ADJ] grid (§8.5) is the fourth
-        // ring-spanning fill family — the tie-break reaches it at a seam-carrying junction
-        // exactly as it reaches the cap, the patch and the terminal fill.
-        let central_representative = templates.register(self.ring_spanning_donor(
+        // ring-spanning fill family — seam-free it takes `B_0`'s rep off this junction's own
+        // ring, and the tie-break reaches it at a seam-carrying junction exactly as it
+        // reaches the cap, the patch and the terminal fill.
+        let central_representative = templates.register(self.anchored_ring_spanning_donor(
             vertex,
             is_beveled,
             affect,
             segments,
+            self.ring_first_boundvert_rep(vertex, &opening_edges),
             templates.interp_components(),
         ));
 
@@ -4022,13 +4028,16 @@ impl LoopMesh {
             // re-stitches off it.
 
             // The fill is ring-spanning, so §6.6.1's rep of the ring's first boundvert
-            // donates — displaced by §6.6.1.4's tie-break when the terminal carries a seam
-            // leg. Registered now, before the re-stitch strips the terminal of its faces.
-            let representative = templates.register(self.ring_spanning_donor(
+            // donates — at a terminal the boundvert whose sector *closes* at `E`, so its own
+            // spoke is `E` and its rep is `prev_face(E)` (§7.6.1.2's scope bullet). Displaced
+            // by §6.6.1.4's tie-break when the terminal carries a seam leg. Registered now,
+            // before the re-stitch strips the terminal of its faces.
+            let representative = templates.register(self.anchored_ring_spanning_donor(
                 vertex,
                 &|leg| beveled.contains(&leg),
                 affect,
                 segments,
+                self.ring_first_boundvert_rep(vertex, &[edge]),
                 templates.interp_components(),
             ));
 
@@ -8294,14 +8303,16 @@ impl LoopMesh {
         }
 
         // §6.6.1: the patch is a ring-spanning fill, so its inherit source is the ring's
-        // first boundvert's rep — or §6.6.1.4's tie-break winner over the beveled legs when
-        // the junction carries a seam leg. Registered while the junction still has its
-        // faces — the re-stitch consumes the vertex.
-        let representative = templates.register(self.ring_spanning_donor(
+        // first boundvert's rep — `prev_face` of the spoke that *closes* `B_0`'s sector,
+        // read off this junction's own §7.6.1.2-anchored ring — or §6.6.1.4's tie-break
+        // winner over the beveled legs when the junction carries a seam leg. Registered
+        // while the junction still has its faces — the re-stitch consumes the vertex.
+        let representative = templates.register(self.anchored_ring_spanning_donor(
             vertex,
             is_beveled,
             affect,
             segments,
+            self.ring_first_boundvert_rep(vertex, &opening_edges),
             templates.interp_components(),
         ));
 
@@ -8355,16 +8366,19 @@ impl LoopMesh {
         let face_right = radial_faces[1];
 
         // §6.6.1: the endpoint fill is a ring-spanning fill — the rep of the ring's first
-        // boundvert, or §6.6.1.4's tie-break winner over every leg when the corner carries
-        // a seam leg (a terminal has one beveled leg, so every leg is a candidate).
+        // boundvert, which at a terminal is the boundvert whose sector *closes* at `edge`
+        // and so reads `prev_face(edge)` (§7.6.1.2's scope bullet) — or §6.6.1.4's tie-break
+        // winner over every leg when the corner carries a seam leg (a terminal has one
+        // beveled leg, so every leg is a candidate).
         // Registered while the terminal still has its faces — the re-stitch consumes the
         // vertex — and whatever the valence: a donor capture gated on the shape of the
         // corner is the bug class the bank exists to kill.
-        let fan_template = templates.register(self.ring_spanning_donor(
+        let fan_template = templates.register(self.anchored_ring_spanning_donor(
             vertex,
             &|leg| beveled.contains(&leg),
             affect,
             segments,
+            self.ring_first_boundvert_rep(vertex, &[edge]),
             templates.interp_components(),
         ));
 
@@ -11185,6 +11199,33 @@ impl LoopMesh {
             .or_else(|| self.departing_face(vertex, edge))
     }
 
+    /// The representative face of the ring's **first** boundvert `B_0` — the donor every
+    /// **(anchor)** ring-spanning row of BEVEL.md §6.6.2 names (the vertex cap, the junction
+    /// patch, the endpoint / terminal fill, the odd-`segments` centre n-gon).
+    ///
+    /// `opening_edges` holds each sector's *opening* beveled spoke `g_k` in ring order — the
+    /// array [`sector_split`] hands back once it is fed the §7.6.1.2 slot array. `B_0`'s
+    /// **own** spoke is its sector's *closing* one (§7.6.1.2 fact 3), so the rep is
+    /// `prev_face(g_1)`, not `prev_face(g_0)`; reading the opening spoke instead takes the
+    /// *previous* sector's face — an off-by-one rotation of the donor around the ring.
+    ///
+    /// The `1 % count` wrap is the **terminal** (`s == 1`) arm of §7.6.1.2's scope bullet
+    /// rather than a bounds guard: a terminal's single sector *closes* at its one beveled
+    /// spoke `E`, so `B_0`'s own spoke is `E` itself and the rep is `prev_face(E)`. That
+    /// makes the terminal donor anchor-free — the seed and the last-slot scan cannot move an
+    /// origin that has only one beveled spoke to land on.
+    fn ring_first_boundvert_rep(
+        &self,
+        vertex: VertexKey,
+        opening_edges: &[EdgeKey],
+    ) -> Option<FaceKey> {
+        let count = opening_edges.len();
+        if count == 0 {
+            return None;
+        }
+        self.boundvert_representative(vertex, opening_edges[1 % count])
+    }
+
     /// The corner's positional donor (BEVEL.md §6.6.1): the representative face of the
     /// ring's first boundvert, which the fan anchor picks — the first incident face the
     /// corner's disk walk reaches (§6.6.1.2's known non-invariance).
@@ -11315,9 +11356,13 @@ impl LoopMesh {
     /// the row family whose donor §6.6.1 pins to the representative face of the ring's
     /// *first* boundvert. Two regimes:
     ///
-    /// - **Seam-free corner** — every leg's fan walk resolves both flanking faces. The
-    ///   donor is §6.6.1's positional pick, which reads the corner's fan anchor and carries
-    ///   §6.6.1.2's documented non-invariance. Nothing here can improve on it.
+    /// - **Seam-free corner** — every leg's fan walk resolves both flanking faces, so the
+    ///   donor is the rep of the ring's *first* boundvert. That is the **ring's** question,
+    ///   not the disk's, so the callers that have a ring resolve it themselves
+    ///   ([`ring_first_boundvert_rep`](Self::ring_first_boundvert_rep)) and enter through
+    ///   [`anchored_ring_spanning_donor`](Self::anchored_ring_spanning_donor); the disk-head
+    ///   fallback kept here answers only for a caller with no ring in hand, and coincides
+    ///   with the ring answer by accident rather than by rule.
     /// - **Seam-carrying corner** — some incident leg is an interpolation seam under
     ///   §6.6.1.4's corner-level test, which fires under *either* independent condition:
     ///   - **Condition (1)**: the leg genuinely lacks a flanking face on one side — an
@@ -11441,6 +11486,41 @@ impl LoopMesh {
     /// - **Seamed junction** — the junction-wide §6.6.1.4 tie-break over the beveled legs' reps,
     ///   which is exactly [`ring_spanning_donor`](Self::ring_spanning_donor)'s seamed branch.
     fn miter_centre_ngon_donor(
+        &self,
+        vertex: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        affect: BevelAffect,
+        segments: u32,
+        ring_first_boundvert_rep: Option<FaceKey>,
+        components: Option<&InterpComponents>,
+    ) -> Option<FaceKey> {
+        self.anchored_ring_spanning_donor(
+            vertex,
+            is_beveled,
+            affect,
+            segments,
+            ring_first_boundvert_rep,
+            components,
+        )
+    }
+
+    /// The stage-1 donor of an **(anchor)** ring-spanning fill (BEVEL.md §6.6.2's three
+    /// marked rows), in the two regimes §6.6.1.2 splits them into:
+    ///
+    /// - **Seam-free corner** — the positional rule: the representative face of the ring's
+    ///   *first* boundvert, which the caller resolves off its own ring
+    ///   ([`ring_first_boundvert_rep`](Self::ring_first_boundvert_rep)). The ring's origin is
+    ///   §7.6.1.2's, so this carries §6.6.1.2's documented non-invariance — reproducible given
+    ///   the same construction history, not an isomorphism invariant. A **material** boundary
+    ///   raises no interpolation seam, so a plain closed manifold fan stays on this branch.
+    /// - **Seam-carrying corner** — §6.6.1.4's tie-break over the positionally-named candidate
+    ///   set, which is [`ring_spanning_donor`](Self::ring_spanning_donor)'s seamed branch. The
+    ///   anchor drops out of the picture entirely there, so the caller's ring rep is ignored.
+    ///
+    /// `None` is a real answer, not a failure: a boundvert that resolves no representative
+    /// feeds a **template-less** mint (§6.6.1.3). On a fan-walkable input a beveled spoke
+    /// always has its arriving face, so it reaches here only from the face-less star.
+    fn anchored_ring_spanning_donor(
         &self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
@@ -11998,17 +12078,25 @@ impl LoopMesh {
         for frame in frames {
             let incident_faces = self.vert_face_keys(frame.vertex);
 
-            // §6.6.1: the cap is a ring-spanning fill, so its stage-1 inherit donor is the
-            // positional representative of the ring's first boundvert — displaced by
-            // §6.6.1.4's tie-break at a seam-carrying corner, which every corner touching
-            // the mesh boundary is. No leg is beveled in vertex mode. Registered now,
-            // against the pristine mesh — the bank is sealed before the incident faces are
-            // killed / rebuilt.
-            let representative_face = self.ring_spanning_donor(
+            // §6.6.1 / §6.6.1.1: the cap is a ring-spanning fill, so its stage-1 inherit
+            // donor is `prev_face` of the fan's **head edge** `e[0]` — which §7.6.1.2's
+            // vertex-bevel reduction pins to the spoke array's slot 0, i.e. to
+            // `disk_order[0]`. Every spoke carries a boundvert in vertex mode, so slot 0
+            // *is* the ring's first boundvert and there is no beveled-spoke scan on top.
+            // Displaced by §6.6.1.4's tie-break at a seam-carrying corner, which every
+            // corner touching the mesh boundary — and every corner carrying a wire — is. No
+            // leg is beveled in vertex mode. Registered now, against the pristine mesh —
+            // the bank is sealed before the incident faces are killed / rebuilt.
+            let head_rep = frame
+                .disk_order
+                .first()
+                .and_then(|&head| self.boundvert_representative(frame.vertex, head));
+            let representative_face = self.anchored_ring_spanning_donor(
                 frame.vertex,
                 &|_| false,
                 BevelAffect::Vertices,
                 segments,
+                head_rep,
                 templates.interp_components(),
             );
             let representative = templates.register(representative_face);
@@ -12585,7 +12673,9 @@ impl LoopMesh {
 
         let mut used = vec![false; steps.len()];
         let mut order: Vec<EdgeKey> = Vec::with_capacity(incident_edges.len());
+        let mut runs = 0usize;
         while let Some(seed) = (0..steps.len()).find(|&index| !used[index]) {
+            runs += 1;
             used[seed] = true;
             let (seed_enters, seed_leaves) = steps[seed];
             let mut chain = vec![seed_enters, seed_leaves];
@@ -12658,6 +12748,141 @@ impl LoopMesh {
             incident_edges.len(),
             "the disk order is a permutation of the incident-edge set",
         );
+        self.anchor_vertex_mode_disk_order(vertex, order, &steps, runs)
+    }
+
+    /// Re-anchor the vertex-mode spoke array onto BEVEL.md [§7.6.1.2]'s **ring origin** — its
+    /// vertex-bevel reduction, whose slot 0 is §6.6.1.1's head edge `e[0]` and therefore the
+    /// vertex cap's donor. Three differences from the edge-bevel form, all from §7.6.1.2's
+    /// scope bullets: step 3 disappears (every spoke carries a boundvert, so there is nothing
+    /// to scan *for*), step 1 loses its beveled clause and falls back to the **disk anchor**,
+    /// and the array's membership is every incident spoke, wires included — which the walk
+    /// above already gives.
+    ///
+    /// That walk is the guide's step-2 array up to rotation and direction, so only those two
+    /// have to be recovered:
+    ///
+    /// - **Direction.** Both are settled by the same aggregate vote (step 2: slot `i` votes
+    ///   on the pair `(i, i + 1)` off its own forward face, and the array reverses iff the
+    ///   sum is strictly negative), and that vote negates under reversal — so a strictly
+    ///   negative tally here means the built walk runs against the sense the guide's array
+    ///   ends in, whichever way step 2 happened to start. A **zero** tally is the one case
+    ///   the two can disagree on with nothing to arbitrate: the guide leaves it unreversed,
+    ///   i.e. pointing the way the walk out of the *seed* went, so that case follows the seed.
+    /// - **Origin.** An unreversed step-2 array leaves the seed in slot 0; a reversed one
+    ///   parks it in the last slot, so slot 0 is then the seed's cyclic successor. Which of
+    ///   the two happened is read off the first step, which leaves the seed for whichever of
+    ///   its **fan** neighbours comes first in the *stored* disk order — vacuous at a fan
+    ///   end, whose other neighbour sits across the faceless gap.
+    ///
+    /// **Out of contract, and deliberately left on the walk's own arbitrary seed:** a disk
+    /// whose faced spokes are not a single face-connected run, and a **branching** disk (a
+    /// spoke carrying three or more faces). §7.6.1.2 orders the first by concatenating
+    /// per-run walks under a seed rule of its own, and the second by a max-placement search;
+    /// the walk above implements neither, so re-anchoring its output would move the origin
+    /// without making it the guide's.
+    fn anchor_vertex_mode_disk_order(
+        &self,
+        vertex: VertexKey,
+        order: Vec<EdgeKey>,
+        steps: &[(EdgeKey, EdgeKey)],
+        runs: usize,
+    ) -> Vec<EdgeKey> {
+        let count = order.len();
+        if runs > 1 || count < 2 {
+            return order;
+        }
+        if order
+            .iter()
+            .any(|&edge| self.edge_radial_iter(edge).take(3).count() > 2)
+        {
+            return order;
+        }
+
+        // Step 1: scan the stored disk order from the anchor. A radial-1 spoke (an open-fan
+        // end) wins and the *last* one takes it; failing that the seed is the anchor itself,
+        // which is where the scan began — the vertex-mode reduction of the beveled clause.
+        let mut seed = None;
+        for edge in self.iter_disk_edges(vertex) {
+            if self.edge_radial_iter(edge).take(2).count() == 1 {
+                seed = Some(edge);
+            }
+        }
+        let Some(seed) = seed.or_else(|| self.iter_disk_edges(vertex).next()) else {
+            return order;
+        };
+        let Some(seed_slot) = order.iter().position(|&edge| edge == seed) else {
+            return order;
+        };
+
+        // A slot's forward face carries the two spokes as consecutive sides of its winding,
+        // so `+1` is "some face leaves along `from` and arrives along `to`" and `-1` is that
+        // same face read the other way round. Only "no such face at all" abstains.
+        let vote = |from: EdgeKey, to: EdgeKey| -> i32 {
+            if steps
+                .iter()
+                .any(|&(leaves, arrives)| leaves == from && arrives == to)
+            {
+                1
+            } else if steps
+                .iter()
+                .any(|&(leaves, arrives)| leaves == to && arrives == from)
+            {
+                -1
+            } else {
+                0
+            }
+        };
+        let tally: i32 = (0..count)
+            .map(|slot| vote(order[slot], order[(slot + 1) % count]))
+            .sum();
+
+        let mut order = order;
+        if tally < 0 {
+            order.reverse();
+        }
+
+        let seed_slot = if tally < 0 {
+            count - 1 - seed_slot
+        } else {
+            seed_slot
+        };
+        let forward = order[(seed_slot + 1) % count];
+        let backward = order[(seed_slot + count - 1) % count];
+        let shares_a_face = |left: EdgeKey, right: EdgeKey| vote(left, right) != 0;
+        let mut follows_the_seed = match (
+            shares_a_face(seed, forward),
+            // A two-spoke disk folds the seed's two neighbours onto one spoke, so there is
+            // no choice of first step to make and the seed stays in slot 0.
+            forward != backward && shares_a_face(seed, backward),
+        ) {
+            (true, true) => {
+                let rank = |edge: EdgeKey| {
+                    self.iter_disk_edges(vertex)
+                        .position(|candidate| candidate == edge)
+                        .unwrap_or(usize::MAX)
+                };
+                rank(forward) < rank(backward)
+            }
+            (false, true) => false,
+            // A fan end's only step, or a wire seed with no fan step at all: vacuous.
+            _ => true,
+        };
+        if tally == 0 && !follows_the_seed {
+            order.reverse();
+            follows_the_seed = true;
+        }
+
+        let seed_slot = order
+            .iter()
+            .position(|&edge| edge == seed)
+            .expect("the seed is a member of the disk order");
+        let origin = if follows_the_seed {
+            seed_slot
+        } else {
+            (seed_slot + 1) % count
+        };
+        order.rotate_left(origin);
         order
     }
 
@@ -14425,6 +14650,244 @@ mod tests {
             ),
             (Some(2), Some(4)),
             "both fan ends are unbeveled, so the scan falls through them to spoke 2",
+        );
+    }
+
+    /// BEVEL.md §7.6.1.2's **vertex-bevel reduction**: the spoke array's slot 0 — which
+    /// §6.6.1.1 calls the fan's head edge `e[0]` — on the same closed 12-fan the section's
+    /// worked example is stated for.
+    ///
+    /// Derived, not observed. Vertex mode drops step 3 and drops step 1's beveled clause, so
+    /// the seed is the **disk anchor**, spoke `2`. Its backward fan neighbour (spoke `1`)
+    /// precedes its forward one (spoke `3`) in the stored order `2, 1, 3, … 12`, so step 2's
+    /// walk runs clockwise, the aggregate ballot reverses it, and the seed lands in the
+    /// array's *last* slot — putting its cyclic successor, spoke `3`, in slot 0. The array
+    /// then reads `3, 4, … 12, 1, 2`, which is the same array the edge-bevel form builds for
+    /// the `1/2/7/8` ring above (both seed on spoke 2); only the origin step differs, and
+    /// vertex mode has none.
+    #[test]
+    fn vertex_mode_disk_order_starts_at_the_ring_origin_not_the_walks_own_seed() {
+        let (mesh, centre, rim) = planar_fan(12);
+        let spoke_edge = |spoke: usize| {
+            mesh.query_edge_exists(centre, rim[spoke - 1])
+                .expect("spoke exists")
+        };
+        let spoke_number = |edge: EdgeKey| (1..=12).find(|&spoke| spoke_edge(spoke) == edge);
+        let incident: Vec<EdgeKey> = mesh.iter_disk_edges(centre).collect();
+
+        assert_eq!(
+            mesh.vertex_mode_disk_order(centre, &incident, &[])
+                .iter()
+                .map(|&edge| spoke_number(edge).expect("a hub spoke"))
+                .collect::<Vec<usize>>(),
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2],
+        );
+    }
+
+    /// BEVEL.md §6.6.2's **vertex-bevel cap** row: the cap inherits `prev_face` of the fan's
+    /// **head edge**, and §7.6.1.2's vertex-bevel reduction is what picks that edge.
+    ///
+    /// The discriminator is that `prev_face(e[0])` is **not** the corner's first incident
+    /// face: both are drawn from the head spoke's two flanking faces, and on this fixture
+    /// they land on opposite ones, so a positional pick off the disk stamps a different
+    /// material slot. Every leg here is a radial-2 interior manifold edge and the mesh
+    /// carries no loop layer, so the corner is seam-free (a material boundary is no
+    /// interpolation seam) and the anchor branch is the one under test.
+    #[test]
+    fn vertex_cap_inherits_the_ring_origins_boundvert_rep_not_the_disk_heads() {
+        // `planar_fan(12)` with spoke `12` attached **before** any face is created, so the
+        // hub's anchor is spoke 12 rather than the spoke a face-create would mint first. The
+        // stored order is then `12, 2, 1, 3, 4, … 11`, in which the anchor's *forward* fan
+        // neighbour (spoke 1, rank 2) precedes its backward one (spoke 11, rank 10): step 2's
+        // walk therefore runs with the fan, the array is unreversed, and the head edge is the
+        // anchor itself. That is the arm where the head's `prev_face` and the disk head's own
+        // first radial face part company.
+        let mut mesh = LoopMesh::new();
+        let centre = mesh.create_vertex(Vec3::ZERO);
+        let rim: Vec<VertexKey> = (0..12)
+            .map(|k| {
+                let angle = std::f32::consts::TAU * (k as f32) / 12.0;
+                mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), 0.0))
+            })
+            .collect();
+        mesh.create_edge([centre, rim[11]], EdgeCreateFlags::NONE);
+        for k in 0..12 {
+            mesh.face_create_verts(&[centre, rim[k], rim[(k + 1) % 12]], FaceCreateFlags::NONE);
+        }
+        for (index, face) in mesh.face_keys().into_iter().enumerate() {
+            mesh.set_face_material_index(face, index as i32 + 1);
+        }
+        let head = mesh
+            .query_edge_exists(centre, rim[11])
+            .expect("spoke 12 exists");
+        let origin_rep = mesh
+            .boundvert_representative(centre, head)
+            .expect("the head edge's arriving face");
+        let disk_head_pick = mesh
+            .first_incident_face(centre)
+            .expect("the disk head's first face");
+        assert!(
+            !mesh.corner_is_seam_carrying(centre),
+            "an interior closed manifold fan raises no interpolation seam",
+        );
+        assert_ne!(
+            origin_rep, disk_head_pick,
+            "fixture sanity: the ring origin's rep and the disk head's face must differ",
+        );
+        let expected = mesh.face_material_index(origin_rep);
+
+        let result = mesh.bevel(
+            &[centre.into()],
+            BevelOptions {
+                offset: 0.2,
+                segments: 1,
+                affect: BevelAffect::Vertices,
+                ..Default::default()
+            },
+        );
+
+        let cap = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&face| mesh.face_vert_keys(face).len() == 12)
+            .expect("the twelve-corner cap n-gon");
+        assert_eq!(
+            mesh.face_material_index(cap),
+            expected,
+            "the cap takes prev_face of the §7.6.1.2 head edge, not of the disk anchor",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's **junction patch** row: the patch inherits the representative face
+    /// of the ring's *first* boundvert, and `B_0`'s own spoke is the one that **closes** its
+    /// sector (§7.6.1.2 fact 3) — `g_1`, not the origin spoke `g_0`.
+    ///
+    /// On the 12-fan's `1/2/7/8` ring the guide's fingerprint table gives `g_0 = 2` and
+    /// `g_1 = 7`, so the donor is the face arriving along spoke 7. Reading `g_0` instead
+    /// would rotate the donor one ring step; reading the disk head would leave the ring out
+    /// of it altogether. All three are distinct faces here.
+    #[test]
+    fn junction_patch_inherits_the_rep_of_the_spoke_that_closes_b_zeros_sector() {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        for (index, face) in mesh.face_keys().into_iter().enumerate() {
+            mesh.set_face_material_index(face, index as i32 + 1);
+        }
+        let spoke_edge = |mesh: &LoopMesh, spoke: usize| {
+            mesh.query_edge_exists(centre, rim[spoke - 1])
+                .expect("spoke exists")
+        };
+        let selected: Vec<EdgeKey> = [1, 2, 7, 8].map(|s| spoke_edge(&mesh, s)).into();
+        let is_beveled = |edge: EdgeKey| selected.contains(&edge);
+
+        let corners = mesh.vertex_bevel_corner_ring(centre, &is_beveled);
+        let sectors = sector_split(&corners, &is_beveled);
+        let opening_edges: Vec<EdgeKey> = sectors
+            .iter()
+            .map(|sector| sector.bounding_edges[0])
+            .collect();
+        assert_eq!(
+            opening_edges[1],
+            spoke_edge(&mesh, 7),
+            "fixture sanity: `g_1` is spoke 7 on this ring",
+        );
+        let expected = mesh.face_material_index(
+            mesh.ring_first_boundvert_rep(centre, &opening_edges)
+                .expect("B_0's own spoke has an arriving face"),
+        );
+        assert_ne!(
+            expected,
+            mesh.face_material_index(
+                mesh.boundvert_representative(centre, opening_edges[0])
+                    .expect("g_0's arriving face"),
+            ),
+            "fixture sanity: reading `g_0` instead of `g_1` must land a different face",
+        );
+        assert_ne!(
+            expected,
+            mesh.face_material_index(mesh.first_incident_face(centre).expect("a disk head face")),
+            "fixture sanity: the disk head's face is a third, distinct face",
+        );
+
+        let beveled: Vec<GeomKey> = selected.iter().map(|&edge| edge.into()).collect();
+        let result = mesh.bevel(
+            &beveled,
+            BevelOptions {
+                offset: 0.1,
+                segments: 1,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        // The patch is the one new face whose corners are *all* boundverts of this junction:
+        // every strip quad reaches down its spoke to the rim, so half its corners sit a unit
+        // away from the hub while the patch's four stay within an offset of it.
+        let patch = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&face| {
+                mesh.face_vert_keys(face)
+                    .iter()
+                    .all(|&vert| mesh.vertex_position(vert).length() < 0.5)
+            })
+            .expect("the four-boundvert junction patch");
+        assert_eq!(
+            mesh.face_material_index(patch),
+            expected,
+            "the patch takes prev_face of `g_1`, the spoke closing `B_0`'s sector",
+        );
+    }
+
+    /// BEVEL.md §6.6.2's **terminal fill** row under §7.6.1.2's `s == 1` scope bullet: a
+    /// terminal's single sector *closes* at the one beveled spoke, so `B_0`'s own spoke is
+    /// that spoke itself and the fill inherits `prev_face(E)`. Anchor-free — a seed cannot
+    /// move an origin with one beveled spoke to land on — but not what a positional pick off
+    /// the disk anchor answers.
+    ///
+    /// Beveling spoke `1` of the interior 12-fan hub makes it a valence-12 terminal, whose
+    /// fill exists (`n − 1 = 11` boundverts) and whose donor is the face arriving along
+    /// spoke 1: the triangle between spokes `12` and `1`.
+    #[test]
+    fn terminal_fill_inherits_prev_face_of_its_one_beveled_spoke() {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        for (index, face) in mesh.face_keys().into_iter().enumerate() {
+            mesh.set_face_material_index(face, index as i32 + 1);
+        }
+        let beveled_spoke = mesh
+            .query_edge_exists(centre, rim[0])
+            .expect("spoke 1 exists");
+        let expected = mesh.face_material_index(
+            mesh.ring_first_boundvert_rep(centre, &[beveled_spoke])
+                .expect("the beveled spoke's arriving face"),
+        );
+        assert_ne!(
+            expected,
+            mesh.face_material_index(mesh.first_incident_face(centre).expect("a disk head face")),
+            "fixture sanity: prev_face(E) is not the disk head's face",
+        );
+
+        let result = mesh.bevel(
+            &[beveled_spoke.into()],
+            BevelOptions {
+                offset: 0.15,
+                segments: 1,
+                affect: BevelAffect::Edges,
+                ..Default::default()
+            },
+        );
+
+        let fill = result
+            .faces
+            .iter()
+            .copied()
+            .find(|&face| mesh.face_vert_keys(face).len() == 11)
+            .expect("the eleven-corner terminal fill");
+        assert_eq!(
+            mesh.face_material_index(fill),
+            expected,
+            "the terminal fill takes prev_face of its one beveled spoke",
         );
     }
 
@@ -17279,9 +17742,15 @@ mod tests {
     /// patch-interior verts are. On the guide's load-bearing cube-corner arm (the
     /// valence-3 corner `v = (1, −1, −1)` at `offset = 0.25`, `segments = 2`, per-vertex
     /// tint `0.11` on `v` and `{0.19, 0.05, 0.23}` on its neighbours toward
-    /// `(1,−1,1)/(1,1,−1)/(−1,−1,−1)`) the apex snaps to the `(1,1,−1)` edge and lands at
-    /// `0.11 + 0.02104·(0.05 − 0.11) = 0.108738`. `NoInterp` layers keep `cd(v)` (the
-    /// §5.2.1 step-1 mint baseline, BMESH.md §10.1.4); untouched verts keep their block.
+    /// `(1,−1,1)/(1,1,−1)/(−1,−1,−1)`) the three candidate blends are `0.112525` /
+    /// `0.108738` / `0.111683` and the winner is fixed by the **ring's start**, which
+    /// §7.6.1.2 reads off the corner's *stored* attachment order. This fixture pre-creates
+    /// its edges, so `v`'s anchor is the `(−1,−1,−1)` spoke and the origin lands there,
+    /// putting the `(1,−1,1)` spoke last: `0.11 + 0.02104·(0.19 − 0.11) = 0.111683`. A cube
+    /// whose edges are *minted by the face creates* anchors on the `(1,1,−1)` spoke instead
+    /// and lands on the guide's own `0.108738` — same rule, different construction.
+    /// `NoInterp` layers keep `cd(v)` (the §5.2.1 step-1 mint baseline, BMESH.md §10.1.4);
+    /// untouched verts keep their block.
     #[test]
     fn vertex_bevel_multiseg_welded_apex_takes_the_edge_linear_snap_blend() {
         let mut mesh = LoopMesh::new();
@@ -17385,19 +17854,19 @@ mod tests {
         assert!(apex_tint.abs() > 1.0e-4, "apex is not the layer default");
 
         // Construction-specific lock (NOT a cross-backend BMesh-parity claim). Per
-        // BEVEL.md §5.2.4.1 the apex snap-edge choice is *not* isomorphism-invariant: it
-        // is a deterministic function of the ring enumeration start/direction, which
-        // differs by mesh construction. On *this* `mesh_add_cube` construction loopmesh's
-        // ring makes the last-visited boundvert the `(1,1,−1)` edge, so the apex snaps to
-        // `cd(far) = 0.05` and lands at 0.108738 — one of the three §5.2.4.1 candidates
-        // pinned above. A cube built by a different face order (e.g. the A/B harness's)
-        // can legitimately select a different candidate (loopmesh yields 0.112525 there,
-        // BMesh 0.108738), so this equality guards loopmesh's own behaviour here only —
-        // the parity-meaningful check is the candidate-set membership assertion above.
+        // BEVEL.md §5.2.4.1 the apex snap-edge choice is *not* isomorphism-invariant: it is
+        // a deterministic function of the ring's start, which §7.6.1.2 reads off the
+        // corner's stored attachment order — a construction artefact. `mesh_add_cube`
+        // pre-creates every edge, so `v`'s anchor is the `(−1,−1,−1)` spoke; the fan is
+        // closed and wound with the walk, so the array is unreversed and the anchor is
+        // slot 0, which makes the `(1,−1,1)` spoke the ring's last boundvert and
+        // `cd(far) = 0.19` the apex's donor. On a cube whose edges are minted by the face
+        // creates (closing-edge-first, so the anchor is the `(1,1,−1)` spoke) the same rule
+        // reverses the array and lands the guide's own `0.108738`.
         assert!(
-            (apex_tint - 0.108738).abs() < 1.0e-4,
-            "apex tint {apex_tint} matches loopmesh's snap-to-{{v,3}} value 0.108738 \
-             on this mesh_add_cube construction",
+            (apex_tint - 0.111683).abs() < 1.0e-4,
+            "apex tint {apex_tint} matches the §7.6.1.2 ring origin's snap-to-{{v,4}} value \
+             0.111683 on this pre-created-edge cube construction",
         );
 
         // §10.1.4: the NoInterp layer is never blended — the apex keeps `cd(v)`'s seed.
