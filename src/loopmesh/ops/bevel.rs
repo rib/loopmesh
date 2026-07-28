@@ -1913,7 +1913,9 @@ impl LoopMesh {
                     &cell,
                     segments,
                     options.profile,
-                    custom,
+                    // §8.6.3.1(6) Regime B: a cap sector has no beveled edge to walk, so the
+                    // whole cap shares one handedness bit.
+                    custom.map(CustomChainRead::vertex_cap),
                     ChainEmission::Resampled,
                     &mut result,
                 );
@@ -1986,7 +1988,7 @@ impl LoopMesh {
                 .map(|&cell| RingChainProfile::Cell {
                     cell,
                     profile: options.profile,
-                    custom,
+                    custom: custom.map(CustomChainRead::vertex_cap),
                 })
                 .collect();
             // Centre n-gon: the ring-spanning §6.6.1.4 donor. Sector fills: the per-sector
@@ -3181,6 +3183,18 @@ impl LoopMesh {
             BevelVmeshMethod::Cutoff => ChainEmission::Raw,
         };
 
+        // §8.6.3.1(6) Regime A: decompose the beveled set into runs and mark every edge-end
+        // with its handedness, *before* the first chain is minted — a run's bit is anchored at
+        // its seed edge-end, which is generally at some other endpoint than the one being
+        // built and whose ring therefore does not exist yet. The pass reads the pristine
+        // corners only, so it can place the seed sector's two ring corners itself. Skipped
+        // outright without a curve: every analytic cross-section is diagonal-symmetric, so the
+        // bit is unobservable and the walk would be pure cost.
+        let orientation = match custom {
+            Some(_) => self.plan_custom_orientation(&beveled_manifold, &is_beveled, offset),
+            None => CustomOrientation::default(),
+        };
+
         for &endpoint in &endpoints {
             if junctions.contains(&endpoint) {
                 // §8.9.3: the inner miter splits every non-reflex sector into an arc.
@@ -3239,6 +3253,7 @@ impl LoopMesh {
                         segments,
                         profile,
                         custom,
+                        &orientation,
                         junction_emission,
                         &mut templates,
                         &mut chains,
@@ -3257,6 +3272,7 @@ impl LoopMesh {
                     segments,
                     profile,
                     custom,
+                    &orientation,
                     &mut templates,
                     &mut chains,
                     &mut face_subst,
@@ -3534,6 +3550,7 @@ impl LoopMesh {
         segments: u32,
         profile: f32,
         custom: Option<&CustomChains>,
+        orientation: &CustomOrientation,
         emission: ChainEmission,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
@@ -3716,14 +3733,18 @@ impl LoopMesh {
                 // own boundary, so a custom curve supplies it — read back off the `doubled`
                 // chain under `Resampled` (the [V-ADJ] cap rim) and raw off `target` under
                 // `Raw` (the §8.3 cutoff fill). Both arms live in `chain_positions`; what
-                // this call site owes is the curve itself.
+                // this call site owes is the curve itself and — §8.6.3.1(6) Regime A — the
+                // handedness the orientation walk marked *this* edge-end with. Sibling
+                // sectors of one junction routinely disagree here: three mutually orthogonal
+                // spokes are three separate runs with three independent seed bits.
+                let reverse = orientation.reverse(crossing, vertex);
                 let (interior, cell) = self.build_chain_between(
                     boundverts[k],
                     boundverts[next],
                     crossing,
                     segments,
                     profile,
-                    custom,
+                    custom.map(|chains| CustomChainRead::edge_sector(chains, reverse)),
                     rescue,
                     None,
                     chain_emission,
@@ -3737,6 +3758,7 @@ impl LoopMesh {
                     end: boundverts[next],
                     side_label: SideLabel::Unlabelled,
                     cell: Some(cell),
+                    custom_reverse: reverse,
                 });
             }
         }
@@ -3900,6 +3922,8 @@ impl LoopMesh {
 
         let mut reversed = interior.clone();
         reversed.reverse();
+        // Gap, not an answer: the §8.3.0.3 weld runs under a custom curve too but samples the
+        // analytic cross-section and never reads §8.6.3.1(6)'s mark for these two edge-ends.
         chains.push(EdgeEndChain {
             edge: first_edge,
             endpoint: vertex,
@@ -3908,6 +3932,7 @@ impl LoopMesh {
             end: second_boundvert,
             side_label: SideLabel::Unlabelled,
             cell: Some(first),
+            custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
         });
         chains.push(EdgeEndChain {
             edge: second_edge,
@@ -3917,6 +3942,7 @@ impl LoopMesh {
             end: first_boundvert,
             side_label: SideLabel::Unlabelled,
             cell: Some(second),
+            custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
         });
     }
 
@@ -4038,6 +4064,7 @@ impl LoopMesh {
                     legs[next][n - k - 1]
                 });
             }
+            // Gap, not an answer: the square-in weld does not read §8.6.3.1(6)'s mark either.
             chains.push(EdgeEndChain {
                 edge: opening_edges[next],
                 endpoint: vertex,
@@ -4046,6 +4073,7 @@ impl LoopMesh {
                 end: boundverts[next],
                 side_label: SideLabel::Unlabelled,
                 cell: Some(cells[i]),
+                custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
             });
         }
     }
@@ -4171,6 +4199,7 @@ impl LoopMesh {
         segments: u32,
         profile: f32,
         custom: Option<&CustomChains>,
+        orientation: &CustomOrientation,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
@@ -4244,13 +4273,17 @@ impl LoopMesh {
         // A terminal endpoint carries exactly one beveled edge, so §8.2.2.1's tier-2 gate
         // (`s ≥ 3`) can never open here — no corner ring needed to find that out.
         let rescue = MidRescue::tier1_only(terminal_position);
+        // §8.6.3.1(6): a terminal is a run *end*, never a branch point, but its cross-section
+        // still carries the run's physical flank — and at a single-edge run it is the end that
+        // takes the parity flip.
+        let reverse = orientation.reverse(edge, vertex);
         let (interior, cell) = self.build_chain_between(
             strip_left,
             strip_right,
             edge,
             segments,
             profile,
-            custom,
+            custom.map(|chains| CustomChainRead::edge_sector(chains, reverse)),
             rescue,
             Some(terminal_position),
             ChainEmission::Raw,
@@ -4433,6 +4466,7 @@ impl LoopMesh {
                 SideLabel::NextFirst
             },
             cell: Some(cell),
+            custom_reverse: reverse,
         });
     }
 
@@ -4560,7 +4594,7 @@ impl LoopMesh {
         edge: EdgeKey,
         segments: u32,
         profile: f32,
-        custom: Option<&CustomChains>,
+        custom: Option<CustomChainRead<'_>>,
         rescue: MidRescue,
         terminal_vertex: Option<Vec3>,
         emission: ChainEmission,
@@ -4607,7 +4641,7 @@ impl LoopMesh {
         cell: &ProfileCell,
         segments: u32,
         profile: f32,
-        custom: Option<&CustomChains>,
+        custom: Option<CustomChainRead<'_>>,
         emission: ChainEmission,
         result: &mut BevelResult,
     ) -> Vec<VertexKey> {
@@ -4658,6 +4692,355 @@ impl LoopMesh {
             vertex: vertex_position,
             neighbour_dirs,
         }
+    }
+
+    /// The §8.6.3.1(6) Regime-A orientation pass: mark every beveled **edge-end** with its
+    /// `is_start_side` bit, so that each cross-section of a run of beveled edges ties its
+    /// asymmetric profile's shape-start to the *same physical flank* of the running strip.
+    ///
+    /// The pass is three rules stacked:
+    ///
+    /// - **A.1** — beveled edge-ends are linked by two kinds of step (same-edge hop,
+    ///   cross-vertex continuation). The cross-vertex link is **directed** and may exist one
+    ///   way only, so a "run" is what one seeding *visits*, not a graph component: the sweep
+    ///   walks the beveled edges in mesh order, seeds each unvisited one, and marks outward.
+    /// - **A.2 / A.2.1** — the seed bit is a single world-`z` tie-break taken at the seed
+    ///   edge-end's own two ring corners: `is_start_side = (start.z < end.z)`, strict, no
+    ///   epsilon, exact equality folded into `false`. The seed *end* is the edge's **stored
+    ///   first endpoint** — a structural datum, not a geometric one — and it is decisive
+    ///   exactly where the compare ties, which is every edge running parallel to world `z`.
+    /// - **A.3** — every other edge-end in the run presents the *same physical flank*, which
+    ///   step to step means flipping the `start`-relative bit. See
+    ///   [`LoopMesh::propagated_handedness_bit`] for why that is not a plain parity here.
+    ///
+    /// A.4 falls out rather than being coded: a junction whose spokes all fail A.1's contest
+    /// leaves each spoke unvisited, so each is later seeded as its own run with its own
+    /// determination. That is the mutually-orthogonal corner, where three spokes give three
+    /// independent bits and no single constant can serve them.
+    ///
+    /// Only a custom profile reads the result — every analytic cross-section is
+    /// diagonal-symmetric, so the bit is a no-op there — which is why the caller runs the pass
+    /// only when a curve is in play.
+    fn plan_custom_orientation(
+        &self,
+        beveled: &[EdgeKey],
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> CustomOrientation {
+        // Mesh order, so a run whose continuation relation is one-way is decomposed the same
+        // way on every run of the operator regardless of the caller's selection order.
+        let mut sweep: Vec<EdgeKey> = beveled.to_vec();
+        sweep.sort_unstable_by_key(|edge| edge.as_usize());
+
+        let mut orientation = CustomOrientation::default();
+        for &edge in &sweep {
+            // A.2.1(i): the seed end is the edge's stored first endpoint. Read unnormalised —
+            // normalising the pair (by index, by height, by valence) destroys the datum and
+            // mirrors every run whose seed compare ties.
+            let seed_endpoint = self.edge_vert_keys(edge)[0];
+            if orientation
+                .is_start_side
+                .contains_key(&(edge, seed_endpoint))
+            {
+                continue;
+            }
+            let seed_bit = self.seed_handedness_bit(edge, seed_endpoint, is_beveled, offset);
+            orientation
+                .is_start_side
+                .insert((edge, seed_endpoint), seed_bit);
+
+            for first_step in [OrientationStep::CrossVertex, OrientationStep::SameEdge] {
+                let mut kind = first_step;
+                let mut node = (edge, seed_endpoint);
+                let mut bit = seed_bit;
+                while let Some(next) = self.orientation_step(node.0, node.1, kind, is_beveled) {
+                    if orientation.is_start_side.contains_key(&next) {
+                        break;
+                    }
+                    bit =
+                        self.propagated_handedness_bit(node, next, kind, bit, is_beveled, offset);
+                    orientation.is_start_side.insert(next, bit);
+                    node = next;
+                    kind = kind.other();
+                }
+            }
+        }
+
+        // The unmarked default is `is_start_side = false` for *every* edge-end, i.e. bit-for-bit
+        // the uniform constant this pass replaces — so an edge-end the sweep failed to visit
+        // would reinstate the mirror bug on exactly that edge, invisibly. Pin the coverage here
+        // rather than leave it as a two-loop argument. (A self-loop contributes one edge-end, not
+        // two: its same-edge hop has nowhere to go.)
+        debug_assert!(
+            sweep.iter().all(|&edge| {
+                self.edge_vert_keys(edge)
+                    .into_iter()
+                    .all(|endpoint| orientation.is_start_side.contains_key(&(edge, endpoint)))
+            }),
+            "every beveled edge-end must carry an orientation mark",
+        );
+        orientation
+    }
+
+    /// One step of §8.6.3.1(6) A.1's walk out of the edge-end `edge` at `endpoint`.
+    fn orientation_step(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        kind: OrientationStep,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+    ) -> Option<(EdgeKey, VertexKey)> {
+        match kind {
+            OrientationStep::SameEdge => {
+                let [a, b] = self.edge_vert_keys(edge);
+                let far = if a == endpoint { b } else { a };
+                (far != endpoint).then_some((edge, far))
+            }
+            OrientationStep::CrossVertex => self
+                .orientation_continuation(edge, endpoint, is_beveled)
+                .map(|next| (next, endpoint)),
+        }
+    }
+
+    /// §8.6.3.1(6) A.1's cross-vertex contest: arriving at `endpoint` along `edge`, which
+    /// other beveled edge there is the run's continuation?
+    ///
+    /// Two short-circuits precede the contest, both keyed on the vertex's **beveled** valence
+    /// (its unbeveled edges never take part): valence 1 is a run terminal, and valence 2 takes
+    /// its unique partner unconditionally — however sharply it folds back. That second case is
+    /// the weld, and it carries no handedness decision of its own.
+    ///
+    /// From valence 3 up, the contest ranks the other beveled edges by how nearly each
+    /// continues the incoming line straight through. Three properties of it are each easy to
+    /// get wrong and each change the run decomposition:
+    ///
+    /// - only **strictly positive** dots are candidates, so a spoke folded back past a right
+    ///   angle is not merely a poor continuation but no continuation at all — and if every
+    ///   other spoke folds back, the run stops even at high valence;
+    /// - the runner-up is **floored at zero**, so a lone candidate still faces the margin and
+    ///   is rejected if it turns by more than about `89.13°`;
+    /// - the margin is a closeness test on the **dot** values, not on the angles between them.
+    ///
+    /// The relation this builds is **directed**: `X` continuing to `Y` does not imply the
+    /// reverse, because the field of contestants differs from each side.
+    fn orientation_continuation(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+    ) -> Option<EdgeKey> {
+        let mut contestants: SmallVec<[EdgeKey; 8]> = SmallVec::new();
+        for candidate in self.iter_disk_edges(endpoint) {
+            if candidate != edge && is_beveled(candidate) {
+                contestants.push(candidate);
+            }
+        }
+        match contestants.len() {
+            0 => return None,
+            1 => return Some(contestants[0]),
+            _ => {}
+        }
+
+        let endpoint_position = self.vertex_position(endpoint);
+        let direction_in =
+            (endpoint_position - self.edge_far_position(edge, endpoint)).normalize_or_zero();
+        let mut winner: Option<(EdgeKey, f32)> = None;
+        let mut runner_up = 0.0_f32;
+        for candidate in contestants {
+            let direction_out = (self.edge_far_position(candidate, endpoint) - endpoint_position)
+                .normalize_or_zero();
+            let dot = direction_out.dot(direction_in);
+            if dot <= 0.0 {
+                continue;
+            }
+            match winner {
+                Some((_, best)) if best >= dot => runner_up = runner_up.max(dot),
+                Some((_, best)) => {
+                    runner_up = runner_up.max(best);
+                    winner = Some((candidate, dot));
+                }
+                None => winner = Some((candidate, dot)),
+            }
+        }
+        let (best_edge, best_dot) = winner?;
+        (best_dot - runner_up > orientation_continuation_margin()).then_some(best_edge)
+    }
+
+    /// §8.6.3.1(6) A.2 / A.2.1(ii)-(iii): the seed edge-end's own tie-break. Of the seed
+    /// sector's two ring corners — as placed, before any vmesh construction — the one strictly
+    /// lower in world `z` is the shape-start side. Single-precision, strict `<`, no epsilon, no
+    /// secondary axis, no index fallback: a strictly higher `start` and an exact tie both
+    /// answer `false`. The tie is not academic — a beveled edge parallel to world `z` has a
+    /// constant-`z` cross-section and therefore ties at *both* its ends.
+    fn seed_handedness_bit(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> bool {
+        match self.sector_ends(edge, endpoint, is_beveled, offset) {
+            Some(ends) => ends.start.z < ends.end.z,
+            None => false,
+        }
+    }
+
+    /// §8.6.3.1(6) A.3: carry the run's handedness one walk step, from the edge-end `from` to
+    /// the edge-end `to`.
+    ///
+    /// What A.3 conserves is a **physical flank** — every cross-section of the run ties its
+    /// shape-start to the same side of the running strip — and the bit flips step to step only
+    /// because each step swaps which of the sector's two ring corners is labelled `start`. The
+    /// two step kinds realise that differently, and conflating them is the trap:
+    ///
+    /// - a **cross-vertex** step reads both sectors off the *same* junction ring, where the
+    ///   two are consecutive (or, at a straight-through crossing of higher beveled valence,
+    ///   symmetrically placed about the through-line) and so present their corners in opposite
+    ///   roles. Mirror the ring and both sectors mirror together, so the swap holds whichever
+    ///   sense the ring runs in: the bit simply flips;
+    /// - a **same-edge** hop crosses to a ring built at the *other* endpoint, whose sense is
+    ///   not fixed relative to this one. So the flank is carried by name — a beveled edge's two
+    ///   ring corners sit against its two radial faces, one each — and re-read against the far
+    ///   end's own labelling. A blind flip here is right only when the two ends happen to label
+    ///   the same physical flank oppositely, which is exactly what a terminal ring need not do.
+    fn propagated_handedness_bit(
+        &self,
+        from: (EdgeKey, VertexKey),
+        to: (EdgeKey, VertexKey),
+        kind: OrientationStep,
+        bit: bool,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> bool {
+        if kind == OrientationStep::CrossVertex {
+            return !bit;
+        }
+        let here = self.sector_ends(from.0, from.1, is_beveled, offset);
+        let there = self.sector_ends(to.0, to.1, is_beveled, offset);
+        // Both ends of a *buildable* beveled edge always name their flanks, so the fallback
+        // below is dead. It has to be spelled out because the value it would take — the plain
+        // alternation — is exactly the blind parity this function exists to reject, and reading
+        // as a supported degenerate path would make silently reintroducing it a one-line change.
+        //
+        // At a terminal end, `terminal_sector_ends` declines only on a non-manifold radial pair
+        // or an unavailable leg layout, and the edge would not be in the walked set at all
+        // without both (the terminal admission is the layout plus the two-radial-face check, and
+        // the set is shrunk to its fixed point before the pass runs). At a junction end,
+        // `junction_sector_ends` declines only on an empty sector split or a beveled edge that
+        // opens no sector; every beveled edge is manifold, so it is never a fan-end spoke and
+        // therefore appears as some ring corner's outgoing edge, which is what opens a sector.
+        debug_assert!(
+            here.is_some() && there.is_some(),
+            "a walked edge-end always names its two flank faces",
+        );
+        match (here, there) {
+            (Some(here), Some(there)) => {
+                let flank = if bit { here.start_face } else { here.end_face };
+                flank == there.start_face
+            }
+            _ => !bit,
+        }
+    }
+
+    /// The sector that spans `edge` at `endpoint`, as the orientation pass needs to see it:
+    /// the chain's two ring corners `start` (the owner `B_k`) and `end` (`B_(k+1)`, §8.2.2.1)
+    /// together with the **radial face of `edge` each of them sits against**. Placed exactly as
+    /// the chain builders place them but without minting anything, so the pass can ask about an
+    /// edge-end whose own endpoint has not been built yet.
+    fn sector_ends(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> Option<SectorEnds> {
+        let beveled_valence = self
+            .iter_disk_edges(endpoint)
+            .filter(|&e| is_beveled(e))
+            .count();
+        if beveled_valence >= 2 {
+            self.junction_sector_ends(edge, endpoint, is_beveled, offset)
+        } else {
+            self.terminal_sector_ends(edge, endpoint, offset)
+        }
+    }
+
+    /// [`LoopMesh::sector_ends`] at a junction: the sector whose chain crosses `edge` is the
+    /// one *preceding* the sector `edge` opens, so its owner is the ring's previous boundvert.
+    /// Reading the opened sector's own boundvert as the owner rotates every mark one step
+    /// around the ring. The two flank faces fall out of the same split: the owning sector
+    /// *closes* on `edge`, so its last corner carries the face just before `edge` in the disk
+    /// walk, and the opened sector's first corner carries the face just after it.
+    fn junction_sector_ends(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        is_beveled: &dyn Fn(EdgeKey) -> bool,
+        offset: f32,
+    ) -> Option<SectorEnds> {
+        let corners = self.vertex_bevel_corner_ring(endpoint, is_beveled);
+        let sectors = sector_split(&corners, is_beveled);
+        let count = sectors.len();
+        if count == 0 {
+            return None;
+        }
+        let opened = sectors
+            .iter()
+            .position(|sector| sector.bounding_edges[0] == edge)?;
+        let owner = (opened + count - 1) % count;
+        let endpoint_position = self.vertex_position(endpoint);
+        Some(SectorEnds {
+            start: self.solve_meet_point(endpoint, endpoint_position, &sectors[owner], offset),
+            end: self.solve_meet_point(endpoint, endpoint_position, &sectors[opened], offset),
+            start_face: sectors[owner].corners.last()?.1,
+            end_face: sectors[opened].corners.first()?.1,
+        })
+    }
+
+    /// [`LoopMesh::sector_ends`] at a terminal, where the "ring" is the beveled edge's two
+    /// strip verts (§7.5.1) and the chain runs from the first radial face's vert to the
+    /// second's — the same `start`/`end` roles `build_terminal_chains` hands the cell.
+    fn terminal_sector_ends(
+        &self,
+        edge: EdgeKey,
+        endpoint: VertexKey,
+        offset: f32,
+    ) -> Option<SectorEnds> {
+        let radial_faces: Vec<FaceKey> = self
+            .edge_loop_keys(edge)
+            .iter()
+            .map(|&l| self.loop_face(l))
+            .collect();
+        if radial_faces.len() != 2 {
+            return None;
+        }
+        let [face_left, face_right] = [radial_faces[0], radial_faces[1]];
+        let legs = self.terminal_leg_layout(endpoint, edge)?;
+        let (left_leg, right_leg) = if legs.start_face == face_left {
+            (legs.start_leg, legs.end_leg)
+        } else {
+            (legs.end_leg, legs.start_leg)
+        };
+        Some(SectorEnds {
+            start: self.terminal_strip_vert(
+                endpoint,
+                edge,
+                left_leg,
+                face_left,
+                left_leg == legs.start_leg,
+                offset,
+            ),
+            end: self.terminal_strip_vert(
+                endpoint,
+                edge,
+                right_leg,
+                face_right,
+                right_leg == legs.start_leg,
+                offset,
+            ),
+            start_face: face_left,
+            end_face: face_right,
+        })
     }
 
     /// The **raw coarse** `(i, 0, 1)` profile mid of a flank / strip ring edge at the
@@ -6130,6 +6513,8 @@ impl LoopMesh {
                     chain.extend_from_slice(&interior);
                     chain.push(end);
                     ring_chains.push(chain);
+                    // Gap, not an answer: the miter ring builder samples analytically and does
+                    // not read §8.6.3.1(6)'s mark for this edge-end.
                     chains.push(EdgeEndChain {
                         edge,
                         endpoint: vertex,
@@ -6138,6 +6523,7 @@ impl LoopMesh {
                         end,
                         side_label: SideLabel::Unlabelled,
                         cell: Some(cell),
+                        custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
                     });
                 }
             }
@@ -6640,6 +7026,8 @@ impl LoopMesh {
                     chain.extend_from_slice(&interior);
                     chain.push(end);
                     ring_chains.push(chain);
+                    // Gap, not an answer: this miter ring builder does not read §8.6.3.1(6)'s
+                    // mark for this edge-end either.
                     chains.push(EdgeEndChain {
                         edge,
                         endpoint: vertex,
@@ -6648,6 +7036,7 @@ impl LoopMesh {
                         end,
                         side_label: SideLabel::Unlabelled,
                         cell: Some(cell),
+                        custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
                     });
                 }
             }
@@ -7813,12 +8202,19 @@ impl LoopMesh {
         // round's doubled resolution and reads its raw coarse mid off it.
         let mut profiles: Vec<RingChainProfile> = Vec::with_capacity(sectors);
         for i in 0..sectors {
-            match self.sector_cell(cut, chains, i) {
-                Some(cell) => profiles.push(RingChainProfile::Cell {
-                    cell,
-                    profile,
-                    custom,
-                }),
+            match self.sector_chain(cut, chains, i) {
+                // §8.6.3.1(6): each sector re-reads the curve through the handedness bit its
+                // own chain was emitted with — siblings of one ring routinely differ.
+                Some(chain) => match chain.cell {
+                    Some(cell) => profiles.push(RingChainProfile::Cell {
+                        cell,
+                        profile,
+                        custom: custom.map(|chains| {
+                            CustomChainRead::edge_sector(chains, chain.custom_reverse)
+                        }),
+                    }),
+                    None => return false,
+                },
                 None => return false,
             }
         }
@@ -14141,9 +14537,26 @@ struct EdgeEndChain {
     /// not recoverable from the boundverts alone, and a downstream re-derivation would
     /// silently restore the default mid-plane — the "recompute erases the override" bug.
     cell: Option<ProfileCell>,
+    /// The §8.6.3.1(6) handedness bit this chain's samples were read through, kept for the
+    /// same reason `cell` is: the cap fill re-samples the sector's generator at its own
+    /// resolutions and must read it the way the rim was read. Meaningless without a custom
+    /// curve (every analytic cross-section is diagonal-symmetric).
+    custom_reverse: bool,
 }
 
 impl EdgeEndChain {
+    /// What `custom_reverse` records where §8.6.3.1(6)'s orientation bit was never threaded to
+    /// the builder: the orientation pass's unmarked default,
+    /// [`CustomOrientation::reverse`]'s answer for an edge-end absent from the map.
+    ///
+    /// Inert on an **analytically**-sampled chain, where the diagonal-symmetric superellipse
+    /// family makes the bit unobservable. It is *not* inert at the builders that can also run
+    /// under a custom curve but do not read the mark yet — the §8.3.0.3 welds and the two miter
+    /// ring builders — so those sites are pre-existing custom-profile gaps, not settled answers.
+    /// The name says "unmarked", not "analytic", precisely so those four uses cannot read as a
+    /// licence to leave them.
+    const UNMARKED_DEFAULT_REVERSE: bool = true;
+
     /// The chain's `segments + 1` verts in order `start → interior → end`.
     fn samples(&self) -> Vec<VertexKey> {
         let mut samples = Vec::with_capacity(self.interior.len() + 2);
@@ -23947,6 +24360,7 @@ mod tests {
             end: verts[4],
             side_label: SideLabel::Unlabelled,
             cell: None,
+            custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
         };
         for first in [verts[0], verts[4]] {
             let oriented = chain.oriented_from(first);
@@ -30947,10 +31361,12 @@ mod tests {
     /// (0, 0, −0.25)`, i.e. the `z` direction, and `b_axis = mid − end = (0, −0.25, 0)`, about
     /// the origin `start + end − mid = (0.75, −0.75, −0.75)`.
     ///
-    /// The read takes §8.6.3.1(6)'s `reverse = true` branch ([`custom_chain_reverse_bit`]),
-    /// which reads the chain from the far end with the axis swap **dropped** — so there is no
-    /// swap here, and at `segments = 2` reversing a three-sample chain leaves the lone interior
-    /// sample where it was. The widget control point `(x, y) = (0.5, 0.25)` therefore enters the
+    /// The read takes §8.6.3.1(6)'s `reverse = true` branch: the orientation pass
+    /// ([`CustomOrientation`]) marks this sector's edge-end `is_start_side = false`, its seed
+    /// compare `start.z < end.z` being `−0.75 < −1`, which is false. That branch reads the chain
+    /// from the far end with the axis swap **dropped** — so there is no swap here, and at
+    /// `segments = 2` reversing a three-sample chain leaves the lone interior sample where it
+    /// was. The widget control point `(x, y) = (0.5, 0.25)` therefore enters the
     /// cell as `(u, v) = (0.5, 0.25)` unchanged, at
     /// `origin + 0.5·a_axis + 0.25·b_axis = (0.75, −0.8125, −0.875)` — where the circle would
     /// put `(√2/2, √2/2)`, `(0.75, −0.92678, −0.92678)`. The two are 0.08 world apart, so this
@@ -40907,7 +41323,7 @@ mod tests {
             RingChainProfile::Cell {
                 cell,
                 profile: 0.5,
-                custom: Some(chains),
+                custom: Some(CustomChainRead::vertex_cap(chains)),
             }
             .raw_positions(2)[1]
         };
@@ -40947,8 +41363,9 @@ mod tests {
         let chains = CustomChains::new(&split, 2);
         let cell = widget_frame_cell();
 
-        let raw = cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Raw);
-        let emitted = cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Resampled);
+        let read = CustomChainRead::vertex_cap(&chains);
+        let raw = cell.chain_positions(2, 0.5, Some(read), ChainEmission::Raw);
+        let emitted = cell.chain_positions(2, 0.5, Some(read), ChainEmission::Resampled);
         assert_eq!(raw.len(), 3);
         assert_eq!(emitted.len(), 3);
         for (index, (r, e)) in raw.iter().zip(emitted.iter()).enumerate() {
@@ -41017,7 +41434,9 @@ mod tests {
 
         let cell = widget_frame_cell();
         let emit =
-            |chains: &CustomChains, emission| cell.chain_positions(5, 0.5, Some(chains), emission);
+            |chains: &CustomChains, emission| {
+                cell.chain_positions(5, 0.5, Some(CustomChainRead::vertex_cap(chains)), emission)
+            };
         let raw_of = |chains: &CustomChains| emit(chains, ChainEmission::Raw);
         let rim_of = |chains: &CustomChains| emit(chains, ChainEmission::Resampled);
 
@@ -41237,6 +41656,521 @@ mod tests {
             "F1 on the sub-budget branch: got {}",
             chains.fullness,
         );
+    }
+
+    /// The asymmetric all-vector control net BEVEL.md §8.6.3.1(6)'s Regime-A worked examples
+    /// measure with: `(1, 0) → (0.5, 0.25) → (0, 1)`. Its interior sample sits at cell
+    /// `(0.25, 0.5)` fed forward and at the diagonal reflection `(0.5, 0.25)` fed mirrored, so
+    /// every handedness slip shows as a visibly displaced rim vertex.
+    fn asymmetric_custom_net() -> BevelCurveProfile {
+        BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ])
+    }
+
+    /// The `±1` box built face-by-face in BEVEL.md §8.6.3.1(6) A.2.1(vi)'s stated order —
+    /// `z = −1`, `x = −1`, `z = +1`, `x = +1`, `y = +1`, `y = −1` — so the three spokes of the
+    /// `(1, −1, −1)` corner take that worked example's **stored first endpoints**: the `−x`
+    /// spoke is minted out of the corner, and both the `+y` and `+z` spokes are minted *into*
+    /// it by a face that reaches them first. A.2.1(i) is structural, so a box assembled in any
+    /// other order is a different fixture with different (equally correct) bits.
+    fn mesh_add_cube_in_guide_face_order(mesh: &mut LoopMesh) -> Vec<VertexKey> {
+        let coords = [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ];
+        let verts: Vec<VertexKey> = coords.iter().map(|&c| mesh.create_vertex(c)).collect();
+        for ring in [
+            [0usize, 1, 2, 3],
+            [1, 5, 6, 2],
+            [4, 7, 6, 5],
+            [4, 0, 3, 7],
+            [3, 2, 6, 7],
+            [0, 4, 5, 1],
+        ] {
+            let face: Vec<VertexKey> = ring.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&face, FaceCreateFlags::NONE);
+        }
+        verts
+    }
+
+    /// Run BEVEL.md §8.6.3.1(6)'s Regime-A orientation pass over `beveled` at `offset` and
+    /// hand back the marks with the membership test the walk itself used.
+    fn orientation_marks(
+        mesh: &LoopMesh,
+        beveled: &[EdgeKey],
+        offset: f32,
+    ) -> (CustomOrientation, HashSet<EdgeKey>) {
+        let set: HashSet<EdgeKey> = beveled.iter().copied().collect();
+        let orientation = {
+            let is_beveled = |edge: EdgeKey| set.contains(&edge);
+            mesh.plan_custom_orientation(beveled, &is_beveled, offset)
+        };
+        (orientation, set)
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.2.1(vi), worked end to end: at the mutually-orthogonal
+    /// beveled-valence-3 cube corner A.1's contest admits **no** continuation (every other
+    /// spoke's dot is exactly `0`, and only strictly-positive dots are candidates), so by A.4
+    /// the three spokes are three separate runs carrying three *independent* seed
+    /// determinations — `reverse = true / false / false` around the ring. No single constant
+    /// can produce that triple, and the constant that used to be fed here made the corner cap
+    /// three-fold symmetric about the body diagonal, which the reference's is not.
+    #[test]
+    fn custom_profile_edge_junction_takes_three_independent_seeds_at_an_orthogonal_corner() {
+        let mut mesh = LoopMesh::new();
+        let verts = mesh_add_cube_in_guide_face_order(&mut mesh);
+        let corner = verts[0];
+        let spoke = |far: VertexKey| mesh.query_edge_exists(corner, far).expect("a beveled spoke");
+        let along_minus_x = spoke(verts[1]);
+        let along_plus_y = spoke(verts[3]);
+        let along_plus_z = spoke(verts[4]);
+        let beveled = [along_minus_x, along_plus_y, along_plus_z];
+
+        // A.2.1(i): the seed end is the edge's stored first endpoint, and on this fixture only
+        // the `−x` spoke stores the corner first. That single fact is what the whole worked
+        // example turns on.
+        assert_eq!(mesh.edge_vert_keys(along_minus_x)[0], corner);
+        assert_eq!(mesh.edge_vert_keys(along_plus_y)[0], verts[3]);
+        assert_eq!(mesh.edge_vert_keys(along_plus_z)[0], verts[4]);
+
+        let (orientation, set) = orientation_marks(&mesh, &beveled, 0.25);
+        let is_beveled = |edge: EdgeKey| set.contains(&edge);
+
+        // The ring the bits are stated against (A.2.1(vi)): `B₀` in `y = −1`, `B₁` in
+        // `z = −1`, `B₂` in `x = 1`, with sector `B_k → B_(k+1)` crossing the spoke named.
+        for (edge, start, end) in [
+            (
+                along_minus_x,
+                Vec3::new(0.75, -1.0, -0.75),
+                Vec3::new(0.75, -0.75, -1.0),
+            ),
+            (
+                along_plus_y,
+                Vec3::new(0.75, -0.75, -1.0),
+                Vec3::new(1.0, -0.75, -0.75),
+            ),
+            (
+                along_plus_z,
+                Vec3::new(1.0, -0.75, -0.75),
+                Vec3::new(0.75, -1.0, -0.75),
+            ),
+        ] {
+            let ends = mesh
+                .sector_ends(edge, corner, &is_beveled, 0.25)
+                .expect("every beveled spoke of the corner spans a sector there");
+            assert!(
+                (ends.start - start).length() < 1.0e-6 && (ends.end - end).length() < 1.0e-6,
+                "sector across {edge:?}: got {:?} → {:?}, want {start:?} → {end:?}",
+                ends.start,
+                ends.end,
+            );
+        }
+
+        assert_eq!(
+            [
+                orientation.reverse(along_minus_x, corner),
+                orientation.reverse(along_plus_y, corner),
+                orientation.reverse(along_plus_z, corner),
+            ],
+            [true, false, false],
+            "A.2.1(vi): the `−x` spoke seeds at the corner and reads `−0.75 < −1` (no); the \
+             `+y` spoke seeds at its far end, reads no there and flips one hop back; the \
+             `+z` spoke is z-parallel, ties at both ends, and reaches the corner flipped",
+        );
+
+        // A.1's contest, which is why these are three runs and not one.
+        for edge in beveled {
+            assert_eq!(
+                mesh.orientation_continuation(edge, corner, &is_beveled),
+                None,
+                "mutually orthogonal spokes give dot 0, which is not a candidate at all",
+            );
+        }
+
+        // The physical consequence: fed the asymmetric net, the corner cap's welded seed is
+        // pulled off the body diagonal. One uniform bit lands it *on* the diagonal.
+        let curve = asymmetric_custom_net();
+        let geom: Vec<GeomKey> = beveled.iter().map(|&edge| edge.into()).collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                vmesh_method: BevelVmeshMethod::Adj,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let seed = Vec3::new(0.814_764_4, -0.805_027_4, -0.824_501_3);
+        let landed = result
+            .verts
+            .iter()
+            .any(|&v| (mesh.vertex_position(v) - seed).length() < 2.0e-6);
+        assert!(
+            landed,
+            "the cap seed must land at {seed:?}; got {:?}",
+            result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            (seed.y - seed.z).abs() > 1.0e-3,
+            "and it must be off the corner's body diagonal — a three-fold symmetric cap is \
+             the signature of one uniform bit",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.2.1(i)/(v): the seed end is **structural**. Re-minting the
+    /// `z`-parallel spoke out of the corner instead of into it — the only difference between
+    /// this box and the one above — flips that sector's bit, while the other two spokes, whose
+    /// seed compares do not tie, are unmoved. Nothing geometric distinguishes the two boxes.
+    #[test]
+    fn custom_profile_edge_junction_seed_end_is_the_edges_stored_first_endpoint() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+        let spoke = |far: Vec3| {
+            mesh.query_edge_exists(corner, vert_at(&mesh, far))
+                .expect("a beveled spoke")
+        };
+        let along_minus_x = spoke(Vec3::new(-1.0, -1.0, -1.0));
+        let along_plus_y = spoke(Vec3::new(1.0, 1.0, -1.0));
+        let along_plus_z = spoke(Vec3::new(1.0, -1.0, 1.0));
+
+        assert_eq!(
+            mesh.edge_vert_keys(along_plus_z)[0],
+            corner,
+            "this builder mints the z-parallel spoke out of the corner",
+        );
+
+        let (orientation, _) = orientation_marks(
+            &mesh,
+            &[along_minus_x, along_plus_y, along_plus_z],
+            0.25,
+        );
+        assert_eq!(
+            [
+                orientation.reverse(along_minus_x, corner),
+                orientation.reverse(along_plus_y, corner),
+                orientation.reverse(along_plus_z, corner),
+            ],
+            [true, false, true],
+            "the z-parallel sector's compare ties at both ends, so which end seeds is the \
+             whole of its answer; the other two are untouched",
+        );
+    }
+
+    /// The folded T-junction of BEVEL.md §8.6.3.1(6) A.7 — three beveled edges meeting at `O`,
+    /// the `±x` pair folded `135°` against a tilted lower face and the branch left flat.
+    /// Returns the mesh and `[E_L, E_R, E_T]`.
+    fn folded_tee_junction() -> (LoopMesh, [EdgeKey; 3], Vec<VertexKey>) {
+        let mut mesh = LoopMesh::new();
+        let coords = [
+            Vec3::new(-1.0, 0.0, 0.0),  // A
+            Vec3::new(0.0, 0.0, 0.0),   // O
+            Vec3::new(1.0, 0.0, 0.0),   // B
+            Vec3::new(0.0, 1.0, 0.0),   // C
+            Vec3::new(-1.0, 1.0, 0.0),  // P
+            Vec3::new(1.0, 1.0, 0.0),   // Q
+            Vec3::new(-1.0, -1.0, 1.0), // R
+            Vec3::new(1.0, -1.0, 1.0),  // S
+        ];
+        let verts: Vec<VertexKey> = coords.iter().map(|&c| mesh.create_vertex(c)).collect();
+        for ring in [
+            vec![6usize, 7, 2, 1, 0],
+            vec![0, 1, 3, 4],
+            vec![1, 2, 5, 3],
+        ] {
+            let face: Vec<VertexKey> = ring.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&face, FaceCreateFlags::NONE);
+        }
+        let edge = |a: usize, b: usize| {
+            mesh.query_edge_exists(verts[a], verts[b])
+                .expect("an interior edge")
+        };
+        let interior = [edge(0, 1), edge(1, 2), edge(1, 3)];
+        (mesh, interior, verts)
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.1/A.3/A.4 on the folded T-junction. The `±x` pair is **one** run
+    /// through `O` — the contest accepts, dot `1` against a floored-at-zero runner-up — and its
+    /// four edge-ends hold one physical flank, which on this fixture (a strict low flank, the
+    /// same one at every end, so no tie and no `z`-twist) means each end's mark equals its own
+    /// local `z` compare. The branch is a **separate** run: arriving along it both other spokes
+    /// give dot `0`, so it never links, and its own seed compare ties.
+    #[test]
+    fn custom_profile_edge_run_holds_one_flank_through_a_folded_tee() {
+        let (mesh, [left, right, branch], verts) = folded_tee_junction();
+        let (orientation, set) = orientation_marks(&mesh, &[left, right, branch], 0.25);
+        let is_beveled = |edge: EdgeKey| set.contains(&edge);
+        let [a, o, b, c] = [verts[0], verts[1], verts[2], verts[3]];
+
+        assert_eq!(
+            mesh.orientation_continuation(left, o, &is_beveled),
+            Some(right),
+            "the through pair continues: dot 1 against a floored-at-zero runner-up",
+        );
+        assert_eq!(
+            mesh.orientation_continuation(right, o, &is_beveled),
+            Some(left),
+            "and the relation is mutual here, so the decomposition is sweep-independent",
+        );
+        assert_eq!(
+            mesh.orientation_continuation(branch, o, &is_beveled),
+            None,
+            "arriving along the branch both other spokes give dot 0 — no candidate at all",
+        );
+
+        for (edge, endpoint) in [(left, a), (left, o), (right, o), (right, b)] {
+            let ends = mesh
+                .sector_ends(edge, endpoint, &is_beveled, 0.25)
+                .expect("every edge-end of the run spans a sector");
+            assert_eq!(
+                !orientation.reverse(edge, endpoint),
+                ends.start.z < ends.end.z,
+                "the run's mark must agree with this end's own compare on a fixture whose \
+                 low flank is strict and never changes sides",
+            );
+        }
+
+        // A.4: the branch's two ends carry its *own* determination. Its cross-section is a
+        // constant-`z` slice at both ends, so both compares tie and both answer `false`; the
+        // `±x` run's orientation constrains it not at all.
+        assert_eq!(
+            [
+                !orientation.reverse(branch, o),
+                !orientation.reverse(branch, c),
+            ],
+            [false, false],
+            "the branch seeds itself, on a tie",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.7's load-bearing assertion. The folded T is mirror-symmetric in
+    /// `x`, and a reflection carries a sector's ring `start` onto its image sector's `end`, so
+    /// the beveled output comes out `x`-symmetric **exactly when** the mirror-paired edge-ends
+    /// carry opposite marks. Handing the whole run one uniform bit mirrors one arm against the
+    /// other and displaces a rim sample by the full chord-fraction swap.
+    #[test]
+    fn custom_profile_edge_run_keeps_the_folded_tee_mirror_symmetric() {
+        let (mut mesh, interior, _) = folded_tee_junction();
+        let curve = asymmetric_custom_net();
+        let geom: Vec<GeomKey> = interior.iter().map(|&edge| edge.into()).collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                segments: 2,
+                affect: BevelAffect::Edges,
+                vmesh_method: BevelVmeshMethod::Adj,
+                profile_type: BevelProfileType::Custom(&curve),
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let positions: Vec<Vec3> = mesh
+            .vert_keys()
+            .into_iter()
+            .map(|v| mesh.vertex_position(v))
+            .collect();
+        for position in &positions {
+            let image = Vec3::new(-position.x, position.y, position.z);
+            let nearest = positions
+                .iter()
+                .map(|other| (*other - image).length())
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                nearest < 1.0e-5,
+                "{position:?} has no mirror partner (nearest {nearest})",
+            );
+        }
+
+        // The symmetry alone leaves the run's *absolute* handedness unpinned (flipping the
+        // whole run maps the output to itself) and is satisfied trivially by a flattened
+        // cross-section, so pin the terminal's one interior rim sample outright. A.7 measures
+        // it at chord fraction `0.375` from the `z = 0` corner, standing `0.0239` off the
+        // chord: reverse A.2's inequality and it swaps to the complementary `0.625`.
+        let terminal_rim = Vec3::new(-1.0, 0.099_111_65, 0.088_388_35);
+        let samples: Vec<Vec3> = result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|p| (p.x + 1.0).abs() < 1.0e-5)
+            .collect();
+        assert!(
+            samples
+                .iter()
+                .any(|p| (*p - terminal_rim).length() < 1.0e-5),
+            "the `−x` terminal's interior rim sample must land at {terminal_rim:?}; got \
+             {samples:?}",
+        );
+        let chord_mid = Vec3::new(-1.0, 0.5 * (0.25 - 0.176_776_7), 0.5 * 0.176_776_7);
+        assert!(
+            (terminal_rim - chord_mid).length() > 1.0e-2,
+            "and it must be well off the chord midpoint, or the symmetry assertion above is \
+             vacuous",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.1's directedness, on the section's own counter-example: `E1`
+    /// arrives along `+x` at `O`, `E2` leaves along `+x` (dot `1`) and `E3` leaves `5°` off it
+    /// (dot `0.99619`). From `E1` the two are `0.0038` apart — inside the `1 − cos 10°` margin
+    /// — so the run stops; from `E2` the `5°` spoke has dot `−0.99619` and is not a candidate
+    /// at all, so the lone survivor clears the floored-at-zero runner-up and the link exists.
+    /// A pass that built an undirected graph and took components would merge the two.
+    #[test]
+    fn custom_profile_edge_run_continuation_is_directed() {
+        let mut mesh = LoopMesh::new();
+        let origin = mesh.create_vertex(Vec3::ZERO);
+        let five_degrees = 5.0_f32.to_radians();
+        let ends = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(five_degrees.cos(), five_degrees.sin(), 0.0),
+        ];
+        let spokes: Vec<EdgeKey> = ends
+            .iter()
+            .map(|&position| {
+                let far = mesh.create_vertex(position);
+                mesh.create_edge([origin, far], EdgeCreateFlags::NONE)
+            })
+            .collect();
+        let set: HashSet<EdgeKey> = spokes.iter().copied().collect();
+        let is_beveled = |edge: EdgeKey| set.contains(&edge);
+
+        assert_eq!(
+            mesh.orientation_continuation(spokes[0], origin, &is_beveled),
+            None,
+            "two candidates 0.0038 apart in dot are too close to call",
+        );
+        assert_eq!(
+            mesh.orientation_continuation(spokes[1], origin, &is_beveled),
+            Some(spokes[0]),
+            "from the other side the 5° spoke folds back and drops out of the contest",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.1's beveled-valence-2 short-circuit, which the contest never
+    /// sees: with exactly one other **beveled** spoke at the vertex the run takes it
+    /// unconditionally, however sharply it folds back. This is not a fast path for a case the
+    /// contest would agree with — the same spoke, put up against a second beveled one, is a
+    /// fold-back past a right angle and so is not a candidate at all. And the valence the
+    /// short-circuit counts is the beveled one: a perfectly straight *unbeveled* continuation
+    /// sits at this vertex throughout and never enters either reading.
+    #[test]
+    fn custom_profile_edge_run_valence_two_takes_its_partner_unconditionally() {
+        let mut mesh = LoopMesh::new();
+        let origin = mesh.create_vertex(Vec3::ZERO);
+        let mut spoke = |position: Vec3| {
+            let far = mesh.create_vertex(position);
+            mesh.create_edge([origin, far], EdgeCreateFlags::NONE)
+        };
+        let incoming = spoke(Vec3::new(-1.0, 0.0, 0.0));
+        let folded_left = spoke(Vec3::new(-1.0, 1.0, 0.0).normalize());
+        let folded_right = spoke(Vec3::new(-1.0, -1.0, 0.0).normalize());
+        let _straight_but_unbeveled = spoke(Vec3::new(1.0, 0.0, 0.0));
+
+        let pair: HashSet<EdgeKey> = [incoming, folded_left].into_iter().collect();
+        assert_eq!(
+            mesh.orientation_continuation(incoming, origin, &|edge| pair.contains(&edge)),
+            Some(folded_left),
+            "beveled valence 2 continues into a 135° fold-back without asking the contest",
+        );
+
+        let trio: HashSet<EdgeKey> = [incoming, folded_left, folded_right].into_iter().collect();
+        assert_eq!(
+            mesh.orientation_continuation(incoming, origin, &|edge| trio.contains(&edge)),
+            None,
+            "and from valence 3 the same fold-back is dot −0.707, not a candidate at all",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(6) A.1/A.3 on a **closed** run. The four `z = +1` edges of a cube form
+    /// a cycle — every corner has beveled valence 2, so A.1 links straight through the right
+    /// angle the contest would refuse — and the walk therefore returns to its seed edge-end and
+    /// `break`s on the revisit rather than re-deriving its bit. Nothing in the pass checks that
+    /// the closing link's *derived* flank agrees with the recorded one; it should, because an
+    /// orientable strip carries one physical flank the whole way round, but "should" is what
+    /// this test converts into an assertion. Every link of the cycle is checked in both
+    /// directions, the closing hop included.
+    #[test]
+    fn custom_profile_edge_run_closes_a_cycle_on_the_flank_it_started() {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let ring_verts: Vec<VertexKey> = [
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ]
+        .into_iter()
+        .map(|position| vert_at(&mesh, position))
+        .collect();
+        let beveled: Vec<EdgeKey> = (0..4)
+            .map(|i| {
+                mesh.query_edge_exists(ring_verts[i], ring_verts[(i + 1) % 4])
+                    .expect("a top-face ring edge")
+            })
+            .collect();
+
+        let (orientation, set) = orientation_marks(&mesh, &beveled, 0.25);
+        let is_beveled = |edge: EdgeKey| set.contains(&edge);
+
+        for (i, &edge) in beveled.iter().enumerate() {
+            let corner = ring_verts[(i + 1) % 4];
+            assert_eq!(
+                mesh.orientation_continuation(edge, corner, &is_beveled),
+                Some(beveled[(i + 1) % 4]),
+                "the ring is one run: beveled valence 2 links through the 90° corner",
+            );
+        }
+        for &edge in &beveled {
+            for endpoint in mesh.edge_vert_keys(edge) {
+                assert!(
+                    orientation.is_start_side.contains_key(&(edge, endpoint)),
+                    "the cycle's revisit break must not leave an edge-end unmarked",
+                );
+            }
+        }
+
+        for &edge in &beveled {
+            for endpoint in mesh.edge_vert_keys(edge) {
+                let bit = !orientation.reverse(edge, endpoint);
+                for kind in [OrientationStep::CrossVertex, OrientationStep::SameEdge] {
+                    let Some(next) = mesh.orientation_step(edge, endpoint, kind, &is_beveled)
+                    else {
+                        continue;
+                    };
+                    assert_eq!(
+                        !orientation.reverse(next.0, next.1),
+                        mesh.propagated_handedness_bit(
+                            (edge, endpoint),
+                            next,
+                            kind,
+                            bit,
+                            &is_beveled,
+                            0.25,
+                        ),
+                        "the mark recorded at {next:?} must be the one this link derives",
+                    );
+                }
+            }
+        }
     }
 
     /// BEVEL.md §8.6.3 / §8.11: a `profile_type = CUSTOM` vertex bevel of a cube corner
@@ -41597,7 +42531,12 @@ mod tests {
         let cell = widget_frame_cell();
         let resampled_mid = |curve: &BevelCurveProfile| {
             let chains = CustomChains::new(curve, 2);
-            cell.chain_positions(2, 0.5, Some(&chains), ChainEmission::Resampled)[1]
+            cell.chain_positions(
+                2,
+                0.5,
+                Some(CustomChainRead::vertex_cap(&chains)),
+                ChainEmission::Resampled,
+            )[1]
         };
         assert!(
             (resampled_mid(&split) - Vec3::new(0.595_36, 0.146_28, 0.0)).length() < 1.0e-4,
@@ -49388,7 +50327,7 @@ impl ProfileCell {
         &self,
         segments: u32,
         profile: f32,
-        custom: Option<&CustomChains>,
+        custom: Option<CustomChainRead<'_>>,
         emission: ChainEmission,
     ) -> Vec<Vec3> {
         let raw = self.raw_chain_positions(segments, profile, custom);
@@ -49422,7 +50361,7 @@ impl ProfileCell {
         &self,
         segments: u32,
         profile: f32,
-        custom: Option<&CustomChains>,
+        custom: Option<CustomChainRead<'_>>,
     ) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
@@ -49435,11 +50374,11 @@ impl ProfileCell {
             // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
             // bypassing the superellipse exponent / even-arc-length solve entirely.
             let cells = match custom {
-                // The §8.6.3.1(6) handedness bit is uniform across every consumer here —
-                // vertex-bevel cap sectors *and* edge-mode junction sectors alike. See
-                // [`custom_chain_reverse_bit`], which records why that constant is right for
-                // Regime B and known wrong for Regime A.
-                Some(chains) => chains.chain_at(segments, custom_chain_reverse_bit()),
+                // §8.6.3.1(6): the handedness bit rides the read, resolved by the caller —
+                // Regime A's per-edge-end walk mark ([`CustomOrientation`]) at an edge-mode
+                // sector, Regime B's uniform cap constant ([`vertex_cap_reverse_bit`]) at a
+                // vertex-bevel cap.
+                Some(read) => read.chains.chain_at(segments, read.reverse),
                 None => superellipse_chain(profile, segments),
             };
             debug_assert_eq!(
@@ -49458,7 +50397,11 @@ impl ProfileCell {
     /// §8.2.2.1.1 at `segments = 2`: the chord-fraction resample of the single interior
     /// sample against the doubled (4-segment) profile. Identity on a symmetric cell
     /// (`f = 0.5` lands on `Q_2`); the skew pushes `f` toward the shorter leg.
-    fn segment2_boundary_resample(&self, profile: f32, custom: Option<&CustomChains>) -> Vec3 {
+    fn segment2_boundary_resample(
+        &self,
+        profile: f32,
+        custom: Option<CustomChainRead<'_>>,
+    ) -> Vec3 {
         self.chain_positions(2, profile, custom, ChainEmission::Resampled)[1]
     }
 
@@ -49865,50 +50808,132 @@ fn cubic_bezier(
     )
 }
 
-/// The §8.6.3.1(6) handedness bit loopmesh feeds **every** custom chain read, in both of the
-/// section's regimes. It takes no argument because it distinguishes none — that uniformity is
-/// the whole content of this function, and half of it is a known divergence.
-///
-/// **Regime B — vertex-bevel cap sectors: the constant is right.** A cap sector runs no
-/// orientation walk (there is no beveled edge to traverse), so §8.6.3.1(6) gives the whole cap
-/// *one* uniform bit, and deliberately declines to name its value: the value is winding-
-/// dependent, fixed by the rotational sense in which an implementation feeds each sector's
-/// `start`/`end` pair into the cell. §8.6.3.1(6)'s worked rim-mid table is stated under its own
-/// canonical forward-feed winding (the `reverse = false` reading), and loopmesh builds each cap
-/// sector's `start`/`end` in the index-reversed **mirror** of that order, so it needs the
+/// A custom curve's sample chains bundled with the §8.6.3.1(6) handedness bit the reading
+/// sector feeds them through. The two travel together because a chain read without its bit is
+/// only half a cross-section: the bit picks which physical ring corner the asymmetric shape's
+/// start ties to, and reading it from the wrong regime mirrors every interior sample.
+#[derive(Clone, Copy)]
+struct CustomChainRead<'c> {
+    chains: &'c CustomChains<'c>,
+    /// `reverse = !is_start_side` — see [`widget_chain_to_cell`].
+    reverse: bool,
+}
+
+impl<'c> CustomChainRead<'c> {
+    /// The §8.6.3.1(6) **Regime B** read: a vertex-bevel cap sector, which runs no orientation
+    /// walk and so takes the whole cap's one uniform bit.
+    fn vertex_cap(chains: &'c CustomChains<'c>) -> Self {
+        CustomChainRead {
+            chains,
+            reverse: vertex_cap_reverse_bit(),
+        }
+    }
+
+    /// The §8.6.3.1(6) **Regime A** read: an edge-mode sector, whose bit is the orientation
+    /// pass's mark on the edge-end it spans.
+    fn edge_sector(chains: &'c CustomChains<'c>, reverse: bool) -> Self {
+        CustomChainRead { chains, reverse }
+    }
+}
+
+/// The §8.6.3.1(6) **Regime B** handedness bit: the one uniform value every sector of a
+/// *vertex*-bevel cap reads. It takes no argument because Regime B distinguishes none — a cap
+/// has no beveled edge for the orientation walk to traverse, so §8.6.3.1(6) hands the whole cap
+/// a single bit and deliberately declines to name its value: the value is winding-dependent,
+/// fixed by the rotational sense in which an implementation feeds each sector's `start`/`end`
+/// pair into the cell. §8.6.3.1(6)'s worked rim-mid table is stated under its own canonical
+/// forward-feed winding (the `reverse = false` reading), and loopmesh builds each cap sector's
+/// `start`/`end` in the index-reversed **mirror** of that order, so it needs the
 /// **complementary** constant to land the same rim positions — chord fraction 0.375 along
 /// `B_k → B_(k+1)`, not the mirrored 0.625. Do **not** "simplify" this to `false`: that
 /// mirror-flips every cap sector onto the wrong fraction. Pinned by the in-crate
 /// `custom_profile_vertex_cap_orientation_forms_symmetry_orbit` and cross-backend by
 /// `bevel_custom_profile_vertex_cube_corner_two_segments`.
 ///
-/// **Regime A — edge-mode junction sectors: the constant is known WRONG, and deliberately left
-/// so.** Since the custom curve was threaded into the junction chains, edge bevels read this
-/// too, and §8.6.3.1(6) Regime A does not admit a constant: each run of beveled edges takes one
-/// A.2 seed determination and every sector in the run derives its bit by A.3's walk parity. At a
-/// mutually-orthogonal beveled-valence-3 junction, A.1's cross-vertex contest admits **no**
-/// continuation — every other spoke's `dot` is exactly `0` and only strictly-positive dots are
-/// candidates — so by **A.4** the three spokes are three separate runs with three *independent*
-/// seed determinations. One constant cannot be three independent determinations.
-///
-/// Measured on the cube corner over the three spokes of one corner, `segments 2..=10`, both
-/// slider ends: the first sector agrees exactly and the other two are each the **mirror** of the
-/// reference (the cell's two widget axes exchanged) at every count. As `is_start_side` around
-/// the ring the reference reads `true/false/false` where this reads `true/true/true`, so
-/// loopmesh's corner cap comes out 3-fold symmetric about the corner diagonal and the
-/// reference's is not (`segments = 2` seed vert: `(0.81476, −0.81476, −0.81476)` here against
-/// `(0.81476, −0.80503, −0.82450)`).
-///
-/// This is a **pre-existing edge-mode defect** that threading the custom curve merely made
-/// observable — the superellipse is diagonal-symmetric, so the bit is a no-op on every analytic
-/// profile and no analytic arm can see it. It is tracked as its own parity-matrix row rather
-/// than patched here, because the fix carries an open question of its own: A.2 takes the seed
-/// from "a fixed one of the edge's two ends" without saying which, and reading it at the `v0`
-/// end reproduces the reference on two of the three spokes but not the third, which lands on
-/// A.2's exact-`z`-tie clause. Its cross-backend pin is the runnable `#[ignore]`d arm
-/// `bevel_edge_tri_corner_ring_custom_profile_junction_handedness_across_all_three_sectors_cube_corner`.
-fn custom_chain_reverse_bit() -> bool {
+/// Edge-mode sectors do **not** read this — §8.6.3.1(6) Regime A admits no constant at all;
+/// see [`CustomOrientation`].
+fn vertex_cap_reverse_bit() -> bool {
     true
+}
+
+/// One beveled edge-end's cross-section as §8.6.3.1(6)'s orientation pass reads it: the two
+/// ring corners the chain runs between, and the radial face of the beveled edge each corner
+/// sits against. The faces are what let a same-edge hop carry the run's *physical* flank across
+/// to a ring whose rotational sense is settled independently.
+#[derive(Debug)]
+struct SectorEnds {
+    start: Vec3,
+    end: Vec3,
+    start_face: FaceKey,
+    end_face: FaceKey,
+}
+
+/// §8.6.3.1(6) A.1's cross-vertex margin: two contestants closer than `1 − cos 10°` in **dot**
+/// are too close to call and the run stops. The runner-up is floored at zero, so a lone
+/// contestant is measured against `0` and must clear the margin on its own.
+///
+/// Derived, never transcribed: the predicate is a closeness test, so the value is consulted
+/// exactly at its own decision boundary — the one place a hand-rounded decimal shows. The
+/// difference is taken in `f64` and rounded once, because `1 − cos θ` cancels badly at small `θ`
+/// and the same expression carried out in `f32` throughout lands ~25 ULP high.
+fn orientation_continuation_margin() -> f32 {
+    (1.0 - (10.0_f64).to_radians().cos()) as f32
+}
+
+/// One step of §8.6.3.1(6) A.1's edge-end walk. The two kinds alternate, and each swaps which
+/// physical flank the arriving sector calls `start` — but they do **not** carry A.3's handedness
+/// the same way. A cross-vertex step stays on one ring, whose two sectors present their corners
+/// in opposite roles whichever sense the ring runs in, so the bit simply flips; a same-edge hop
+/// crosses to a ring whose sense is settled independently, so the flank has to be re-read by
+/// name. See [`LoopMesh::propagated_handedness_bit`] — a blind parity on both kinds mirrors
+/// every terminal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrientationStep {
+    /// To the other beveled edge-end at the same junction vertex — the near-straight
+    /// continuation that wins A.1's contest.
+    CrossVertex,
+    /// To the other end of the same beveled edge.
+    SameEdge,
+}
+
+impl OrientationStep {
+    fn other(self) -> Self {
+        match self {
+            OrientationStep::CrossVertex => OrientationStep::SameEdge,
+            OrientationStep::SameEdge => OrientationStep::CrossVertex,
+        }
+    }
+}
+
+/// The §8.6.3.1(6) **Regime A** orientation marks: one `is_start_side` bit per **edge-end**,
+/// keyed by the pair (beveled edge, the endpoint whose junction sector spans it).
+///
+/// The edge-end — not the edge — is the unit, because a beveled edge carries two cross-section
+/// arcs, one owned by each of its end junctions, and the two *often* take opposite marks: where
+/// the two ends' boundvert rings wind oppositely as seen along the edge, holding one **physical**
+/// flank as the shape-start across the edge means flipping the `start`/`end`-relative bit. Often,
+/// not always — the two rings' senses are settled independently, so A.3 carries the flank by name
+/// rather than by parity across a same-edge hop ([`LoopMesh::propagated_handedness_bit`]).
+///
+/// An edge-end absent from the map owns no beveled-edge arc and keeps the pass's default,
+/// `is_start_side = false` — which is the uniform constant the pass exists to replace, so the
+/// pass asserts it has marked every edge-end it walked
+/// ([`LoopMesh::plan_custom_orientation`]).
+#[derive(Default)]
+struct CustomOrientation {
+    is_start_side: HashMap<(EdgeKey, VertexKey), bool>,
+}
+
+impl CustomOrientation {
+    /// The `reverse` bit [`widget_chain_to_cell`] reads for the sector of `edge` at
+    /// `endpoint`. `reverse = !is_start_side`, so an unmarked edge-end reads `true`.
+    fn reverse(&self, edge: EdgeKey, endpoint: VertexKey) -> bool {
+        !self
+            .is_start_side
+            .get(&(edge, endpoint))
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// Map a widget-frame `(x, y)` chain into the profile cell frame (BEVEL.md §8.6.3.1(5)/(6)).
@@ -51369,9 +52394,12 @@ enum RingChainProfile<'c> {
     Cell {
         cell: ProfileCell,
         profile: f32,
-        /// The custom curve's two chains and their read schedule (BEVEL.md §8.6.3 /
-        /// §8.6.3.1(4).4), or `None` for the analytic superellipse family.
-        custom: Option<&'c CustomChains<'c>>,
+        /// The custom curve's two chains, their read schedule (BEVEL.md §8.6.3 /
+        /// §8.6.3.1(4).4) and the sector's §8.6.3.1(6) handedness bit, or `None` for the
+        /// analytic superellipse family. The bit must be the one the *emitted* chain was read
+        /// through: the stencil re-pins its boundary off this generator, so a generator that
+        /// mirrors the rim tears the cap's interior away from its own edge.
+        custom: Option<CustomChainRead<'c>>,
     },
     Arc {
         b1: Vec3,
