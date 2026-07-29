@@ -10274,24 +10274,37 @@ impl LoopMesh {
             // through a boundary leg that no later corner re-reports, so the recorded
             // list starts one edge late and would pair `g_k` with an edge from a
             // different face's corner entirely.
+            //
+            // A flank that runs **collinear** with its own leg — straight through `v`,
+            // as an unbeveled spoke continuing a beveled one does — crosses to exactly
+            // zero. That zero is the answer, not a hole to be plugged: it zeroes the
+            // perpendicular, so that line passes through `v` un-offset and the meet
+            // lands where the *other* flank's offset line crosses the flank's own line.
+            // No ladder guards it, because the ladder tests the two flanks against each
+            // other and they can be square while one is collinear with the leg between
+            // them. See `orient_normal`.
+            //
+            // A leg with **no direction at all** — a degenerate leg whose far endpoint sits
+            // on `v` — is the limiting case of that same collinearity, and gets the same
+            // zero: flank × leg is zero either way, and §7.6.2's case-3 recipe has no
+            // branch for a missing leg, so what answers is the shared zero-returning floor.
+            // Handing over the sector face's normal instead is the one thing §7.6.2 (d)
+            // rules out — the face enters the recipe as a *sign* and nothing else — and it
+            // would push that base point a full `offset` off the flank's own line. On a
+            // degenerate face it would also substitute `face_plane_normal`'s synthetic `+Z`
+            // axis, first on the guide's list of what a rescue must not invent.
             let first_leg = walk_first.and_then(|(next_edge, _)| {
                 self.edge_direction_from(next_edge, vertex, vertex_position)
             });
             let last_leg = between_edges
                 .last()
                 .and_then(|&edge| self.edge_direction_from(edge, vertex, vertex_position));
-            let normal_first = match first_leg {
-                Some(leg) => {
-                    orient_normal(dir_first.cross(leg), self.face_plane_normal(face_first))
-                }
-                None => self.face_plane_normal(face_first),
-            };
-            let normal_second = match last_leg {
-                Some(leg) => {
-                    orient_normal(dir_second.cross(leg), self.face_plane_normal(face_last))
-                }
-                None => self.face_plane_normal(face_last),
-            };
+            let normal_first = first_leg.map_or(Vec3::ZERO, |leg| {
+                orient_normal(dir_first.cross(leg), self.face_plane_normal(face_first))
+            });
+            let normal_second = last_leg.map_or(Vec3::ZERO, |leg| {
+                orient_normal(dir_second.cross(leg), self.face_plane_normal(face_last))
+            });
             let perp_first = normalise_at_direction_floor(normal_first.cross(raw_first));
             let perp_second = normalise_at_direction_floor(raw_second.cross(normal_second));
             (normal_first, normal_second, perp_first, perp_second)
@@ -10321,8 +10334,10 @@ impl LoopMesh {
             // Cross order is free: swapping it negates every component exactly, and the
             // sign fix undoes the flip identically.
             let edge_span = raw_first.cross(raw_second);
-            // `orient_normal` carries the only fallback the span needs: a zero-length
-            // cross (an (anti-)parallel flank pair) hands back the reference.
+            // A zero-length span means an (anti-)parallel flank pair. The ladder claims
+            // that geometry in `solve_meet_point`, not here, so the sign fix's zero branch
+            // is **reached but inert**: the layout is still built, the zero is kept, and no
+            // offset line is ever built from it.
             let normal = orient_normal(edge_span, reference);
             // Each perpendicular is the pure right-of-`g_k` / left-of-`g_(k+1)`
             // rotation about that normal: its sign comes from the edge's **role** in
@@ -15439,12 +15454,17 @@ struct SectorLayout {
     far_second: Vec3,
     perp_first: Vec3,
     perp_second: Vec3,
-    /// The plane normal each offset line's perpendicular is rotated about —
-    /// **direction only; the magnitude is not meaningful and must not be read**. Every
-    /// source happens to hand over a unit vector today (a unit Newell normal, or an
-    /// `orient_normal` result), but the only consumer crosses it with an edge direction
-    /// and normalises, so nothing downstream would notice a raw `sin θ`-magnitude cross.
-    /// Contrast `sector_normal`, whose *zero* magnitude is load-bearing.
+    /// The plane normal each offset line's perpendicular is rotated about — **zero or
+    /// unit, never anything between**. Above the direction floor `orient_normal` hands
+    /// over a unit vector — a Newell normal enters only as the sign reference *inside*
+    /// it, never as the field — and only its
+    /// *direction* is read: the sole consumer crosses it with an edge direction and
+    /// normalises, so a raw `sin θ`-magnitude cross would go unnoticed there. At or below
+    /// the floor `orient_normal` hands over the **zero vector**, and that zero *is* the
+    /// degenerate answer rather than a missing one — it zeroes the perpendicular, so that
+    /// line runs through `v` un-offset. Same convention as `sector_normal`, arrived at
+    /// differently: there the zero comes from a zero-area face read directly, here from a
+    /// zero cross of a flank against its adjacent leg.
     normal_first: Vec3,
     normal_second: Vec3,
     /// §7.6.2's plane normal for the **near-collinear ladder** only — a different
@@ -15475,17 +15495,44 @@ struct DropCandidate {
 /// Orient `candidate` to agree with `reference` (flip when they oppose), giving a
 /// consistent local sector normal for a case-3 offset-line perpendicular.
 ///
-/// The unitisation is §7.6.2's shared `normalise` arithmetic (one reciprocal scaled
-/// into three components, never three divisions): this normal is what the offset-line
-/// perpendicular is rotated about, so its last bits reach the base points and land on
-/// the guide's normalisation axis. The floor stays this function's own — a degenerate
-/// candidate falls back to the reference rather than to the zero vector.
+/// The unitisation is §7.6.2's shared `normalise` — one reciprocal scaled into three
+/// components, never three divisions, on [`SLIDE_DIRECTION_FLOOR_SQ`]. This normal is
+/// what the offset-line perpendicular is rotated about, so its last bits reach the base
+/// points and land on the guide's normalisation axis.
+///
+/// The operator is **not** yet uniform on that floor, and the exception is worth knowing
+/// about before reading a divergence as a bug here. §7.5.1's terminal regime-3 normal, in
+/// `terminal_meet_placement`, still hand-rolls this same construct on the older spelling —
+/// `cross.length() <= f32::EPSILON`, plus its own copy of the sign fix. That is a floor
+/// some eleven orders of magnitude higher, stated on the **unsquared** length and with the
+/// `<=` sense rather than `>`. Worse, the directions it crosses are **raw**, so unlike
+/// every `normalise` here the guard is **scale-dependent**: at a world scale of `~1e-4` an
+/// ordinary right-angle terminal produces a cross of `~1e-8`, trips it, and diverts a
+/// perfectly well-conditioned terminal into `degenerate_meet_placement`. That site's own
+/// comment — "deep inside regime 1's band, so the dispatch above has already taken it" —
+/// holds at unit scale and fails below it. Unifying it is its own change.
+///
+/// **The reference contributes a sign and nothing else** — there is no rescue on a
+/// degenerate candidate. §7.6.2's case-3 recipe states the local normal as the cross of a
+/// flank with its adjacent in-between leg, *oriented by* the face at that end of the
+/// sector, and stops there — the face enters as an orientation and never as a value. The
+/// only path from that normal into a coordinate is the base-point construction, which
+/// takes `normalise(direction × normal)`, and the shared zero-returning `normalise` is
+/// what absorbs a degenerate cross. (The sign fix's name is this file's shorthand; the
+/// guide spells it as prose.) So substituting a synthetic normal (an axis, the vertex
+/// normal, a neighbouring face's) pushes the offset line a whole `offset` off-axis where
+/// the reference does not move the base point at all — and note the "no rescue" the guide
+/// spells out for the near-collinear ladder's own plane normal is a *different* construct
+/// that happens to reach the same conclusion.
+/// A zero normal is *load-bearing*: it zeroes the perpendicular,
+/// which collapses that line's sideways push onto `v`, so the line runs through `v`
+/// along its own flank. That is the answer at a case-3 sector whose flanking beveled
+/// edge runs **collinear** with its adjacent in-between leg — straight through `v` —
+/// where the flank × leg cross is exactly zero and no §7.6.2 ladder guards it (the
+/// ladder tests the two *flanks*' direction angle, and those can be square to each
+/// other while one of them is collinear with the leg between them).
 fn orient_normal(candidate: Vec3, reference: Vec3) -> Vec3 {
-    let length = candidate.length();
-    if length <= f32::EPSILON {
-        return reference;
-    }
-    let unit = candidate * (1.0 / length);
+    let unit = normalise_at_direction_floor(candidate);
     if unit.dot(reference) < 0.0 {
         -unit
     } else {
@@ -37909,15 +37956,23 @@ mod tests {
             "fixture sanity: the sector's forward face must average below `v`'s upper half",
         );
         // Fixture sanity, measured on the superseded heuristic itself rather than on
-        // `layout.perp_first` — which now carries the role-based cross order and so points
+        // `layout.perp_first`, which now carries the role-based cross order and so points
         // *into* the sector. The two disagree here, which is what makes the fixture
         // discriminating; at this `θ_dir = 0` the ladder returns before either is read, so
         // only `junction_planar_sector_perpendicular_takes_the_cross_order_not_the_centroid`
         // sees the difference in a meet.
+        //
+        // The plane normal has to come from the face, not from `layout.normal_first`: with
+        // the two flanks exactly anti-parallel the edge span is zero and the sign fix hands
+        // that zero straight on (it has no rescue), which is inert precisely because the
+        // ladder claims this geometry before any offset line is built.
+        let plane_normal = mesh
+            .face_newell_normal(concave_face)
+            .expect("the sector's forward face has a normal");
         let centroid_perp = centroid_oriented_perpendicular(
             &mesh,
             layout.dir_first,
-            layout.normal_first,
+            plane_normal,
             concave_face,
             v_pos,
         );
@@ -37926,11 +37981,15 @@ mod tests {
             "fixture sanity: the centroid heuristic must point out of the sector, got \
              {centroid_perp:?}",
         );
+        assert_eq!(
+            layout.normal_first,
+            Vec3::ZERO,
+            "an exactly anti-parallel flank pair spans no plane, and the zero is kept",
+        );
         assert!(
-            layout.perp_first.y > 0.0,
+            plane_normal.cross(layout.dir_first).y > 0.0,
             "the offset-line perpendicular is the cross order about the walk-sense normal, \
-             so it points into the sector, got {:?}",
-            layout.perp_first,
+             so it points into the sector",
         );
 
         let offset = 0.25_f32;
@@ -41878,9 +41937,17 @@ mod tests {
     /// the `±x` pair folded `135°` against a tilted lower face and the branch left flat.
     /// Returns the mesh and `[E_L, E_R, E_T]`.
     fn folded_tee_junction() -> (LoopMesh, [EdgeKey; 3], Vec<VertexKey>) {
+        folded_tee_junction_with_left_arm_at(Vec3::new(-1.0, 0.0, 0.0))
+    }
+
+    /// `folded_tee_junction` with `A` — `E_L`'s far endpoint — relocated, so the same
+    /// junction can be posed with a degenerate left arm.
+    fn folded_tee_junction_with_left_arm_at(
+        left_arm: Vec3,
+    ) -> (LoopMesh, [EdgeKey; 3], Vec<VertexKey>) {
         let mut mesh = LoopMesh::new();
         let coords = [
-            Vec3::new(-1.0, 0.0, 0.0),  // A
+            left_arm,                   // A
             Vec3::new(0.0, 0.0, 0.0),   // O
             Vec3::new(1.0, 0.0, 0.0),   // B
             Vec3::new(0.0, 1.0, 0.0),   // C
@@ -41904,6 +41971,258 @@ mod tests {
         };
         let interior = [edge(0, 1), edge(1, 2), edge(1, 3)];
         (mesh, interior, verts)
+    }
+
+    /// The junction boundverts of a bevel at the folded T's `O` — the only result verts
+    /// that stay within half a unit of it, the ring verts being out at the terminals.
+    fn junction_boundverts(mesh: &LoopMesh, result: &BevelResult, junction: Vec3) -> Vec<Vec3> {
+        let mut found: Vec<Vec3> = result
+            .verts
+            .iter()
+            .map(|&v| mesh.vertex_position(v))
+            .filter(|p| (*p - junction).length() < 0.5)
+            .collect();
+        found.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        found
+    }
+
+    fn assert_boundverts(found: &[Vec3], expected: &[Vec3], what: &str) {
+        assert_eq!(
+            found.len(),
+            expected.len(),
+            "{what}: expected {expected:?}, got {found:?}",
+        );
+        for (got, want) in found.iter().zip(expected) {
+            assert!(
+                (*got - *want).length() < 1.0e-4,
+                "{what}: expected {expected:?}, got {found:?}",
+            );
+        }
+    }
+
+    /// BEVEL.md §7.6.2 case 3, the **collinear flank-and-leg** sector. Bevel the folded
+    /// T's `E_L` and `E_T` — a beveled valence of 2 at `O`, but turning a right angle
+    /// instead of running through. The sector on the far side spans the *unbeveled*
+    /// `E_R`, which straddles the fold (`z = 0` faces one side, the `z = -y` pentagon the
+    /// other), so it is case 3 — and `E_L` is **collinear** with that leg, so `E_L`'s
+    /// local normal (flank × leg) is exactly zero.
+    ///
+    /// That zero is load-bearing: §7.6.2's sign fix has no rescue, so the zero survives,
+    /// zeroes `E_L`'s perpendicular, and leaves `E_L`'s offset line running through `O`
+    /// along the `x` axis un-offset. It crosses `E_T`'s offset line at `(0.25, 0, 0)` — in
+    /// the `z = 0` plane its own line lies in. Rescuing the zero to the adjacent face's
+    /// normal instead pushes that base point a whole `offset` into the fold plane and
+    /// lands the boundvert at `(0.25, -0.13258, 0.13258)`.
+    ///
+    /// The two rows are mirror images of each other and that is the point: `E_L + E_T`
+    /// reaches the zero through one slot of the case-3 branch and `E_R + E_T` through the
+    /// *other*, so a fix applied to only one of `normal_first` / `normal_second` fails
+    /// exactly one row. Each row therefore names its own slot and carries its own failure
+    /// label.
+    #[test]
+    fn junction_case3_collinear_flank_and_leg_leaves_the_offset_line_through_v() {
+        for (pair, leg_index, zero_slot, expected, label) in [
+            (
+                [0usize, 2],
+                1usize,
+                [true, false],
+                [Vec3::new(-0.25, 0.25, 0.0), Vec3::new(0.25, 0.0, 0.0)],
+                "E_L + E_T: the collinear flank opens the sector, so the zero is reached \
+                 through `normal_first` and the `walk_first` corner's leg",
+            ),
+            (
+                [1usize, 2],
+                0usize,
+                [false, true],
+                [Vec3::new(-0.25, 0.0, 0.0), Vec3::new(0.25, 0.25, 0.0)],
+                "E_R + E_T: the mirror — the collinear flank closes the sector, so the zero \
+                 is reached through `normal_second` and the `between_edges.last()` leg",
+            ),
+        ] {
+            let (mut mesh, interior, verts) = folded_tee_junction();
+            let junction_vert = verts[1];
+            let junction = mesh.vertex_position(junction_vert);
+
+            let beveled = [interior[pair[0]], interior[pair[1]]];
+            let is_beveled = |edge: EdgeKey| beveled.contains(&edge);
+            let leg = interior[leg_index];
+            let sector = sector_split(
+                &mesh.vertex_bevel_corner_ring(junction_vert, &is_beveled),
+                &is_beveled,
+            )
+            .into_iter()
+            .find(|s| s.corners.iter().any(|&(edge, _)| edge == leg))
+            .expect("the sector spanning the unbeveled leg");
+            let layout = mesh
+                .sector_layout(junction_vert, junction, &sector)
+                .expect("a two-flank sector has a layout");
+            assert!(
+                layout.non_planar,
+                "{label}: fixture sanity — the leg straddles the fold, so this is case 3",
+            );
+            assert_eq!(
+                [
+                    layout.normal_first == Vec3::ZERO,
+                    layout.normal_second == Vec3::ZERO,
+                ],
+                zero_slot,
+                "{label}",
+            );
+
+            let result = mesh.bevel(
+                &[interior[pair[0]].into(), interior[pair[1]].into()],
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments: 1,
+                    profile: 0.5,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    ..Default::default()
+                },
+            );
+            let found = junction_boundverts(&mesh, &result, junction);
+            assert_boundverts(&found, &expected, label);
+            // The rescued-normal answer sits in the fold plane `z = -y`; the correct one
+            // is in `z = 0`. Pin the plane directly so a near-miss cannot pass.
+            for point in &found {
+                assert!(
+                    point.z.abs() < 1.0e-5,
+                    "{label}: every boundvert of this junction stays in the z = 0 plane, \
+                     got {point:?}",
+                );
+            }
+            mesh.validate_topology();
+        }
+    }
+
+    /// The limiting case of the one above: a case-3 sector whose in-between leg has **no
+    /// direction at all**, its far endpoint sitting on the junction. §7.6.2's case-3 recipe
+    /// crosses each flank with that leg and normalises, so a directionless leg is a zero
+    /// cross exactly as a collinear one is, and the shared zero-returning floor answers
+    /// both the same way — both local normals zero, both perpendiculars zero, both offset
+    /// lines through `O`, and the meet on `O` itself.
+    ///
+    /// Here *both* slots go to zero at once (the sector's single leg is simultaneously the
+    /// `walk_first` corner's leg and `between_edges.last()`), which is what distinguishes
+    /// this from the collinear pair above. Substituting either flanking face's normal
+    /// instead pushes both base points a whole `offset` out and moves the meet off `O`.
+    ///
+    /// Two poses of `A`, pinning two different things:
+    ///
+    /// - **`A` exactly on `O`** — the rule pin. The leg is identically zero, so flank × leg
+    ///   is exactly zero and the answer holds under *any* direction floor. `E_L` is a leg
+    ///   here and not a beveled edge, so a zero-length one is legal input.
+    /// - **`A` a hair off `O`** — a **floor-width** pin, not a rule pin. `1e-8` sits above
+    ///   the guide's cross floor but below `edge_direction_from`'s `f32::EPSILON` guard, so
+    ///   the zero here comes from loopmesh's leg-direction floor being the wider of the two.
+    ///   Unifying that floor across the operator is expected to flip this arm to a
+    ///   well-conditioned unit local normal and a base point a full `offset` off `O`, and
+    ///   that flip is a fix, not a regression.
+    #[test]
+    fn junction_case3_directionless_leg_zeroes_both_local_normals() {
+        for (left_arm, label) in [
+            (Vec3::ZERO, "A on O (rule pin)"),
+            (
+                Vec3::new(-1.0e-8, 0.0, 0.0),
+                "A a hair off O (floor-width pin)",
+            ),
+        ] {
+            let (mut mesh, interior, verts) = folded_tee_junction_with_left_arm_at(left_arm);
+            let junction_vert = verts[1];
+            let junction = mesh.vertex_position(junction_vert);
+
+            let beveled = [interior[1], interior[2]];
+            let is_beveled = |edge: EdgeKey| beveled.contains(&edge);
+            let sector = sector_split(
+                &mesh.vertex_bevel_corner_ring(junction_vert, &is_beveled),
+                &is_beveled,
+            )
+            .into_iter()
+            .find(|s| s.corners.iter().any(|&(edge, _)| edge == interior[0]))
+            .expect("the sector spanning the degenerate leg");
+            let layout = mesh
+                .sector_layout(junction_vert, junction, &sector)
+                .expect("a two-flank sector has a layout");
+
+            assert!(
+                layout.non_planar,
+                "{label}: fixture sanity — the leg still straddles the fold, so this is \
+                 case 3; the two flanking faces stay well-conditioned even though the leg \
+                 between them does not",
+            );
+            assert!(
+                mesh.edge_direction_from(interior[0], junction_vert, junction)
+                    .is_none(),
+                "{label}: fixture sanity — the leg has no direction at all",
+            );
+            assert_eq!(
+                [
+                    layout.normal_first,
+                    layout.normal_second,
+                    layout.perp_first,
+                    layout.perp_second,
+                ],
+                [Vec3::ZERO; 4],
+                "{label}: a directionless leg zeroes both local normals, and both \
+                 perpendiculars with them",
+            );
+
+            let offset = 0.25_f32;
+            let meet = mesh.solve_meet_point(junction_vert, junction, &sector, offset);
+            assert!(
+                (meet - junction).length() < 1.0e-5,
+                "{label}: both offset lines run through `O` un-offset, so they cross there; \
+                 got {meet:?}",
+            );
+
+            // A sector whose boundvert collapses onto `v` is exactly the shape that can hand
+            // the adjacent sectors coincident boundverts and zero-length strip edges.
+            let result = mesh.bevel(
+                &beveled.map(Into::into),
+                BevelOptions {
+                    offset,
+                    affect: BevelAffect::Edges,
+                    segments: 1,
+                    profile: 0.5,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    ..Default::default()
+                },
+            );
+            assert!(!result.verts.is_empty(), "{label}: the bevel produced a ring");
+            mesh.validate_topology();
+        }
+    }
+
+    /// The control for the case above: the **collinear** pair `E_L` + `E_R` at the same
+    /// junction, same parameters. Both of its sectors are claimed by §7.6.2's
+    /// near-collinear ladder (the two flanks run straight through `O`), so neither builds
+    /// an offset line at all and the sign fix is never reached — the upper sector pushes
+    /// perpendicular in `z = 0`, the lower one in the fold plane `z = -y`.
+    #[test]
+    fn collinear_beveled_pair_at_the_folded_tee_junction_pushes_perpendicular() {
+        let (mut mesh, interior, verts) = folded_tee_junction();
+        let junction = mesh.vertex_position(verts[1]);
+        let result = mesh.bevel(
+            &[interior[0].into(), interior[1].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 1,
+                profile: 0.5,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        let found = junction_boundverts(&mesh, &result, junction);
+        assert_boundverts(
+            &found,
+            &[
+                Vec3::new(0.0, -0.176_776_7, 0.176_776_7),
+                Vec3::new(0.0, 0.25, 0.0),
+            ],
+            "collinear beveled pair at the fold",
+        );
+        mesh.validate_topology();
     }
 
     /// BEVEL.md §8.6.3.1(6) A.1/A.3/A.4 on the folded T-junction. The `±x` pair is **one** run
@@ -49849,9 +50168,20 @@ fn terminal_leg_meet(meet: TerminalLegMeet) -> TerminalPlacement {
             let cross_normal = dir_second.cross(dir_first);
             let length = cross_normal.length();
             if length <= f32::EPSILON {
-                // Collinear to floating-point exactness — deep inside regime 1's band, so
-                // the dispatch above has already taken it. Kept as a division guard, and
-                // routed to the same placement so it cannot answer differently.
+                // Meant as an unreachable division guard: collinear to floating-point
+                // exactness is deep inside regime 1's band, so the dispatch above should
+                // already have taken it, and this routes to the same placement so it
+                // cannot answer differently.
+                //
+                // It is not actually unreachable. This is the operator's one surviving
+                // hand-rolled `normalise`: the floor is `f32::EPSILON` on the **unsquared**
+                // length with the `<=` sense, against `normalise_at_direction_floor`'s
+                // `SLIDE_DIRECTION_FLOOR_SQ` on the squared length with `>`. And because
+                // `dir_first` / `dir_second` are **raw**, the guard scales with the mesh:
+                // at a world scale of `~1e-4` an ordinary right-angle terminal crosses to
+                // `~1e-8` and is diverted here with `direction_angle` nowhere near regime 1.
+                // Unifying the two spellings is its own change — the sign fix below has to
+                // move with the floor, and the degenerate-return contract changes with it.
                 return TerminalPlacement::Degenerate(degenerate_meet_placement(
                     endpoint,
                     first_far,
