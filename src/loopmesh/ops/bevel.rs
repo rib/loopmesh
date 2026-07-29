@@ -3896,14 +3896,7 @@ impl LoopMesh {
         for index in 1..segments as usize {
             let from_first = first_samples[index];
             let from_second = second_samples[segments as usize - index];
-            // The midpoint, except where exactly one profile collapsed to a chord — then
-            // the curved one's sample stands. (That is precisely the case in which the
-            // override above was abandoned and the two samplings were never reconciled.)
-            let position = match (first.collinear, second.collinear) {
-                (true, false) => from_second,
-                (false, true) => from_first,
-                _ => (from_first + from_second) * 0.5,
-            };
+            let position = merge_welded_sample(&first, &second, from_first, from_second);
             // §5.2.4: not yet minted from the corner.
             let welded = self.create_vertex(position);
             result.verts.push(welded);
@@ -9004,7 +8997,7 @@ impl LoopMesh {
                 continue;
             }
             let straight =
-                is_degenerate_direction_angle(direction_angle_between(-dir_open, dir_close));
+                is_degenerate_direction_angle(unit_chord_angle_between(-dir_open, dir_close));
             split.push((!straight).then_some((dir_open, dir_close)));
         }
         if reflex_count > 1 || (reflex_count == 1 && miter.outer != BevelMiter::Sharp) {
@@ -10114,7 +10107,7 @@ impl LoopMesh {
         // both halves of the ladder then share one closed form in
         // `degenerate_meet_placement`, the doubled-back arm sliding along `bounding_edges[1]`
         // — the pair's second member, whose far position `far_second` is.
-        let direction_angle = direction_angle_between(-dir_first, dir_second);
+        let direction_angle = unit_chord_angle_between(-dir_first, dir_second);
         if is_degenerate_direction_angle(direction_angle) {
             return degenerate_meet_placement(
                 vertex_position,
@@ -16712,6 +16705,110 @@ mod tests {
         }
     }
 
+    /// The **collinear control** for §8.2.2.1's zero-cell-axis rule: the flat-grid cross
+    /// weld, where the tier-3 collapse fires for *both* profiles and must stay exactly
+    /// where it was.
+    ///
+    /// §8.3.0.3's oracle: *"on a flat grid, bevel the two **opposite** spokes of an interior
+    /// valence-4 vertex … `v` then lies exactly on the `B_0`–`B_1` chord, both profiles
+    /// collapse, and the welded chain is the plain even subdivision of the straight chord:
+    /// with `v = (1, 1, 0)`, `offset = 0.25`, `B_0 = (1, 1.25, 0)`, `B_1 = (1, 0.75, 0)`,
+    /// the interiors are `(1, 1, 0)` at `segments = 2`; `(1, 1.08333, 0)` and
+    /// `(1, 0.91667, 0)` at `3`; and `(1, 1.125, 0)`, `(1, 1, 0)`, `(1, 0.875, 0)` at `4` —
+    /// **identical at `profile = 0.3`, `0.5` and `0.8`**, which is the signature of a
+    /// collapsed profile: the cross-section exponent stops mattering."*
+    ///
+    /// This is the arm the zero-axis case must **not** be conflated with. Both reach the
+    /// even chord, but by different routes and carrying different flags — here the profiles
+    /// are flagged linear and their projection setup is zeroed, and §8.3.0.3 contrasts the
+    /// two directly: *"Contrast the zero-axis case at a clear apex, where only **one** half
+    /// of the merge is exponent-independent."*
+    #[test]
+    fn edge_bevel_collinear_cross_weld_is_the_exponent_independent_even_chord() {
+        let build_grid = || {
+            let mut grid = LoopMesh::new();
+            let grid_verts: Vec<VertexKey> = (0..3)
+                .flat_map(|row| (0..3).map(move |col| (row, col)))
+                .map(|(row, col)| grid.create_vertex(Vec3::new(col as f32, row as f32, 0.0)))
+                .collect();
+            for row in 0..2usize {
+                for col in 0..2usize {
+                    let ring = [
+                        grid_verts[row * 3 + col],
+                        grid_verts[row * 3 + col + 1],
+                        grid_verts[(row + 1) * 3 + col + 1],
+                        grid_verts[(row + 1) * 3 + col],
+                    ];
+                    grid.face_create_verts(&ring, FaceCreateFlags::NONE);
+                }
+            }
+            (grid, grid_verts)
+        };
+        let junction = Vec3::new(1.0, 1.0, 0.0);
+        let boundvert_0 = Vec3::new(1.0, 1.25, 0.0);
+        let boundvert_1 = Vec3::new(1.0, 0.75, 0.0);
+
+        // Fixture sanity, stated on the *inputs* §8.3.0.3 names rather than on the emitted
+        // chain: `v` lies exactly on the `B_0`–`B_1` chord — its two cell axes are exactly
+        // anti-parallel — which is what collapses **both** profiles.
+        assert!(
+            near_collinear_control_points(boundvert_0, junction, boundvert_1)
+                && (junction - (boundvert_0 + boundvert_1) * 0.5).length() < 1.0e-6,
+            "fixture sanity: `v` is the chord midpoint, so both profiles collapse",
+        );
+
+        for (segments, interiors) in [
+            (2u32, vec![1.0_f32]),
+            (3, vec![0.916_666_7, 1.083_333_3]),
+            (4, vec![0.875, 1.0, 1.125]),
+        ] {
+            for profile in [0.3_f32, 0.5, 0.8] {
+                let (mut mesh, grid_verts) = build_grid();
+                let west = mesh
+                    .query_edge_exists(grid_verts[4], grid_verts[3])
+                    .expect("the −x spoke");
+                let east = mesh
+                    .query_edge_exists(grid_verts[4], grid_verts[5])
+                    .expect("the +x spoke");
+                let result = mesh.bevel(
+                    &[west.into(), east.into()],
+                    BevelOptions {
+                        offset: 0.25,
+                        affect: BevelAffect::Edges,
+                        segments,
+                        profile,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+                let mut chain: Vec<f32> = result
+                    .verts
+                    .iter()
+                    .map(|&v| mesh.vertex_position(v))
+                    .filter(|p| (p.x - 1.0).abs() < 1.0e-4 && (p.y - 1.0).abs() < 0.4)
+                    .map(|p| p.y)
+                    .collect();
+                chain.sort_by(f32::total_cmp);
+                let mut expected = vec![boundvert_1.y];
+                expected.extend_from_slice(&interiors);
+                expected.push(boundvert_0.y);
+                assert_eq!(
+                    chain.len(),
+                    expected.len(),
+                    "segments = {segments}, profile = {profile}: welded chain {chain:?}",
+                );
+                for (got, want) in chain.iter().zip(&expected) {
+                    assert!(
+                        (got - want).abs() < 1.0e-4,
+                        "segments = {segments}, profile = {profile}: expected {expected:?}, \
+                         got {chain:?} — a collapsed profile's chain is the even chord at \
+                         every exponent",
+                    );
+                }
+            }
+        }
+    }
+
     /// BEVEL.md §8.3.0.3's attribute note: at the **cross** weld the chain reads as the
     /// continuation of the two crossing legs, so its edges take those legs' flags — the
     /// seam only crosses if it crosses on **both** sides, and the shading stays smooth
@@ -17370,6 +17467,87 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.3.0.3's merge rule, and the construct it scopes its exception to.
+    ///
+    /// The rule is *"`w_t` is the midpoint of `p_a` and `p_b` — except that for a
+    /// non-custom profile in which **exactly one** of the two has degenerated to a
+    /// straight chord (§8.2.2.1's **tier-3 collapse**), `w_t` is the curved one's sample
+    /// instead."* The named construct is the tier-3 collapse, whose signature §8.2.2.1
+    /// gives as *"'`projection_dir` is zero' is thus the machine-checkable signature of a
+    /// collapsed profile"* — **not** the cell being chord-*shaped*, which is a different
+    /// question with its own flag. The last arm below is the one that separates them.
+    #[test]
+    fn weld_merge_exception_is_scoped_to_the_tier3_collapse_not_to_a_chord_shape() {
+        let start = Vec3::new(2.0, 1.0, 0.0);
+        let end = Vec3::new(4.0, 3.0, 0.0);
+        let from_first = Vec3::new(0.0, 0.0, 0.0);
+        let from_second = Vec3::new(1.0, 0.0, 0.0);
+        let midpoint = (from_first + from_second) * 0.5;
+
+        let curved = {
+            let mut cell = ProfileCell::new(start, end, Vec3::ZERO, Vec3::X);
+            cell.rescue_degenerate_mid(&MidRescue::tier1_only(Vec3::new(2.0, 3.0, 0.0)));
+            assert!(!cell.is_tier3_collapsed(), "tier 1 keeps a projection");
+            cell
+        };
+        let collapsed = {
+            let mut cell = ProfileCell::new(start, end, Vec3::ZERO, Vec3::X);
+            cell.rescue_degenerate_mid(&MidRescue::tier1_only(Vec3::new(0.0, -1.0, 0.0)));
+            assert!(cell.is_tier3_collapsed(), "tier 3 zeroes the projection");
+            cell
+        };
+
+        assert_eq!(
+            merge_welded_sample(&curved, &curved, from_first, from_second),
+            midpoint,
+            "two curved profiles: the plain midpoint",
+        );
+        assert_eq!(
+            merge_welded_sample(&collapsed, &collapsed, from_first, from_second),
+            midpoint,
+            "two collapsed profiles: still the plain midpoint — the exception needs \
+             EXACTLY one",
+        );
+        assert_eq!(
+            merge_welded_sample(&collapsed, &curved, from_first, from_second),
+            from_second,
+            "exactly one collapsed: the curved one's sample stands",
+        );
+        assert_eq!(
+            merge_welded_sample(&curved, &collapsed, from_first, from_second),
+            from_first,
+            "and symmetrically, whichever side carries the chord",
+        );
+
+        // The separating arm, posed on the one **production-reachable** cell that emits a
+        // straight chord without being the collapse: §8.2.2.1's zero cell axis. The crossed
+        // edge's line meets the chord line *at* `end`, so `mid = end` and `b_axis` is zero.
+        // The rescue-entry predicate reads that cell as `60°` and skips it, so it keeps its
+        // projection direction and is never flagged linear; only the frame builder declines.
+        // This is exactly the folded tee's spoke half, and §8.3.0.3 scopes its exception to
+        // the collapse, so this pair takes the plain midpoint.
+        let zero_axis = {
+            let mut cell = ProfileCell::new(start, end, end, Vec3::Z);
+            cell.rescue_degenerate_mid(&MidRescue::tier1_only(Vec3::new(2.0, 3.0, 0.0)));
+            cell
+        };
+        assert_eq!(zero_axis.mid, end, "the meet lands on the chain endpoint");
+        assert!(
+            zero_axis.emits_straight_chord() && !zero_axis.collinear,
+            "the frame declines, but the rescue never ran, so nothing flagged it linear",
+        );
+        assert!(
+            !zero_axis.is_tier3_collapsed(),
+            "and it kept its projection direction — it is not the tier-3 collapse",
+        );
+        assert_eq!(
+            merge_welded_sample(&zero_axis, &curved, from_first, from_second),
+            midpoint,
+            "a chord-emitting cell that is not the tier-3 collapse the exception names, so \
+             the merge averages rather than picking the curved sample",
+        );
+    }
+
     /// BEVEL.md §8.2.2.1: a profile cell's degeneracy is an **angle** band — `EPS_ANG =
     /// 2°` from straight or from folded-back, on the two *normalised* axes — and never a
     /// floor on the raw cross-product length. An area reading is wrong in both
@@ -17421,6 +17599,291 @@ mod tests {
             "a 45° cell on 1e-3 legs reads below a 1e-6 area floor",
         );
         assert!(!small.collinear, "but 45° is nowhere near the band");
+    }
+
+    /// BEVEL.md §8.6.3.1's `angle_between` convention — the one measure the operator
+    /// carries — and the `60°` its degenerate input yields.
+    ///
+    /// §8.6.3.1: *"a zero input gives `dot(d̂, â) = 0`, which takes the **acute** arm. With
+    /// one input zero the difference chord is the surviving unit vector's own length, `1`:
+    /// `turn = 2·asin(1/2) = π/3 = 60°` — a fixed constant, independent of the other
+    /// input."* And: *"**Both tangents zero is a different answer** … the difference chord
+    /// is `|0 − 0| = 0`, and the segment scores `0°`."*
+    ///
+    /// The two spellings §8.6.3.1 names as wrong are pinned as non-answers, because one of
+    /// them inverts §8.2.2.1's zero-cell-axis branch: *"`atan2(cross, dot)` … returns `0°`
+    /// … `0°` falls inside the `2°` band, so the rescue runs and the welded chain moves."*
+    /// The other, normalise-then-`acos(dot)`, returns `90°` and reaches the same verdict
+    /// here for the wrong reason.
+    #[test]
+    fn angle_between_is_the_chord_measure_and_reads_a_zero_input_as_sixty_degrees() {
+        let sixty = std::f32::consts::FRAC_PI_3;
+        for other in [Vec3::X, Vec3::new(0.0, -3.0, 4.0), Vec3::splat(-1.0)] {
+            for degenerate in [
+                unit_chord_angle_between(Vec3::ZERO, other),
+                unit_chord_angle_between(other, Vec3::ZERO),
+            ] {
+                assert!(
+                    (degenerate - sixty).abs() < 1.0e-6,
+                    "a zero input scores a constant 60°, independent of the other input; \
+                     got {}°",
+                    degenerate.to_degrees(),
+                );
+                assert!(
+                    degenerate.to_degrees() > 2.0,
+                    "and 60° is outside EPS_ANG — the `atan2` spelling's 0° is not",
+                );
+            }
+        }
+        assert_eq!(
+            unit_chord_angle_between(Vec3::ZERO, Vec3::ZERO),
+            0.0,
+            "both inputs zero is a different answer: a zero chord, so 0°",
+        );
+
+        // The ordinary range still agrees with the textbook angle, to well inside the
+        // `2°` band the predicate is stated against.
+        for degrees in [1.0_f32, 45.0, 90.0, 135.0, 179.0] {
+            let radians = degrees.to_radians();
+            let measured = unit_chord_angle_between(
+                Vec3::X,
+                Vec3::new(radians.cos(), radians.sin(), 0.0),
+            );
+            assert!(
+                (measured.to_degrees() - degrees).abs() < 1.0e-3,
+                "{degrees}° measured as {}°",
+                measured.to_degrees(),
+            );
+        }
+
+        assert!(
+            !near_parallel_directions(Vec3::ZERO, Vec3::X),
+            "so the rescue-entry predicate answers FALSE on a zero axis — the cell never \
+             reaches the ladder at all",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1 ["The other degeneracy"]: `mid` coincident with a chain endpoint —
+    /// a zero cell axis — is **not** a tier-3 collapse, and the rescue is never entered.
+    ///
+    /// The three consequences the guide lists, in order:
+    ///
+    /// 1. *"The rescue does not fire, and the cell is not a collapse. … The profile keeps
+    ///    its cross-section exponent (it is **not** flagged linear), keeps `plane_point =
+    ///    start`, and keeps `projection_dir = edge_dir`. … The only frame field that does
+    ///    degenerate is `mid_plane_normal` … and is therefore **zero**."*
+    /// 2. *"The frame cannot be built, and the builder's own test is what catches it."*
+    /// 3. *"When the builder returns nothing, the chain's interior is the even straight
+    ///    subdivision `lerp(start, end, k / segments)`"* — *"not the cross-section's own
+    ///    spacing"*.
+    ///
+    /// **Which threshold this fixture is degenerate under.** It is degenerate under
+    /// [`cell_frame_is_wellformed`]'s clause (1) — `b_axis` is `Vec3::ZERO` **exactly, component-wise**,
+    /// which is the guide's own test verbatim. It is *not* degenerate under the rescue's
+    /// `2°` band (it reads the guide's stated `60°`), and it is *not* degenerate under any
+    /// loopmesh length floor: no floor is consulted on this path at all.
+    #[test]
+    fn zero_cell_axis_declines_the_frame_without_collapsing_the_profile() {
+        // The §8.3.0.3 asymmetric weld's spoke: `E` along `x` through the origin, and the
+        // chord line meeting it exactly at `end`.
+        let start = Vec3::new(-0.25, 0.25, 0.0);
+        let end = Vec3::new(0.25, 0.0, 0.0);
+        let edge_dir = Vec3::new(-1.0, 0.0, 0.0);
+        let mut cell = ProfileCell::new(start, end, Vec3::ZERO, edge_dir);
+
+        assert_eq!(cell.mid, end, "the meet lands exactly on the chain endpoint");
+        assert_eq!(
+            cell.mid - cell.end,
+            Vec3::ZERO,
+            "so one cell axis is exactly zero, component-wise",
+        );
+        assert!(
+            !cell.collinear,
+            "consequence 1: the rescue-entry predicate reads 60°, so it answers false",
+        );
+        assert_eq!(
+            cell.projection_dir, edge_dir,
+            "consequence 1: `projection_dir` is untouched — only tier 3 zeroes it",
+        );
+        assert!(
+            !cell.is_tier3_collapsed(),
+            "consequence 1: and the profile is therefore not flagged linear",
+        );
+        assert_eq!(
+            cell.mid_plane_normal,
+            Vec3::ZERO,
+            "consequence 1: the one field that does degenerate — the axes' cross product",
+        );
+        assert!(
+            !cell.frame_is_wellformed(),
+            "consequence 2: the frame builder's clause (1) declines",
+        );
+
+        // Consequence 1 again, from the other end: running the rescue changes nothing,
+        // because its gate never opens.
+        let before = cell.mid;
+        cell.rescue_degenerate_mid(&MidRescue::tier1_only(Vec3::ZERO));
+        assert_eq!(cell.mid, before, "the rescue is not entered");
+        assert_eq!(cell.projection_dir, edge_dir, "nor re-planed");
+
+        // Consequence 3: the even straight subdivision, at `k / segments` — NOT the
+        // cross-section's own spacing, which at `segments = 2` would put the sample at
+        // chord fraction `0.7071` (§8.2.2.1's rung 2).
+        for segments in [2u32, 3, 4] {
+            let chain = cell.chain_positions(segments, 0.5, None, ChainEmission::Raw);
+            for k in 0..=segments {
+                let want = start + (end - start) * (k as f32 / segments as f32);
+                assert!(
+                    (chain[k as usize] - want).length() < 1.0e-6,
+                    "segments = {segments}, k = {k}: expected {want:?}, got {:?}",
+                    chain[k as usize],
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.2.2.1's cell frame builder, clause by clause. The two clauses differ in
+    /// shape on purpose and neither is a restatement of the rescue's band: *"clause (1) is
+    /// an exact equality on a quantity the band cannot express, and clause (2) is one-sided
+    /// where the band is two-sided."*
+    ///
+    /// **Clause (1) is exact, and its discontinuity is the reference's.** §8.2.2.1: *"When
+    /// the coincidence is exact the builder declines … When it is off by even a single ulp
+    /// the builder **succeeds**."* The perturbed cell below is degenerate under **neither**
+    /// threshold: not the guide's exact-zero clause (1), and not loopmesh's shared direction
+    /// floor — §8.2.2.1 measures that band as empty here, *"that floor is
+    /// `DIRECTION_FLOOR_SQ = 1e-35`, a length of `3.2e-18` … the smallest non-zero `f32`
+    /// difference is already about `3e-8`, ten orders of magnitude above it."*
+    ///
+    /// **Clause (2) is the `180°` end only**, at the guide's `EPS_ANG = 2°`; the `0°` arm is
+    /// absent because *"a `0°` pair means `mid` sits on the chord line outside the segment,
+    /// which the rescue upstream has already caught"*. Both arms are probed a tenth of a
+    /// degree either side of `2°`, so the pin is on the guide's threshold rather than on
+    /// any loopmesh epsilon.
+    #[test]
+    fn cell_frame_clause_one_is_exact_and_clause_two_is_one_sided() {
+        let start = Vec3::new(-0.25, 0.25, 0.0);
+        let end = Vec3::new(0.25, 0.0, 0.0);
+
+        assert!(
+            !cell_frame_is_wellformed(start, end, end),
+            "clause (1): `mid` on `end` — `b_axis` exactly zero",
+        );
+        assert!(
+            !cell_frame_is_wellformed(start, start, end),
+            "clause (1): and its mirror, `mid` on `start`",
+        );
+
+        // One ulp off in `x` — a miss of ≈ 1.5e-8 world units, ten orders above the
+        // direction floor and so a perfectly ordinary unit vector once normalised.
+        let barely_off = Vec3::new(f32::from_bits(end.x.to_bits() + 1), end.y, end.z);
+        let miss = (barely_off - end).length();
+        assert!(
+            (1.0e-9..1.0e-6).contains(&miss),
+            "fixture sanity: the miss is ULP-scale but far above any length floor: {miss}",
+        );
+        assert!(
+            cell_frame_is_wellformed(start, barely_off, end),
+            "clause (1) is an exact equality: one ulp off and the frame IS built",
+        );
+
+        // Clause (2): the anti-parallel end of the band, and only that end. Build a `mid`
+        // that sits on the chord line at a controlled angular departure from anti-parallel
+        // by shifting it off the chord by a known perpendicular amount.
+        let chord = end - start;
+        let perpendicular = Vec3::new(-chord.y, chord.x, 0.0).normalize();
+        let anti_parallel_at = |departure_degrees: f32| {
+            // `mid` at the chord midpoint pushed sideways: the two axes then enclose
+            // `180° − 2·atan(sideways / half_chord)`.
+            let half = chord.length() * 0.5;
+            let sideways = half * (departure_degrees.to_radians() * 0.5).tan();
+            (start + end) * 0.5 + perpendicular * sideways
+        };
+        assert!(
+            !cell_frame_is_wellformed(start, anti_parallel_at(1.9), end),
+            "clause (2): 1.9° from anti-parallel is inside EPS_ANG, so the frame declines",
+        );
+        assert!(
+            cell_frame_is_wellformed(start, anti_parallel_at(2.1), end),
+            "clause (2): 2.1° is outside, so it builds — the threshold is the guide's 2°",
+        );
+
+        // The `0°` arm: `mid` on the chord line *outside* the segment, so the two axes are
+        // near-*parallel*. The rescue owns that case; the builder must not also claim it.
+        let outside = start + chord * 2.0;
+        assert!(
+            near_parallel_directions(outside - start, outside - end),
+            "fixture sanity: the rescue's two-sided band does read this cell as degenerate",
+        );
+        assert!(
+            cell_frame_is_wellformed(start, outside, end),
+            "clause (2) has no 0° arm — the builder still builds this frame",
+        );
+    }
+
+    /// BEVEL.md §8.2.2.1's **rung 2** and its two mirrors. When the meet misses the
+    /// endpoint by an ulp the frame *is* built, with one near-zero column, and the cell map
+    /// `origin + u·a_axis + v·b_axis` collapses onto the same chord — but parameterised by
+    /// the cross-section's own spacing, and running from whichever endpoint the surviving
+    /// column leaves standing:
+    ///
+    /// ```text
+    ///   mid coincides with `end`   → b_axis ≈ 0, origin ≈ start
+    ///                              → sample_k = start + x_k · (end − start)
+    ///   mid coincides with `start` → a_axis ≈ 0, origin ≈ end
+    ///                              → sample_k = end   + y_k · (start − end)
+    /// ```
+    ///
+    /// §8.2.2.1: *"These are **different points at every interior index and every
+    /// `segments ≥ 2`** … at `segments = 2` they sit at chord fractions `0.7071` and
+    /// `0.2929` … at `segments = 3` the two interior fractions are `(0.5, 0.8660)` against
+    /// `(0.1340, 0.5)`. … get it backwards and every rung-2 sample lands on the wrong side
+    /// of the chord."*
+    ///
+    /// This is not the rung the canonical fixtures land on — §8.2.2.1 pins those on
+    /// clause (1) — but which mirror the map produces is a property of the map, so it is
+    /// checkable directly and cheaply.
+    #[test]
+    fn near_zero_cell_axis_takes_the_stated_rung_two_mirror() {
+        let start = Vec3::new(-0.25, 0.25, 0.0);
+        let end = Vec3::new(0.25, 0.0, 0.0);
+        let chord = end - start;
+        let nudge = |point: Vec3| Vec3::new(f32::from_bits(point.x.to_bits() + 1), point.y, point.z);
+
+        let fraction_along_chord = |sample: Vec3| (sample - start).dot(chord) / chord.dot(chord);
+
+        for (mid, expected, which) in [
+            (
+                nudge(end),
+                [[0.7071_f32].as_slice(), [0.5, 0.8660].as_slice()],
+                "`mid = end`: b_axis vanishes, so the chord runs from `start` at x_k",
+            ),
+            (
+                nudge(start),
+                [[0.2929_f32].as_slice(), [0.1340, 0.5].as_slice()],
+                "`mid = start`: a_axis vanishes, so it runs from `end` at y_k",
+            ),
+        ] {
+            let cell = ProfileCell::from_control_points(start, end, mid);
+            assert!(
+                cell.frame_is_wellformed(),
+                "{which}: an ULP-scale miss builds the frame",
+            );
+            for (index, segments) in [2u32, 3].iter().copied().enumerate() {
+                let chain = cell.chain_positions(segments, 0.5, None, ChainEmission::Raw);
+                let fractions: Vec<f32> = (1..segments)
+                    .map(|k| fraction_along_chord(chain[k as usize]))
+                    .collect();
+                for (got, want) in fractions.iter().zip(expected[index]) {
+                    assert!(
+                        (got - want).abs() < 1.0e-3,
+                        "{which}, segments = {segments}: expected chord fractions \
+                         {:?}, got {fractions:?}",
+                        expected[index],
+                    );
+                }
+            }
+        }
     }
 
     /// BEVEL.md §8.9.4.1's worked junction: three beveled edges out of `(0, 0, 1)`, one
@@ -36909,7 +37372,7 @@ mod tests {
             .sector_layout(v, v_pos, &sector)
             .expect("a two-flank sector has a layout");
 
-        let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+        let direction_angle = unit_chord_angle_between(-layout.dir_first, layout.dir_second);
         let from_anti_parallel = std::f32::consts::PI - direction_angle;
         assert!(
             from_anti_parallel > 0.0141 && from_anti_parallel < MEET_DIRECTION_EPS_ANGLE,
@@ -37034,7 +37497,7 @@ mod tests {
                 .sector_layout(vertex, vertex_position, &sector)
                 .expect("a two-flank sector has a layout");
 
-            let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+            let direction_angle = unit_chord_angle_between(-layout.dir_first, layout.dir_second);
             assert!(
                 !is_degenerate_direction_angle(direction_angle),
                 "fixture sanity: {}° must sit outside the ladder band, or the general \
@@ -37298,7 +37761,7 @@ mod tests {
                 !layout.non_planar,
                 "fixture sanity: this is a case-1 sector, no in-between legs at all",
             );
-            let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+            let direction_angle = unit_chord_angle_between(-layout.dir_first, layout.dir_second);
             assert!(
                 direction_angle > TERMINAL_DIRECTION_SMALL_ANGLE,
                 "fixture sanity: {}° must clear the shallow exception, which is the one \
@@ -38058,7 +38521,7 @@ mod tests {
             !layout.non_planar,
             "fixture sanity: a flat fan is a case-1/2 sector, the branch under test",
         );
-        let direction_angle = direction_angle_between(-layout.dir_first, layout.dir_second);
+        let direction_angle = unit_chord_angle_between(-layout.dir_first, layout.dir_second);
         assert!(
             !is_degenerate_direction_angle(direction_angle),
             "fixture sanity: θ_dir = {} rad must be outside the ladder band so the general \
@@ -41945,14 +42408,27 @@ mod tests {
     fn folded_tee_junction_with_left_arm_at(
         left_arm: Vec3,
     ) -> (LoopMesh, [EdgeKey; 3], Vec<VertexKey>) {
+        folded_tee_junction_with_branch_at(left_arm, Vec3::new(0.0, 1.0, 0.0))
+    }
+
+    /// `folded_tee_junction` with the beveled **branch** spoke `C` re-aimed, which is the
+    /// axis §8.2.2.1's worked table varies (`B = (0,1,0)`, `(1,1,0)`, `(1,4,0)`). The two
+    /// upper faces' outer corners ride the branch (`P = C − x̂`, `Q = C + x̂`) so both stay
+    /// simple convex quads in `z = 0` at every pose, and the `(0,1,0)` pose reproduces the
+    /// original fixture's coordinates exactly. Only the two faces' *plane* matters to the
+    /// meet, and that is `z = 0` throughout.
+    fn folded_tee_junction_with_branch_at(
+        left_arm: Vec3,
+        branch: Vec3,
+    ) -> (LoopMesh, [EdgeKey; 3], Vec<VertexKey>) {
         let mut mesh = LoopMesh::new();
         let coords = [
             left_arm,                   // A
             Vec3::new(0.0, 0.0, 0.0),   // O
             Vec3::new(1.0, 0.0, 0.0),   // B
-            Vec3::new(0.0, 1.0, 0.0),   // C
-            Vec3::new(-1.0, 1.0, 0.0),  // P
-            Vec3::new(1.0, 1.0, 0.0),   // Q
+            branch,                     // C
+            branch - Vec3::X,           // P
+            branch + Vec3::X,           // Q
             Vec3::new(-1.0, -1.0, 1.0), // R
             Vec3::new(1.0, -1.0, 1.0),  // S
         ];
@@ -42277,6 +42753,201 @@ mod tests {
             [false, false],
             "the branch seeds itself, on a tie",
         );
+    }
+
+    /// BEVEL.md §8.3.0.3's **asymmetric weld** worked check — one rescued curve, one
+    /// zero-axis chord — on the folded tee, over **all six** rows of §8.2.2.1's worked
+    /// table: branch `B = (0,1,0)`, `(1,1,0)` and `(1,4,0)`, each at `segments` 2 and 3.
+    ///
+    /// The junction is the case §8.2.2.1 ["The other degeneracy"] exists for: the beveled
+    /// spoke continues straight through `O` into the **unbeveled** collinear leg, whose
+    /// sector is §7.6.2 case 3 and therefore puts its boundvert `B_1` **on the spoke's own
+    /// line**. The spoke's closest-approach `mid` is where the chord line meets that line,
+    /// which is `B_1` itself — one cell axis exactly zero. So the two welded profiles are
+    /// of different kinds and §8.3.0.3's merge does real work:
+    ///
+    /// - the **branch**'s `mid` lands on the chord line strictly between the endpoints, so
+    ///   its axes are exactly anti-parallel, the rescue fires, and tier 1 puts the bulge at
+    ///   `v` — a curve;
+    /// - the **spoke**'s cell has a zero axis, so the rescue does **not** fire (§8.2.2.1:
+    ///   a zero axis reads `60°`, outside the `2°` band), the frame builder declines, and
+    ///   the chain is the **even straight subdivision** of `B_0`–`B_1`.
+    ///
+    /// The expectation is built here from §8.2.2.1's closed form rather than from copied
+    /// coordinates, so it pins the *rule*: `w_t = ½·(arc_t + chord_t)` with
+    /// `arc_t = v + (1 − x_t)·(B_0 − v) + (1 − y_t)·(B_1 − v)` and
+    /// `chord_t = lerp(B_0, B_1, t / segments)`, `(x_t, y_t) = (sin θ_t, cos θ_t)`,
+    /// `θ_t = t · 90° / segments`.
+    ///
+    /// **`segments = 3` is the discriminating count.** §8.2.2.1: *"Their two samples fit
+    /// **no single quarter-arc** about any apex whatever"* — solving for a common apex
+    /// gives `(0.01117, 0.05692, 0)` from `w_1` and `(−0.01117, 0.06807, 0)` from `w_2` —
+    /// so a rule fitted only to `segments = 2`, where the symmetric cross-section makes the
+    /// two halves collinear with each other, would not be caught.
+    ///
+    /// **And `(0,1,0)` alone is not the discriminating pose.** That branch is perpendicular
+    /// to the spoke and its two boundverts are equidistant from `v`, so a merge that swapped
+    /// the two profiles' roles, or that assumed equal arm lengths, still reproduces it.
+    /// §8.2.2.1 says why the other two rows are in the table: they *"carry the same check
+    /// onto junctions whose two boundverts are at different distances from `v` and whose
+    /// chord is not perpendicular to either spoke."* Both the closed form **and** the
+    /// guide's own printed `w_t` are asserted, so the rule and its worked numbers are pinned
+    /// together.
+    #[test]
+    fn folded_tee_weld_merges_the_tier1_arc_with_the_zero_axis_even_chord() {
+        let junction = Vec3::ZERO;
+
+        // §8.2.2.1's worked table: branch `B`, its two boundverts, and the printed `w_t` at
+        // `segments` 2 and 3.
+        let table = [
+            (
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(-0.25, 0.25, 0.0),
+                Vec3::new(0.25, 0.0, 0.0),
+                vec![Vec3::new(0.0, 0.099_11, 0.0)],
+                vec![
+                    Vec3::new(-0.087_42, 0.145_83, 0.0),
+                    Vec3::new(0.087_42, 0.058_41, 0.0),
+                ],
+            ),
+            (
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-0.103_55, 0.25, 0.0),
+                Vec3::new(0.353_55, 0.0, 0.0),
+                vec![Vec3::new(0.099_11, 0.099_11, 0.0)],
+                vec![
+                    Vec3::new(0.022_20, 0.145_83, 0.0),
+                    Vec3::new(0.182_04, 0.058_41, 0.0),
+                ],
+            ),
+            (
+                Vec3::new(1.0, 4.0, 0.0),
+                Vec3::new(-0.195_19, 0.25, 0.0),
+                Vec3::new(0.257_69, 0.0, 0.0),
+                vec![Vec3::new(0.024_78, 0.099_11, 0.0)],
+                vec![
+                    Vec3::new(-0.053_65, 0.145_83, 0.0),
+                    Vec3::new(0.104_71, 0.058_41, 0.0),
+                ],
+            ),
+        ];
+
+        for (branch, boundvert_0, boundvert_1, worked_two, worked_three) in table {
+            for (segments, worked) in [(2u32, &worked_two), (3, &worked_three)] {
+                let (mut mesh, interior, verts) =
+                    folded_tee_junction_with_branch_at(Vec3::new(-1.0, 0.0, 0.0), branch);
+                assert_eq!(
+                    mesh.vertex_position(verts[1]),
+                    junction,
+                    "fixture sanity: the junction is at the origin",
+                );
+                let result = mesh.bevel(
+                    &[interior[0].into(), interior[2].into()],
+                    BevelOptions {
+                        offset: 0.25,
+                        affect: BevelAffect::Edges,
+                        segments,
+                        profile: 0.5,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+                mesh.validate_topology();
+
+                let mut expected = vec![boundvert_0];
+                for t in 1..segments {
+                    let theta = (t as f32) * std::f32::consts::FRAC_PI_2 / segments as f32;
+                    let arc = junction
+                        + (1.0 - theta.sin()) * (boundvert_0 - junction)
+                        + (1.0 - theta.cos()) * (boundvert_1 - junction);
+                    let chord = boundvert_0
+                        + (boundvert_1 - boundvert_0) * (t as f32 / segments as f32);
+                    expected.push((arc + chord) * 0.5);
+                }
+                expected.push(boundvert_1);
+
+                let what = format!("folded-tee weld, branch = {branch:?}, segments = {segments}");
+                let interior_expected = &expected[1..expected.len() - 1];
+                assert_boundverts(
+                    interior_expected,
+                    worked,
+                    &format!("{what}: closed form vs the guide's printed w_t"),
+                );
+
+                let found = junction_boundverts(&mesh, &result, junction);
+                assert_boundverts(&found, &expected, &what);
+            }
+        }
+    }
+
+    /// The three readings §8.3.0.3's discrimination table kills at the same fixture, pinned
+    /// as *absences* so a regression that reproduces any of them fails loudly. The table's
+    /// own numbers, at `segments = 2`:
+    ///
+    /// | reading | `w_1` | verdict |
+    /// |---|---|---|
+    /// | plain midpoint, zero-axis half = even subdivision (**the rule**) | `(0, 0.09911, 0)` | matches |
+    /// | merge exception fires, curved sample alone | `(0, 0.07322, 0)` | `2589` quanta out |
+    /// | one arc struck about `v` for the whole chain | `(0, 0.07322, 0)` | same point |
+    /// | zero-axis half sampled *through* a near-degenerate cell | `(0.05178, 0.07322, 0)` | `5789` quanta out |
+    ///
+    /// Rows 2 and 3 are the same point by construction. Row 4 is the reference's own
+    /// **rung 2** in the `mid = end` mirror — a real behaviour elsewhere, but not here,
+    /// because this fixture's meet lands exactly on `B_1`.
+    ///
+    /// §8.3.0.3 forecloses the one-arc reading at this fixture by a measured margin rather
+    /// than by fiat: *"Here `B_0 = (−0.25, 0.25, 0)` and `B_1 = (0.25, 0, 0)`, so the chord
+    /// sits **26.57°** off `E` — clear of the band by `26.6°`. … Bending the entry angle
+    /// into the band would need `mid` displaced by roughly `6.7` world units, about `27×`
+    /// the `offset`."* The `4.00° ≤ δ ≤ 6.00°` sliver window where one-arc-about-`v` *is*
+    /// the reference's answer is a sliver-family window and does not reach here.
+    #[test]
+    fn folded_tee_weld_is_not_the_one_arc_nor_the_near_degenerate_cell_reading() {
+        let junction = Vec3::ZERO;
+        let boundvert_0 = Vec3::new(-0.25, 0.25, 0.0);
+        let boundvert_1 = Vec3::new(0.25, 0.0, 0.0);
+
+        // Fixture sanity, on the quantity §8.3.0.3 names: the chord's angle to `E`. `E`
+        // runs along `x`; anything outside `EPS_ANG` forecloses the rescue-entry rung.
+        let chord_vs_edge =
+            unit_chord_angle_between(boundvert_1 - boundvert_0, Vec3::X).to_degrees();
+        assert!(
+            (26.5..26.6).contains(&chord_vs_edge),
+            "the chord sits 26.57° off `E`, far outside the 2° rescue-entry band: \
+             {chord_vs_edge}",
+        );
+
+        let (mut mesh, interior, _) = folded_tee_junction();
+        let result = mesh.bevel(
+            &[interior[0].into(), interior[2].into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 2,
+                profile: 0.5,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        let found = junction_boundverts(&mesh, &result, junction);
+
+        for (wrong, why) in [
+            (
+                Vec3::new(0.0, 0.073_223, 0.0),
+                "rows 2 and 3 — the curved sample alone, i.e. one arc struck about `v` for \
+                 the whole chain",
+            ),
+            (
+                Vec3::new(0.051_777, 0.073_223, 0.0),
+                "row 4 — the zero-axis half sampled *through* a near-degenerate cell, at \
+                 the cross-section's own spacing instead of evenly",
+            ),
+        ] {
+            assert!(
+                found.iter().all(|p| (*p - wrong).length() > 1.0e-3),
+                "{why}: {found:?} must not contain {wrong:?}",
+            );
+        }
     }
 
     /// BEVEL.md §8.6.3.1(6) A.7's load-bearing assertion. The folded T is mirror-symmetric in
@@ -49851,21 +50522,7 @@ const COPLANAR_NORMAL_TOLERANCE: f32 = 1.0e-4;
 /// one-sided formula.
 fn terminal_direction_angle(edge_out: Vec3, leg_out: Vec3, leg_precedes_edge: bool) -> f32 {
     let (first_dir, second_dir) = terminal_meet_directions(edge_out, leg_out, leg_precedes_edge);
-    direction_angle_between(first_dir, second_dir)
-}
-
-/// The §7.6.2 / §7.5.1 **direction** angle of an already-bound pair: `first_dir` taken
-/// *into* the shared vertex, `second_dir` taken *out* of it. Near `0` the two flanks run
-/// straight *through* the vertex; near `π` they double back on one another.
-///
-/// Read off `atan2(|cross|, dot)` rather than `acos(dot)` so it stays conditioned at both
-/// ends of the range — which is where the whole ladder lives — and so the caller need not
-/// hand over unit vectors.
-fn direction_angle_between(first_dir: Vec3, second_dir: Vec3) -> f32 {
-    first_dir
-        .cross(second_dir)
-        .length()
-        .atan2(first_dir.dot(second_dir))
+    unit_chord_angle_between(first_dir, second_dir)
 }
 
 /// §7.5.1's binding of the pair's two directions: the **first** member of the pair (in
@@ -49889,6 +50546,13 @@ fn terminal_meet_directions(
 /// within `EPS_ANG` of `0` (the two flanks run straight through the vertex) or of `π`
 /// (they double back on each other). Neither offset line is well defined there, so no
 /// line solve runs at all. Both tests are strict, and the two bands are disjoint.
+///
+/// The angle handed in is always [`unit_chord_angle_between`] of the pair bound as
+/// §7.5.1 binds it — first member taken *into* the shared vertex, second taken *out* of
+/// it (see [`terminal_meet_directions`]). §7.6.2's ladder writes it as
+/// `θ_dir = angle_between(dir_first, dir_second)`, and §8.6.3.1 scopes that name to one
+/// operator-wide measure: *"Carry **one** `angle_between`."* A second spelling here is
+/// the failure §8.2.2.1 names by construction.
 fn is_degenerate_direction_angle(direction_angle: f32) -> bool {
     direction_angle < MEET_DIRECTION_EPS_ANGLE
         || direction_angle > std::f32::consts::PI - MEET_DIRECTION_EPS_ANGLE
@@ -49898,6 +50562,38 @@ fn is_degenerate_direction_angle(direction_angle: f32) -> bool {
 /// band, which has no meet plane at all) and strictly under `SMALL_ANG`.
 fn is_shallow_direction_angle(direction_angle: f32) -> bool {
     (MEET_DIRECTION_EPS_ANGLE..TERMINAL_DIRECTION_SMALL_ANGLE).contains(&direction_angle)
+}
+
+/// BEVEL.md §8.6.3.1's `angle_between`, the operator-wide measure: **normalise first**,
+/// then read the angle off a *chord* between the two unit vectors, branching on the sign
+/// of their dot with the `dot = 0` boundary taken down the **acute** arm.
+///
+/// The branch is not a tie-break detail — it is the whole of the degenerate answer, and
+/// the degenerate answer decides a branch in two separate places. §8.6.3.1: *"a zero
+/// input gives `dot(d̂, â) = 0`, which takes the **acute** arm. With one input zero the
+/// difference chord is the surviving unit vector's own length, `1`: `turn = 2·asin(1/2)
+/// = π/3 = 60°` — a fixed constant, independent of the other input."* Both inputs zero
+/// gives a zero chord and so `0°`, which is a *different* answer; §8.6.3.1 warns against
+/// generalising the `60°` past the exactly-one-zero case.
+///
+/// Two spellings a reader reaches for first are wrong at exactly that input, and
+/// §8.6.3.1 names both: `atan2(|a × b|, a · b)` on the raw inputs returns `0°`, and
+/// `acos(dot)` after normalising returns `90°`. The `atan2` one is the load-bearing
+/// misreading, because `0°` falls *inside* §8.2.2.1's `2°` band — see
+/// [`near_parallel_directions`], whose zero-axis case §8.2.2.1 ("The other degeneracy")
+/// turns on this `60°`.
+///
+/// Carry **one** of these. This is it; the custom-profile segment ranking of
+/// §8.6.3.1(4).1 spells the same convention over its own 2-D control-net tangents.
+fn unit_chord_angle_between(first: Vec3, second: Vec3) -> f32 {
+    let first_unit = normalise_at_direction_floor(first);
+    let second_unit = normalise_at_direction_floor(second);
+    let chord_angle = |chord: Vec3| 2.0 * (0.5 * chord.length()).clamp(-1.0, 1.0).asin();
+    if first_unit.dot(second_unit) >= 0.0 {
+        chord_angle(first_unit - second_unit)
+    } else {
+        std::f32::consts::PI - chord_angle(first_unit + second_unit)
+    }
 }
 
 /// BEVEL.md §8.2.2.1's degeneracy predicate, on **normalised** directions: two
@@ -49912,13 +50608,52 @@ fn is_shallow_direction_angle(direction_angle: f32) -> bool {
 /// of `1e-3` clear a `1e-6` floor at any angle at all). `2°` is wide enough to be a
 /// *behavioural* boundary between two visibly different constructions rather than a
 /// round-off guard, so neither end of that error is noise.
+///
+/// **A zero input is not "parallel to" anything.** §8.2.2.1 ("The other degeneracy"):
+/// *"A zero axis normalises to zero, and a zero direction is not 'collinear with'
+/// anything: fed to `directions_near_collinear` it comes out **60°** from `0°` and
+/// `120°` from `180°`, so the predicate answers **false** and the rescue is skipped."*
+/// That verdict is scoped to *this* predicate — the degenerate-`mid` rescue's **entry**
+/// test — and it is what keeps a cell with a zero axis out of the rescue ladder
+/// entirely. Catching such a cell is [`cell_frame_is_wellformed`]'s job, on a differently-shaped test.
 fn near_parallel_directions(first: Vec3, second: Vec3) -> bool {
-    let first_unit = first.normalize_or_zero();
-    let second_unit = second.normalize_or_zero();
-    if first_unit == Vec3::ZERO || second_unit == Vec3::ZERO {
-        return true;
+    is_degenerate_direction_angle(unit_chord_angle_between(first, second))
+}
+
+/// BEVEL.md §8.2.2.1's **cell frame builder** and its own well-formedness test — a
+/// separate, later step from the degenerate-`mid` rescue, and deliberately *not* a second
+/// copy of the rescue's ladder. §8.2.2.1: *"it is shorter, asymmetric, and asks 'can this
+/// parallelogram be built at all'."* Two clauses, in this order:
+///
+/// 1. **Either axis exactly zero, component-wise** — *"Not a length floor and not an
+///    angle band."* It runs first, before any normalisation, because it exists for the one
+///    case the rescue's normalised angular predicate structurally cannot see (a zero axis
+///    reads `60°` there, so nothing upstream has certified such a cell), and because a
+///    length floor here would start swallowing thin-but-valid cells. §8.2.2.1 calls this
+///    *"the one place in the cell machinery where a tolerance would be actively wrong"*,
+///    and pins the resulting ULP-scale discontinuity as the reference's own.
+/// 2. **The two normalised axes within `EPS_ANG` of *anti*-parallel** — the `180°` end and
+///    only that end. *"The `0°` arm is absent on purpose: a `0°` pair means `mid` sits on
+///    the chord line outside the segment, which the rescue upstream has already caught."*
+///    This clause is what turns away a tier-3 chord that reached the builder (its two axes
+///    are exactly anti-parallel about the chord midpoint), so the collapsed and the
+///    declined routes agree with no special case.
+///
+/// `false` means the chain emits the **even straight subdivision** of its chord instead of
+/// a cell sample. Under clause (1) that carries *none* of tier 3's other consequences — no
+/// linear flag, no zeroed projection direction — which is precisely what §8.3.0.3's merge
+/// rule reads.
+///
+/// It is a predicate and not a frame *factory* on purpose: the cell map itself is spelled
+/// once, in [`ProfileCell::sample`]. Handing the axes back here would give the map two
+/// spellings that must agree for every cell the builder accepts.
+fn cell_frame_is_wellformed(start: Vec3, mid: Vec3, end: Vec3) -> bool {
+    let a_axis = mid - start;
+    let b_axis = mid - end;
+    if a_axis == Vec3::ZERO || b_axis == Vec3::ZERO {
+        return false;
     }
-    is_degenerate_direction_angle(direction_angle_between(first_unit, second_unit))
+    unit_chord_angle_between(a_axis, b_axis) <= std::f32::consts::PI - MEET_DIRECTION_EPS_ANGLE
 }
 
 /// BEVEL.md §8.2.2.1's `near_collinear` on a profile cell's three control points, with
@@ -50398,6 +51133,54 @@ impl MidRescue {
     }
 }
 
+/// BEVEL.md §8.3.0.3's **merge rule** for one interior index of an `n == 2` junction's
+/// welded chain: *"For each interior index `t = 1 … segments−1`, take `p_a` = `E_a`'s
+/// profile sample at index `t` and `p_b` = `E_b`'s profile sample at index `segments − t`
+/// (both post-override). Then **`w_t` is the midpoint of `p_a` and `p_b`** — except that
+/// when **neither** profile's `profile_type` is `CUSTOM` and **exactly one** of the two
+/// carries §8.2.2.1's **tier-3 linear flag**, `w_t` is the **unflagged** one's sample
+/// instead."*
+///
+/// Three things the exception's predicate is **not**, each of which §8.3.0.3 calls out by
+/// name:
+///
+/// - It is not the *stickiness* mark. §8.3.0.3: *"`profile_type == CUSTOM` is the
+///   cross-section **kind**, not the stickiness mark … every profile at a weld gets
+///   [the mark], by construction, the moment the override is attempted. Read the
+///   exception's predicate as the stickiness mark and it can never fire at a weld at
+///   all."* No custom cross-section reaches this site at all yet (the gap documented on
+///   [`LoopMesh::build_welded_chain`]), so the analytic families all take this arm.
+/// - It is not the emitted *shape*. §8.3.0.3: *"'Has degenerated to a straight chord' is a
+///   fair description of a tier-3 profile but is the wrong test … Test the flag an actual
+///   tier-3 collapse sets; do not re-derive the condition from the samples."* The whole
+///   point is a profile that emits a straight chain **without** being flagged — the
+///   zero-cell-axis case of §8.2.2.1, where the rescue never runs and the straightness
+///   comes from the frame builder declining. Hence [`ProfileCell::is_tier3_collapsed`],
+///   not [`ProfileCell::emits_straight_chord`].
+/// - It is not observable at an `s == 2` weld. §8.3.0.3 proves the only reachable pairing
+///   (one zero-axis profile, one rescued-and-collapsed partner) is a no-op, because both
+///   halves then emit the same even chord and the merge reads them from opposite ends.
+///   *"An implementation that omits the exception entirely is, at an `s == 2` weld,
+///   indistinguishable from one that has it."* It is kept because it is what the reference
+///   tests, not to explain any observed placement.
+///
+/// The exception is the fallback half of the same pair as the override's all-or-nothing
+/// gate: a collapsed profile has no projection direction, so the very configuration that
+/// makes the merge choose rather than average is the one in which the weld-plane override
+/// was abandoned and the two samplings were never reconciled.
+fn merge_welded_sample(
+    first: &ProfileCell,
+    second: &ProfileCell,
+    from_first: Vec3,
+    from_second: Vec3,
+) -> Vec3 {
+    match (first.is_tier3_collapsed(), second.is_tier3_collapsed()) {
+        (true, false) => from_second,
+        (false, true) => from_first,
+        _ => (from_first + from_second) * 0.5,
+    }
+}
+
 /// The 3-D frame of one sector's profile cell (BEVEL.md §8.2.2.1): the three
 /// control points `start` / `end` / `mid` plus the derived in-plane axes and the
 /// mid-plane normal. `start` / `end` are the two ring boundverts the chain spans;
@@ -50430,12 +51213,15 @@ impl ProfileCell {
 
         let a_axis = mid - start;
         let b_axis = mid - end;
-        let cross = a_axis.cross(b_axis);
         let collinear = near_parallel_directions(a_axis, b_axis);
+        // A zero axis leaves the cross exactly zero (§8.2.2.1: "The only frame field that
+        // *does* degenerate is `mid_plane_normal` … and is therefore **zero**"), and the
+        // rescue-entry predicate above reads that cell as `60°`, i.e. not collinear — so
+        // the zero branch cannot be keyed on `collinear` alone.
         let mid_plane_normal = if collinear {
             Vec3::ZERO
         } else {
-            cross.normalize()
+            a_axis.cross(b_axis).normalize_or_zero()
         };
 
         ProfileCell {
@@ -50516,10 +51302,57 @@ impl ProfileCell {
             return;
         }
         let cross = (mid - self.start).cross(mid - self.end);
+        // `cross` is exactly zero when the rescued `mid` lands *on* `start` or `end` — a
+        // zero cell axis, which the re-check above reads as `60°` (§8.2.2.1, "The other
+        // degeneracy") and therefore does not collapse. The ladder is then followed
+        // literally: the rescue re-planes onto its own plane normal, which here is zero,
+        // and `collinear` stays unset because no tier-3 ran. So such a cell reads
+        // `emits_straight_chord` (its frame declines) while `is_tier3_collapsed` reads
+        // **false** — the only state in this type where those two disagree. Both routes
+        // emit the even chord, and §8.3.0.3's merge exception is a no-op at `s == 2`, so
+        // the disagreement is not observable in the emitted positions.
         self.mid = mid;
-        self.mid_plane_normal = cross.normalize();
+        self.mid_plane_normal = cross.normalize_or_zero();
         self.projection_dir = self.mid_plane_normal;
         self.collinear = false;
+    }
+
+    /// Whether this profile went through the §8.2.2.1 **tier-3 collapse** — asked as the
+    /// whole bundle that section gives the collapse, not as the chord *shape* alone.
+    /// §8.2.2.1: *"the profile is flagged **linear**, ... `plane_point`,
+    /// `mid_plane_normal` and `projection_dir` are all **zeroed**. '`projection_dir` is
+    /// zero' is thus the machine-checkable signature of a collapsed profile."*
+    ///
+    /// Neither half alone is that signature for a cell built through
+    /// [`LoopMesh::derive_profile_cell`]. [`ProfileCell::collinear`] is set the moment the
+    /// closest-approach `mid` comes out degenerate, *before* the rescue ladder has decided
+    /// between a recovered frame and a chord; and a zero `projection_dir` alone is also
+    /// what a §7.5.4 zero-length beveled edge hands a perfectly uncollapsed cell. Taken
+    /// together they are exactly "[`ProfileCell::collapse`] ran".
+    ///
+    /// The distinction matters because §8.3.0.3's merge exception is scoped to *"§8.2.2.1's
+    /// tier-3 collapse"* by name — not to every cell that emits a straight chord.
+    fn is_tier3_collapsed(&self) -> bool {
+        self.collinear && self.projection_dir.length_squared() <= f32::EPSILON
+    }
+
+    /// Whether [`cell_frame_is_wellformed`] accepts this cell's parallelogram (BEVEL.md
+    /// §8.2.2.1, "The other degeneracy").
+    fn frame_is_wellformed(&self) -> bool {
+        cell_frame_is_wellformed(self.start, self.mid, self.end)
+    }
+
+    /// Whether the chain through this cell is the **even straight subdivision**
+    /// `lerp(start, end, k / segments)` rather than a cross-section sample.
+    ///
+    /// Two independent routes reach it, and BEVEL.md §8.3.0.3 turns on their being
+    /// distinguishable: the §8.2.2.1 **tier-3 collapse** (which also flags the profile
+    /// linear and zeroes its projection setup), and the frame builder **declining**
+    /// (§8.2.2.1: *"the same points a tier-3 collapse emits, but reached by a different
+    /// route and carrying **none** of tier 3's other consequences"*). Only the first is
+    /// [`ProfileCell::is_tier3_collapsed`].
+    fn emits_straight_chord(&self) -> bool {
+        self.collinear || !self.frame_is_wellformed()
     }
 
     /// The §8.2.2.1 tier-3 collapse: the profile is a straight chord, so `mid` is the
@@ -50599,7 +51432,7 @@ impl ProfileCell {
             mid_plane_normal: if collinear {
                 Vec3::ZERO
             } else {
-                cross.normalize()
+                cross.normalize_or_zero()
             },
             projection_dir: Vec3::ZERO,
             collinear,
@@ -50661,7 +51494,7 @@ impl ProfileCell {
         emission: ChainEmission,
     ) -> Vec<Vec3> {
         let raw = self.raw_chain_positions(segments, profile, custom);
-        if self.collinear {
+        if self.emits_straight_chord() {
             return raw;
         }
         if emission == ChainEmission::Raw {
@@ -50695,7 +51528,7 @@ impl ProfileCell {
     ) -> Vec<Vec3> {
         let mut positions = Vec::with_capacity(segments as usize + 1);
         positions.push(self.start);
-        if self.collinear {
+        if self.emits_straight_chord() {
             for k in 1..segments {
                 let t = k as f32 / segments as f32;
                 positions.push(self.start + (self.end - self.start) * t);
@@ -53291,6 +54124,21 @@ fn circumsphere(points: [Vec3; 4]) -> Option<(Vec3, f32)> {
 /// Intersect the line `point + t·direction` with the plane through `plane_point`
 /// with normal `plane_normal` (BEVEL.md §8.2.2.1 projection). `None` when the
 /// line is parallel to the plane.
+///
+/// **The parallel arm is a required landing point, not a convenience.** §8.2.2.1 ("The
+/// other degeneracy"): *"when the ray direction is parallel to the plane, the sample must
+/// end up at the raw input point, unmoved. How you spell that is free — an
+/// `intersect_line_plane` that returns the input point itself, or one that reports 'no
+/// intersection' and leaves the caller to keep the raw point, reach the same place."*
+/// This is the second spelling, and the sole caller ([`ProfileCell::sample`]) keeps the
+/// raw point. What is not free is dividing anyway: on a zero-cell-axis profile at a
+/// §8.3.0.3 weld both the denominator *and* the numerator vanish — the projection
+/// direction lies in the weld plane and the raw point is already in it — so the literal
+/// quotient is `NaN` on every interior vert of that configuration.
+///
+/// This arm is distinct from the **zero-`projection_dir`** arm, which §8.2.2.1 pins
+/// separately and [`ProfileCell::sample`] tests before calling here: no direction to cast
+/// along, versus a direction that never leaves the plane.
 fn intersect_line_plane(
     point: Vec3,
     direction: Vec3,
