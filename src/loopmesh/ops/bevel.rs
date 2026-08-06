@@ -3706,6 +3706,8 @@ impl LoopMesh {
                 is_beveled,
                 segments,
                 profile,
+                custom,
+                orientation,
                 chains,
                 cross_welds,
                 result,
@@ -3846,12 +3848,16 @@ impl LoopMesh {
     /// difference by averaging. The merge below is BMesh's defensive midpoint — it does
     /// real work only in the fallback where the override was abandoned.
     ///
-    /// **Known gap — no custom awareness (§8.6.3).** Both chains are sampled from the analytic
-    /// family off `profile` alone; no custom chain reaches here, so an edge-mode bevel through a
-    /// hand-drawn curve emits a superellipse cross-section at its two-boundvert welds while
-    /// emitting the curve everywhere else in the same operation. One of the three sites still
-    /// owed the threading, with [`LoopMesh::mint_pipe_override_loose_verts`] and
-    /// [`pipe_cross_section_replant`]; tracked on its own parity-matrix row.
+    /// A custom curve reaches here on the same terms as any other ring sector. §8.6.3.1(4).4's
+    /// per-consumer table puts the weld in **row 6** — the raw `target` chain at every
+    /// `segments`, with no cascade, no source polyline and no stride — which is what
+    /// [`ChainEmission::Raw`] at the operation's own `segments` already asks for. The
+    /// handedness is §8.6.3.1(6) **Regime A**: a `count == 2` ring is the walk's
+    /// beveled-valence-2 cross-vertex continuation, so each half's bit is just its owner
+    /// edge-end's mark, read straight from the pass (A.5 — "the weld is not special"). Reading
+    /// the two halves through *equal* bits is the observable failure: the halves then sample
+    /// mirrored cell coordinates, no re-planing can reconcile them, and the merge below papers
+    /// the difference over with a midpoint that lies on neither cross-section.
     #[allow(clippy::too_many_arguments)]
     fn build_welded_chain(
         &mut self,
@@ -3862,6 +3868,8 @@ impl LoopMesh {
         is_beveled: &dyn Fn(EdgeKey) -> bool,
         segments: u32,
         profile: f32,
+        custom: Option<&CustomChains>,
+        orientation: &CustomOrientation,
         chains: &mut Vec<EdgeEndChain>,
         cross_welds: &mut Vec<CrossWeld>,
         result: &mut BevelResult,
@@ -3886,17 +3894,35 @@ impl LoopMesh {
         );
         ProfileCell::override_weld_plane(&mut first, &mut second, self.vertex_position(vertex));
 
+        // §8.6.3.1(6) A.5: each half reads the curve through *its own* edge-end's mark. The two
+        // marks differ by the walk's parity across the cross-vertex step, which is precisely
+        // what makes the two halves' cell coordinates transpose and their samples coincide.
+        let first_reverse = orientation.reverse(first_edge, vertex);
+        let second_reverse = orientation.reverse(second_edge, vertex);
+
         // The welded chain is no cap boundary — neither method fills this corner — so
         // both profiles emit their raw samples (§8.2.2.1.1's resample is a [V-ADJ] cap
-        // property), which is why `Cutoff` and `Adj` land the same verts here.
-        let first_samples = first.chain_positions(segments, profile, None, ChainEmission::Raw);
-        let second_samples = second.chain_positions(segments, profile, None, ChainEmission::Raw);
+        // property, and §8.6.3.1(4).4 row 6 says the same of a custom curve's chain), which
+        // is why `Cutoff` and `Adj` land the same verts here.
+        let first_samples = first.chain_positions(
+            segments,
+            profile,
+            custom.map(|chains| CustomChainRead::edge_sector(chains, first_reverse)),
+            ChainEmission::Raw,
+        );
+        let second_samples = second.chain_positions(
+            segments,
+            profile,
+            custom.map(|chains| CustomChainRead::edge_sector(chains, second_reverse)),
+            ChainEmission::Raw,
+        );
 
         let mut interior = Vec::with_capacity(segments.saturating_sub(1) as usize);
         for index in 1..segments as usize {
             let from_first = first_samples[index];
             let from_second = second_samples[segments as usize - index];
-            let position = merge_welded_sample(&first, &second, from_first, from_second);
+            let position =
+                merge_welded_sample(&first, &second, custom.is_some(), from_first, from_second);
             // §5.2.4: not yet minted from the corner.
             let welded = self.create_vertex(position);
             result.verts.push(welded);
@@ -3915,8 +3941,6 @@ impl LoopMesh {
 
         let mut reversed = interior.clone();
         reversed.reverse();
-        // Gap, not an answer: the §8.3.0.3 weld runs under a custom curve too but samples the
-        // analytic cross-section and never reads §8.6.3.1(6)'s mark for these two edge-ends.
         chains.push(EdgeEndChain {
             edge: first_edge,
             endpoint: vertex,
@@ -3925,7 +3949,7 @@ impl LoopMesh {
             end: second_boundvert,
             side_label: SideLabel::Unlabelled,
             cell: Some(first),
-            custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
+            custom_reverse: first_reverse,
         });
         chains.push(EdgeEndChain {
             edge: second_edge,
@@ -3935,7 +3959,7 @@ impl LoopMesh {
             end: first_boundvert,
             side_label: SideLabel::Unlabelled,
             cell: Some(second),
-            custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
+            custom_reverse: second_reverse,
         });
     }
 
@@ -5444,8 +5468,8 @@ impl LoopMesh {
     /// **Known gap — no custom awareness (§8.6.3).** The leftovers are recomputed from the
     /// analytic arc off `profile` alone, so under a hand-drawn curve they land on the
     /// superellipse the slider names rather than on the curve the fill used. Positions only —
-    /// the count is topological and correct either way. One of the three sites still owed the
-    /// threading, with [`LoopMesh::build_welded_chain`] and [`pipe_cross_section_replant`].
+    /// the count is topological and correct either way. One of the two sites still owed the
+    /// threading, with [`pipe_cross_section_replant`].
     fn mint_pipe_override_loose_verts(
         &mut self,
         cut: &JunctionCut,
@@ -14558,11 +14582,12 @@ impl EdgeEndChain {
     /// [`CustomOrientation::reverse`]'s answer for an edge-end absent from the map.
     ///
     /// Inert on an **analytically**-sampled chain, where the diagonal-symmetric superellipse
-    /// family makes the bit unobservable. It is *not* inert at the builders that can also run
-    /// under a custom curve but do not read the mark yet — the §8.3.0.3 welds and the two miter
-    /// ring builders — so those sites are pre-existing custom-profile gaps, not settled answers.
-    /// The name says "unmarked", not "analytic", precisely so those four uses cannot read as a
-    /// licence to leave them.
+    /// family makes the bit unobservable — which covers the §8.5.5.5(f.4a) square-in weld, whose
+    /// ring test refuses a custom profile outright. It is *not* inert at the two miter ring
+    /// builders, which can run under a custom curve and do not read the mark yet, so those sites
+    /// are pre-existing custom-profile gaps rather than settled answers. The name says
+    /// "unmarked", not "analytic", precisely so those uses cannot read as a licence to leave
+    /// them.
     const UNMARKED_DEFAULT_REVERSE: bool = true;
 
     /// The chain's `segments + 1` verts in order `start → interior → end`.
@@ -17498,26 +17523,37 @@ mod tests {
         };
 
         assert_eq!(
-            merge_welded_sample(&curved, &curved, from_first, from_second),
+            merge_welded_sample(&curved, &curved, false, from_first, from_second),
             midpoint,
             "two curved profiles: the plain midpoint",
         );
         assert_eq!(
-            merge_welded_sample(&collapsed, &collapsed, from_first, from_second),
+            merge_welded_sample(&collapsed, &collapsed, false, from_first, from_second),
             midpoint,
             "two collapsed profiles: still the plain midpoint — the exception needs \
              EXACTLY one",
         );
         assert_eq!(
-            merge_welded_sample(&collapsed, &curved, from_first, from_second),
+            merge_welded_sample(&collapsed, &curved, false, from_first, from_second),
             from_second,
             "exactly one collapsed: the curved one's sample stands",
         );
         assert_eq!(
-            merge_welded_sample(&curved, &collapsed, from_first, from_second),
+            merge_welded_sample(&curved, &collapsed, false, from_first, from_second),
             from_first,
             "and symmetrically, whichever side carries the chord",
         );
+
+        // The exception's *other* conjunct: it fires only when NEITHER profile's
+        // `profile_type` is `CUSTOM`. §8.3.0.3: *"A profile whose `profile_type` is `CUSTOM`
+        // always takes the midpoint, flagged or not."*
+        for (first, second) in [(&collapsed, &curved), (&curved, &collapsed)] {
+            assert_eq!(
+                merge_welded_sample(first, second, true, from_first, from_second),
+                midpoint,
+                "a CUSTOM cross-section takes the midpoint even with exactly one collapse",
+            );
+        }
 
         // The separating arm, posed on the one **production-reachable** cell that emits a
         // straight chord without being the collapse: §8.2.2.1's zero cell axis. The crossed
@@ -17541,7 +17577,7 @@ mod tests {
             "and it kept its projection direction — it is not the tier-3 collapse",
         );
         assert_eq!(
-            merge_welded_sample(&zero_axis, &curved, from_first, from_second),
+            merge_welded_sample(&zero_axis, &curved, false, from_first, from_second),
             midpoint,
             "a chord-emitting cell that is not the tier-3 collapse the exception names, so \
              the merge averages rather than picking the curved sample",
@@ -42143,6 +42179,169 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.6.3.1(4).4 **row 6** and §8.6.3.1(6) **A.5**: the §8.3.0.3 two-boundvert
+    /// weld is a custom-chain consumer like any other ring sector. Row 6 lists "the §8.3.0.3
+    /// two-sector weld" among the families that read `target[k]`, **raw**, at every
+    /// `segments`; A.5 — *"the weld is not special"* — says a beveled-valence-2 junction is
+    /// the orientation walk's own unconditional cross-vertex step, so each welded half reads
+    /// the curve through **its own** edge-end's mark, with no weld-specific reversal.
+    ///
+    /// **The fixture and the closed form the expectations come from.** The cube corner
+    /// `v = (1,-1,-1)` with its two `z = -1` edges beveled at `offset = 0.25` — the corner
+    /// the analytic weld pins already use. Its two ring corners are `P = (0.75,-0.75,-1)`
+    /// (the in-face meet) and `Q = (1,-1,-0.75)` (the meet on the unbeveled leg), and the
+    /// §8.3.0.3 weld-plane override re-planes both halves onto `plane(v, P, Q)`, which is
+    /// `x + y = 0`. Composing §8.2.2.1's cell map with the projection into that plane, the
+    /// half anchored at `P` reduces to the affine
+    ///
+    /// ```text
+    ///     (u, v)  ->  ( 0.75 + 0.25·u,  −(0.75 + 0.25·u),  −0.75 − 0.25·v )
+    /// ```
+    ///
+    /// and the half anchored at `Q` to the same map with `u` and `v` **transposed** —
+    /// independently of which of the two beveled edges each half's chain crosses, since the
+    /// projection into the weld plane is what removes that difference. The map is checked
+    /// against an already-oracle-pinned value rather than merely asserted: the circular
+    /// chain's single interior cell sample `(√2/2, √2/2)` goes to
+    /// `(0.926777, −0.926777, −0.926777)`, which is what
+    /// `edge_bevel_two_edge_junction_weld_vert_sits_on_the_weld_plane` pins.
+    ///
+    /// **Why the transposition is the whole point.** Because the two halves' maps are
+    /// transposes, and because §8.6.3.1(5)/(6)'s two readings of one chain
+    /// (`(u_t, v_t) = (y_t, x_t)` forward, `(x_(n−t), y_(n−t))` mirrored) are likewise
+    /// transposes of one another read from opposite ends, the two halves' samples
+    /// **coincide exactly** when their marks differ — which is what A.3's parity across the
+    /// cross-vertex step guarantees. Equal marks would leave two genuinely different points
+    /// and the §8.3.0.3 merge would average them into a third that lies on neither
+    /// cross-section; at `segments = 2` that average is `(0.84375, −0.84375, −0.84375)`,
+    /// asserted absent below.
+    ///
+    /// **The expectations.** The all-vector net `(1,0) → (0.5,0.25) → (0,1)` has `E = 2`, so
+    /// §8.6.3.1(4).1's even split gives `target` = the two control chords sampled at even
+    /// parameter: `[(1,0), (0.5,0.25), (0,1)]` at `n = 2` and
+    /// `[(1,0), (0.75,0.125), (0.5,0.25), (0.25,0.625), (0,1)]` at `n = 4`. Mapping the
+    /// interior samples through the closed form above under each of the two readings gives
+    /// the two admissible position sets below — and *only* those two: which one lands is the
+    /// composition of the run's A.2 seed bit with which sector the ring indexes first, and
+    /// both compositions are covered because they exchange the two sets.
+    #[test]
+    fn custom_profile_two_boundvert_weld_reads_the_control_net() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+
+        // The two readings' interior weld positions, hard-coded from the closed form in the
+        // doc comment above. `forward` reads the chain `(u_t, v_t) = (y_t, x_t)`; `mirrored`
+        // reads it `(x_(n−t), y_(n−t))`.
+        let cases: [(u32, [&[Vec3]; 2]); 2] = [
+            (
+                2,
+                [
+                    &[Vec3::new(0.8125, -0.8125, -0.875)],
+                    &[Vec3::new(0.875, -0.875, -0.8125)],
+                ],
+            ),
+            (
+                4,
+                [
+                    &[
+                        Vec3::new(0.78125, -0.78125, -0.9375),
+                        Vec3::new(0.8125, -0.8125, -0.875),
+                        Vec3::new(0.90625, -0.90625, -0.8125),
+                    ],
+                    &[
+                        Vec3::new(0.8125, -0.8125, -0.90625),
+                        Vec3::new(0.875, -0.875, -0.8125),
+                        Vec3::new(0.9375, -0.9375, -0.78125),
+                    ],
+                ],
+            ),
+        ];
+
+        for (segments, readings) in cases {
+            let mut mesh = LoopMesh::new();
+            mesh_add_cube(&mut mesh);
+            let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+            let geom: Vec<GeomKey> = [Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0)]
+                .into_iter()
+                .map(|far| {
+                    GeomKey::from(
+                        mesh.query_edge_exists(corner, vert_at(&mesh, far))
+                            .expect("the cube corner's beveled edge"),
+                    )
+                })
+                .collect();
+            let result = mesh.bevel(
+                &geom,
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    profile_type: BevelProfileType::Custom(&curve),
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            // The welded chain's interior verts, isolated by the open box the chain runs
+            // through: on the weld plane `x + y = 0`, strictly between the two ring corners
+            // in both `x` and `z`. No other minted vert of this bevel is in it — the rest
+            // live at the two beveled edges' far terminals.
+            let mut welded: Vec<Vec3> = result
+                .verts
+                .iter()
+                .map(|&v| mesh.vertex_position(v))
+                .filter(|p| {
+                    (p.x + p.y).abs() < 1.0e-5
+                        && p.x > 0.7501
+                        && p.x < 0.9999
+                        && p.z > -0.9999
+                        && p.z < -0.7501
+                })
+                .collect();
+            welded.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+            let matches = |want: &[Vec3]| {
+                welded.len() == want.len()
+                    && welded
+                        .iter()
+                        .zip(want.iter())
+                        .all(|(got, want)| (*got - *want).length() < 1.0e-6)
+            };
+            assert!(
+                matches(readings[0]) || matches(readings[1]),
+                "segments = {segments}: the weld emitted {welded:?}, which is neither \
+                 §8.6.3.1(5)/(6) reading of the custom `target` chain — {:?} or {:?}",
+                readings[0],
+                readings[1],
+            );
+
+            if segments == 2 {
+                assert_eq!(
+                    result_has_vert_near(
+                        &mesh,
+                        &result,
+                        Vec3::new(0.926_776_7, -0.926_776_7, -0.926_776_7),
+                    ),
+                    0,
+                    "the analytic circular cross-section must not survive a custom bevel",
+                );
+                assert_eq!(
+                    result_has_vert_near(
+                        &mesh,
+                        &result,
+                        Vec3::new(0.843_75, -0.843_75, -0.843_75),
+                    ),
+                    0,
+                    "the two halves read through EQUAL marks would leave the merge averaging \
+                     two mirrored samples into a point on neither cross-section",
+                );
+            }
+        }
+    }
+
     /// BEVEL.md §8.5.5.5(f.3) law **F1**: the custom-profile fullness is
     /// `(1/(2·n))·Σ_{i=0}^{n-1}(u_i + v_i)` — the `i = n` endpoint `(1,0)` is excluded and
     /// the divisor is `2·n`.
@@ -51148,8 +51347,12 @@ impl MidRescue {
 ///   cross-section **kind**, not the stickiness mark … every profile at a weld gets
 ///   [the mark], by construction, the moment the override is attempted. Read the
 ///   exception's predicate as the stickiness mark and it can never fire at a weld at
-///   all."* No custom cross-section reaches this site at all yet (the gap documented on
-///   [`LoopMesh::build_welded_chain`]), so the analytic families all take this arm.
+///   all."* Hence `custom` here is the operation's `profile_type`, taken at the call site
+///   from whether a curve was supplied — not a per-profile bit the weld sets. Both welded
+///   profiles carry it or neither does: §8.9's miter carve-out, the one thing that can hand
+///   a sector the analytic spacing under a custom bevel, cannot reach an `n == 2` ring at
+///   all (§8.3.0.3 — an inner miter lifts the ring above two boundverts, and outer mitering
+///   is only considered at `s >= 3`).
 /// - It is not the emitted *shape*. §8.3.0.3: *"'Has degenerated to a straight chord' is a
 ///   fair description of a tier-3 profile but is the wrong test … Test the flag an actual
 ///   tier-3 collapse sets; do not re-derive the condition from the samples."* The whole
@@ -51171,9 +51374,13 @@ impl MidRescue {
 fn merge_welded_sample(
     first: &ProfileCell,
     second: &ProfileCell,
+    custom: bool,
     from_first: Vec3,
     from_second: Vec3,
 ) -> Vec3 {
+    if custom {
+        return (from_first + from_second) * 0.5;
+    }
     match (first.is_tier3_collapsed(), second.is_tier3_collapsed()) {
         (true, false) => from_second,
         (false, true) => from_first,
@@ -53431,9 +53638,9 @@ fn pipe_station_placement(pipe_axis: Vec3, cell: &ProfileCell) -> StationPlaceme
 /// custom bevel whose untouched slider happens to read `≥ 0.95` no longer has the square ring
 /// claim the junction and suppress this replant. So `profile ≥ 0.95` + a pipe junction + even
 /// `segments` under a hand-drawn curve now replants onto the superellipse the slider names
-/// rather than onto the curve — a positional divergence, no topology in it. This is the **third**
-/// of the sites where the custom curve is not yet threaded, alongside [`LoopMesh::build_welded_chain`]
-/// and [`LoopMesh::mint_pipe_override_loose_verts`]; it carries its own parity-matrix row and is
+/// rather than onto the curve — a positional divergence, no topology in it. This is the **second**
+/// of the sites where the custom curve is not yet threaded, alongside
+/// [`LoopMesh::mint_pipe_override_loose_verts`]; it carries its own parity-matrix row and is
 /// deliberately not fixed here.
 ///
 /// Everything below is carried **relative to `base`**, and that framing is the whole
