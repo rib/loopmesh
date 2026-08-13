@@ -3689,12 +3689,12 @@ impl LoopMesh {
                         TRI_CORNER_BAND_SMOOTH,
                     )
             })
-            // The layout's own frame origin `c`, resolved here rather than at fill time: the
-            // legs are stated in octant coordinates and mapped through it, and the `s`-gon
-            // that closes them at odd `n` needs the same point as its winding anchor. Two
-            // phases deriving it independently could disagree — and a fill-time derivation is
-            // allowed to *decline*, which after a completed weld would leave the legs meeting
-            // nowhere: an open boundary in a closed mesh.
+            // The layout's own frame origin `c`: the legs are stated in octant coordinates and
+            // mapped through it. Taken as the frame's translation alone rather than through
+            // the conditioned frame because that frame's guard answers a different question
+            // (is the map invertible) and is allowed to *decline*, which here — the phase that
+            // welds the chains — would leave the legs meeting nowhere: an open boundary in a
+            // closed mesh. Nothing downstream needs the point; the fill maps nothing.
             .map(|ring| unit_octant_origin(ring, vertex_position));
 
         if count == 2 {
@@ -3832,7 +3832,7 @@ impl LoopMesh {
             centre_column_representatives,
             dihedral_band_deviation,
             pipe_override,
-            square_in_weld,
+            square_in_weld: square_in_weld.is_some(),
             opening_edge_directions,
             opening_edge_tips,
         });
@@ -6007,12 +6007,12 @@ impl LoopMesh {
             // `profile` slider happens to resolve to and is read by nothing here — the curve
             // supplies the boundary chains and law F1 supplies the centre seed.
             debug_assert!(
-                !(cut.square_in_weld.is_some() && pipe_claims_junction),
+                !(cut.square_in_weld && pipe_claims_junction),
                 "(f.1) tests the pipe one step before the weld's row",
             );
-            if let Some(anchor) = cut.square_in_weld {
+            if cut.square_in_weld {
                 return self.build_adj_fill_square_in_weld(
-                    cut, chains, segments, anchor, material, templates, result,
+                    cut, chains, segments, material, templates, result,
                 );
             }
             match segments {
@@ -6167,46 +6167,41 @@ impl LoopMesh {
         // slot walk aligned with `result.verts` on this closed-form path too.
         slots.record((0, 1, 1));
 
+        // The pinwheel's rim is the general grid's rim at `seg = 2` and nothing else. Sector
+        // `k`'s chain is `B_k → (k,0,1) → B_(k+1)`; quad `k` walks its **first** step as the
+        // cell's `j = 0` row (`(k,0,0) → (k,0,1)`) and quad `k+1` walks its **second** as the
+        // cell's closing `k = 0` column step (`(k+1,1,0) → (k+1,0,0)`, which is `(k,0,1) →
+        // B_(k+1)`). Between them the `2·count` chain edges are each walked exactly once and
+        // **ascending** — the disk order of §5.1, the same one [`Self::adj_grid_needs_reversing`]
+        // hands the subdivided grid. So the whole pinwheel takes **one** aggregate §5.1 bit,
+        // read here before any cap face exists so that no quad's vote can be polluted by a
+        // sibling's, rather than a per-quad probe that a §7.8 input could split.
+        let pinwheel_rim_edge = |i: usize, k: usize| {
+            if k == 0 {
+                (cut.boundverts[i], interior_of_sector[i])
+            } else {
+                (interior_of_sector[i], cut.boundverts[(i + 1) % count])
+            }
+        };
+        self.debug_assert_rim_agrees_within_each_sector(count, 2, pinwheel_rim_edge);
+        let reverse = self.patch_rim_needs_reversing(
+            (0..count).flat_map(|i| (0..2).map(move |k| pinwheel_rim_edge(i, k))),
+        );
+
         // §8.5.3: one pinwheel quad per sector, all sharing the apex. Sector i's
         // quad is B_i → (i,0,1) → apex → (i−1,0,1).
         for i in 0..count {
             let before = (i + count - 1) % count;
-            let mut quad = vec![
+            let quad = [
                 cut.boundverts[i],
                 interior_of_sector[i],
                 apex,
                 interior_of_sector[before],
             ];
-
-            // Wind opposite the strip's traversal of the shared `B_i → (i,0,1)` edge
-            // so that edge stays radial-2 against the arriving multi-segment strip
-            // (§8.5.3 / §5.1), the same share-don't-flip discipline as cutoff.
-            if let Some(strip_edge) = self.query_edge_exists(quad[0], quad[1]) {
-                let runs_forward = self
-                    .edge_loop_keys(strip_edge)
-                    .first()
-                    .map(|&l| {
-                        let start = self.loop_vertex(l);
-                        let next = self.loop_vertex(self.loop_next(l));
-                        start == quad[0] && next == quad[1]
-                    })
-                    .unwrap_or(false);
-                if runs_forward {
-                    quad.reverse();
-                }
-            }
             // §6.6.2's grid row: this `segments = 2` pinwheel quad is sub-patch `i`'s lone
             // welded cell, so it takes sector `i`'s **own** boundvert rep — not one
             // corner-wide donor. Even `segments` has no centre column to re-scope.
-            let face = self.face_create_verts(&quad, FaceCreateFlags::NONE);
-            self.assign_bevel_face_attributes(
-                face,
-                material,
-                sector_representatives[i],
-                BevelNewFaceKind::Cap,
-            );
-            result.faces.push(face);
-            self.collect_face_edges(face, result);
+            self.emit_patch_face(&quad, reverse, material, sector_representatives[i], result);
         }
         true
     }
@@ -8143,24 +8138,22 @@ impl LoopMesh {
     /// - **odd** `segments`: no sample reaches the origin, so the `s` innermost leg verts
     ///   `(i, 0, ⌊n/2⌋)` are distinct and exactly **one** central `s`-gon closes the hole.
     ///
-    /// The face-winding `anchor` is the octant origin's image — the notch bottom the legs run
-    /// down to, and the one point guaranteed to sit on the solid side of a concave cap. It
-    /// rides the cut from **layout** time, where the legs were mapped through it, rather than
-    /// being re-derived here through the full corner frame: that frame's conditioning guard
-    /// answers a different question (is the map invertible), and a decline from it at this
-    /// point would be unrecoverable — the chains welded a phase ago, so at odd `segments` the
-    /// `s` legs would meet nowhere and the corner would be left open in a closed mesh.
+    /// The `s`-gon's **winding** is §5.1's manifold condition, exactly as the grid cap's is,
+    /// because its own edges are rim chain edges: the weld's identification makes
+    /// `chain_i[⌊n/2⌋ + 1]` the same vertex as `chain_(i+1)[⌊n/2⌋]`, so the step from
+    /// `central[i]` to `central[i+1]` *is* chain `i`'s ascending step across the turn — the
+    /// corner-cutting chord, carrying the one strip face that arrived along that chain. So the
+    /// ring hands straight to [`Self::patch_rim_needs_reversing`], with no interior point to
+    /// orient against and nothing geometric left in the decision.
     ///
     /// This fill emits **no** interior net, so it cannot leave a net slot to replant and
     /// answers `false` to its caller's question. (A pipe junction cannot reach this row
     /// anyway — (f.1) tests the pipe one step earlier.)
-    #[allow(clippy::too_many_arguments)]
     fn build_adj_fill_square_in_weld(
         &mut self,
         cut: &JunctionCut,
         chains: &[EdgeEndChain],
         segments: u32,
-        anchor: Vec3,
         material: i32,
         templates: &TemplateBank,
         result: &mut BevelResult,
@@ -8186,18 +8179,31 @@ impl LoopMesh {
             );
             central.push(chain[half]);
         }
+        // Re-read the step across the turn only where the assertion that consumes it is
+        // compiled; a release build must not carry a vector for a debug-only reader.
+        if cfg!(debug_assertions) {
+            for i in 0..sectors {
+                let across_the_turn = self
+                    .sector_chain(cut, chains, i)
+                    .and_then(|chain| chain.oriented_sample(cut.boundverts[i], half + 1));
+                debug_assert_eq!(
+                    across_the_turn,
+                    Some(central[(i + 1) % sectors]),
+                    "the weld identifies chain {i}'s step across the turn with the next sector's \
+                     innermost leg vert — which is what makes the `s`-gon's edges rim edges",
+                );
+            }
+        }
+
+        let reverse = self.patch_rim_needs_reversing(
+            (0..sectors).map(|i| (central[i], central[(i + 1) % sectors])),
+        );
 
         // §6.6.1: the centre `s`-gon is a ring-spanning face — its corners span the whole
         // boundvert ring — so it takes the ring-spanning donor, exactly as the general grid's
         // odd centre does.
         let central_representative = templates.resolve(cut.central_representative);
-        self.emit_patch_face(
-            &central,
-            PatchWinding::Outward { anchor },
-            material,
-            central_representative,
-            result,
-        );
+        self.emit_patch_face(&central, reverse, material, central_representative, result);
         false
     }
 
@@ -8430,9 +8436,7 @@ impl LoopMesh {
         );
         // §5.1 / §8.5.3: the cap's winding is one bit for the whole grid, read off the rim it
         // welds to, not a per-face geometric test.
-        let winding = PatchWinding::Grid {
-            reverse: self.adj_grid_needs_reversing(sectors, seg, chain_of),
-        };
+        let reverse = self.adj_grid_needs_reversing(sectors, seg, chain_of);
         let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
             std::collections::HashMap::new();
 
@@ -8496,7 +8500,7 @@ impl LoopMesh {
                     );
                     self.emit_patch_face(
                         &[a, b, c, d],
-                        winding,
+                        reverse,
                         material,
                         sector_representatives[i],
                         result,
@@ -8536,7 +8540,7 @@ impl LoopMesh {
             for r in 0..half {
                 self.emit_patch_face(
                     &[column[r], row[r], row[r + 1], column[r + 1]],
-                    winding,
+                    reverse,
                     material,
                     centre_column_representatives[i],
                     result,
@@ -8554,7 +8558,7 @@ impl LoopMesh {
         // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
         // its corners span the whole boundvert ring — so it takes the ring-spanning donor,
         // not the sector-positional one the rest of the grid carries.
-        self.emit_patch_face(&central, winding, material, central_representative, result);
+        self.emit_patch_face(&central, reverse, material, central_representative, result);
     }
 
     /// Resolve the adjacency-grid vert at sub-patch index `(i, j, k)` (BEVEL.md
@@ -8742,16 +8746,15 @@ impl LoopMesh {
         }
     }
 
-    /// Emit one adjacency-grid patch face (BEVEL.md §8.5.5), wound outward so it is
-    /// radial-2 against the arriving strips and its neighbours: the face normal is
-    /// flipped to agree with the outward direction `centroid − anchor`, where
-    /// `anchor` is an interior point below the cap (the corner sphere centre for the
-    /// cube grid, the reflected-fullness anchor for the general grid). Consecutive
+    /// Emit one adjacency-grid patch face (BEVEL.md §8.5.5). `verts` arrives in the cap's own
+    /// walk order and `reverse` is the cap's one winding bit — decided once for the whole cap
+    /// by [`Self::patch_rim_needs_reversing`], never per face and never from geometry, so
+    /// every face of a cap is consistent with its siblings by construction. Consecutive
     /// duplicate corners (none expected, a guard) are dropped.
     fn emit_patch_face(
         &mut self,
         verts: &[VertexKey],
-        winding: PatchWinding,
+        reverse: bool,
         material: i32,
         representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
@@ -8769,10 +8772,6 @@ impl LoopMesh {
             return;
         }
 
-        let reverse = match winding {
-            PatchWinding::Grid { reverse } => reverse,
-            PatchWinding::Outward { anchor } => self.patch_ring_faces_inward(&ring, anchor),
-        };
         if reverse {
             ring.reverse();
         }
@@ -8783,63 +8782,158 @@ impl LoopMesh {
         self.collect_face_edges(face, result);
     }
 
-    /// Does `ring`, walked in its own order, put its Newell normal *toward* `anchor` — a point
-    /// the caller knows lies on the solid side, below the cap?
+    /// One rim edge's vote on a cap's winding (BEVEL.md §5.1), read with the edge walked in
+    /// the cap's **own** sense `from → to`: `+1` keep that walk, `−1` turn it round, `0`
+    /// abstain.
     ///
-    /// A last-resort orientation test: it decides one face in isolation, so it can only be
-    /// trusted where the anchor is a genuine interior point of the corner (the octant origin,
-    /// the notch bottom a welded leg runs down to). The grid cap does **not** use it — its
-    /// winding is the §5.1 manifold condition, one bit for the whole cap.
-    fn patch_ring_faces_inward(&self, ring: &[VertexKey], anchor: Vec3) -> bool {
-        let positions: Vec<Vec3> = ring.iter().map(|&v| self.vertex_position(v)).collect();
-        let centroid = positions.iter().sum::<Vec3>() / positions.len() as f32;
-        let mut normal = Vec3::ZERO;
-        for index in 0..positions.len() {
-            let edge_a = positions[index] - centroid;
-            let edge_b = positions[(index + 1) % positions.len()] - centroid;
-            normal += edge_a.cross(edge_b);
+    /// §5.1's manifold condition is that the cap and the face it shares a rim edge with
+    /// traverse that edge in *opposite* directions, so a neighbour walking `to → from` wants
+    /// the cap's walk kept and one walking `from → to` wants it reversed. An absent edge, or
+    /// one no face has reached yet — §5.1's face-less star — abstains for want of anything to
+    /// be manifold against.
+    ///
+    /// **One vote per loop, not per edge — a deliberate weighting.** §5.1 is stated per
+    /// *shared edge*, so counting each already-attached face separately is a choice, and it has
+    /// a visible consequence: a rim edge that is already radial-2 and internally **consistent**
+    /// cancels to an abstention (correctly — a third face cannot bring it to radial 2 either
+    /// way, so it has nothing to say about the cap), while one that is already radial-2 and
+    /// **inconsistent** — both its faces walking it the same way — casts a **double-weight**
+    /// vote, so one conflicted rim edge can outvote one clean one. That is the intended
+    /// reading: a conflicted rim edge has two loops the cap could still be made manifold
+    /// against, and each is a claim on the cap's sense, whereas a clean radial-2 edge has none
+    /// left. It is a reachable object here rather than a hypothetical — the (f.4a) weld's leg
+    /// edges are genuinely radial-2 before the cap closes — and it is pinned by
+    /// `patch_rim_winding_is_an_aggregate_over_the_whole_rim`'s doubled arms.
+    fn rim_edge_winding_vote(&self, from: VertexKey, to: VertexKey) -> i32 {
+        let Some(rim_edge) = self.query_edge_exists(from, to) else {
+            return 0;
+        };
+        let mut vote = 0;
+        for loop_key in self.edge_radial_iter(rim_edge) {
+            let start = self.loop_vertex(loop_key);
+            let end = self.loop_vertex(self.loop_next(loop_key));
+            debug_assert!(
+                (start == from && end == to) || (start == to && end == from),
+                "a loop on the rim edge walks one of its two ends to the other",
+            );
+            vote += if start == from && end == to { -1 } else { 1 };
         }
-        normal.dot(centroid - anchor) < 0.0
+        vote
     }
 
-    /// The one winding bit for a whole [V-ADJ] grid cap (BEVEL.md §5.1, applied to the grid
-    /// by §8.5.3): does the grid's own cell walk need reversing to leave every rim edge it
-    /// shares with an arriving strip at radial count 2?
+    /// The one winding bit for a whole [V-ADJ] cap (BEVEL.md §5.1, applied to the grid by
+    /// §8.5.3): does the cap's own walk need reversing to leave every rim edge it shares with
+    /// an arriving strip at radial count 2? `rim` yields the cap's rim edges as directed
+    /// pairs, each walked the way the cap itself walks it.
     ///
-    /// The grid's cell order already walks its rim **ascending** along each sector chain, and
-    /// the chains ascend in sector order — that is the disk order, which §5.1 says the cap
-    /// runs *with*. So the answer is `true` only when the already-built neighbour on a rim
-    /// edge walks that edge the same way, which is what a ring that came back reversed looks
-    /// like. Deciding it once, combinatorially, is the whole point: every cell of every
-    /// sub-patch, the odd centre's bridge strips and its centre `s`-gon are all indexed off
-    /// the same `(i, j, k)` frame, so they are consistent with each other by construction and
-    /// a per-face geometric test can only break that consistency (and cannot orient a cap
-    /// over a non-planar ring at all).
+    /// Deciding it **once, combinatorially, for the whole cap** is the point. Every cell of
+    /// every sub-patch, the odd centre's bridge strips and its centre `s`-gon are indexed off
+    /// one `(i, j, k)` frame, so they agree with each other by construction; a per-face
+    /// geometric test can only break that agreement, and cannot orient a cap over a
+    /// non-planar (saddle) ring at all.
     ///
-    /// A rim with no faces on it yet — the face-less star of §5.1 — leaves the cap's
-    /// orientation pinned by the disk-order convention alone, so the grid walk stands.
+    /// **Aggregate, not first-found.** What licenses the rule is §5.1 itself: the manifold
+    /// condition is stated *per shared edge*, every rim edge states it, and on a cap that has
+    /// only one winding bit to give they can conflict — so the bit is the sum of
+    /// [`Self::rim_edge_winding_vote`] over the whole rim (see there for the per-loop
+    /// weighting), reversed **iff the sum is strictly negative**.
+    ///
+    /// The **tie-break** is §7.6.1.2's, and only the tie-break: a tie breaks toward doing
+    /// nothing, so an even split, or a rim with nothing to be manifold against, leaves the walk
+    /// standing, pinned by the disk-order convention alone (§5.1's face-less star, where the
+    /// winding is not observable anyway). The rest of §7.6.1.2's box is a *different* rule and
+    /// is not claimed here — it abstains only on "no forward face at all", and it resolves
+    /// several candidate faces by **selection** (the walk's own choice among them) rather than
+    /// by summing them.
+    ///
+    /// Both halves are load-bearing rather than decorative, because the votes genuinely can
+    /// disagree. On an inconsistently wound input (§7.8) different sectors' strips inherit
+    /// different senses from the original faces they were stitched to, and no cap winding
+    /// satisfies all of them: a first-found answer there is a coin toss keyed on which sector
+    /// the probe happened to reach first, the sum takes the majority instead, and an even split
+    /// — reachable at even valence — is what the tie-break then has to settle.
+    fn patch_rim_needs_reversing(&self, rim: impl Iterator<Item = (VertexKey, VertexKey)>) -> bool {
+        rim.map(|(from, to)| self.rim_edge_winding_vote(from, to))
+            .sum::<i32>()
+            < 0
+    }
+
+    /// [`Self::patch_rim_needs_reversing`] over a [V-ADJ] grid cap's rim: the grid's cell
+    /// order walks its rim **ascending** along each sector chain, and the chains ascend in
+    /// sector order — that is the disk order, which §5.1 says the cap runs *with*.
+    ///
+    /// **Why the answer can legitimately be `true` at all**, given that the ascent is not an
+    /// independent convention: a chain ascends from `B_i`, and the ring the `B`s sit in is
+    /// itself built by the §7.6.2 winding walk, so on a consistently wound corner the rim's
+    /// ascent and the arriving strips' traversal of it flip **together** and this returns
+    /// `false` every time. What makes `true` reachable is the aggregate, not the ascent: at a
+    /// §7.8 junction the strips inherit their senses from *different* original faces, and when
+    /// two of three sectors dissent from the sense the ring's own walk implies, the majority
+    /// reverses the cap. So this stays a query and must **not** be hardened into an assertion
+    /// that it always answers `false`.
     fn adj_grid_needs_reversing(
         &self,
         sectors: usize,
         seg: usize,
         chain_of: &[Vec<VertexKey>],
     ) -> bool {
-        for i in 0..sectors {
-            for k in 0..seg {
-                let from = chain_of[i][k];
-                let to = chain_of[i][k + 1];
-                let Some(rim_edge) = self.query_edge_exists(from, to) else {
-                    continue;
-                };
-                let Some(&loop_key) = self.edge_loop_keys(rim_edge).first() else {
-                    continue;
-                };
-                let start = self.loop_vertex(loop_key);
-                let end = self.loop_vertex(self.loop_next(loop_key));
-                return start == from && end == to;
-            }
+        let rim_edge = |i: usize, k: usize| (chain_of[i][k], chain_of[i][k + 1]);
+        self.debug_assert_rim_agrees_within_each_sector(sectors, seg, rim_edge);
+        self.patch_rim_needs_reversing(
+            (0..sectors).flat_map(|i| (0..seg).map(move |k| rim_edge(i, k))),
+        )
+    }
+
+    /// Sector-local agreement guard for [`Self::adj_grid_needs_reversing`]'s vote, and for the
+    /// `segments = 2` pinwheel's, whose rim is the same object at `seg = 2`. `rim_edge(i, k)`
+    /// is sector `i`'s `k`-th rim edge, walked the way the cap walks it.
+    ///
+    /// A sector's rim is the whole of one arriving strip's terminal boundary, so every faced
+    /// edge of it carries faces of that one strip — which is internally consistent by
+    /// construction. Disagreement is therefore only ever a *between*-sector fact, and that is
+    /// exactly the §7.8 case the aggregate exists to decide. Asserting unanimity across the
+    /// whole rim instead would fire on an inconsistently wound input, which is a mesh we are
+    /// meant to survive rather than a bug in the probe.
+    ///
+    /// **What the "one sector, one strip" premise covers.** It is stated for a plain strip
+    /// arrival, and it extends to the two arrivals that are not plain, but not equally firmly:
+    ///
+    /// - a **§7.8-collapsed flank** is covered outright — the collapse changes the rung's
+    ///   *width*, not the build, and still lays `segments` quads across it in one pass
+    ///   (§7.8.4), so the terminal chain still carries one strip's consistent traversal;
+    /// - a **§8.9 miter** sector's rim is the arc run `B1 → bulge → B3` that the sector's
+    ///   rebuilt face(s) re-stitch onto (§8.9.3), which is one rebuild's boundary rather than
+    ///   one strip's. The miter ring fills route through here, so this guard is the thing that
+    ///   would surface a counterexample; it is quiet across the miter fixtures, and a firing
+    ///   here on a *consistently* wound miter would be a finding, not a false alarm.
+    ///
+    /// What the premise does **not** cover either way is a sector whose rim carries faces from
+    /// two different builds — which no path here produces.
+    fn debug_assert_rim_agrees_within_each_sector(
+        &self,
+        sectors: usize,
+        seg: usize,
+        rim_edge: impl Fn(usize, usize) -> (VertexKey, VertexKey),
+    ) {
+        if !cfg!(debug_assertions) {
+            return;
         }
-        false
+        for i in 0..sectors {
+            let votes: Vec<i32> = (0..seg)
+                .map(|k| {
+                    let (from, to) = rim_edge(i, k);
+                    self.rim_edge_winding_vote(from, to)
+                })
+                .filter(|&vote| vote != 0)
+                .collect();
+            debug_assert!(
+                votes
+                    .windows(2)
+                    .all(|pair| pair[0].signum() == pair[1].signum()),
+                "sector {i}'s rim edges disagree on the cap winding ({votes:?}) — one \
+                 sector's rim is one strip's boundary, so it cannot",
+            );
+        }
     }
 
     /// The chain spanning sector `i`'s boundvert pair at this junction (BEVEL.md §8.2.2) —
@@ -14868,20 +14962,15 @@ struct JunctionCut {
     /// beveled-edge directions and incident-face normals are gone by fill time — so it is
     /// captured here alongside `dihedral_band_deviation`.
     pipe_override: bool,
-    /// `Some(c)` when this junction's chains were laid as the §8.5.5.5(f.4a) **square-in
-    /// weld** (`build_square_in_weld_chains`): edge bevel, the `r = 0` sentinel, no pipe, and
-    /// a tri-corner ring the predicate *fires* on (valence 3, not merely three boundverts).
+    /// Set when this junction's chains were laid as the §8.5.5.5(f.4a) **square-in weld**
+    /// (`build_square_in_weld_chains`): edge bevel, the `r = 0` sentinel, no pipe, and a
+    /// tri-corner ring the predicate *fires* on (valence 3, not merely three boundverts).
     /// The layout is a phase-1 decision — the strips are built over the chains, so the
     /// pairwise identification has to precede them — and the fill's only remaining job is the
     /// odd-`segments` central `s`-gon, so both halves read the one verdict rather than
-    /// re-deriving it and risking disagreement.
-    ///
-    /// The payload is that layout's own frame origin `c` ([`unit_octant_origin`]): the point
-    /// the legs were mapped through, and the winding anchor the `s`-gon needs. Carried rather
-    /// than re-derived for the same reason the verdict is — and because a fill-time
-    /// derivation is allowed to *decline*, which after a completed weld would leave the
-    /// corner open.
-    square_in_weld: Option<Vec3>,
+    /// re-deriving it and risking disagreement. The layout's frame origin `c` does *not* ride
+    /// along: the fill maps nothing and orients the `s`-gon off its own rim.
+    square_in_weld: bool,
     /// Per sector `k` (disk order), the **pristine** unit direction of `opening_edges[k]`
     /// out of `vertex` (BEVEL.md §8.5.5.5(f.5)). The square parallel-offset grid's centreline
     /// seeds are line-line meets on these beveled edges, but the edges themselves are consumed
@@ -31513,7 +31602,7 @@ mod tests {
             // the geometry test alone decides these assertions.
             dihedral_band_deviation: None,
             pipe_override: false,
-            square_in_weld: None,
+            square_in_weld: false,
             opening_edge_directions: Vec::new(),
             opening_edge_tips: Vec::new(),
         };
@@ -32875,10 +32964,10 @@ mod tests {
         }
     }
 
-    /// The §8.5.5.5(f.4a) weld's winding anchor has to be **total**. It is fixed at layout
-    /// time, where the chains are welded, so no later phase may decline it: at odd `segments`
-    /// the `s` legs are closed by exactly one central `s`-gon, and a fill that skipped it
-    /// would leave a genuine boundary in a closed mesh.
+    /// The §8.5.5.5(f.4a) weld's leg frame has to be **total**. It is resolved at layout time,
+    /// where the chains are welded and the legs are mapped through it, so a decline there is
+    /// unrecoverable: the `s` legs would meet nowhere and the corner would be left open in a
+    /// closed mesh.
     ///
     /// `unit_octant_origin` is the frame's translation alone — an affine combination of the
     /// four points — so it agrees with the conditioned frame's origin wherever that frame
@@ -32890,7 +32979,7 @@ mod tests {
         let ring = square_in_weld_boundverts();
         let frame = UnitOctant::from_corner(ring, vertex).expect("the driver's corner is sound");
         assert!(
-            (frame.origin() - unit_octant_origin(ring, vertex)).length() <= 1.0e-6,
+            (frame.translation - unit_octant_origin(ring, vertex)).length() <= 1.0e-6,
             "the translation is the frame's origin",
         );
         assert!(
@@ -34034,6 +34123,399 @@ mod tests {
         }
     }
 
+    /// The cube's shell turned inside out: the same eight verts and six quads, every ring
+    /// walked backwards. Geometrically identical, so every position-based predicate — the
+    /// tri-corner meet geometry, the octant frame, the `r = 0` weld's leg layout — decides
+    /// exactly as it does on [`mesh_add_cube`]; only the faces' sense differs. It is the
+    /// in-crate stand-in for an inward-wound shell (a cup seen from inside).
+    fn mesh_add_inward_wound_cube(mesh: &mut LoopMesh) {
+        let coords = [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ];
+        let verts: Vec<VertexKey> = coords.iter().map(|&c| mesh.create_vertex(c)).collect();
+        for ring in [
+            [3usize, 2, 1, 0],
+            [2, 6, 5, 1],
+            [6, 7, 4, 5],
+            [7, 3, 0, 4],
+            [7, 6, 2, 3],
+            [1, 5, 4, 0],
+        ] {
+            let face: Vec<VertexKey> = ring.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&face, FaceCreateFlags::NONE);
+        }
+    }
+
+    /// [`cube_corner_adj_profile`]'s driver on the inward-wound shell: the same corner, the
+    /// same three beveled spokes, the same [V-ADJ] dispatch — only the incident faces' sense
+    /// is flipped, so the cap has to come out flipped with them.
+    fn inward_wound_corner_adj_profile(segments: u32, profile: f32) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_inward_wound_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §5.1: the §8.5.5.5(f.4a) weld's centre `s`-gon is wound by the **manifold
+    /// condition**, not by facing away from a point inside the corner.
+    ///
+    /// The `s`-gon's own edges are rim chain edges — the weld identifies `chain_i[⌊n/2⌋+1]`
+    /// with `chain_(i+1)[⌊n/2⌋]`, so the step from one innermost leg vert to the next is
+    /// chain `i`'s step across the turn — and each already carries the strip that arrived
+    /// along that chain. So the same one-bit rule the grid cap uses applies verbatim, and it
+    /// is the *only* rule that survives an inward-wound shell: an outward test against the
+    /// notch bottom answers the same way whichever sense the surrounding faces run in, which
+    /// on this shell is the wrong way round and leaves the `s`-gon's three edges traversed
+    /// twice in the same direction.
+    ///
+    /// The upright cube is the control: identical face output, and it is wound *outward*
+    /// there. Odd `segments` only — even parity welds at the octant origin and emits nothing.
+    #[test]
+    fn adj_square_in_weld_ngon_winds_against_an_inward_wound_shell() {
+        for segments in [3u32, 5, 7] {
+            let (mesh, result) = inward_wound_corner_adj_profile(segments, 0.0);
+            mesh.validate_topology();
+
+            let cap = curved_corner_grid_faces(&mesh, &result);
+            assert_eq!(
+                cap.len(),
+                1,
+                "the weld's whole face output is one central `s`-gon (segments = {segments})",
+            );
+            assert_eq!(
+                mesh.face_vert_keys(cap[0]).len(),
+                3,
+                "a triangle at the cube corner (segments = {segments})",
+            );
+
+            let conflicts = winding_conflicts(&mesh);
+            assert!(
+                conflicts.is_empty(),
+                "segments = {segments}: {} shared edge(s) traversed the same way by both \
+                 adjacent faces",
+                conflicts.len(),
+            );
+            assert!(
+                signed_volume(&mesh) < 0.0,
+                "segments = {segments}: the shell is still inside out — the cap followed the \
+                 input's sense, it did not correct it",
+            );
+
+            // The control, and the sharper statement: the same corner on the upright cube
+            // emits the same triangle over the same rim, walked the *other* way.
+            let (upright, upright_result) = cube_corner_adj_profile(segments, 0.0);
+            upright.validate_topology();
+            let upright_cap = curved_corner_grid_faces(&upright, &upright_result);
+            assert_eq!(upright_cap.len(), 1);
+            let ring_positions = |mesh: &LoopMesh, face: FaceKey| -> Vec<Vec3> {
+                mesh.face_vert_keys(face)
+                    .iter()
+                    .map(|&v| mesh.vertex_position(v))
+                    .collect()
+            };
+            let newell = |ring: &[Vec3]| -> Vec3 {
+                let centroid = ring.iter().sum::<Vec3>() / ring.len() as f32;
+                (0..ring.len()).fold(Vec3::ZERO, |total, i| {
+                    total + (ring[i] - centroid).cross(ring[(i + 1) % ring.len()] - centroid)
+                })
+            };
+            let inward = newell(&ring_positions(&mesh, cap[0]));
+            let outward = newell(&ring_positions(&upright, upright_cap[0]));
+            assert!(
+                inward.dot(outward) < 0.0,
+                "segments = {segments}: the two shells' `s`-gons wind oppositely",
+            );
+            assert!(
+                outward.dot(Vec3::new(1.0, -1.0, -1.0)) > 0.0,
+                "segments = {segments}: the upright shell's `s`-gon faces out of the cube",
+            );
+        }
+    }
+
+    /// The general [V-ADJ] grid cap obeys the same rule on the same shell — the aggregate is
+    /// a cap-wide bit, so flipping the input's sense flips the whole cap and nothing else.
+    /// Sweeps both parities and both sides of the §8.5.5.5(f.1) dispatch (`0.25` is the
+    /// straight chord's forced pinwheel at `segments = 2`).
+    #[test]
+    fn adj_grid_cap_winds_against_an_inward_wound_shell() {
+        for profile in [0.25f32, 0.5, 0.7] {
+            for segments in 2..=5 {
+                let (mesh, result) = inward_wound_corner_adj_profile(segments, profile);
+                let case = format!("inward-wound cap, segments = {segments}, profile = {profile}");
+                mesh.validate_topology();
+                assert!(!result.faces.is_empty(), "{case}: bevel produced no faces");
+                let conflicts = winding_conflicts(&mesh);
+                assert!(
+                    conflicts.is_empty(),
+                    "{case}: {} shared edge(s) traversed the same way by both adjacent faces",
+                    conflicts.len(),
+                );
+                assert!(
+                    signed_volume(&mesh) < 0.0,
+                    "{case}: the shell is still inside out",
+                );
+            }
+        }
+    }
+
+    /// The cube with **one** face — the `z = −1` front — wound backwards, the rest left
+    /// alone: an inconsistently wound input (BEVEL.md §7.8), and the smallest mesh on which
+    /// a cap's rim edges genuinely disagree about which way the cap should run.
+    fn mesh_add_cube_with_front_inverted(mesh: &mut LoopMesh) {
+        let coords = [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ];
+        let verts: Vec<VertexKey> = coords.iter().map(|&c| mesh.create_vertex(c)).collect();
+        for ring in [
+            [3usize, 2, 1, 0],
+            [1, 5, 6, 2],
+            [5, 4, 7, 6],
+            [4, 0, 3, 7],
+            [3, 2, 6, 7],
+            [0, 4, 5, 1],
+        ] {
+            let face: Vec<VertexKey> = ring.iter().map(|&i| verts[i]).collect();
+            mesh.face_create_verts(&face, FaceCreateFlags::NONE);
+        }
+    }
+
+    /// The aggregate on a real inconsistently wound input (BEVEL.md §7.8), which is the case
+    /// that decides between "first-found plus a unanimity assertion" and "aggregate plus a
+    /// tie-break": beveling the three spokes of a corner **incident** to the inverted face
+    /// gives the cap three sectors' worth of rim edges that do **not** agree, 2 against 1.
+    ///
+    /// No cap winding can satisfy all of them, so the test is which ones it dissatisfies: the
+    /// aggregate takes the majority and leaves exactly the **one dissenting sector's** rim in
+    /// conflict — that sector's strip is the one that inherited the inverted face's sense — so
+    /// one edge of the §8.5.5.5(f.4a) `s`-gon at `profile = 0`, and one whole chain's worth
+    /// (`segments` edges) on the general grid. A minority choice would leave twice that.
+    ///
+    /// **All three dispatch arms are swept, and that is the point of the profile loop.** At
+    /// `profile = 0` the corner welds and [`LoopMesh::patch_rim_needs_reversing`] is called
+    /// directly, so the sector-agreement guard is never reached; a non-zero profile routes the
+    /// same corner through the §8.5.3 pinwheel (`segments = 2`) and the subdivided grid
+    /// (`segments ≥ 3`), where [`LoopMesh::debug_assert_rim_agrees_within_each_sector`] is live
+    /// and each sector's rim is `segments` edges rather than one. Everywhere else in the suite
+    /// that guard holds trivially, on winding-consistent input; here it is deliberately pointed
+    /// at the §7.8 collapse-at-a-junction regime — the corner is incident to the inverted face,
+    /// so two of its three strips collapse a flank (§7.8.1) — and it still holds, non-vacuously:
+    /// two sectors vote unanimously one way and the third unanimously the other, so the guard
+    /// passes on a 2:1 rim that a unanimity assertion over the *whole* rim would have fired on,
+    /// on a mesh the operator is meant to survive.
+    ///
+    /// The cap's **internal** edges carry the other half of the claim: whatever the rim made
+    /// the cap choose, no two cap faces disagree with each other. That is what "one bit"
+    /// means, and it is what a per-face probe breaks — such a probe reverses the dissenting
+    /// sector's cells alone, which cracks the cap along its seams while leaving the rim tally
+    /// below unchanged.
+    #[test]
+    fn adj_cap_winding_takes_the_majority_on_an_inconsistently_wound_input() {
+        for profile in [0.0f32, 0.5, 0.75] {
+            for segments in [2u32, 3, 5] {
+                // Even `segments` at `r = 0` welds every leg at the octant origin and emits no
+                // face at all (§8.5.5.5(e)), so there is no cap to wind.
+                if profile == 0.0 && segments % 2 == 0 {
+                    continue;
+                }
+                let case = format!("segments = {segments}, profile = {profile}");
+                let mut mesh = LoopMesh::new();
+                mesh_add_cube_with_front_inverted(&mut mesh);
+                assert_eq!(
+                    winding_conflicts(&mesh).len(),
+                    4,
+                    "the input starts with the inverted face's four edges in conflict",
+                );
+                let e01 = cube_edge(
+                    &mesh,
+                    Vec3::new(1.0, -1.0, -1.0),
+                    Vec3::new(-1.0, -1.0, -1.0),
+                );
+                let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+                let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+                let result = mesh.bevel(
+                    &[e01.into(), e03.into(), e04.into()],
+                    BevelOptions {
+                        offset: 0.25,
+                        affect: BevelAffect::Edges,
+                        segments,
+                        profile,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+                mesh.validate_topology();
+
+                let cap = curved_corner_grid_faces(&mesh, &result);
+                assert!(!cap.is_empty(), "{case}: the corner emitted no cap");
+                if profile == 0.0 {
+                    assert_eq!(cap.len(), 1, "{case}: one central `s`-gon");
+                } else if segments == 2 {
+                    assert_eq!(cap.len(), 3, "{case}: the forced §8.5.3 pinwheel");
+                }
+
+                // The cap's rim is every cap edge that also carries a non-cap face — the
+                // arriving strips' terminal chains, `segments` of them per sector, or the
+                // `s`-gon's own three sides once the weld has identified them pairwise.
+                let conflicts = winding_conflicts(&mesh);
+                let mut rim = 0usize;
+                let mut dissenting = 0usize;
+                for &face in &cap {
+                    for loop_key in mesh.face_loop_keys(face) {
+                        let edge = mesh.loop_edge(loop_key);
+                        let from = mesh.loop_vertex(loop_key);
+                        let to = mesh.loop_vertex(mesh.loop_next(loop_key));
+                        let conflicting =
+                            conflicts.contains(&(from, to)) || conflicts.contains(&(to, from));
+                        let internal = mesh
+                            .edge_face_keys(edge)
+                            .iter()
+                            .all(|neighbour| cap.contains(neighbour));
+                        if internal {
+                            // One bit for the whole cap: whatever the rim made it choose,
+                            // siblings never disagree with each other. A per-face probe would
+                            // flip the dissenting sector's cells alone and crack the cap here
+                            // while leaving the rim tally unchanged.
+                            assert!(
+                                !conflicting,
+                                "{case}: two cap faces disagree across their shared edge",
+                            );
+                            continue;
+                        }
+                        rim += 1;
+                        dissenting += usize::from(conflicting);
+                    }
+                }
+                let per_sector = if profile == 0.0 { 1 } else { segments as usize };
+                assert_eq!(rim, 3 * per_sector, "{case}: three sectors' rim edges");
+                assert_eq!(
+                    dissenting, per_sector,
+                    "{case}: the cap sides with the two sectors that agree, leaving only the \
+                     dissenting sector's rim in conflict",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §5.1's manifold condition read over a whole rim: the cap's winding bit is an
+    /// **aggregate** of the per-rim-edge conditions, settled on ties by §7.6.1.2's convention
+    /// (a tie does nothing) — the tie-break is all that is borrowed from there.
+    ///
+    /// Pins each arm on a bare triangular rim whose three edges are given faces by hand:
+    /// unanimity either way, a 2:1 split that a first-found probe would get backwards
+    /// whichever edge it reached first, the tie (which does **not** reverse), the face-less
+    /// star (nothing to be manifold against, so the walk stands), and both radial-2 arms — the
+    /// consistently wound pair that cancels to an abstention, and the **inconsistently** wound
+    /// pair that keeps both its votes and so outweighs a clean edge on its own. That last arm
+    /// is what pins the per-loop weighting as a decision: it reverses under per-loop counting
+    /// (`−2 + 1 = −1`) and does not under per-rim-edge counting (`−1 + 1 = 0`).
+    #[test]
+    fn patch_rim_winding_is_an_aggregate_over_the_whole_rim() {
+        // `votes[i]` is the sense the face on rim edge `i` walks it: `Some(true)` the same
+        // way the cap would (so the cap must reverse), `Some(false)` the other way (keep),
+        // `None` no face at all. `doubled` adds a second face to edge 0: `Some(true)` wound
+        // consistently with the first, `Some(false)` wound the same way as it (a conflict).
+        let build = |votes: [Option<bool>; 3],
+                     doubled: Option<bool>|
+         -> (LoopMesh, [VertexKey; 3]) {
+            let mut mesh = LoopMesh::new();
+            let rim = [
+                mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0)),
+                mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0)),
+                mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0)),
+            ];
+            for (index, vote) in votes.iter().enumerate() {
+                let Some(same_way) = *vote else { continue };
+                let from = rim[index];
+                let to = rim[(index + 1) % 3];
+                let outer = mesh.create_vertex(Vec3::new(index as f32, -1.0, 0.0));
+                let ring = if same_way {
+                    [outer, from, to]
+                } else {
+                    [outer, to, from]
+                };
+                mesh.face_create_verts(&ring, FaceCreateFlags::NONE);
+                if index == 0 {
+                    if let Some(consistent) = doubled {
+                        let opposite = mesh.create_vertex(Vec3::new(0.0, -2.0, 0.0));
+                        let ring = if same_way == consistent {
+                            [opposite, to, from]
+                        } else {
+                            [opposite, from, to]
+                        };
+                        mesh.face_create_verts(&ring, FaceCreateFlags::NONE);
+                    }
+                }
+            }
+            (mesh, rim)
+        };
+        let verdict = |votes: [Option<bool>; 3], doubled: Option<bool>| -> bool {
+            let (mesh, rim) = build(votes, doubled);
+            mesh.patch_rim_needs_reversing((0..3).map(|i| (rim[i], rim[(i + 1) % 3])))
+        };
+
+        let keep = Some(false);
+        let flip = Some(true);
+        assert!(!verdict([keep, keep, keep], None), "unanimous keep");
+        assert!(verdict([flip, flip, flip], None), "unanimous reverse");
+        assert!(
+            verdict([keep, flip, flip], None),
+            "the majority decides, not the first rim edge reached",
+        );
+        assert!(
+            !verdict([flip, keep, keep], None),
+            "and the same the other way round",
+        );
+        assert!(
+            !verdict([flip, keep, None], None),
+            "an even split ties, and a tie does not reverse",
+        );
+        assert!(
+            !verdict([None, None, None], None),
+            "a face-less rim leaves the walk standing",
+        );
+        assert!(
+            !verdict([flip, keep, None], Some(true)),
+            "a rim edge already at radial 2 and internally consistent abstains — doubling \
+             edge 0 must not give it a second, decisive vote",
+        );
+        assert!(
+            verdict([flip, keep, None], Some(false)),
+            "a rim edge already at radial 2 and internally *inconsistent* keeps both votes: \
+             per-loop weighting is the decision, so it outweighs the one clean edge",
+        );
+    }
+
     /// BEVEL.md §8.5.5.5(f.4a)'s welding rule — `(i, 0, k)` **is the same vertex as**
     /// `(i−1, 0, n−k)` for `k <= ⌊n/2⌋` — read off the finished mesh.
     ///
@@ -34342,7 +34824,7 @@ mod tests {
             centre_column_representatives: Vec::new(),
             dihedral_band_deviation: None,
             pipe_override: false,
-            square_in_weld: None,
+            square_in_weld: false,
             opening_edge_directions: directions.clone(),
             opening_edge_tips: tips,
         };
@@ -34853,11 +35335,11 @@ mod tests {
     /// B2 (BEVEL.md §8.5.5.5(f.2)): the flat chamfer (`r = 1`) is a member of the tri-corner
     /// family, so a `segments = 2` cube corner at `profile = 0.25` takes the forced pinwheel
     /// — *not* the general ring's `fullness = 0` planar cap — and its apex is the octant
-    /// closed form `3^(−1/1)·(1,1,1)`, i.e. the boundvert centroid on the chamfer plane. The
-    /// The forced pinwheel and the general grid orient their faces by different rules (the
-    /// pinwheel opposes the arriving strip's traversal of the shared rim edge; the general
-    /// grid flips against an anchor below the cap), so the reroute has to be shown
-    /// winding-neutral as well as position-neutral. The reference is the **circular**
+    /// closed form `3^(−1/1)·(1,1,1)`, i.e. the boundvert centroid on the chamfer plane.
+    /// Pinwheel and general grid now orient by the **same** §5.1 rule — one aggregate bit off
+    /// the rim they weld to — but they reach it down different dispatch arms and place their
+    /// apex differently, so the reroute is still worth showing winding-neutral as well as
+    /// position-neutral. The reference is the **circular**
     /// `segments = 2` corner, whose pinwheel is the strictly-pinned forced case (§8.5.4):
     /// the flat corner emits the same three faces over the same rim, traversed in the same
     /// direction, differing only in where the apex sits.
@@ -55215,18 +55697,6 @@ fn seed_closer_to_vertex(slot: &mut Option<Vec3>, candidate: Vec3, vertex: Vec3)
     }
 }
 
-/// How a bevel patch face's boundary loop is oriented.
-#[derive(Clone, Copy)]
-enum PatchWinding {
-    /// The [V-ADJ] grid cap's one winding bit (BEVEL.md §5.1 / §8.5.3): the ring arrives in
-    /// the grid's own cell walk, and `reverse` says whether that walk has to be turned round
-    /// to meet the rim at radial count 2.
-    Grid { reverse: bool },
-    /// Orient against a point known to lie on the solid side, below the cap. Only for the
-    /// lone faces that have no grid frame to inherit a sense from.
-    Outward { anchor: Vec3 },
-}
-
 /// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
 /// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
 /// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
@@ -55431,9 +55901,8 @@ struct UnitOctant {
 /// Split out from [`UnitOctant::from_corner`] because it is the one part of the frame that
 /// needs **no** conditioning: it is a plain affine combination of the four points, where the
 /// linear columns have to be invertible before anything may be read back through them. A
-/// caller that only maps *forward* — §8.5.5.5(f.4a)'s legs, `c + (1 − k·b)·(B_i − c)`, and
-/// the winding anchor of the `s`-gon that closes them — must not be refused by a guard that
-/// exists for the inverse.
+/// caller that only maps *forward* — §8.5.5.5(f.4a)'s legs, `c + (1 − k·b)·(B_i − c)` — must
+/// not be refused by a guard that exists for the inverse.
 fn unit_octant_origin(boundverts: [Vec3; 3], vertex: Vec3) -> Vec3 {
     (boundverts[0] + boundverts[1] + boundverts[2] - vertex) * 0.5
 }
@@ -55498,11 +55967,6 @@ impl UnitOctant {
 
     fn to_octant(&self, world: Vec3) -> Vec3 {
         self.inverse * (world - self.translation)
-    }
-
-    /// The image of the octant origin: the corner surface's centre `c`, not `v`.
-    fn origin(&self) -> Vec3 {
-        self.translation
     }
 }
 
