@@ -41515,9 +41515,12 @@ mod tests {
     /// ones included. On the guide's mixed net (`E = 4`, only two curved segments, turns
     /// `0° / 19.04° / 2.20° / 0°`) a curved-only cut hands out just two advances at
     /// `segments = 3`, and the short chain that follows becomes a ring with the wrong vertex
-    /// count — no panic, no signal. Chains quoted from the guide's worked table; the
-    /// `segments = 3` row is deliberately length-only, because the cut lands inside the tie
-    /// block of the two `0°` segments and §8.6.3.1(4).1 does not define that order.
+    /// count — no panic, no signal. Chains quoted from the guide's worked table.
+    ///
+    /// *Which* straight segment the `segments = 3` cut takes is settled by §8.6.3.1(4).1's
+    /// rule (b): the two are not tied at all — segment `0` carries a `½·2⁻²⁴` round-trip
+    /// residue and segment `3` scores exactly `0`, so the cut is `{0, 1, 2}` strictly. The
+    /// alternative `{1, 2, 3}` a `turn = 0` short-circuit produces differs at **both** ends.
     #[test]
     fn custom_profile_sub_budget_cut_reaches_into_straight_control_segments() {
         let mixed = BevelCurveProfile::from_points_with_handles(&[
@@ -41539,10 +41542,18 @@ mod tests {
             "mixed net segments = 2",
         );
         // The under-fill case: `curved_count = 2 < 3 < E = 4`.
+        let (turns, ranked) = turn_ranking(&mixed);
         assert_eq!(
-            mixed.widget_chain(3).len(),
-            4,
-            "the top-3 cut must take a straight segment to reach segments + 1 samples",
+            turns[0] / TURN_RESIDUE_SCALE,
+            0.5,
+            "segment 0's residue separates it from segment 3's exact zero: {turns:?}",
+        );
+        assert_eq!(turns[3], 0.0);
+        assert_eq!(ranked, vec![1, 2, 0, 3]);
+        assert_widget_chain(
+            &mixed.widget_chain(3),
+            &[(1.00, 0.00), (0.80, 0.05), (0.50, 0.40), (0.15, 0.85)],
+            "mixed net segments = 3 (select {0, 1, 2}: the residue, not the tie-break)",
         );
         assert_widget_chain(
             &mixed.widget_chain(4),
@@ -41714,6 +41725,344 @@ mod tests {
             &[(0.9, 0.5), (0.1, 0.5)],
             "curl-back net segments = 1 (the obtuse middle segment)",
         );
+    }
+
+    /// The rank key BEVEL.md §8.6.3.1(4).1 states, evaluated once per control segment: the
+    /// `turn` of the named segment, and the ranking the whole net induces (descending on
+    /// `turn`, then descending on index).
+    fn turn_ranking(net: &BevelCurveProfile) -> (Vec<f32>, Vec<usize>) {
+        let handles = net.resolved_handles();
+        let turns: Vec<f32> = (0..net.points.len() - 1)
+            .map(|s| control_segment_turn(&net.points, &handles, s))
+            .collect();
+        let mut ranked: Vec<usize> = (0..turns.len()).collect();
+        ranked.sort_by(|&a, &b| turns[b].total_cmp(&turns[a]).then(b.cmp(&a)));
+        (turns, ranked)
+    }
+
+    /// Per-segment allotments for a net at budget `n` (BEVEL.md §8.6.3.1(4).1).
+    fn allotments_of(net: &BevelCurveProfile, n: usize) -> Vec<usize> {
+        distribute_budget(&net.points, &net.resolved_handles(), n)
+    }
+
+    /// A net of `(x, y)` control points with **vector** handles on both sides of every point —
+    /// every segment a straight chord, so the whole ranking is rule (b)'s residues and rule
+    /// (a)'s index tie-break.
+    fn all_vector_net(net: &[(f32, f32)]) -> BevelCurveProfile {
+        BevelCurveProfile::from_points(
+            &net.iter()
+                .map(|&(x, y)| (x, y, BevelHandle::Vector))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The `2⁻²⁴` scale rule (b)'s round-trip residues live at. Dividing a residue by it is
+    /// exact (a power of two), so the multipliers below are asserted rather than approximated.
+    const TURN_RESIDUE_SCALE: f32 = 1.0 / (1u32 << 24) as f32;
+
+    /// BEVEL.md §8.6.3.1(4).1 **rule (b)**: a geometrically straight (vector–vector) control
+    /// segment does *not* necessarily score exactly `0`. Its two endpoint tangents are the same
+    /// chord reconstructed twice by two different `f32` round-trips — `(P_s + chord·fl(1/3)) −
+    /// P_s` and `P_{s+1} − (P_{s+1} − chord·fl(1/3))` — which need not land on the same float,
+    /// so the score is a cancellation residue at the `2⁻²⁴` scale. Those residues are part of
+    /// the rank key and usually order straight segments strictly before rule (a) is consulted.
+    ///
+    /// The guide's `E = 3` all-vector net, on which a naive reading predicts a total tie:
+    /// residues `0`, `√2·2⁻²⁴`, `3·2⁻²⁴`, hence the strict ranking `[2, 1, 0]`. The residues
+    /// are asserted as exact multiples because each of the six arithmetic-spelling traps the
+    /// guide enumerates moves them — dividing by `3` instead of scaling by `fl(1/3)`, or
+    /// normalising by componentwise divide instead of reciprocal-multiply, each changes this
+    /// row and the ranking that falls out of it.
+    #[test]
+    fn custom_profile_straight_control_segments_score_rounding_residues_not_zero() {
+        let (turns, ranked) = turn_ranking(&all_vector_e3_net());
+        assert_eq!(turns[0], 0.0, "segment 0's two round-trips agree exactly");
+        assert_eq!(
+            turns[1] / TURN_RESIDUE_SCALE,
+            std::f32::consts::SQRT_2,
+            "segment 1 scores √2·2⁻²⁴ (turns = {turns:?})",
+        );
+        assert_eq!(
+            turns[2] / TURN_RESIDUE_SCALE,
+            3.0,
+            "segment 2 scores 3·2⁻²⁴ (turns = {turns:?})",
+        );
+        assert_eq!(ranked, vec![2, 1, 0], "strict; rule (a) never consulted");
+
+        // The guide's allotment / selection table for the same net. `n = 3` and `n = 6` are
+        // exact multiples of `E` and pin nothing — the remainder is empty and any ranking
+        // reproduces them — so they are here as the control, not as evidence.
+        let net = all_vector_e3_net();
+        assert_eq!(allotments_of(&net, 3), vec![1, 1, 1], "ranking inert");
+        assert_eq!(allotments_of(&net, 6), vec![2, 2, 2], "ranking inert");
+        assert_eq!(allotments_of(&net, 4), vec![1, 1, 2]);
+        assert_eq!(allotments_of(&net, 5), vec![1, 2, 2]);
+        assert_eq!(allotments_of(&net, 7), vec![2, 2, 3]);
+        assert_eq!(allotments_of(&net, 8), vec![2, 3, 3]);
+
+        // The `n < E` sub-chain branch, where the cut decides both of the chain's ends.
+        assert_widget_chain(
+            &net.widget_chain(1),
+            &[(0.35, 0.40), (0.00, 1.00)],
+            "E = 3 all-vector net segments = 1 (select {2})",
+        );
+        assert_widget_chain(
+            &net.widget_chain(2),
+            &[(0.80, 0.12), (0.35, 0.40), (0.00, 1.00)],
+            "E = 3 all-vector net segments = 2 (select {2, 1})",
+        );
+        assert_widget_chain(
+            &net.widget_chain(4),
+            &[
+                (1.00, 0.00),
+                (0.80, 0.12),
+                (0.35, 0.40),
+                (0.175, 0.70),
+                (0.00, 1.00),
+            ],
+            "E = 3 all-vector net segments = 4",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1: rules (a) and (b) **interleave** within one ranking. On the
+    /// guide's `E = 5` all-vector net the residues are `(2⁻²⁴, 2⁻²⁴, 2.5·2⁻²⁴, 0, 0)`: segment
+    /// `2` leads on its residue alone, then rule (b) leaves two tied pairs that rule (a)
+    /// resolves by descending index — `1` before `0`, then `4` before `3`. Neither rule
+    /// reproduces `[2, 1, 0, 4, 3]` on its own: an all-tie reading gives `[4, 3, 2, 1, 0]` and
+    /// an ascending-index tie-break gives `[2, 0, 1, 3, 4]`, and both move the `n = 1` chain.
+    #[test]
+    fn custom_profile_residue_and_index_tie_break_interleave_in_one_ranking() {
+        let net = all_vector_net(&[
+            (1.0, 0.0),
+            (0.9, 0.05),
+            (0.7, 0.15),
+            (0.4, 0.3),
+            (0.15, 0.6),
+            (0.0, 1.0),
+        ]);
+        let (turns, ranked) = turn_ranking(&net);
+        let multiples: Vec<f32> = turns.iter().map(|t| t / TURN_RESIDUE_SCALE).collect();
+        assert_eq!(
+            multiples,
+            vec![1.0, 1.0, 2.5, 0.0, 0.0],
+            "turns = {turns:?}"
+        );
+        assert_eq!(ranked, vec![2, 1, 0, 4, 3]);
+
+        assert_widget_chain(
+            &net.widget_chain(1),
+            &[(0.70, 0.15), (0.40, 0.30)],
+            "E = 5 residue net segments = 1 (select {2})",
+        );
+        assert_widget_chain(
+            &net.widget_chain(2),
+            &[(0.90, 0.05), (0.70, 0.15), (0.40, 0.30)],
+            "E = 5 residue net segments = 2 (select {1, 2})",
+        );
+        // The item-3 jump: segment 3 is outranked, so `P₃` never appears.
+        assert_widget_chain(
+            &net.widget_chain(4),
+            &[
+                (1.00, 0.00),
+                (0.90, 0.05),
+                (0.70, 0.15),
+                (0.15, 0.60),
+                (0.00, 1.00),
+            ],
+            "E = 5 residue net segments = 4 (select {0, 1, 2, 4}, jumping segment 3)",
+        );
+        assert_eq!(allotments_of(&net, 6), vec![1, 1, 2, 1, 1]);
+        assert_eq!(allotments_of(&net, 7), vec![1, 2, 2, 1, 1]);
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1 rule (a) acting **entirely on its own**: an axis-aligned
+    /// staircase has one exactly-zero chord component per segment, so both of rule (b)'s
+    /// round-trips normalise to the same axis unit vector bit-for-bit and every residue
+    /// cancels. The whole ranking is then the descending-index tie-break, and the sub-budget
+    /// cut is the staircase's **tail** — an ascending-index tie-break samples the other end
+    /// of the stairs and is visibly wrong at every ordinary segment count.
+    ///
+    /// The stock staircase preset is built at `points = 17` (`E = 16`) whenever the widget has
+    /// never recorded a segment count, so `segments < 16` — every ordinary count — takes this
+    /// branch. The `segments = 4` chain is the guide's.
+    #[test]
+    fn custom_profile_all_tie_staircase_cut_is_the_tail() {
+        let staircase = staircase_net(17);
+        let (turns, ranked) = turn_ranking(&staircase);
+        assert!(
+            turns.iter().all(|&t| t == 0.0),
+            "every axis-aligned tread and riser ties at exactly 0: {turns:?}",
+        );
+        assert_eq!(ranked, (0..16).rev().collect::<Vec<_>>(), "pure rule (a)");
+
+        assert_widget_chain(
+            &staircase.widget_chain(4),
+            &[
+                (0.250, 0.750),
+                (0.125, 0.750),
+                (0.125, 0.875),
+                (0.000, 0.875),
+                (0.000, 1.000),
+            ],
+            "E = 16 staircase segments = 4 (the tail, start corner absent)",
+        );
+        // At `segments >= E` only the remainder is ranked, still from the high index down.
+        assert_eq!(
+            allotments_of(&staircase, 18),
+            {
+                let mut want = vec![1usize; 16];
+                want[15] = 2;
+                want[14] = 2;
+                want
+            },
+            "the two leftover advances go to the last two segments",
+        );
+
+        // Larger hand-built all-tie staircases take the same tail.
+        for points in [9usize, 33, 65] {
+            let net = staircase_net(points);
+            let segment_count = points - 1;
+            let n = segment_count / 2;
+            let chain = net.widget_chain(n as u32);
+            let want_first = (
+                net.points[segment_count - n].x,
+                net.points[segment_count - n].y,
+            );
+            assert!(
+                (chain[0].0 - want_first.0).abs() < 1.0e-6
+                    && (chain[0].1 - want_first.1).abs() < 1.0e-6,
+                "E = {segment_count} staircase at n = {n} must start at the tail's first \
+                 control point {want_first:?}, got {:?}",
+                chain[0],
+            );
+        }
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1's other worked ranking, the all-vector `E = 5` net of §(4).4:
+    /// `[3, 2, 1, 0, 4]`. It is the sharpest guard on the **reciprocal-multiply**
+    /// normalisation — swapping only that spelling for a componentwise divide re-ranks it to
+    /// `[3, 1, 2, 0, 4]`, which moves the `n = 2` sub-chain from
+    /// `(0.60,0.18) · (0.35,0.30) · (0.12,0.60)` to `(0.85,0.10) · (0.35,0.30) · (0.12,0.60)`.
+    #[test]
+    fn custom_profile_reciprocal_normalisation_ranks_the_stride_net() {
+        let net = all_vector_net(&[
+            (1.0, 0.0),
+            (0.85, 0.10),
+            (0.60, 0.18),
+            (0.35, 0.30),
+            (0.12, 0.60),
+            (0.0, 1.0),
+        ]);
+        let (turns, ranked) = turn_ranking(&net);
+        let multiples: Vec<f32> = turns.iter().map(|t| t / TURN_RESIDUE_SCALE).collect();
+        assert_eq!(
+            multiples,
+            vec![1.0, 1.0, 1.0, std::f32::consts::SQRT_2, 0.0],
+            "turns = {turns:?}",
+        );
+        assert_eq!(ranked, vec![3, 2, 1, 0, 4]);
+
+        assert_widget_chain(
+            &net.widget_chain(1),
+            &[(0.35, 0.30), (0.12, 0.60)],
+            "§(4).4 net segments = 1 (select {3})",
+        );
+        assert_widget_chain(
+            &net.widget_chain(2),
+            &[(0.60, 0.18), (0.35, 0.30), (0.12, 0.60)],
+            "§(4).4 net segments = 2 (select {2, 3})",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).1 rule (a) on a **genuine, non-residue** tie reachable from a stock
+    /// preset. The supports preset's two arc segments flanking `P₁` are the same angle by
+    /// construction and the single-precision evaluation agrees too — the same `f32` bit
+    /// pattern, not two floats a residue apart — so (b) contributes nothing and (a) decides
+    /// alone. It picks the *later* segment `1`: at `segments = 2` the cut is `{2, 1}` (the
+    /// zero-length segment's `60°` first, then the tie-break's winner) and the chain starts at
+    /// the arc sample, not at the widget corner `(1, 0)` an ascending-index tie-break gives.
+    #[test]
+    fn custom_profile_supports_preset_two_segment_cut_is_the_pure_tie_break() {
+        let supports = supports_preset_five_points();
+        let (turns, ranked) = turn_ranking(&supports);
+        assert_eq!(
+            turns[0].to_bits(),
+            turns[1].to_bits(),
+            "the two arc segments must tie bit-for-bit, not merely print alike: {turns:?}",
+        );
+        assert_eq!(ranked, vec![2, 1, 0, 3]);
+
+        assert_widget_chain(
+            &supports.widget_chain(2),
+            &[(0.85355, 0.85355), (0.5, 1.0), (0.5, 1.0)],
+            "supports segments = 2 (the pure tie-break)",
+        );
+        assert!(
+            (supports.widget_chain(2)[0].0 - 1.0).abs() > 0.1,
+            "an ascending-index tie-break would start the chain at the widget corner (1, 0)",
+        );
+    }
+
+    /// BEVEL.md §8.6.3.1(4).3's `n = 3` row on the **split** net, the one the guide's own
+    /// cross-backend arm asserts reference-side only. Segments `1` and `2` are vector–vector
+    /// chords that here score exactly `0` both — rule (b)'s residue vanishes on this net — so
+    /// rule (a) decides and the *later* segment `2` is taken. `P₂` reappears in the chain and
+    /// `P₁` does not, the opposite of an ascending-index tie-break.
+    #[test]
+    fn custom_profile_split_net_three_segment_cut_takes_the_later_tied_segment() {
+        let split = split_net();
+        let (turns, _) = turn_ranking(&split);
+        assert_eq!((turns[1], turns[2]), (0.0, 0.0), "a genuine tie: {turns:?}");
+        assert_widget_chain(
+            &split.widget_chain(3),
+            &[(1.00, 0.00), (0.60, 0.55), (0.10, 0.60), (0.00, 1.00)],
+            "split net segments = 3 (select {0, 2, 3})",
+        );
+    }
+
+    /// The guide's `E = 3` **all-vector** net `(1,0) → (0.8,0.12) → (0.35,0.4) → (0,1)`, on
+    /// which every segment is a straight chord and the entire chain is decided by
+    /// §8.6.3.1(4).1's residue ranking.
+    fn all_vector_e3_net() -> BevelCurveProfile {
+        all_vector_net(&[(1.0, 0.0), (0.8, 0.12), (0.35, 0.4), (0.0, 1.0)])
+    }
+
+    /// The staircase preset's control path at a given odd `points` (BEVEL.md §8.6.3.1(3)):
+    /// `x_i = 1 − 2·⌊(i+1)/2⌋ / X`, `y_i = 2·⌊i/2⌋ / Y` with `X = Y = points − 1`, vector
+    /// handles throughout. Every tread and riser is axis-aligned.
+    fn staircase_net(points: usize) -> BevelCurveProfile {
+        assert!(points % 2 == 1, "the odd-`points` layout only");
+        let span = (points - 1) as f32;
+        all_vector_net(
+            &(0..points)
+                .map(|i| {
+                    (
+                        1.0 - 2.0 * ((i + 1) / 2) as f32 / span,
+                        2.0 * (i / 2) as f32 / span,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The **supports** preset at its `points = 5` layout (BEVEL.md §8.6.3.1(3)): the start
+    /// corner, one arc sample with auto handles, the arc's `θ = π/2` sample coinciding with the
+    /// vector-handled end shoulder — hence a duplicated point and a zero-length control segment
+    /// — and the end corner.
+    fn supports_preset_five_points() -> BevelCurveProfile {
+        let arc = 0.5 + 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        BevelCurveProfile::from_points_with_handles(&[
+            (1.0, 0.0, BevelHandle::Vector, BevelHandle::Vector),
+            (
+                1.0 - 0.5 * (1.0 - std::f32::consts::FRAC_1_SQRT_2),
+                arc,
+                BevelHandle::Auto,
+                BevelHandle::Auto,
+            ),
+            (0.5, 1.0, BevelHandle::Auto, BevelHandle::Auto),
+            (0.5, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector, BevelHandle::Vector),
+        ])
     }
 
     /// The guide's all-auto **LATE_TURN** net (`E = 3`), the driver of §8.6.3.1(4).4's stride
@@ -52107,6 +52456,15 @@ struct ResolvedHandles {
 /// for parity; it has no simpler closed form.
 const CURVE_AUTO_HANDLE_FACTOR: f32 = 2.5614;
 
+/// The vector handle's one-third reach as a **rounded `f32` constant** (BEVEL.md
+/// §8.6.3.1(4).1, rule (b)). Scaling by `fl(1/3)` and dividing by `3` differ by an ulp on
+/// some inputs, and the difference is not cosmetic: the turn measure reads a vector-handled
+/// segment's two tangents as the *same chord reconstructed twice*, so its score is a
+/// cancellation residue at the `2⁻²⁴` scale and every spelling choice on the way there moves
+/// it. Dividing re-ranks the guide's `E = 5` residue net from `[2, 1, 0, 4, 3]` to
+/// `[3, 2, 1, 0, 4]`, which lands its `n = 1` sub-chain on a different pair of control points.
+const CURVE_VECTOR_HANDLE_THIRD: f32 = 1.0 / 3.0;
+
 /// Resolve one side of a control point's Bézier handle (BEVEL.md §8.6.3.1(2)). `is_left`
 /// selects the arriving (`h1`, toward `prev`) vs the leaving (`h2`, toward `next`) side.
 fn resolve_handle_side(
@@ -52124,8 +52482,8 @@ fn resolve_handle_side(
         BevelHandle::Vector => {
             let neighbour = if is_left { prev } else { next };
             (
-                p.0 + (neighbour.0 - p.0) / 3.0,
-                p.1 + (neighbour.1 - p.1) / 3.0,
+                p.0 + (neighbour.0 - p.0) * CURVE_VECTOR_HANDLE_THIRD,
+                p.1 + (neighbour.1 - p.1) * CURVE_VECTOR_HANDLE_THIRD,
             )
         }
         BevelHandle::Auto => auto_handle(p, prev, next, is_left),
@@ -52327,6 +52685,72 @@ fn widget_chain_to_cell(chain: &[(f32, f32)], reverse: bool) -> Vec<(f32, f32)> 
     }
 }
 
+/// One control segment's **turn magnitude** — the rank key of BEVEL.md §8.6.3.1(4).1.
+///
+/// Both tangents point the way the curve travels along the segment: the departure runs from
+/// the start point to its *right* handle, the arrival runs from the end point's *left* handle
+/// **into** the end point. Taken that way a straight chord scores `≈ 0` and a sharper bend
+/// scores larger, up to `π`; heading the arrival at the handle instead yields exactly
+/// `π − turn` on every segment — a clean rank inversion with no numerical noise to hint at it.
+///
+/// The measure normalises **first** and then reads the angle off a chord between the two unit
+/// vectors, splitting on the sign of their dot with the boundary inclusive on the acute arm.
+/// That is not an equivalent restatement of `acos(dot/(|d|·|a|))`: a zero-length tangent
+/// normalises to the zero vector, which lands on `dot = 0` and so takes the acute arm, giving
+/// the difference chord the surviving unit vector's own length. **Exactly one** zero tangent
+/// therefore scores a fixed `π/3` — near the *top* of the ranking, not the bottom — while
+/// both zero score `0`.
+///
+/// **Every arithmetic step here is part of the rule** rather than an implementation detail
+/// (§8.6.3.1(4).1, rule (b)). On a vector-handled segment the two tangents are the *same*
+/// chord reconstructed twice by two different round-trips, so the score is a cancellation
+/// residue at the `2⁻²⁴ ≈ 5.96e-8` radian scale rather than an exact zero — and those residues
+/// order geometrically-identical straight segments strictly, deciding the allotment before the
+/// index tie-break is ever consulted. So: read the reconstructed handle *positions* and
+/// difference them back out (never short-circuit a straight segment to `0`, never simplify the
+/// round-trip algebraically — the simplification is exactly what cancels the residue), take
+/// each length as `sqrt(dot)` in `f32`, and normalise by a single `f32` reciprocal multiplied
+/// into both components. A componentwise divide is algebraically identical and numerically is
+/// not: it re-ranks the guide's §(4).4 net from `[3, 2, 1, 0, 4]` to `[3, 1, 2, 0, 4]` and
+/// moves that net's sub-chain. Widening to `f64` does not make the residues vanish either —
+/// the same cancellation happens at `2⁻⁵³` and induces a different order once ties are broken.
+fn control_segment_turn(points: &[BevelCurvePoint], handles: &[ResolvedHandles], s: usize) -> f32 {
+    let start = (points[s].x, points[s].y);
+    let end = (points[s + 1].x, points[s + 1].y);
+    let departure = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
+    let arrival = (end.0 - handles[s + 1].left.0, end.1 - handles[s + 1].left.1);
+    let unit = |v: (f32, f32)| {
+        let length = (v.0 * v.0 + v.1 * v.1).sqrt();
+        if length == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let reciprocal = 1.0 / length;
+            (v.0 * reciprocal, v.1 * reciprocal)
+        }
+    };
+    let departure_unit = unit(departure);
+    let arrival_unit = unit(arrival);
+    let dot = departure_unit.0 * arrival_unit.0 + departure_unit.1 * arrival_unit.1;
+    let half_chord = |chord: (f32, f32)| {
+        (0.5 * (chord.0 * chord.0 + chord.1 * chord.1).sqrt())
+            .clamp(-1.0, 1.0)
+            .asin()
+    };
+    if dot >= 0.0 {
+        2.0 * half_chord((
+            departure_unit.0 - arrival_unit.0,
+            departure_unit.1 - arrival_unit.1,
+        ))
+    } else {
+        std::f32::consts::PI
+            - 2.0
+                * half_chord((
+                    departure_unit.0 + arrival_unit.0,
+                    departure_unit.1 + arrival_unit.1,
+                ))
+    }
+}
+
 /// Distribute a chain budget of `n` interior advances across the control-point segments
 /// (BEVEL.md §8.6.3.1(4), straight-edge sampling **off**). Returns the per-segment sample
 /// count `m_i` (each segment sampled at `m_i + 1` Bézier points), with `Σ m_i = n`.
@@ -52347,65 +52771,21 @@ fn distribute_budget(
     }
     let is_curved = |s: usize| all_curved || curved[s];
 
-    // Turn magnitude per segment (BEVEL.md §8.6.3.1(4).1). Both tangents point the way the
-    // curve travels along the segment: departure runs from the start point to its right
-    // handle, arrival runs from the end point's left handle *into* the end point. Taken
-    // that way a straight chord scores ≈ 0 and a sharper bend scores larger, up to π;
-    // heading the arrival at the handle instead inverts the whole ranking (it yields
-    // exactly π − turn on every segment).
-    //
-    // The measure normalises **first** and then reads the angle off a chord between the two
-    // unit vectors, splitting on the sign of their dot with the boundary inclusive on the
-    // acute arm. That is not an equivalent restatement of `acos(dot/(|d|·|a|))`: a
-    // zero-length tangent normalises to the zero vector, which lands on `dot = 0` and so
-    // takes the acute arm, giving the difference chord the surviving unit vector's own
-    // length. Exactly one zero tangent therefore scores a fixed π/3 — near the *top* of the
-    // ranking, not the bottom — while both zero score 0.
-    let turn = |s: usize| -> f32 {
-        let start = (points[s].x, points[s].y);
-        let end = (points[s + 1].x, points[s + 1].y);
-        let departure = (handles[s].right.0 - start.0, handles[s].right.1 - start.1);
-        let arrival = (end.0 - handles[s + 1].left.0, end.1 - handles[s + 1].left.1);
-        let unit = |v: (f32, f32)| {
-            let length = (v.0 * v.0 + v.1 * v.1).sqrt();
-            if length == 0.0 {
-                (0.0, 0.0)
-            } else {
-                (v.0 / length, v.1 / length)
-            }
-        };
-        let departure_unit = unit(departure);
-        let arrival_unit = unit(arrival);
-        let dot = departure_unit.0 * arrival_unit.0 + departure_unit.1 * arrival_unit.1;
-        let half_chord = |chord: (f32, f32)| {
-            (0.5 * (chord.0 * chord.0 + chord.1 * chord.1).sqrt())
-                .clamp(-1.0, 1.0)
-                .asin()
-        };
-        if dot >= 0.0 {
-            2.0 * half_chord((
-                departure_unit.0 - arrival_unit.0,
-                departure_unit.1 - arrival_unit.1,
-            ))
-        } else {
-            std::f32::consts::PI
-                - 2.0
-                    * half_chord((
-                        departure_unit.0 + arrival_unit.0,
-                        departure_unit.1 + arrival_unit.1,
-                    ))
-        }
-    };
+    let turn = |s: usize| control_segment_turn(points, handles, s);
 
-    // Every segment ranked sharpest-first (descending `turn`), scored once rather than once
-    // per comparison. Equal-`turn` order is *not* derivable — §8.6.3.1(4).1 states the
-    // reference resolves it through an ordering that is neither total nor stable — so the
-    // ascending-index fallback below is an arbitrary deterministic choice, not a parity
-    // claim. It is reached routinely: every straight segment scores exactly 0, so whenever
-    // `curved_count < n < segment_count` the sub-budget cut necessarily falls inside a tie
-    // block, and an all-vector net ties everywhere.
+    // Every segment ranked sharpest-first, scored once rather than once per comparison. The
+    // key is the pair `(turn, index)` compared **descending on both** (§8.6.3.1(4).1, rule
+    // (a)): among segments whose `turn` compares equal the one *later* along the curve takes
+    // its advance first. Descending, not ascending — the "obvious" stable descending-`turn`
+    // sort leaves ascending index among equal scorers and diverges on the first genuine tie,
+    // which is a mainstream path rather than a corner: a staircase net's every segment is
+    // axis-aligned, so both round-trips of rule (b) normalise to the same axis unit vector
+    // bit-for-bit and the whole ranking is the tie-break's.
+    //
+    // `total_cmp` is safe because `turn` is never `-0.0`: both arms return `2·asin` of a
+    // non-negative chord length (or π minus such a term), and `asin(+0) = +0`.
     let mut ranked: Vec<(f32, usize)> = (0..segment_count).map(|s| (turn(s), s)).collect();
-    ranked.sort_by(|&(turn_a, a), &(turn_b, b)| turn_b.total_cmp(&turn_a).then(a.cmp(&b)));
+    ranked.sort_by(|&(turn_a, a), &(turn_b, b)| turn_b.total_cmp(&turn_a).then(b.cmp(&a)));
 
     let mut budget = vec![0usize; segment_count];
     if n >= segment_count {
@@ -52418,12 +52798,9 @@ fn distribute_budget(
         }
         // The remainder is what the even split left over *among the curved segments*, so
         // only they are offered it; the straight ones are already at their reserved one.
-        // This is not equivalent to walking the unfiltered ranking: a curved segment can
-        // score exactly 0 too (collinear auto handles), so a straight segment can outrank
-        // one on a `total_cmp` tie-break and take an advance the filtered walk would give
-        // elsewhere. The two readings can only differ inside such a 0-scored tie block,
-        // which §8.6.3.1(4).1 leaves undefined; the filter is the closer reading of "split
-        // the remaining budget evenly among the curved segments".
+        // (An all-vector net has no curved segment at all, and §8.6.3.1(4).1's "if none are
+        // curved, treat all as curved" makes the filter inert there — which is the branch the
+        // guide's worked residue nets exercise.)
         for &(_, s) in ranked.iter().filter(|&&(_, s)| is_curved(s)).take(leftover) {
             budget[s] += 1;
         }
