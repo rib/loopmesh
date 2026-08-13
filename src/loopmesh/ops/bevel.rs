@@ -6685,7 +6685,7 @@ impl LoopMesh {
     /// single sharp meet-point, so the junction presents an `(s + 1)`-boundvert ring
     /// the general grid tiles.
     ///
-    /// Scoped to a circular (or custom, or even-`segments` square) profile and `s ≥ 3`: both
+    /// Scoped to a circular (or custom, or square) profile and `s ≥ 3`: both
     /// `ARC` (§8.9.5.1–§8.9.5.3) and `PATCH` (§8.9.2's `s − 1` shoulders per chord leg) are
     /// segments-general. Both engage at a
     /// **single-face** reflex sector (no absorbed unbeveled legs); a **multi-face**
@@ -6695,8 +6695,10 @@ impl LoopMesh {
     /// `restitch_multiface_arc_sector`). All classification runs read-only first; the
     /// method returns `false` **without mutating** for any junction outside those cases
     /// (no reflex sector — the miter is inert — more than one reflex sector, a
-    /// non-circular *analytic* profile (a custom curve admits at any slider value), `s < 3`,
-    /// or `segments < 2`), so the caller falls back to the sharp ring.
+    /// non-circular, non-square *analytic* profile (a custom curve admits at any slider
+    /// value; that analytic decline is **this implementation's scope**, not a guide gate —
+    /// see the body's dispatch comment), `s < 3`, or `segments < 2`), so the caller falls
+    /// back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_outer_miter<'c>(
         &mut self,
@@ -6715,24 +6717,36 @@ impl LoopMesh {
         miter_ring_junctions: &mut Vec<MiterRingJunction<'c>>,
         result: &mut BevelResult,
     ) -> bool {
-        // §8.9.5: the outer miter rides the [V-ADJ] grid, so `segments ≥ 2`. The circular
-        // profile is filled by the general relaxed cap; the **square** profile (§8.5.5.5(f.5))
-        // is filled by the parallel-offset grid, which is even-`segments` only, so decline an
-        // odd-`segments` square miter to the sharp ring. Every other exponent stays out of the
-        // outer-miter fill for now.
+        // **Scope marker, not spec.** The guide puts *no* exponent gate on the outer miter at
+        // all: §8.9.2 / §8.9.6 / §8.9.8 gate it on the `s ≥ 3` beveled-edge count and the
+        // §8.9.1 firing margin, nothing else, and §8.9.5 forces an arc start's exponent to the
+        // circle value *independently of the user `profile` scalar*. So the surviving
+        // `exponent != 2.0 && !square` arm below is **this implementation's scope limit** and a
+        // live parity divergence: at a curved analytic profile (`profile = 0.7`, say) the
+        // reference builds the miter and we hand back the sharp ring. Nothing pins that today —
+        // no A/B arm covers a curved-analytic outer miter — so the divergence is unwitnessed as
+        // well as unfixed. Widening it is its own matrix row, not a tidy-up, and the paragraphs
+        // below are *not* a justification for it.
         //
-        // Both exponent tests are `custom.is_none()`'s. §8.9.5 forces an arc start's exponent
-        // to the circle value *independently of the user `profile` scalar*, and the patch legs
-        // are straight whatever it reads, so under a curve neither the arc nor the fill
-        // (`build_adj_fill_miter_ring` sends a custom ring to the general grid) consults the
-        // slider — declining on it would move the boundvert count (§8.9.6) on a value nothing
-        // downstream uses. The **analytic** non-circular / odd-square cases stay declined.
+        // What **is** guide-licensed is the **square** sentinel at either parity. §8.9.5: the
+        // outer miter rides the [V-ADJ] grid, so `segments ≥ 2`. *Which* grid is §8.5.5.5(f.1)'s
+        // dispatch over the enlarged ring, and the miter never pre-empts it. In particular the
+        // parallel-offset lattice of §8.5.5.5(f.5) is claimed by step 1 only when `segments` is
+        // **even**, so a square ring at an odd count never reaches that lattice in the first
+        // place — there is nothing for this gate to decline. It falls through to step 4's
+        // general fullness grid, which is the same fill the circular exponent's miter already
+        // takes at those counts, with the §8.5.5.5(e) odd-parity centre polygon.
+        // `build_adj_fill_miter_ring` asks step 1's predicate itself (`adj_square_ring_claims`,
+        // which carries the parity conjunct), so both parities are admitted here.
+        //
+        // Both arms are scoped to `custom.is_none()`, because a custom curve reaches neither
+        // consumer of the slider: §8.9.5 forces the arc start's exponent to the circle value,
+        // the patch legs are straight whatever it reads, and `build_adj_fill_miter_ring` sends a
+        // custom ring to the general grid. Declining on the slider there would move the
+        // boundvert count (§8.9.6) on a value nothing downstream reads.
         let exponent = profile_to_exponent(profile);
         let square = exponent == PROFILE_SQUARE_EXPONENT;
         if segments < 2 || (custom.is_none() && exponent != 2.0 && !square) {
-            return false;
-        }
-        if custom.is_none() && square && segments % 2 != 0 {
             return false;
         }
         let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
@@ -26250,6 +26264,294 @@ mod tests {
         }
     }
 
+    /// The apex junction's **cap faces** on the `octagonal_bipyramid` driver: the new faces
+    /// lying wholly above the rim plane. Each of the three profile strips spans a single cell
+    /// from the cap's ring chain down to its rim vert at `z = 0`, and every re-stitched reflex
+    /// face reaches one of the absorbed rim verts, so the cut isolates the cap exactly.
+    fn bipyramid_apex_cap_faces(mesh: &LoopMesh, result: &BevelResult) -> Vec<FaceKey> {
+        result
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face| {
+                mesh.face_vert_keys(face)
+                    .iter()
+                    .all(|&vertex| mesh.vertex_position(vertex).z > 0.4)
+            })
+            .collect()
+    }
+
+    /// The cap disk's **innermost ring** (BEVEL.md §8.5.5.5(e)): peel inward from the cap's
+    /// boundary chain — the verts it shares with the profile strips — and keep the last ring
+    /// the peel reaches. At odd `segments` that ring is the central `(ring valence)`-gon's seam
+    /// verts, so the closing polygon is identified **topologically**, without reading any
+    /// position (which §8.5.5.5(f.5) warns can corroborate a construction but not attribute
+    /// one). At even parity the same peel lands on the single welded apex.
+    fn cap_innermost_ring(mesh: &LoopMesh, cap: &[FaceKey]) -> Vec<VertexKey> {
+        let mut cap_verts: Vec<VertexKey> = Vec::new();
+        for &face in cap {
+            for vertex in mesh.face_vert_keys(face) {
+                if !cap_verts.contains(&vertex) {
+                    cap_verts.push(vertex);
+                }
+            }
+        }
+        let mut ring: Vec<VertexKey> = cap_verts
+            .iter()
+            .copied()
+            .filter(|&vertex| {
+                !mesh
+                    .vert_face_keys(vertex)
+                    .iter()
+                    .all(|face| cap.contains(face))
+            })
+            .collect();
+        let mut peeled = ring.clone();
+        loop {
+            let mut next: Vec<VertexKey> = Vec::new();
+            for &vertex in &ring {
+                for neighbour in mesh.vert_neighbor_keys(vertex) {
+                    if cap_verts.contains(&neighbour)
+                        && !peeled.contains(&neighbour)
+                        && !next.contains(&neighbour)
+                    {
+                        next.push(neighbour);
+                    }
+                }
+            }
+            if next.is_empty() {
+                return ring;
+            }
+            peeled.extend(next.iter().copied());
+            ring = next;
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) step 1 / §8.5.5.5(f.5) / §8.9.5.3: the outer miter **is admitted**
+    /// at the square sentinel with **odd** `segments`, and what it then builds is step 4's
+    /// general fullness grid — not the (f.5) parallel-offset lattice.
+    ///
+    /// Step 1's claim carries an even-`segments` conjunct, and (f.5) says the same from its own
+    /// side: its lattice "is not reached on odd `segments` at all". So at an odd count a square
+    /// ring never reaches that lattice, and there is nothing for the miter's admission to
+    /// decline — the enlarged ring falls through to the same grid the circular exponent's miter
+    /// already rides, closing on §8.5.5.5(e)'s central `(s + 1)`-gon.
+    ///
+    /// The pins, in the order they narrow the claim:
+    ///
+    /// - the miter **fires** — the square ring is not the sharp ring. This is the regression the
+    ///   test exists for: an admission gate carrying step 1's parity conjunct returned the sharp
+    ///   ring verbatim at every odd count;
+    /// - `PATCH`'s `+2` boundverts cost exactly twice `ARC`'s `+1` over the shared sharp baseline
+    ///   (§8.9.6), so neither mode half-fell-back;
+    /// - the square cap's element census equals the **circular** cap's while its positions do
+    ///   not: at an odd count the exponent is a curve shape only, exactly as (f.5)'s witness box
+    ///   reports ("the vertex totals are identical across all three profiles");
+    /// - the cap is **built** as §8.5.5.5(e)'s odd-parity grid: `valence` sub-patch blocks of
+    ///   `h²` quads + `valence` seam bridges of `h` quads + **one** central `valence`-gon, with
+    ///   `h = (segments − 1) / 2` — the `h = 1`, valence-4 instance of which is §8.9.5.3's worked
+    ///   `4 + 4 + 1 = 9`-face cap. The closing polygon is found by peeling the cap disk inward,
+    ///   *not* by reading a position: at odd `segments` **neither** (f.5) construction welds, so
+    ///   "no vert at `v`" excludes nothing that odd parity does not already exclude, and (f.5)'s
+    ///   reachability box warns that an apex footprint corroborates a construction rather than
+    ///   attributing one. That test is kept below as corroboration, no longer as the attribution;
+    /// - `PATCH`'s §8.9.2.1 re-stitch survives the widening: the absorbed-leg fan still closes
+    ///   as four hub triangles + two `(segments + 3)`-gons, the same shape
+    ///   `square_outer_patch_welds_apex_and_keeps_hub_fan` pins at even counts.
+    ///
+    /// Swept across the whole sentinel band (§8.6.2), because it is the snap — not one slider
+    /// value — that used to trip the gate.
+    #[test]
+    fn square_outer_miter_admits_odd_segments_on_the_step4_grid() {
+        let build = |miter: BevelMiter, profile: f32, segments: u32| {
+            let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+            let result = mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    profile,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: miter,
+                    ..Default::default()
+                },
+            );
+            (mesh, result, rim)
+        };
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+
+        // §8.9.6: the enlarged ring's totals are not a closed form, so the two odd counts are
+        // pinned against the reference figures — `(ARC, PATCH)` per `segments`.
+        for (segments, expected) in [
+            (3_u32, ((37_usize, 78_usize, 43_usize), (41, 84, 45))),
+            (5, ((63, 132, 71), (72, 147, 77))),
+        ] {
+            let (sharp_mesh, _, _) = build(BevelMiter::Sharp, 0.97, segments);
+            let sharp = counts(&sharp_mesh);
+            let (circular_mesh, circular_result, _) = build(BevelMiter::Arc, 0.5, segments);
+            let circular = counts(&circular_mesh);
+            let circular_positions: Vec<Vec3> = circular_result
+                .verts
+                .iter()
+                .map(|&vertex| circular_mesh.vertex_position(vertex))
+                .collect();
+
+            for profile in [0.95_f32, 0.97, 0.99, 1.0] {
+                assert_eq!(
+                    profile_to_exponent(profile),
+                    PROFILE_SQUARE_EXPONENT,
+                    "profile {profile} snaps to the square sentinel (§8.6.2)",
+                );
+                let (arc_mesh, arc_result, _) = build(BevelMiter::Arc, profile, segments);
+                let (patch_mesh, patch_result, patch_rim) =
+                    build(BevelMiter::Patch, profile, segments);
+                arc_mesh.validate_topology();
+                patch_mesh.validate_topology();
+                let arc = counts(&arc_mesh);
+                let patch = counts(&patch_mesh);
+                assert_eq!(
+                    (arc, patch),
+                    expected,
+                    "segments {segments}, profile {profile}: the odd square miter's element \
+                     totals (§8.9.6)",
+                );
+
+                // §8.9.2 / §8.9.6: `ARC` adds one boundvert to the `s = 3` sharp ring and
+                // `PATCH` two, so the fill sees a valence-4 and a valence-5 ring respectively —
+                // and §8.5.5.5(e) closes each on a central polygon of exactly that valence.
+                for (name, mesh, result, census, valence) in [
+                    ("ARC", &arc_mesh, &arc_result, arc, 4_usize),
+                    ("PATCH", &patch_mesh, &patch_result, patch, 5),
+                ] {
+                    assert_eq!(
+                        census.0 as i64 - census.1 as i64 + census.2 as i64,
+                        2,
+                        "segments {segments}, profile {profile}: the square outer {name} miter \
+                         closes to a χ = 2 manifold",
+                    );
+                    assert_ne!(
+                        census, sharp,
+                        "segments {segments}, profile {profile}: the square outer {name} miter \
+                         must not decline to the sharp ring",
+                    );
+                    assert!(
+                        !mesh
+                            .vert_keys()
+                            .into_iter()
+                            .any(|v| (mesh.vertex_position(v) - apex).length() < 1.0e-4),
+                        "segments {segments}, profile {profile}: odd parity closes on \
+                         §8.5.5.5(e)'s central polygon, so (f.5)'s even-only weld at `v` is \
+                         absent ({name})",
+                    );
+
+                    let cap = bipyramid_apex_cap_faces(mesh, result);
+                    let steps = (segments as usize - 1) / 2;
+                    assert_eq!(
+                        cap.len(),
+                        valence * steps * steps + valence * steps + 1,
+                        "segments {segments}, profile {profile}: the {name} cap is §8.5.5.5(e)'s \
+                         odd grid — {valence} sub-patch blocks of {steps}² + {valence} seam \
+                         bridges of {steps} + the central {valence}-gon",
+                    );
+                    let innermost = cap_innermost_ring(mesh, &cap);
+                    assert_eq!(
+                        innermost.len(),
+                        valence,
+                        "segments {segments}, profile {profile}: the {name} cap's innermost ring \
+                         is the {valence} seam verts of §8.5.5.5(e)",
+                    );
+                    let closing: Vec<FaceKey> = cap
+                        .iter()
+                        .copied()
+                        .filter(|&face| {
+                            mesh.face_vert_keys(face)
+                                .iter()
+                                .all(|vertex| innermost.contains(vertex))
+                        })
+                        .collect();
+                    assert_eq!(
+                        closing.len(),
+                        1,
+                        "segments {segments}, profile {profile}: odd parity closes the {name} cap \
+                         on exactly one central face",
+                    );
+                    assert_eq!(
+                        mesh.face_vert_keys(closing[0]).len(),
+                        valence,
+                        "segments {segments}, profile {profile}: that central face is the \
+                         `(ring valence)`-gon of §8.5.5.5(e) ({name})",
+                    );
+                }
+
+                // §8.9.2.1: the odd `PATCH` re-stitch is untouched by the widening — the five
+                // absorbed legs still fan to the hub `B_2` as four bare triangles flanked by two
+                // `(segments + 3)`-gons. Same isolation as the even-count sibling test: the
+                // apex-side faces touching an absorbed rim vert, dropping the base pyramid's.
+                let is_base = |v: VertexKey| {
+                    (patch_mesh.vertex_position(v) - Vec3::new(0.0, 0.0, -1.0)).length() < 1.0e-4
+                };
+                let absorbed = [
+                    patch_rim[3],
+                    patch_rim[4],
+                    patch_rim[5],
+                    patch_rim[6],
+                    patch_rim[7],
+                ];
+                let mut sizes: Vec<usize> = Vec::new();
+                for face in patch_mesh.face_keys() {
+                    let verts = patch_mesh.face_vert_keys(face);
+                    if !verts.iter().any(|x| absorbed.contains(x))
+                        || verts.iter().any(|&x| is_base(x))
+                    {
+                        continue;
+                    }
+                    sizes.push(verts.len());
+                }
+                sizes.sort_unstable();
+                let mut expected_sizes = vec![3_usize; 4];
+                expected_sizes.push(segments as usize + 3);
+                expected_sizes.push(segments as usize + 3);
+                expected_sizes.sort_unstable();
+                assert_eq!(
+                    sizes, expected_sizes,
+                    "segments {segments}, profile {profile}: four hub triangles + two \
+                     `(segments + 3)`-gons still wrap the 270° gap (§8.9.2.1)",
+                );
+
+                assert_eq!(
+                    (
+                        patch.0 - sharp.0,
+                        patch.1 - sharp.1,
+                        patch.2 - sharp.2
+                    ),
+                    (
+                        2 * (arc.0 - sharp.0),
+                        2 * (arc.1 - sharp.1),
+                        2 * (arc.2 - sharp.2)
+                    ),
+                    "segments {segments}, profile {profile}: PATCH's `+2` boundverts cost twice \
+                     ARC's `+1` (§8.9.6)",
+                );
+                assert_eq!(
+                    arc, circular,
+                    "segments {segments}, profile {profile}: at odd `segments` the square ring \
+                     rides the same step-4 grid the circle does, so the census is unchanged",
+                );
+                assert!(
+                    arc_result.verts.iter().any(|&vertex| {
+                        let position = arc_mesh.vertex_position(vertex);
+                        !circular_positions
+                            .iter()
+                            .any(|candidate| (*candidate - position).length() <= 1.0e-4)
+                    }),
+                    "segments {segments}, profile {profile}: the exponent still shapes the ring \
+                     chains, so the square cap is not the circular one",
+                );
+            }
+        }
+    }
+
     /// BEVEL.md §8.5.5.5(f.5): the convex sector **trailing** a fired outer miter keeps its
     /// pass-1 parallel-offset centreline seed. On the octagonal bipyramid arc/patch bevel the
     /// reflex sector opens over the `270°` gap and the miter's arc/patch end `B_3` lands on the
@@ -32721,10 +33023,9 @@ mod tests {
     /// nothing in the build reads.
     ///
     /// The unmitered sibling cannot see this: its fixture has no miter at all. Both builders are
-    /// swept, because each carried its own exponent gate — the inner miter's `r == 2` and the
-    /// outer's `r == 2 or square` plus the square's even-`segments` conjunct — so
-    /// `profile = 0.7` (curved) declined everywhere and `profile = 0.99` (square) declined at
-    /// odd `segments` on the outer path.
+    /// swept, because each carries its own exponent gate — the inner miter's `r == 2` and the
+    /// outer's `r == 2 or square` — so an analytic `profile = 0.7` (curved) declines on both
+    /// paths, and only the profile *type* may decide otherwise.
     ///
     /// The `Sharp` contrast is what stops the sweep passing vacuously: without it, a build in
     /// which *every* arm declined would be perfectly slider-invariant too.
