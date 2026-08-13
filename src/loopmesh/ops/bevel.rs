@@ -3211,6 +3211,8 @@ impl LoopMesh {
                         offset,
                         segments,
                         profile,
+                        custom,
+                        &orientation,
                         options.spread,
                         options.miter_outer,
                         &mut templates,
@@ -3237,6 +3239,8 @@ impl LoopMesh {
                         offset,
                         segments,
                         profile,
+                        custom,
+                        &orientation,
                         options.miter_outer,
                         &mut templates,
                         &mut chains,
@@ -4081,7 +4085,9 @@ impl LoopMesh {
                     legs[next][n - k - 1]
                 });
             }
-            // Gap, not an answer: the square-in weld does not read §8.6.3.1(6)'s mark either.
+            // Inert, not a gap: §8.5.5.5(f.4a)'s ring test refuses a custom profile outright, so
+            // every chain laid here is an analytic superellipse — diagonal-symmetric, and
+            // §8.6.3.1(6)'s handedness bit is unobservable on those.
             chains.push(EdgeEndChain {
                 edge: opening_edges[next],
                 endpoint: vertex,
@@ -5066,36 +5072,41 @@ impl LoopMesh {
     /// symmetric (equal-offset) cell this equals the emitted rim mid (the resample is the
     /// identity there); on the skewed arc-flanking cell it is the un-skewed point the
     /// extraordinary-centre stencil must see instead of the resampled rim value.
-    fn coarse_flank_mid(
+    fn coarse_flank_mid<'c>(
         &self,
         start: VertexKey,
         end: VertexKey,
         edge: EdgeKey,
         profile: f32,
+        custom: Option<CustomChainRead<'c>>,
         rescue: MidRescue,
     ) -> Vec3 {
-        self.ring_flank_profile(start, end, edge, profile, rescue)
+        // §8.6.3.1(4).4 row 1: the coarse net is the read at `m = 2`, and this mid is only
+        // ever consumed at `segments == 2`, where the schedule's `m == segments` arm returns
+        // `target[1]` — not the strided `doubled[doubled_resolution / 2]`.
+        self.ring_flank_profile(start, end, edge, profile, custom, rescue)
             .raw_positions(2)[1]
     }
 
     /// The profile **generator** of a ring edge that crosses a beveled edge (BEVEL.md
     /// §8.2.2.1 / §8.5.5.5(a)): that edge's cross-section cell between the two ring
     /// boundverts. Rebuilt from the same three inputs `build_chain_between` used, so the
-    /// generator re-samples to exactly the polyline the emitted chain was read off.
-    fn ring_flank_profile(
+    /// generator re-samples to exactly the polyline the emitted chain was read off — which
+    /// is why `custom` must be the *same* read (curve **and** §8.6.3.1(6) handedness bit)
+    /// the emitted chain was minted through.
+    fn ring_flank_profile<'c>(
         &self,
         start: VertexKey,
         end: VertexKey,
         edge: EdgeKey,
         profile: f32,
+        custom: Option<CustomChainRead<'c>>,
         rescue: MidRescue,
-    ) -> RingChainProfile<'static> {
+    ) -> RingChainProfile<'c> {
         RingChainProfile::Cell {
             cell: self.derive_profile_cell(start, end, edge, rescue),
             profile,
-            // Junction / miter ring flanks route the analytic sampler; the custom-profile
-            // edge-junction fill is a separate follow-up (BEVEL.md §8.6.3).
-            custom: None,
+            custom,
         }
     }
 
@@ -6229,11 +6240,12 @@ impl LoopMesh {
     ///
     /// All classification runs read-only first; the method returns `false` **without
     /// mutating** for any junction outside its scope (`segments < 2`, a non-circular
-    /// profile, fewer than three sectors, an all-non-reflex ring that is not the forced
+    /// *analytic* profile — a custom curve admits at any slider value, §8.9.5 forcing the
+    /// arc circular regardless — fewer than three sectors, an all-non-reflex ring that is not the forced
     /// tri-corner geometry, more than one reflex sector, or a reflex sector the outer
     /// miter owns), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
-    fn build_junction_inner_miter(
+    fn build_junction_inner_miter<'c>(
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
@@ -6241,12 +6253,14 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        custom: Option<&'c CustomChains<'c>>,
+        orientation: &CustomOrientation,
         spread: f32,
         miter_outer: BevelMiter,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
-        miter_ring_junctions: &mut Vec<MiterRingJunction>,
+        miter_ring_junctions: &mut Vec<MiterRingJunction<'c>>,
         result: &mut BevelResult,
     ) -> bool {
         // §8.9.5: the inner miter rides the [V-ADJ] grid, so `segments ≥ 2`, and the arc
@@ -6256,7 +6270,14 @@ impl LoopMesh {
         // boundvert ring (valence `2s` all-convex, `2s − 1` with a sharp reflex sector, since
         // every non-reflex sector splits — not the outer miter's `s + 1`) rather than
         // declining to the sharp ring.
-        if segments < 2 || profile_to_exponent(profile) != 2.0 {
+        //
+        // The exponent conjunct is `custom.is_none()`'s, for the reason the fill's own square
+        // gate carries one: §8.9.5 forces the arc's exponent to the circle value *independently
+        // of the user `profile` scalar*, so under a curve the slider is a value nothing in this
+        // build reads — and declining on it would move the boundvert count (§8.9.6), a topology
+        // divergence keyed on a dead slider. The **analytic** non-circular miter stays out of
+        // scope (that fill is undistilled), which is what the conjunct still declines.
+        if segments < 2 || (custom.is_none() && profile_to_exponent(profile) != 2.0) {
             return false;
         }
         let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
@@ -6369,6 +6390,13 @@ impl LoopMesh {
             // segments-general. The stored meet-point is the circumscribing square's outer
             // corner, not a point on the arc; the `segments = 2` interior sample keeps the
             // closed-form `√2 − 1` bulge.
+            //
+            // Analytic under a **custom** curve too, and that is the answer, not a gap:
+            // §8.6.3.1(4).4's miter carve-out hands every arc-start / patch-start boundvert a
+            // second, non-custom spacing pair, and §8.6.3.1(6) A.6 makes those the one site
+            // that never reads the orientation walk's mark. `B1` is that arc start; threading
+            // the curve in here would diverge. Its ring *successor* `B3` is not tagged, owns
+            // the sector's closing beveled edge, and does read the curve — below.
             let arc = RingChainProfile::Arc {
                 b1: b1_position,
                 b3: b3_position,
@@ -6504,14 +6532,22 @@ impl LoopMesh {
                 }
                 Some(edge) => {
                     let rescue = self.mid_rescue(vertex, edge, &corners, is_beveled);
-                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
+                    // §8.6.3.1(4).4: a ring flank is the cross-section of a beveled edge, owned
+                    // by the ring corner it opens at (§8.6.3.1(6) A.0) — here the arc *end*
+                    // `B3`, or a sharp reflex meet-point. Neither is tagged an arc / patch
+                    // start, so neither takes the miter carve-out: the flank rides the custom
+                    // curve, through A.3's mark on *this* edge-end like any ordinary sector.
+                    let reverse = orientation.reverse(edge, vertex);
+                    let read = custom.map(|chains| CustomChainRead::edge_sector(chains, reverse));
+                    ring_profiles
+                        .push(self.ring_flank_profile(start, end, edge, profile, read, rescue));
                     let (interior, cell) = self.build_chain_between(
                         start,
                         end,
                         edge,
                         segments,
                         profile,
-                        None,
+                        read,
                         rescue,
                         None,
                         ChainEmission::Resampled,
@@ -6530,8 +6566,6 @@ impl LoopMesh {
                     chain.extend_from_slice(&interior);
                     chain.push(end);
                     ring_chains.push(chain);
-                    // Gap, not an answer: the miter ring builder samples analytically and does
-                    // not read §8.6.3.1(6)'s mark for this edge-end.
                     chains.push(EdgeEndChain {
                         edge,
                         endpoint: vertex,
@@ -6540,7 +6574,7 @@ impl LoopMesh {
                         end,
                         side_label: SideLabel::Unlabelled,
                         cell: Some(cell),
-                        custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
+                        custom_reverse: reverse,
                     });
                 }
             }
@@ -6565,6 +6599,9 @@ impl LoopMesh {
                         ring[(i + 1) % ring_count],
                         edge,
                         profile,
+                        custom.map(|chains| {
+                            CustomChainRead::edge_sector(chains, orientation.reverse(edge, vertex))
+                        }),
                         self.mid_rescue(vertex, edge, &corners, is_beveled),
                     ),
                 })
@@ -6619,11 +6656,14 @@ impl LoopMesh {
             cross_edges: cross_edge,
             segments,
             profile,
+            custom,
             sector_representatives,
             central_representative,
             centre_column_representatives,
-            // §8.9.3: the inner miter admits only the circular profile, so it never routes to
-            // the square parallel-offset fill — the (f.5) seed inputs stay empty.
+            // §8.9.3: the inner miter admits the circular exponent and any custom curve, and
+            // neither routes to the square parallel-offset fill — the first by exponent, the
+            // second by (f.1) step 1's `not a custom profile` conjunct — so the (f.5) seed
+            // inputs stay empty.
             opening_edge_directions: Vec::new(),
             opening_edge_tips: Vec::new(),
             boundvert_reflex: Vec::new(),
@@ -6645,7 +6685,7 @@ impl LoopMesh {
     /// single sharp meet-point, so the junction presents an `(s + 1)`-boundvert ring
     /// the general grid tiles.
     ///
-    /// Scoped to a circular profile and `s ≥ 3`: `ARC` is segments-general
+    /// Scoped to a circular (or custom, or even-`segments` square) profile and `s ≥ 3`: `ARC` is segments-general
     /// (§8.9.5.1–§8.9.5.3), `PATCH` is still `segments = 2`-only. Both engage at a
     /// **single-face** reflex sector (no absorbed unbeveled legs); a **multi-face**
     /// reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to the hub `B2`
@@ -6654,10 +6694,11 @@ impl LoopMesh {
     /// `restitch_multiface_arc_sector`). All classification runs read-only first; the
     /// method returns `false` **without mutating** for any junction outside those cases
     /// (no reflex sector — the miter is inert — more than one reflex sector, a
-    /// non-circular profile, `s < 3`, `segments < 2`, or a `PATCH` at `segments != 2`),
-    /// so the caller falls back to the sharp ring.
+    /// non-circular *analytic* profile (a custom curve admits at any slider value), `s < 3`,
+    /// `segments < 2`, or a `PATCH` at `segments != 2`), so the caller falls back to the
+    /// sharp ring.
     #[allow(clippy::too_many_arguments)]
-    fn build_junction_outer_miter(
+    fn build_junction_outer_miter<'c>(
         &mut self,
         vertex: VertexKey,
         is_beveled: &dyn Fn(EdgeKey) -> bool,
@@ -6665,11 +6706,13 @@ impl LoopMesh {
         offset: f32,
         segments: u32,
         profile: f32,
+        custom: Option<&'c CustomChains<'c>>,
+        orientation: &CustomOrientation,
         mode: BevelMiter,
         templates: &mut TemplateBank,
         chains: &mut Vec<EdgeEndChain>,
         face_subst: &mut Vec<FaceSubstitution>,
-        miter_ring_junctions: &mut Vec<MiterRingJunction>,
+        miter_ring_junctions: &mut Vec<MiterRingJunction<'c>>,
         result: &mut BevelResult,
     ) -> bool {
         // §8.9.5: the outer miter rides the [V-ADJ] grid, so `segments ≥ 2`. The circular
@@ -6677,12 +6720,19 @@ impl LoopMesh {
         // is filled by the parallel-offset grid, which is even-`segments` only, so decline an
         // odd-`segments` square miter to the sharp ring. Every other exponent stays out of the
         // outer-miter fill for now.
+        //
+        // Both exponent tests are `custom.is_none()`'s. §8.9.5 forces an arc start's exponent
+        // to the circle value *independently of the user `profile` scalar*, and the patch legs
+        // are straight whatever it reads, so under a curve neither the arc nor the fill
+        // (`build_adj_fill_miter_ring` sends a custom ring to the general grid) consults the
+        // slider — declining on it would move the boundvert count (§8.9.6) on a value nothing
+        // downstream uses. The **analytic** non-circular / odd-square cases stay declined.
         let exponent = profile_to_exponent(profile);
         let square = exponent == PROFILE_SQUARE_EXPONENT;
-        if segments < 2 || (exponent != 2.0 && !square) {
+        if segments < 2 || (custom.is_none() && exponent != 2.0 && !square) {
             return false;
         }
-        if square && segments % 2 != 0 {
+        if custom.is_none() && square && segments % 2 != 0 {
             return false;
         }
         // `PATCH` is still pinned to `segments = 2` (its flat-chord build below is
@@ -6810,6 +6860,11 @@ impl LoopMesh {
             BevelMiter::Arc => {
                 // §8.9.5.1: the reflex chain is the inscribed circular arc sampled in the
                 // (non-orthonormal) unit-square frame of `B1` / `B3` / the stored midpoint.
+                //
+                // Non-custom even under `profile_type = CUSTOM`, by §8.6.3.1(4).4's miter
+                // carve-out: `B1` is the arc start, and an arc / patch start is handed a
+                // second, analytic spacing pair and skips §8.6.3.1(6)'s handedness pass
+                // outright (A.6). Matching behaviour, not an omission.
                 let arc = RingChainProfile::Arc {
                     b1: b1_position,
                     b3: b3_position,
@@ -6860,7 +6915,12 @@ impl LoopMesh {
                 result.verts.push(mid12);
                 result.verts.push(mid23);
                 // The patch legs are straight chords: their chord-fraction resample is the
-                // identity, so raw and emitted mids coincide.
+                // identity, so raw and emitted mids coincide. Straight under a custom curve
+                // too, and not because of any boundvert's tag — `B2 → B3` is not `B1`'s leg
+                // and `B2` carries no tag at all. §8.9.2 / §8.9.5 build **both** chord
+                // segments with straight profiles: the exponent is not forced to a circle and
+                // no bulge is applied, so each one's interior samples are evenly spaced along
+                // the line between its ends. That construction is blind to the profile type.
                 (
                     vec![b1, b2, b3],
                     vec![vec![b1, mid12, b2], vec![b2, mid23, b3]],
@@ -7008,7 +7068,16 @@ impl LoopMesh {
                 }
                 Some(edge) => {
                     let rescue = self.mid_rescue(vertex, edge, &corners, is_beveled);
-                    ring_profiles.push(self.ring_flank_profile(start, end, edge, profile, rescue));
+                    // §8.6.3.1(4).4 / §8.6.3.1(6) A.0: this ring edge is a beveled edge's
+                    // cross-section, owned by the corner it opens at — a plain sharp
+                    // meet-point, or the reflex sector's arc *end* `B3`, which §8.9.2 gives
+                    // genuine ownership of the closing beveled edge while clearing the arc
+                    // start `B1`'s own-edge slot. The carve-out tags only arc / patch
+                    // *starts*, so every flank here reads the curve with A.3's mark.
+                    let reverse = orientation.reverse(edge, vertex);
+                    let read = custom.map(|chains| CustomChainRead::edge_sector(chains, reverse));
+                    ring_profiles
+                        .push(self.ring_flank_profile(start, end, edge, profile, read, rescue));
                     // §8.9.5.2: each flanking beveled-edge cross-section carries `segments
                     // − 1` interior samples. The reflex sector's flanking pair runs to an
                     // inward-repositioned arc-start boundvert, making the cell skewed; at
@@ -7020,7 +7089,7 @@ impl LoopMesh {
                         edge,
                         segments,
                         profile,
-                        None,
+                        read,
                         rescue,
                         None,
                         ChainEmission::Resampled,
@@ -7043,8 +7112,6 @@ impl LoopMesh {
                     chain.extend_from_slice(&interior);
                     chain.push(end);
                     ring_chains.push(chain);
-                    // Gap, not an answer: this miter ring builder does not read §8.6.3.1(6)'s
-                    // mark for this edge-end either.
                     chains.push(EdgeEndChain {
                         edge,
                         endpoint: vertex,
@@ -7053,7 +7120,7 @@ impl LoopMesh {
                         end,
                         side_label: SideLabel::Unlabelled,
                         cell: Some(cell),
-                        custom_reverse: EdgeEndChain::UNMARKED_DEFAULT_REVERSE,
+                        custom_reverse: reverse,
                     });
                 }
             }
@@ -7080,6 +7147,9 @@ impl LoopMesh {
                         ring[(i + 1) % ring.len()],
                         edge,
                         profile,
+                        custom.map(|chains| {
+                            CustomChainRead::edge_sector(chains, orientation.reverse(edge, vertex))
+                        }),
                         self.mid_rescue(vertex, edge, &corners, is_beveled),
                     ),
                 })
@@ -7166,6 +7236,7 @@ impl LoopMesh {
             cross_edges: cross_edge,
             segments,
             profile,
+            custom,
             sector_representatives,
             central_representative,
             centre_column_representatives,
@@ -7368,10 +7439,17 @@ impl LoopMesh {
         // parallel-offset grid (even `segments` only), not the general relaxed cap — the
         // arc/patch start seeds one centreline off the stored meet-point / boundvert-pair
         // midpoints and the original corner `v` survives un-rounded at the weld.
-        if profile_to_exponent(omj.profile) == PROFILE_SQUARE_EXPONENT
-            && omj.segments >= 2
-            && omj.segments % 2 == 0
-            && omj.opening_edge_directions.len() == count
+        //
+        // The dispatch predicate is (f.1) step 1's, asked over the *enlarged* ring —
+        // [`adj_square_ring_claims`] reads a boundvert count, which a miter only raises. Only
+        // the (f.5) seed-input lengths are local: a ring built without them (the inner miter's,
+        // §8.9.3) cannot be seeded, so it takes the general grid whatever its exponent says.
+        if adj_square_ring_claims(
+            profile_to_exponent(omj.profile),
+            count,
+            omj.segments,
+            omj.custom.is_some(),
+        ) && omj.opening_edge_directions.len() == count
             && omj.opening_edge_tips.len() == count
             && omj.boundvert_reflex.len() == count
         {
@@ -7395,7 +7473,11 @@ impl LoopMesh {
             &omj.profiles,
             omj.segments,
             omj.profile,
-            None,
+            // §8.5.5.5(f.3): a mitered cap is a [V-ADJ] cap like any other, so a custom
+            // profile puts its centre on law **F1** and the reflected-seed blend of
+            // §8.5.5.5(b). The carve-out is about which *cross-sections* read the curve, not
+            // about the cap's centre.
+            omj.custom,
             false,
             raw_coarse_mids,
             material,
@@ -14582,12 +14664,11 @@ impl EdgeEndChain {
     /// [`CustomOrientation::reverse`]'s answer for an edge-end absent from the map.
     ///
     /// Inert on an **analytically**-sampled chain, where the diagonal-symmetric superellipse
-    /// family makes the bit unobservable — which covers the §8.5.5.5(f.4a) square-in weld, whose
-    /// ring test refuses a custom profile outright. It is *not* inert at the two miter ring
-    /// builders, which can run under a custom curve and do not read the mark yet, so those sites
-    /// are pre-existing custom-profile gaps rather than settled answers. The name says
-    /// "unmarked", not "analytic", precisely so those uses cannot read as a licence to leave
-    /// them.
+    /// family makes the bit unobservable. Its one live use is the §8.5.5.5(f.4a) square-in weld,
+    /// whose ring test refuses a custom profile outright, so no chain that reaches it can read a
+    /// curve. The name says "unmarked", not "analytic", so that a future builder cannot read it
+    /// as a licence to skip the pass: the two miter ring builders used to sit here and were
+    /// genuine gaps until they were threaded onto their edge-ends' own marks.
     const UNMARKED_DEFAULT_REVERSE: bool = true;
 
     /// The chain's `segments + 1` verts in order `start → interior → end`.
@@ -14923,6 +15004,12 @@ struct MiterRingJunction<'c> {
     /// frame), so this is `0.5` today — carried rather than re-asserted as a literal at the
     /// fill, so widening the miter gate cannot silently leave the cap's fullness behind.
     profile: f32,
+    /// The operation's custom curve, or `None` for the analytic family. Carried because the
+    /// cap's `fullness` is law **F1** whenever the profile is custom (BEVEL.md §8.5.5.5(f.3),
+    /// which keys on the profile *type*, is computed once per operation and knows nothing of
+    /// miters) — the per-edge generators cannot stand in for it, since §8.6.3.1(4).4's miter
+    /// carve-out leaves the arc / patch chains analytic on a ring whose flanks ride the curve.
+    custom: Option<&'c CustomChains<'c>>,
     /// Per sector `i` (same order as `boundverts` / `chains`), the [V-ADJ] grid donor of
     /// that sector's **non-centre** faces (BEVEL.md §6.6.2's grid row, edge bevel): the
     /// sector's **own** boundvert rep — `boundvert_representative` of `cross_edges[i]` for a
@@ -26854,7 +26941,7 @@ mod tests {
             vertex: mesh.vertex_position(ep0),
             neighbour_dirs: None,
         };
-        let raw = mesh.coarse_flank_mid(start, end, edge, 0.5, rescue);
+        let raw = mesh.coarse_flank_mid(start, end, edge, 0.5, None, rescue);
         let edge_dir = (mesh.vertex_position(ep1) - mesh.vertex_position(ep0)).normalize_or_zero();
         let cell = ProfileCell::new(
             mesh.vertex_position(start),
@@ -31949,6 +32036,290 @@ mod tests {
         }
     }
 
+    /// The §8.5.5.8 driver's corner with an **inner miter** (BEVEL.md §8.9.3) pushed out by
+    /// `spread`, through the custom curve when one is given and the analytic family when not.
+    /// The two arms share every other input, so any positional difference between them is the
+    /// curve's.
+    ///
+    /// `profile` is a parameter because the miter's admission gate is keyed on the profile
+    /// *type*: under a curve §8.9.5 forces the arc circular whatever the slider reads, so
+    /// sweeping it must not move the output
+    /// ([`custom_profile_mitered_output_is_independent_of_the_superellipse_slider`]).
+    /// `miter_inner` is one so the same fixture supplies the sharp contrast.
+    fn cube_corner_adj_inner_miter_profile(
+        curve: Option<&BevelCurveProfile>,
+        spread: f32,
+        segments: u32,
+        profile: f32,
+        miter_inner: BevelMiter,
+    ) -> (LoopMesh, BevelResult) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube(&mut mesh);
+        let e01 = cube_edge(
+            &mesh,
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+        );
+        let e03 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0));
+        let e04 = cube_edge(&mesh, Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, -1.0, 1.0));
+        let result = mesh.bevel(
+            &[e01.into(), e03.into(), e04.into()],
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                profile_type: match curve {
+                    Some(curve) => BevelProfileType::Custom(curve),
+                    None => BevelProfileType::Superellipse,
+                },
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner,
+                spread,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4's **miter carve-out**, both halves at once: on a mitered ring a
+    /// beveled edge's **flank** cross-section rides the custom control net, while the split
+    /// sector's own **arc** chain stays analytic.
+    ///
+    /// The carve-out is stated per *boundvert*: the operator hands a second, non-custom
+    /// spacing pair to every corner tagged an arc start or a patch start, and §8.6.3.1(6) A.6
+    /// makes exactly those corners skip the handedness pass. An inner miter tags each
+    /// sector's leading `B1`; its partner `B3` is an arc *end*, which §8.9.2/§8.9.3 give
+    /// genuine ownership of the sector's closing beveled edge, so `B3`'s flank is an ordinary
+    /// §8.6.3.1(6) A.0 edge-end cross-section and reads the curve.
+    ///
+    /// Worked on the `{0,1}` flank of `custom_profile_edge_junction_chain_rides_the_control_net_not_the_circle`,
+    /// whose cell is `a_axis = (0, 0, −0.25)` / `b_axis = (0, −0.25, 0)` about the origin
+    /// `(0.75, −0.75, −0.75)`. The miter slides **both** of that chain's boundverts `spread`
+    /// along the *same* beveled edge (`B3` of one sector and `B1` of the next both ride the
+    /// edge they share), so the whole cell — start, end, on-edge foot, both axes — is a rigid
+    /// translation by `spread·(−1, 0, 0)` and every sample of it translates with it. At
+    /// `spread = 0.3` the widget control point `(0.5, 0.25)` therefore lands at
+    /// `(0.45, −0.8125, −0.875)` where the circle would put `(0.45, −0.92678, −0.92678)`.
+    ///
+    /// The arc is the contrast: its `segments = 2` sample is the closed-form
+    /// `(2 − √2)·chord_mid + (√2 − 1)·midpoint` bulge, which for the `y = −1` sector's meet
+    /// `(0.75, −1, −0.75)` and its two edge directions `(−1, 0, 0)` / `(0, 0, 1)` is
+    /// `meet + ((2 − √2)/2)·spread·(−1, 0, 1) = (0.66213, −1, −0.66213)` — the same point
+    /// under both profile types.
+    ///
+    /// **The other two flanks are pinned too, and they are not the first one's rotations.**
+    /// §8.6.3.1(6)(i) fixes each run's seed *end* from the input mesh's stored edge endpoints,
+    /// and this cube mints `e_x` as `v → (−1,−1,−1)` and `e_z` as `v → (1,−1,1)` — both seeding
+    /// **at the corner** — while `e_y` is minted `(1,1,−1) → v`, seeding at its far end. So by
+    /// (ii)'s compare (which ties on `e_z`'s constant-`z` sector and answers `false`) the three
+    /// bits are `reverse = true / false / true` over the `e_x` / `e_y` / `e_z` owners, and the
+    /// cap is **not** three-fold symmetric — §8.6.3.1(6)'s own worked cube corner makes the same
+    /// point with a `true / false / false` vector, the single difference being that its box
+    /// mints `e_z` from the far end. A mirrored read swaps the widget axes onto the cell, so the
+    /// `e_y` flank takes `(0.8125, −0.45, −0.875)` where the `e_x` and `e_z` flanks take the
+    /// unswapped `(0.45, −0.8125, −0.875)` / `(0.8125, −0.875, −0.45)`.
+    ///
+    /// **The welded apex is pinned on both arms**, because the flank mids are not only rim
+    /// samples: they are the coarse control-net mids `(i, 0, 1)` the §8.5.5.5 centre stencil
+    /// consumes, so moving one moves the apex. Six boundverts ⇒ the general grid at valence
+    /// `s = 6` and §8.9.5's worked recipe — seed `centre_0` by the (b) fullness blend, run the
+    /// one even-`2` subdivision round, take `apex = E − γ_6·F + γ_6·centre_0` with
+    /// `γ_6 = 0.523423277`. Both expectations below are computed from that model, not read
+    /// back from the fill:
+    ///
+    /// - **analytic** — §8.9.5's worked value verbatim. `fullness = 0.559` ((f.3) law **F2**'s
+    ///   circle table at `n = 2`) gives `centre_0 = (0.8824, −0.8824, −0.8824)`, the
+    ///   `(−1/6, +4/3, −1/6)` tap of §8.5.5.5(c) sharpens all six mids, and the apex lands at
+    ///   `(0.859816, −0.859816, −0.859816)`.
+    /// - **custom** — three inputs change and nothing else. (i) The three flank mids are the
+    ///   curve's, as above; the three arc mids are unchanged by the carve-out. (ii) The fullness
+    ///   is law **F1**, `(1/(2n))·Σ_{i < n} (x_i + y_i) = ((1 + 0) + (0.5 + 0.25))/4 = 0.4375`,
+    ///   consumed through (b)'s *reflected* blend `(2·centroid − v) + 2·fullness·(v − centroid)`,
+    ///   so `centre_0 = (0.7, −0.7, −0.7)`. (iii) §8.5.5.5(c)'s "a custom profile is not tapped
+    ///   at all" suppresses the sharpening tap for the whole ring — the carve-out's analytic
+    ///   arcs included, the tap being keyed on the operation's profile type the way law **F1**
+    ///   is. The apex is then `(0.707719, −0.710201, −0.712683)`, whose asymmetry is the `e_y`
+    ///   flank's mirrored read carried through the stencil.
+    ///
+    /// That second arm is the pin for both effects the curve threading brings to a *mitered*
+    /// ring for the first time: control-net mids read off the curve, and a tap suppression that
+    /// is anything but a no-op at `N_in = 2` (where only the half-chain and Jacobi scope rules
+    /// go inert, not the tap itself).
+    #[test]
+    fn custom_profile_miter_ring_flank_reads_the_curve_while_the_arc_stays_analytic() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let spread = 0.3;
+        let control_point = Vec3::new(0.45, -0.8125, -0.875);
+        let circle = Vec3::new(0.45, -0.926_776_7, -0.926_776_7);
+        let arc_bulge = Vec3::new(0.662_132_0, -1.0, -0.662_132_0);
+        let arc_start = Vec3::new(0.45, -0.75, -1.0);
+
+        let (custom_mesh, custom_result) =
+            cube_corner_adj_inner_miter_profile(Some(&curve), spread, 2, 0.5, BevelMiter::Arc);
+        custom_mesh.validate_topology();
+        let (analytic_mesh, analytic_result) =
+            cube_corner_adj_inner_miter_profile(None, spread, 2, 0.5, BevelMiter::Arc);
+        analytic_mesh.validate_topology();
+
+        // Both arms actually built the miter — the ring carries the spread-pushed arc pair.
+        for (mesh, result, arm) in [
+            (&custom_mesh, &custom_result, "custom"),
+            (&analytic_mesh, &analytic_result, "analytic"),
+        ] {
+            assert_eq!(
+                result_has_vert_near(mesh, result, arc_start),
+                1,
+                "the {arm} arm's inner miter fired (arc start `spread` out along −x)",
+            );
+        }
+
+        // The flank: the custom arm sits on the control point, the analytic arm on the circle,
+        // and neither carries the other's sample anywhere in the mesh.
+        assert_eq!(
+            result_has_vert_near(&custom_mesh, &custom_result, control_point),
+            1,
+            "the mitered flank's lone interior sample is the widget control point",
+        );
+        assert_eq!(
+            result_has_vert_near(&custom_mesh, &custom_result, circle),
+            0,
+            "…and nothing on that ring sits on the circular cross-section",
+        );
+        assert_eq!(
+            result_has_vert_near(&analytic_mesh, &analytic_result, circle),
+            1,
+            "control: the analytic arm's same flank is the circle",
+        );
+        assert_eq!(
+            result_has_vert_near(&analytic_mesh, &analytic_result, control_point),
+            0,
+            "…and never the control net",
+        );
+
+        // The carve-out: the arc-start sector's own chain is analytic under both.
+        for (mesh, result, arm) in [
+            (&custom_mesh, &custom_result, "custom"),
+            (&analytic_mesh, &analytic_result, "analytic"),
+        ] {
+            assert_eq!(
+                result_has_vert_near(mesh, result, arc_bulge),
+                1,
+                "the {arm} arm's arc keeps the closed-form √2 bulge (the miter carve-out)",
+            );
+        }
+
+        // The other two flanks, read through their own §8.6.3.1(6)(i) seed ends: `e_z`'s
+        // unswapped like `e_x`'s, `e_y`'s mirrored. They are the remaining two control-net mids
+        // the apex below is built from.
+        for (mid, edge) in [
+            (Vec3::new(0.8125, -0.875, -0.45), "e_z"),
+            (Vec3::new(0.8125, -0.45, -0.875), "e_y"),
+        ] {
+            assert_eq!(
+                result_has_vert_near(&custom_mesh, &custom_result, mid),
+                1,
+                "the {edge} flank reads the curve through its own handedness bit",
+            );
+        }
+
+        // The welded apex of the six-boundvert cap, from §8.9.5's model on both arms (the doc
+        // comment carries the derivation). The custom arm is where the flank mids reach the
+        // centre stencil and where §8.5.5.5(c)'s tap goes away.
+        for (mesh, result, apex, arm) in [
+            (
+                &analytic_mesh,
+                &analytic_result,
+                Vec3::new(0.859_815_7, -0.859_815_7, -0.859_815_7),
+                "analytic",
+            ),
+            (
+                &custom_mesh,
+                &custom_result,
+                Vec3::new(0.707_718_5, -0.710_200_7, -0.712_682_9),
+                "custom",
+            ),
+        ] {
+            assert_eq!(
+                result_has_vert_near(mesh, result, apex),
+                1,
+                "the {arm} arm's mitered cap welds its apex at {apex:?} (§8.9.5)",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4 row 1, at the one resolution where the schedule's two arms
+    /// disagree: the coarse control-net mid a mitered cap's centre stencil consumes is a read
+    /// at `m = 2`, so at `segments == 2` it is `target[1]` — the curve's own sample — and not
+    /// the analytic superellipse the `profile` scalar names.
+    ///
+    /// Driven through `coarse_flank_mid` on the *un-translated* `{0,1}` cell of the cube
+    /// corner (origin `(0.75, −0.75, −0.75)`, `a_axis = (0, 0, −0.25)`, `b_axis =
+    /// (0, −0.25, 0)`), read **forward** — `reverse = false` swaps the widget axes, so
+    /// `(x, y) = (0.5, 0.25)` enters the cell as `(u, v) = (0.25, 0.5)` and lands at
+    /// `(0.75, −0.875, −0.8125)`, the *mirror* of the `reverse = true` reading the whole-mesh
+    /// arm above pins. That the two differ is the point: the bit rides the read, and a
+    /// generator that ignored it would mirror the cap's interior off its own rim.
+    ///
+    /// The mid is also **raw**: `chain_positions`' §8.2.2.1.1 read-back is not applied, which
+    /// on this all-vector net is the identity anyway — so the value separates custom from
+    /// analytic, not resampled from raw.
+    #[test]
+    fn custom_profile_coarse_flank_mid_reads_the_curve_through_its_own_handedness() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let chains = CustomChains::new(&curve, 2);
+
+        let mut mesh = LoopMesh::new();
+        let start = mesh.create_vertex(Vec3::new(0.75, -1.0, -0.75));
+        let end = mesh.create_vertex(Vec3::new(0.75, -0.75, -1.0));
+        let apex = mesh.create_vertex(Vec3::new(1.0, -1.0, -1.0));
+        let far = mesh.create_vertex(Vec3::new(-1.0, -1.0, -1.0));
+        let edge = mesh.create_edge([apex, far], EdgeCreateFlags::NONE);
+        let rescue = MidRescue {
+            vertex: mesh.vertex_position(apex),
+            neighbour_dirs: None,
+        };
+
+        let forward = mesh.coarse_flank_mid(
+            start,
+            end,
+            edge,
+            0.5,
+            Some(CustomChainRead::edge_sector(&chains, false)),
+            rescue,
+        );
+        let mirrored = mesh.coarse_flank_mid(
+            start,
+            end,
+            edge,
+            0.5,
+            Some(CustomChainRead::edge_sector(&chains, true)),
+            rescue,
+        );
+        let analytic = mesh.coarse_flank_mid(start, end, edge, 0.5, None, rescue);
+
+        assert!(
+            (forward - Vec3::new(0.75, -0.875, -0.8125)).length() < 1.0e-6,
+            "the forward read swaps the widget axes onto the cell, got {forward:?}",
+        );
+        assert!(
+            (mirrored - Vec3::new(0.75, -0.8125, -0.875)).length() < 1.0e-6,
+            "the mirrored read drops the swap, got {mirrored:?}",
+        );
+        assert!(
+            (analytic - Vec3::new(0.75, -0.926_776_7, -0.926_776_7)).length() < 1.0e-6,
+            "control: without a curve the same cell samples the circle, got {analytic:?}",
+        );
+    }
+
     /// The two arms above, stated as the invariant behind them (BEVEL.md §8.6.3): a custom
     /// profile "bypasses §8.6.2 and §8.6.4 entirely and supplies its chain directly", and
     /// every rule that would otherwise consult the exponent — (f.1) steps 1 and 3, the (f.3)
@@ -32014,6 +32385,148 @@ mod tests {
                         "…nor a single one of its positions ({position:?} at \
                          profile = {profile}, segments = {segments})",
                     );
+                }
+            }
+        }
+    }
+
+    /// The single-face reflex junction of [`single_face_reflex_junction`] under an **outer**
+    /// miter, through the custom curve when one is given. Same shape as
+    /// [`cube_corner_adj_inner_miter_profile`] and for the same reason: §8.9.5 leaves an outer
+    /// arc circular and its patch legs straight whatever the `profile` slider reads, so the
+    /// slider is swept against it.
+    fn reflex_apex_outer_miter_profile(
+        kind: BevelMiter,
+        curve: Option<&BevelCurveProfile>,
+        profile: f32,
+        segments: u32,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, _apex, [va, vb, vc]) = single_face_reflex_junction();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments,
+                profile,
+                profile_type: match curve {
+                    Some(curve) => BevelProfileType::Custom(curve),
+                    None => BevelProfileType::Superellipse,
+                },
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: kind,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// The invariant above, carried onto a **mitered** junction — where it is a *topology*
+    /// statement, not a placement one (BEVEL.md §8.9.5 / §8.9.6).
+    ///
+    /// A miter's admission is keyed on the profile **type**, never on the slider: §8.9.5 forces
+    /// an arc start's exponent to the circle value "independent of the user `profile` scalar"
+    /// and leaves a patch's two chord legs straight regardless, and the fill a custom ring takes
+    /// is (f.1) step 1's general grid whatever the slider resolves to. So a miter that declined
+    /// on the exponent under `profile_type = CUSTOM` would drop the `+1` / `+2` boundverts of
+    /// §8.9.6 and fall back to the sharp ring — a whole-mesh census divergence keyed on a value
+    /// nothing in the build reads.
+    ///
+    /// The unmitered sibling cannot see this: its fixture has no miter at all. Both builders are
+    /// swept, because each carried its own exponent gate — the inner miter's `r == 2` and the
+    /// outer's `r == 2 or square` plus the square's even-`segments` conjunct — so
+    /// `profile = 0.7` (curved) declined everywhere and `profile = 0.99` (square) declined at
+    /// odd `segments` on the outer path.
+    ///
+    /// The `Sharp` contrast is what stops the sweep passing vacuously: without it, a build in
+    /// which *every* arm declined would be perfectly slider-invariant too.
+    #[test]
+    fn custom_profile_mitered_output_is_independent_of_the_superellipse_slider() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        let inner = |profile: f32, segments: u32, mode: BevelMiter| {
+            cube_corner_adj_inner_miter_profile(Some(&curve), 0.3, segments, profile, mode)
+        };
+        let outer_arc = |profile: f32, segments: u32, mode: BevelMiter| {
+            reflex_apex_outer_miter_profile(mode, Some(&curve), profile, segments)
+        };
+        let outer_patch = |profile: f32, segments: u32, mode: BevelMiter| {
+            let mode = match mode {
+                BevelMiter::Sharp => BevelMiter::Sharp,
+                _ => BevelMiter::Patch,
+            };
+            reflex_apex_outer_miter_profile(mode, Some(&curve), profile, segments)
+        };
+        let builders: [(
+            &str,
+            &dyn Fn(f32, u32, BevelMiter) -> (LoopMesh, BevelResult),
+            &[u32],
+        ); 3] = [
+            ("inner arc", &inner, &[2, 3]),
+            ("outer arc", &outer_arc, &[2, 3]),
+            // §8.9.2's flat chord strip is a `segments = 2` build.
+            ("outer patch", &outer_patch, &[2]),
+        ];
+
+        for (name, build, counts) in builders {
+            for &segments in counts {
+                let (baseline_mesh, baseline) = build(0.5, segments, BevelMiter::Arc);
+                let reference: Vec<Vec3> = baseline
+                    .verts
+                    .iter()
+                    .map(|&vertex| baseline_mesh.vertex_position(vertex))
+                    .collect();
+                let (sharp_mesh, _sharp) = build(0.5, segments, BevelMiter::Sharp);
+                assert_ne!(
+                    (
+                        baseline_mesh.vertex_count(),
+                        baseline_mesh.edge_count(),
+                        baseline_mesh.face_count()
+                    ),
+                    (
+                        sharp_mesh.vertex_count(),
+                        sharp_mesh.edge_count(),
+                        sharp_mesh.face_count()
+                    ),
+                    "the {name} baseline actually mitered (segments = {segments})",
+                );
+
+                for profile in [0.0_f32, 0.25, 0.7, 0.99] {
+                    let (mesh, result) = build(profile, segments, BevelMiter::Arc);
+                    mesh.validate_topology();
+                    assert_eq!(
+                        (mesh.vertex_count(), mesh.edge_count(), mesh.face_count()),
+                        (
+                            baseline_mesh.vertex_count(),
+                            baseline_mesh.edge_count(),
+                            baseline_mesh.face_count()
+                        ),
+                        "the slider cannot decide whether a custom {name} miter fires \
+                         (profile = {profile}, segments = {segments})",
+                    );
+                    let moved: Vec<Vec3> = result
+                        .verts
+                        .iter()
+                        .map(|&vertex| mesh.vertex_position(vertex))
+                        .collect();
+                    assert_eq!(
+                        moved.len(),
+                        reference.len(),
+                        "…nor how many verts it emits (profile = {profile}, \
+                         segments = {segments}, {name})",
+                    );
+                    for position in &moved {
+                        assert!(
+                            reference
+                                .iter()
+                                .any(|candidate| (*candidate - *position).length() <= 1.0e-5),
+                            "…nor a single one of its positions ({position:?} at \
+                             profile = {profile}, segments = {segments}, {name})",
+                        );
+                    }
                 }
             }
         }
@@ -53767,8 +54280,9 @@ fn snap_to_unit_square_walls(unit: Vec3, inward: bool, land_on_corner: bool) -> 
 ///
 /// Step 1 outranks step 2, and the ordering is part of the dispatch — "a square profile at a
 /// pipe corner satisfies both the square and pipe tests, **and the square grid wins**". So this
-/// is asked twice: once by [`LoopMesh::build_adj_fill_base`] to route the grid, and once by
-/// [`LoopMesh::build_adj_fill`] to suppress the (f.6) replant that would otherwise post-pass it.
+/// is asked three times: by [`LoopMesh::build_adj_fill_base`] to route the grid, by
+/// [`LoopMesh::build_adj_fill`] to suppress the (f.6) replant that would otherwise post-pass it,
+/// and by [`LoopMesh::build_adj_fill_miter_ring`] to route the mitered ring's own fill.
 /// A junction the ring claims never enters step 2 at all.
 ///
 /// `custom` is step 1's own `not a custom profile` conjunct, and it is not the same test as the
@@ -53777,8 +54291,9 @@ fn snap_to_unit_square_walls(unit: Vec3, inward: bool, land_on_corner: bool) -> 
 /// conjunct is what keeps a caller that resolves `exponent` from the `profile` slider (which a
 /// custom bevel still carries) from routing the ring here on a scalar the curve does not use.
 ///
-/// With no outer miter in scope the boundvert count equals the beveled-edge count, which is
-/// what lets the ring's gate read the ring.
+/// The count is the **ring's**, not the junction's beveled-edge count: they coincide at an
+/// unmitered junction, and a miter only raises the ring (§8.9.6), so the `≥ 3` floor reads the
+/// same way at either caller.
 fn adj_square_ring_claims(exponent: f32, boundverts: usize, segments: u32, custom: bool) -> bool {
     exponent == PROFILE_SQUARE_EXPONENT
         && !custom
@@ -54530,6 +55045,15 @@ fn adj_relaxed_net(
     let target = boundary_source_resolution(segments);
     // §8.5.5.5(c): a custom-profile ring feeds its chains to the interior stencil verbatim
     // — no sharpening tap. The analytic superellipse chains are masked.
+    //
+    // A **mitered** ring reaches `false` here too, and it is the one ring whose two chain kinds
+    // disagree: under a custom bevel its arc / patch chains stay analytic (§8.6.3.1(4).4's
+    // carve-out) while its flanks read the curve. `any`, not `all`, because §8.5.5.5(c) states
+    // the suppression of the profile *type* ("a custom profile is not tapped at all") the way
+    // (f.3)'s law **F1** does — a per-operation key, not a per-chain switch — so the carve-out's
+    // analytic arcs ride the ring's answer. Not a no-op at `N_in = 2`: the lone interior sample
+    // *is* tapped there (only the half-chain and Jacobi scope rules go inert), so the answer
+    // moves the welded apex.
     let mask_boundary = !profiles.iter().any(RingChainProfile::is_custom);
     let mut net = AdjNet::coarse(boundverts, mids, centre, mask_boundary);
     let source: Vec<Vec<Vec3>> = profiles
