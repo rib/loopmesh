@@ -6685,8 +6685,9 @@ impl LoopMesh {
     /// single sharp meet-point, so the junction presents an `(s + 1)`-boundvert ring
     /// the general grid tiles.
     ///
-    /// Scoped to a circular (or custom, or even-`segments` square) profile and `s ≥ 3`: `ARC` is segments-general
-    /// (§8.9.5.1–§8.9.5.3), `PATCH` is still `segments = 2`-only. Both engage at a
+    /// Scoped to a circular (or custom, or even-`segments` square) profile and `s ≥ 3`: both
+    /// `ARC` (§8.9.5.1–§8.9.5.3) and `PATCH` (§8.9.2's `s − 1` shoulders per chord leg) are
+    /// segments-general. Both engage at a
     /// **single-face** reflex sector (no absorbed unbeveled legs); a **multi-face**
     /// reflex sector (absorbed legs) re-stitches for `PATCH` by a fan to the hub `B2`
     /// (§8.9.2.1, `restitch_multiface_patch_reflex`) and for `ARC` by tiling the arc's
@@ -6695,8 +6696,7 @@ impl LoopMesh {
     /// method returns `false` **without mutating** for any junction outside those cases
     /// (no reflex sector — the miter is inert — more than one reflex sector, a
     /// non-circular *analytic* profile (a custom curve admits at any slider value), `s < 3`,
-    /// `segments < 2`, or a `PATCH` at `segments != 2`), so the caller falls back to the
-    /// sharp ring.
+    /// or `segments < 2`), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_outer_miter<'c>(
         &mut self,
@@ -6733,11 +6733,6 @@ impl LoopMesh {
             return false;
         }
         if custom.is_none() && square && segments % 2 != 0 {
-            return false;
-        }
-        // `PATCH` is still pinned to `segments = 2` (its flat-chord build below is
-        // seg = 2-only), so decline a non-2 `PATCH` to the sharp ring.
-        if mode == BevelMiter::Patch && segments != 2 {
             return false;
         }
         let corners = self.vertex_bevel_corner_ring(vertex, is_beveled);
@@ -6840,9 +6835,10 @@ impl LoopMesh {
         //     `segments = 2` the lone interior sample is the `√2 − 1` bulge (below).
         //   - `Patch` promotes the retained meet corner to the middle boundvert `B2`, so
         //     the ring gains `B1 → B2 → B3`; the two internal edges carry flat chord
-        //     samples at their straight segment midpoints — no corner-ward bulge, so the
-        //     tent apex `B2` stays at the meet while its two ends slid back (§8.9.5).
-        //     (`Patch` is seg = 2-only, gated above.)
+        //     samples evenly spaced along their straight leg — no corner-ward bulge, so
+        //     the tent apex `B2` stays at the meet while its two ends slid back (§8.9.5).
+        //     Segments-general: each leg carries `segments − 1` shoulder samples
+        //     (§8.9.2.1), one at the leg midpoint when `segments = 2`.
         // `reflex_ring` is the sector's ordered ring boundverts; `internal_chains` holds
         // one full `k + 1`-sample chain per internal (`None` cross-edge) edge between them
         // (oriented along the ring); `raw_internal_mids` holds each of those chains' *raw*
@@ -6907,35 +6903,63 @@ impl LoopMesh {
             BevelMiter::Patch => {
                 // §5.2.4: not yet minted from the corner.
                 let b2 = self.create_vertex(midpoint);
-                let mid12_position = 0.5 * (b1_position + midpoint);
-                let mid23_position = 0.5 * (midpoint + b3_position);
-                let mid12 = self.create_vertex(mid12_position);
-                let mid23 = self.create_vertex(mid23_position);
                 result.verts.push(b2);
-                result.verts.push(mid12);
-                result.verts.push(mid23);
-                // The patch legs are straight chords: their chord-fraction resample is the
-                // identity, so raw and emitted mids coincide. Straight under a custom curve
-                // too, and not because of any boundvert's tag — `B2 → B3` is not `B1`'s leg
-                // and `B2` carries no tag at all. §8.9.2 / §8.9.5 build **both** chord
-                // segments with straight profiles: the exponent is not forced to a circle and
-                // no bulge is applied, so each one's interior samples are evenly spaced along
-                // the line between its ends. That construction is blind to the profile type.
+                // §8.9.2 / §8.9.5 build **both** chord legs with straight profiles: the
+                // exponent is not forced to a circle and no bulge is applied, so each leg's
+                // interior samples are evenly spaced along the line between its ends. Straight
+                // under a custom curve too, and not because of any boundvert's tag — `B2 → B3`
+                // is not `B1`'s leg and `B2` carries no tag at all. That construction is blind
+                // to the profile type.
+                let legs = [
+                    RingChainProfile::Chord {
+                        start: b1_position,
+                        end: midpoint,
+                    },
+                    RingChainProfile::Chord {
+                        start: midpoint,
+                        end: b3_position,
+                    },
+                ];
+                let leg_ends = [(b1, b2), (b2, b3)];
+                // §8.9.2.1: at `segments = s` each leg carries `s − 1` shoulder samples.
+                // The §8.2.2.1.1 chord-fraction resample every ring chain runs through is
+                // the **identity** here whatever `segments` is: even spacing along a
+                // straight line *is* even chord spacing, and the source polyline is that
+                // same line, so each target fraction reads back its own point. So raw and
+                // emitted coincide on a chord — unlike the arc, where they part company at
+                // every non-power-of-two count (§8.9.5.1).
+                let [leading_leg, trailing_leg]: [Vec<VertexKey>; 2] =
+                    std::array::from_fn(|index| {
+                        let (leg_start, leg_end) = leg_ends[index];
+                        let positions = legs[index].raw_positions(segments);
+                        let mut chain = Vec::with_capacity(segments as usize + 1);
+                        chain.push(leg_start);
+                        for position in positions.iter().take(segments as usize).skip(1) {
+                            // §5.2.4: not yet minted from the corner.
+                            let shoulder = self.create_vertex(*position);
+                            result.verts.push(shoulder);
+                            chain.push(shoulder);
+                        }
+                        chain.push(leg_end);
+                        chain
+                    });
+                // `[B1, shoulders…, B2, shoulders…, B3]` — the hub `B2` at index `segments`.
+                let mut run = Vec::with_capacity(2 * segments as usize + 1);
+                run.extend_from_slice(&leading_leg);
+                run.extend_from_slice(&trailing_leg[1..]);
+                // §8.5.5.5(d) / §8.9.5.3: the centre stencil eats each ring chain's raw
+                // *coarse* `(i, 0, 1)` control point — the leg's own midpoint, whatever
+                // resolution the emitted chain was built at. Only the `segments = 2`
+                // stencil consumes them (see `raw_coarse_mids` below), and there the coarse
+                // resolution *is* `segments`, so this repeats the mid already emitted rather
+                // than recovering a distinct one — as it must, a chord being resample-inert.
+                let raw_mids = legs.iter().map(|leg| leg.raw_positions(2)[1]).collect();
                 (
                     vec![b1, b2, b3],
-                    vec![vec![b1, mid12, b2], vec![b2, mid23, b3]],
-                    vec![mid12_position, mid23_position],
-                    vec![
-                        RingChainProfile::Chord {
-                            start: b1_position,
-                            end: midpoint,
-                        },
-                        RingChainProfile::Chord {
-                            start: midpoint,
-                            end: b3_position,
-                        },
-                    ],
-                    vec![b1, mid12, b2, mid23, b3],
+                    vec![leading_leg, trailing_leg],
+                    raw_mids,
+                    legs.to_vec(),
+                    run,
                 )
             }
             BevelMiter::Sharp => {
@@ -6956,8 +6980,12 @@ impl LoopMesh {
         }
 
         // Re-stitch: each non-reflex sector face collapses to its single boundvert
-        // (1-for-1); the reflex sector's one face re-stitches onto the arc run
-        // `B1 → bulge → B3` (1-for-3), ordered to the face's traversal through `v`.
+        // (1-for-1); the reflex sector's one face re-stitches onto the whole
+        // `forward_run`, ordered to the face's traversal through `v`. That run's length is
+        // both mode- and count-dependent — `segments + 1` slots under `Arc` (the sample
+        // chain `B1 … B3`), `2·segments + 1` under `Patch` (the two chord legs spliced at
+        // the hub `B2`) — so the familiar 1-for-3 is only the `Arc`, `segments = 2` corner
+        // of the rule, not the rule.
         for (k, sector) in sectors.iter().enumerate() {
             if k == r {
                 continue;
@@ -6986,14 +7014,16 @@ impl LoopMesh {
             // Multi-face reflex sector: rebuild each absorbed-leg face by mode.
             match mode {
                 // §8.9.2.1: `Patch` fans every reflex face to the hub `B2` (identical to
-                // the SHARP outer join), opening only the two flank faces into pentagons
-                // along their patch legs. `forward_run` is the patch chain `[B1, SH_lead,
-                // B2, SH_trail, B3]`, so `B2` is its middle slot.
+                // the SHARP outer join), opening only the two flank faces, each of which
+                // grows to a `(segments + 3)`-gon along its patch leg. `forward_run` is the
+                // patch chain `[B1, shoulders…, B2, shoulders…, B3]`, so the hub sits at
+                // index `segments`.
                 BevelMiter::Patch => {
                     self.restitch_multiface_patch_reflex(
                         vertex,
                         &sectors[r],
                         &forward_run,
+                        segments,
                         face_subst,
                     );
                 }
@@ -7250,9 +7280,9 @@ impl LoopMesh {
 
     /// Re-stitch a **multi-face** reflex sector for the outer `PATCH` miter
     /// (BEVEL.md §8.9.2.1). The sector's `> 180°` gap absorbs one or more unbeveled
-    /// legs; `patch_chain` is the three ring boundverts with their two flat chord
-    /// mid-samples (the grid **shoulders**) interleaved — `[B1, SH_lead, B2, SH_trail,
-    /// B3]`, so the hub `B2` is the middle slot (index 2).
+    /// legs; `patch_chain` is the three ring boundverts with each leg's `segments − 1` flat
+    /// chord samples (the grid **shoulders**) interleaved — `[B1, SH_lead…, B2, SH_trail…,
+    /// B3]`, so the hub `B2` sits at index `segments`.
     ///
     /// `PATCH` closes the reflex hole by a **fan to the single hub `B2`**, not by tiling
     /// the ring run. `B2` is the retained §7.6.2 meet-point (the lifted `SHARP` V-join
@@ -7268,6 +7298,7 @@ impl LoopMesh {
         vertex: VertexKey,
         reflex_sector: &Sector,
         patch_chain: &[VertexKey],
+        segments: u32,
         face_subst: &mut Vec<FaceSubstitution>,
     ) {
         // The sector's legs in disk order (leading flank, absorbed legs, trailing
@@ -7283,11 +7314,12 @@ impl LoopMesh {
         let leg_count = legs.len();
         // A multi-face reflex sector is two flanking beveled edges plus ≥ 1 absorbed
         // leg; anything shorter is single-face and never reaches here. `patch_chain` is
-        // always the five-slot `[B1, SH_lead, B2, SH_trail, B3]` at `segments = 2`.
-        if leg_count < 3 || patch_chain.len() != 5 {
+        // the two `segments`-edge legs spliced at the hub, so `2·segments + 1` slots.
+        let seg = segments as usize;
+        if leg_count < 3 || patch_chain.len() != 2 * seg + 1 {
             return;
         }
-        let hub = patch_chain[2]; // B2
+        let hub = patch_chain[seg]; // B2
         let leading_flank = 0;
         let trailing_flank = leg_count - 2;
 
@@ -7295,16 +7327,17 @@ impl LoopMesh {
             let face = reflex_sector.corners[face_slot].1;
             // The apex-corner run, ordered from the face's disk-*leading* leg side to its
             // trailing side. Interior faces collapse the apex to the lone hub; the two
-            // flank faces splice that flank's patch leg (`B_flank → shoulder → hub`)
-            // between the hub and the flank's reflex boundvert (§8.9.2.1).
+            // flank faces splice that flank's whole patch leg (`B_flank → shoulders… →
+            // hub`) between the hub and the flank's reflex boundvert, growing the triangle
+            // to an `(segments + 3)`-gon (§8.9.2.1).
             let forward: Vec<VertexKey> = if face_slot == leading_flank {
                 // Leading flank (disk-leading leg is the flank beveled edge): the flank
                 // boundvert B1 sits on the leading side, the hub on the trailing side.
-                patch_chain[0..=2].to_vec() // [B1, SH_lead, B2]
+                patch_chain[0..=seg].to_vec() // [B1, SH_lead…, B2]
             } else if face_slot == trailing_flank {
                 // Trailing flank (disk-trailing leg is the flank beveled edge): the hub
                 // sits on the leading side, the flank boundvert B3 on the trailing side.
-                patch_chain[2..=4].to_vec() // [B2, SH_trail, B3]
+                patch_chain[seg..=2 * seg].to_vec() // [B2, SH_trail…, B3]
             } else {
                 vec![hub]
             };
@@ -25276,19 +25309,7 @@ mod tests {
     /// Bevel the three apex edges of `single_face_reflex_junction` with the given outer
     /// miter, `segments = 2`, default circular profile, `vmesh_method = ADJ`.
     fn reflex_apex_outer_miter(kind: BevelMiter) -> (LoopMesh, BevelResult) {
-        let (mut mesh, _apex, [va, vb, vc]) = single_face_reflex_junction();
-        let result = mesh.bevel(
-            &[va.into(), vb.into(), vc.into()],
-            BevelOptions {
-                offset: 0.2,
-                affect: BevelAffect::Edges,
-                segments: 2,
-                vmesh_method: BevelVmeshMethod::Adj,
-                miter_outer: kind,
-                ..Default::default()
-            },
-        );
-        (mesh, result)
+        reflex_apex_outer_miter_segments(kind, 2)
     }
 
     /// BEVEL.md §7.6.6: the base **sharp** bevel (no miter engaged) of a reflex
@@ -25448,43 +25469,8 @@ mod tests {
     /// pull. In particular the arc's pulled-in bulge sample does **not** appear.
     #[test]
     fn outer_miter_patch_flat_chord_placement() {
-        let offset = 0.2;
-        let (mut mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
-        let apex_position = mesh.vertex_position(apex);
-        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
-
-        // Replicate the §8.9.1 classification / §8.9.2 reposition (mode-independent).
-        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
-        let sectors = sector_split(&corners, &is_beveled);
-        let sector_count = sectors.len();
-        let mut meets: Vec<Vec3> = Vec::new();
-        let mut dir_open: Vec<Vec3> = Vec::new();
-        let mut dir_close: Vec<Vec3> = Vec::new();
-        let mut reflex: Vec<bool> = Vec::new();
-        for sector in &sectors {
-            let opening = sector.bounding_edges[0];
-            let closing = sector.bounding_edges[1];
-            let face = sector.corners[0].1;
-            let d_open = mesh
-                .edge_direction_from(opening, apex, apex_position)
-                .unwrap();
-            let d_close = mesh
-                .edge_direction_from(closing, apex, apex_position)
-                .unwrap();
-            let cross = (-d_open).cross(-d_close);
-            reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
-            meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
-            dir_open.push(d_open);
-            dir_close.push(d_close);
-        }
-        let r = reflex.iter().position(|&x| x).unwrap();
-        let midpoint = meets[r];
-        let predecessor = meets[(r + sector_count - 1) % sector_count];
-        let successor = meets[(r + 1) % sector_count];
-        let d_open = dir_open[r];
-        let d_close = dir_close[r];
-        let b1 = midpoint + (predecessor - midpoint).dot(d_open) * d_open;
-        let b3 = midpoint + (successor - midpoint).dot(d_close) * d_close;
+        // §8.9.1 classification + §8.9.2 reposition, replayed off the pristine mesh.
+        let (b1, midpoint, b3) = single_face_reflex_patch_boundverts();
         let mid12 = 0.5 * (b1 + midpoint);
         let mid23 = 0.5 * (midpoint + b3);
 
@@ -25492,17 +25478,7 @@ mod tests {
         let sqrt2 = std::f32::consts::SQRT_2;
         let arc_bulge = (2.0 - sqrt2) * (0.5 * (b1 + b3)) + (sqrt2 - 1.0) * midpoint;
 
-        let result = mesh.bevel(
-            &[va.into(), vb.into(), vc.into()],
-            BevelOptions {
-                offset,
-                affect: BevelAffect::Edges,
-                segments: 2,
-                vmesh_method: BevelVmeshMethod::Adj,
-                miter_outer: BevelMiter::Patch,
-                ..Default::default()
-            },
-        );
+        let (mesh, result) = reflex_apex_outer_miter_segments(BevelMiter::Patch, 2);
         mesh.validate_topology();
 
         assert_eq!(
@@ -25535,6 +25511,302 @@ mod tests {
             0,
             "no vertex sits at the arc's pulled-in bulge — the Patch chords are flat (§8.9.5)",
         );
+    }
+
+    /// Bevel the three apex edges of `single_face_reflex_junction` at an arbitrary
+    /// `segments` with the given outer miter, `offset = 0.2`, default circular profile,
+    /// `vmesh_method = ADJ`, `miter_inner = Sharp`, `spread = 0`.
+    fn reflex_apex_outer_miter_segments(
+        kind: BevelMiter,
+        segments: u32,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, _apex, [va, vb, vc]) = single_face_reflex_junction();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: kind,
+                ..Default::default()
+            },
+        );
+        (mesh, result)
+    }
+
+    /// Re-derive the single-face reflex junction's three outer-`PATCH` ring boundverts
+    /// `(B1, B2, B3)` independently of the operator, by replaying the §8.9.1 signed reflex
+    /// classification and the §8.9.2 neighbour-plane reposition. `B2` is the retained
+    /// §7.6.2 meet-point (unmoved); `B1` / `B3` are it slid back along their own flanking
+    /// beveled edge until level with the neighbouring sector's boundvert. None of the three
+    /// depends on `segments` (§8.9.5.1's closing line), which is what the caller asserts.
+    fn single_face_reflex_patch_boundverts() -> (Vec3, Vec3, Vec3) {
+        let offset = 0.2;
+        let (mesh, apex, [va, vb, vc]) = single_face_reflex_junction();
+        let apex_position = mesh.vertex_position(apex);
+        let is_beveled = |edge: EdgeKey| edge == va || edge == vb || edge == vc;
+        let corners = mesh.vertex_bevel_corner_ring(apex, &is_beveled);
+        let sectors = sector_split(&corners, &is_beveled);
+        let sector_count = sectors.len();
+        let mut meets: Vec<Vec3> = Vec::new();
+        let mut dir_open: Vec<Vec3> = Vec::new();
+        let mut dir_close: Vec<Vec3> = Vec::new();
+        let mut reflex: Vec<bool> = Vec::new();
+        for sector in &sectors {
+            let opening = sector.bounding_edges[0];
+            let closing = sector.bounding_edges[1];
+            let face = sector.corners[0].1;
+            let d_open = mesh
+                .edge_direction_from(opening, apex, apex_position)
+                .unwrap();
+            let d_close = mesh
+                .edge_direction_from(closing, apex, apex_position)
+                .unwrap();
+            let cross = (-d_open).cross(-d_close);
+            reflex.push(cross.dot(mesh.face_plane_normal(face)) < 0.0);
+            meets.push(mesh.solve_meet_point(apex, apex_position, sector, offset));
+            dir_open.push(d_open);
+            dir_close.push(d_close);
+        }
+        let r = reflex.iter().position(|&x| x).expect("one reflex sector");
+        let midpoint = meets[r];
+        let predecessor = meets[(r + sector_count - 1) % sector_count];
+        let successor = meets[(r + 1) % sector_count];
+        let b1 = midpoint + (predecessor - midpoint).dot(dir_open[r]) * dir_open[r];
+        let b3 = midpoint + (successor - midpoint).dot(dir_close[r]) * dir_close[r];
+        (b1, midpoint, b3)
+    }
+
+    /// BEVEL.md §8.9.2 / §8.9.6: the outer `PATCH` miter has **no `segments` floor** — its
+    /// only gates are the `s ≥ 3` beveled-edge count and the §8.9.1 firing margin. So the
+    /// `+2`-boundvert ring is built at every `segments ≥ 2`, and the enlarged ring re-tiles
+    /// through the same §8.5.5.5 general grid the sharp and `ARC` rings ride.
+    ///
+    /// The totals are not a closed form at `segments ≥ 2` (§8.9.6), so they are pinned
+    /// against the reference figures. They are internally consistent: each extra ring sector
+    /// contributes the same `(ΔV, ΔE, ΔF)` at a given `segments`, so `PATCH` (`+2` sectors
+    /// over sharp) sits exactly twice as far from sharp as `ARC` (`+1`) does — the second
+    /// block asserts that, which is what fails loudly if `PATCH` silently falls back to the
+    /// sharp ring at any count.
+    #[test]
+    fn outer_miter_patch_counts_are_segments_general() {
+        for (segments, expected) in [
+            (2_u32, (21_usize, 34_usize, 15_usize)),
+            (3, (33, 55, 24)),
+            (4, (47, 81, 36)),
+            (5, (64, 112, 50)),
+        ] {
+            let (patch_mesh, _) = reflex_apex_outer_miter_segments(BevelMiter::Patch, segments);
+            patch_mesh.validate_topology();
+            let patch = counts(&patch_mesh);
+            assert_eq!(
+                patch, expected,
+                "segments {segments}: the outer PATCH miter's element totals (§8.9.6)",
+            );
+            assert_eq!(
+                patch.0 as i64 - patch.1 as i64 + patch.2 as i64,
+                2,
+                "segments {segments}: the outer PATCH miter closes to a χ = 2 manifold",
+            );
+
+            let (sharp_mesh, _) = reflex_apex_outer_miter_segments(BevelMiter::Sharp, segments);
+            let (arc_mesh, _) = reflex_apex_outer_miter_segments(BevelMiter::Arc, segments);
+            let sharp = counts(&sharp_mesh);
+            let arc = counts(&arc_mesh);
+            assert_ne!(
+                patch, sharp,
+                "segments {segments}: PATCH must not fall back to the sharp ring",
+            );
+            // §8.9.6: `ARC` is `+1` boundvert, `PATCH` `+2`, over the same sharp baseline —
+            // and the general grid's per-sector contribution is uniform around the ring.
+            assert_eq!(
+                (patch.0 - sharp.0, patch.1 - sharp.1, patch.2 - sharp.2),
+                (
+                    2 * (arc.0 - sharp.0),
+                    2 * (arc.1 - sharp.1),
+                    2 * (arc.2 - sharp.2)
+                ),
+                "segments {segments}: PATCH's `+2` boundverts cost twice ARC's `+1` (§8.9.6)",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.9.2 / §8.9.5 / §8.9.2.1: the outer `PATCH` chord legs at general
+    /// `segments`. Everything asserted here is derived from the guide, not from a count
+    /// table:
+    ///
+    /// - The two ends `B1` / `B3` are the §8.9.2 neighbour-plane reposition of the retained
+    ///   §7.6.2 meet-point, and that reposition is **`segments`-independent** (§8.9.5.1's
+    ///   closing line) and **mode-independent** (§8.9.2's worked `PATCH` paragraph: `PATCH`
+    ///   reuses the identical end reposition `ARC` performs). So the same three positions
+    ///   are re-derived once, off the pristine mesh, and must appear at every `segments`.
+    /// - `B2` is **not** repositioned — it stays at the stored meet-point (§8.9.2's tent).
+    /// - Each chord leg carries `segments − 1` **shoulder** samples "evenly spaced along the
+    ///   straight line between its two endpoints" (§8.9.5), i.e. shoulder `j` of the leading
+    ///   leg is exactly `B1 + (j / segments)·(B2 − B1)` — the equal-step ladder §8.9.2.1's
+    ///   worked trace reads off the leg (`z: 0.457 → 0.785 → 1.112`, equal steps).
+    /// - No sample is pulled toward the corner: the `ARC` bulge position (a fraction
+    ///   `√2 − 1` off the chord midpoint toward the stored corner, §8.9.5) is absent.
+    #[test]
+    fn outer_miter_patch_chord_shoulders_are_evenly_spaced_at_every_segments() {
+        let (b1, b2, b3) = single_face_reflex_patch_boundverts();
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let arc_bulge = (2.0 - sqrt2) * (0.5 * (b1 + b3)) + (sqrt2 - 1.0) * b2;
+
+        for segments in [2_u32, 3, 4, 5] {
+            let (mesh, result) = reflex_apex_outer_miter_segments(BevelMiter::Patch, segments);
+            mesh.validate_topology();
+
+            for (label, position) in [("B1", b1), ("B2", b2), ("B3", b3)] {
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, position),
+                    1,
+                    "segments {segments}: {label} is the segments-independent ring boundvert",
+                );
+            }
+            for j in 1..segments {
+                let fraction = j as f32 / segments as f32;
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, b1 + fraction * (b2 - b1)),
+                    1,
+                    "segments {segments}: leading-leg shoulder {j} sits at its even step",
+                );
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, b2 + fraction * (b3 - b2)),
+                    1,
+                    "segments {segments}: trailing-leg shoulder {j} sits at its even step",
+                );
+            }
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, arc_bulge),
+                0,
+                "segments {segments}: the PATCH chords are flat — no corner-ward pull (§8.9.5)",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.9.2.1 at general `segments`: the multi-face reflex `PATCH` closure keeps
+    /// its shape as the legs subdivide. Every reflex face still fans to the single hub `B2`
+    /// (identical to the `SHARP` outer join), the interior faces stay **triangles** at every
+    /// `segments` (their rim side is never subdivided), and the two flank faces open into
+    /// `(segments + 3)`-gons — a pentagon at `segments = 2`, a hexagon at `3`, a heptagon at
+    /// `4` — because the flank's whole patch leg (`B_flank`, its `segments − 1` shoulders,
+    /// `B2`) replaces the single apex corner of a triangle.
+    ///
+    /// The `segments = 3` arm additionally pins the leading flank's **exact corner run**, not
+    /// just its size: §8.9.2.1 splices the leg `B1 → SH_1 → SH_2 → B2` in that order, with the
+    /// flank boundvert `B1` on the *beveled* side and the hub against the absorbed leg's rim
+    /// vert. A leg spliced in reverse keeps the face's size, the histogram and χ intact, so
+    /// only the ordered walk catches it.
+    #[test]
+    fn multiface_patch_flank_faces_grow_with_segments() {
+        let (b1_pos, b2_pos, _) = octagonal_patch_boundvert_positions();
+
+        for segments in [2_u32, 3, 4] {
+            let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+            let result = mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: BevelMiter::Patch,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            let (v, e, f) = counts(&mesh);
+            assert_eq!(
+                v as i64 - e as i64 + f as i64,
+                2,
+                "segments {segments}: the multi-face PATCH miter closes to χ = 2",
+            );
+
+            let hub = result
+                .verts
+                .iter()
+                .copied()
+                .find(|&x| (mesh.vertex_position(x) - b2_pos).length() < 1.0e-4)
+                .expect("the hub B2 stays at the retained meet-point at every segments");
+
+            // The six reflex faces are those touching an absorbed leg's rim vert.
+            let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
+            let mut sizes: Vec<usize> = Vec::new();
+            for face in mesh.face_keys() {
+                let face_verts = mesh.face_vert_keys(face);
+                if !face_verts.iter().any(|x| absorbed.contains(x)) {
+                    continue;
+                }
+                if !face_verts.contains(&hub) {
+                    continue;
+                }
+                sizes.push(face_verts.len());
+            }
+            sizes.sort_unstable();
+            let mut expected = vec![3; 4];
+            expected.push(segments as usize + 3);
+            expected.push(segments as usize + 3);
+            expected.sort_unstable();
+            assert_eq!(
+                sizes, expected,
+                "segments {segments}: four hub triangles + two `(segments + 3)`-gon flanks \
+                 (§8.9.2.1)",
+            );
+
+            if segments != 3 {
+                continue;
+            }
+            // §8.9.2.1 / §8.9.5: the leading leg's ordered samples `B1, SH_1, SH_2, B2`, each at
+            // its even step along the straight chord.
+            let sample_at = |position: Vec3| {
+                result
+                    .verts
+                    .iter()
+                    .copied()
+                    .find(|&x| (mesh.vertex_position(x) - position).length() < 1.0e-4)
+                    .expect("every leading-leg sample is minted")
+            };
+            let leading_leg: Vec<VertexKey> = (0..=segments)
+                .map(|step| {
+                    sample_at(b1_pos + (step as f32 / segments as f32) * (b2_pos - b1_pos))
+                })
+                .collect();
+            let flank = mesh
+                .face_keys()
+                .into_iter()
+                .find(|&face| {
+                    let face_verts = mesh.face_vert_keys(face);
+                    face_verts.len() == segments as usize + 3
+                        && face_verts.contains(&leading_leg[0])
+                        && face_verts.iter().any(|x| absorbed.contains(x))
+                })
+                .expect("the leading flank threads B1, its leg, the hub and an absorbed rim vert");
+            let face_verts = mesh.face_vert_keys(flank);
+            let size = face_verts.len();
+            let start = face_verts
+                .iter()
+                .position(|&x| x == leading_leg[0])
+                .expect("B1 sits on the flank face");
+            // The run is contiguous and in leg order in *one* of the two walk directions (which
+            // one depends only on the face's winding); the vertex one step past the hub is the
+            // absorbed leg's rim vert, which is what fixes the leg's direction rather than just
+            // its vertex set.
+            let walk = |forward: bool, step: usize| {
+                let offset = if forward { step } else { size - step };
+                face_verts[(start + offset) % size]
+            };
+            let ordered = |forward: bool| {
+                (0..=segments as usize).all(|step| walk(forward, step) == leading_leg[step])
+                    && absorbed.contains(&walk(forward, segments as usize + 1))
+            };
+            assert!(
+                ordered(true) || ordered(false),
+                "segments 3: the leading flank splices its leg as B1 → SH_1 → SH_2 → B2 with the \
+                 hub against the absorbed leg (§8.9.2.1)",
+            );
+        }
     }
 
     // Replicate the §8.9.1 classification / §8.9.2 reposition on a pristine octagonal
@@ -25903,63 +26175,79 @@ mod tests {
     /// BEVEL.md §8.5.5.5(f.5) / §8.9.2.1: the **square-profile** outer `PATCH` miter. The patch
     /// promotes the retained meet corner `B_2` to a ring hub and seeds its two centrelines from
     /// the boundvert-pair midpoints; the enlarged `s = 5` ring is filled by the parallel-offset
-    /// grid, welding the apex `v` at the centre, and the six reflex faces still close as the
-    /// four hub triangles + two flank pentagons of §8.9.2.1.
+    /// grid, welding the apex `v` at the centre, and the reflex faces still close as the four
+    /// hub triangles + two `(segments + 3)`-gon flanks of §8.9.2.1.
+    ///
+    /// Swept over **every even `segments`** the dispatch admits, not just `2`. §8.5.5.5(f.5)'s
+    /// general-ring square grid is stated for "valence `s`, `≥ 3` beveled edges, **even**
+    /// `segments` only" with `h = ⌊n/2⌋` steps — there is no upper count in the gate — and case
+    /// 1's two patch seeds `C_i = mid(B_i, B_{i+1})` / `C_{i+1} = mid(B_{i+1}, B_{i+2})` read no
+    /// `segments` at all. So the whole even family is one construction, and the two `h`-step rim
+    /// rows `B_i → C_i` / `B_i → C_{i−1}` legitimately **overwrite** the flat chord shoulders the
+    /// miter placed: on a square ring the rim rows *are* the profile. At `segments = 4` each
+    /// patch leg's five slots are exactly the two rows meeting at the shared `C`, which is what
+    /// makes the overwrite total rather than partial.
     #[test]
     fn square_outer_patch_welds_apex_and_keeps_hub_fan() {
-        let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
-        mesh.bevel(
-            &[va.into(), vb.into(), vc.into()],
-            BevelOptions {
-                offset: 0.2,
-                affect: BevelAffect::Edges,
-                segments: 2,
-                profile: 0.97,
-                vmesh_method: BevelVmeshMethod::Adj,
-                miter_outer: BevelMiter::Patch,
-                ..Default::default()
-            },
-        );
-        mesh.validate_topology();
+        for segments in [2_u32, 4] {
+            let (mut mesh, _apex, rim, [va, vb, vc]) = octagonal_bipyramid();
+            mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    profile: 0.97,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: BevelMiter::Patch,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
 
-        let (v, e, f) = counts(&mesh);
-        assert_eq!(
-            v as i64 - e as i64 + f as i64,
-            2,
-            "the square outer PATCH miter closes to a χ = 2 manifold",
-        );
+            let (v, e, f) = counts(&mesh);
+            assert_eq!(
+                v as i64 - e as i64 + f as i64,
+                2,
+                "segments {segments}: the square outer PATCH miter closes to a χ = 2 manifold",
+            );
 
-        let apex = Vec3::new(0.0, 0.0, 1.0);
-        assert!(
-            mesh.vert_keys().into_iter()
-                .any(|v| (mesh.vertex_position(v) - apex).length() < 1.0e-4),
-            "the square PATCH welds the un-rounded apex v at the grid centre (§8.5.5.5(f.5))",
-        );
+            let apex = Vec3::new(0.0, 0.0, 1.0);
+            assert!(
+                mesh.vert_keys()
+                    .into_iter()
+                    .any(|v| (mesh.vertex_position(v) - apex).length() < 1.0e-4),
+                "segments {segments}: the square PATCH welds the un-rounded apex v at the grid \
+                 centre (§8.5.5.5(f.5))",
+            );
 
-        // §8.9.2.1 fan topology is preserved at the square profile: six reflex faces wrapping
-        // the absorbed legs, four bare triangles + two pentagons. The reflex faces are the
-        // apex-side faces touching an absorbed rim vert; exclude the base-pyramid faces (which
-        // also touch `R4 … R8`) by dropping any face reaching the base vertex `(0,0,-1)`.
-        let is_base = |v: VertexKey| (mesh.vertex_position(v) - Vec3::new(0.0, 0.0, -1.0)).length() < 1.0e-4;
-        let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
-        let mut tris = 0usize;
-        let mut pents = 0usize;
-        let mut reflex_faces = 0usize;
-        for face in mesh.face_keys() {
-            let verts = mesh.face_vert_keys(face);
-            if !verts.iter().any(|x| absorbed.contains(x)) || verts.iter().any(|&x| is_base(x)) {
-                continue;
+            // §8.9.2.1 fan topology is preserved at the square profile: six reflex faces wrapping
+            // the absorbed legs, four bare triangles + two `(segments + 3)`-gons. The reflex faces
+            // are the apex-side faces touching an absorbed rim vert; exclude the base-pyramid
+            // faces (which also touch `R4 … R8`) by dropping any face reaching the base vertex
+            // `(0,0,-1)`.
+            let is_base =
+                |v: VertexKey| (mesh.vertex_position(v) - Vec3::new(0.0, 0.0, -1.0)).length() < 1.0e-4;
+            let absorbed = [rim[3], rim[4], rim[5], rim[6], rim[7]];
+            let mut sizes: Vec<usize> = Vec::new();
+            for face in mesh.face_keys() {
+                let verts = mesh.face_vert_keys(face);
+                if !verts.iter().any(|x| absorbed.contains(x)) || verts.iter().any(|&x| is_base(x)) {
+                    continue;
+                }
+                sizes.push(verts.len());
             }
-            reflex_faces += 1;
-            match verts.len() {
-                3 => tris += 1,
-                5 => pents += 1,
-                _ => {}
-            }
+            sizes.sort_unstable();
+            let mut expected = vec![3usize; 4];
+            expected.push(segments as usize + 3);
+            expected.push(segments as usize + 3);
+            expected.sort_unstable();
+            assert_eq!(
+                sizes, expected,
+                "segments {segments}: four interior hub triangles + two `(segments + 3)`-gon \
+                 flanks wrap the 270° gap (§8.9.2.1)",
+            );
         }
-        assert_eq!(reflex_faces, 6, "six reflex faces wrap the 270° gap");
-        assert_eq!(tris, 4, "four interior hub triangles (§8.9.2.1)");
-        assert_eq!(pents, 2, "two flank pentagons (§8.9.2.1)");
     }
 
     /// BEVEL.md §8.5.5.5(f.5): the convex sector **trailing** a fired outer miter keeps its
@@ -32467,8 +32755,13 @@ mod tests {
         ); 3] = [
             ("inner arc", &inner, &[2, 3]),
             ("outer arc", &outer_arc, &[2, 3]),
-            // §8.9.2's flat chord strip is a `segments = 2` build.
-            ("outer patch", &outer_patch, &[2]),
+            // `segments = 3` is the load-bearing arm here, not a duplicate of `2`: at
+            // `segments ≥ 3` a custom ring reaches the general §8.5.5.5 grid, whose boundary
+            // mask and relaxed net both re-read each ring chain's *generator* at doubled
+            // resolutions. A patch leg's generator is the straight chord (§8.9.5), so if that
+            // straightness were secretly conditioned on the profile type the divergence would
+            // surface here and nowhere at `segments = 2`.
+            ("outer patch", &outer_patch, &[2, 3]),
         ];
 
         for (name, build, counts) in builders {
