@@ -6240,8 +6240,9 @@ impl LoopMesh {
     ///
     /// All classification runs read-only first; the method returns `false` **without
     /// mutating** for any junction outside its scope (`segments < 2`, a non-circular
-    /// *analytic* profile — a custom curve admits at any slider value, §8.9.5 forcing the
-    /// arc circular regardless — fewer than three sectors, an all-non-reflex ring that is not the forced
+    /// *analytic* profile — a custom curve admits at any slider value, its cap fill being
+    /// exponent-blind (law **F1**) even though its arc chain is not — fewer than three
+    /// sectors, an all-non-reflex ring that is not the forced
     /// tri-corner geometry, more than one reflex sector, or a reflex sector the outer
     /// miter owns), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
@@ -6272,10 +6273,12 @@ impl LoopMesh {
         //
         // The exponent conjunct is this implementation's scope limit, not spec: the
         // non-circular inner-miter *cap fill* is undistilled, so we decline rather than emit a
-        // wrong interior. It is `custom.is_none()`'s because under a curve the analytic slider
-        // reaches nothing in this build — §8.6.3.1(4).4's miter carve-out hands the arc start a
-        // second, analytic spacing pair — and declining on it would move the boundvert count
-        // (§8.9.6), a topology divergence keyed on a value the cap never reads.
+        // wrong interior. It is `custom.is_none()`'s because the missing piece is the analytic
+        // family's own: a custom ring's fill is exponent-blind (law **F1** reads the curve, and
+        // (f.1) step 1's `not a custom profile` conjunct keeps it off the square lattice), so
+        // the slider reaches only the arc chain, which is exponent-general already
+        // (§8.9.5's exponent-scope note). Declining there would move the boundvert count
+        // (§8.9.6) — a topology divergence — to protect an interior that does not depend on it.
         if segments < 2 || (custom.is_none() && profile_to_exponent(profile) != 2.0) {
             return false;
         }
@@ -6396,12 +6399,15 @@ impl LoopMesh {
             // second, non-custom spacing pair, and §8.6.3.1(6) A.6 makes those the one site
             // that never reads the orientation walk's mark. `B1` is that arc start; threading
             // the curve in here would diverge. Its ring *successor* `B3` is not tagged, owns
-            // the sector's closing beveled edge, and does read the curve — below.
+            // the sector's closing beveled edge, and does read the curve — below. What the
+            // carve-out withholds is the **curve**, not the slider: the second pair is the
+            // analytic superellipse at the run's own `profile`, so the scalar still moves this
+            // chain under `CUSTOM` exactly as it does under the analytic family.
             let arc = RingChainProfile::Arc {
                 b1: b1_position,
                 b3: b3_position,
                 midpoint: plan.meet,
-                profile: miter_chain_profile(profile, custom.is_some()),
+                profile,
             };
             // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil consumes the arc's
             // raw coarse `(i, 0, 1)` mid, never the emitted rim mid. The inner arc cell is
@@ -6739,11 +6745,13 @@ impl LoopMesh {
         // `build_adj_fill_miter_ring` asks step 1's predicate itself (`adj_square_ring_claims`,
         // which carries the parity conjunct), so both parities are admitted here.
         //
-        // Both arms are scoped to `custom.is_none()`, because a custom curve reaches no
-        // consumer of the analytic slider: §8.6.3.1(4).4's miter carve-out hands an arc start a
-        // second, analytic spacing pair, the patch legs are straight whatever they read, and
-        // `build_adj_fill_miter_ring` sends a custom ring to the general grid. Declining on the
-        // slider there would move the boundvert count (§8.9.6) on a value the cap never reads.
+        // Both arms are scoped to `custom.is_none()`, because what they are protecting — the
+        // curved-analytic and square-lattice *cap fills* — is the analytic family's own: a
+        // custom ring's fill is exponent-blind, `build_adj_fill_miter_ring` sending it to the
+        // general grid over law **F1**'s curve-derived fullness. The slider does still reach
+        // the arc chain there (§8.6.3.1(4).4's carve-out withholds the curve, not the scalar),
+        // but that chain is exponent-general. Declining on the slider under a curve would move
+        // the boundvert count (§8.9.6) — a topology divergence — for no interior gain.
         let exponent = profile_to_exponent(profile);
         let square = exponent == PROFILE_SQUARE_EXPONENT;
         if segments < 2 || (custom.is_none() && exponent != 2.0 && !square) {
@@ -6877,12 +6885,14 @@ impl LoopMesh {
                 // Non-custom even under `profile_type = CUSTOM`, by §8.6.3.1(4).4's miter
                 // carve-out: `B1` is the arc start, and an arc / patch start is handed a
                 // second, analytic spacing pair and skips §8.6.3.1(6)'s handedness pass
-                // outright (A.6). Matching behaviour, not an omission.
+                // outright (A.6). Matching behaviour, not an omission. That pair is built
+                // "from the `profile` scalar", so the carve-out withholds the **curve** and
+                // not the slider — a `CUSTOM` run's miter chain moves with `profile`.
                 let arc = RingChainProfile::Arc {
                     b1: b1_position,
                     b3: b3_position,
                     midpoint,
-                    profile: miter_chain_profile(profile, custom.is_some()),
+                    profile,
                 };
                 let raw_bulge = arc.raw_positions(2)[1];
 
@@ -32887,9 +32897,11 @@ mod tests {
     /// curve's.
     ///
     /// `profile` is a parameter because the miter's admission gate is keyed on the profile
-    /// *type*: under a curve §8.9.5 forces the arc circular whatever the slider reads, so
-    /// sweeping it must not move the output
-    /// ([`custom_profile_mitered_output_is_independent_of_the_superellipse_slider`]).
+    /// *type*, never on the slider — sweeping the slider under a curve must not decide whether
+    /// the miter fires
+    /// ([`custom_profile_miter_admission_is_independent_of_the_superellipse_slider`]) — while
+    /// the arc chain's *placement* does move with it (§8.6.3.1(4).4's carve-out withholds the
+    /// curve, not the scalar).
     /// `miter_inner` is one so the same fixture supplies the sharp contrast.
     fn cube_corner_adj_inner_miter_profile(
         curve: Option<&BevelCurveProfile>,
@@ -32951,7 +32963,10 @@ mod tests {
     /// `(2 − √2)·chord_mid + (√2 − 1)·midpoint` bulge, which for the `y = −1` sector's meet
     /// `(0.75, −1, −0.75)` and its two edge directions `(−1, 0, 0)` / `(0, 0, 1)` is
     /// `meet + ((2 − √2)/2)·spread·(−1, 0, 1) = (0.66213, −1, −0.66213)` — the same point
-    /// under both profile types.
+    /// under both profile types **at this test's `profile = 0.5`**. It is the *curve* the
+    /// carve-out withholds from the arc, not the slider, so the two arms coincide because they
+    /// share a scalar and not because the type pins the exponent
+    /// ([`custom_profile_outer_miter_arc_chain_tracks_the_superellipse_slider`]).
     ///
     /// **The other two flanks are pinned too, and they are not the first one's rotations.**
     /// §8.6.3.1(6)(i) fixes each run's seed *end* from the input mesh's stored edge endpoints,
@@ -33274,13 +33289,15 @@ mod tests {
     /// `+2` boundverts of §8.9.6 and fall back to the sharp ring — a whole-mesh census
     /// divergence keyed on a value the admission never reads.
     ///
-    /// Positions are swept too, and there the sweep pins **less** than it looks like it does.
-    /// A `PATCH` start's two legs are straight chords at every exponent (§8.9.5), so that arm
-    /// is a genuine guide invariant. An `ARC` start's chain is not: §8.6.3.1(4).4's carve-out
-    /// builds its analytic spacing pair "from the `profile` scalar", so the slider ought to
-    /// move it. This arm therefore pins [`miter_chain_profile`]'s documented **scope marker**
-    /// — the custom branch's deliberate round default — and not a law. It moves when that row
-    /// lands.
+    /// **Positions are swept on one arm only, because only one of them is a law.** A `PATCH`
+    /// start's two legs are straight chords at every exponent, and for a stronger reason than
+    /// a different exponent (§8.9.5): each leg's stored midpoint *is* its own chord midpoint,
+    /// so its three anchors are collinear, the cell degenerates and no unit-square map exists
+    /// — the samples are plain interpolation whatever the exponent or the profile type says.
+    /// An `ARC` start's chain is the opposite: §8.6.3.1(4).4's carve-out builds its analytic
+    /// spacing pair "from the `profile` scalar", so the slider *does* move it under a curve,
+    /// and that is pinned positively by
+    /// [`custom_profile_outer_miter_arc_chain_tracks_the_superellipse_slider`].
     ///
     /// Both builders are swept, because each carries its own exponent gate — the inner miter's
     /// `r == 2` and the outer's `r == 2 or square` — so an analytic `profile = 0.7` (curved)
@@ -33289,7 +33306,7 @@ mod tests {
     /// The `Sharp` contrast is what stops the sweep passing vacuously: without it, a build in
     /// which *every* arm declined would be perfectly slider-invariant too.
     #[test]
-    fn custom_profile_mitered_output_is_independent_of_the_superellipse_slider() {
+    fn custom_profile_miter_admission_is_independent_of_the_superellipse_slider() {
         let curve = BevelCurveProfile::from_points(&[
             (1.0, 0.0, BevelHandle::Vector),
             (0.5, 0.25, BevelHandle::Vector),
@@ -33312,19 +33329,20 @@ mod tests {
             &str,
             &dyn Fn(f32, u32, BevelMiter) -> (LoopMesh, BevelResult),
             &[u32],
+            bool,
         ); 3] = [
-            ("inner arc", &inner, &[2, 3]),
-            ("outer arc", &outer_arc, &[2, 3]),
+            ("inner arc", &inner, &[2, 3], false),
+            ("outer arc", &outer_arc, &[2, 3], false),
             // `segments = 3` is the load-bearing arm here, not a duplicate of `2`: at
             // `segments ≥ 3` a custom ring reaches the general §8.5.5.5 grid, whose boundary
             // mask and relaxed net both re-read each ring chain's *generator* at doubled
             // resolutions. A patch leg's generator is the straight chord (§8.9.5), so if that
             // straightness were secretly conditioned on the profile type the divergence would
             // surface here and nowhere at `segments = 2`.
-            ("outer patch", &outer_patch, &[2, 3]),
+            ("outer patch", &outer_patch, &[2, 3], true),
         ];
 
-        for (name, build, counts) in builders {
+        for (name, build, counts, positions_invariant) in builders {
             for &segments in counts {
                 let (baseline_mesh, baseline) = build(0.5, segments, BevelMiter::Arc);
                 let reference: Vec<Vec3> = baseline
@@ -33371,6 +33389,9 @@ mod tests {
                         "…nor how many verts it emits (profile = {profile}, \
                          segments = {segments}, {name})",
                     );
+                    if !positions_invariant {
+                        continue;
+                    }
                     for position in &moved {
                         assert!(
                             reference
@@ -33381,6 +33402,107 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// BEVEL.md §8.6.3.1(4).4's miter carve-out, read literally: the second spacing pair it
+    /// hands an arc start is the analytic superellipse **of the `profile` scalar**, so moving
+    /// that slider moves a mitered sector's chain even under `profile_type = CUSTOM`. What the
+    /// carve-out withholds is the *curve*, not the scalar.
+    ///
+    /// The companion invariant is
+    /// [`custom_profile_miter_admission_is_independent_of_the_superellipse_slider`]: admission
+    /// is still slider-blind, and a `PATCH` start's legs are still slider-flat — but for
+    /// §8.9.5's independent collinear-anchor reason, not because the type pins the exponent.
+    ///
+    /// Pinned in closed form at `segments = 2` on the single-face reflex junction, whose arc
+    /// cell is symmetric, so the §8.2.2.1.1 resample is the identity there and raw = emitted.
+    /// §8.9.5's general reduction puts the lone interior sample at
+    /// `(2 − 2m)·½(B1 + B3) + (2m − 1)·midpoint` with `m` read off the *sampler*: `0.5` inside
+    /// the line sentinel (the plain chord midpoint, no pull), `1/√2` at the circle, `√0.7` on
+    /// the curved exponent and `1` inside the square sentinel — where the sample *is* the
+    /// stored corner the miter replaced. Four exponents, four distinct answers, all on the
+    /// bisector chord; a build that re-pinned the custom arc to the circle collapses them onto
+    /// the second row.
+    ///
+    /// The `segments = 3` station is where raw and emitted part company (the resample is no
+    /// longer the identity at an odd count, §8.9.5.1), so it pins that the slider reaches the
+    /// *generator* and not merely one closed-form sample.
+    #[test]
+    fn custom_profile_outer_miter_arc_chain_tracks_the_superellipse_slider() {
+        let curve = BevelCurveProfile::from_points(&[
+            (1.0, 0.0, BevelHandle::Vector),
+            (0.5, 0.25, BevelHandle::Vector),
+            (0.0, 1.0, BevelHandle::Vector),
+        ]);
+        // §8.9.5.1 worked trace B's frame (offset 0.2, spread 0, ARC) — the same cell
+        // `outer_miter_arc_samples_track_the_run_profile_exponent` reads the analytic family on.
+        let b1 = Vec3::new(-0.51500, 0.27005, 0.72995);
+        let b3 = Vec3::new(0.51500, 0.27005, 0.72995);
+        let midpoint = Vec3::new(0.0, -0.24495, 1.24495);
+        let round_sample = Vec3::new(0.0, 0.05673, 0.94327);
+        // The frame literals above are quoted to five places, so the derived expectations carry
+        // a few `1e-6` of quoting error — far inside this band, and four orders inside the
+        // ≈`0.2` that separates any two of the four rows.
+        let emitted_near = |mesh: &LoopMesh, result: &BevelResult, target: Vec3| {
+            result
+                .verts
+                .iter()
+                .filter(|&&vertex| (mesh.vertex_position(vertex) - target).length() < 1.0e-4)
+                .count()
+        };
+
+        for (profile, expected) in [
+            (0.25_f32, Vec3::new(0.0, 0.27005, 0.72995)),
+            (0.5, round_sample),
+            (0.7, Vec3::new(0.0, -0.07671, 1.07671)),
+            (0.99, midpoint),
+        ] {
+            let (mesh, result) =
+                reflex_apex_outer_miter_profile(BevelMiter::Arc, Some(&curve), profile, 2);
+            mesh.validate_topology();
+            assert_eq!(
+                emitted_near(&mesh, &result, expected),
+                1,
+                "custom profile {profile}: the arc's lone interior sample is {expected:?}",
+            );
+            if profile != 0.5 {
+                assert!(
+                    (expected - round_sample).length() > 1.0e-2,
+                    "profile {profile}'s answer is far from the circle's, so the absence \
+                     check below has teeth",
+                );
+                assert_eq!(
+                    emitted_near(&mesh, &result, round_sample),
+                    0,
+                    "custom profile {profile}: the forced-circle sample must be gone",
+                );
+            }
+        }
+
+        for profile in [0.25_f32, 0.7, 0.99] {
+            let (mesh, result) =
+                reflex_apex_outer_miter_profile(BevelMiter::Arc, Some(&curve), profile, 3);
+            mesh.validate_topology();
+            let chain = emitted_arc_chain(b1, b3, midpoint, profile, 3);
+            let round = emitted_arc_chain(b1, b3, midpoint, 0.5, 3);
+            for k in 1..3 {
+                assert!(
+                    (chain[k] - round[k]).length() > 1.0e-2,
+                    "profile {profile}, sample {k}: the two chains are genuinely apart",
+                );
+                assert_eq!(
+                    emitted_near(&mesh, &result, chain[k]),
+                    1,
+                    "custom profile {profile}, segments 3: sample {k} is {:?}",
+                    chain[k],
+                );
+                assert_eq!(
+                    emitted_near(&mesh, &result, round[k]),
+                    0,
+                    "custom profile {profile}, segments 3: the circle's sample {k} must be gone",
+                );
             }
         }
     }
@@ -55567,27 +55689,6 @@ impl RingChainProfile<'_> {
     /// relaxes its interior against the verbatim boundary.
     fn is_custom(&self) -> bool {
         matches!(self, RingChainProfile::Cell { custom: Some(_), .. })
-    }
-}
-
-/// The `profile` scalar a miter arc's chain is sampled at (BEVEL.md §8.9.5, §8.6.3.1(4).4).
-///
-/// Under the analytic superellipse family it is simply the run's own scalar — an arc start
-/// records the circle exponent but that copy never selects a spacing table, so the arc is
-/// circular only when the run is.
-///
-/// **Scope marker, not spec, for the custom branch.** §8.6.3.1(4).4's miter carve-out hands an
-/// arc / patch start a second, *non-custom* spacing pair built "from the `profile` scalar" — so
-/// by the letter of the guide the slider should move a custom run's miter chain too. That axis
-/// is flagged in the same paragraph as unobservable through the A/B harness (its custom-profile
-/// oracle entry point pins the slider at the default), and honouring it would move a mitered
-/// custom cap with nothing able to witness which side is right. Deferred to its own row; the
-/// curve keeps the default round chain here.
-const fn miter_chain_profile(profile: f32, custom: bool) -> f32 {
-    if custom {
-        0.5
-    } else {
-        profile
     }
 }
 
