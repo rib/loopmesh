@@ -7518,10 +7518,9 @@ impl LoopMesh {
         let central_representative = templates.resolve(omj.central_representative);
         // §8.9.5.3: the mitered ring takes the ordinary (f.1) dispatch with no miter-specific
         // step, so it reads the flat cap off (f.3) law **F2** exactly as a plain ring does —
-        // `r == 1` (the mitered chain there *is* the flat chord, §8.9.5) seeds `fullness = 0`
-        // and reflects the winding anchor through the ring plane, which the general seed
-        // cannot do once it collapses onto the in-plane centroid. Law F1 is tested before F2,
-        // so a custom curve is never the flat cap whatever the untouched slider reads.
+        // `r == 1` (the mitered chain there *is* the flat chord, §8.9.5) seeds `fullness = 0`.
+        // Law F1 is tested before F2, so a custom curve is never the flat cap whatever the
+        // untouched slider reads.
         let flat = profile_to_exponent(omj.profile) == 1.0 && omj.custom.is_none();
         // §8.9.5.3: feed the centre stencil the raw coarse control-net mids (populated
         // at `segments = 2`), so the resampled arc-flanking rim mids never skew the apex.
@@ -7625,9 +7624,6 @@ impl LoopMesh {
             }
         }
 
-        let centroid = starts.iter().fold(Vec3::ZERO, |acc, &(b, _)| acc + b) / sectors as f32;
-        let anchor = centroid - (vertex_position - centroid);
-
         let sector_representatives = omj.resolve_sector_representatives(templates);
         let centre_column_representatives = omj.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(omj.central_representative);
@@ -7640,7 +7636,6 @@ impl LoopMesh {
             &AdjInterior::Parallel {
                 starts: &starts,
                 vertex: vertex_position,
-                anchor,
             },
             material,
             &sector_representatives,
@@ -7741,18 +7736,6 @@ impl LoopMesh {
             centroid + fullness * (vertex_position - centroid)
         };
 
-        // The face-winding anchor (§8.5.5): a point below the cap, on the solid side away
-        // from `v`. The flat cap reflects `v` through the centroid (its `fullness = 0`
-        // would otherwise collapse the anchor onto the in-plane centroid); a custom cap
-        // mirrors its seed through the centroid to stay on the far side.
-        let anchor = if flat {
-            centroid - (vertex_position - centroid)
-        } else if custom.is_some() {
-            2.0 * centroid - fullness_seed
-        } else {
-            centroid - fullness * (vertex_position - centroid)
-        };
-
         if flat && even && seg == 2 {
             // §8.3.0.2.1: the straight-chord **even** cap at `segments = 2` welds at the
             // ring-plane centroid (`fullness = 0` ⇒ `fullness_seed == centroid`) with **no
@@ -7762,7 +7745,7 @@ impl LoopMesh {
             // a *determined* quantity (§8.5.5.5(e) / (f.3) law **F2**) that must descend
             // through the same subdivision-limit relaxation the odd and curved caps use — not
             // a planar bilinear patch — so those parities fall through to the relaxed net
-            // below (still with `fullness_seed == centroid` and the flat reflected `anchor`).
+            // below (still with `fullness_seed == centroid`).
             let mut corners: Vec<[Vec3; 4]> = Vec::with_capacity(sectors);
             for i in 0..sectors {
                 let p00 = boundverts[i];
@@ -7777,10 +7760,7 @@ impl LoopMesh {
                 half,
                 even,
                 chain_of,
-                &AdjInterior::Blend {
-                    corners: &corners,
-                    anchor,
-                },
+                &AdjInterior::Blend { corners: &corners },
                 material,
                 sector_representatives,
                 centre_column_representatives,
@@ -7801,8 +7781,8 @@ impl LoopMesh {
         // way the interior descends from the fullness centre (here the ring-plane centroid,
         // `fullness = 0`) through the very same subdivision-limit relaxation the curved caps
         // use; only the `fullness = 0` seed differs. So the flat cap folds onto the general
-        // relaxed-net construction below with `fullness_seed == centroid` and the flat
-        // (reflected) `anchor` already in hand — it is not a distinct planar bilinear blend.
+        // relaxed-net construction below with `fullness_seed == centroid` — it is not a
+        // distinct planar bilinear blend.
 
         // §8.5.5.5(a) and the "the centre stencil consumes the *raw coarse* profile mids"
         // rule: the coarse net's `(i, 0, 1)` control points are each ring edge's own
@@ -7835,7 +7815,6 @@ impl LoopMesh {
                 axis: &axis,
                 sectors,
                 segments: seg,
-                anchor,
             },
             material,
             sector_representatives,
@@ -8125,13 +8104,6 @@ impl LoopMesh {
             }
         }
 
-        // The face-winding anchor (§8.5.5): a point on the solid side, below the cap. The
-        // square cap dips to `v` at its centre and rises to the boundvert ring, so reflecting
-        // `v` through the ring centroid lands behind the cap.
-        let centroid =
-            starts.iter().fold(Vec3::ZERO, |acc, &(b, _)| acc + b) / sectors as f32;
-        let anchor = centroid - (vertex_position - centroid);
-
         let sector_representatives = cut.resolve_sector_representatives(templates);
         let centre_column_representatives = cut.resolve_centre_column_representatives(templates);
         let central_representative = templates.resolve(cut.central_representative);
@@ -8144,7 +8116,6 @@ impl LoopMesh {
             &AdjInterior::Parallel {
                 starts: &starts,
                 vertex: vertex_position,
-                anchor,
             },
             material,
             &sector_representatives,
@@ -8220,7 +8191,13 @@ impl LoopMesh {
         // boundvert ring — so it takes the ring-spanning donor, exactly as the general grid's
         // odd centre does.
         let central_representative = templates.resolve(cut.central_representative);
-        self.emit_patch_face(&central, anchor, material, central_representative, result);
+        self.emit_patch_face(
+            &central,
+            PatchWinding::Outward { anchor },
+            material,
+            central_representative,
+            result,
+        );
         false
     }
 
@@ -8451,7 +8428,11 @@ impl LoopMesh {
             sectors,
             "one centre-column donor per sector — §6.6.2's odd-`segments` grid row",
         );
-        let anchor = interior.anchor();
+        // §5.1 / §8.5.3: the cap's winding is one bit for the whole grid, read off the rim it
+        // welds to, not a per-face geometric test.
+        let winding = PatchWinding::Grid {
+            reverse: self.adj_grid_needs_reversing(sectors, seg, chain_of),
+        };
         let mut grid: std::collections::HashMap<(usize, usize, usize), VertexKey> =
             std::collections::HashMap::new();
 
@@ -8515,7 +8496,7 @@ impl LoopMesh {
                     );
                     self.emit_patch_face(
                         &[a, b, c, d],
-                        anchor,
+                        winding,
                         material,
                         sector_representatives[i],
                         result,
@@ -8555,7 +8536,7 @@ impl LoopMesh {
             for r in 0..half {
                 self.emit_patch_face(
                     &[column[r], row[r], row[r + 1], column[r + 1]],
-                    anchor,
+                    winding,
                     material,
                     centre_column_representatives[i],
                     result,
@@ -8573,7 +8554,7 @@ impl LoopMesh {
         // §6.6.1 / §8.5.5.5(e): the centre n-gon is the grid's one **ring-spanning** face —
         // its corners span the whole boundvert ring — so it takes the ring-spanning donor,
         // not the sector-positional one the rest of the grid carries.
-        self.emit_patch_face(&central, anchor, material, central_representative, result);
+        self.emit_patch_face(&central, winding, material, central_representative, result);
     }
 
     /// Resolve the adjacency-grid vert at sub-patch index `(i, j, k)` (BEVEL.md
@@ -8770,7 +8751,7 @@ impl LoopMesh {
     fn emit_patch_face(
         &mut self,
         verts: &[VertexKey],
-        anchor: Vec3,
+        winding: PatchWinding,
         material: i32,
         representative: FaceTemplateRef<'_>,
         result: &mut BevelResult,
@@ -8788,6 +8769,28 @@ impl LoopMesh {
             return;
         }
 
+        let reverse = match winding {
+            PatchWinding::Grid { reverse } => reverse,
+            PatchWinding::Outward { anchor } => self.patch_ring_faces_inward(&ring, anchor),
+        };
+        if reverse {
+            ring.reverse();
+        }
+
+        let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
+        self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
+        result.faces.push(face);
+        self.collect_face_edges(face, result);
+    }
+
+    /// Does `ring`, walked in its own order, put its Newell normal *toward* `anchor` — a point
+    /// the caller knows lies on the solid side, below the cap?
+    ///
+    /// A last-resort orientation test: it decides one face in isolation, so it can only be
+    /// trusted where the anchor is a genuine interior point of the corner (the octant origin,
+    /// the notch bottom a welded leg runs down to). The grid cap does **not** use it — its
+    /// winding is the §5.1 manifold condition, one bit for the whole cap.
+    fn patch_ring_faces_inward(&self, ring: &[VertexKey], anchor: Vec3) -> bool {
         let positions: Vec<Vec3> = ring.iter().map(|&v| self.vertex_position(v)).collect();
         let centroid = positions.iter().sum::<Vec3>() / positions.len() as f32;
         let mut normal = Vec3::ZERO;
@@ -8796,14 +8799,47 @@ impl LoopMesh {
             let edge_b = positions[(index + 1) % positions.len()] - centroid;
             normal += edge_a.cross(edge_b);
         }
-        if normal.dot(centroid - anchor) < 0.0 {
-            ring.reverse();
-        }
+        normal.dot(centroid - anchor) < 0.0
+    }
 
-        let face = self.face_create_verts(&ring, FaceCreateFlags::NONE);
-        self.assign_bevel_face_attributes(face, material, representative, BevelNewFaceKind::Cap);
-        result.faces.push(face);
-        self.collect_face_edges(face, result);
+    /// The one winding bit for a whole [V-ADJ] grid cap (BEVEL.md §5.1, applied to the grid
+    /// by §8.5.3): does the grid's own cell walk need reversing to leave every rim edge it
+    /// shares with an arriving strip at radial count 2?
+    ///
+    /// The grid's cell order already walks its rim **ascending** along each sector chain, and
+    /// the chains ascend in sector order — that is the disk order, which §5.1 says the cap
+    /// runs *with*. So the answer is `true` only when the already-built neighbour on a rim
+    /// edge walks that edge the same way, which is what a ring that came back reversed looks
+    /// like. Deciding it once, combinatorially, is the whole point: every cell of every
+    /// sub-patch, the odd centre's bridge strips and its centre `s`-gon are all indexed off
+    /// the same `(i, j, k)` frame, so they are consistent with each other by construction and
+    /// a per-face geometric test can only break that consistency (and cannot orient a cap
+    /// over a non-planar ring at all).
+    ///
+    /// A rim with no faces on it yet — the face-less star of §5.1 — leaves the cap's
+    /// orientation pinned by the disk-order convention alone, so the grid walk stands.
+    fn adj_grid_needs_reversing(
+        &self,
+        sectors: usize,
+        seg: usize,
+        chain_of: &[Vec<VertexKey>],
+    ) -> bool {
+        for i in 0..sectors {
+            for k in 0..seg {
+                let from = chain_of[i][k];
+                let to = chain_of[i][k + 1];
+                let Some(rim_edge) = self.query_edge_exists(from, to) else {
+                    continue;
+                };
+                let Some(&loop_key) = self.edge_loop_keys(rim_edge).first() else {
+                    continue;
+                };
+                let start = self.loop_vertex(loop_key);
+                let end = self.loop_vertex(self.loop_next(loop_key));
+                return start == from && end == to;
+            }
+        }
+        false
     }
 
     /// The chain spanning sector `i`'s boundvert pair at this junction (BEVEL.md §8.2.2) —
@@ -18644,6 +18680,112 @@ mod tests {
         }
     }
 
+    /// BEVEL.md §5.1 / §8.5.3: the [V-ADJ] cap's winding is the manifold condition against
+    /// the rim it welds to, so it must not depend on any *quantity* the profile scales. The
+    /// concave band (`profile < 0.25`, exponent `r < 1`) is where a geometric outward test
+    /// anchored on the fullness blend inverts — the blend's own sign flips there — and takes
+    /// the whole cap with it. Swept over the full valence-4 junction, where every sector is
+    /// a general grid cell rather than a closed-form octant.
+    #[test]
+    fn adj_cap_winding_survives_the_concave_profile_band() {
+        for profile in [0.5f32, 0.3, 0.26, 0.255, 0.252, 0.2, 0.1, 0.02] {
+            for segments in 2..=5 {
+                let mut mesh = LoopMesh::new();
+                mesh_add_octahedron(&mut mesh);
+                let apex = vert_at(&mesh, Vec3::new(0.0, 0.0, 1.0));
+                let geom: Vec<GeomKey> = mesh
+                    .vert_edge_keys(apex)
+                    .into_iter()
+                    .map(GeomKey::from)
+                    .collect();
+                assert_eq!(geom.len(), 4, "the octahedron apex has valence 4");
+                let result = mesh.bevel(
+                    &geom,
+                    BevelOptions {
+                        offset: 0.2,
+                        affect: BevelAffect::Edges,
+                        segments,
+                        profile,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+                assert_bevel_sound(
+                    &mesh,
+                    &result,
+                    &format!("valence-4 adj cap, segments = {segments}, profile = {profile}"),
+                );
+            }
+        }
+    }
+
+    /// The same rule at a **vertex** bevel, whose multi-segment cap enters the general
+    /// [V-ADJ] fill unconditionally (BEVEL.md §8.11.3 — no closed-form octant path), so it is
+    /// a second, independent way into the grid emitter.
+    #[test]
+    fn vertex_bevel_adj_cap_winding_survives_the_concave_profile_band() {
+        for profile in [0.5f32, 0.252, 0.15] {
+            for segments in 2..=4 {
+                let mut mesh = LoopMesh::new();
+                mesh_add_cube(&mut mesh);
+                let corner = vert_at(&mesh, Vec3::new(1.0, -1.0, -1.0));
+                let result = mesh.bevel(
+                    &[corner.into()],
+                    BevelOptions {
+                        offset: 0.3,
+                        affect: BevelAffect::Vertices,
+                        segments,
+                        profile,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+                assert_bevel_sound(
+                    &mesh,
+                    &result,
+                    &format!("vertex adj cap, segments = {segments}, profile = {profile}"),
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §5.1: the cap is **one** cycle wound with the disk order, so its consistency
+    /// cannot be decided face by face against a point. A reflex junction's boundvert ring is
+    /// non-planar — the reflex boundvert sits far off the plane the other two span — so no
+    /// single point lies below every cell at once, and a per-cell test splits the cap: the
+    /// cells over the convex boundverts flip while the reflex one stays put. The rim's radial
+    /// count is the invariant that catches it.
+    #[test]
+    fn adj_cap_winding_is_consistent_over_a_reflex_ring() {
+        for profile in [0.25f32, 0.2, 0.5, 0.6, 0.75, 0.9] {
+            for segments in 2..=5 {
+                let (mut mesh, _apex, spokes) = single_face_reflex_junction();
+                let geom: Vec<GeomKey> = spokes.into_iter().map(GeomKey::from).collect();
+                let result = mesh.bevel(
+                    &geom,
+                    BevelOptions {
+                        offset: 0.2,
+                        affect: BevelAffect::Edges,
+                        segments,
+                        profile,
+                        vmesh_method: BevelVmeshMethod::Adj,
+                        ..Default::default()
+                    },
+                );
+
+                let case = format!("reflex adj cap, segments = {segments}, profile = {profile}");
+                mesh.validate_topology();
+                assert!(!result.faces.is_empty(), "{case}: bevel produced no faces");
+                let conflicts = winding_conflicts(&mesh);
+                assert!(
+                    conflicts.is_empty(),
+                    "{case}: {} shared edge(s) traversed the same way by both adjacent faces",
+                    conflicts.len(),
+                );
+            }
+        }
+    }
+
     /// Bevel two of the four edges at the octahedron apex — a valence-4 junction at
     /// one end of each strip, a valence-4 terminal (the poly-fan close, §8.3.0.2) at
     /// the other — and assert every result is sound.
@@ -24999,7 +25141,6 @@ mod tests {
                 let last_j = if even { half - 1 } else { half };
                 let interior = AdjInterior::Blend {
                     corners: &[],
-                    anchor: Vec3::ZERO,
                 };
                 let mut grid = std::collections::HashMap::new();
                 let mut result = BevelResult::default();
@@ -30591,7 +30732,6 @@ mod tests {
             axis: &axis,
             sectors,
             segments: seg,
-            anchor: centroid,
         };
 
         let mut predicted = Vec::new();
@@ -34469,7 +34609,6 @@ mod tests {
         let interior = AdjInterior::Parallel {
             starts: &starts,
             vertex,
-            anchor: Vec3::ZERO,
         };
         let placed = interior.position(0, 1, 1, 2);
 
@@ -34510,7 +34649,6 @@ mod tests {
         let interior = AdjInterior::Parallel {
             starts: &starts,
             vertex,
-            anchor: Vec3::ZERO,
         };
         let placed = interior.position(0, 1, 1, 2);
         // Midlines of the unit square `B=(1,1), C_i=(0,1), v=(0,0), C_{i−1}=(1,0)` cross at
@@ -55077,6 +55215,18 @@ fn seed_closer_to_vertex(slot: &mut Option<Vec3>, candidate: Vec3, vertex: Vec3)
     }
 }
 
+/// How a bevel patch face's boundary loop is oriented.
+#[derive(Clone, Copy)]
+enum PatchWinding {
+    /// The [V-ADJ] grid cap's one winding bit (BEVEL.md §5.1 / §8.5.3): the ring arrives in
+    /// the grid's own cell walk, and `reverse` says whether that walk has to be turned round
+    /// to meet the rim at radial count 2.
+    Grid { reverse: bool },
+    /// Orient against a point known to lie on the solid side, below the cap. Only for the
+    /// lone faces that have no grid frame to inherit a sense from.
+    Outward { anchor: Vec3 },
+}
+
 /// Where an adjacency grid's **interior** verts come from (BEVEL.md §8.5.5). The rim
 /// (`j == 0` / `k == 0`) is never sourced here — it is always the already-emitted chain,
 /// the deterministic §8.2.2.1.1 read-back — so this covers only `j, k ≥ 1`.
@@ -55086,12 +55236,8 @@ enum AdjInterior<'a> {
     /// interior ring to relax and no surface to snap onto — the blend *is* the fill
     /// (§8.3.0.2.1). Every other flat cap — all odd `segments`, and even `segments ≥ 4` whose
     /// interior grid is a *determined* quantity — takes the [`AdjInterior::Relaxed`] descent
-    /// instead (§8.5.5.5(e) / (f.3) law **F2**). `anchor` is the interior point below the cap
-    /// that orients face winding outward.
-    Blend {
-        corners: &'a [[Vec3; 4]],
-        anchor: Vec3,
-    },
+    /// instead (§8.5.5.5(e) / (f.3) law **F2**).
+    Blend { corners: &'a [[Vec3; 4]] },
     /// The §8.5.5.5(c) subdivision-relaxation net, read back at the target resolution by
     /// the §8.5.5.5(d) kernel — bilinear within the source quad, against each axis's own
     /// **profile-arc fractions** (`axis[i]`, the fractional source index the §8.2.2.1.1
@@ -55105,7 +55251,6 @@ enum AdjInterior<'a> {
         axis: &'a [Vec<f32>],
         sectors: usize,
         segments: usize,
-        anchor: Vec3,
     },
     /// The same §8.5.5.5(c)/(d) net and read-back, but carried in **unit-octant**
     /// coordinates (§8.5.5.5(f.2)): each interior vert is read off the octant net, snapped
@@ -55131,7 +55276,6 @@ enum AdjInterior<'a> {
     Parallel {
         starts: &'a [(Vec3, Vec3)],
         vertex: Vec3,
-        anchor: Vec3,
     },
     /// The §8.5.5.5(f.5) **tri-corner** square grid — three flat unit squares, closed-form in
     /// octant coordinates with no subdivision and no snap, mapped to the corner by `octant`.
@@ -55139,26 +55283,12 @@ enum AdjInterior<'a> {
 }
 
 impl AdjInterior<'_> {
-    fn anchor(&self) -> Vec3 {
-        match self {
-            AdjInterior::Blend { anchor, .. } => *anchor,
-            AdjInterior::Relaxed { anchor, .. } => *anchor,
-            // The octant origin's image is the corner sphere centre `c` — inside the solid,
-            // below the cap, so it orients the patch winding outward exactly as the sphere
-            // centre does on the circular path.
-            AdjInterior::Octant { octant, .. } => octant.origin(),
-            AdjInterior::Parallel { anchor, .. } => *anchor,
-            // The octant origin's image is the frame centre, below the three flat squares.
-            AdjInterior::SquareTriCorner { octant, .. } => octant.origin(),
-        }
-    }
-
     /// The interior position of sub-patch `i`'s grid vert `(j, k)` at target half-width
     /// `half`. Callers pass the *canonical* `(i, j, k)` so a welded seam / centre resolves
     /// to one position.
     fn position(&self, i: usize, j: usize, k: usize, half: usize) -> Vec3 {
         match self {
-            AdjInterior::Blend { corners, .. } => {
+            AdjInterior::Blend { corners } => {
                 let [p00, p0t, pt0, ptt] = corners[i];
                 let s = k as f32 / half as f32;
                 let u = j as f32 / half as f32;
@@ -55172,7 +55302,6 @@ impl AdjInterior<'_> {
                 axis,
                 sectors,
                 segments,
-                ..
             } => {
                 // Sub-patch `i`'s `k` axis is chain `i` read forward; its `j` axis is chain
                 // `i − 1` read *backward* from `B_i`, so its source coordinate is the
@@ -55198,9 +55327,7 @@ impl AdjInterior<'_> {
                 let unit = net.sample(i, along_previous, along_chain);
                 octant.to_world(snap_to_unit_superellipsoid(unit, *exponent, false))
             }
-            AdjInterior::Parallel {
-                starts, vertex, ..
-            } => {
+            AdjInterior::Parallel { starts, vertex } => {
                 let sectors = starts.len();
                 let h = half as f32;
                 let (b_i, c_i) = starts[i];
