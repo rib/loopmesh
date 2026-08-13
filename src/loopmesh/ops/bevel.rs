@@ -6263,20 +6263,19 @@ impl LoopMesh {
         miter_ring_junctions: &mut Vec<MiterRingJunction<'c>>,
         result: &mut BevelResult,
     ) -> bool {
-        // §8.9.5: the inner miter rides the [V-ADJ] grid, so `segments ≥ 2`, and the arc
-        // forces the circular profile. The arc build is segments-general (§8.9.5.1) — the
-        // same even-angle inscribed-arc sampling the outer `ARC` uses (§8.9.3 rebuilds the
-        // inner miter "exactly like an outer ARC"), so odd `segments` closes on the enlarged
-        // boundvert ring (valence `2s` all-convex, `2s − 1` with a sharp reflex sector, since
-        // every non-reflex sector splits — not the outer miter's `s + 1`) rather than
-        // declining to the sharp ring.
+        // §8.9.5: the inner miter rides the [V-ADJ] grid, so `segments ≥ 2`. The arc build is
+        // segments-general and exponent-general (§8.9.5.1) — the same sampling the outer `ARC`
+        // uses (§8.9.3 rebuilds the inner miter "exactly like an outer ARC") — so odd
+        // `segments` closes on the enlarged boundvert ring (valence `2s` all-convex, `2s − 1`
+        // with a sharp reflex sector, since every non-reflex sector splits — not the outer
+        // miter's `s + 1`) rather than declining to the sharp ring.
         //
-        // The exponent conjunct is `custom.is_none()`'s, for the reason the fill's own square
-        // gate carries one: §8.9.5 forces the arc's exponent to the circle value *independently
-        // of the user `profile` scalar*, so under a curve the slider is a value nothing in this
-        // build reads — and declining on it would move the boundvert count (§8.9.6), a topology
-        // divergence keyed on a dead slider. The **analytic** non-circular miter stays out of
-        // scope (that fill is undistilled), which is what the conjunct still declines.
+        // The exponent conjunct is this implementation's scope limit, not spec: the
+        // non-circular inner-miter *cap fill* is undistilled, so we decline rather than emit a
+        // wrong interior. It is `custom.is_none()`'s because under a curve the analytic slider
+        // reaches nothing in this build — §8.6.3.1(4).4's miter carve-out hands the arc start a
+        // second, analytic spacing pair — and declining on it would move the boundvert count
+        // (§8.9.6), a topology divergence keyed on a value the cap never reads.
         if segments < 2 || (custom.is_none() && profile_to_exponent(profile) != 2.0) {
             return false;
         }
@@ -6385,11 +6384,12 @@ impl LoopMesh {
             let b1_position = plan.meet + plan.dir_open * spread;
             let b3_position = plan.meet + plan.dir_close * spread;
             // §8.9.3 / §8.9.5.1: the inner arc is rebuilt exactly like the outer `ARC` —
-            // the inscribed quarter-circle in the arc's (non-orthonormal) unit-square frame
-            // of `B1` / `B3` / the stored meet-corner, sampled at even angles and
-            // segments-general. The stored meet-point is the circumscribing square's outer
-            // corner, not a point on the arc; the `segments = 2` interior sample keeps the
-            // closed-form `√2 − 1` bulge.
+            // the run's own cross-section quadrant in the arc's (non-orthonormal)
+            // unit-square frame of `B1` / `B3` / the stored meet-corner, sampled by the
+            // §8.6.4 even-chord table and segments-general. The stored meet-point is the
+            // circumscribing square's outer corner, not generally a point on the curve; at
+            // the circular exponent this build is gated to, the `segments = 2` interior
+            // sample is the closed-form `√2 − 1` bulge.
             //
             // Analytic under a **custom** curve too, and that is the answer, not a gap:
             // §8.6.3.1(4).4's miter carve-out hands every arc-start / patch-start boundvert a
@@ -6401,6 +6401,7 @@ impl LoopMesh {
                 b1: b1_position,
                 b3: b3_position,
                 midpoint: plan.meet,
+                profile: miter_chain_profile(profile, custom.is_some()),
             };
             // §8.5.5.5(d) / §8.9.5.3: the extraordinary-centre stencil consumes the arc's
             // raw coarse `(i, 0, 1)` mid, never the emitted rim mid. The inner arc cell is
@@ -6719,14 +6720,13 @@ impl LoopMesh {
     ) -> bool {
         // **Scope marker, not spec.** The guide puts *no* exponent gate on the outer miter at
         // all: §8.9.2 / §8.9.6 / §8.9.8 gate it on the `s ≥ 3` beveled-edge count and the
-        // §8.9.1 firing margin, nothing else, and §8.9.5 forces an arc start's exponent to the
-        // circle value *independently of the user `profile` scalar*. So the surviving
-        // `exponent != 2.0 && !square` arm below is **this implementation's scope limit** and a
-        // live parity divergence: at a curved analytic profile (`profile = 0.7`, say) the
-        // reference builds the miter and we hand back the sharp ring. Nothing pins that today —
-        // no A/B arm covers a curved-analytic outer miter — so the divergence is unwitnessed as
-        // well as unfixed. Widening it is its own matrix row, not a tidy-up, and the paragraphs
-        // below are *not* a justification for it.
+        // §8.9.1 firing margin, nothing else. So the surviving `exponent != 2.0 && !square` arm
+        // below is **this implementation's scope limit** and a live parity divergence: at a
+        // curved analytic profile (`profile = 0.7`, say) the reference builds the miter and we
+        // hand back the sharp ring. What is missing is the curved-analytic *cap fill*, not the
+        // ring or the chains — the arc chain itself is exponent-general (§8.9.5's
+        // exponent-scope note; see `arc_chain_positions`). Widening it is its own matrix row,
+        // not a tidy-up, and the paragraphs below are *not* a justification for it.
         //
         // What **is** guide-licensed is the **square** sentinel at either parity. §8.9.5: the
         // outer miter rides the [V-ADJ] grid, so `segments ≥ 2`. *Which* grid is §8.5.5.5(f.1)'s
@@ -6739,11 +6739,11 @@ impl LoopMesh {
         // `build_adj_fill_miter_ring` asks step 1's predicate itself (`adj_square_ring_claims`,
         // which carries the parity conjunct), so both parities are admitted here.
         //
-        // Both arms are scoped to `custom.is_none()`, because a custom curve reaches neither
-        // consumer of the slider: §8.9.5 forces the arc start's exponent to the circle value,
-        // the patch legs are straight whatever it reads, and `build_adj_fill_miter_ring` sends a
-        // custom ring to the general grid. Declining on the slider there would move the
-        // boundvert count (§8.9.6) on a value nothing downstream reads.
+        // Both arms are scoped to `custom.is_none()`, because a custom curve reaches no
+        // consumer of the analytic slider: §8.6.3.1(4).4's miter carve-out hands an arc start a
+        // second, analytic spacing pair, the patch legs are straight whatever they read, and
+        // `build_adj_fill_miter_ring` sends a custom ring to the general grid. Declining on the
+        // slider there would move the boundvert count (§8.9.6) on a value the cap never reads.
         let exponent = profile_to_exponent(profile);
         let square = exponent == PROFILE_SQUARE_EXPONENT;
         if segments < 2 || (custom.is_none() && exponent != 2.0 && !square) {
@@ -6843,10 +6843,10 @@ impl LoopMesh {
 
         // The reflex sector's interior ring differs by mode (§8.9.2 / §8.9.6):
         //   - `Arc` adds no interior ring boundvert; the single `B1 → B3` internal edge
-        //     carries the `segments + 1`-sample circular arc chain `s_0 … s_segments`
-        //     (§8.9.5.1) — `s_0 = B1`, `s_segments = B3`, each interior sample on the
-        //     inscribed profile at even angle `θ_k = 90°·(1 − k/segments)`. At
-        //     `segments = 2` the lone interior sample is the `√2 − 1` bulge (below).
+        //     carries the `segments + 1`-sample arc chain `s_0 … s_segments` (§8.9.5.1) —
+        //     `s_0 = B1`, `s_segments = B3`, each interior sample at the run's own §8.6.4
+        //     even-chord parameter `(u_k, v_k)` in the arc's unit-square frame. At the round
+        //     profile and `segments = 2` the lone interior sample is the `√2 − 1` bulge.
         //   - `Patch` promotes the retained meet corner to the middle boundvert `B2`, so
         //     the ring gains `B1 → B2 → B3`; the two internal edges carry flat chord
         //     samples evenly spaced along their straight leg — no corner-ward bulge, so
@@ -6868,8 +6868,11 @@ impl LoopMesh {
             Vec<VertexKey>,
         ) = match mode {
             BevelMiter::Arc => {
-                // §8.9.5.1: the reflex chain is the inscribed circular arc sampled in the
-                // (non-orthonormal) unit-square frame of `B1` / `B3` / the stored midpoint.
+                // §8.9.5.1: the reflex chain is the run's own cross-section quadrant sampled
+                // in the (non-orthonormal) unit-square frame of `B1` / `B3` / the stored
+                // midpoint — the §8.6.4 even-chord table at the `profile`-derived exponent,
+                // *not* a forced circle (§8.9.5's exponent-scope note). At the square sentinel
+                // the raw chain therefore walks the two cell sides through the stored midpoint.
                 //
                 // Non-custom even under `profile_type = CUSTOM`, by §8.6.3.1(4).4's miter
                 // carve-out: `B1` is the arc start, and an arc / patch start is handed a
@@ -6879,6 +6882,7 @@ impl LoopMesh {
                     b1: b1_position,
                     b3: b3_position,
                     midpoint,
+                    profile: miter_chain_profile(profile, custom.is_some()),
                 };
                 let raw_bulge = arc.raw_positions(2)[1];
 
@@ -27286,6 +27290,257 @@ mod tests {
         );
     }
 
+    /// Decode a world point back into the §8.9.5 unit-square arc frame:
+    /// `P(u, v) = (midpoint − b1)·u + (midpoint − b3)·v + (b1 + b3 − midpoint)`. The two
+    /// axes are independent but **not** orthonormal (the reflex cell's included angle is
+    /// `60°` on the octagonal fan, `70.529°` on the single-face one), so the inverse is the
+    /// 2×2 Gram solve, not a pair of dot products.
+    fn arc_frame_uv(point: Vec3, b1: Vec3, b3: Vec3, midpoint: Vec3) -> (f32, f32) {
+        let a_axis = midpoint - b1;
+        let b_axis = midpoint - b3;
+        let offset = point - (b1 + b3 - midpoint);
+        let aa = a_axis.dot(a_axis);
+        let bb = b_axis.dot(b_axis);
+        let ab = a_axis.dot(b_axis);
+        let determinant = aa * bb - ab * ab;
+        assert!(determinant.abs() > 1.0e-9, "the arc cell has independent axes");
+        let (da, db) = (a_axis.dot(offset), b_axis.dot(offset));
+        ((bb * da - ab * db) / determinant, (aa * db - ab * da) / determinant)
+    }
+
+    /// The **emitted** arc chain of BEVEL.md §8.9.5.1: the raw chain at the run's own
+    /// §8.6.4 spacing, pushed through the §8.2.2.1.1 chord-fraction resample against the
+    /// profile materialised at the source resolution — exactly what the outer-miter
+    /// builder does with it.
+    fn emitted_arc_chain(
+        b1: Vec3,
+        b3: Vec3,
+        midpoint: Vec3,
+        profile: f32,
+        segments: u32,
+    ) -> Vec<Vec3> {
+        let arc = RingChainProfile::Arc {
+            b1,
+            b3,
+            midpoint,
+            profile,
+        };
+        let raw = arc.raw_positions(segments);
+        let source_segments = boundary_source_resolution(segments);
+        if source_segments == segments {
+            raw
+        } else {
+            let source = arc.raw_positions(source_segments);
+            chord_fraction_resample(&raw, &source)
+        }
+    }
+
+    /// BEVEL.md §8.9.5's exponent-scope rule: the miter arc is sampled by the **run's own**
+    /// `profile`-derived §8.6.4 spacing table, not by a forced circle. The circle-valued
+    /// exponent an arc-start boundvert records never selects a sampler, so the emitted
+    /// chain moves right across the family.
+    ///
+    /// Read back in the §8.9.5 unit-square frame on the `70.529°` cell of the single-face
+    /// reflex junction, the guide publishes all four rows at `segments = 3`; a regression
+    /// that re-forced the circle would collapse every row onto the `profile = 0.5` one.
+    #[test]
+    fn outer_miter_arc_samples_track_the_run_profile_exponent() {
+        // BEVEL.md §8.9.5.1 worked trace B's frame (offset 0.2, spread 0, ARC).
+        let b1 = Vec3::new(-0.51500, 0.27005, 0.72995);
+        let b3 = Vec3::new(0.51500, 0.27005, 0.72995);
+        let midpoint = Vec3::new(0.0, -0.24495, 1.24495);
+
+        // profile → the emitted `(u, v)` of `s_1` at `segments = 3`.
+        let published = [
+            (0.25_f32, (0.33333_f32, 0.66667_f32)), // EXP_LINE — the plain chord B1 → B3
+            (0.5, (0.49429, 0.84931)),              // EXP_CIRCLE
+            (0.7, (0.58451, 0.93227)),              // curved, and neither neighbour
+            (1.0, (0.71010, 1.00000)),              // EXP_SQUARE — on the cell's side
+        ];
+        for (profile, expected) in published {
+            let chain = emitted_arc_chain(b1, b3, midpoint, profile, 3);
+            assert_eq!(chain.len(), 4, "segments + 1 samples");
+            assert!(
+                (chain[0] - b1).length() < 1.0e-6 && (chain[3] - b3).length() < 1.0e-6,
+                "the arc ends are the two repositioned boundverts at every exponent",
+            );
+            let (u, v) = arc_frame_uv(chain[1], b1, b3, midpoint);
+            assert!(
+                (u - expected.0).abs() < 1.0e-4 && (v - expected.1).abs() < 1.0e-4,
+                "profile {profile}: emitted s_1 at ({u}, {v}), guide says {expected:?}",
+            );
+            // Mirror symmetry holds at every exponent (§8.9.5.1).
+            let (mirror_u, mirror_v) = arc_frame_uv(chain[2], b1, b3, midpoint);
+            assert!(
+                (mirror_u - expected.1).abs() < 1.0e-4 && (mirror_v - expected.0).abs() < 1.0e-4,
+                "profile {profile}: s_2 is s_1's u ↔ v mirror",
+            );
+        }
+
+        // The whole `profile ≥ 0.95` sentinel band is one corner (§8.6.2), so keying on
+        // `profile == 1.0` would miss most of it.
+        for profile in [0.95_f32, 0.97, 0.99, 1.0] {
+            let (u, v) = arc_frame_uv(
+                emitted_arc_chain(b1, b3, midpoint, profile, 3)[1],
+                b1,
+                b3,
+                midpoint,
+            );
+            assert!(
+                (u - 0.710098).abs() < 1.0e-4 && (v - 1.0).abs() < 1.0e-4,
+                "profile {profile} is inside the square sentinel: got ({u}, {v})",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.9.5.1's square-sentinel law. At `profile ≥ 0.95` the raw chain runs
+    /// along the two cell **sides** through the stored corner, the source polyline is that
+    /// same two-sided path, and the resample degenerates to "walk `B_1 → midpoint → B_3` by
+    /// arc length". At **even** `segments` a raw sample already sits on the corner and the
+    /// walk is the identity; at **odd** `segments` the target's straddling chord cuts the
+    /// corner, so every sample is pushed outward toward it.
+    ///
+    /// The published `u_1` is **cell-shape dependent** — `0.738797` on the octagonal fan's
+    /// `60°` cell, `0.710098` on the single-face fan's `70.529°` one — so any per-`segments`
+    /// lookup table is wrong.
+    #[test]
+    fn outer_miter_arc_square_sentinel_walks_the_cell_corner_path() {
+        // Trace A — octagonal_bipyramid, included angle 60°.
+        let (a_b1, a_b3, a_mid) = (
+            Vec3::new(-0.19194, 0.46338, 0.45712),
+            Vec3::new(0.46338, -0.19194, 0.45712),
+            Vec3::new(-0.19194, -0.19194, 1.11243),
+        );
+        // Trace B — single_face_reflex_junction, included angle 70.529°.
+        let (b_b1, b_b3, b_mid) = (
+            Vec3::new(-0.51500, 0.27005, 0.72995),
+            Vec3::new(0.51500, 0.27005, 0.72995),
+            Vec3::new(0.0, -0.24495, 1.24495),
+        );
+
+        let u_of = |chain: &[Vec3], k: usize, b1, b3, mid| arc_frame_uv(chain[k], b1, b3, mid).0;
+
+        let a3 = emitted_arc_chain(a_b1, a_b3, a_mid, 1.0, 3);
+        let b3_chain = emitted_arc_chain(b_b1, b_b3, b_mid, 1.0, 3);
+        let ua = u_of(&a3, 1, a_b1, a_b3, a_mid);
+        let ub = u_of(&b3_chain, 1, b_b1, b_b3, b_mid);
+        assert!((ua - 0.738797).abs() < 1.0e-4, "60° cell, n = 3: u_1 = {ua}");
+        assert!((ub - 0.710098).abs() < 1.0e-4, "70.529° cell, n = 3: u_1 = {ub}");
+        assert!(
+            (ua - ub).abs() > 1.0e-2,
+            "the same segments and the same exponent give different samples on the two cells",
+        );
+        // Both are pushed outward past the raw square sample `b = 0.585786`, and neither
+        // reaches the corner.
+        for u in [ua, ub] {
+            assert!(u > 0.585786 && u < 1.0, "odd n pushes the sample toward the corner: {u}");
+        }
+
+        let a5 = emitted_arc_chain(a_b1, a_b3, a_mid, 1.0, 5);
+        let b5 = emitted_arc_chain(b_b1, b_b3, b_mid, 1.0, 5);
+        for (u, expected) in [
+            (u_of(&a5, 1, a_b1, a_b3, a_mid), 0.424886_f32),
+            (u_of(&a5, 2, a_b1, a_b3, a_mid), 0.849772),
+            (u_of(&b5, 1, b_b1, b_b3, b_mid), 0.415240),
+            (u_of(&b5, 2, b_b1, b_b3, b_mid), 0.830481),
+        ] {
+            assert!((u - expected).abs() < 1.0e-4, "n = 5: got {u}, guide says {expected}");
+        }
+
+        // Even `segments`: the resample is the identity, so `s_{n/2}` lands *on* the
+        // stored corner — the un-mitered meet-point the arc replaced (§8.9.5.1).
+        for segments in [2_u32, 4] {
+            let chain = emitted_arc_chain(b_b1, b_b3, b_mid, 1.0, segments);
+            assert!(
+                (chain[segments as usize / 2] - b_mid).length() < 1.0e-5,
+                "square sentinel, segments {segments}: the central sample is the stored corner",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.9.5.1 worked trace B, end to end through the operator: the single-face
+    /// reflex junction's outer `ARC` miter at the square sentinel and odd `segments` emits
+    /// the corner-path chain, not the circular one. The `segments = 3` circular chain sits
+    /// ≈25 800 quanta away in the max-norm, so this fails loudly if the arc is re-pinned to
+    /// the circle.
+    #[test]
+    fn outer_miter_arc_square_sentinel_emits_the_oracle_chain() {
+        for profile in [0.95_f32, 0.97, 0.99, 1.0] {
+            let (mut mesh, _apex, [va, vb, vc]) = single_face_reflex_junction();
+            let result = mesh.bevel(
+                &[va.into(), vb.into(), vc.into()],
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments: 3,
+                    profile,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_outer: BevelMiter::Arc,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+
+            for sample in [
+                Vec3::new(-0.14930, -0.09565, 1.09565),
+                Vec3::new(0.14930, -0.09565, 1.09565),
+            ] {
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, sample),
+                    1,
+                    "profile {profile}, segments 3: the arc sample {sample:?} is emitted",
+                );
+            }
+            // The circle's own resampled chain at this driver is a different point
+            // entirely and must not appear — this is the regression the fix closes.
+            let circular = emitted_arc_chain(
+                Vec3::new(-0.51500, 0.27005, 0.72995),
+                Vec3::new(0.51500, 0.27005, 0.72995),
+                Vec3::new(0.0, -0.24495, 1.24495),
+                0.5,
+                3,
+            );
+            for sample in &circular[1..3] {
+                assert!(
+                    (*sample - Vec3::new(-0.14930, -0.09565, 1.09565)).length() > 1.0e-2,
+                    "the two chains are genuinely far apart, so the check below has teeth",
+                );
+                assert_eq!(
+                    result_has_vert_near(&mesh, &result, *sample),
+                    0,
+                    "profile {profile}: the forced-circle sample {sample:?} must be gone",
+                );
+            }
+        }
+
+        let (mut mesh, _apex, [va, vb, vc]) = single_face_reflex_junction();
+        let result = mesh.bevel(
+            &[va.into(), vb.into(), vc.into()],
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 5,
+                profile: 1.0,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_outer: BevelMiter::Arc,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        for sample in [
+            Vec3::new(-0.30115, 0.05620, 0.94380),
+            Vec3::new(-0.08730, -0.15765, 1.15765),
+            Vec3::new(0.08730, -0.15765, 1.15765),
+            Vec3::new(0.30115, 0.05620, 0.94380),
+        ] {
+            assert_eq!(
+                result_has_vert_near(&mesh, &result, sample),
+                1,
+                "segments 5: the arc sample {sample:?} is emitted",
+            );
+        }
+    }
+
     /// BEVEL.md §7.6.2 case 1: the meet-point of a **non-planar single-face reflex
     /// sector** is built from the **edge-span normal** (the cross of the two flanking
     /// beveled-edge directions), sign-fixed by the face normal — not the reflex
@@ -32982,9 +33237,9 @@ mod tests {
 
     /// The single-face reflex junction of [`single_face_reflex_junction`] under an **outer**
     /// miter, through the custom curve when one is given. Same shape as
-    /// [`cube_corner_adj_inner_miter_profile`] and for the same reason: §8.9.5 leaves an outer
-    /// arc circular and its patch legs straight whatever the `profile` slider reads, so the
-    /// slider is swept against it.
+    /// [`cube_corner_adj_inner_miter_profile`]: the slider is swept against it because a
+    /// miter's *admission* never reads the slider (§8.9.6), even though — under `PATCH`
+    /// alone — its emitted chain does not read it either (§8.9.5's straight legs).
     fn reflex_apex_outer_miter_profile(
         kind: BevelMiter,
         curve: Option<&BevelCurveProfile>,
@@ -33011,21 +33266,25 @@ mod tests {
         (mesh, result)
     }
 
-    /// The invariant above, carried onto a **mitered** junction — where it is a *topology*
-    /// statement, not a placement one (BEVEL.md §8.9.5 / §8.9.6).
+    /// The invariant above, carried onto a **mitered** junction (BEVEL.md §8.9.5 / §8.9.6).
     ///
-    /// A miter's admission is keyed on the profile **type**, never on the slider: §8.9.5 forces
-    /// an arc start's exponent to the circle value "independent of the user `profile` scalar"
-    /// and leaves a patch's two chord legs straight regardless, and the fill a custom ring takes
-    /// is (f.1) step 1's general grid whatever the slider resolves to. So a miter that declined
-    /// on the exponent under `profile_type = CUSTOM` would drop the `+1` / `+2` boundverts of
-    /// §8.9.6 and fall back to the sharp ring — a whole-mesh census divergence keyed on a value
-    /// nothing in the build reads.
+    /// A miter's admission is keyed on the profile **type**, never on the slider: the fill a
+    /// custom ring takes is (f.1) step 1's general grid whatever the slider resolves to. So a
+    /// miter that declined on the exponent under `profile_type = CUSTOM` would drop the `+1` /
+    /// `+2` boundverts of §8.9.6 and fall back to the sharp ring — a whole-mesh census
+    /// divergence keyed on a value the admission never reads.
     ///
-    /// The unmitered sibling cannot see this: its fixture has no miter at all. Both builders are
-    /// swept, because each carries its own exponent gate — the inner miter's `r == 2` and the
-    /// outer's `r == 2 or square` — so an analytic `profile = 0.7` (curved) declines on both
-    /// paths, and only the profile *type* may decide otherwise.
+    /// Positions are swept too, and there the sweep pins **less** than it looks like it does.
+    /// A `PATCH` start's two legs are straight chords at every exponent (§8.9.5), so that arm
+    /// is a genuine guide invariant. An `ARC` start's chain is not: §8.6.3.1(4).4's carve-out
+    /// builds its analytic spacing pair "from the `profile` scalar", so the slider ought to
+    /// move it. This arm therefore pins [`miter_chain_profile`]'s documented **scope marker**
+    /// — the custom branch's deliberate round default — and not a law. It moves when that row
+    /// lands.
+    ///
+    /// Both builders are swept, because each carries its own exponent gate — the inner miter's
+    /// `r == 2` and the outer's `r == 2 or square` — so an analytic `profile = 0.7` (curved)
+    /// declines on both paths, and only the profile *type* may decide otherwise.
     ///
     /// The `Sharp` contrast is what stops the sweep passing vacuously: without it, a build in
     /// which *every* arm declined would be perfectly slider-invariant too.
@@ -55261,6 +55520,10 @@ enum RingChainProfile<'c> {
         b1: Vec3,
         b3: Vec3,
         midpoint: Vec3,
+        /// The operation-wide `profile` scalar (§8.6.2). An arc start records the circle
+        /// exponent, but that copy never selects a spacing table — the arc reads the run's
+        /// own §8.6.4 table like every other chain (§8.9.5's exponent-scope note).
+        profile: f32,
     },
     Chord {
         start: Vec3,
@@ -55287,9 +55550,12 @@ impl RingChainProfile<'_> {
                 profile,
                 custom,
             } => cell.raw_chain_positions(segments, profile, custom),
-            RingChainProfile::Arc { b1, b3, midpoint } => {
-                arc_chain_positions(b1, b3, midpoint, segments)
-            }
+            RingChainProfile::Arc {
+                b1,
+                b3,
+                midpoint,
+                profile,
+            } => arc_chain_positions(b1, b3, midpoint, profile, segments),
             RingChainProfile::Chord { start, end } => (0..=segments)
                 .map(|k| start + (end - start) * (k as f32 / segments as f32))
                 .collect(),
@@ -55304,30 +55570,62 @@ impl RingChainProfile<'_> {
     }
 }
 
+/// The `profile` scalar a miter arc's chain is sampled at (BEVEL.md §8.9.5, §8.6.3.1(4).4).
+///
+/// Under the analytic superellipse family it is simply the run's own scalar — an arc start
+/// records the circle exponent but that copy never selects a spacing table, so the arc is
+/// circular only when the run is.
+///
+/// **Scope marker, not spec, for the custom branch.** §8.6.3.1(4).4's miter carve-out hands an
+/// arc / patch start a second, *non-custom* spacing pair built "from the `profile` scalar" — so
+/// by the letter of the guide the slider should move a custom run's miter chain too. That axis
+/// is flagged in the same paragraph as unobservable through the A/B harness (its custom-profile
+/// oracle entry point pins the slider at the default), and honouring it would move a mitered
+/// custom cap with nothing able to witness which side is right. Deferred to its own row; the
+/// curve keeps the default round chain here.
+const fn miter_chain_profile(profile: f32, custom: bool) -> f32 {
+    if custom {
+        0.5
+    } else {
+        profile
+    }
+}
+
 /// The `segments + 1` raw samples of a miter arc (BEVEL.md §8.9.5 / §8.9.5.1) in the
 /// arc's (generally non-orthonormal) unit-square frame: `a_axis = midpoint − b1`,
 /// `b_axis = midpoint − b3`, inner corner `b1 + b3 − midpoint`, sample `k` at
-/// `P(cos θ_k, sin θ_k)` with `θ` **descending** from 90° at `b1` to 0° at `b3`. The
-/// `segments = 2` interior sample keeps the closed-form `(2−√2)·chord_mid + (√2−1)·
-/// midpoint` bulge — the same 45° point, written the way §8.9.5 pins it.
-fn arc_chain_positions(b1: Vec3, b3: Vec3, midpoint: Vec3, segments: u32) -> Vec<Vec3> {
+/// `P(u_k, v_k) = a_axis·u_k + b_axis·v_k + inner_corner`, so `(0, 1)` recovers `b1`,
+/// `(1, 0)` recovers `b3` and `(1, 1)` the stored midpoint.
+///
+/// The `(u_k, v_k)` are the run's **own** [S] even-chord spacing table (§8.6.4) at the
+/// `profile`-derived exponent (§8.6.2) — the very table every beveled edge's
+/// cross-section reads. There is no arc-specific sampler and no arc-specific spacing
+/// table: §8.9.5's exponent-scope note is explicit that the circle-valued exponent an
+/// arc-start boundvert *records* never selects a sampler, so an arc is circular only when
+/// the run is. At `profile = 0.25` the table degenerates to the plain chord `b1 → b3`; at
+/// the square sentinel it runs along the two cell sides *through* the stored midpoint; at
+/// `profile = 0.5` it is the inscribed quarter circle whose `segments = 2` interior sample
+/// is the closed-form `(2−√2)·chord_mid + (√2−1)·midpoint` bulge.
+fn arc_chain_positions(
+    b1: Vec3,
+    b3: Vec3,
+    midpoint: Vec3,
+    profile: f32,
+    segments: u32,
+) -> Vec<Vec3> {
     let a_axis = midpoint - b1;
     let b_axis = midpoint - b3;
     let inner_corner = b1 + b3 - midpoint;
-    let sqrt2 = std::f32::consts::SQRT_2;
-    let chord_mid = 0.5 * (b1 + b3);
-    let bulge = (2.0 - sqrt2) * chord_mid + (sqrt2 - 1.0) * midpoint;
-    (0..=segments)
-        .map(|k| {
+    superellipse_chain(profile, segments)
+        .into_iter()
+        .enumerate()
+        .map(|(k, (u, v))| {
             if k == 0 {
                 b1
-            } else if k == segments {
+            } else if k == segments as usize {
                 b3
-            } else if segments == 2 {
-                bulge
             } else {
-                let theta = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / segments as f32);
-                a_axis * theta.cos() + b_axis * theta.sin() + inner_corner
+                a_axis * u + b_axis * v + inner_corner
             }
         })
         .collect()
