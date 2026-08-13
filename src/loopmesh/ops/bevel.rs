@@ -3627,7 +3627,7 @@ impl LoopMesh {
         // §8.5.1 / §7.6.6: the dihedral-band verdict must be read from the *original*
         // corner — its edges and faces are about to be consumed by the re-stitch — so it is
         // captured now and carried on the cut for the fill-time routing decision.
-        let dihedral_band_deviation = self.junction_dihedral_band_deviation(vertex, &corners);
+        let dihedral_band = self.junction_dihedral_band(vertex, &corners);
 
         // §8.5.5.5(f.4a): the **edge-mode square-in weld**. At a tri-corner-eligible ring the
         // concave profile's two straight legs make consecutive sectors' chains coincide, and
@@ -3685,7 +3685,7 @@ impl LoopMesh {
                     && tri_corner_shape_admits(
                         vertex_position,
                         ring,
-                        dihedral_band_deviation,
+                        dihedral_band,
                         TRI_CORNER_BAND_SMOOTH,
                     )
             })
@@ -3830,7 +3830,7 @@ impl LoopMesh {
             central_representative,
             sector_representatives,
             centre_column_representatives,
-            dihedral_band_deviation,
+            dihedral_band,
             pipe_override,
             square_in_weld: square_in_weld.is_some(),
             opening_edge_directions,
@@ -5546,13 +5546,16 @@ impl LoopMesh {
     /// chord (`r = 1`, whose octant grid is the flat chamfer plane). All of them are what
     /// the unit-octant grid of §8.5.5.5(f.2) builds. Only the two square exponents, which
     /// take closed-form grids of their own (§8.5.5.5(f.4)/(f.5)), are refused here.
-    /// The gate keys on **3 boundverts** and a smooth exponent, then admits the corner two
-    /// ways (BEVEL.md §8.5.1 / §7.6.6): the position-only meet-geometry test (equal spokes,
-    /// 60° octant — the symmetric cube corner) **or** the per-edge dihedral band captured on
-    /// the cut. The band admits an **oblique / absorbed-leg / reflex** corner the geometry
-    /// test declines; a reflex sector is not itself a disqualifier — only failing the band
-    /// (a fold past `3·π/4`, the wrong near-flat count, or a signed sum outside the `±π/4`
-    /// window) drops the corner through to the general grid of §8.5.5.5.
+    /// The gate keys on **3 boundverts** and a smooth exponent, then asks the per-edge
+    /// dihedral band captured on the cut (BEVEL.md §8.5.1 / §7.6.6). The band **decides
+    /// wherever it can be measured**: it admits an **oblique / absorbed-leg / reflex** corner
+    /// the position-only meet geometry would decline (a reflex sector is not itself a
+    /// disqualifier), and it *refuses* — with no appeal to the ring's shape — a corner with a
+    /// fold past `3·π/4`, the wrong near-flat count, or a signed sum outside the window,
+    /// dropping it through to the general grid of §8.5.5.5. The meet-geometry test (equal
+    /// spokes, 60° octant — the symmetric cube corner) stands in for the **one** case the band
+    /// cannot read at all: an open fan or a wire, where no closed fold exists
+    /// ([`DihedralBand::Unmeasurable`]).
     ///
     /// `custom` is the predicate's **refusal** arm (§8.5.5.5(f.1), the three-valued predicate):
     /// a custom profile is refused outright, before any offset or dihedral is looked at, because
@@ -5582,12 +5585,13 @@ impl LoopMesh {
     }
 
     /// Whether the ring's *shape* is one the tri-corner family owns (BEVEL.md §8.5.1 /
-    /// §7.6.6): three boundverts, admitted either by the position-only meet geometry or by
-    /// the per-edge dihedral band, whose total-angle window is the caller's to choose.
+    /// §7.6.6): three boundverts, and the per-edge dihedral band's verdict — measured against
+    /// the caller's total-angle window, honoured as-is when it is a hard refusal, and replaced
+    /// by the position-only meet geometry only where it could not be measured.
     ///
     /// The window ([`TRI_CORNER_BAND_SMOOTH`] / [`TRI_CORNER_BAND_SQUARE`]) is the only thing
     /// that varies across the trigger's arms, so the construction lives here once; the
-    /// meet-geometry half ([`tri_corner_meet_geometry`], described on
+    /// stand-in ([`tri_corner_meet_geometry`], described on
     /// [`Self::adj_tri_corner_trigger`]) is band-free.
     fn adj_tri_corner_shape(&self, cut: &JunctionCut, band_tolerance: f32) -> bool {
         if cut.boundverts.len() != 3 {
@@ -5602,7 +5606,7 @@ impl LoopMesh {
         tri_corner_shape_admits(
             vertex,
             &meet_points,
-            cut.dihedral_band_deviation,
+            cut.dihedral_band,
             band_tolerance,
         )
     }
@@ -7826,14 +7830,14 @@ impl LoopMesh {
     /// The (incoming, outgoing) edges of `face` meeting at `vertex` in the face's
     /// loop traversal order: the edge arriving at `vertex` and the edge leaving it.
     fn face_corner_edges(&self, face: FaceKey, vertex: VertexKey) -> Option<(EdgeKey, EdgeKey)> {
-        for loop_key in self.face_loop_keys(face) {
-            if self.loop_vertex(loop_key) == vertex {
-                let incoming = self.loop_edge(self.loop_prev(loop_key));
-                let outgoing = self.loop_edge(loop_key);
-                return Some((incoming, outgoing));
-            }
-        }
-        None
+        self.iter_face_loops(face)
+            .find(|&loop_key| self.loop_vertex(loop_key) == vertex)
+            .map(|loop_key| {
+                (
+                    self.loop_edge(self.loop_prev(loop_key)),
+                    self.loop_edge(loop_key),
+                )
+            })
     }
 
     /// Build the [V-ADJ] fill for the symmetric equal-offset 3-way cube corner at
@@ -9077,9 +9081,24 @@ impl LoopMesh {
 
     /// One corner's face normal oriented to the **walk-positive** side (BEVEL.md §7.6.2):
     /// the face interior sweeps positively about this normal from the corner's outgoing
-    /// edge round to its incoming one, so `cross(d_out, d_in)` fixes the side and the true
-    /// face plane fixes the tilt (a non-planar reflex quad keeps its Newell normal, not the
-    /// flat wedge one). `None` when either flanking edge is degenerate.
+    /// edge round to its incoming one, so the wedge fixes the side and the true face plane
+    /// fixes the tilt (a non-planar reflex quad keeps its Newell normal, not the flat wedge
+    /// one). `None` when either flanking edge is degenerate.
+    ///
+    /// The side is fixed in the **ring's** direction of travel, so a shell wound wholly
+    /// inward reads exactly as the same shell wound outward (the ring reverses with it, and
+    /// every fold's two normals reverse together). What does *not* survive that reversal is a
+    /// face whose own loop cycle **disagrees** with the ring — §7.8.1(b)'s per-sector ballot
+    /// read for one corner, the `−1` term — and such a face contributes its plane upside down
+    /// relative to its neighbours, so [`Self::corner_walk_normal_dissents`] negates it. On a
+    /// consistently wound fan nothing dissents and the flip never fires; on the
+    /// inconsistently wound fans of §7.8 it is the whole of what makes §8.5.1's dihedral sum
+    /// a genuinely *signed* quantity rather than a sum of magnitudes.
+    ///
+    /// That ballot flip is what makes this the **band's** normal rather than a general-purpose
+    /// oriented corner normal: it is chosen so that folding one corner's normal against its
+    /// neighbour's reads the §8.5.1 dihedral, and a caller wanting the face's own geometric
+    /// side wants [`Self::face_plane_normal`] instead.
     fn corner_walk_normal(&self, corner: &VertexCorner, vertex: VertexKey, vertex_position: Vec3) -> Option<Vec3> {
         let d_in = self.edge_direction_from(corner.incoming_edge, vertex, vertex_position)?;
         let d_out = self.edge_direction_from(corner.outgoing_edge, vertex, vertex_position)?;
@@ -9088,7 +9107,39 @@ impl LoopMesh {
         if normal.dot(wedge) < 0.0 {
             normal = -normal;
         }
+        if self.corner_walk_normal_dissents(corner, vertex) {
+            normal = -normal;
+        }
         Some(normal)
+    }
+
+    /// §7.8.1(b): whether this corner's face carries the corner's two edges **against** the
+    /// ring's direction of travel — the `−1` term of the [`Self::corner_ring_winding_tally`]
+    /// ballot, read for one sector instead of summed. A corner whose face presents neither
+    /// order (nothing to read) does not dissent.
+    fn corner_walk_normal_dissents(&self, corner: &VertexCorner, vertex: VertexKey) -> bool {
+        self.corner_winding_vote(corner, vertex) < 0
+    }
+
+    /// One corner's vote in the BEVEL.md §7.8.1(a) / §7.6.1.2 step 2 winding ballot: `+1` when
+    /// the corner's own face leaves `vertex` along the corner's **incoming** edge and arrives
+    /// along its **outgoing** one (the §7.6.2 walk sense), `−1` when that face carries the
+    /// pair the other way round, `0` when the corner presents no such face.
+    ///
+    /// The ring's aggregate ([`Self::corner_ring_winding_tally`]) and the band's per-sector
+    /// read ([`Self::corner_walk_normal_dissents`]) are the same ballot at two scales, so they
+    /// share this one reading rather than each spelling the two orders out.
+    fn corner_winding_vote(&self, corner: &VertexCorner, vertex: VertexKey) -> i32 {
+        let Some((arrives_on, leaves_on)) = self.face_corner_edges(corner.face, vertex) else {
+            return 0;
+        };
+        if corner.incoming_edge == leaves_on && corner.outgoing_edge == arrives_on {
+            1
+        } else if corner.incoming_edge == arrives_on && corner.outgoing_edge == leaves_on {
+            -1
+        } else {
+            0
+        }
     }
 
     /// The §8.3.4.1 **pipe-override** gate on the **original** corner: whether this multi-edge
@@ -9155,38 +9206,42 @@ impl LoopMesh {
     ///   (an open fan or a wire leaves a dihedral undefined and declines);
     /// - **no** edge is too-folded: `|signed dihedral| < 3·π/4`;
     /// - **exactly `edgecount − 3`** edges are near-flat (`|signed dihedral| ≤ π/4`);
-    /// - the **signed** dihedrals (convex-positive, §7.6.2's disk-walk sense) sum to within
-    ///   `π/4` of `3·π/2`.
+    /// - the signed dihedrals — signed *relative to each other* in §7.6.2's disk-walk sense —
+    ///   sum to within `π/4` of `3·π/2` in magnitude; see
+    ///   [`Self::junction_dihedral_band`] for why the sum's own overall sign is not part
+    ///   of the corner.
     ///
     /// Equal beveled offsets — the gate's other clause — hold structurally here: a junction
     /// bevels all its edges at the one op-wide `offset`.
     fn junction_dihedral_band_admits(&self, vertex: VertexKey, corners: &[VertexCorner]) -> bool {
-        self.junction_dihedral_band_deviation(vertex, corners)
-            .is_some_and(|deviation| deviation <= std::f32::consts::FRAC_PI_4)
+        matches!(
+            self.junction_dihedral_band(vertex, corners),
+            DihedralBand::Deviation(deviation) if deviation <= std::f32::consts::FRAC_PI_4,
+        )
     }
 
-    /// The §8.5.1 / §7.6.6 dihedral-band's **total-angle deviation** — how far the junction's
-    /// signed dihedral sum sits from the `3·π/2` an orthonormal corner carries — or `None`
-    /// when a *hard* band condition fails (an edge folded past `3·π/4`, the wrong near-flat
-    /// count, a single-face edge). The tolerance on this deviation is the caller's: `π/4` for
-    /// every smooth exponent ([`junction_dihedral_band_admits`]), tightened to `π/16` at a
-    /// square exponent (BEVEL.md §8.5.5.5(f.1), the three-flat-squares grid is far less
-    /// forgiving of an only-approximately-orthonormal corner). Captured on the cut so the
-    /// fill-time routing can apply whichever tolerance the profile selects.
-    fn junction_dihedral_band_deviation(
-        &self,
-        vertex: VertexKey,
-        corners: &[VertexCorner],
-    ) -> Option<f32> {
+    /// The §8.5.1 / §7.6.6 dihedral band's verdict at one junction: its **total-angle
+    /// deviation** — how far the signed dihedral sum sits from the `3·π/2` an orthonormal
+    /// corner carries — or [`DihedralBand::Refused`] when one of the band's own hard clauses
+    /// fails, or [`DihedralBand::Unmeasurable`] when there is no closed fan to fold across.
+    /// The three are not interchangeable: a refusal is final, while an unmeasurable band hands
+    /// the question to the position-only stand-in ([`tri_corner_shape_admits`]).
+    ///
+    /// The tolerance on the deviation is the caller's: `π/4` for every smooth exponent
+    /// ([`Self::junction_dihedral_band_admits`]), tightened to `π/16` at a square exponent
+    /// (BEVEL.md §8.5.5.5(f.1), the three-flat-squares grid is far less forgiving of an
+    /// only-approximately-orthonormal corner). Captured on the cut so the fill-time routing
+    /// can apply whichever tolerance the profile selects.
+    fn junction_dihedral_band(&self, vertex: VertexKey, corners: &[VertexCorner]) -> DihedralBand {
         if corners.len() < 3 {
-            return None;
+            return DihedralBand::Unmeasurable;
         }
         let vertex_position = self.vertex_position(vertex);
 
         let edges = junction_incident_edges(corners);
         let edgecount = edges.len();
         if edgecount < 3 {
-            return None;
+            return DihedralBand::Unmeasurable;
         }
 
         let quarter = std::f32::consts::FRAC_PI_4;
@@ -9201,30 +9256,31 @@ impl LoopMesh {
             let (corner_a, corner_b) = match (corner_out, corner_in) {
                 (Some(a), Some(b)) => (a, b),
                 // A single-face (boundary / wire) edge has no dihedral: the band is
-                // undefined and the corner is not tri-corner-eligible here.
-                _ => return None,
+                // undefined here, not failed.
+                _ => return DihedralBand::Unmeasurable,
             };
             if corner_a.face == corner_b.face {
-                return None;
+                return DihedralBand::Unmeasurable;
             }
             let edge_direction = match self.edge_direction_from(edge, vertex, vertex_position) {
                 Some(direction) => direction,
-                None => return None,
+                None => return DihedralBand::Unmeasurable,
             };
             let normal_a = match self.corner_walk_normal(corner_a, vertex, vertex_position) {
                 Some(normal) => normal,
-                None => return None,
+                None => return DihedralBand::Unmeasurable,
             };
             let normal_b = match self.corner_walk_normal(corner_b, vertex, vertex_position) {
                 Some(normal) => normal,
-                None => return None,
+                None => return DihedralBand::Unmeasurable,
             };
             let magnitude = normal_a.dot(normal_b).clamp(-1.0, 1.0).acos();
             let orientation = normal_a.cross(normal_b).dot(edge_direction);
-            let signed = TRI_CORNER_CONVEX_SIGN * magnitude * if orientation >= 0.0 { 1.0 } else { -1.0 };
+            let signed = magnitude * if orientation >= 0.0 { 1.0 } else { -1.0 };
 
+            // §8.5.1: one hard crease at the vertex disqualifies the whole corner.
             if magnitude >= three_quarter {
-                return None;
+                return DihedralBand::Refused;
             }
             if magnitude <= quarter {
                 in_plane += 1;
@@ -9233,9 +9289,21 @@ impl LoopMesh {
         }
 
         if in_plane != edgecount - 3 {
-            return None;
+            return DihedralBand::Refused;
         }
-        Some((signed_sum - target).abs())
+        // The sum's *overall* sign is not a property of the corner: inverting every face at
+        // the junction reverses the disk walk and negates every term, and the two shells
+        // carry identical local data — a solid's convex corner and the same corner seen from
+        // inside are the same measurement. So the target is matched against the sum's
+        // magnitude, and the per-edge chirality needs no convex-positive re-basing: which of
+        // the two global signs a given walk lands on is unobservable by construction.
+        //
+        // What the fold does **not** discard is each edge's sign *relative to its
+        // neighbours*, which is the whole content of the test: a fold that creases the other
+        // way (a concave leg among convex ones reads `|Σ| = π/2`, a whole `π` off target), or
+        // a §7.8 mis-wound face flipping the two edges it flanks, still pulls the sum off
+        // `3·π/2` and refuses the corner. A sum of *magnitudes* would pass both.
+        DihedralBand::Deviation((signed_sum.abs() - target).abs())
     }
 
     /// Push every edge of `face` into the result's edge set (de-duplicated).
@@ -10251,26 +10319,15 @@ impl LoopMesh {
         reverse_corner_ring(ring)
     }
 
-    /// The winding ballot of BEVEL.md §7.8.1(a) / §7.6.1.2 step 2, summed over a corner
-    /// ring: `+1` for a corner whose own face leaves `vertex` along the corner's incoming
-    /// edge and arrives along its outgoing one (the §7.6.2 walk sense), `−1` when that face
-    /// carries the pair the other way round, `0` when the corner has no such face.
+    /// The winding ballot of BEVEL.md §7.8.1(a) / §7.6.1.2 step 2 ([`Self::corner_winding_vote`]),
+    /// summed over a corner ring.
     ///
     /// The ballot reads each corner independently, so it is invariant under rotating the
     /// ring's origin and negates exactly when the ring is reversed.
     fn corner_ring_winding_tally(&self, vertex: VertexKey, ring: &[VertexCorner]) -> i32 {
-        let mut tally: i32 = 0;
-        for corner in ring {
-            let Some((arrives_on, leaves_on)) = self.face_corner_edges(corner.face, vertex) else {
-                continue;
-            };
-            if corner.incoming_edge == leaves_on && corner.outgoing_edge == arrives_on {
-                tally += 1;
-            } else if corner.incoming_edge == arrives_on && corner.outgoing_edge == leaves_on {
-                tally -= 1;
-            }
-        }
-        tally
+        ring.iter()
+            .map(|corner| self.corner_winding_vote(corner, vertex))
+            .sum()
     }
 
     /// The junction's **slot array** in the sense of BEVEL.md §7.6.1.2: the corner ring of
@@ -14942,17 +14999,21 @@ struct JunctionCut {
     /// between this and the next boundvert's reps. Unread at even `segments` (no centre
     /// column) and under vertex bevel (the caller supplies its own next-boundvert reps).
     centre_column_representatives: Vec<FaceTemplate>,
-    /// The original corner's §8.5.1 **dihedral-band** verdict (BEVEL.md §8.5.1 / §7.6.6):
-    /// the band's raw **total-angle deviation** from `3·π/2`, or `None` on a hard-fail (an
-    /// edge folded past `3·π/4`, or a near-flat count other than `edgecount − 3`). Captured
-    /// here — before the re-stitch consumes the vertex — because by fill time the corner's
-    /// edges and faces are gone. The deviation is carried raw rather than pre-thresholded
-    /// because the window is the *caller's*: it admits the tri-corner cube-corner cap for an
-    /// **oblique / absorbed-leg / reflex** corner that the position-only meet-geometry test
-    /// (equal spokes, 60° octant) would decline — the reflex-agnostic split of §7.6.6 — and a
-    /// **square** exponent tests it against the tighter [`TRI_CORNER_BAND_SQUARE`] window the
-    /// three-flat-squares grid demands (§8.5.5.5(f.1)).
-    dihedral_band_deviation: Option<f32>,
+    /// The original corner's §8.5.1 **dihedral-band** verdict (BEVEL.md §8.5.1 / §7.6.6), in
+    /// its three values: the band's raw **total-angle deviation** from `3·π/2`, a hard
+    /// **refusal** (an edge folded past `3·π/4`, or a near-flat count other than
+    /// `edgecount − 3`), or **unmeasurable** (no closed fan to fold across — an open fan or a
+    /// wire), where the position-only meet geometry stands in. Captured here — before the
+    /// re-stitch consumes the vertex — because by fill time the corner's edges and faces are
+    /// gone.
+    ///
+    /// The deviation is carried raw rather than pre-thresholded because the window is the
+    /// *caller's*: it admits the tri-corner cube-corner cap for an **oblique / absorbed-leg /
+    /// reflex** corner that the position-only meet-geometry test (equal spokes, 60° octant)
+    /// would decline — the reflex-agnostic split of §7.6.6 — and a **square** exponent tests
+    /// it against the tighter [`TRI_CORNER_BAND_SQUARE`] window the three-flat-squares grid
+    /// demands (§8.5.5.5(f.1)).
+    dihedral_band: DihedralBand,
     /// Whether this junction takes the §8.3.4.1 **pipe override**: a `CUTOFF` ring of 3 or 4
     /// boundverts carrying an exactly anti-parallel opposite pair of beveled spokes (two
     /// spokes collinear *through* `v`) in a neighbourhood whose incident faces are all
@@ -14960,7 +15021,7 @@ struct JunctionCut {
     /// the all-quad adjacency grid (§8.5) over the *cutoff*-configured profile chains instead
     /// of the per-sector cut faces + bottom n-gon. Read from the *original* corner — the
     /// beveled-edge directions and incident-face normals are gone by fill time — so it is
-    /// captured here alongside `dihedral_band_deviation`.
+    /// captured here alongside `dihedral_band`.
     pipe_override: bool,
     /// Set when this junction's chains were laid as the §8.5.5.5(f.4a) **square-in weld**
     /// (`build_square_in_weld_chains`): edge bevel, the `r = 0` sentinel, no pipe, and a
@@ -15510,13 +15571,26 @@ fn corner_verts_coincide(positions: &[Vec3]) -> bool {
         .all(|&position| (position - first).length() <= 1.0e-4)
 }
 
-/// Sign that maps the per-edge chirality `(n_a × n_b)·edge` to the **convex-positive**
-/// convention the §8.5.1 dihedral band sums in (BEVEL.md §7.6.2). The disk walk's
-/// rotational sense (`vertex_corner_ring`, "run against the face winding") makes a genuinely
-/// convex corner's chirality land consistently **negative**, so this constant negates it to
-/// place a convex fold on the positive axis — pinned so the beveled cube corner sums to
-/// `+3·π/2`, the band's centre.
-const TRI_CORNER_CONVEX_SIGN: f32 = -1.0;
+/// The §8.5.1 dihedral band's verdict at one junction — **three-valued**, because the band
+/// distinguishes "this corner is disqualified" from "this corner has no band to measure"
+/// (BEVEL.md §8.5.1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DihedralBand {
+    /// A **hard refusal**: an edge folded past `3·π/4` ("one hard crease at the vertex
+    /// disqualifies the whole corner"), or a near-flat count other than `edgecount − 3`.
+    /// Neither depends on a tolerance the caller picks, and neither is rescuable by the
+    /// ring's shape — a refusal is the one answer §8.5.5.5(f.1) step 4's shortcut honours
+    /// too, so it must not fall through to the position-only stand-in.
+    Refused,
+    /// The band is **not measurable** here: some edge at the junction carries no two faces
+    /// to fold between (an open fan, a wire, a face meeting itself across the edge), or a
+    /// flanking direction is degenerate. §8.5.1 states the band over a closed fan and leaves
+    /// this case unstated, so the position-only meet geometry stands in.
+    Unmeasurable,
+    /// The band's **total-angle deviation** from `3·π/2` — the quantity the caller's window
+    /// is applied to.
+    Deviation(f32),
+}
 
 /// The junction's distinct incident edges, in corner-walk order (BEVEL.md §7.6.2): every
 /// corner contributes its incoming and outgoing edge and the pair-shared ones collapse, so a
@@ -15536,8 +15610,21 @@ fn junction_incident_edges(corners: &[VertexCorner]) -> Vec<EdgeKey> {
 }
 
 /// The exponent-free half of the §8.5.1 tri-corner test, on raw inputs: three boundverts
-/// admitted either by the position-only meet geometry or by the per-edge dihedral band,
-/// whose total-angle window is the caller's to choose (BEVEL.md §8.5.1 / §7.6.6).
+/// inside the per-edge dihedral band, whose total-angle window is the caller's to choose
+/// (BEVEL.md §8.5.1 / §7.6.6).
+///
+/// **The band decides wherever it can be measured**, and the position-only meet geometry is
+/// only its stand-in where it cannot. §8.5.1 states the gate as a conjunction — a corner that
+/// fails the band is *refused*, and a refusal is the one answer §8.5.5.5(f.1) step 4's
+/// shortcut honours too — so an octant-shaped ring cannot buy its way past a band the corner
+/// fails. That holds for **both** ways of failing it: the caller's total-angle window, and the
+/// band's own hard clauses ([`DihedralBand::Refused`] — a fold past `3·π/4`, the wrong
+/// near-flat count). Only [`DihedralBand::Unmeasurable`] reaches the geometry, which is why
+/// the verdict is three-valued rather than an `Option`.
+///
+/// That is what keeps a §7.8 mis-wound junction off the tri-corner family: its ring is
+/// a perfect octant by position and says nothing about the incident faces' sense, while the
+/// band's *signed* sum sees the dissenting face and pulls the total a whole `π` off `3·π/2`.
 ///
 /// Taken on positions rather than on a [`JunctionCut`] because the §8.5.5.5(f.4a) weld has
 /// to ask the same question during chain layout, one phase before any cut exists.
@@ -15549,12 +15636,15 @@ fn junction_incident_edges(corners: &[VertexCorner]) -> Vec<EdgeKey> {
 fn tri_corner_shape_admits(
     vertex_position: Vec3,
     meet_points: &[Vec3],
-    dihedral_band_deviation: Option<f32>,
+    dihedral_band: DihedralBand,
     band_tolerance: f32,
 ) -> bool {
     meet_points.len() == 3
-        && (tri_corner_meet_geometry(vertex_position, meet_points)
-            || dihedral_band_deviation.is_some_and(|deviation| deviation <= band_tolerance))
+        && match dihedral_band {
+            DihedralBand::Refused => false,
+            DihedralBand::Deviation(deviation) => deviation <= band_tolerance,
+            DihedralBand::Unmeasurable => tri_corner_meet_geometry(vertex_position, meet_points),
+        }
 }
 
 /// The §8.5.1 forced-tri-corner geometry test on three meet-point positions
@@ -31600,7 +31690,7 @@ mod tests {
             centre_column_representatives: Vec::new(),
             // The synthetic cuts carry no real corner, so the band verdict is inert here;
             // the geometry test alone decides these assertions.
-            dihedral_band_deviation: None,
+            dihedral_band: DihedralBand::Unmeasurable,
             pipe_override: false,
             square_in_weld: false,
             opening_edge_directions: Vec::new(),
@@ -31718,9 +31808,9 @@ mod tests {
 
     /// BEVEL.md §8.5.1 / §7.6.6: the reflex-agnostic dihedral-band gate. It admits the
     /// absorbed-leg reflex junction and the convex cube corner, and — via the `edgecount − 3`
-    /// near-flat count clause — declines the single-face valence-3 reflex apex, which stays
-    /// on the general fill. The cube corner's all-convex 90° edges also pin the sign
-    /// convention: they must sum to `+3·π/2`, the band's centre.
+    /// near-flat count clause — refuses the single-face valence-3 reflex apex, which stays
+    /// on the general fill. That refusal is *final*, not a fall-through to the position-only
+    /// stand-in: the band was measurable and said no.
     #[test]
     fn dihedral_band_admits_absorbed_leg_reflex_junction() {
         let (mesh, apex, _) = absorbed_leg_reflex_junction();
@@ -31736,14 +31826,38 @@ mod tests {
         let cube_corners = cube.vertex_corner_ring(corner);
         assert!(
             cube.junction_dihedral_band_admits(corner, &cube_corners),
-            "the convex cube corner clears the band (signed dihedrals sum to +3·π/2)",
+            "the convex cube corner clears the band (its signed dihedrals sum to 3·π/2 in \
+             magnitude)",
         );
 
         let (reflex_mesh, reflex_apex, _) = single_face_reflex_junction();
         let reflex_corners = reflex_mesh.vertex_corner_ring(reflex_apex);
+        assert_eq!(
+            reflex_mesh.junction_dihedral_band(reflex_apex, &reflex_corners),
+            DihedralBand::Refused,
+            "the single-face reflex apex fails the near-flat count clause — a hard refusal, \
+             not an unmeasurable band, so no ring shape can rescue it",
+        );
+        // A perfect octant ring — the very shape the stand-in admits — handed to the refused
+        // corner: the refusal still wins, which is the whole point of the three-valued verdict.
+        let apex_position = reflex_mesh.vertex_position(reflex_apex);
+        let octant_ring = [
+            apex_position + Vec3::new(1.0, 1.0, 0.0),
+            apex_position + Vec3::new(0.0, 1.0, 1.0),
+            apex_position + Vec3::new(1.0, 0.0, 1.0),
+        ];
         assert!(
-            !reflex_mesh.junction_dihedral_band_admits(reflex_apex, &reflex_corners),
-            "the single-face reflex apex fails the near-flat count clause and stays general",
+            tri_corner_meet_geometry(apex_position, &octant_ring),
+            "the stand-in reads this ring as an octant",
+        );
+        assert!(
+            !tri_corner_shape_admits(
+                apex_position,
+                &octant_ring,
+                reflex_mesh.junction_dihedral_band(reflex_apex, &reflex_corners),
+                TRI_CORNER_BAND_SMOOTH,
+            ),
+            "yet a refused corner is not bought back by its ring's shape",
         );
     }
 
@@ -34318,21 +34432,20 @@ mod tests {
     /// No cap winding can satisfy all of them, so the test is which ones it dissatisfies: the
     /// aggregate takes the majority and leaves exactly the **one dissenting sector's** rim in
     /// conflict — that sector's strip is the one that inherited the inverted face's sense — so
-    /// one edge of the §8.5.5.5(f.4a) `s`-gon at `profile = 0`, and one whole chain's worth
-    /// (`segments` edges) on the general grid. A minority choice would leave twice that.
+    /// one whole chain's worth (`segments` edges). A minority choice would leave twice that.
     ///
-    /// **All three dispatch arms are swept, and that is the point of the profile loop.** At
-    /// `profile = 0` the corner welds and [`LoopMesh::patch_rim_needs_reversing`] is called
-    /// directly, so the sector-agreement guard is never reached; a non-zero profile routes the
-    /// same corner through the §8.5.3 pinwheel (`segments = 2`) and the subdivided grid
-    /// (`segments ≥ 3`), where [`LoopMesh::debug_assert_rim_agrees_within_each_sector`] is live
-    /// and each sector's rim is `segments` edges rather than one. Everywhere else in the suite
-    /// that guard holds trivially, on winding-consistent input; here it is deliberately pointed
-    /// at the §7.8 collapse-at-a-junction regime — the corner is incident to the inverted face,
-    /// so two of its three strips collapse a flank (§7.8.1) — and it still holds, non-vacuously:
-    /// two sectors vote unanimously one way and the third unanimously the other, so the guard
-    /// passes on a 2:1 rim that a unanimity assertion over the *whole* rim would have fired on,
-    /// on a mesh the operator is meant to survive.
+    /// **The profile loop sweeps `r`, not the dispatch.** This corner reaches the *general*
+    /// grid at every one of these profiles, the square-in sentinel included: §8.5.1's band
+    /// refuses a junction with a dissenting face, so `r = 0` lands on (f.4b) rather than on
+    /// (f.4a)'s weld (`adj_square_in_weld_declines_at_a_miswound_junction`). What the loop does
+    /// vary is the fill — the §8.5.3 pinwheel at `segments = 2` and the subdivided grid above
+    /// it — and [`LoopMesh::debug_assert_rim_agrees_within_each_sector`] is live throughout.
+    /// Everywhere else in the suite that guard holds trivially, on winding-consistent input;
+    /// here it is deliberately pointed at the §7.8 collapse-at-a-junction regime — the corner
+    /// is incident to the inverted face, so two of its three strips collapse a flank (§7.8.1) —
+    /// and it still holds, non-vacuously: two sectors vote unanimously one way and the third
+    /// unanimously the other, so the guard passes on a 2:1 rim that a unanimity assertion over
+    /// the *whole* rim would have fired on, on a mesh the operator is meant to survive.
     ///
     /// The cap's **internal** edges carry the other half of the claim: whatever the rim made
     /// the cap choose, no two cap faces disagree with each other. That is what "one bit"
@@ -34343,11 +34456,6 @@ mod tests {
     fn adj_cap_winding_takes_the_majority_on_an_inconsistently_wound_input() {
         for profile in [0.0f32, 0.5, 0.75] {
             for segments in [2u32, 3, 5] {
-                // Even `segments` at `r = 0` welds every leg at the octant origin and emits no
-                // face at all (§8.5.5.5(e)), so there is no cap to wind.
-                if profile == 0.0 && segments % 2 == 0 {
-                    continue;
-                }
                 let case = format!("segments = {segments}, profile = {profile}");
                 let mut mesh = LoopMesh::new();
                 mesh_add_cube_with_front_inverted(&mut mesh);
@@ -34378,15 +34486,12 @@ mod tests {
 
                 let cap = curved_corner_grid_faces(&mesh, &result);
                 assert!(!cap.is_empty(), "{case}: the corner emitted no cap");
-                if profile == 0.0 {
-                    assert_eq!(cap.len(), 1, "{case}: one central `s`-gon");
-                } else if segments == 2 {
+                if segments == 2 {
                     assert_eq!(cap.len(), 3, "{case}: the forced §8.5.3 pinwheel");
                 }
 
                 // The cap's rim is every cap edge that also carries a non-cap face — the
-                // arriving strips' terminal chains, `segments` of them per sector, or the
-                // `s`-gon's own three sides once the weld has identified them pairwise.
+                // arriving strips' terminal chains, `segments` of them per sector.
                 let conflicts = winding_conflicts(&mesh);
                 let mut rim = 0usize;
                 let mut dissenting = 0usize;
@@ -34416,7 +34521,7 @@ mod tests {
                         dissenting += usize::from(conflicting);
                     }
                 }
-                let per_sector = if profile == 0.0 { 1 } else { segments as usize };
+                let per_sector = segments as usize;
                 assert_eq!(rim, 3 * per_sector, "{case}: three sectors' rim edges");
                 assert_eq!(
                     dissenting, per_sector,
@@ -34424,6 +34529,267 @@ mod tests {
                      dissenting sector's rim in conflict",
                 );
             }
+        }
+    }
+
+    /// Bevel the three spokes of one corner of the front-inverted cube at the square-in
+    /// sentinel, and report the shell's face count and its cap.
+    fn miswound_cube_corner_square_in(corner: Vec3, segments: u32) -> (usize, usize) {
+        let mut mesh = LoopMesh::new();
+        mesh_add_cube_with_front_inverted(&mut mesh);
+        let vertex = vert_at(&mesh, corner);
+        let geom: Vec<GeomKey> = mesh
+            .vert_edge_keys(vertex)
+            .into_iter()
+            .map(GeomKey::from)
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments,
+                profile: 0.0,
+                vmesh_method: BevelVmeshMethod::Adj,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        // The cap is every emitted face lying wholly inside the beveled octant — the same
+        // reading `curved_corner_grid_faces` takes, at whichever corner this run beveled.
+        // The radius is the octant's own half-diagonal (`offset · √3`, the centre-to-deleted-
+        // junction-vertex distance) with slack, so a cap vert sitting exactly on the corner
+        // is not decided by float noise.
+        let octant_centre = corner * 0.75;
+        let octant_radius = 0.25 * 3.0_f32.sqrt() * 1.01;
+        let cap = result
+            .faces
+            .iter()
+            .filter(|&&face| {
+                mesh.face_vert_keys(face)
+                    .iter()
+                    .all(|&v| (mesh.vertex_position(v) - octant_centre).length() <= octant_radius)
+            })
+            .count();
+        (mesh.face_count(), cap)
+    }
+
+    /// BEVEL.md §8.5.5.5(f.1) step 3 admits a corner only where §8.5.1's tri-corner test
+    /// *fires*, and that test's dihedral band is a **signed** sum — so the one face whose
+    /// winding dissents from its neighbours (§7.8.1(b)) folds the two edges it flanks the
+    /// other way and drops the total to `π/2`, a whole `π` short of the `3·π/2` the band
+    /// centres on. Each of the four corners of the reversed face is therefore *refused*, and a
+    /// refusal routes the junction to step 4's general fullness grid — (f.4b) — even though its
+    /// boundvert ring is a perfect octant by position and the position-only meet geometry
+    /// cannot tell it from the four clear corners, which still take (f.4a)'s weld.
+    ///
+    /// The census separates the two fills without reading a coordinate: the weld emits no ring
+    /// quads and at most one centre `s`-gon, so it lands far below the grid's count.
+    #[test]
+    fn adj_square_in_weld_declines_at_a_miswound_junction() {
+        let straddling = [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+        ];
+        let clear = [
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ];
+        // Both censuses are **measured**, not derived: they are the shell's face counts at
+        // `segments = 2..=7` for the general fullness grid and for the weld respectively.
+        // A successor changing a fill's face output should re-measure them, not "correct"
+        // them toward a formula.
+        let grid_census = [15usize, 22, 30, 40, 51, 64];
+        let weld_census = [12usize, 16, 18, 22, 24, 28];
+
+        for (index, segments) in (2u32..=7).enumerate() {
+            for corner in straddling {
+                let (faces, cap) = miswound_cube_corner_square_in(corner, segments);
+                assert_eq!(
+                    faces, grid_census[index],
+                    "corner {corner:?}, segments = {segments}: the general grid's census",
+                );
+                assert!(
+                    cap > 1,
+                    "corner {corner:?}, segments = {segments}: a whole grid, not the weld's \
+                     lone `s`-gon (cap held {cap} face(s))",
+                );
+            }
+            for corner in clear {
+                let (faces, cap) = miswound_cube_corner_square_in(corner, segments);
+                assert_eq!(
+                    faces, weld_census[index],
+                    "corner {corner:?}, segments = {segments}: clear of the reversed face, so \
+                     the weld still fires",
+                );
+                assert_eq!(
+                    cap,
+                    usize::from(segments % 2 == 1),
+                    "corner {corner:?}, segments = {segments}: the weld's whole face output is \
+                     one centre `s`-gon at odd parity and nothing at even",
+                );
+            }
+        }
+    }
+
+    /// The §8.5.1 band's total-angle deviation itself, corner by corner, which is what the
+    /// dispatch above reads. Three claims:
+    ///
+    /// - a dissenting face costs the sum `π` — its two edges fold against the other one
+    ///   (`π/2 − π/2 − π/2`), so the deviation is `π`, outside both the `π/4` smooth window
+    ///   and the `π/16` square one;
+    /// - the four corners clear of it read `0` — the band is not a blanket decline on a shell
+    ///   that happens to carry a reversed face somewhere;
+    /// - **turning the whole shell inside out changes nothing.** Inverting every face reverses
+    ///   the disk walk and negates every term, and the two shells carry identical local data at
+    ///   a corner, so only the sum's magnitude is a property of the corner. This is the claim a
+    ///   naive convex-positive sum gets wrong, refusing an inward-wound cup outright.
+    #[test]
+    fn tri_corner_band_refuses_a_junction_with_a_dissenting_face() {
+        let quarter = std::f32::consts::FRAC_PI_4;
+        let band_deviation = |build: fn(&mut LoopMesh), corner: Vec3| -> f32 {
+            let mut mesh = LoopMesh::new();
+            build(&mut mesh);
+            let vertex = vert_at(&mesh, corner);
+            let spokes = mesh.vert_edge_keys(vertex);
+            let corners = mesh.vertex_bevel_corner_ring(vertex, &|edge| spokes.contains(&edge));
+            match mesh.junction_dihedral_band(vertex, &corners) {
+                DihedralBand::Deviation(deviation) => deviation,
+                other => panic!("corner {corner:?}: a closed fan measures a band, got {other:?}"),
+            }
+        };
+
+        for corner in [
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+        ] {
+            let deviation = band_deviation(mesh_add_cube_with_front_inverted, corner);
+            assert!(
+                (deviation - std::f32::consts::PI).abs() <= 1.0e-4,
+                "corner {corner:?}: the dissenting face costs the signed sum a whole π \
+                 (deviation was {deviation})",
+            );
+            assert!(deviation > quarter, "corner {corner:?}: outside the smooth band");
+        }
+
+        for corner in [
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ] {
+            for build in [
+                mesh_add_cube_with_front_inverted as fn(&mut LoopMesh),
+                mesh_add_inward_wound_cube,
+                mesh_add_cube,
+            ] {
+                let deviation = band_deviation(build, corner);
+                assert!(
+                    deviation <= 1.0e-4,
+                    "corner {corner:?}: an orthonormal corner whose faces agree sums to 3·π/2 \
+                     whichever way the shell as a whole is wound (deviation was {deviation})",
+                );
+            }
+        }
+    }
+
+    /// Two valence-4 corners that carry the **same four fold magnitudes** — three right angles
+    /// and one flat splitting edge — built as a matched pair: the convex octant whose flat face
+    /// is cut in two by a diagonal, and the inner corner of a square notch, where the vertical
+    /// fold creases the other way.
+    ///
+    /// `concave` picks the second. Both are closed fans of four faces, consistently wound
+    /// outward (so nothing dissents, §7.8.1(b)), and both give `edgecount = 4` with exactly one
+    /// near-flat edge — the `edgecount − 3` the §8.5.1 band asks for.
+    fn matched_fold_sign_junction(concave: bool) -> (LoopMesh, VertexKey) {
+        let mut mesh = LoopMesh::new();
+        let apex = mesh.create_vertex(Vec3::ZERO);
+        let up = mesh.create_vertex(Vec3::new(0.0, 0.0, 1.0));
+        let along_x = mesh.create_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let along_y = mesh.create_vertex(Vec3::new(0.0, 1.0, 0.0));
+        // The flat edge splitting the apex's horizontal face: inside the 90° wedge for the
+        // octant, inside the 270° one for the notch (whose horizontal face is reflex at the
+        // apex, so it is split to keep every face corner convex and the fixtures comparable).
+        let split = mesh.create_vertex(if concave {
+            Vec3::new(-1.0, -1.0, 0.0)
+        } else {
+            Vec3::new(1.0, 1.0, 0.0)
+        });
+        let x_rise = mesh.create_vertex(Vec3::new(1.0, 0.0, 1.0));
+        let y_rise = mesh.create_vertex(Vec3::new(0.0, 1.0, 1.0));
+
+        if concave {
+            mesh.face_create_verts(&[apex, up, x_rise, along_x], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, along_x, split], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, split, along_y], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, along_y, y_rise, up], FaceCreateFlags::NONE);
+        } else {
+            mesh.face_create_verts(&[apex, along_x, x_rise, up], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, split, along_x], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, along_y, split], FaceCreateFlags::NONE);
+            mesh.face_create_verts(&[apex, up, y_rise, along_y], FaceCreateFlags::NONE);
+        }
+        (mesh, apex)
+    }
+
+    /// BEVEL.md §8.5.1: the band sums the dihedrals **signed**, and a sum of magnitudes is not
+    /// the same test. The matched pair above differ in exactly one thing — whether the vertical
+    /// fold creases outward or inward — and their four fold magnitudes are identical
+    /// (`π/2, π/2, π/2, 0`), so a magnitude sum reads `3·π/2` for both and admits both. The
+    /// signed sum separates them: the octant keeps `|Σ| = 3·π/2` (deviation `0`, admitted at
+    /// both windows) while the notch's concave fold subtracts, leaving `|Σ| = π/2` — a whole
+    /// `π` off target, refused. §8.5.1's own worked note calls this out: a corner carrying a
+    /// concave leg is the case where the magnitude sum goes wrong.
+    #[test]
+    fn tri_corner_band_reads_a_concave_fold_against_its_convex_neighbours() {
+        let band = |concave: bool| -> DihedralBand {
+            let (mesh, apex) = matched_fold_sign_junction(concave);
+            let spokes = mesh.vert_edge_keys(apex);
+            let corners = mesh.vertex_bevel_corner_ring(apex, &|edge| spokes.contains(&edge));
+            mesh.junction_dihedral_band(apex, &corners)
+        };
+        let deviation = |concave: bool| -> f32 {
+            match band(concave) {
+                DihedralBand::Deviation(deviation) => deviation,
+                other => panic!("concave = {concave}: a closed fan measures a band, got {other:?}"),
+            }
+        };
+
+        let convex = deviation(false);
+        assert!(
+            convex <= 1.0e-4,
+            "three convex right angles and a flat splitting edge sum to 3·π/2 (deviation was \
+             {convex})",
+        );
+        let notch = deviation(true);
+        assert!(
+            (notch - std::f32::consts::PI).abs() <= 1.0e-4,
+            "the same four magnitudes with one fold concave sum to π/2, a whole π off target \
+             (deviation was {notch})",
+        );
+
+        // And the refusal is what the tri-corner gate sees, at either window.
+        let apex_position = Vec3::ZERO;
+        let octant_ring = [
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+        ];
+        for tolerance in [TRI_CORNER_BAND_SMOOTH, TRI_CORNER_BAND_SQUARE] {
+            assert!(
+                tri_corner_shape_admits(apex_position, &octant_ring, band(false), tolerance),
+                "the octant corner is admitted at tolerance {tolerance}",
+            );
+            assert!(
+                !tri_corner_shape_admits(apex_position, &octant_ring, band(true), tolerance),
+                "the notch corner is not, octant-shaped ring or no",
+            );
         }
     }
 
@@ -34822,7 +35188,7 @@ mod tests {
             central_representative: FaceTemplate::default(),
             sector_representatives: Vec::new(),
             centre_column_representatives: Vec::new(),
-            dihedral_band_deviation: None,
+            dihedral_band: DihedralBand::Unmeasurable,
             pipe_override: false,
             square_in_weld: false,
             opening_edge_directions: directions.clone(),
