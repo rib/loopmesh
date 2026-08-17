@@ -3617,7 +3617,8 @@ impl LoopMesh {
         // the **resampled** chain, exactly the emission a plain ADJ junction gets, not the
         // raw cutoff arc. (The `(segments − 1) · s` loose leftovers are minted separately at
         // the raw arc samples; only the connected rim moves to the resampled positions.)
-        let pipe_override = self.pipe_override_admits(vertex, vertex_position, &opening_edges);
+        let pipe_override =
+            self.pipe_override_admits(vertex, vertex_position, &opening_edges, &corners);
         let chain_emission = if pipe_override {
             ChainEmission::Resampled
         } else {
@@ -9244,10 +9245,14 @@ impl LoopMesh {
     ///    anti-parallel pair present.
     /// 2. **A collinear opposite pair.** Two beveled spokes are exactly **anti-parallel**
     ///    through `vertex` — their rays out of `v` point in opposite directions to within the
-    ///    §7.6.2 near-collinear angular tolerance. The shared line is the **pipe axis**.
-    /// 3. **Incident faces parallel to the pipe axis.** Every face touching the junction has
+    ///    §7.6.2 near-collinear angular tolerance of **`2°`**. The shared line is the **pipe
+    ///    axis**.
+    /// 3. **Incident faces parallel to the pipe axis.** Every face in the junction's fan has
     ///    its normal perpendicular to the pipe axis, so the pipe runs straight through a
-    ///    locally flat neighbourhood rather than turning a corner.
+    ///    locally flat neighbourhood rather than turning a corner. The fan is the disk's
+    ///    per-slot **forward faces**; the window is a dot-product magnitude
+    ///    ([`PIPE_PERPENDICULAR_DOT_EPS`], four orders of magnitude tighter than condition 2's
+    ///    `2°`), not an angle.
     ///
     /// Read from the pristine corner (its edges and faces are about to be consumed by the
     /// re-stitch), so it is captured at ring-placement time and carried on the cut.
@@ -9256,6 +9261,7 @@ impl LoopMesh {
         vertex: VertexKey,
         vertex_position: Vec3,
         opening_edges: &[EdgeKey],
+        corners: &[VertexCorner],
     ) -> bool {
         // Condition 1: the ring is a 3- or 4-way junction.
         let count = opening_edges.len();
@@ -9279,12 +9285,24 @@ impl LoopMesh {
             None => return false,
         };
 
-        // Condition 3: every incident face's normal is perpendicular to the pipe axis, i.e.
-        // the pipe threads a locally flat neighbourhood. `sin 2°` is the perpendicularity
-        // slack matching the same 2° near-collinear window.
-        let perpendicular_slack = (2.0_f32.to_radians()).sin();
-        for face in self.vert_face_keys(vertex) {
-            if self.face_plane_normal(face).dot(pipe_axis).abs() > perpendicular_slack {
+        // Condition 3: every face in the fan has its normal perpendicular to the pipe axis,
+        // i.e. the pipe threads a locally flat neighbourhood. Condition 2's `2°` window is
+        // **not** this window — the two measure different quantities at scales four orders of
+        // magnitude apart, and sharing a constant between them is the classic way to build
+        // this predicate wrong. See [`PIPE_PERPENDICULAR_DOT_EPS`].
+        //
+        // The fan is enumerated as one **forward face per disk slot**, not as every face
+        // incident to `vertex`: on a non-manifold spoke the latter tests strictly more faces,
+        // so it declines junctions that qualify. On a manifold fan the corner ring *is* that
+        // slot array, so `corners` is the enumeration. On a non-manifold slot step it is not:
+        // where two faces both qualify as the one step's forward face, [`vertex_corner_ring`]
+        // records both, and this loop then declines on whichever is tilted while §8.3.4.1 keeps
+        // the branch. Known gap, safe direction (over-test ⇒ false-decline, never false-admit),
+        // pinned by the ignored `bevel_pipe_gate_condition3_records_one_face_per_slot_doubled_fin_fan`;
+        // the defect is in the ring's forward-face record, not in condition 3.
+        for corner in corners {
+            let out_of_plane = self.face_plane_normal(corner.face).dot(pipe_axis).abs();
+            if out_of_plane > PIPE_PERPENDICULAR_DOT_EPS {
                 return false;
             }
         }
@@ -23871,6 +23889,98 @@ mod tests {
             4,
             "`(segments − 1)·s = 1·4` loose leftover verts on the re-tiled ring",
         );
+    }
+
+    /// The flat 12-spoke fan with rim vert `4` lifted out of plane by `lift`, which tilts the
+    /// two triangles that vert bounds and nothing else. Beveled as the 3-way pipe `[0, 3, 6]`
+    /// — spokes at `0° / 90° / 180°`, the sole collinear pair running along `±x` — so no
+    /// beveled spoke moves and §8.3.4.1's conditions 1 and 2 hold exactly at every `lift`,
+    /// leaving condition 3's dot magnitude the only quantity in motion.
+    ///
+    /// That magnitude moves at **`2·lift`**: the steepest tilted face is the triangle
+    /// spanning rim verts `3` (at `90°`, so its `y` component is `1`) and `4`, whose raw
+    /// Newell normal picks up an axis component of `lift` over a `sin 30° = ½` area scale.
+    fn bevel_tilted_fan_pipe_s3(lift: f32, offset: f32, segments: u32) -> (LoopMesh, f32) {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        mesh.set_vertex_position(rim[4], mesh.vertex_position(rim[4]) + Vec3::Z * lift);
+
+        let spokes: Vec<EdgeKey> = [0usize, 3, 6]
+            .into_iter()
+            .map(|k| mesh.query_edge_exists(centre, rim[k]).expect("spoke exists"))
+            .collect();
+        let axis = mesh
+            .edge_direction_from(spokes[0], centre, mesh.vertex_position(centre))
+            .expect("the pipe axis");
+        let out_of_plane = mesh
+            .vert_face_keys(centre)
+            .into_iter()
+            .map(|face| mesh.face_plane_normal(face).dot(axis).abs())
+            .fold(0.0_f32, f32::max);
+
+        let geom: Vec<GeomKey> = spokes.into_iter().map(GeomKey::from).collect();
+        mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Cutoff,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, out_of_plane)
+    }
+
+    /// BEVEL.md §8.3.4.1 condition 3: the fan-parallelism window is a **dot-product
+    /// magnitude** against `1e-4` (≈ `0.0057°` off perpendicular), *not* an angle, and
+    /// emphatically not condition 2's `EPS_ANG = 2°`.
+    ///
+    /// The tilted fan isolates it: conditions 1 and 2 are satisfied exactly at every lift
+    /// (no beveled spoke moves), so the verdict turns on the fan's largest
+    /// `|dot(face normal, pipe axis)|` alone, which the fixture drives linearly at `2·lift`.
+    /// The override's signature is its `(segments − 1)·s` loose leftover verts, which no
+    /// ordinary cutoff ring mints.
+    ///
+    /// The last row is the one that measures the constant rather than merely the shape of
+    /// the comparison: at `|dot| = 0.02` the fan is a visible `1.15°` off prismatic, well
+    /// outside `1e-4` — yet still *inside* a `sin 2°` window, so reusing condition 2's
+    /// tolerance here fires the override on it.
+    #[test]
+    fn cutoff_pipe_override_condition3_window_is_a_dot_magnitude_not_an_angle() {
+        let condition_2_window_as_a_dot = (2.0_f32.to_radians()).sin();
+        // (lift, the `|dot|` it drives, whether §8.3.4.1 admits).
+        let window: [(f32, bool); 4] = [
+            (0.0, true),
+            (4.0e-5, true),
+            (6.0e-5, false),
+            (1.0e-2, false),
+        ];
+        for (lift, admits) in window {
+            let (mesh, out_of_plane) = bevel_tilted_fan_pipe_s3(lift, 0.25, 2);
+            // `2·lift` is the first-order figure; unitising the tilted normal costs a
+            // `1/√(1 + 4·lift²)` the fixture is not trying to pin.
+            assert!(
+                (out_of_plane - 2.0 * lift).abs() < 1.0e-3 * (2.0 * lift) + 1.0e-9,
+                "fixture arithmetic: lift {lift} drives |dot| = {out_of_plane}, wanted {}",
+                2.0 * lift,
+            );
+            assert_eq!(
+                out_of_plane <= PIPE_PERPENDICULAR_DOT_EPS,
+                admits,
+                "fixture sanity: |dot| = {out_of_plane} sits on the wrong side of the window",
+            );
+            assert!(
+                out_of_plane < condition_2_window_as_a_dot,
+                "every row stays inside condition 2's window, so only condition 3 decides",
+            );
+            assert_eq!(
+                loose_vertex_count(&mesh) == 3,
+                admits,
+                "lift {lift} (|dot| = {out_of_plane}): the override's `(segments − 1)·s = 3` \
+                 loose leftover verts must appear iff the fan is within `1e-4` of prismatic",
+            );
+        }
     }
 
     /// BEVEL.md §8.3.4.1 condition 2 / §8.5.5.5(f.6): *which* pair a two-pair ring names.
@@ -56861,6 +56971,23 @@ struct PipeCrossSection {
     sectors: (usize, usize),
 }
 
+/// BEVEL.md §8.3.4.1 **condition 3**'s perpendicularity window: the largest `|dot|` between
+/// the unit pipe axis and a fan face's unit normal that still reads as "this face is parallel
+/// to the axis".
+///
+/// It is a **dot-product magnitude**, not an angle, and it is `1e-4` — about `0.0057°` off
+/// perpendicular, the same tight window §8.8.2's in-plane leg classification uses. Condition
+/// 2's `EPS_ANG = 2°` is a *different test on a different quantity*: that one asks whether two
+/// spoke rays are collinear enough for the junction to *have* an axis at all, and is generous
+/// by design so a hand-modelled near-straight tube still takes the pipe path. This one asks
+/// whether the cross-section is genuinely constant along that axis, and is deliberately
+/// conservative — a fan that is merely *visibly* flat, its normals accumulated through float
+/// arithmetic, fails it and takes the ordinary cutoff path.
+///
+/// The two must therefore never share a constant. Reusing `2°` here is a `|dot| ≤ 0.035`
+/// window, 349× wider, and fires the pipe override on corners that merely turn gently.
+const PIPE_PERPENDICULAR_DOT_EPS: f32 = 1.0e-4;
+
 /// The §8.3.4.1 **pipe boundvert**'s two collinear spokes, as indices into the ring's
 /// per-sector spoke directions (BEVEL.md §8.3.4.1 condition 2 / §8.5.5.5(f.6)). The first
 /// returned index is the pipe boundvert's *own* edge; the second is its collinear opposite.
@@ -56895,6 +57022,9 @@ struct PipeCrossSection {
 /// declines a junction an any-pair scan would have re-tiled. That is a change in `V`, `E` and
 /// `F`, not in positions ([`cutoff_pipe_override_declines_on_a_ring_adjacent_pair`]).
 fn pipe_boundvert_spokes(directions: &[Vec3]) -> Option<(usize, usize)> {
+    // Condition 2's own window: an **angle** of `EPS_ANG = 2°` between two unit spoke
+    // directions oriented through the vertex. Deliberately not shared with condition 3's
+    // [`PIPE_PERPENDICULAR_DOT_EPS`] — see that constant.
     let near_collinear_cos = (2.0_f32.to_radians()).cos();
     let count = directions.len();
     (0..count)
