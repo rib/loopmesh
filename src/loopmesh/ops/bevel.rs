@@ -28791,6 +28791,421 @@ mod tests {
         );
     }
 
+    /// BEVEL.md §8.9.5.4(c)/(g).3: a `spread = 0` inner miter mints all three of its arc
+    /// anchors on one point, and the resulting collapsed chain reaches §8.2.2.1.1's
+    /// zero-total guard **only at a power-of-two count**. The two-term interpolation
+    /// `(1 − t)·start + t·end` returns a coincident end bit-exactly only at dyadic `t`, so a
+    /// non-power-of-two count — exactly the set on which the [V-ADJ] down-resample runs —
+    /// leaves ulp-scale but strictly positive chords and an ordinary normalised table.
+    ///
+    /// This is the load-bearing arithmetic in the whole operator: the one-term
+    /// `start + t·(end − start)` is algebraically the same and bit-inert on coincident ends,
+    /// and swapping it in silently rebuilds the fallback-on-both-axes reading §8.9.5.4(c)
+    /// retires.
+    #[test]
+    fn zero_spread_arc_chain_takes_the_fallback_table_only_at_a_power_of_two_count() {
+        let meet = Vec3::new(0.2, 0.2, 0.0);
+        let arc_chain = |segments: u32| arc_chain_positions(meet, meet, meet, 0.5, segments);
+
+        assert_eq!(
+            meet.lerp(meet, 1.0 / 3.0),
+            meet,
+            "the one-term form is bit-inert on coincident ends — that is the trap, and the \
+             reason the two-term spelling is part of the contract",
+        );
+
+        for segments in [2u32, 4, 8] {
+            let chain = arc_chain(segments);
+            assert!(
+                chain.iter().all(|&sample| sample == meet),
+                "every k / {segments} is dyadic, so the whole chain is bit-exactly the meet \
+                 point: {chain:?}",
+            );
+            let mut fallback = vec![0.0; segments as usize + 1];
+            *fallback.last_mut().unwrap() = 1.0;
+            assert_eq!(normalised_chord_fractions(&chain), fallback);
+        }
+
+        let chain = arc_chain(3);
+        assert_ne!(
+            chain[1], meet,
+            "`t = 1/3` is not dyadic, so the sample lands an ulp off the coincident point",
+        );
+        assert_eq!(
+            normalised_chord_fractions(&chain),
+            vec![0.0, 0.5, 1.0, 1.0],
+            "§8.9.5.4(c)'s tabulated target table at this meet point",
+        );
+
+        // The source chain is materialised at the doubling resolution, which is a power of
+        // two by construction — so the *pair* of tables the read-back consumes is a genuine
+        // fallback against an ordinary one, and the interior lands inside the last source
+        // span rather than at index 0.
+        let source = arc_chain(boundary_source_resolution(3));
+        assert!(source.iter().all(|&sample| sample == meet));
+        assert_eq!(
+            chord_fraction_indices(&chain, &source),
+            vec![0.0, 3.5, 4.0, 4.0],
+        );
+        assert_ne!(
+            chord_fraction_indices(&chain, &source),
+            vec![0.0, 0.0, 0.0, 4.0],
+            "the fallback-on-both-axes reading is the retired premise",
+        );
+
+        // A profile cell whose frame declines emits through the same rule — the arc is not a
+        // special case of it (§8.2.2.1 clause (1)).
+        let declined = ProfileCell::from_control_points(meet, meet, meet);
+        assert!(declined.emits_straight_chord());
+        assert_eq!(declined.raw_chain_positions(3, 0.5, None), chain);
+    }
+
+    /// BEVEL.md §8.2.2.1.1's zero-length-chain fallback: the guard is an **exact** test on
+    /// the accumulated chord length, and when it fails the table is `[0, …, 0, 1]` — not
+    /// left undivided, not filled uniformly, and not a signal to bail out of the resample.
+    ///
+    /// The three readings the guide separates are all pinned here, because they are
+    /// indistinguishable on the degenerate chain's own samples (which coincide whatever the
+    /// table says) and only diverge once the table is consumed as a read-back
+    /// parametrisation.
+    #[test]
+    fn degenerate_chord_table_is_zero_until_the_last_step_not_uniform_and_not_the_raw_chain() {
+        let point = Vec3::new(0.3, -0.7, 0.2);
+        let degenerate = vec![point; 4];
+
+        assert_eq!(
+            normalised_chord_fractions(&degenerate),
+            vec![0.0, 0.0, 0.0, 1.0],
+            "a chain with zero total chord has no extent until its very last step",
+        );
+        assert_ne!(
+            normalised_chord_fractions(&degenerate),
+            vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+            "the uniform table is a different rule, not the natural reading of this one",
+        );
+
+        // The guard is exact: a chain that is merely *short* still carries real fractions,
+        // and widening the test into a length floor would claim this one too.
+        let stride = 1.0e-8;
+        let short = vec![
+            Vec3::ZERO,
+            Vec3::X * stride,
+            Vec3::X * (3.0 * stride),
+            Vec3::X * (4.0 * stride),
+        ];
+        assert_eq!(
+            normalised_chord_fractions(&short),
+            vec![0.0, 0.25, 0.75, 1.0],
+            "the total-length guard is exact zero, not an epsilon",
+        );
+
+        // Read out as fractional source indices, the table sends every interior sample to
+        // the source polyline's `start` end and only the last one to its far end.
+        let source = vec![point; 5];
+        assert_eq!(
+            chord_fraction_indices(&degenerate, &source),
+            vec![0.0, 0.0, 0.0, 4.0],
+            "every interior query of a degenerate chain reads the source at index 0",
+        );
+        assert_ne!(
+            chord_fraction_indices(&degenerate, &source),
+            vec![0.0, 4.0 / 3.0, 8.0 / 3.0, 4.0],
+            "uniform index fractions are the mis-reading this table exists to rule out",
+        );
+
+        // On the chain's own samples the fallback is invisible — which is exactly why the
+        // "return the raw chain unchanged" reading survives so easily.
+        assert_eq!(chord_fraction_resample(&degenerate, &source), degenerate);
+    }
+
+    /// BEVEL.md §8.5.5.5(d)'s two-axis read: sub-patch `i` consumes chain `i`'s table
+    /// **forward** on the `k` axis and chain `i − 1`'s table **reversed** on the `j` axis.
+    /// The reversal is an *index* mirror, so `[0, …, 0, 1]` presents as `[1, 0, …, 0]` — the
+    /// degenerate chain pulls its own block onto one edge of the source grid and the next
+    /// block onto the opposite edge. Re-deriving fractions along a reversed polyline would
+    /// give `[0, 1, …, 1]` and a symmetric answer instead, which is the divergence.
+    #[test]
+    fn degenerate_chord_table_read_reversed_lands_on_the_opposite_end_of_the_source_axis() {
+        let sectors = 3usize;
+        let segments = 3usize;
+        let resolution = boundary_source_resolution(segments as u32) as usize;
+        let net_half = resolution / 2;
+        let target_half = segments / 2;
+
+        let point = Vec3::new(-0.2, 0.5, 0.1);
+        let degenerate =
+            chord_fraction_indices(&vec![point; segments + 1], &vec![point; resolution + 1]);
+
+        // The `k` axis, forward: every interior column stands on the source grid's first
+        // column, the one over the degenerate boundvert.
+        for k in 0..segments {
+            assert_eq!(
+                degenerate[k], 0.0,
+                "forward interior column {k} reads index 0"
+            );
+        }
+        assert_eq!(
+            degenerate[segments], resolution as f32,
+            "the far end is the last entry",
+        );
+
+        // A net whose every slot is distinguishable, so a read can be identified by where
+        // it landed rather than by re-deriving the arithmetic the fill does.
+        let chains: Vec<Vec<Vec3>> = (0..sectors)
+            .map(|i| {
+                (0..=resolution)
+                    .map(|k| Vec3::new(i as f32, k as f32, 0.0))
+                    .collect()
+            })
+            .collect();
+        let mut net = AdjNet::new(sectors, net_half, chains, true);
+        let interior_slot = Vec3::new(9.0, 9.0, 9.0);
+        for i in 0..sectors {
+            for j in 1..=net_half {
+                for k in 1..=net_half {
+                    net.set(i, j, k, interior_slot);
+                }
+            }
+        }
+
+        // Chain 0 is the degenerate arc. Its neighbours read at integer indices so the
+        // bilinear kernel lands on a net slot exactly and the assertion can be an identity.
+        let well_conditioned: Vec<f32> = (0..=segments).map(|k| k as f32).collect();
+        let axis = vec![
+            degenerate.clone(),
+            well_conditioned.clone(),
+            well_conditioned,
+        ];
+        let interior = AdjInterior::Relaxed {
+            net: &net,
+            axis: &axis,
+            sectors,
+            segments,
+        };
+
+        // Sub-patch 1's `j` axis is chain 0's table read *reversed*, so its lone interior
+        // row queries `resolution − axis[0][segments − 1] = resolution` — past the far end
+        // of the stored ring axis. §8.5.2's backward seam rewrites that to `(0, k, 0)`:
+        // sub-patch 0's rim column, not a row of sub-patch 1's block at all.
+        let landed = interior.position(1, 1, 1, target_half);
+        assert_eq!(
+            landed,
+            net.at(0, 1, 0),
+            "the read is the previous rim column"
+        );
+        assert_eq!(
+            landed,
+            net.chains[sectors - 1][resolution - 1],
+            "and that column is pinned from the chain before it, one step in from the end",
+        );
+        assert_ne!(
+            landed, interior_slot,
+            "truncating the query to the stored quadrant would land on the seam spoke — \
+             the opposite end of the axis the rule points at",
+        );
+
+        // The other flank: sub-patch 0's own `k` axis reads the same table *forward*, so
+        // its interior column stands on column `0` of its source axis — the one over the
+        // degenerate boundvert — while its `j` coordinate stays well conditioned at the
+        // axis midpoint. Opposite ends of the same stored column, as §8.9.5.4(c) says.
+        let forward = interior.position(0, 1, 1, target_half);
+        assert_eq!(forward, net.at(0, net_half, 0));
+        assert_ne!(forward, landed);
+    }
+
+    /// How far the mesh's position set is from `x ↦ −x` invariance — the one-sided
+    /// Hausdorff distance to its own mirror — in the `1e-5` position quanta BEVEL.md
+    /// §8.9.5.4(d) states its readings in.
+    ///
+    /// The inner distance is **Chebyshev**, component-wise, and the accumulation is `f64`:
+    /// §8.9.5.4(d)'s table is stated in canonical position quanta, which are per-component,
+    /// so a Euclidean inner distance reads systematically larger than the numbers there and
+    /// cannot be compared against them. Matching each position to its *nearest* mirror
+    /// partner keeps this a lower bound on any index-paired reading, so it under-reports
+    /// rather than inventing asymmetry.
+    fn worst_mirror_gap(mesh: &LoopMesh) -> f64 {
+        let positions: Vec<[f64; 3]> = mesh
+            .vert_keys()
+            .iter()
+            .map(|&v| {
+                let position = mesh.vertex_position(v);
+                [position.x as f64, position.y as f64, position.z as f64]
+            })
+            .collect();
+        positions
+            .iter()
+            .map(|p| {
+                let mirrored = [-p[0], p[1], p[2]];
+                positions
+                    .iter()
+                    .map(|q| {
+                        (q[0] - mirrored[0])
+                            .abs()
+                            .max((q[1] - mirrored[1]).abs())
+                            .max((q[2] - mirrored[2]).abs())
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0f64, f64::max)
+            / 1.0e-5
+    }
+
+    /// BEVEL.md §8.9.5.4: at `spread = 0` the inner miter's two boundverts coincide, so the
+    /// arc chain's cell declines and the chain is the chord's even subdivision. Only the
+    /// **source** table takes §8.2.2.1.1's degenerate fallback — it is materialised at a
+    /// power of two, where the two-term interpolation is bit-inert; the **target** table is
+    /// materialised at the run's own `segments`, and a down-resample runs only when that is
+    /// *not* a power of two, which is exactly when the chain carries ulp-scale but strictly
+    /// positive chords (§8.9.5.4(c)). Reading a fallback source axis against an ordinary
+    /// target table, forward on `k` and reversed on the neighbour's `j`, is what makes a
+    /// **mirror-symmetric** junction emit a mirror-*asymmetric* cap.
+    ///
+    /// The scope is "does the down-resample reach an interior sample", **not** "is
+    /// `segments` odd" (§8.9.5.4(e)): `segments = 4` is a power of two, so gate part (i)
+    /// declines and nothing fires; `segments ∈ {3, 6}` are live. `6` is the discriminator
+    /// the guide names — even *and* live — and it is also the only station here where the
+    /// even-target mid-index pin of [`adj_interior_axis`] meets a degenerate table. Two
+    /// controls hold the fixture fixed and vary one thing each: `spread = 0.1` (same
+    /// miter, well-conditioned chord) and `SHARP` (same spread, no miter), the latter
+    /// carrying the baseline asymmetry §8.9.5.4(d) says the high segment counts have
+    /// independently of miters. What the live arm reads is the **excess** over both.
+    #[test]
+    fn inner_miter_arc_zero_spread_breaks_mirror_symmetry_only_where_the_resample_runs() {
+        let beveled_fan = |segments: u32, spread: f32, miter_inner: BevelMiter| -> LoopMesh {
+            let (mut mesh, centre, rim) = planar_fan_axis_aligned(12);
+            let geom: Vec<GeomKey> = [1usize, 4, 7]
+                .iter()
+                .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+                .collect();
+            mesh.bevel(
+                &geom,
+                BevelOptions {
+                    offset: 0.2,
+                    affect: BevelAffect::Edges,
+                    segments,
+                    profile: 0.5,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_inner,
+                    miter_outer: BevelMiter::Sharp,
+                    spread,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            mesh
+        };
+        let arc_gap = |segments: u32, spread: f32| {
+            worst_mirror_gap(&beveled_fan(segments, spread, BevelMiter::Arc))
+        };
+
+        // The census is untouched — this is a placement-only divergence.
+        let live = beveled_fan(3, 0.0, BevelMiter::Arc);
+        let control = beveled_fan(3, 0.1, BevelMiter::Arc);
+        assert_eq!(counts(&live), counts(&control));
+
+        assert!(
+            worst_mirror_gap(&control) < 1.0,
+            "the spread control stays mirror-exact at the f32 read-back floor, not {}",
+            worst_mirror_gap(&control),
+        );
+        // The magnitude at `segments = 3` is pinned separately — see
+        // `inner_miter_arc_zero_spread_segments3_matches_the_tabulated_mirror_gap`, which
+        // is where the two-sided reading of this arm lives.
+        assert!(
+            worst_mirror_gap(&live) > 5.0,
+            "a degenerate arc chain throws the flanking blocks to opposite ends of their \
+             source axes, which is orders of magnitude past the read-back floor, not {}",
+            worst_mirror_gap(&live),
+        );
+
+        // Rim-only at `segments = 2` (§8.9.5.4(e)): a degenerate rim is one repeated point
+        // whatever the table says. Gate part (i) then declines outright at a power of two.
+        assert!(
+            arc_gap(2, 0.0) < 1.0,
+            "only the rim is sampled at segments = 2, so the table is inert, not {}",
+            arc_gap(2, 0.0),
+        );
+        assert!(
+            arc_gap(4, 0.0) < 1.0,
+            "no resample runs at segments = 4, so zero spread stays mirror-exact, not {}",
+            arc_gap(4, 0.0),
+        );
+
+        // §8.9.5.4(e): even *and* live, and firing hardest of every count measured. Both
+        // controls carry the baseline asymmetry the high counts have anyway (the `SHARP`
+        // arm shows it with no miter in play at all), so what the live arm reads is the
+        // excess over them. Two-sided: "asymmetric" is not the claim — the claim is
+        // asymmetric by the amount a whole block thrown to the far end of its source axis
+        // costs, and §8.9.5.4(d) tabulates that amount.
+        let six_sharp = worst_mirror_gap(&beveled_fan(6, 0.0, BevelMiter::Sharp));
+        let six_spread = arc_gap(6, 0.1);
+        let six_live = arc_gap(6, 0.0);
+        assert!(
+            (180.0..240.0).contains(&six_sharp),
+            "segments = 6 baseline (§8.9.5.4(d) reads 206.9): {six_sharp}",
+        );
+        assert!(
+            (280.0..350.0).contains(&six_spread),
+            "segments = 6 spread control (§8.9.5.4(d) reads 311.1): {six_spread}",
+        );
+        assert!(
+            (2800.0..3350.0).contains(&six_live),
+            "segments = 6 live arm (§8.9.5.4(d) reads 3072.4): {six_live}",
+        );
+        assert!(
+            six_live > 8.0 * six_sharp.max(six_spread),
+            "the excess must be an order of magnitude over both controls: \
+             sharp {six_sharp}, spread {six_spread}, live {six_live}",
+        );
+
+        // `segments = 8` is a power of two, so the table is never built and the zero-spread
+        // arm sits *below* both controls — the baseline asymmetry with nothing added.
+        let eight_live = arc_gap(8, 0.0);
+        assert!(
+            eight_live < worst_mirror_gap(&beveled_fan(8, 0.0, BevelMiter::Sharp)),
+            "no resample runs at segments = 8, so the live arm carries no excess: \
+             {eight_live}",
+        );
+    }
+
+    /// The `segments = 3` row of BEVEL.md §8.9.5.4(d): `729.5` quanta against a `0.04`
+    /// control band, on the same fixture and options as the arm above.
+    ///
+    /// It is the **magnitude** that pins §8.9.5.4(c)'s two-table reading. Applying the
+    /// zero-total fallback to the target axis as well collapses the two carrier slots onto
+    /// positions whose mirror images exist elsewhere in the set, and the metric then reads
+    /// single digits — §8.9.5.4(d)'s box tabulates that mis-reading at ≈`9` quanta, which
+    /// is why this arm is two-sided and not merely "asymmetric".
+    #[test]
+    fn inner_miter_arc_zero_spread_segments3_matches_the_tabulated_mirror_gap() {
+        let (mut mesh, centre, rim) = planar_fan_axis_aligned(12);
+        let geom: Vec<GeomKey> = [1usize, 4, 7]
+            .iter()
+            .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+            .collect();
+        mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments: 3,
+                profile: 0.5,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: BevelMiter::Arc,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.0,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        let gap = worst_mirror_gap(&mesh);
+        assert!(
+            (600.0..900.0).contains(&gap),
+            "segments = 3 live arm (§8.9.5.4(d) reads 729.5): {gap}",
+        );
+    }
+
     /// A cell point's coordinates `(u, v)` in the §8.2.2.1 profile cell: solve
     /// `p = origin + u·a_axis + v·b_axis` in the (non-orthogonal) cell basis.
     fn cell_uv(cell: &ProfileCell, position: Vec3) -> (f32, f32) {
@@ -54998,6 +55413,39 @@ fn cell_frame_is_wellformed(start: Vec3, mid: Vec3, end: Vec3) -> bool {
     unit_chord_angle_between(a_axis, b_axis) <= std::f32::consts::PI - MEET_DIRECTION_EPS_ANGLE
 }
 
+/// The interior samples of a chain whose cell frame **declined** (BEVEL.md §8.2.2.1
+/// clause (1)) — the even straight subdivision of the chord — written in the **two-term**
+/// form `(1 − t)·start + t·end`, evaluated componentwise in `f32`.
+///
+/// The spelling is part of the contract here, not a style choice (BEVEL.md §8.9.5.4(g).3).
+/// The algebraically equivalent one-term `start + t·(end − start)` returns `start`
+/// bit-exactly whenever the two ends **coincide**; this form returns the ends exactly only
+/// at dyadic `t`, and otherwise lands an ulp off. That single ulp decides whether the
+/// chain's own chord table is §8.2.2.1.1's zero-total fallback or the ordinary
+/// normalisation of ulp-scale chords — and those two tables park the neighbouring sector's
+/// interior block on different lines of the mesh (§8.9.5.4(c)). A chain materialised at a
+/// power-of-two count takes the fallback either way; one materialised at a
+/// non-power-of-two count does not, which is exactly the count set on which the [V-ADJ]
+/// down-resample runs.
+///
+/// `Vec3::lerp` and any fused-multiply-add contraction *are* the one-term form. Do not
+/// route this through either, and do not widen any of it to `f64`.
+fn collapsed_chain_sample(start: Vec3, end: Vec3, k: u32, n: u32) -> Vec3 {
+    if k == 0 {
+        return start;
+    }
+    if k == n {
+        return end;
+    }
+    let t = k as f32 / n as f32;
+    let s = 1.0 - t;
+    Vec3::new(
+        s * start.x + t * end.x,
+        s * start.y + t * end.y,
+        s * start.z + t * end.z,
+    )
+}
+
 /// BEVEL.md §8.2.2.1's `near_collinear` on a profile cell's three control points, with
 /// `apex` — the cell's `mid` — as the corner: the cell's two in-plane axes are
 /// `apex − start` and `apex − end`, so the cell is degenerate exactly when those two are
@@ -55880,8 +56328,7 @@ impl ProfileCell {
         positions.push(self.start);
         if self.emits_straight_chord() {
             for k in 1..segments {
-                let t = k as f32 / segments as f32;
-                positions.push(self.start + (self.end - self.start) * t);
+                positions.push(collapsed_chain_sample(self.start, self.end, k, segments));
             }
         } else {
             // §8.6.3: a custom profile supplies its `(u, v)` chain directly (§8.6.3.1),
@@ -56093,8 +56540,28 @@ impl<'c> CustomChains<'c> {
 }
 
 /// The normalised chord fractions of a polyline (`0` at the first point, `1` at the
-/// last). `None` for a zero-length polyline, which carries no fractions.
-fn normalised_chord_fractions(points: &[Vec3]) -> Option<Vec<f32>> {
+/// last).
+///
+/// The guard on the accumulated length is **exact** (BEVEL.md §8.2.2.1.1): a chain whose
+/// samples all coincide has total `0`, and its table is neither left undivided, nor filled
+/// uniformly, nor a signal to skip the resample. Only the *last* entry is set —
+/// `[0, 0, …, 0, 1]` — so every interior query reads the source polyline at its `start`
+/// end. Widening the test into a length floor is the larger divergence, because it changes
+/// the answer for a band of chains whose fractions are perfectly well defined (§8.9.5.4(f));
+/// the singularity is removable, not thresholded.
+///
+/// The table is deliberately **asymmetric under reversal**, and it *is* read both ways:
+/// §8.5.5.5(d) reads one sector's table forward on the `k` axis and the neighbouring
+/// sector's reversed on the `j` axis. Reversal is an **index** mirror, so `[0, …, 0, 1]`
+/// presents as `[1, 0, …, 0]` — the two blocks flanking a degenerate chain are pulled to
+/// opposite ends of their source axes.
+///
+/// **Accumulate in `f32`, take the square root per chord, and test the total exactly.**
+/// Widening any of the three changes the table of a chain whose chords are ulp-scale, and
+/// a `spread = 0` inner miter builds exactly such a chain on its target axis whenever the
+/// resample runs (§8.9.5.4(c)/(g).3). That table — not the fallback — is what makes such a
+/// miter emit a mirror-*asymmetric* cap on a mirror-symmetric junction.
+fn normalised_chord_fractions(points: &[Vec3]) -> Vec<f32> {
     let mut fractions = Vec::with_capacity(points.len());
     let mut travelled = 0.0;
     fractions.push(0.0);
@@ -56102,13 +56569,26 @@ fn normalised_chord_fractions(points: &[Vec3]) -> Option<Vec<f32>> {
         travelled += (pair[1] - pair[0]).length();
         fractions.push(travelled);
     }
-    if travelled <= f32::EPSILON {
-        return None;
+    // `travelled > 0.0` is also false for NaN, and the fallback below would then dress a
+    // broken chain up as a plausible degenerate one. A non-finite accumulated chord length
+    // is an upstream invariant break, so say so rather than absorbing it.
+    assert!(
+        travelled.is_finite(),
+        "chord-length accumulation over a profile chain must stay finite",
+    );
+    if travelled > 0.0 {
+        for fraction in fractions.iter_mut() {
+            *fraction /= travelled;
+        }
+    } else {
+        for fraction in fractions.iter_mut() {
+            *fraction = 0.0;
+        }
+        if let Some(last) = fractions.last_mut() {
+            *last = 1.0;
+        }
     }
-    for fraction in fractions.iter_mut() {
-        *fraction /= travelled;
-    }
-    Some(fractions)
+    fractions
 }
 
 /// Read a polyline at a normalised chord fraction: find the span holding `fraction`
@@ -56138,21 +56618,25 @@ fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32)
 /// fractions"): the target grid's `k` axis *is* its chain, so a target column sits over
 /// the dense grid at exactly the fractional column its rim sample sits at. That keeps the
 /// interior consistent with the rim it meets, which uniform index fractions would not.
+///
+/// A **degenerate** chain — every sample the same point — carries
+/// [`normalised_chord_fractions`]'s `[0, …, 0, 1]` and so maps to
+/// `[0, …, 0, source.len() − 1]`. Uniform index fractions here would be a divergence, not a
+/// harmless bail-out: this is the one place the degenerate table is *observable*, since the
+/// resampled chain's own samples coincide whatever the table says (§8.9.5.4(g)).
+///
+/// The `spread = 0` inner-miter arc reaches that state on the **source** side only. Its
+/// target chain is materialised at the run's own `segments`, and a resample runs at all
+/// only when that is not a power of two — precisely when the collapsed chain's two-term
+/// interpolation leaves ulp-scale, strictly positive chords and the zero-total guard does
+/// *not* fire (§8.9.5.4(c)). So the usual query here is a fallback source table read
+/// against an ordinary target one, which lands each interior sample at
+/// `source.len() − 1 + fraction` — inside the last source span, where the §8.5.2 seam
+/// rules take it into a neighbouring sector's slots.
 fn chord_fraction_indices(raw: &[Vec3], source: &[Vec3]) -> Vec<f32> {
     let last = source.len() - 1;
-    let target_last = raw.len() - 1;
-    let identity = || {
-        (0..raw.len())
-            .map(|k| k as f32 * last as f32 / target_last as f32)
-            .collect()
-    };
-    let (target_fractions, source_fractions) = match (
-        normalised_chord_fractions(raw),
-        normalised_chord_fractions(source),
-    ) {
-        (Some(target), Some(source)) => (target, source),
-        _ => return identity(),
-    };
+    let target_fractions = normalised_chord_fractions(raw);
+    let source_fractions = normalised_chord_fractions(source);
     let mut indices = Vec::with_capacity(raw.len());
     for &fraction in target_fractions.iter() {
         let mut index = last as f32;
@@ -56180,14 +56664,8 @@ fn chord_fraction_indices(raw: &[Vec3], source: &[Vec3]) -> Vec<f32> {
 /// move; it is the identity wherever the source polyline already contains the raw
 /// sample at the same fraction, so it is safe to run on every chain unconditionally.
 fn chord_fraction_resample(raw: &[Vec3], source: &[Vec3]) -> Vec<Vec3> {
-    let target_fractions = match normalised_chord_fractions(raw) {
-        Some(fractions) => fractions,
-        None => return raw.to_vec(),
-    };
-    let source_fractions = match normalised_chord_fractions(source) {
-        Some(fractions) => fractions,
-        None => return raw.to_vec(),
-    };
+    let target_fractions = normalised_chord_fractions(raw);
+    let source_fractions = normalised_chord_fractions(source);
     let mut emitted = Vec::with_capacity(raw.len());
     emitted.push(raw[0]);
     for k in 1..raw.len() - 1 {
@@ -58044,6 +58522,17 @@ fn arc_chain_positions(
 ) -> Vec<Vec3> {
     let a_axis = midpoint - b1;
     let b_axis = midpoint - b3;
+    // §8.2.2.1 clause (1), the exact zero-axis arm, tested before anything is normalised:
+    // an inner miter at `spread = 0` mints both its ends on the retained meet point, so all
+    // three of the arc's anchors are one point and there is no frame to sample through
+    // (§8.9.5.4(b)). What the chain emits then is the chord's even subdivision — and at
+    // this count it is the *arithmetic* of that subdivision, not only its algebra, that the
+    // fill downstream reads (§8.9.5.4(c)).
+    if a_axis == Vec3::ZERO || b_axis == Vec3::ZERO {
+        return (0..=segments)
+            .map(|k| collapsed_chain_sample(b1, b3, k, segments))
+            .collect();
+    }
     let inner_corner = b1 + b3 - midpoint;
     superellipse_chain(profile, segments)
         .into_iter()
@@ -58290,12 +58779,44 @@ impl AdjNet {
 
     /// Read sub-patch `i` at fractional grid coordinates — the §8.5.5.5(d) resample
     /// kernel, bilinear within the source quad.
+    ///
+    /// The domain is the **whole** chart on both axes, `[0, resolution]` with
+    /// `resolution = 2·half`, not the stored quadrant `[0, half]`. A well-conditioned
+    /// read-back never leaves the quadrant (both coordinates of a canonical target index
+    /// come out of a monotone chord table at or below its midpoint), but a **degenerate**
+    /// chain's `[0, …, 0, 1]` table sends the neighbouring sub-patch's `j` coordinate to
+    /// `resolution` outright (§8.9.5.4(c)). Clamping there would land on the seam spoke —
+    /// the opposite end of the very axis the rule points at — so the cell corners are
+    /// handed to [`AdjNet::at`], whose seam rewrite is what §8.5.2 names for exactly this
+    /// query.
+    ///
+    /// Only one axis may leave the quadrant at a time: a triple past `half` on both would
+    /// walk two sub-patches in opposite directions, and §8.5.2 rejects it rather than
+    /// defining it.
+    ///
+    /// A coordinate that lands *on* `half` keeps the cell below it, so an in-quadrant read
+    /// never reaches for a corner it does not weight — which is what makes the wider domain
+    /// bit-inert on every well-conditioned input.
     fn sample(&self, i: usize, j: f32, k: f32) -> Vec3 {
-        let top = self.half as f32;
+        let half = self.half;
+        let resolution = 2 * half;
+        let top = resolution as f32;
         let j = j.clamp(0.0, top);
         let k = k.clamp(0.0, top);
-        let j0 = (j.floor() as usize).min(self.half - 1);
-        let k0 = (k.floor() as usize).min(self.half - 1);
+        debug_assert!(
+            j <= half as f32 || k <= half as f32,
+            "a grid query past `half` on both axes has no canonical representative",
+        );
+        let cell_origin = |coordinate: f32| {
+            let floor = coordinate.floor() as usize;
+            if coordinate <= half as f32 {
+                floor.min(half - 1)
+            } else {
+                floor.min(resolution - 1)
+            }
+        };
+        let j0 = cell_origin(j);
+        let k0 = cell_origin(k);
         let tj = j - j0 as f32;
         let tk = k - k0 as f32;
         self.at(i, j0, k0) * ((1.0 - tj) * (1.0 - tk))
