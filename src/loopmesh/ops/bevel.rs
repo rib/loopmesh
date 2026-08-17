@@ -5201,6 +5201,25 @@ impl LoopMesh {
         if p_samples.len() != segments as usize + 1 || q_samples.len() != segments as usize + 1 {
             return;
         }
+        // The no-regression argument for reading the cycle off the labels is that the two
+        // candidate ring orders below are exact negations of each other. They are — unless
+        // a vert appears on *both* endpoints' chains, where the dedup collapses both orders
+        // onto the same triple and the negation stops holding. No builder can produce that
+        // (the two chains sit at opposite ends of E), so keep it checkable rather than
+        // assumed.
+        //
+        // The negation is also what makes a seed flip *inert* wherever the rail repair
+        // below finds an anchor — but only **conditionally**, on that anchor being the
+        // lone face on its rail (`strip_runs_with_restitched_face`'s radial-1 assert):
+        // flipping the seed flips the direction the rail is read in, and a radial-1 rail
+        // answers the two directions oppositely, so `reversed` flips back and the emitted
+        // cycle is unchanged. On a radial-2 rail *both* directions answer yes, the
+        // compensation stops holding, and a seed change would propagate to the output.
+        // Unreachable today, which is why that stays an assert rather than a branch.
+        debug_assert!(
+            p_samples.iter().all(|p| !q_samples.contains(p)),
+            "the two endpoints' chains must be vertex-disjoint",
+        );
 
         // §7.8.3's absolute-winding rule fixes each quad's *directed* cycle with nothing
         // but the two arcs and their `P`-end indexing consulted: index each end's arc
@@ -5216,17 +5235,53 @@ impl LoopMesh {
         // makes the twisted strip come out right: there the crack leaves neither outer
         // rail owned by a rebuilt flank, so the anchor below has no input and whatever
         // handedness the seed carried survives untouched.
-        let crosses_first = matches!(chain_a.side_label, SideLabel::PrevFirst);
+        //
+        // The rule is endpoint-symmetric — relabelling `a ↔ b` sends quad `k` to quad
+        // `segments − k + 1` with its directed cycle unchanged, so either end may anchor
+        // the numbering — which is what lets an unlabelled `a` end take its seed from `b`
+        // instead of falling back to a handedness nothing chose.
+        //
+        // What that buys is bounded, and worth stating exactly: the *pairing* above is
+        // still established by the rail-existence probe on such a strip — §7.8.3's
+        // explicitly-excluded flank-identity route — so what the `b`-anchored seed
+        // delivers is that the **winding is right whenever the pairing is right**. It
+        // does not make the pairing right. Only recording the label on junction chains
+        // does that.
+        let anchor_chain_starts_at_prev_side =
+            match strip_winding_seed(chain_a.side_label, chain_b.side_label, swap) {
+                Some(seed) => seed,
+                None => {
+                    // Neither end carries a label because *this crate's junction chain
+                    // builders record none* — a gap on our side, not a licence from the
+                    // spec: §7.8.6's junction bullet scopes out the collapse and the ring
+                    // it produces, not the `P` / `N` labels, which §8.3.0 reads at both
+                    // ends of every multi-segment strip whatever the endpoint's valence.
+                    // Until they are recorded the seed leans entirely on the rail repair
+                    // below, which needs a rail to read.
+                    debug_assert!(
+                        anchored,
+                        "an unlabelled strip end needs a re-stitched rail to wind against",
+                    );
+                    false
+                }
+            };
 
         // The seed is still checked against an outer longitudinal rail (§5.1 / §6.7.5.2)
-        // — see `strip_runs_with_restitched_face` — because an *unlabelled* junction end
-        // leaves the arcs indexed by their boundvert ring alone, with no `P` end to read.
-        // A rung edge borders the *fill*, not a rebuilt original, so it is no such anchor.
-        let reversed =
-            self.strip_runs_with_restitched_face(&p_samples, &q_samples, crosses_first, anchored);
+        // — see `strip_runs_with_restitched_face` — because junction ends at *both* ends
+        // of E leave the arcs indexed by their boundvert ring alone, with no *recorded*
+        // `P` end to read. Recorded: §8.3.0 defines the label at both ends of every
+        // multi-segment strip whatever the endpoint's valence, and this crate's junction
+        // chain builders simply do not carry it through. A rung edge borders the *fill*,
+        // not a rebuilt original, so it is no such anchor.
+        let reversed = self.strip_runs_with_restitched_face(
+            &p_samples,
+            &q_samples,
+            anchor_chain_starts_at_prev_side,
+            anchored,
+        );
 
         for k in 1..=segments as usize {
-            let ring = if crosses_first {
+            let ring = if anchor_chain_starts_at_prev_side {
                 [
                     p_samples[k - 1],
                     q_samples[k - 1],
@@ -5269,8 +5324,9 @@ impl LoopMesh {
     /// Whether the seeded strip order (BEVEL.md §8.3.0, §7.8.3's absolute-winding rule)
     /// would traverse an outer longitudinal rail the *same* way the re-stitched
     /// original face already traverses it — i.e. whether the strip must be reversed
-    /// to keep every rail radial-2 (§5.1). `crosses_first` says which cycle the caller
-    /// seeded: `[p_(k−1), q_(k−1), q_k, p_k]` when set, its reverse when clear.
+    /// to keep every rail radial-2 (§5.1). `anchor_chain_starts_at_prev_side` says which
+    /// cycle the caller seeded — it is set when the arc the caller anchored the numbering
+    /// on runs `P → N`, giving `[p_(k−1), q_(k−1), q_k, p_k]`, and clear for its reverse.
     ///
     /// The strip's two *outer* longitudinal rails — sample 0 and sample `segments`
     /// (§6.7.5.2) — are the boundary the two re-stitched originals rebuilt along E's
@@ -5280,9 +5336,9 @@ impl LoopMesh {
     /// whole strip, since consecutive quads traverse their shared interior rail
     /// oppositely by construction.
     ///
-    /// Under the seed `crosses_first` names, quad 1 runs the sample-0 rail `p_0 → q_0`
-    /// and quad `segments` runs the sample-`segments` rail `q_s → p_s` (both reversed
-    /// when `crosses_first` is clear); each must run *opposite* the re-stitched
+    /// Under the seed `anchor_chain_starts_at_prev_side` names, quad 1 runs the sample-0
+    /// rail `p_0 → q_0` and quad `segments` runs the sample-`segments` rail `q_s → p_s`
+    /// (both reversed when it is clear); each must run *opposite* the re-stitched
     /// face already owning that rail, so the rail ends radial-2. The sample-0 rail
     /// decides whenever it carries a face; the sample-`segments` rail is the fallback
     /// for a collapsed chain end. Should the input mesh be winding-inconsistent across
@@ -5293,13 +5349,13 @@ impl LoopMesh {
         &self,
         p_samples: &[VertexKey],
         q_samples: &[VertexKey],
-        crosses_first: bool,
+        anchor_chain_starts_at_prev_side: bool,
         anchored: bool,
     ) -> bool {
         debug_assert_eq!(p_samples.len(), q_samples.len());
         debug_assert!(!p_samples.is_empty());
         let last = p_samples.len() - 1;
-        let rails = if crosses_first {
+        let rails = if anchor_chain_starts_at_prev_side {
             [
                 (p_samples[0], q_samples[0]),
                 (q_samples[last], p_samples[last]),
@@ -14695,11 +14751,14 @@ struct CornerVert {
     face: FaceKey,
     near_vert: VertexKey,
     /// Which of `vertex`'s two BEVEL.md §7.8.3 side labels `near_vert` carries:
-    /// `PrevFirst` for `P(vertex)`, `NextFirst` for `N(vertex)`. `Unlabelled` at a
-    /// junction endpoint, whose sector boundvert ring establishes no such label —
-    /// there the rail pairing has no choice but to name the side by flank face, which
-    /// is §7.8.3's wrong route whenever that endpoint is also inconsistently wound.
-    /// §7.8.6's third bullet leaves exactly that configuration unpinned; see
+    /// `PrevFirst` for `P(vertex)`, `NextFirst` for `N(vertex)`.
+    ///
+    /// `Unlabelled` at a junction endpoint — not because no label exists there (§7.8.6's
+    /// junction bullet scopes out the *collapse* and the ring it produces, explicitly not
+    /// the `P` / `N` labels, which §8.3.0 reads at every beveled endpoint of any valence)
+    /// but because the junction ring builders here do not record which of `vertex`'s two
+    /// rotational slots each boundvert filled. Where that leaves the rail pairing naming
+    /// the side by flank face instead, it is on §7.8.3's explicitly wrong route; see
     /// [`labelled_strip_rails`].
     side_label: SideLabel,
 }
@@ -14912,10 +14971,12 @@ impl RungEnds {
 /// rotational order, or `N(v)`, the one on the sector following it.
 ///
 /// **Invariant: only junction-family chains are `Unlabelled`.** A junction chain is
-/// ordered by its boundvert ring alone, which is a ring statement establishing no such
-/// label; every terminal chain is labelled at layout time. `Unlabelled` at either end of
-/// an edge therefore means the rail pairing must fall back to naming the side
-/// topologically — see `build_multisegment_strip`.
+/// ordered by its boundvert ring alone and the builder does not carry the endpoint's
+/// rotational slot through to the chain; every terminal chain is labelled at layout time.
+/// `Unlabelled` is therefore a statement about this crate, not about the endpoint — the
+/// label is defined at every beveled endpoint of any valence (§7.8.6's junction bullet,
+/// §8.3.0) — and where it appears the rail pairing must fall back to naming the side
+/// topologically. See `build_multisegment_strip`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SideLabel {
     PrevFirst,
@@ -15579,12 +15640,14 @@ fn labelled_rung_ends(
 /// flank's own two ring verts. `None` when *either* endpoint is unlabelled (a junction
 /// end), where the pairing falls back to naming the side by flank-face identity.
 ///
-/// That fallback is **not** justified by "the labels would have been mirrored anyway": an
-/// inconsistently-wound endpoint carrying two or more beveled edges makes this return
-/// `None` for its edges, so both ends get paired by flank face — §7.8.3's explicitly named
-/// wrong route. What covers it is narrower: §7.8.6's third bullet puts junctions at an
-/// inconsistently-wound endpoint **out of scope**, so that configuration is simply
-/// unpinned. Labelling junction boundverts would close the hole.
+/// That fallback is **not** justified by "the labels would have been mirrored anyway", and
+/// it is not licensed by the spec either: an inconsistently-wound endpoint carrying two or
+/// more beveled edges makes this return `None` for its edges, so both ends get paired by
+/// flank face — §7.8.3's explicitly named wrong route. §7.8.6's *fourth* bullet ("junctions
+/// are out of scope") does **not** cover it: that bullet scopes out the §7.8.2 collapse and
+/// the boundvert ring it produces, and says in as many words that the `P` / `N` labels are
+/// defined at every beveled endpoint of any valence — §8.3.0 restates it. So the hole is
+/// ours: recording the label on junction boundverts is what closes it.
 fn labelled_strip_rails(
     corner_vert: &[CornerVert],
     edge: EdgeKey,
@@ -15594,6 +15657,40 @@ fn labelled_strip_rails(
     let (prev_a, next_a) = labelled_rung_ends(corner_vert, edge, a)?;
     let (prev_b, next_b) = labelled_rung_ends(corner_vert, edge, b)?;
     Some([(prev_a, next_b), (next_a, prev_b)])
+}
+
+/// BEVEL.md §7.8.3's absolute-winding seed for one strip: whether the arc the numbering
+/// is anchored on runs `P → N`, so quad `k` comes out as `[p_(k−1), q_(k−1), q_k, p_k]`
+/// rather than its reverse.
+///
+/// **`swap` is a precondition the caller owes**, not a description of anything checkable
+/// here: it must be the reversal that leaves the two chains in *cross-label*
+/// correspondence, `q_(k−1)` reading the partner end's arc backwards from the `p`
+/// numbering (§7.8.3, §7.8.4). Every arm's correctness rests on that, including the arms
+/// that never see a second label — where a label is missing the caller derives `swap`
+/// from rail existence instead, and in the doubly-unlabelled case from nothing at all, so
+/// the burden of establishing the correspondence stays entirely on the caller.
+///
+/// The rule is **endpoint-symmetric** — relabelling `a ↔ b` sends quad `k` to quad
+/// `segments − k + 1` with its directed cycle unchanged — so either end may anchor the
+/// numbering and the two derivations must agree wherever both labels exist. That is what
+/// lets an unlabelled `a` end read its seed off `b`: with the chains paired cross-label,
+/// the seeded cycle is the rule's own exactly when the paired `q` walk starts at `N(b)`,
+/// since `q_(k−1)` then reads `B_(segments−k+1)`. Which is to say the unlabelled arms buy
+/// **the right winding whenever the pairing is right** — the pairing itself is the
+/// caller's precondition above, and on an unlabelled end it still comes from the rail
+/// probe §7.8.3 excludes.
+///
+/// `None` when neither end recorded a label, which is a gap in this crate's junction
+/// chain builders rather than an endpoint that has no labels — see [`SideLabel`].
+fn strip_winding_seed(label_a: SideLabel, label_b: SideLabel, swap: bool) -> Option<bool> {
+    match (label_a, label_b) {
+        (SideLabel::PrevFirst, _) => Some(true),
+        (SideLabel::NextFirst, _) => Some(false),
+        (SideLabel::Unlabelled, SideLabel::PrevFirst) => Some(swap),
+        (SideLabel::Unlabelled, SideLabel::NextFirst) => Some(!swap),
+        (SideLabel::Unlabelled, SideLabel::Unlabelled) => None,
+    }
 }
 
 /// True when all the corner-vert positions coincide within tolerance (the §8.3.4
@@ -51701,42 +51798,100 @@ mod tests {
         for segments in 1..=4 {
             let (mut mesh, edge) = two_quad_plane(false);
             bevel_one_edge(&mut mesh, edge, segments);
-
-            let flanks = [
-                face_through(&mesh, Vec3::ZERO),
-                face_through(&mesh, Vec3::new(2.0, 0.0, 0.0)),
-            ];
-            let mut same_endpoint_sides = 0;
-            for face in mesh.face_keys() {
-                if flanks.contains(&face) {
-                    continue;
-                }
-                let cycle: Vec<Vec3> = mesh
-                    .face_vert_keys(face)
-                    .into_iter()
-                    .map(|v| mesh.vertex_position(v))
-                    .collect();
-                for index in 0..cycle.len() {
-                    let from = cycle[index];
-                    let to = cycle[(index + 1) % cycle.len()];
-                    if (from.y - to.y).abs() > 1.0e-4 {
-                        continue;
-                    }
-                    same_endpoint_sides += 1;
-                    assert!(
-                        to.x > from.x + 1.0e-4,
-                        "at segments = {segments} a strip quad walks {from:?} → {to:?}, \
-                         which runs P-ward to N-ward — the strip is reversed",
-                    );
-                }
-            }
-            assert_eq!(
-                same_endpoint_sides,
-                2 * segments as usize,
-                "every one of the {segments} strip quads contributes one side per endpoint",
-            );
+            assert_plane_strip_winds_n_to_p(&mesh, segments);
             mesh.validate_topology();
         }
+    }
+
+    /// §7.8.3 reading (1) on the two-quad plane's strip, whichever builder emitted it:
+    /// every strip quad's two same-endpoint sides — the two joining rung ends at equal
+    /// `y` — must be walked `N`-ward to `P`-ward, which on this fixture is `+x`.
+    ///
+    /// Only the planar faces are read, so the same check serves a mesh that also carries
+    /// a disjoint junction body: the plane sits entirely in `z = 0` and nothing the cube
+    /// contributes reaches it.
+    fn assert_plane_strip_winds_n_to_p(mesh: &LoopMesh, segments: u32) {
+        let flanks = [
+            face_through(mesh, Vec3::ZERO),
+            face_through(mesh, Vec3::new(2.0, 0.0, 0.0)),
+        ];
+        let mut same_endpoint_sides = 0;
+        for face in mesh.face_keys() {
+            if flanks.contains(&face) {
+                continue;
+            }
+            let cycle: Vec<Vec3> = mesh
+                .face_vert_keys(face)
+                .into_iter()
+                .map(|v| mesh.vertex_position(v))
+                .collect();
+            if cycle.iter().any(|position| position.z.abs() > 1.0e-4) {
+                continue;
+            }
+            for index in 0..cycle.len() {
+                let from = cycle[index];
+                let to = cycle[(index + 1) % cycle.len()];
+                if (from.y - to.y).abs() > 1.0e-4 {
+                    continue;
+                }
+                same_endpoint_sides += 1;
+                assert!(
+                    to.x > from.x + 1.0e-4,
+                    "at segments = {segments} a strip quad walks {from:?} → {to:?}, \
+                     which runs P-ward to N-ward — the strip is reversed",
+                );
+            }
+        }
+        assert_eq!(
+            same_endpoint_sides,
+            2 * segments as usize,
+            "every one of the {segments} strip quads contributes one side per endpoint",
+        );
+    }
+
+    /// §7.8.3's endpoint-symmetry lemma, on the winding seed itself: relabelling `a ↔ b`
+    /// leaves every quad's directed cycle unchanged, so either end may anchor the
+    /// numbering. That is what licenses reading the seed off `b` when `a` carries no
+    /// label — the case a junction end at `a` puts the strip in — and it is only sound
+    /// if the two derivations agree wherever both labels exist, which is what this pins.
+    ///
+    /// The pairing route sets `swap` from the labels themselves when both are present
+    /// (agreeing labels are §7.8.3's un-mirrored, tied-vote regime and need the `q` chain
+    /// reversed), so the `b`-anchored derivation is fed exactly the `swap` the real
+    /// caller would have.
+    ///
+    /// This is the **only** pin on the two unlabelled-`a` arms, and deliberately a
+    /// function-level one: no mesh-level assertion can reach them. An unlabelled end
+    /// sends `build_multisegment_strip` down the rail-existence route, which reports
+    /// `anchored` on every mesh the public API can build — and while anchored, flipping
+    /// the seed flips the direction `strip_runs_with_restitched_face` reads its radial-1
+    /// rail in, so `reversed` flips back and the emitted cycle is byte-identical. The
+    /// seed only reaches the output where that repair has no anchor, which for an
+    /// unlabelled end means both of E's originals lost their rebuild — a state the
+    /// caller's own `debug_assert!` calls broken. So the arms are pinned here or nowhere.
+    #[test]
+    fn strip_winding_seed_is_the_same_from_either_endpoints_label() {
+        for label_a in [SideLabel::PrevFirst, SideLabel::NextFirst] {
+            for label_b in [SideLabel::PrevFirst, SideLabel::NextFirst] {
+                let swap = label_a == label_b;
+                let from_a = strip_winding_seed(label_a, label_b, swap);
+                let from_b = strip_winding_seed(SideLabel::Unlabelled, label_b, swap);
+                assert_eq!(
+                    from_a, from_b,
+                    "an unlabelled end must seed the same cycle its labelled partner does",
+                );
+                assert_eq!(
+                    from_a,
+                    Some(label_a == SideLabel::PrevFirst),
+                    "the anchor arc runs P → N exactly when its own label says so",
+                );
+            }
+        }
+        assert_eq!(
+            strip_winding_seed(SideLabel::Unlabelled, SideLabel::Unlabelled, false),
+            None,
+            "two unlabelled ends leave the seed to the rail repair",
+        );
     }
 
     /// §7.8.4 / §7.8.3's index rule at `segments = 2`: the rungs open into two profile
@@ -51795,18 +51950,22 @@ mod tests {
         (mesh, isolated, junction)
     }
 
-    fn bevel_count_delta(mesh: &mut LoopMesh, edges: &[EdgeKey]) -> (i64, i64, i64) {
-        let before = counts(mesh);
+    fn bevel_edges_at_segments(mesh: &mut LoopMesh, edges: &[EdgeKey], segments: u32) {
         let selection: Vec<GeomKey> = edges.iter().map(|&e| e.into()).collect();
         mesh.bevel(
             &selection,
             BevelOptions {
                 offset: 0.2,
                 affect: BevelAffect::Edges,
-                segments: 1,
+                segments,
                 ..Default::default()
             },
         );
+    }
+
+    fn bevel_count_delta(mesh: &mut LoopMesh, edges: &[EdgeKey]) -> (i64, i64, i64) {
+        let before = counts(mesh);
+        bevel_edges_at_segments(mesh, edges, 1);
         let after = counts(mesh);
         (
             after.0 as i64 - before.0 as i64,
@@ -51850,7 +52009,23 @@ mod tests {
             "the §7.8.3 crack survives the junction route: the twisted strip shares no \
              edge with either rebuilt flank",
         );
+        assert_plane_strip_winds_n_to_p(&mesh, 1);
         mesh.validate_topology();
+
+        // The absolute-winding rule is one rule at every `segments` (§7.8.3), and the
+        // crack leaves the multi-rung strip nothing to be repaired against, so the
+        // junction route has to spell the rule's own cycle from the seed alone here too.
+        for segments in 2..=4 {
+            let (mut mesh, isolated, junction) = plane_plus_cube_junction(false);
+            bevel_edges_at_segments(&mut mesh, &[isolated, junction[0], junction[1]], segments);
+            assert_eq!(
+                strip_flank_shared_edges(&mesh),
+                0,
+                "the crack survives the profile on the junction route as well",
+            );
+            assert_plane_strip_winds_n_to_p(&mesh, segments);
+            mesh.validate_topology();
+        }
     }
 
     /// The mirrored-label control for the test above: on a contiguous pair the
