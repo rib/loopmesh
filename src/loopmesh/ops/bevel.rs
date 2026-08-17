@@ -5202,18 +5202,45 @@ impl LoopMesh {
             return;
         }
 
-        // The strip's absolute winding is anchored on an outer longitudinal rail
-        // (§5.1 / §6.7.5.2) — see `strip_runs_with_restitched_face`. A rung edge
-        // borders the *fill*, not a rebuilt original, so it is no such anchor.
-        let reversed = self.strip_runs_with_restitched_face(&p_samples, &q_samples, anchored);
+        // §7.8.3's absolute-winding rule fixes each quad's *directed* cycle with nothing
+        // but the two arcs and their `P`-end indexing consulted: index each end's arc
+        // forward from that end's `P` label and quad `k` is
+        // `[A_(k−1), B_(s−k+1), B_(s−k), A_k]` — cross the edge first, then step *down*
+        // both arcs. With the chains already paired cross-label, that is
+        // `[p_(k−1), q_(k−1), q_k, p_k]` when the anchor chain runs `P → N`, and its
+        // reverse when it runs `N → P`: re-indexing *both* arcs from the other label
+        // reverses the cycle (relabelling the two endpoints, by contrast, leaves it
+        // alone, which is why either endpoint may anchor the numbering).
+        //
+        // Seeding the rule's own cycle rather than repairing an arbitrary one is what
+        // makes the twisted strip come out right: there the crack leaves neither outer
+        // rail owned by a rebuilt flank, so the anchor below has no input and whatever
+        // handedness the seed carried survives untouched.
+        let crosses_first = matches!(chain_a.side_label, SideLabel::PrevFirst);
+
+        // The seed is still checked against an outer longitudinal rail (§5.1 / §6.7.5.2)
+        // — see `strip_runs_with_restitched_face` — because an *unlabelled* junction end
+        // leaves the arcs indexed by their boundvert ring alone, with no `P` end to read.
+        // A rung edge borders the *fill*, not a rebuilt original, so it is no such anchor.
+        let reversed =
+            self.strip_runs_with_restitched_face(&p_samples, &q_samples, crosses_first, anchored);
 
         for k in 1..=segments as usize {
-            let ring = [
-                p_samples[k - 1],
-                p_samples[k],
-                q_samples[k],
-                q_samples[k - 1],
-            ];
+            let ring = if crosses_first {
+                [
+                    p_samples[k - 1],
+                    q_samples[k - 1],
+                    q_samples[k],
+                    p_samples[k],
+                ]
+            } else {
+                [
+                    p_samples[k - 1],
+                    p_samples[k],
+                    q_samples[k],
+                    q_samples[k - 1],
+                ]
+            };
             let mut distinct: Vec<VertexKey> = Vec::with_capacity(4);
             for &v in &ring {
                 if !distinct.contains(&v) {
@@ -5239,10 +5266,11 @@ impl LoopMesh {
         }
     }
 
-    /// Whether the `[p_(k−1), p_k, q_k, q_(k−1)]` strip order (BEVEL.md §8.3.0)
+    /// Whether the seeded strip order (BEVEL.md §8.3.0, §7.8.3's absolute-winding rule)
     /// would traverse an outer longitudinal rail the *same* way the re-stitched
     /// original face already traverses it — i.e. whether the strip must be reversed
-    /// to keep every rail radial-2 (§5.1).
+    /// to keep every rail radial-2 (§5.1). `crosses_first` says which cycle the caller
+    /// seeded: `[p_(k−1), q_(k−1), q_k, p_k]` when set, its reverse when clear.
     ///
     /// The strip's two *outer* longitudinal rails — sample 0 and sample `segments`
     /// (§6.7.5.2) — are the boundary the two re-stitched originals rebuilt along E's
@@ -5252,8 +5280,9 @@ impl LoopMesh {
     /// whole strip, since consecutive quads traverse their shared interior rail
     /// oppositely by construction.
     ///
-    /// Quad 1 runs the sample-0 rail `q_0 → p_0` and quad `segments` runs the
-    /// sample-`segments` rail `p_s → q_s`; each must run *opposite* the re-stitched
+    /// Under the seed `crosses_first` names, quad 1 runs the sample-0 rail `p_0 → q_0`
+    /// and quad `segments` runs the sample-`segments` rail `q_s → p_s` (both reversed
+    /// when `crosses_first` is clear); each must run *opposite* the re-stitched
     /// face already owning that rail, so the rail ends radial-2. The sample-0 rail
     /// decides whenever it carries a face; the sample-`segments` rail is the fallback
     /// for a collapsed chain end. Should the input mesh be winding-inconsistent across
@@ -5264,15 +5293,23 @@ impl LoopMesh {
         &self,
         p_samples: &[VertexKey],
         q_samples: &[VertexKey],
+        crosses_first: bool,
         anchored: bool,
     ) -> bool {
         debug_assert_eq!(p_samples.len(), q_samples.len());
         debug_assert!(!p_samples.is_empty());
         let last = p_samples.len() - 1;
-        let rails = [
-            (q_samples[0], p_samples[0]),
-            (p_samples[last], q_samples[last]),
-        ];
+        let rails = if crosses_first {
+            [
+                (p_samples[0], q_samples[0]),
+                (q_samples[last], p_samples[last]),
+            ]
+        } else {
+            [
+                (q_samples[0], p_samples[0]),
+                (p_samples[last], q_samples[last]),
+            ]
+        };
         for (from, to) in rails {
             let Some(rail) = self.query_edge_exists(from, to) else {
                 continue;
@@ -51641,6 +51678,65 @@ mod tests {
             "the strip's rails join opposite side labels, not alike ones: got {strip:?}",
         );
         mesh.validate_topology();
+    }
+
+    /// §7.8.3's **absolute winding** on the tied-vote twist, at every `segments`. The
+    /// twist is the one configuration where neither outer rail belongs to a rebuilt
+    /// flank (the crack), so §5.1's "wind against the face across the shared edge" has
+    /// no input and the emitted cycle must come from the rule itself: every quad's two
+    /// same-endpoint sides run `N`-ward to `P`-ward (reading (1)).
+    ///
+    /// On this fixture that reads off as `+x` at both ends — at `a = (1, 0)` the slid
+    /// vert `(0.8, 0)` is `N(a)` and the collapsed `(1, 0)` is `P(a)`; at `b = (1, 1)`
+    /// the collapsed `(1, 1)` is `N(b)` and the slid `(1.2, 1)` is `P(b)` — which is why
+    /// the labelling can be pinned through positions alone. Nothing weaker sees a
+    /// reversal: the strip is edge-disjoint from everything, so it stays internally
+    /// consistent when reversed wholesale, and any comparison blind to winding calls
+    /// the reversed strip equal.
+    ///
+    /// `segments = 1` and `segments ≥ 2` are emitted by two different builders; the rule
+    /// is one rule, so both are swept here.
+    #[test]
+    fn edge_bevel_tied_vote_twist_quads_wind_n_to_p_at_both_ends() {
+        for segments in 1..=4 {
+            let (mut mesh, edge) = two_quad_plane(false);
+            bevel_one_edge(&mut mesh, edge, segments);
+
+            let flanks = [
+                face_through(&mesh, Vec3::ZERO),
+                face_through(&mesh, Vec3::new(2.0, 0.0, 0.0)),
+            ];
+            let mut same_endpoint_sides = 0;
+            for face in mesh.face_keys() {
+                if flanks.contains(&face) {
+                    continue;
+                }
+                let cycle: Vec<Vec3> = mesh
+                    .face_vert_keys(face)
+                    .into_iter()
+                    .map(|v| mesh.vertex_position(v))
+                    .collect();
+                for index in 0..cycle.len() {
+                    let from = cycle[index];
+                    let to = cycle[(index + 1) % cycle.len()];
+                    if (from.y - to.y).abs() > 1.0e-4 {
+                        continue;
+                    }
+                    same_endpoint_sides += 1;
+                    assert!(
+                        to.x > from.x + 1.0e-4,
+                        "at segments = {segments} a strip quad walks {from:?} → {to:?}, \
+                         which runs P-ward to N-ward — the strip is reversed",
+                    );
+                }
+            }
+            assert_eq!(
+                same_endpoint_sides,
+                2 * segments as usize,
+                "every one of the {segments} strip quads contributes one side per endpoint",
+            );
+            mesh.validate_topology();
+        }
     }
 
     /// §7.8.4 / §7.8.3's index rule at `segments = 2`: the rungs open into two profile
