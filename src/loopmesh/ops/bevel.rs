@@ -6307,7 +6307,8 @@ impl LoopMesh {
     /// Build a junction's **inner-miter** boundvert ring and its cross-section chains
     /// (BEVEL.md §8.9.3 / §8.9.5).
     ///
-    /// Every **non-reflex** sector is rebuilt as an **arc start** (§8.9.3): its §7.6.2
+    /// Every **non-reflex and not straight** sector is rebuilt as an **arc start**
+    /// (§8.9.3): its §7.6.2
     /// meet-point becomes the stored **arc midpoint**, and the sector gains two ring
     /// boundverts — `B1` keeping the opening edge's side and a new `B3` taking over the
     /// closing edge's side. Both are pushed `spread` away from the junction along their
@@ -6323,20 +6324,23 @@ impl LoopMesh {
     /// non-sharp `miter_outer` the whole junction is declined here and
     /// [`Self::build_junction_outer_miter`] owns it.
     ///
-    /// The arc build is segments-general (§8.9.5.1): each non-reflex sector's `B1 → B3`
+    /// The arc build is segments-general (§8.9.5.1): each qualifying sector's `B1 → B3`
     /// internal edge carries the `segments + 1`-sample inscribed arc, so odd `segments`
     /// closes the enlarged ring rather than declining. The inner miter splits **every**
-    /// non-reflex sector, so the central polygon's valence equals the **boundvert-ring
-    /// valence** — `2s` when every sector is convex (each of the `s` sectors contributing
-    /// both `B1` and `B3`), `2s − 1` when one sector is a sharp reflex keeping its single
-    /// meet-point — **not** the outer miter's `s + 1` (§8.9.5.3 splits exactly one sector).
+    /// qualifying sector, so the central polygon's valence equals the **boundvert-ring
+    /// valence** — one boundvert per unsplit sector plus two per split one, i.e. `2s` when
+    /// every sector qualifies and one fewer per sector held back as a sharp reflex or a
+    /// straight meet-point — **not** the outer miter's `s + 1` (§8.9.5.3 splits exactly one
+    /// sector). A pipe junction is the shape that makes the straight class visible: its
+    /// bare `180°` side is one exactly-straight sector, so an `s = 3` pipe ring goes to
+    /// **5**, never 4 (§8.9.8's `#miter-never-pipe` derivation).
     ///
     /// All classification runs read-only first; the method returns `false` **without
     /// mutating** for any junction outside its scope (`segments < 2`, the *analytic* square
     /// sentinel — whose (f.5) cap seeds this builder does not mint; a custom curve admits at
     /// any slider value, (f.1) step 1 keeping it off that lattice — fewer than three
-    /// sectors, an all-non-reflex ring that is not the forced
-    /// tri-corner geometry, more than one reflex sector, or a reflex sector the outer
+    /// sectors, no qualifying sector at all (the miter is then inert and the enlarged ring
+    /// *is* the sharp ring), more than one reflex sector, or a reflex sector the outer
     /// miter owns), so the caller falls back to the sharp ring.
     #[allow(clippy::too_many_arguments)]
     fn build_junction_inner_miter<'c>(
@@ -6360,9 +6364,9 @@ impl LoopMesh {
         // §8.9.5: the inner miter rides the [V-ADJ] grid, so `segments ≥ 2`. The arc build is
         // segments-general and exponent-general (§8.9.5.1) — the same sampling the outer `ARC`
         // uses (§8.9.3 rebuilds the inner miter "exactly like an outer ARC") — so odd
-        // `segments` closes on the enlarged boundvert ring (valence `2s` all-convex, `2s − 1`
-        // with a sharp reflex sector, since every non-reflex sector splits — not the outer
-        // miter's `s + 1`) rather than declining to the sharp ring.
+        // `segments` closes on the enlarged boundvert ring (valence `2s` when every sector
+        // fires, one fewer for each sector held back as a sharp reflex or a straight
+        // meet-point — not the outer miter's `s + 1`) rather than declining to the sharp ring.
         //
         // The whole **analytic** band is admitted. §8.9.5's exponent-scope note makes the arc
         // chain read the run's own §8.6.4 spacing table at every `r`, and §8.9.3 rebuilds a
@@ -6398,60 +6402,52 @@ impl LoopMesh {
         let vertex_position = self.vertex_position(vertex);
 
         // Read-only classification pass (§8.9.1): solve each sector's meet-point and its
-        // two flanking edge directions, and run the winding-invariant signed reflex test
-        // in the genuine incident-face frame (`cross · n_ref < 0` ⇒ reflex).
+        // two flanking edge directions, and take the three-way straight / reflex /
+        // non-reflex verdict.
         struct SectorPlan {
             opening: EdgeKey,
             closing: EdgeKey,
             meet: Vec3,
             dir_open: Vec3,
             dir_close: Vec3,
-            reflex: bool,
+            class: MiterSectorClass,
         }
         let mut plans: Vec<SectorPlan> = Vec::with_capacity(sector_count);
         for sector in &sectors {
-            if sector.bounding_edges.len() < 2 {
+            let (Some(&opening), Some(&closing)) =
+                (sector.bounding_edges.first(), sector.bounding_edges.get(1))
+            else {
                 return false;
-            }
-            let opening = sector.bounding_edges[0];
-            let closing = sector.bounding_edges[1];
+            };
             if sector.corners.is_empty() {
                 return false;
             }
-            let dir_open = match self.edge_direction_from(opening, vertex, vertex_position) {
-                Some(direction) => direction,
-                None => return false,
+            let Some(verdict) = self.classify_miter_sector(vertex, vertex_position, sector) else {
+                return false;
             };
-            let dir_close = match self.edge_direction_from(closing, vertex, vertex_position) {
-                Some(direction) => direction,
-                None => return false,
-            };
-            let cross = (-dir_open).cross(-dir_close);
-            let reference = self.reflex_reference_normal(sector, vertex);
-            let reflex = cross.dot(reference) < 0.0;
             let meet = self.solve_meet_point(vertex, vertex_position, sector, offset);
             plans.push(SectorPlan {
                 opening,
                 closing,
                 meet,
-                dir_open,
-                dir_close,
-                reflex,
+                dir_open: verdict.dir_open,
+                dir_close: verdict.dir_close,
+                class: verdict.class,
             });
         }
 
         // §8.9.1: a junction has at most one reflex sector. Two or more contradicts that
         // invariant, so decline rather than build an ill-defined ring.
-        let reflex_count = plans.iter().filter(|plan| plan.reflex).count();
+        let reflex_count = plans
+            .iter()
+            .filter(|plan| plan.class == MiterSectorClass::Reflex)
+            .count();
         match reflex_count {
-            // The all-convex ring keeps the §8.5.1 forced tri-corner geometry gate: an
-            // oblique or unequal-offset convex junction has no distilled inner-miter fill.
-            0 => {
-                let meet_points: Vec<Vec3> = plans.iter().map(|plan| plan.meet).collect();
-                if !tri_corner_meet_geometry(vertex_position, &meet_points) {
-                    return false;
-                }
-            }
+            // §8.9.3 / §8.9.3.2(a) license **no** junction-level geometry gate on the
+            // all-convex ring: the inner miter has no beveled-edge-count floor, no
+            // `segments` floor, and no admission test beyond the per-sector
+            // non-reflex-and-not-straight predicate.
+            0 => {}
             // The reflex sector is `miter_outer`'s. Only when the outer miter is `Sharp`
             // does it stay a plain meet-point this builder can carry; otherwise the outer
             // builder owns the whole ring.
@@ -6463,8 +6459,19 @@ impl LoopMesh {
             _ => return false,
         }
 
-        // Mutation pass: every check has passed. Each non-reflex sector splits into its
-        // arc pair; the reflex sector (if any) keeps its single sharp meet-point.
+        // No sector qualifies, so the miter is inert here (§8.9.1's straight bullet) and
+        // the enlarged ring *is* the sharp ring. Hand it back to the ordinary sharp path
+        // rather than rebuild an identical ring through the miter machinery.
+        if plans
+            .iter()
+            .all(|plan| plan.class != MiterSectorClass::NonReflex)
+        {
+            return false;
+        }
+
+        // Mutation pass: every check has passed. Each non-reflex, non-straight sector
+        // splits into its arc pair; a straight sector and the reflex sector (if any) each
+        // keep their single sharp meet-point.
         // Per sector: its ring boundverts in ring order (one when sharp, `B1`/`B3` when
         // split), the split sector's internal arc chain (`segments + 1` samples,
         // §8.9.5.1), and that arc's raw coarse mid. The arc cell is always symmetric
@@ -6479,7 +6486,7 @@ impl LoopMesh {
             Vec::with_capacity(sector_count);
         let mut sector_bulge: Vec<Option<Vec3>> = Vec::with_capacity(sector_count);
         for plan in &plans {
-            if plan.reflex {
+            if plan.class != MiterSectorClass::NonReflex {
                 // §5.2.4: not yet minted from the corner.
                 let boundvert = self.create_vertex(plan.meet);
                 result.verts.push(boundvert);
@@ -6856,41 +6863,28 @@ impl LoopMesh {
         let vertex_position = self.vertex_position(vertex);
 
         // Read-only classification (§8.9.1): per sector solve the meet-point and the two
-        // flanking edge directions, and run the winding-invariant signed reflex test in
-        // the genuine incident-face frame (`cross · n_ref < 0` ⇒ reflex).
+        // flanking edge directions, and take the three-way straight / reflex / non-reflex
+        // verdict.
         struct SectorPlan {
             meet: Vec3,
             dir_open: Vec3,
             dir_close: Vec3,
-            reflex: bool,
+            class: MiterSectorClass,
         }
         let mut plans: Vec<SectorPlan> = Vec::with_capacity(sector_count);
         for sector in &sectors {
-            if sector.bounding_edges.len() < 2 {
-                return false;
-            }
-            let opening = sector.bounding_edges[0];
-            let closing = sector.bounding_edges[1];
             if sector.corners.is_empty() {
                 return false;
             }
-            let dir_open = match self.edge_direction_from(opening, vertex, vertex_position) {
-                Some(direction) => direction,
-                None => return false,
+            let Some(verdict) = self.classify_miter_sector(vertex, vertex_position, sector) else {
+                return false;
             };
-            let dir_close = match self.edge_direction_from(closing, vertex, vertex_position) {
-                Some(direction) => direction,
-                None => return false,
-            };
-            let cross = (-dir_open).cross(-dir_close);
-            let reference = self.reflex_reference_normal(sector, vertex);
-            let reflex = cross.dot(reference) < 0.0;
             let meet = self.solve_meet_point(vertex, vertex_position, sector, offset);
             plans.push(SectorPlan {
                 meet,
-                dir_open,
-                dir_close,
-                reflex,
+                dir_open: verdict.dir_open,
+                dir_close: verdict.dir_close,
+                class: verdict.class,
             });
         }
 
@@ -6898,7 +6892,9 @@ impl LoopMesh {
         // miter is inert (no reflex corner); fall back to the sharp ring. More than one
         // ⇒ the signed test contradicts the "at most one reflex sector" invariant, so
         // decline defensively rather than build an ill-defined ring.
-        let reflex_indices: Vec<usize> = (0..sector_count).filter(|&k| plans[k].reflex).collect();
+        let reflex_indices: Vec<usize> = (0..sector_count)
+            .filter(|&k| plans[k].class == MiterSectorClass::Reflex)
+            .collect();
         if reflex_indices.len() != 1 {
             return false;
         }
@@ -9173,6 +9169,59 @@ impl LoopMesh {
         self.junction_outward_normal(vertex)
     }
 
+    /// §8.9.1's three-way sector classification, with the two flanking edge directions
+    /// (both taken **out of** `vertex`) the miter builders slide along.
+    ///
+    /// The **straight** band is asked first, and that order is the guide's: §8.9.8's
+    /// pipe-ring derivation has the straight branch claim a sector "before any reflex
+    /// classification is asked for", which is what keeps an exactly-`180°` side of a pipe
+    /// junction out of *both* miters. Straightness is §7.6.2's near-collinear band on the
+    /// direction angle `θ_dir` — first flank taken **into** `v`, second **out of** it, so
+    /// `θ_dir ≈ 0` is the straight-through run and `θ_dir ≈ 180°` the double-back — and
+    /// the band is symmetric at both ends, so the supplementary pair a beveled spoke cuts
+    /// a `180°` side into is always classified together.
+    ///
+    /// Otherwise the winding-invariant signed test decides: `cross · n_ref < 0` is the
+    /// wide (reflex) sector, in the genuine incident-face frame and never a flattened
+    /// working-plane one (§8.9.1's consequence 1 — no flat swept-angle substitute, no
+    /// fitted angular cutoff).
+    ///
+    /// `None` when the sector carries fewer than two bounding edges (the malformed open
+    /// fan [`Self::sector_layout`] also declines) or when either flank is degenerate.
+    fn classify_miter_sector(
+        &self,
+        vertex: VertexKey,
+        vertex_position: Vec3,
+        sector: &Sector,
+    ) -> Option<MiterSectorVerdict> {
+        let dir_open =
+            self.edge_direction_from(*sector.bounding_edges.first()?, vertex, vertex_position)?;
+        let dir_close =
+            self.edge_direction_from(*sector.bounding_edges.get(1)?, vertex, vertex_position)?;
+        // Load-bearing coupling: these are bit-identical to the arguments `solve_meet_point`
+        // feeds its own §7.6.2 degenerate-ladder gate, which is *why* a `Straight` verdict
+        // guarantees the sector's meet-point took that ladder's (anti-)parallel branch —
+        // exactly what §8.9.1's straight bullet asks of a sector no miter may fire on. Any
+        // refactor that lets the two angles drift apart breaks the guarantee silently.
+        let class = if is_degenerate_direction_angle(unit_chord_angle_between(-dir_open, dir_close))
+        {
+            MiterSectorClass::Straight
+        } else if (-dir_open)
+            .cross(-dir_close)
+            .dot(self.reflex_reference_normal(sector, vertex))
+            < 0.0
+        {
+            MiterSectorClass::Reflex
+        } else {
+            MiterSectorClass::NonReflex
+        };
+        Some(MiterSectorVerdict {
+            dir_open,
+            dir_close,
+            class,
+        })
+    }
+
     /// One corner's face normal oriented to the **walk-positive** side (BEVEL.md §7.6.2):
     /// the face interior sweeps positively about this normal from the corner's outgoing
     /// edge round to its incoming one, so the wedge fixes the side and the true face plane
@@ -9457,26 +9506,24 @@ impl LoopMesh {
         let mut split: Vec<Option<(Vec3, Vec3)>> = Vec::with_capacity(sectors.len());
         let mut reflex_count = 0usize;
         for sector in sectors {
-            if sector.bounding_edges.len() < 2 || sector.corners.len() < 2 {
+            if sector.corners.len() < 2 {
                 split.push(None);
                 continue;
             }
-            let (Some(dir_open), Some(dir_close)) = (
-                self.edge_direction_from(sector.bounding_edges[0], vertex, vertex_position),
-                self.edge_direction_from(sector.bounding_edges[1], vertex, vertex_position),
-            ) else {
+            let Some(verdict) = self.classify_miter_sector(vertex, vertex_position, sector) else {
                 split.push(None);
                 continue;
             };
-            let reference = self.reflex_reference_normal(sector, vertex);
-            if (-dir_open).cross(-dir_close).dot(reference) < 0.0 {
-                reflex_count += 1;
-                split.push(None);
-                continue;
+            match verdict.class {
+                MiterSectorClass::Reflex => {
+                    reflex_count += 1;
+                    split.push(None);
+                }
+                MiterSectorClass::Straight => split.push(None),
+                MiterSectorClass::NonReflex => {
+                    split.push(Some((verdict.dir_open, verdict.dir_close)))
+                }
             }
-            let straight =
-                is_degenerate_direction_angle(unit_chord_angle_between(-dir_open, dir_close));
-            split.push((!straight).then_some((dir_open, dir_close)));
         }
         if reflex_count > 1 || (reflex_count == 1 && miter.outer != BevelMiter::Sharp) {
             return vec![None; sectors.len()];
@@ -15616,6 +15663,29 @@ struct Sector {
     corners: Vec<(EdgeKey, FaceKey)>,
 }
 
+/// §8.9.1's sector classification, which is **three**-way and not a reflex boolean: a
+/// sector whose two flanking beveled edges run nearly collinear fires *no* miter at all,
+/// and collapsing that class into `NonReflex` over-splits every straight sector in the
+/// mesh (§8.9.3 / §8.9.3.2(a)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MiterSectorClass {
+    /// The flanks run straight through `v` (`θ_dir ≈ 0`) or double back on it
+    /// (`θ_dir ≈ 180°`). The sector keeps its single §7.6.2 meet-point.
+    Straight,
+    /// The wide (`> 180°`) sector — `miter_outer`'s.
+    Reflex,
+    /// The narrow sector — `miter_inner`'s.
+    NonReflex,
+}
+
+/// One sector's §8.9.1 verdict: its class plus the two unit flank directions taken **out
+/// of** the junction vertex, which every miter builder then slides its boundverts along.
+struct MiterSectorVerdict {
+    dir_open: Vec3,
+    dir_close: Vec3,
+    class: MiterSectorClass,
+}
+
 /// The near-corner vert recorded for the (edge, vertex, face) corner. `None` when the
 /// placement pass **declined** that corner (a degenerate endpoint it could not close):
 /// the strip that would have landed on it is then declined too, rather than the corner
@@ -15801,9 +15871,11 @@ fn tri_corner_shape_admits(
 
 /// The §8.5.1 forced-tri-corner geometry test on three meet-point positions
 /// (BEVEL.md §8.5.5.3): equal spoke length and a mutually-60° convex octant
-/// (`cos = ½`). This is the single position-based predicate — `adj_tri_corner_trigger`
-/// feeds it the boundvert-ring positions, and the inner-miter classifier feeds it the
-/// raw meet-points before any vert is minted.
+/// (`cos = ½`). This is the single position-based predicate, and it is the §8.5.1 cap's
+/// alone: `adj_tri_corner_trigger` feeds it the boundvert-ring positions, and
+/// [`tri_corner_shape_admits`] feeds it the same ring when the dihedral band is
+/// unmeasurable. The inner miter never consults it — §8.9.3 / §8.9.3.2(a) put no
+/// junction-level geometry gate on that miter at all.
 fn tri_corner_meet_geometry(vertex_position: Vec3, meet_points: &[Vec3]) -> bool {
     if meet_points.len() != 3 {
         return false;
@@ -16252,6 +16324,7 @@ mod tests {
     fn counts(mesh: &LoopMesh) -> (usize, usize, usize) {
         (mesh.vertex_count(), mesh.edge_count(), mesh.face_count())
     }
+
 
     /// The §7.6.1.2 worked example's slot array, spoke by spoke, on the closed 12-fan the
     /// guide states it for.
@@ -29551,6 +29624,292 @@ mod tests {
         let (sharp_mesh, _) =
             cube_corner_adj_inner_miter_profile(None, 0.3, 2, 0.94, BevelMiter::Sharp);
         assert_ne!(counts(&mesh), counts(&sharp_mesh));
+    }
+
+    /// Bevel `spokes` of a flat 12-spoke fan with the given inner miter, at `offset = 0.2`
+    /// / `spread = 0.1` / round profile on the [V-ADJ] grid — the §8.9.8 pipe-ring frame.
+    fn planar_fan12_inner_miter(
+        spokes: &[usize],
+        segments: u32,
+        inner: BevelMiter,
+    ) -> (LoopMesh, BevelResult) {
+        let (mut mesh, centre, rim) = planar_fan(12);
+        let geom: Vec<GeomKey> = spokes
+            .iter()
+            .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: inner,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.1,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// The §8.9.1 classification is **three**-way, and the flat pipe fan is the shape that
+    /// makes the third class observable: its two collinear beveled spokes cut the disk into
+    /// two `180°` sides, and the side carrying no intervening beveled spoke is one
+    /// **exactly-straight** sector (§8.9.8's `#miter-never-pipe`). §7.6.2's `θ_dir` band
+    /// claims it, so no miter fires there — while the other side, cut by the `90°` spoke
+    /// into the supplementary pair `(90°, 90°)`, is two ordinary non-reflex sectors.
+    ///
+    /// The `0°/90°/150°` arm is the contrast: no collinear pair, so nothing is straight and
+    /// the `210°` gap reads reflex through the signed test.
+    #[test]
+    fn miter_sector_classification_is_three_way_on_the_pipe_and_reflex_fans() {
+        let classify = |spokes: &[usize]| {
+            let (mesh, centre, rim) = planar_fan(12);
+            let beveled: Vec<EdgeKey> = spokes
+                .iter()
+                .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap())
+                .collect();
+            let is_beveled = |edge: EdgeKey| beveled.contains(&edge);
+            let corners = mesh.vertex_bevel_corner_ring(centre, &is_beveled);
+            let sectors = sector_split(&corners, &is_beveled);
+            let vertex_position = mesh.vertex_position(centre);
+            sectors
+                .iter()
+                .map(|sector| {
+                    mesh.classify_miter_sector(centre, vertex_position, sector)
+                        .expect("every fan sector has two non-degenerate flanks")
+                        .class
+                })
+                .collect::<Vec<MiterSectorClass>>()
+        };
+
+        // Sector order is the disk walk from the first beveled spoke, so the verdicts are
+        // asserted **in place**: for the pipe fan that is `[0→3]`, `[3→6]`, `[6→0]`, and it
+        // is the last one — the bare `180°` side, the only sector spanning no beveled spoke
+        // — that must be the straight one. A sorted or set-wise compare would accept the
+        // same three verdicts pinned to the wrong sectors.
+        assert_eq!(
+            classify(&[0, 3, 6]),
+            vec![
+                MiterSectorClass::NonReflex,
+                MiterSectorClass::NonReflex,
+                MiterSectorClass::Straight,
+            ],
+            "the pipe fan's supplementary pair is (90°, 90°) non-reflex and its bare 180° \
+             side is straight, not a third non-reflex sector",
+        );
+        assert_eq!(
+            classify(&[0, 3, 5]),
+            vec![
+                MiterSectorClass::NonReflex,
+                MiterSectorClass::NonReflex,
+                MiterSectorClass::Reflex,
+            ],
+            "the 0°/90°/150° fan has no collinear pair, so nothing is straight and it is \
+             the trailing 210° gap that reads reflex",
+        );
+    }
+
+    /// BEVEL.md §8.9.3 / §8.9.3.2(a) put **no** junction-level geometry gate on the inner
+    /// miter — its gates are `miter_inner != SHARP`, `vmesh_method == ADJ`, and §8.9.1's
+    /// per-*sector* non-reflex-and-not-straight test. So the flat pipe fan, whose meet-point
+    /// ring is nothing like a forced tri-corner octant, still fires at `segments ≥ 2`, and
+    /// it fires on the **supplementary pair only** — the bare `180°` side stays sharp, so
+    /// the ring goes `3 → 5` and never `3 → 6` (§8.9.8's `#miter-never-pipe`).
+    ///
+    /// `segments = 1` reads the split count directly: §8.9.3.2(d) makes each split cost
+    /// exactly `+1 V / +1 E / +0 F`. The `segments ∈ {2, 3}` rows are the recorded oracle
+    /// for the same ring under the [V-ADJ] grid.
+    #[test]
+    fn inner_miter_fires_on_the_pipe_ring_supplementary_pair_only() {
+        let pipe = [0usize, 3, 6];
+
+        let (sharp, _) = planar_fan12_inner_miter(&pipe, 1, BevelMiter::Sharp);
+        let (arc, _) = planar_fan12_inner_miter(&pipe, 1, BevelMiter::Arc);
+        let (sharp_v, sharp_e, sharp_f) = counts(&sharp);
+        let (arc_v, arc_e, arc_f) = counts(&arc);
+        assert_eq!(
+            (
+                arc_v as i64 - sharp_v as i64,
+                arc_e as i64 - sharp_e as i64,
+                arc_f as i64 - sharp_f as i64,
+            ),
+            (2, 2, 0),
+            "exactly two of the three sectors split (§8.9.3.2(d) / §8.9.8): the straight \
+             side is not one of them, and the count is never odd",
+        );
+
+        assert_eq!(
+            counts(&planar_fan12_inner_miter(&pipe, 2, BevelMiter::Arc).0),
+            (29, 51, 23),
+            "the mitered pipe ring at segments = 2",
+        );
+        assert_eq!(
+            counts(&planar_fan12_inner_miter(&pipe, 3, BevelMiter::Arc).0),
+            (41, 72, 32),
+            "the mitered pipe ring at segments = 3",
+        );
+        for segments in [2u32, 3] {
+            assert_ne!(
+                counts(&planar_fan12_inner_miter(&pipe, segments, BevelMiter::Arc).0),
+                counts(&planar_fan12_inner_miter(&pipe, segments, BevelMiter::Sharp).0),
+                "the multi-segment inner miter is not inert on an all-convex ring that \
+                 fails the §8.5.1 tri-corner geometry — that gate is §8.5.1's, not §8.9.3's",
+            );
+        }
+    }
+
+    /// The `s = 4` pipe cross carries **two** supplementary pairs and no bare side, so all
+    /// four sectors fire and the ring goes `4 → 8` (§8.9.8). Read at `segments = 1`, where
+    /// §8.9.3.2(d) makes the vertex delta the split count outright; the `segments ∈ {2, 3}`
+    /// rows are then the recorded oracle for the same ring under the [V-ADJ] grid, pinned
+    /// exactly against their own sharp controls.
+    #[test]
+    fn inner_miter_pipe_cross_splits_all_four_sectors() {
+        let cross = [0usize, 3, 6, 9];
+
+        let (sharp, _) = planar_fan12_inner_miter(&cross, 1, BevelMiter::Sharp);
+        let (arc, _) = planar_fan12_inner_miter(&cross, 1, BevelMiter::Arc);
+        assert_eq!(
+            (
+                counts(&arc).0 as i64 - counts(&sharp).0 as i64,
+                counts(&arc).1 as i64 - counts(&sharp).1 as i64,
+                counts(&arc).2 as i64 - counts(&sharp).2 as i64,
+            ),
+            (4, 4, 0),
+            "both supplementary pairs fire, so the ring is 8 (§8.9.8's even firing count)",
+        );
+
+        // Exact censuses, not merely "differs from sharp": an over-splitting classifier —
+        // the very failure mode the straight class exists to prevent — also differs from
+        // sharp, so `assert_ne!` would pass on a ring of the wrong size. The sharp control
+        // is pinned alongside so the pair still states the miter is *not inert* here.
+        assert_eq!(
+            (
+                counts(&planar_fan12_inner_miter(&cross, 2, BevelMiter::Sharp).0),
+                counts(&planar_fan12_inner_miter(&cross, 2, BevelMiter::Arc).0),
+            ),
+            ((29, 52, 24), (37, 64, 28)),
+            "the pipe cross at segments = 2, sharp then mitered",
+        );
+        assert_eq!(
+            (
+                counts(&planar_fan12_inner_miter(&cross, 3, BevelMiter::Sharp).0),
+                counts(&planar_fan12_inner_miter(&cross, 3, BevelMiter::Arc).0),
+            ),
+            ((40, 72, 33), (56, 96, 41)),
+            "the pipe cross at segments = 3, sharp then mitered",
+        );
+    }
+
+    /// A straight hexagonal tube: six-sided rings of unit radius at `z = 0 … 4`, bridged by
+    /// four bands of quads and left open at both ends. Every interior-ring vertex is a
+    /// valence-4 junction whose two axial rungs are exactly antiparallel, so beveling both
+    /// of them plus one circumferential rail makes a genuine `s = 3` **pipe** junction that
+    /// is not flat — unlike [`planar_fan`], the sector faces fold across the rails.
+    fn hex_tube_five_rings() -> (LoopMesh, Vec<Vec<VertexKey>>) {
+        let mut mesh = LoopMesh::new();
+        let rings: Vec<Vec<VertexKey>> = (0..5)
+            .map(|ring| {
+                (0..6)
+                    .map(|corner| {
+                        let angle = corner as f32 / 6.0 * std::f32::consts::TAU;
+                        mesh.create_vertex(Vec3::new(angle.cos(), angle.sin(), ring as f32))
+                    })
+                    .collect()
+            })
+            .collect();
+        for ring in 0..4 {
+            for corner in 0..6 {
+                let next = (corner + 1) % 6;
+                mesh.face_create_verts(
+                    &[
+                        rings[ring][corner],
+                        rings[ring][next],
+                        rings[ring + 1][next],
+                        rings[ring + 1][corner],
+                    ],
+                    FaceCreateFlags::NONE,
+                );
+            }
+        }
+        (mesh, rings)
+    }
+
+    /// Bevel the middle-ring pipe junction of [`hex_tube_five_rings`] — both axial rungs at
+    /// ring `2` / corner `0` plus the rail running to corner `1` — at `offset = 0.2` /
+    /// `spread = 0.1` on the [V-ADJ] grid.
+    fn hex_tube_pipe_inner_miter(segments: u32, inner: BevelMiter) -> (LoopMesh, BevelResult) {
+        let (mut mesh, rings) = hex_tube_five_rings();
+        let geom: Vec<GeomKey> = [
+            mesh.query_edge_exists(rings[1][0], rings[2][0]),
+            mesh.query_edge_exists(rings[2][0], rings[3][0]),
+            mesh.query_edge_exists(rings[2][0], rings[2][1]),
+        ]
+        .map(|edge| {
+            edge.expect("the junction's two rungs and its trailing rail")
+                .into()
+        })
+        .to_vec();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.2,
+                affect: BevelAffect::Edges,
+                segments,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: inner,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.1,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+        (mesh, result)
+    }
+
+    /// The same §8.9.8 pipe ring as the flat fan, but on a **folded** junction: the tube's
+    /// two axial rungs are antiparallel while its faces bend across the rails, so the
+    /// straight sector's classification cannot be an artefact of a single working plane.
+    /// The bare `180°` side stays sharp and only the supplementary pair fires — `3 → 5`,
+    /// never `3 → 6` — and the multi-segment rows are pinned exactly, so an over-splitting
+    /// classifier is caught by its ring size rather than merely by differing from sharp.
+    #[test]
+    fn inner_miter_fires_on_the_folded_tube_pipe_supplementary_pair_only() {
+        let (sharp, _) = hex_tube_pipe_inner_miter(1, BevelMiter::Sharp);
+        let (arc, _) = hex_tube_pipe_inner_miter(1, BevelMiter::Arc);
+        let (sharp_v, sharp_e, sharp_f) = counts(&sharp);
+        let (arc_v, arc_e, arc_f) = counts(&arc);
+        assert_eq!(
+            (
+                arc_v as i64 - sharp_v as i64,
+                arc_e as i64 - sharp_e as i64,
+                arc_f as i64 - sharp_f as i64,
+            ),
+            (2, 2, 0),
+            "two of the three sectors split at §8.9.3.2(d)'s +1 V / +1 E / +0 F each; the \
+             straight side between the two rungs is not one of them",
+        );
+
+        assert_eq!(
+            (
+                counts(&hex_tube_pipe_inner_miter(2, BevelMiter::Sharp).0),
+                counts(&hex_tube_pipe_inner_miter(2, BevelMiter::Arc).0),
+            ),
+            ((45, 84, 39), (49, 90, 41)),
+            "the folded tube's pipe junction at segments = 2, sharp then mitered",
+        );
+        assert_eq!(
+            (
+                counts(&hex_tube_pipe_inner_miter(3, BevelMiter::Sharp).0),
+                counts(&hex_tube_pipe_inner_miter(3, BevelMiter::Arc).0),
+            ),
+            ((53, 102, 49), (61, 114, 53)),
+            "the folded tube's pipe junction at segments = 3, sharp then mitered",
+        );
     }
 
     /// BEVEL.md §8.9.3: `miter_inner` distinguishes only sharp from non-sharp — the
