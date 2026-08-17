@@ -32197,6 +32197,347 @@ mod tests {
         );
     }
 
+    /// A valence-3 cap ring whose three cross-section cells are **skewed**: each cell's
+    /// bulge control point sits `bulge_along` of the way along its chord rather than at the
+    /// midpoint, so `|mid − start| ≠ |mid − end|` and the chain's chord table is not
+    /// symmetric under reversal. `bulge_along = 0.5` is the mirror-symmetric control — the
+    /// three boundverts are equidistant from the origin, so the bulge then leaves the cell
+    /// on its perpendicular bisector.
+    ///
+    /// Skew is a property of the **cell**, and the cell's two legs are `|mid − start|` and
+    /// `|mid − end|` — nothing about the ring's regularity decides it. A vertex-mode cap
+    /// builds each sector's cell as `from_control_points(B_i, B_{i+1}, v)` (§8.11.2 puts
+    /// `mid` at the corner vertex), so it is skewed exactly when the corner's ring slid its
+    /// two flanking edges by different distances. §4's ring slides *every* incident edge by
+    /// `offset`, which is why an unclamped vertex bevel is mirror-symmetric by construction
+    /// and quiet here (§8.5.5.5(d)'s vertex-mode bullet); §4.1's edge-length clamp, [W]
+    /// weights and the non-`OFFSET` `offset_type`s each break that and put a real skew on the
+    /// cell. This fixture reaches the same state directly, by moving the bulge control point
+    /// off the chord midpoint.
+    fn skewed_cap_ring(
+        bulge_along: f32,
+        profile: f32,
+    ) -> (Vec<Vec3>, Vec<RingChainProfile<'static>>) {
+        let boundverts = vec![Vec3::X, Vec3::Y, Vec3::Z];
+        let profiles = (0..3)
+            .map(|i| {
+                let start = boundverts[i];
+                let end = boundverts[(i + 1) % 3];
+                let bulge = 0.3 * (start + end).normalize();
+                RingChainProfile::Cell {
+                    cell: ProfileCell::from_control_points(
+                        start,
+                        end,
+                        start + bulge_along * (end - start) + bulge,
+                    ),
+                    profile,
+                    custom: None,
+                }
+            })
+            .collect();
+        (boundverts, profiles)
+    }
+
+    /// The relaxed net a [`skewed_cap_ring`] descends to at `segments` (§8.5.5.5(b)/(c)),
+    /// seeded from the ring's own fullness centre toward the corner `(1, 1, 1)`.
+    fn skewed_cap_net(
+        boundverts: &[Vec3],
+        profiles: &[RingChainProfile],
+        segments: u32,
+        profile: f32,
+    ) -> AdjNet {
+        let mids: Vec<Vec3> = profiles.iter().map(|p| p.raw_positions(2)[1]).collect();
+        let centroid = boundverts.iter().fold(Vec3::ZERO, |acc, &b| acc + b) / 3.0;
+        let seed = centroid + adj_fullness(profile, segments) * (Vec3::ONE - centroid);
+        adj_relaxed_net(boundverts, &mids, seed, profiles, segments)
+    }
+
+    /// Every **index-canonical** interior triple of an even-`segments` valence-3 cap
+    /// (§8.5.2): the `j == half` row belongs to the previous sub-patch's seam column, and
+    /// all `s` copies of `(half, half)` are the one welded centre.
+    fn canonical_interior_triples(sectors: usize, half: usize) -> Vec<(usize, usize, usize)> {
+        let mut triples = Vec::new();
+        for i in 0..sectors {
+            for j in 1..=half {
+                for k in 1..=half {
+                    if j < half || (k == half && i == 0) {
+                        triples.push((i, j, k));
+                    }
+                }
+            }
+        }
+        triples
+    }
+
+    /// BEVEL.md §8.5.5.5(d), the ["even-`segments` mid index"] rule: at an even target the
+    /// mid index `half` is read off the chord table like every other index. On a skewed cell
+    /// that fraction is **not** the dense mid, and the whole table — mid included — is the
+    /// plain §8.2.2.1.1 read-back parametrisation.
+    ///
+    /// Two controls the rule is the identity on, and which are why forcing the mid entry to
+    /// `resolution / 2` survives most fixtures: a mirror-symmetric cell, where the target's
+    /// `f_half` and the source's `g_{N/2}` are both `1/2`, and a power-of-two target, where
+    /// source and target tables are the same table. The second control reads
+    /// [`chord_fraction_indices`] directly rather than through [`adj_interior_axis`], whose
+    /// `resolution == segments` arm returns the identity table without consulting either
+    /// chain — that arm is pinned separately by
+    /// `adj_general_cap_valence4_segments4_interior_is_the_relaxed_net`.
+    #[test]
+    fn adj_even_mid_index_is_read_off_the_chord_table_not_pinned_to_the_dense_mid() {
+        let (_, skewed) = skewed_cap_ring(0.9, 0.7);
+        for segments in [6_u32, 10] {
+            let resolution = boundary_source_resolution(segments);
+            let half = (segments / 2) as usize;
+            let axis = adj_interior_axis(&skewed, segments, resolution);
+            for (i, profile) in skewed.iter().enumerate() {
+                let table = chord_fraction_indices(
+                    &profile.raw_positions(segments),
+                    &profile.raw_positions(resolution),
+                );
+                assert_eq!(
+                    axis[i], table,
+                    "every index of chain {i} is the chord-fraction read-back, mid included",
+                );
+                // Measured `6.19e-3` at `segments = 6` and `5.45e-3` at `10`, so the margin
+                // is ~6×. It also sits ~1500× above the few-ulp window
+                // [`snapped_to_integral_source_index`] may erase, which is what keeps that
+                // snap from quietly reinstating the forbidden pin.
+                assert!(
+                    (axis[i][half] - resolution as f32 / 2.0).abs() > 1.0e-3,
+                    "a skewed cell's mid chord fraction is provably not the dense mid: \
+                     {} vs {}",
+                    axis[i][half],
+                    resolution as f32 / 2.0,
+                );
+            }
+        }
+
+        let (_, symmetric) = skewed_cap_ring(0.5, 0.7);
+        for segments in [6_u32, 10, 12, 20] {
+            let resolution = boundary_source_resolution(segments);
+            let half = (segments / 2) as usize;
+            for chain in adj_interior_axis(&symmetric, segments, resolution) {
+                // *Exactly* the dense mid, not merely near it — see
+                // `adj_mid_index_of_a_mirror_symmetric_cell_is_exactly_the_dense_mid`.
+                assert_eq!(
+                    chain[half],
+                    resolution as f32 / 2.0,
+                    "a mirror-symmetric cell reads the dense mid anyway",
+                );
+            }
+        }
+
+        for profile in skewed.iter() {
+            let table = chord_fraction_indices(
+                &profile.raw_positions(8),
+                &profile.raw_positions(boundary_source_resolution(8)),
+            );
+            for (k, &index) in table.iter().enumerate() {
+                assert_eq!(
+                    index, k as f32,
+                    "at a power-of-two target the source and target tables are one table",
+                );
+            }
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(d), the "Coinciding *mathematically* is not coinciding in `f32`"
+    /// hazard: on a mirror-symmetric cell the mid index is mathematically `N/2`, but `f_half`
+    /// and `g_{N/2}` are accumulated over chains of different length and divided by different
+    /// totals, so the quotient lands beside the integer. [`snapped_to_integral_source_index`]
+    /// is the rule that puts it back, and it is keyed to the index's own value — never to
+    /// `segments % 2`, never to the mid coordinate.
+    ///
+    /// Both halves matter. Without the snap the symmetric ring reads `1` ulp off at
+    /// `segments ∈ {12, 20}` (and `0` at `6, 10, 16`), which is enough to tip the innermost
+    /// seam entries into the neighbouring `1e-5` position bucket. With a window wide enough
+    /// to reach a real skew the §8.5.5.5(d) rule itself would be gone, so the skewed arm here
+    /// asserts the snap left it alone to the last bit.
+    #[test]
+    fn adj_mid_index_of_a_mirror_symmetric_cell_is_exactly_the_dense_mid() {
+        let (_, symmetric) = skewed_cap_ring(0.5, 0.7);
+        let (_, skewed) = skewed_cap_ring(0.9, 0.7);
+        for segments in [6_u32, 10, 12, 16, 20] {
+            let resolution = boundary_source_resolution(segments);
+            let half = (segments / 2) as usize;
+            let dense_mid = resolution as f32 / 2.0;
+
+            for chain in adj_interior_axis(&symmetric, segments, resolution) {
+                assert_eq!(
+                    chain[half].to_bits(),
+                    dense_mid.to_bits(),
+                    "segments {segments}: the symmetric mid index is bit-exactly {dense_mid}",
+                );
+            }
+
+            for (i, chain) in adj_interior_axis(&skewed, segments, resolution)
+                .iter()
+                .enumerate()
+            {
+                let unsnapped = chord_fraction_indices(
+                    &skewed[i].raw_positions(segments),
+                    &skewed[i].raw_positions(resolution),
+                );
+                assert_eq!(
+                    chain[half].to_bits(),
+                    unsnapped[half].to_bits(),
+                    "segments {segments}: the snap never reaches a skewed cell's mid index",
+                );
+            }
+        }
+
+        // The window is a few ulp and nothing wider: an index a thousand ulp out — two
+        // orders of magnitude *below* the closest real skew measured on this ring — is still
+        // left where it is.
+        let thousand_ulps = f32::from_bits(8.0_f32.to_bits() + 1000);
+        assert_eq!(snapped_to_integral_source_index(thousand_ulps), thousand_ulps);
+        assert_eq!(
+            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() + 4)),
+            8.0,
+        );
+        assert_eq!(
+            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() - 4)),
+            8.0,
+        );
+        assert_eq!(
+            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() + 5)),
+            f32::from_bits(8.0_f32.to_bits() + 5),
+        );
+        // A genuinely fractional index is untouched wherever it sits.
+        assert_eq!(snapped_to_integral_source_index(6.5), 6.5);
+    }
+
+    /// BEVEL.md §8.5.5.5(d): pinning the read-back tables' mid entry to the dense mid — the
+    /// rule the guide writes out as *"WRONG. Do not do this."* — displaces exactly the
+    /// **seam columns** `(i, j, half)` for `j = 1 … half − 1`, i.e. `s · (half − 1)` cap
+    /// verts, with the welded centre excluded because the centre is placed by its own rule
+    /// and not through the tables.
+    ///
+    /// The two arms run the real fill kernel twice over one net, differing only in the
+    /// tables, so the displaced set is attributable to nothing else. Both quiet cases from
+    /// the guide are here as controls: a power-of-two target and a mirror-symmetric cell.
+    #[test]
+    fn adj_even_mid_pin_would_displace_exactly_the_seam_columns() {
+        let sectors = 3;
+        let displaced_by_pinning = |boundverts: &[Vec3], profiles: &[RingChainProfile], segments| {
+            let seg = segments as usize;
+            let half = seg / 2;
+            let net = skewed_cap_net(boundverts, profiles, segments, 0.7);
+            let resolution = 2 * net.half as u32;
+            let axis = adj_interior_axis(profiles, segments, resolution);
+            let mut pinned = axis.clone();
+            for chain in pinned.iter_mut() {
+                chain[half] = resolution as f32 / 2.0;
+            }
+            let read_back = AdjInterior::Relaxed {
+                net: &net,
+                axis: &axis,
+                sectors,
+                segments: seg,
+            };
+            let mid_pinned = AdjInterior::Relaxed {
+                net: &net,
+                axis: &pinned,
+                sectors,
+                segments: seg,
+            };
+            let mut moved = Vec::new();
+            let mut worst = 0.0_f32;
+            for (i, j, k) in canonical_interior_triples(sectors, half) {
+                let gap = (read_back.position(i, j, k, half) - mid_pinned.position(i, j, k, half))
+                    .length();
+                worst = worst.max(gap);
+                if gap > 1.0e-6 {
+                    moved.push((i, j, k));
+                }
+            }
+            (moved, worst)
+        };
+
+        let (skewed_ring, skewed) = skewed_cap_ring(0.9, 0.7);
+        for segments in [6_u32, 10] {
+            let half = (segments / 2) as usize;
+            let (moved, worst) = displaced_by_pinning(&skewed_ring, &skewed, segments);
+            let expected: Vec<(usize, usize, usize)> = (0..sectors)
+                .flat_map(|i| (1..half).map(move |j| (i, j, half)))
+                .collect();
+            assert_eq!(
+                moved, expected,
+                "only the seam columns move, and the welded centre is not among them",
+            );
+            assert_eq!(moved.len(), sectors * (half - 1));
+            assert!(
+                worst > 1.0e-4,
+                "the displacement is real at segments = {segments}, not float noise: {worst}",
+            );
+        }
+
+        let (moved, _) = displaced_by_pinning(&skewed_ring, &skewed, 8);
+        assert!(
+            moved.is_empty(),
+            "at a power-of-two target the pin is the identity: {moved:?}",
+        );
+
+        let (symmetric_ring, symmetric) = skewed_cap_ring(0.5, 0.7);
+        for segments in [6_u32, 12] {
+            let (moved, _) = displaced_by_pinning(&symmetric_ring, &symmetric, segments);
+            assert!(
+                moved.is_empty(),
+                "on a mirror-symmetric cell the pin is the identity: {moved:?}",
+            );
+        }
+    }
+
+    /// BEVEL.md §8.5.5.5(d), "What *is* pinned": the even welded centre `(i, half, half)` is
+    /// the dense net's own centre vertex taken verbatim — its own rule, not a consequence of
+    /// where the two flanking chord tables land. Its observable signature is that the centre
+    /// is keyed to the **source** resolution `N` and not to `segments`: it holds while
+    /// `segments` sweeps a whole power-of-two band and steps only when the band does.
+    #[test]
+    fn adj_even_welded_centre_is_the_dense_net_centre_keyed_to_the_source_resolution() {
+        let (boundverts, profiles) = skewed_cap_ring(0.9, 0.7);
+        let centre_at = |segments: u32| {
+            let seg = segments as usize;
+            let half = seg / 2;
+            let net = skewed_cap_net(&boundverts, &profiles, segments, 0.7);
+            let axis = adj_interior_axis(&profiles, segments, 2 * net.half as u32);
+            let interior = AdjInterior::Relaxed {
+                net: &net,
+                axis: &axis,
+                sectors: 3,
+                segments: seg,
+            };
+            let emitted = interior.position(0, half, half, half);
+            assert_eq!(
+                emitted,
+                net.at(0, net.half, net.half),
+                "the welded centre is the dense net's centre verbatim",
+            );
+            emitted
+        };
+
+        // Within a band the centre still creeps by a few `1e-5` position quanta, because the
+        // §8.5.5.5(b) fullness *seed* the net descends from carries a (near-nil) segment-count
+        // term; the band step is two orders of magnitude larger.
+        let low_band = [centre_at(6), centre_at(8)];
+        let high_band = [centre_at(10), centre_at(12), centre_at(14), centre_at(16)];
+        for band in [&low_band[..], &high_band[..]] {
+            for centre in band {
+                assert!(
+                    (*centre - band[0]).length() < 5.0e-5,
+                    "the centre holds across a whole source-resolution band: {centre:?} vs {:?}",
+                    band[0],
+                );
+            }
+        }
+        assert!(
+            (low_band[0] - high_band[0]).length() > 1.0e-3,
+            "and steps when the band does: {:?} vs {:?}",
+            low_band[0],
+            high_band[0],
+        );
+    }
+
     /// BEVEL.md §8.5.5.5(e) / §8.5.5.7 invariant 2 at valence 5, where the central `s`-gon
     /// is a pentagon and the parity is therefore visible in the face-side histogram: even
     /// `segments` weld one centre vertex and close no central face; odd `segments` weld
@@ -56652,9 +56993,57 @@ fn chord_fraction_indices(raw: &[Vec3], source: &[Vec3]) -> Vec<f32> {
                 break;
             }
         }
-        indices.push(index);
+        indices.push(snapped_to_integral_source_index(index));
     }
     indices
+}
+
+/// How many ulp an index may miss a whole source sample by and still be treated as landing
+/// **on** it. See [`snapped_to_integral_source_index`] for the measured separation this sits
+/// in the middle of; it is deliberately three orders of magnitude below the smallest real
+/// skew, so widening it to hide a divergence would be visible as a number, not a judgement
+/// call.
+const CHORD_INDEX_INTEGRAL_ULPS: i64 = 4;
+
+/// Snap an index that misses a whole source sample by a few ulp onto that sample
+/// (BEVEL.md §8.5.5.5(d), the "Coinciding *mathematically* is not coinciding in `f32`"
+/// hazard, which names this as the rule to adopt).
+///
+/// **Why it is needed.** Where the read-back is *mathematically* exact — a mirror-symmetric
+/// cell's mid entry is the standing case, `f_h = 1/2` on the target polyline and
+/// `g_{N/2} = 1/2` on the source one — the two halves of `1/2` are nevertheless accumulated
+/// over **different chains** (`segments` chords against `N`) and divided by different totals,
+/// so they differ in the last place and the quotient lands beside the integer instead of on
+/// it. The bilinear read is steepest at the dense net's centre, so that last place is enough
+/// to tip the innermost seam entries `(i, h − 1, h)` — the `s` neighbours of the welded
+/// centre — into the neighbouring `1e-5` position bucket while every other cap vert stays
+/// exact.
+///
+/// **Why it cannot reinstate the dense-mid pin the §8.5.5.5(d) rule forbids.** The two
+/// populations are separated by three orders of magnitude, measured on the valence-3 cap ring
+/// of `skewed_cap_ring` (index units, mid entry, all three chains agreeing):
+///
+/// ```text
+///    mirror-symmetric cell     segments  6, 10, 16 → 0 ulp         12, 20 → 1 ulp
+///    skewed cell (bulge 0.9)   segments  6 → 6.19e-3 (12972 ulp)   10 → 5.45e-3 (5713 ulp)
+///                                       12 → 2.72e-3 (2848 ulp)    20 → 2.55e-3 (1339 ulp)
+/// ```
+///
+/// A four-ulp window is ~330× narrower than the *closest* real skew in that table, so it
+/// cannot reach one. It is also keyed to the index's own value and to nothing else — never to
+/// `segments % 2`, never to the mid coordinate — so a skewed cell's mid entry is read off the
+/// chord table exactly as §8.5.5.5(d) requires.
+fn snapped_to_integral_source_index(index: f32) -> f32 {
+    let nearest = index.round();
+    if index == nearest {
+        return index;
+    }
+    let ulps = (index.to_bits() as i64 - nearest.to_bits() as i64).abs();
+    if ulps <= CHORD_INDEX_INTEGRAL_ULPS {
+        nearest
+    } else {
+        index
+    }
 }
 
 /// The §8.2.2.1.1 chord-fraction resample: each raw target sample carries a chord
@@ -57696,6 +58085,9 @@ impl AdjInterior<'_> {
                 sectors,
                 segments,
             } => {
+                if let Some(centre) = net.welded_centre(*segments, j, k, half) {
+                    return centre;
+                }
                 // Sub-patch `i`'s `k` axis is chain `i` read forward; its `j` axis is chain
                 // `i − 1` read *backward* from `B_i`, so its source coordinate is the
                 // complement of that chain's index at target sample `segments − j`.
@@ -57713,11 +58105,16 @@ impl AdjInterior<'_> {
                 exponent,
                 octant,
             } => {
-                let resolution = (2 * net.half) as f32;
-                let previous = (i + sectors - 1) % sectors;
-                let along_chain = axis[i][k];
-                let along_previous = resolution - axis[previous][segments - j];
-                let unit = net.sample(i, along_previous, along_chain);
+                let unit = match net.welded_centre(*segments, j, k, half) {
+                    Some(centre) => centre,
+                    None => {
+                        let resolution = (2 * net.half) as f32;
+                        let previous = (i + sectors - 1) % sectors;
+                        let along_chain = axis[i][k];
+                        let along_previous = resolution - axis[previous][segments - j];
+                        net.sample(i, along_previous, along_chain)
+                    }
+                };
                 octant.to_world(snap_to_unit_superellipsoid(unit, *exponent, false))
             }
             AdjInterior::Parallel { starts, vertex } => {
@@ -58781,29 +59178,41 @@ impl AdjNet {
     /// kernel, bilinear within the source quad.
     ///
     /// The domain is the **whole** chart on both axes, `[0, resolution]` with
-    /// `resolution = 2·half`, not the stored quadrant `[0, half]`. A well-conditioned
-    /// read-back never leaves the quadrant (both coordinates of a canonical target index
-    /// come out of a monotone chord table at or below its midpoint), but a **degenerate**
-    /// chain's `[0, …, 0, 1]` table sends the neighbouring sub-patch's `j` coordinate to
-    /// `resolution` outright (§8.9.5.4(c)). Clamping there would land on the seam spoke —
-    /// the opposite end of the very axis the rule points at — so the cell corners are
-    /// handed to [`AdjNet::at`], whose seam rewrite is what §8.5.2 names for exactly this
-    /// query.
+    /// `resolution = 2·half`, not the stored quadrant `[0, half]`, and a *well-conditioned*
+    /// read-back leaves the quadrant too. At an even target the seam column's own chord
+    /// fraction is read like every other index (§8.5.5.5(d)), and on a skewed cell it lands
+    /// a fraction of a cell past the dense mid — the second-order gap between a chord table
+    /// taken at `segments` and one taken at `resolution`; that is a `k`-axis over-run,
+    /// resolved by §8.5.2's **forward** seam rule. A **degenerate** chain's `[0, …, 0, 1]`
+    /// table is the extreme of the same thing on the other axis: it sends the neighbouring
+    /// sub-patch's `j` coordinate to `resolution` outright (§8.9.5.4(c)), which is the
+    /// **backward** rule. Clamping in either case would land on the seam spoke — the
+    /// opposite end of the very axis the rule points at — so the cell corners are handed to
+    /// [`AdjNet::at`], which carries both rewrites.
     ///
     /// Only one axis may leave the quadrant at a time: a triple past `half` on both would
     /// walk two sub-patches in opposite directions, and §8.5.2 rejects it rather than
-    /// defining it.
+    /// defining it — hence the assert. The two over-run mechanisms are **independent
+    /// per-chain conditions**, so nothing about the construction rules the pair out: a
+    /// degenerate *source* table drives the `k` axis to `resolution` at ordinary non-centre
+    /// triples (measured `k = 8.0`, `j = 1.33` at `half = 4` inside the
+    /// `inner_miter_arc_zero_spread_*` fixtures), while a degenerate *target* table drives
+    /// the `j` axis there (`degenerate_chord_table_read_reversed_*`). A ring carrying one on
+    /// chain `i` and the other on chain `i − 1` would over-run both. No fixture in either
+    /// suite reaches that, and no attempt to construct one has succeeded, so the assert is
+    /// the honest statement: it has never fired, not that it cannot.
     ///
-    /// A coordinate that lands *on* `half` keeps the cell below it, so an in-quadrant read
-    /// never reaches for a corner it does not weight — which is what makes the wider domain
-    /// bit-inert on every well-conditioned input.
+    /// A coordinate that lands *on* `half` keeps the cell below it, so a read that stays in
+    /// the quadrant never reaches for a corner it does not weight.
     fn sample(&self, i: usize, j: f32, k: f32) -> Vec3 {
         let half = self.half;
         let resolution = 2 * half;
         let top = resolution as f32;
         let j = j.clamp(0.0, top);
         let k = k.clamp(0.0, top);
-        debug_assert!(
+        // One comparison per interior grid vert, off any hot loop, guarding a case the guide
+        // leaves undefined rather than one it forbids — so it stays on in release.
+        assert!(
             j <= half as f32 || k <= half as f32,
             "a grid query past `half` on both axes has no canonical representative",
         );
@@ -58824,6 +59233,37 @@ impl AdjNet {
             + self.at(i, j0 + 1, k0) * (tj * (1.0 - tk))
             + self.at(i, j0 + 1, k0 + 1) * (tj * tk)
     }
+
+    /// The even target's welded centre `(i, half, half)`: the dense net's own centre vertex,
+    /// taken **verbatim**, as its own rule rather than as a consequence of where the two
+    /// flanking chord tables happen to land (§8.5.5.5(d), "What *is* pinned"). It is a
+    /// statement about this **one** vertex — generalising it to the coordinate `half`, by
+    /// pinning the mid entry of the read-back tables, is what displaces the seam columns.
+    ///
+    /// The observable consequence is that the even welded centre is a function of the
+    /// **source** resolution alone: it holds constant while `segments` sweeps a whole
+    /// power-of-two band and steps only when the band does.
+    ///
+    /// `None` at an odd target, where the grid closes on a central `s`-gon and there is no
+    /// welded vertex for the rule to bite on, and at every non-centre index.
+    ///
+    /// `target_half` is the **target** grid's half-width `segments / 2`, which `(j, k)` are
+    /// indices into; `self.half` is the **source** net's, which the returned vertex is named
+    /// by. Confusing the two is the whole defect this rule exists to rule out, so they do not
+    /// share a name.
+    fn welded_centre(
+        &self,
+        segments: usize,
+        j: usize,
+        k: usize,
+        target_half: usize,
+    ) -> Option<Vec3> {
+        debug_assert_eq!(target_half, segments / 2);
+        if segments % 2 != 0 || j != target_half || k != target_half {
+            return None;
+        }
+        Some(self.at(0, self.half, self.half))
+    }
 }
 
 /// The §8.5.5.5(d) read-back parametrisation, one map per ring chain: where target sample
@@ -58832,12 +59272,17 @@ impl AdjNet {
 /// (§8.2.2.1.1), so a target grid column stands over the dense grid exactly where its own
 /// rim sample stands — the interior meets the rim it is stitched to.
 ///
-/// One index is pinned rather than read: at an **even** target the mid index `half` is the
-/// grid's *shared* coordinate — the seam spokes and the welded centre live on it, and both
-/// neighbouring sub-patches must land on the same dense column — so it maps to the dense
-/// mid `resolution / 2` exactly. That is also what makes the even centre the once-
-/// subdivided extraordinary centre **verbatim**, which §8.5.5.7 pins strictly (it is not
-/// Tier-2 free, and on a skewed cell the chord fraction alone would drift off it).
+/// **Every index is read off the table, an even target's mid `half` included**
+/// (§8.5.5.5(d), "the even-`segments` mid index"). Forcing that one entry to the dense mid
+/// `resolution / 2` — so that the two sub-patches sharing the coordinate `half` are
+/// "guaranteed to agree" — is the fill's classic mis-derivation. There is nothing to
+/// reconcile: the grid is evaluated only at index-canonical triples (§8.5.2), so the shared
+/// row has exactly one owner and one evaluation. Pinning it instead stands the seam column
+/// over a different point of the dense polyline from the rim vertex it is stitched to,
+/// which displaces `sectors · (half − 1)` cap verts on any skewed cell (it is the identity
+/// on a mirror-symmetric one, at a power-of-two target, and at the line exponent — which is
+/// why it hides). The one quantity that *is* pinned is the welded centre, and it is pinned
+/// as its own rule ([`AdjNet::welded_centre`]), not through this table.
 fn adj_interior_axis(
     profiles: &[RingChainProfile],
     segments: u32,
@@ -58847,18 +59292,14 @@ fn adj_interior_axis(
     profiles
         .iter()
         .map(|profile| {
-            let mut indices = if resolution == segments {
+            if resolution == segments {
                 (0..=seg).map(|k| k as f32).collect()
             } else {
                 chord_fraction_indices(
                     &profile.raw_positions(segments),
                     &profile.raw_positions(resolution),
                 )
-            };
-            if seg % 2 == 0 {
-                indices[seg / 2] = resolution as f32 / 2.0;
             }
-            indices
         })
         .collect()
 }
