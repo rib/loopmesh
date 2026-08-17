@@ -7929,10 +7929,12 @@ impl LoopMesh {
 
         // §8.5.5.5(c)/(d): double the fullness-seeded coarse net — at least once, even at
         // `segments = 2` — until the working resolution reaches the target, then read the
-        // interior back at the target sample fractions. The rim is *not* read back from
-        // this net: it stays the already-emitted chain (§8.2.2.1.1, "the emitted boundary").
+        // grid back at the target sample fractions. The rim is the net's `j = 0` row of that
+        // same read, which normally reproduces the already-emitted chain and sometimes does
+        // not (below).
         let net = adj_relaxed_net(&boundverts, &mids, fullness_seed, profiles, segments);
         let axis = adj_interior_axis(profiles, segments, 2 * net.half as u32);
+        self.replant_rim_off_the_saturating_net(chain_of, &net, &axis, sectors, seg, half);
 
         self.emit_adj_grid(
             sectors,
@@ -7956,6 +7958,58 @@ impl LoopMesh {
             result,
         );
         true
+    }
+
+    /// Re-place the rim samples that the §8.5.5.5(d) two-axis read does **not** put on the
+    /// profile polyline — the `⌊segments/2⌋` per chain whose predecessor's source table
+    /// saturates ([`adj_rim_source_row`]).
+    ///
+    /// **Which samples can move.** The resample computes sub-patch `i`'s block over
+    /// `j = 0 … ⌈segments/2⌉ − 1`, `k = 0 … ⌊segments/2⌋`, so chain `i`'s rim is produced by
+    /// **two** sub-patches: `k = 1 … half` is block `i`'s own `j = 0` row and carries the
+    /// foreign `j*_rim`, while `k = half + 1 … segments − 1` is stored as block `i + 1`'s
+    /// `k = 0` column, whose `j` coordinate comes from chain `i`'s own tables and so
+    /// reproduces §8.2.2.1.1 step 3's 1-D read-back algebraically at every count, whatever
+    /// any table does. One chain's two rim halves are therefore computed against two
+    /// different chains' tables and need not be reflections of each other — that asymmetry
+    /// is structural, not miter-specific.
+    ///
+    /// **Why the collapsing case is left alone.** At `j*_rim = 0` the kernel lerps along
+    /// source row `0`, and source row `0` *is* the profile polyline, so the read is the same
+    /// point the chain builders' 1-D read-back already emitted; re-deriving it through the
+    /// grid would move every well-conditioned rim in the crate by a float representation's
+    /// worth for no parity gain. The two expressions are the same rule, and
+    /// [`adj_rim_source_row`] is where the guide's collapse condition is tested.
+    ///
+    /// **Re-placing rather than minting is a scheduling compromise.** §8.5.5.5(d) mints the
+    /// rim *from* the net, which it can do because the net exists first; here the rim verts
+    /// were minted with the ring, since they are shared with the beveled edge's
+    /// cross-section and the strips are stitched before any cap. Moving the already-minted
+    /// keys leaves the topology, the census and every rim-sharing strip identical — what it
+    /// does not reach is anything position-keyed that a caller derived from a rim vert
+    /// before the cap ran.
+    fn replant_rim_off_the_saturating_net(
+        &mut self,
+        chain_of: &[Vec<VertexKey>],
+        net: &AdjNet,
+        axis: &[Vec<f32>],
+        sectors: usize,
+        seg: usize,
+        half: usize,
+    ) {
+        if seg < 2 {
+            return;
+        }
+        let resolution = 2 * net.half;
+        for i in 0..sectors {
+            let Some(rim_row) = adj_rim_source_row(axis, sectors, seg, resolution, i) else {
+                continue;
+            };
+            for k in 1..=half.min(seg - 1) {
+                let position = net.sample(i, rim_row, axis[i][k]);
+                self.set_vertex_position(chain_of[i][k], position);
+            }
+        }
     }
 
     /// The (incoming, outgoing) edges of `face` meeting at `vertex` in the face's
@@ -29203,6 +29257,333 @@ mod tests {
         assert!(
             (600.0..900.0).contains(&gap),
             "segments = 3 live arm (§8.9.5.4(d) reads 729.5): {gap}",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(d), "The rim's own `j` coordinate": the emitted rim is the `j = 0`
+    /// row of the two-axis read and carries a source row `j*_rim = resolution −
+    /// locate(1, g_{i−1})` belonging to the **previous** chain. It collapses to zero — and
+    /// only then is the rim the 1-D read-back of §8.2.2.1.1 step 3 along the profile
+    /// polyline — exactly when that chain's source table does not saturate.
+    ///
+    /// The three tables a `spread = 0` inner miter can build are all exercised here, because
+    /// two of them collapse and only the third displaces, and the pair that collapses is
+    /// where the tempting wrong rule ("a degenerate chain cannot hurt the rim") looks true:
+    ///
+    /// - a well-conditioned chain — the ordinary case;
+    /// - a **fully** degenerate chain, whose `[0, …, 0, 1]` fallback still reaches `1` only
+    ///   at the last index, so `locate(1, g) = resolution` and its successor's rim stays on
+    ///   the polyline (§8.9.5.4(c): this is the `offset = 0.2` meet point);
+    /// - a **saturating** chain, which reaches `1` early because the meet point's mantissa
+    ///   refuses the two-term interpolation at some dyadic parameter (§8.9.5.4(c)'s measured
+    ///   `offset = 0.25` table), and whose successor's rim is read `resolution − p` rows
+    ///   inside the net.
+    #[test]
+    fn rim_source_row_is_the_previous_chains_saturation_and_collapses_on_every_other_table() {
+        let segments = 5usize;
+        let resolution = boundary_source_resolution(segments as u32) as usize;
+        assert_eq!(resolution, 8);
+
+        // §8.9.5.4(c)'s measured saturating table, at the meet point an `offset = 0.25`
+        // bevel of the fan below puts the miter on.
+        let saturating_meet = Vec3::new(0.24999999, 0.25, 0.0);
+        let saturating_source =
+            arc_chain_positions(saturating_meet, saturating_meet, saturating_meet, 0.5, 8);
+        assert_eq!(
+            normalised_chord_fractions(&saturating_source),
+            vec![0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0],
+            "neither the fallback nor a well-formed monotone table — it saturates at 6",
+        );
+        let saturating = chord_fraction_indices(
+            &arc_chain_positions(
+                saturating_meet,
+                saturating_meet,
+                saturating_meet,
+                0.5,
+                segments as u32,
+            ),
+            &saturating_source,
+        );
+        assert_eq!(
+            *saturating.last().unwrap(),
+            6.0,
+            "locate(1, g) is the plateau's FIRST index, not the last",
+        );
+
+        // The fully degenerate sibling: every source sample is bit-exactly the meet point,
+        // so the table is the `[0, …, 0, 1]` fallback and `locate(1, g)` is the far end.
+        let degenerate_meet = Vec3::new(0.2, 0.2, 0.0);
+        let degenerate_source = arc_chain_positions(
+            degenerate_meet,
+            degenerate_meet,
+            degenerate_meet,
+            0.5,
+            resolution as u32,
+        );
+        assert!(degenerate_source.iter().all(|&p| p == degenerate_meet));
+        let degenerate = chord_fraction_indices(
+            &arc_chain_positions(
+                degenerate_meet,
+                degenerate_meet,
+                degenerate_meet,
+                0.5,
+                segments as u32,
+            ),
+            &degenerate_source,
+        );
+        assert_eq!(*degenerate.last().unwrap(), resolution as f32);
+
+        let well_conditioned: Vec<f32> = (0..=segments)
+            .map(|k| k as f32 * resolution as f32 / segments as f32)
+            .collect();
+
+        let axis = vec![
+            saturating,
+            well_conditioned.clone(),
+            degenerate,
+            well_conditioned,
+        ];
+        let sectors = axis.len();
+        assert_eq!(
+            adj_rim_source_row(&axis, sectors, segments, resolution, 1),
+            Some(2.0),
+            "the chain AFTER the saturating one reads two rows inside the net",
+        );
+        for i in [0usize, 2, 3] {
+            assert_eq!(
+                adj_rim_source_row(&axis, sectors, segments, resolution, i),
+                None,
+                "chain {i}'s predecessor does not saturate, so its rim stays on the polyline",
+            );
+        }
+    }
+
+    /// The other half of the rule: what a non-zero `j*_rim` actually reads. BEVEL.md
+    /// §8.9.5.4(c)'s zero-residual box names the two samples exactly —
+    /// `sample(chain 1, j* = 2, 1.6)` and `sample(chain 1, j* = 2, 3.2)` at `offset = 0.25`,
+    /// `segments = 5` — so this arm drives those coordinates through a net whose every slot
+    /// is identifiable and shows that they land on an interior **row**, not on the profile
+    /// polyline that row 0 stores.
+    #[test]
+    fn a_saturating_rim_reads_an_interior_net_row_not_the_profile_polyline() {
+        let sectors = 3usize;
+        let net_half = 4usize;
+        let resolution = 2 * net_half;
+
+        let chains: Vec<Vec<Vec3>> = (0..sectors)
+            .map(|i| {
+                (0..=resolution)
+                    .map(|k| Vec3::new(i as f32, k as f32, 0.0))
+                    .collect()
+            })
+            .collect();
+        let mut net = AdjNet::new(sectors, net_half, chains, true);
+        // `j < net_half` keeps every write on its own sub-patch: the `j == half` row is the
+        // *previous* sub-patch's seam column, so writing it would relabel the slots this arm
+        // identifies its reads by.
+        for i in 0..sectors {
+            for j in 1..net_half {
+                for k in 1..=net_half {
+                    net.set(i, j, k, Vec3::new(100.0 + i as f32, j as f32, k as f32));
+                }
+            }
+        }
+
+        let rim_row = 2.0;
+        for along_chain in [1.6f32, 3.2] {
+            let read = net.sample(1, rim_row, along_chain);
+            let on_polyline = net.sample(1, 0.0, along_chain);
+            assert_eq!(
+                read.x, 101.0,
+                "the read landed in sub-patch 1's stored interior, {along_chain} along",
+            );
+            assert_eq!(read.y, rim_row, "on the row `j*_rim` names");
+            assert!(
+                (read.z - along_chain).abs() < 1.0e-5,
+                "and at the chain coordinate it was asked for: {read:?}",
+            );
+            assert_eq!(
+                on_polyline,
+                Vec3::new(1.0, along_chain, 0.0),
+                "row 0 IS the profile polyline — which is what the collapsing case reads",
+            );
+        }
+    }
+
+    /// End to end at BEVEL.md §8.9.5.4(c)'s worked station: the flat 12-spoke fan beveled on
+    /// `0° / 90° / 180°` at `offset = 0.25`, `segments = 5`, inner `ARC`, `spread = 0`. One
+    /// of the two collapsed arcs saturates its source table there, so its successor's first
+    /// `⌊segments/2⌋ = 2` rim samples leave the profile polyline.
+    ///
+    /// The two positions a rim emitted from the profile chain alone carries are named below.
+    /// They are **absent** from the emitted mesh, and what stands in their place sits
+    /// `1191` and `835` position quanta away — the first being the figure §8.9.5.4(e)'s
+    /// `offset` sweep reports for this station, which is what ties the local rule to the
+    /// measured divergence. Nothing else moves: the census is identical to the
+    /// well-conditioned `spread` control's.
+    ///
+    /// The *absolute* positions are loopmesh's own. A displaced rim sample is a read of the
+    /// relaxed net's interior, so unlike an ordinary rim vertex it inherits the §8.5.5.7
+    /// Tier-2 interior band — only the displacement is a hard quantity.
+    #[test]
+    fn zero_spread_arc_rim_is_replanted_where_the_previous_source_table_saturates() {
+        let beveled_fan = |spread: f32| -> LoopMesh {
+            let (mut mesh, centre, rim) = planar_fan_axis_aligned(12);
+            let geom: Vec<GeomKey> = [1usize, 4, 7]
+                .iter()
+                .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+                .collect();
+            mesh.bevel(
+                &geom,
+                BevelOptions {
+                    offset: 0.25,
+                    affect: BevelAffect::Edges,
+                    segments: 5,
+                    profile: 0.5,
+                    vmesh_method: BevelVmeshMethod::Adj,
+                    miter_inner: BevelMiter::Arc,
+                    miter_outer: BevelMiter::Sharp,
+                    spread,
+                    ..Default::default()
+                },
+            );
+            mesh.validate_topology();
+            mesh
+        };
+
+        let mesh = beveled_fan(0.0);
+        assert_eq!(
+            counts(&mesh),
+            counts(&beveled_fan(0.1)),
+            "the replant is placement-only — same census as the well-conditioned control",
+        );
+
+        let nearest_quanta = |want: Vec3| -> f64 {
+            mesh.vert_keys()
+                .iter()
+                .map(|&v| {
+                    let p = mesh.vertex_position(v);
+                    ((p.x - want.x).abs())
+                        .max((p.y - want.y).abs())
+                        .max((p.z - want.z).abs()) as f64
+                        / 1.0e-5
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+
+        // Chain 1's own 1-D chord read-back, at source positions 1.6 and 3.2 — the two
+        // samples §8.9.5.4(c)'s box identifies as the profile-emitting fill's extras.
+        let profile_emitted = [
+            (Vec3::new(0.055_179_883, 0.151_881_35, 0.0), 1191.0),
+            (Vec3::new(0.159_748_9, 0.186_428_01, 0.0), 835.0),
+        ];
+        for (naive, displacement) in profile_emitted {
+            let gap = nearest_quanta(naive);
+            assert!(
+                (displacement - 40.0..displacement + 40.0).contains(&gap),
+                "the emitted rim sits {displacement} quanta off the profile polyline read, \
+                 not {gap}",
+            );
+        }
+    }
+
+    /// A grid read past `half` on **both** axes has no §8.5.2 canonical representative, and
+    /// [`AdjNet::sample`] resolves it rather than rejecting it — the case is reachable on
+    /// ordinary input (that method's note names the configuration). This arm pins the
+    /// resolution: [`AdjNet::at`]'s two seam rewrites compose, terminate, and land on a
+    /// stored interior slot, so the behaviour is a checked property of the code rather than
+    /// folklore. The *value* stays undefined by the guide, which pins neither the pair nor a
+    /// composition order; only its well-definedness is claimed here.
+    #[test]
+    fn a_grid_read_past_half_on_both_axes_composes_the_two_seam_rewrites() {
+        let sectors = 5usize;
+        let half = 3usize;
+        let resolution = 2 * half;
+
+        let chains: Vec<Vec<Vec3>> = (0..sectors)
+            .map(|i| {
+                (0..=resolution)
+                    .map(|k| Vec3::new(i as f32, k as f32, 0.0))
+                    .collect()
+            })
+            .collect();
+        let mut net = AdjNet::new(sectors, half, chains, true);
+        // Strictly interior slots only, so no write aliases a seam row and every read below
+        // is identifiable by where it landed.
+        for i in 0..sectors {
+            for j in 1..half {
+                for k in 1..half {
+                    net.set(i, j, k, Vec3::new(10.0 + i as f32, j as f32, k as f32));
+                }
+            }
+        }
+
+        let (i, j, k) = (1usize, 4usize, 5usize);
+        let landed = net.at(i, j, k);
+        assert_eq!(
+            landed,
+            net.at((i + 2) % sectors, resolution - j, resolution - k),
+            "the `k` rewrite runs first and the `j` rewrite runs on its result",
+        );
+        assert_eq!(
+            landed,
+            Vec3::new(10.0 + 3.0, 2.0, 1.0),
+            "and that composition names a stored interior slot of sub-patch `i + 2`",
+        );
+        assert_ne!(
+            landed,
+            net.at(i, half, half),
+            "clamping both axes instead would land on the shared centre — the far end of \
+             both axes the seam rules point at",
+        );
+    }
+
+    /// The reachable configuration behind the arm above, driven end to end: a plain
+    /// 12-spoke fan beveled on `0° / 90° / 180°` with an inner `ARC` miter at zero spread
+    /// over the [V-ADJ] grid. The §8.9.5.4(c) degenerate chord tables it produces send one
+    /// [`AdjNet::sample`] read past `half` on **both** axes, which §8.5.2 asks an
+    /// implementation to reject — so this ran as a *panic in debug builds*, and the compat
+    /// suite runs in debug.
+    ///
+    /// Nothing here is exotic: no degenerate geometry, no hand-built net, ordinary
+    /// parameters. So the arm is the pin that stops the rejecting guard being reintroduced —
+    /// the run must finish, the mesh must survive [`LoopMesh::validate_topology`], and every
+    /// vertex the bevel mints must be finite (the seam composition lands on a stored slot,
+    /// never on an uninitialised or NaN one).
+    #[test]
+    fn zero_spread_arc_miter_fan_completes_despite_reading_past_half_on_both_axes() {
+        let (mut mesh, centre, rim) = planar_fan_axis_aligned(12);
+        let geom: Vec<GeomKey> = [1usize, 4, 7]
+            .iter()
+            .map(|&k| mesh.query_edge_exists(centre, rim[k]).unwrap().into())
+            .collect();
+        let result = mesh.bevel(
+            &geom,
+            BevelOptions {
+                offset: 0.25,
+                affect: BevelAffect::Edges,
+                segments: 6,
+                profile: 0.5,
+                vmesh_method: BevelVmeshMethod::Adj,
+                miter_inner: BevelMiter::Arc,
+                miter_outer: BevelMiter::Sharp,
+                spread: 0.0,
+                ..Default::default()
+            },
+        );
+        mesh.validate_topology();
+
+        assert!(
+            !result.faces.is_empty(),
+            "the bevel ran to completion and emitted its fill",
+        );
+        assert!(
+            result
+                .verts
+                .iter()
+                .all(|&v| mesh.vertex_position(v).is_finite()),
+            "every minted vert is finite — the both-axes seam composition landed on a \
+             stored slot",
         );
     }
 
@@ -59015,8 +59396,17 @@ impl AdjNet {
     /// `i`'s chart continues into `i + 1` as `(i, j, half + t) ≡ (i + 1, half − t, j)`
     /// (and symmetrically backward across `j`). That is what lets the valence-4 vertex
     /// mask be written once and still be correct on the shared spokes.
+    ///
+    /// Both rewrites may fire on one query (see [`AdjNet::sample`]); the pair composes and
+    /// terminates. What the chart genuinely cannot express is an index outside
+    /// `0 ..= 2·half`: the forward rewrite would reflect it below zero. The rewrites
+    /// preserve that bound, so asserting it on entry covers the recursion too.
     fn at(&self, i: usize, j: usize, k: usize) -> Vec3 {
         let half = self.half;
+        debug_assert!(
+            j <= 2 * half && k <= 2 * half,
+            "grid index outside the `[0, resolution]` chart",
+        );
         if k > half {
             return self.at((i + 1) % self.sectors, half - (k - half), j);
         }
@@ -59190,17 +59580,36 @@ impl AdjNet {
     /// opposite end of the very axis the rule points at — so the cell corners are handed to
     /// [`AdjNet::at`], which carries both rewrites.
     ///
-    /// Only one axis may leave the quadrant at a time: a triple past `half` on both would
-    /// walk two sub-patches in opposite directions, and §8.5.2 rejects it rather than
-    /// defining it — hence the assert. The two over-run mechanisms are **independent
-    /// per-chain conditions**, so nothing about the construction rules the pair out: a
-    /// degenerate *source* table drives the `k` axis to `resolution` at ordinary non-centre
-    /// triples (measured `k = 8.0`, `j = 1.33` at `half = 4` inside the
-    /// `inner_miter_arc_zero_spread_*` fixtures), while a degenerate *target* table drives
-    /// the `j` axis there (`degenerate_chord_table_read_reversed_*`). A ring carrying one on
-    /// chain `i` and the other on chain `i − 1` would over-run both. No fixture in either
-    /// suite reaches that, and no attempt to construct one has succeeded, so the assert is
-    /// the honest statement: it has never fired, not that it cannot.
+    /// A triple past `half` on **both** axes at once is **resolved here, not rejected**,
+    /// and no guard stands against it. §8.5.2 asks for the opposite — it guards its backward
+    /// rule with `k ≤ h` and says to reject a triple that has left the domain on both axes,
+    /// on the reading that "in practice that triple never arises". That reading is wrong for
+    /// this kernel. The two over-run mechanisms are **independent per-chain conditions**, so
+    /// nothing about the construction rules the pair out: a degenerate *source* table drives
+    /// the `k` axis to `resolution` at ordinary non-centre triples (measured `k = 8.0`,
+    /// `j = 1.33` at `half = 4` inside the `inner_miter_arc_zero_spread_*` fixtures), a
+    /// degenerate *target* table drives the `j` axis there
+    /// (`degenerate_chord_table_read_reversed_*`), and a ring carrying one on chain `i` and
+    /// the other on chain `i − 1` over-runs both. Ordinary input reaches it:
+    /// `planar_fan_axis_aligned(12)` beveled on its `0° / 90° / 180°` spokes at
+    /// `offset = 0.25`, `segments = 6`, `profile = 0.5`, `ADJ`, inner `ARC`, outer `SHARP`,
+    /// `spread = 0` does, as do neighbouring offsets and counts
+    /// (`zero_spread_arc_miter_fan_completes_*` is the pin). Rejecting would abort a bevel a
+    /// caller may legitimately ask for — and abort it in *debug* builds, which is what the
+    /// parity suite runs.
+    ///
+    /// So the cell corners go to [`AdjNet::at`] like any others, and its two seam rewrites
+    /// compose in succession, `(i, j, k) → (i + 1, resolution − k, j) →
+    /// (i + 2, resolution − j, resolution − k)`, which terminates on a stored slot and stays
+    /// in bounds. That value is well defined but **undefined-*by-the-guide***: §8.5.2 neither
+    /// defines the pair nor says which axis composes first, so nothing here claims the
+    /// composition is the parity-correct one — only that it is total, deterministic, and
+    /// in-bounds (`a_grid_read_past_half_on_both_axes_composes_the_two_seam_rewrites` pins
+    /// it). Clamping instead would be the worse answer: it lands on the seam spoke, the far
+    /// end of both axes the rules point at.
+    ///
+    /// The real invariant is the chart bound, `0 ≤ j, k ≤ resolution` — which the clamp
+    /// below enforces, so the corners handed to [`AdjNet::at`] are always in the chart.
     ///
     /// A coordinate that lands *on* `half` keeps the cell below it, so a read that stays in
     /// the quadrant never reaches for a corner it does not weight.
@@ -59210,12 +59619,6 @@ impl AdjNet {
         let top = resolution as f32;
         let j = j.clamp(0.0, top);
         let k = k.clamp(0.0, top);
-        // One comparison per interior grid vert, off any hot loop, guarding a case the guide
-        // leaves undefined rather than one it forbids — so it stays on in release.
-        assert!(
-            j <= half as f32 || k <= half as f32,
-            "a grid query past `half` on both axes has no canonical representative",
-        );
         let cell_origin = |coordinate: f32| {
             let floor = coordinate.floor() as usize;
             if coordinate <= half as f32 {
@@ -59302,6 +59705,42 @@ fn adj_interior_axis(
             }
         })
         .collect()
+}
+
+/// The **rim** row's own `j` source coordinate, `j*_rim = resolution − locate(1, g_{i−1})`
+/// (BEVEL.md §8.5.5.5(d), "The rim's own `j` coordinate"), or `None` when it comes out zero.
+///
+/// The emitted rim `(i, 0, k)` is the `j = 0` row of the same two-axis read the interior
+/// takes, not a standalone 1-D rule, so it carries a `j` coordinate like every other row.
+/// Substituting `j = 0` makes the `j`-axis query `f^{(i−1)}_{segments}`, which is `1` for
+/// every normalised table — so the coordinate is a quantity of the **previous** chain with
+/// nothing of chain `i` in it, and `locate(1, g)` is the last entry of that chain's index
+/// table.
+///
+/// `locate(1, g)` is `resolution` for any table whose final source chord survived
+/// normalisation, which is every well-conditioned chain and also the fully degenerate
+/// `[0, …, 0, 1]` fallback — hence the `None`, and hence the rim's usual collapse to the
+/// pure `k`-axis read-back of §8.2.2.1.1 step 3 along source row `0`, which *is* the profile
+/// polyline. That collapse is a **theorem about the table**, not a rule of the fill: a
+/// **saturating** table — one that reaches `1` at some `p < resolution` and plateaus, which a
+/// `spread = 0` inner-miter arc produces whenever the meet point's mantissa refuses the
+/// two-term interpolation at some dyadic parameter (§8.9.5.4(c)) — leaves
+/// `j*_rim = resolution − p > 0`, and then the next chain's rim is lerped along an interior
+/// row of the relaxed net instead.
+///
+/// The chain that is degenerate is never the chain that moves: a collapsed chain's own rim is
+/// one repeated point either way, and it is its **successor** around the ring that reads the
+/// foreign row.
+fn adj_rim_source_row(
+    axis: &[Vec<f32>],
+    sectors: usize,
+    segments: usize,
+    resolution: usize,
+    i: usize,
+) -> Option<f32> {
+    let previous = (i + sectors - 1) % sectors;
+    let row = resolution as f32 - axis[previous][segments];
+    (row != 0.0).then_some(row)
 }
 
 /// Relax a general valence-`s` cap's coarse control net up to the working resolution the
