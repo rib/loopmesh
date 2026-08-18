@@ -7992,7 +7992,7 @@ impl LoopMesh {
         &mut self,
         chain_of: &[Vec<VertexKey>],
         net: &AdjNet,
-        axis: &[Vec<f32>],
+        axis: &[Vec<SourcePosition>],
         sectors: usize,
         seg: usize,
         half: usize,
@@ -8006,7 +8006,7 @@ impl LoopMesh {
                 continue;
             };
             for k in 1..=half.min(seg - 1) {
-                let position = net.sample(i, rim_row, axis[i][k]);
+                let position = net.sample(i, rim_row, axis[i][k].snapped());
                 self.set_vertex_position(chain_of[i][k], position);
             }
         }
@@ -28898,11 +28898,11 @@ mod tests {
         let source = arc_chain(boundary_source_resolution(3));
         assert!(source.iter().all(|&sample| sample == meet));
         assert_eq!(
-            chord_fraction_indices(&chain, &source),
+            source_position_values(&chord_fraction_source_positions(&chain, &source)),
             vec![0.0, 3.5, 4.0, 4.0],
         );
         assert_ne!(
-            chord_fraction_indices(&chain, &source),
+            source_position_values(&chord_fraction_source_positions(&chain, &source)),
             vec![0.0, 0.0, 0.0, 4.0],
             "the fallback-on-both-axes reading is the retired premise",
         );
@@ -28957,14 +28957,25 @@ mod tests {
         // the source polyline's `start` end and only the last one to its far end.
         let source = vec![point; 5];
         assert_eq!(
-            chord_fraction_indices(&degenerate, &source),
+            source_position_values(&chord_fraction_source_positions(&degenerate, &source)),
             vec![0.0, 0.0, 0.0, 4.0],
             "every interior query of a degenerate chain reads the source at index 0",
         );
         assert_ne!(
-            chord_fraction_indices(&degenerate, &source),
+            source_position_values(&chord_fraction_source_positions(&degenerate, &source)),
             vec![0.0, 4.0 / 3.0, 8.0 / 3.0, 4.0],
             "uniform index fractions are the mis-reading this table exists to rule out",
+        );
+        // The far end is the upper-endpoint spelling: the index never reaches `4`, which is
+        // why a saturation test written as `index == source.len() − 1` reports backwards.
+        assert_eq!(
+            *chord_fraction_source_positions(&degenerate, &source)
+                .last()
+                .unwrap(),
+            SourcePosition {
+                index: 3,
+                remainder: 1.0,
+            },
         );
 
         // On the chain's own samples the fallback is invisible — which is exactly why the
@@ -28987,19 +28998,23 @@ mod tests {
         let target_half = segments / 2;
 
         let point = Vec3::new(-0.2, 0.5, 0.1);
-        let degenerate =
-            chord_fraction_indices(&vec![point; segments + 1], &vec![point; resolution + 1]);
+        let degenerate = chord_fraction_source_positions(
+            &vec![point; segments + 1],
+            &vec![point; resolution + 1],
+        );
 
         // The `k` axis, forward: every interior column stands on the source grid's first
         // column, the one over the degenerate boundvert.
         for k in 0..segments {
             assert_eq!(
-                degenerate[k], 0.0,
+                degenerate[k],
+                SourcePosition::ORIGIN,
                 "forward interior column {k} reads index 0"
             );
         }
         assert_eq!(
-            degenerate[segments], resolution as f32,
+            degenerate[segments].value(),
+            resolution as f32,
             "the far end is the last entry",
         );
 
@@ -29024,7 +29039,8 @@ mod tests {
 
         // Chain 0 is the degenerate arc. Its neighbours read at integer indices so the
         // bilinear kernel lands on a net slot exactly and the assertion can be an identity.
-        let well_conditioned: Vec<f32> = (0..=segments).map(|k| k as f32).collect();
+        let well_conditioned: Vec<SourcePosition> =
+            (0..=segments).map(SourcePosition::at).collect();
         let axis = vec![
             degenerate.clone(),
             well_conditioned.clone(),
@@ -29294,7 +29310,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0],
             "neither the fallback nor a well-formed monotone table — it saturates at 6",
         );
-        let saturating = chord_fraction_indices(
+        let saturating = chord_fraction_source_positions(
             &arc_chain_positions(
                 saturating_meet,
                 saturating_meet,
@@ -29306,8 +29322,12 @@ mod tests {
         );
         assert_eq!(
             *saturating.last().unwrap(),
-            6.0,
-            "locate(1, g) is the plateau's FIRST index, not the last",
+            SourcePosition {
+                index: 5,
+                remainder: 1.0,
+            },
+            "locate(1, g) is the plateau's FIRST index, not the last — and it arrives as the \
+             upper endpoint of the span below it, so its *value* is 6 while its *index* is 5",
         );
 
         // The fully degenerate sibling: every source sample is bit-exactly the meet point,
@@ -29321,7 +29341,7 @@ mod tests {
             resolution as u32,
         );
         assert!(degenerate_source.iter().all(|&p| p == degenerate_meet));
-        let degenerate = chord_fraction_indices(
+        let degenerate = chord_fraction_source_positions(
             &arc_chain_positions(
                 degenerate_meet,
                 degenerate_meet,
@@ -29331,10 +29351,16 @@ mod tests {
             ),
             &degenerate_source,
         );
-        assert_eq!(*degenerate.last().unwrap(), resolution as f32);
+        assert_eq!(degenerate.last().unwrap().value(), resolution as f32);
+        assert_ne!(
+            degenerate.last().unwrap().index,
+            resolution,
+            "the index never reaches the axis's last sample, so a saturation predicate \
+             written as `index == resolution` answers backwards on every non-saturating table",
+        );
 
-        let well_conditioned: Vec<f32> = (0..=segments)
-            .map(|k| k as f32 * resolution as f32 / segments as f32)
+        let well_conditioned: Vec<SourcePosition> = (0..=segments)
+            .map(|k| upper_endpoint_spelling(k as f32 * resolution as f32 / segments as f32))
             .collect();
 
         let axis = vec![
@@ -29346,7 +29372,7 @@ mod tests {
         let sectors = axis.len();
         assert_eq!(
             adj_rim_source_row(&axis, sectors, segments, resolution, 1),
-            Some(2.0),
+            Some(SourcePosition::at(2)),
             "the chain AFTER the saturating one reads two rows inside the net",
         );
         for i in [0usize, 2, 3] {
@@ -29389,15 +29415,16 @@ mod tests {
             }
         }
 
-        let rim_row = 2.0;
+        let rim_row = SourcePosition::at(2);
         for along_chain in [1.6f32, 3.2] {
-            let read = net.sample(1, rim_row, along_chain);
-            let on_polyline = net.sample(1, 0.0, along_chain);
+            let chain = upper_endpoint_spelling(along_chain);
+            let read = net.sample(1, rim_row, chain);
+            let on_polyline = net.sample(1, SourcePosition::ORIGIN, chain);
             assert_eq!(
                 read.x, 101.0,
                 "the read landed in sub-patch 1's stored interior, {along_chain} along",
             );
-            assert_eq!(read.y, rim_row, "on the row `j*_rim` names");
+            assert_eq!(read.y, rim_row.value(), "on the row `j*_rim` names");
             assert!(
                 (read.z - along_chain).abs() < 1.0e-5,
                 "and at the chain coordinate it was asked for: {read:?}",
@@ -29405,7 +29432,8 @@ mod tests {
             assert_eq!(
                 on_polyline,
                 Vec3::new(1.0, along_chain, 0.0),
-                "row 0 IS the profile polyline — which is what the collapsing case reads",
+                "row 0 IS the profile polyline — which is what the collapsing case reads: \
+                 {on_polyline:?}",
             );
         }
     }
@@ -32536,8 +32564,12 @@ mod tests {
         // the Tier-2 kernel's doing.
         let axis = adj_interior_axis(&profiles, 4, 4);
         for chain in &axis {
-            for (k, &index) in chain.iter().enumerate() {
-                assert_eq!(index, k as f32, "no resample runs at a power-of-two target");
+            for (k, &position) in chain.iter().enumerate() {
+                assert_eq!(
+                    position,
+                    SourcePosition::at(k),
+                    "no resample runs at a power-of-two target",
+                );
             }
         }
 
@@ -32633,6 +32665,33 @@ mod tests {
         adj_relaxed_net(boundverts, &mids, seed, profiles, segments)
     }
 
+    /// The values a run of [`SourcePosition`]s denotes. For assertions whose claim is
+    /// genuinely about the position — never for one about the tolerance, whose unit is the
+    /// remainder and whose whole point is that the value has already lost it.
+    fn source_position_values(positions: &[SourcePosition]) -> Vec<f32> {
+        positions.iter().map(|p| p.value()).collect()
+    }
+
+    /// A synthetic axis entry in [`chord_fraction_source_positions`]'s own spelling: an
+    /// integral position `p > 0` arrives as the **upper** endpoint `(p − 1, 1)` of the span
+    /// below it, because a query landing on a source sample divides a span by itself. Tests
+    /// that hand-build an axis must use this spelling or they exercise a pair the producer
+    /// never emits — and, at the far end, the only spelling available.
+    fn upper_endpoint_spelling(value: f32) -> SourcePosition {
+        let floor = value.floor();
+        if value == floor && value > 0.0 {
+            SourcePosition {
+                index: floor as usize - 1,
+                remainder: 1.0,
+            }
+        } else {
+            SourcePosition {
+                index: floor as usize,
+                remainder: value - floor,
+            }
+        }
+    }
+
     /// Every **index-canonical** interior triple of an even-`segments` valence-3 cap
     /// (§8.5.2): the `j == half` row belongs to the previous sub-patch's seam column, and
     /// all `s` copies of `(half, half)` are the one welded centre.
@@ -32659,7 +32718,7 @@ mod tests {
     /// `resolution / 2` survives most fixtures: a mirror-symmetric cell, where the target's
     /// `f_half` and the source's `g_{N/2}` are both `1/2`, and a power-of-two target, where
     /// source and target tables are the same table. The second control reads
-    /// [`chord_fraction_indices`] directly rather than through [`adj_interior_axis`], whose
+    /// [`chord_fraction_source_positions`] directly rather than through [`adj_interior_axis`], whose
     /// `resolution == segments` arm returns the identity table without consulting either
     /// chain — that arm is pinned separately by
     /// `adj_general_cap_valence4_segments4_interior_is_the_relaxed_net`.
@@ -32671,7 +32730,7 @@ mod tests {
             let half = (segments / 2) as usize;
             let axis = adj_interior_axis(&skewed, segments, resolution);
             for (i, profile) in skewed.iter().enumerate() {
-                let table = chord_fraction_indices(
+                let table = chord_fraction_source_positions(
                     &profile.raw_positions(segments),
                     &profile.raw_positions(resolution),
                 );
@@ -32680,13 +32739,15 @@ mod tests {
                     "every index of chain {i} is the chord-fraction read-back, mid included",
                 );
                 // Measured `6.19e-3` at `segments = 6` and `5.45e-3` at `10`, so the margin
-                // is ~6×. It also sits ~1500× above the few-ulp window
-                // [`snapped_to_integral_source_index`] may erase, which is what keeps that
-                // snap from quietly reinstating the forbidden pin.
+                // is ~6×. It also sits three orders of magnitude above the `1e-6` window
+                // [`SourcePosition::snapped`] may erase, which is what keeps that snap from
+                // quietly reinstating the forbidden pin *on this ring* — the window's safety
+                // in general rests on the bound on its positional consequence, not on a
+                // margin read off one fixture.
                 assert!(
-                    (axis[i][half] - resolution as f32 / 2.0).abs() > 1.0e-3,
+                    (axis[i][half].value() - resolution as f32 / 2.0).abs() > 1.0e-3,
                     "a skewed cell's mid chord fraction is provably not the dense mid: \
-                     {} vs {}",
+                     {:?} vs {}",
                     axis[i][half],
                     resolution as f32 / 2.0,
                 );
@@ -32697,95 +32758,513 @@ mod tests {
         for segments in [6_u32, 10, 12, 20] {
             let resolution = boundary_source_resolution(segments);
             let half = (segments / 2) as usize;
+            let dense_mid = resolution as f32 / 2.0;
             for chain in adj_interior_axis(&symmetric, segments, resolution) {
-                // *Exactly* the dense mid, not merely near it — see
-                // `adj_mid_index_of_a_mirror_symmetric_cell_is_exactly_the_dense_mid`.
-                assert_eq!(
+                // The dense mid to within the ulp or two the two accumulations cost. Whether
+                // the snap then restores it *exactly* is a question about the remainder, not
+                // about this distance, and
+                // `adj_symmetric_mid_source_position_snaps_where_the_remainder_is_under_the_window`
+                // is where it is asked in the right unit.
+                assert!(
+                    (chain[half].value() - dense_mid).abs() <= dense_mid * f32::EPSILON,
+                    "a mirror-symmetric cell reads the dense mid anyway: {:?} vs {dense_mid}",
                     chain[half],
-                    resolution as f32 / 2.0,
-                    "a mirror-symmetric cell reads the dense mid anyway",
                 );
             }
         }
 
         for profile in skewed.iter() {
-            let table = chord_fraction_indices(
+            let table = chord_fraction_source_positions(
                 &profile.raw_positions(8),
                 &profile.raw_positions(boundary_source_resolution(8)),
             );
-            for (k, &index) in table.iter().enumerate() {
+            for (k, &position) in table.iter().enumerate() {
                 assert_eq!(
-                    index, k as f32,
+                    position.value(),
+                    k as f32,
                     "at a power-of-two target the source and target tables are one table",
                 );
             }
         }
     }
 
-    /// BEVEL.md §8.5.5.5(d), the "Coinciding *mathematically* is not coinciding in `f32`"
-    /// hazard: on a mirror-symmetric cell the mid index is mathematically `N/2`, but `f_half`
-    /// and `g_{N/2}` are accumulated over chains of different length and divided by different
-    /// totals, so the quotient lands beside the integer. [`snapped_to_integral_source_index`]
-    /// is the rule that puts it back, and it is keyed to the index's own value — never to
-    /// `segments % 2`, never to the mid coordinate.
+    /// BEVEL.md §8.5.5.5(d), ["what to measure, and in what unit"]: the `1e-6` tolerance is
+    /// tested on the **span remainder**, so the measurement is a direct read of
+    /// [`chord_fraction_source_positions`]'s second return value — never a miss recovered
+    /// from a position, which has already lost it.
     ///
-    /// Both halves matter. Without the snap the symmetric ring reads `1` ulp off at
-    /// `segments ∈ {12, 20}` (and `0` at `6, 10, 16`), which is enough to tip the innermost
-    /// seam entries into the neighbouring `1e-5` position bucket. With a window wide enough
-    /// to reach a real skew the §8.5.5.5(d) rule itself would be gone, so the skewed arm here
-    /// asserts the snap left it alone to the last bit.
+    /// Measured on the mirror-symmetric [`skewed_cap_ring`], all three chains agreeing at
+    /// every count:
+    ///
+    /// ```text
+    ///   segments        6        10        12        16        20        24        34        40
+    ///   N               8        16        16        16        32        32        64        64
+    ///   index           3         7         8         7        16        15        32        32
+    ///   remainder     1.0       1.0   8.15e-7       1.0   1.62e-6       1.0   4.85e-6   1.62e-6
+    ///   k snaps?        —         —       YES         —        no         —        no        no
+    /// ```
+    ///
+    /// Two readings of that table are worth spelling out, because both were got wrong from a
+    /// **collapsed** `index as f32 + remainder` measurement of the same fixture (which reads
+    /// `+0, +0, +1, +0, +1, +0, +1, +0` ulp of the dense mid — this test's stations reproduce
+    /// that fingerprint exactly, which is what makes them the same measurement re-taken in
+    /// the right unit):
+    ///
+    /// - At `6, 10, 16, 24` the entry is **already exactly the dense mid**, in `locate`'s
+    ///   upper-endpoint spelling `(N/2 − 1, 1)`. Its remainder is `1.0`, so the chain axis's
+    ///   snap does **not** fire — and nothing is lost by that, because at a remainder of `1`
+    ///   the kernel's two `lo` terms carry the exact factor `0` and the read is already the
+    ///   pure copy of column `N/2` that a snap would have produced. The collapsed reading's
+    ///   `+0` was decoded as "a tiny remainder, therefore snapped"; the truth is "no
+    ///   residue at all, therefore no epsilon was ever consulted".
+    /// - At `40` the remainder is `1.62e-6` and the reference **declines**, yet the collapsed
+    ///   reading is `+0`: one ulp of position `32` is `3.81e-6`, so the sum rounds the
+    ///   remainder away and *manufactures* an exact hit, emitting a pure copy where a blend
+    ///   with weight `1.62e-6` on column `33` is owed. That is the divergence the pair
+    ///   representation exists to remove, and it is invisible to any position-space
+    ///   measurement.
+    ///
+    /// `12` is the station that decides the residue this snap was adopted for — the
+    /// mirror-symmetric cell whose innermost seam entries otherwise tip a position bucket —
+    /// and under the remainder rule it still snaps, at `8.15e-7` against `1e-6`.
     #[test]
-    fn adj_mid_index_of_a_mirror_symmetric_cell_is_exactly_the_dense_mid() {
+    fn adj_symmetric_mid_source_position_snaps_where_the_remainder_is_under_the_window() {
         let (_, symmetric) = skewed_cap_ring(0.5, 0.7);
-        let (_, skewed) = skewed_cap_ring(0.9, 0.7);
-        for segments in [6_u32, 10, 12, 16, 20] {
+        // (segments, span index, remainder, does the chain axis snap, collapsed reading in
+        // ulp of the dense mid — the last carried only as a cross-check that this is the
+        // same measurement in a unit that cannot decide the question).
+        let stations: [(u32, usize, f32, bool, i64); 8] = [
+            (6, 3, 1.0, false, 0),
+            (10, 7, 1.0, false, 0),
+            (12, 8, 8.145_89e-7, true, 1),
+            (16, 7, 1.0, false, 0),
+            (20, 16, 1.620_055e-6, false, 1),
+            (24, 15, 1.0, false, 0),
+            (34, 32, 4.853_12e-6, false, 1),
+            (40, 32, 1.617_707e-6, false, 0),
+        ];
+        let mut snapped_somewhere = false;
+        let mut declined_somewhere = false;
+        for (segments, index, remainder, snaps, collapsed_ulp) in stations {
             let resolution = boundary_source_resolution(segments);
             let half = (segments / 2) as usize;
             let dense_mid = resolution as f32 / 2.0;
-
-            for chain in adj_interior_axis(&symmetric, segments, resolution) {
-                assert_eq!(
-                    chain[half].to_bits(),
-                    dense_mid.to_bits(),
-                    "segments {segments}: the symmetric mid index is bit-exactly {dense_mid}",
+            for profile in symmetric.iter() {
+                // Straight off the producer, so nothing downstream can be masking the unit.
+                let table = chord_fraction_source_positions(
+                    &profile.raw_positions(segments),
+                    &profile.raw_positions(resolution),
                 );
+                let position = table[half];
+                assert_eq!(
+                    position.index, index,
+                    "segments {segments}: the mid entry's span index",
+                );
+                assert!(
+                    (position.remainder - remainder).abs() < 1.0e-12,
+                    "segments {segments}: the mid entry's remainder is {:e}, not {remainder:e}",
+                    position.remainder,
+                );
+                // A cross-check that the same measurement is being re-taken in the right
+                // unit — not a parity quantity. It pins OUR chord accumulation's own
+                // fingerprint, so a future mismatch here reads as "our accumulation moved",
+                // never as "the reference moved".
+                assert_eq!(
+                    position.value().to_bits() as i64 - dense_mid.to_bits() as i64,
+                    collapsed_ulp,
+                    "segments {segments}: the collapsed fingerprint",
+                );
+
+                // The chain axis: one-sided, on the remainder.
+                assert_eq!(
+                    position.remainder < SOURCE_POSITION_INTEGRAL_EPSILON,
+                    snaps,
+                    "segments {segments}: the chain axis's snap decision",
+                );
+                if snaps {
+                    assert_eq!(position.snapped(), SourcePosition::at(index));
+                    assert_eq!(position.snapped().value(), dense_mid);
+                } else {
+                    // Where the remainder is `1` the declined snap costs nothing: the read
+                    // is already the pure copy of column `index + 1` a snap would give.
+                    assert_eq!(position.snapped(), position);
+                }
+
+                // The ring axis: two-sided, on the PRE-reflection remainder. It fires
+                // wherever the chain axis does, and additionally at the four counts whose
+                // remainder is `1.0` — where it raises the position to the integer that pair
+                // already denotes, so the composite is the identity in value.
+                let two_sided = position.remainder.min(1.0 - position.remainder)
+                    < SOURCE_POSITION_INTEGRAL_EPSILON;
+                assert_eq!(two_sided, snaps || position.remainder == 1.0);
+                let ring = ring_source_position(position, resolution as usize);
+                if two_sided {
+                    assert_eq!(
+                        ring,
+                        SourcePosition::at(resolution as usize / 2),
+                        "segments {segments}: the reflection's own fixed point is integral, \
+                         so both applications land on it exactly",
+                    );
+                } else {
+                    assert_ne!(ring.remainder, 0.0, "segments {segments}");
+                }
+
+                snapped_somewhere |= snaps;
+                declined_somewhere |= !two_sided;
             }
+        }
+        assert!(
+            snapped_somewhere && declined_somewhere,
+            "the sweep must contain a station on each side of the window, or it pins nothing",
+        );
+    }
 
-            for (i, chain) in adj_interior_axis(&skewed, segments, resolution)
-                .iter()
-                .enumerate()
-            {
-                let unsnapped = chord_fraction_indices(
-                    &skewed[i].raw_positions(segments),
-                    &skewed[i].raw_positions(resolution),
-                );
-                assert_eq!(
-                    chain[half].to_bits(),
-                    unsnapped[half].to_bits(),
-                    "segments {segments}: the snap never reaches a skewed cell's mid index",
-                );
+    /// The snap's **call sites**, not its rule. [`SourcePosition::snapped`] is applied where
+    /// the two-axis kernel *consumes* the table rather than inside the shared producer
+    /// (which cannot carry it — the two axes want different sidedness), so pinning
+    /// [`SourcePosition::snapped`] in isolation leaves every consumer free to drop it.
+    /// This arm drives the three chain-axis consumers instead:
+    /// [`AdjInterior::Relaxed`], [`AdjInterior::Octant`] and
+    /// [`LoopMesh::replant_rim_off_the_saturating_net`].
+    ///
+    /// `segments = 12` is the one station of the [`skewed_cap_ring`] sweep whose mid entry
+    /// carries a residue the window actually catches (`8.15e-7` — see
+    /// [`adj_symmetric_mid_source_position_snaps_where_the_remainder_is_under_the_window`]).
+    /// At every other count the entry is already integral or already the upper-endpoint
+    /// spelling of the dense mid, and a dropped snap is silent there — which is why an
+    /// interior test at an arbitrary count pins nothing about the call sites.
+    ///
+    /// The net is synthetic so the leak is unmistakable rather than sub-ulp: every slot off
+    /// dense column `N/2` carries a `1e6` marker in `z`, which a dropped snap's `8.15e-7`
+    /// weight turns into a `~0.8` contamination of a coordinate that must read an exact `0`.
+    /// The `assert_ne!` beside each pin is what makes it a pin: it shows the fixture can see
+    /// the mutation the `assert_eq!` claims to exclude.
+    #[test]
+    fn the_chain_axis_snap_is_applied_at_every_kernel_call_site() {
+        let (_, symmetric) = skewed_cap_ring(0.5, 0.7);
+        let sectors = symmetric.len();
+        let segments = 12usize;
+        let resolution = boundary_source_resolution(segments as u32) as usize;
+        let net_half = resolution / 2;
+        let target_half = segments / 2;
+        assert_eq!((resolution, net_half, target_half), (16, 8, 6));
+
+        let axis = adj_interior_axis(&symmetric, segments as u32, resolution as u32);
+        for chain in axis.iter() {
+            let mid = chain[target_half];
+            assert_eq!(mid.index, net_half, "the mid entry's span index");
+            assert_ne!(mid.remainder, 0.0, "a residue the snap has to remove");
+            assert!(
+                mid.remainder < SOURCE_POSITION_INTEGRAL_EPSILON,
+                "and one the window catches: {:e}",
+                mid.remainder,
+            );
+        }
+
+        // `z` is the marker: zero exactly on dense column `N/2`, enormous everywhere else.
+        // The seam identifies `(i, half, k)` with `(i − 1, k, half)`, so the rule has to be
+        // stated over *both* coordinates to stay consistent under it.
+        let off_column = 1.0e6;
+        let marker = |j: usize, k: usize| {
+            let on_dense_mid = j == net_half || k == net_half;
+            Vec3::new(
+                j as f32,
+                k as f32,
+                if on_dense_mid { 0.0 } else { off_column },
+            )
+        };
+        let chains: Vec<Vec<Vec3>> = (0..sectors)
+            .map(|_| (0..=resolution).map(|k| marker(0, k)).collect())
+            .collect();
+        let mut net = AdjNet::new(sectors, net_half, chains, true);
+        for i in 0..sectors {
+            for j in 1..net_half {
+                for k in 1..=net_half {
+                    net.set(i, j, k, marker(j, k));
+                }
             }
         }
 
-        // The window is a few ulp and nothing wider: an index a thousand ulp out — two
-        // orders of magnitude *below* the closest real skew measured on this ring — is still
-        // left where it is.
-        let thousand_ulps = f32::from_bits(8.0_f32.to_bits() + 1000);
-        assert_eq!(snapped_to_integral_source_index(thousand_ulps), thousand_ulps);
+        let (i, j, k) = (0usize, 2usize, target_half);
+        let previous = (i + sectors - 1) % sectors;
+        let ring = ring_source_position(axis[previous][segments - j], resolution);
+        let on_dense_column = net.sample(i, ring, SourcePosition::at(net_half));
+        let leaked = net.sample(i, ring, axis[i][k]);
+        assert_eq!(on_dense_column.z, 0.0);
+        assert_ne!(
+            leaked, on_dense_column,
+            "the fixture cannot see a dropped snap, so nothing below pins one",
+        );
+
+        let relaxed = AdjInterior::Relaxed {
+            net: &net,
+            axis: &axis,
+            sectors,
+            segments,
+        };
         assert_eq!(
-            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() + 4)),
-            8.0,
+            relaxed.position(i, j, k, target_half),
+            on_dense_column,
+            "the interior read of the mid column stays on dense column N/2",
+        );
+
+        let exponent = 3.0f32;
+        let octant = UnitOctant::from_corner([Vec3::X, Vec3::Y, Vec3::Z], Vec3::ONE)
+            .expect("the unit cube corner is a well-conditioned octant frame");
+        let expected_octant =
+            octant.to_world(snap_to_unit_superellipsoid(on_dense_column, exponent, false));
+        assert_ne!(
+            octant.to_world(snap_to_unit_superellipsoid(leaked, exponent, false)),
+            expected_octant,
+            "the surface snap must not wash the leak out before it can be seen",
+        );
+        let octant_interior = AdjInterior::Octant {
+            net: &net,
+            axis: &axis,
+            sectors,
+            segments,
+            exponent,
+            octant,
+        };
+        assert_eq!(
+            octant_interior.position(i, j, k, target_half),
+            expected_octant,
+            "the octant read of the mid column stays on dense column N/2 too",
+        );
+
+        // The saturating-rim replant is the third consumer. Its `j` row comes from the
+        // *previous* chain's last entry, so splice one that saturates; its `k` coordinate is
+        // the same mid entry, and at `k == target_half` both remainders are then zero, so the
+        // replanted vert must be a verbatim net slot.
+        let mut saturating = axis.clone();
+        for chain in saturating.iter_mut() {
+            chain[segments] = SourcePosition {
+                index: resolution - 5,
+                remainder: 1.0,
+            };
+        }
+        let rim_row = adj_rim_source_row(&saturating, sectors, segments, resolution, i)
+            .expect("the spliced table saturates, so the rim leaves the profile polyline");
+        assert_eq!(rim_row, SourcePosition::at(4));
+
+        let mut mesh = LoopMesh::new();
+        let chain_of: Vec<Vec<VertexKey>> = (0..sectors)
+            .map(|_| {
+                (0..=segments)
+                    .map(|_| mesh.create_vertex(Vec3::ZERO))
+                    .collect()
+            })
+            .collect();
+        mesh.replant_rim_off_the_saturating_net(
+            &chain_of,
+            &net,
+            &saturating,
+            sectors,
+            segments,
+            target_half,
         );
         assert_eq!(
-            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() - 4)),
-            8.0,
+            mesh.vertex_position(chain_of[i][k]),
+            marker(4, net_half),
+            "the replanted rim sample is the verbatim slot at (row 4, dense column N/2)",
+        );
+        assert_ne!(
+            net.sample(i, rim_row, saturating[i][k]),
+            marker(4, net_half),
+            "and the fixture can see that call site's snap go missing too",
+        );
+    }
+
+    /// BEVEL.md §8.5.5.5(d), ["the tolerance's *metric*"] Consequence 1(b): the window is
+    /// **index-independent**, which is a property only the `(span index, remainder)` pair
+    /// can have. A collapsed `index as f32 + remainder` spelling quantises the remainder by
+    /// half an ulp of the *position* before the comparison runs, buying an effective
+    /// threshold that wobbles with the index — `+43%` on `[8, 16)`, `−5%` on `[16, 32)`,
+    /// `+281%` on `[64, 128)` — and additionally manufacturing exact hits.
+    ///
+    /// Each remainder below is chosen to sit on the far side of the *collapsed* threshold
+    /// from the specified one, so the assertion fails under a collapse and passes only under
+    /// the pair.
+    #[test]
+    fn source_position_snap_window_does_not_depend_on_the_span_index() {
+        // Declined by the spec at every index; the collapsed spelling's `1.43e-6` effective
+        // threshold on `[8, 16)` would take it.
+        for index in [0usize, 1, 4, 8, 15, 32, 64, 127] {
+            let position = SourcePosition {
+                index,
+                remainder: 1.2e-6,
+            };
+            assert_eq!(position.snapped(), position, "declined at index {index}");
+        }
+        // Snapped by the spec at every index; the collapsed spelling's `9.54e-7` effective
+        // threshold on `[16, 32)` would decline it.
+        for index in [0usize, 1, 4, 8, 16, 31, 64, 127] {
+            let position = SourcePosition {
+                index,
+                remainder: 9.8e-7,
+            };
+            assert_eq!(
+                position.snapped(),
+                SourcePosition::at(index),
+                "snapped at index {index}",
+            );
+        }
+        // Declined by the spec; the collapsed spelling's `3.81e-6` threshold on `[64, 128)`
+        // would take it.
+        let wide = SourcePosition {
+            index: 64,
+            remainder: 3.0e-6,
+        };
+        assert_eq!(wide.snapped(), wide);
+
+        // The manufactured exact hit, end to end through the kernel. At index `32` one ulp of
+        // the position is `3.81e-6`, so a remainder of `1.5e-6` rounds away in a collapsed
+        // sum and the read becomes a pure copy of column `32` — with no epsilon test
+        // involved. Carried as a pair it is a genuine two-column blend, which is what the
+        // reference emits.
+        let sectors = 3usize;
+        let net_half = 32usize;
+        // Column `33` is the only one carrying a marker, so the blend's weight on it is read
+        // off directly. Numbering the columns instead would hide the effect: at a magnitude
+        // of `32` a `1.5e-6` displacement is below the coordinate's own ulp, which is the
+        // guide's reason this divergence has no A/B witness.
+        let chains: Vec<Vec<Vec3>> = (0..sectors)
+            .map(|i| {
+                (0..=2 * net_half)
+                    .map(|k| Vec3::new(i as f32, f32::from(k == 33), 0.0))
+                    .collect()
+            })
+            .collect();
+        let net = AdjNet::new(sectors, net_half, chains, true);
+        let manufactured = SourcePosition {
+            index: 32,
+            remainder: 1.5e-6,
+        };
+        assert_ne!(manufactured.snapped().remainder, 0.0);
+        let blended = net.sample(0, SourcePosition::ORIGIN, manufactured.snapped());
+        let copied = net.sample(0, SourcePosition::ORIGIN, SourcePosition::at(32));
+        assert_ne!(
+            blended, copied,
+            "the declined snap must leave a weight on the next column, not a pure copy",
+        );
+        assert_eq!(copied.y, 0.0);
+        assert_eq!(blended.y, 1.5e-6);
+    }
+
+    /// BEVEL.md §8.5.5.5(d), ["the tolerance's *metric*"] Consequence 2: the **sidedness** is
+    /// part of the rule. The chain (`k`) axis snaps from above only — it has no reflection,
+    /// so nothing supplies a from-below arm — while the ring (`j`) axis is two-sided on its
+    /// pre-reflection pair, because the same one rule is applied on both sides of the
+    /// reflection.
+    ///
+    /// Widening the chain axis to a symmetric window is the single most likely way to
+    /// implement this subsection wrong while believing it has been implemented, so the
+    /// from-below arm is asserted absent rather than merely not exercised.
+    #[test]
+    fn source_position_snap_is_one_sided_on_the_chain_axis_and_two_sided_on_the_ring_axis() {
+        let resolution = 16usize;
+        let just_above = SourcePosition {
+            index: 8,
+            remainder: 5.0e-7,
+        };
+        let just_below = SourcePosition {
+            index: 7,
+            remainder: 1.0 - 5.0e-7,
+        };
+
+        // Chain axis: takes the one from above, declines the one from below — and what it
+        // leaves behind is a genuine two-column blend, weighted by the surviving remainder.
+        assert_eq!(just_above.snapped(), SourcePosition::at(8));
+        assert_eq!(just_below.snapped(), just_below);
+        assert_ne!(just_below.snapped().remainder, 0.0);
+
+        // Ring axis: both, and both land on the same reflected integer.
+        assert_eq!(
+            ring_source_position(just_above, resolution),
+            SourcePosition::at(8),
         );
         assert_eq!(
-            snapped_to_integral_source_index(f32::from_bits(8.0_f32.to_bits() + 5)),
-            f32::from_bits(8.0_f32.to_bits() + 5),
+            ring_source_position(just_below, resolution),
+            SourcePosition::at(8),
         );
-        // A genuinely fractional index is untouched wherever it sits.
-        assert_eq!(snapped_to_integral_source_index(6.5), 6.5);
+
+        // The two windows meet at the integer rather than being disjoint, and the meeting
+        // point is the reflection's own fixed point — reached on every mirror-symmetric
+        // cell, in either spelling. Both applications are the identity there.
+        assert_eq!(
+            ring_source_position(SourcePosition::at(8), resolution),
+            SourcePosition::at(8),
+        );
+        assert_eq!(
+            ring_source_position(
+                SourcePosition {
+                    index: 7,
+                    remainder: 1.0,
+                },
+                resolution,
+            ),
+            SourcePosition::at(8),
+        );
+
+        // A genuinely fractional position passes through both axes untouched, and the ring
+        // axis's reflection of it is exact index arithmetic on the pair rather than a
+        // subtraction of a position float.
+        let fractional = SourcePosition {
+            index: 6,
+            remainder: 0.5,
+        };
+        assert_eq!(fractional.snapped(), fractional);
+        assert_eq!(
+            ring_source_position(fractional, resolution),
+            SourcePosition {
+                index: 9,
+                remainder: 0.5,
+            },
+        );
+
+        // The ring axis can never carry a remainder of `1`: the pass-through arm emits
+        // `1 − remainder_prev` and both snapped arms emit `0`, and `remainder_prev == 0`
+        // takes a snapped arm by definition. The chain axis carries one routinely.
+        for remainder in [0.0f32, 1.0, 0.25, 5.0e-7, 1.0 - 5.0e-7] {
+            let reflected = ring_source_position(
+                SourcePosition {
+                    index: 3,
+                    remainder,
+                },
+                resolution,
+            );
+            assert_ne!(reflected.remainder, 1.0, "remainder {remainder}");
+        }
+
+        // The guard in the other direction: whatever the window's unit and sidedness, it
+        // must not reach a genuine skew and reinstate the forbidden dense-mid pin.
+        let (_, skewed) = skewed_cap_ring(0.9, 0.7);
+        for segments in [6_u32, 10, 12, 16, 20, 24, 34, 40] {
+            let source_resolution = boundary_source_resolution(segments);
+            let half = (segments / 2) as usize;
+            for profile in skewed.iter() {
+                let table = chord_fraction_source_positions(
+                    &profile.raw_positions(segments),
+                    &profile.raw_positions(source_resolution),
+                );
+                assert_eq!(
+                    table[half].snapped(),
+                    table[half],
+                    "segments {segments}: the snap never reaches a skewed cell's mid entry",
+                );
+                // The ring axis's composite is the bare reflection there too — asserted on
+                // the pair, because the pair form is *exact* index arithmetic where the
+                // position-space `resolution − value` it would otherwise be compared against
+                // costs an ulp.
+                assert_eq!(
+                    ring_source_position(table[half], source_resolution as usize),
+                    SourcePosition {
+                        index: source_resolution as usize - table[half].index - 1,
+                        remainder: 1.0 - table[half].remainder,
+                    },
+                );
+            }
+        }
     }
 
     /// BEVEL.md §8.5.5.5(d): pinning the read-back tables' mid entry to the dense mid — the
@@ -32808,7 +33287,7 @@ mod tests {
             let axis = adj_interior_axis(profiles, segments, resolution);
             let mut pinned = axis.clone();
             for chain in pinned.iter_mut() {
-                chain[half] = resolution as f32 / 2.0;
+                chain[half] = SourcePosition::at(resolution as usize / 2);
             }
             let read_back = AdjInterior::Relaxed {
                 net: &net,
@@ -57331,10 +57810,152 @@ fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32)
     points[last]
 }
 
+/// A position on a source axis, as the `(span index, remainder)` **pair** BEVEL.md
+/// §8.5.5.5(d) requires — never as the single float `index + remainder` denotes.
+///
+/// `remainder` is how far across span `index` the position sits, in units of one source
+/// span, so it lies in `[0, 1]` **closed at both ends**. A remainder of exactly `1` is
+/// routine rather than exceptional: any target fraction landing on a source sample produces
+/// one, and the rim's `query = 1` does it deliberately. There is deliberately no
+/// `remainder < 1` invariant here to assert.
+///
+/// **The pair is the specification, not an optimisation of one.** The
+/// [`SOURCE_POSITION_INTEGRAL_EPSILON`] tolerance is measured on `remainder`, which is a
+/// full-precision `f32` whichever span it came from. Collapsing to `index as f32 +
+/// remainder` quantises it by half an ulp of the *position*, which grows with the index, so
+/// the collapsed spelling silently acquires an **index-dependent** window — `+43%` at index
+/// `8`, `−5%` at `16`, `+91%` at `32`, `+281%` at `64` — and, worse, *manufactures* exact
+/// hits, where the sum rounds a remainder away before any tolerance is consulted and the
+/// read emits a pure copy where a bilinear blend was owed. [`SourcePosition::value`]
+/// therefore exists for value-form identities and for nothing else; it is never the input to
+/// a tolerance test or to the kernel's weights.
+///
+/// An integral position `p` has two spellings, `(p, 0)` and `(p − 1, 1)`, and both occur:
+/// [`chord_fraction_source_positions`] reaches an integer as `(p − 1, 1)` — its index never
+/// reaches the axis's last sample at all — while [`SourcePosition::reflected`] always emits
+/// `(p, 0)`. Neither [`SourcePosition::snapped`] nor [`AdjNet::sample`] can tell them apart.
+/// The corollary is the one predicate that is easy to write backwards: **an index compared
+/// against the axis length is false on every table**, so "does this table saturate" must be
+/// asked of the pair as a whole (`index == last − 1 && remainder == 1` means it does not) or
+/// of the reflected pair's being the origin, never of `index == last`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourcePosition {
+    index: usize,
+    remainder: f32,
+}
+
+impl SourcePosition {
+    const ORIGIN: Self = Self::at(0);
+
+    const fn at(index: usize) -> Self {
+        Self {
+            index,
+            remainder: 0.0,
+        }
+    }
+
+    /// The real number the pair denotes, for value-form identities only — never for the
+    /// epsilon test and never for the kernel. See the type's own docs for why.
+    fn value(self) -> f32 {
+        self.index as f32 + self.remainder
+    }
+
+    /// The one snap rule of §8.5.5.5(d): a *downward* attraction on the **remainder**.
+    ///
+    /// One unit of remainder is one source span, so the window is absolute in that unit —
+    /// it does not scale with the position's magnitude, with the source resolution, with
+    /// `segments`, with the profile exponent, or with the chain's length, and it is not a
+    /// fixed ulp count. The reference applies exactly this rule once on the chain axis and
+    /// twice on the ring axis, straddling the reflection; nothing else in the fill snaps.
+    fn snapped(self) -> Self {
+        if self.remainder < SOURCE_POSITION_INTEGRAL_EPSILON {
+            Self::at(self.index)
+        } else {
+            self
+        }
+    }
+
+    /// `x ↦ resolution − x`, done on the pair so it never subtracts a position float.
+    fn reflected(self, resolution: usize) -> Self {
+        if self.remainder == 0.0 {
+            Self::at(resolution - self.index)
+        } else {
+            Self {
+                index: resolution - self.index - 1,
+                remainder: 1.0 - self.remainder,
+            }
+        }
+    }
+}
+
+/// How far a source position may sit past a whole source sample and still be treated as
+/// landing **on** it (BEVEL.md §8.5.5.5(d), "The tolerance's *metric*").
+///
+/// The unit is the **span remainder** — the second component of a [`SourcePosition`] — one
+/// unit of which is one source span. Measured there the window has no binade structure at
+/// all: it is a full-resolution `1e-6` of a span at every index, with no collapse and no
+/// crossover. A fixed-ulp-of-*position* window is a genuinely different rule that crosses
+/// this one at source position `4` and disagrees with it in opposite directions on either
+/// side — narrower below (it cannot reach a position a hair above `0` at all, because it
+/// scales with what it measures) and wider above, by `7.6×` at the dense mid of a net with
+/// `N = 32` and `15×` at `N = 64`.
+///
+/// **What it is for.** Where the read-back is *mathematically* exact — a mirror-symmetric
+/// cell's mid entry is the standing case, `f_h = 1/2` on the target polyline and
+/// `g_{N/2} = 1/2` on the source one — the two halves of `1/2` are accumulated over
+/// different chains and divided by different totals, so the quotient can land beside the
+/// integer instead of on it, which is enough to tip the innermost seam entries into the
+/// neighbouring position bucket. Measured on the mirror-symmetric [`skewed_cap_ring`], all
+/// chains agreeing:
+///
+/// ```text
+///   segments        6        10        12        16        20        24        34        40
+///   N               8        16        16        16        32        32        64        64
+///   index           3         7         8         7        16        15        32        32
+///   remainder     1.0       1.0   8.15e-7       1.0   1.62e-6       1.0   4.85e-6   1.62e-6
+///   snaps?          —         —       YES         —        no         —        no        no
+/// ```
+///
+/// Half the counts carry **no residue at all**: the entry is exactly the dense mid in the
+/// upper-endpoint spelling `(N/2 − 1, 1)`, where the kernel already emits the pure copy a
+/// snap would produce, so no epsilon is consulted. `12` is the count the window exists for.
+/// `40` is the one that shows why it must be measured on the remainder: collapsed to a
+/// position it reads as an *exact* hit, because a `1.62e-6` remainder is under half an ulp
+/// of position `32` — a pure copy manufactured by the sum, with no tolerance involved.
+const SOURCE_POSITION_INTEGRAL_EPSILON: f32 = 1.0e-6;
+
+/// The **ring (`j`) axis's** source position: the *previous* chain's own position, snapped,
+/// reflected through `resolution`, snapped again (BEVEL.md §8.5.5.5(d),
+/// "The `1e-6` integer snap, pinned in one frame").
+///
+/// The two applications are the *same* [`SourcePosition::snapped`] the chain axis applies
+/// once, in **application** order — the inner one before the reflection, on the previous
+/// chain's own axis, the outer one after it. Because the reflection turns "just above an
+/// integer" into "just below" one, the composite is **two-sided in the position frame**: it
+/// fires exactly when `min(remainder, 1 − remainder) < 1e-6` on the *pre-reflection* pair,
+/// and moves that position to the nearer integer.
+///
+/// The two windows meet at the integer rather than being disjoint, and that meeting point is
+/// reachable: `resolution / 2` is the reflection's own fixed point, is integral on every net,
+/// and is exactly what a mirror-symmetric cell lands on. There both applications are the
+/// identity.
+///
+/// Testing symmetrically on the *post*-reflection position instead would be a different rule
+/// — the reflection inverts the two ends, so the position the inner application attracts is
+/// the **upper** endpoint of its span, not the lower one.
+fn ring_source_position(previous: SourcePosition, resolution: usize) -> SourcePosition {
+    previous.snapped().reflected(resolution).snapped()
+}
+
 /// Where each target sample of the §8.2.2.1.1 resample lands on the source polyline,
-/// as a **fractional source index** (`0 … source.len() − 1`) rather than a point. Same
+/// as a **source-axis position** (`0 … source.len() − 1`) rather than a point. Same
 /// chord-fraction rule, read out one level up: `chord_fraction_resample` is this map
 /// composed with a lerp along the source span.
+///
+/// This is the guide's `locate(q, g)`: the **least** position at which the source table's
+/// piecewise-linear interpolant reaches the query. "Least" is the word doing the work — it
+/// is what resolves a plateau onto its *first* index, which is the whole of the saturating /
+/// degenerate distinction §8.9.5.4 turns on.
 ///
 /// This is what the §8.5.5.5(d) interior read-back parametrises against ("profile-arc
 /// fractions"): the target grid's `k` axis *is* its chain, so a target column sits over
@@ -57355,76 +57976,44 @@ fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32)
 /// against an ordinary target one, which lands each interior sample at
 /// `source.len() − 1 + fraction` — inside the last source span, where the §8.5.2 seam
 /// rules take it into a neighbouring sector's slots.
-fn chord_fraction_indices(raw: &[Vec3], source: &[Vec3]) -> Vec<f32> {
+///
+/// **No snap happens here.** One table is consumed by *both* axes of the §8.5.5.5(d)
+/// kernel under **different** sidedness — the chain axis reads it forward and snaps from
+/// above only, the ring axis reads the *previous* chain's entry, snaps, reflects and snaps
+/// again — so the tolerance cannot live in the shared producer without widening one axis or
+/// narrowing the other. It lives at the two consumption sites,
+/// [`SourcePosition::snapped`] and [`ring_source_position`].
+///
+/// The returned index lies in `0 ..= last − 1`, so the axis's far end arrives as
+/// `(last − 1, 1.0)` and **never** as `(last, 0.0)`.
+fn chord_fraction_source_positions(raw: &[Vec3], source: &[Vec3]) -> Vec<SourcePosition> {
     let last = source.len() - 1;
     let target_fractions = normalised_chord_fractions(raw);
     let source_fractions = normalised_chord_fractions(source);
-    let mut indices = Vec::with_capacity(raw.len());
+    let mut positions = Vec::with_capacity(raw.len());
     for &fraction in target_fractions.iter() {
-        let mut index = last as f32;
+        let mut position = SourcePosition {
+            index: last.saturating_sub(1),
+            remainder: 1.0,
+        };
         for m in 0..last {
             if fraction <= source_fractions[m + 1] || m + 1 == last {
                 let span = source_fractions[m + 1] - source_fractions[m];
-                let t = if span <= f32::EPSILON {
+                let remainder = if span <= f32::EPSILON {
                     0.0
                 } else {
                     (fraction - source_fractions[m]) / span
                 };
-                index = m as f32 + t;
+                position = SourcePosition {
+                    index: m,
+                    remainder,
+                };
                 break;
             }
         }
-        indices.push(snapped_to_integral_source_index(index));
+        positions.push(position);
     }
-    indices
-}
-
-/// How many ulp an index may miss a whole source sample by and still be treated as landing
-/// **on** it. See [`snapped_to_integral_source_index`] for the measured separation this sits
-/// in the middle of; it is deliberately three orders of magnitude below the smallest real
-/// skew, so widening it to hide a divergence would be visible as a number, not a judgement
-/// call.
-const CHORD_INDEX_INTEGRAL_ULPS: i64 = 4;
-
-/// Snap an index that misses a whole source sample by a few ulp onto that sample
-/// (BEVEL.md §8.5.5.5(d), the "Coinciding *mathematically* is not coinciding in `f32`"
-/// hazard, which names this as the rule to adopt).
-///
-/// **Why it is needed.** Where the read-back is *mathematically* exact — a mirror-symmetric
-/// cell's mid entry is the standing case, `f_h = 1/2` on the target polyline and
-/// `g_{N/2} = 1/2` on the source one — the two halves of `1/2` are nevertheless accumulated
-/// over **different chains** (`segments` chords against `N`) and divided by different totals,
-/// so they differ in the last place and the quotient lands beside the integer instead of on
-/// it. The bilinear read is steepest at the dense net's centre, so that last place is enough
-/// to tip the innermost seam entries `(i, h − 1, h)` — the `s` neighbours of the welded
-/// centre — into the neighbouring `1e-5` position bucket while every other cap vert stays
-/// exact.
-///
-/// **Why it cannot reinstate the dense-mid pin the §8.5.5.5(d) rule forbids.** The two
-/// populations are separated by three orders of magnitude, measured on the valence-3 cap ring
-/// of `skewed_cap_ring` (index units, mid entry, all three chains agreeing):
-///
-/// ```text
-///    mirror-symmetric cell     segments  6, 10, 16 → 0 ulp         12, 20 → 1 ulp
-///    skewed cell (bulge 0.9)   segments  6 → 6.19e-3 (12972 ulp)   10 → 5.45e-3 (5713 ulp)
-///                                       12 → 2.72e-3 (2848 ulp)    20 → 2.55e-3 (1339 ulp)
-/// ```
-///
-/// A four-ulp window is ~330× narrower than the *closest* real skew in that table, so it
-/// cannot reach one. It is also keyed to the index's own value and to nothing else — never to
-/// `segments % 2`, never to the mid coordinate — so a skewed cell's mid entry is read off the
-/// chord table exactly as §8.5.5.5(d) requires.
-fn snapped_to_integral_source_index(index: f32) -> f32 {
-    let nearest = index.round();
-    if index == nearest {
-        return index;
-    }
-    let ulps = (index.to_bits() as i64 - nearest.to_bits() as i64).abs();
-    if ulps <= CHORD_INDEX_INTEGRAL_ULPS {
-        nearest
-    } else {
-        index
-    }
+    positions
 }
 
 /// The §8.2.2.1.1 chord-fraction resample: each raw target sample carries a chord
@@ -58403,15 +58992,16 @@ enum AdjInterior<'a> {
     Blend { corners: &'a [[Vec3; 4]] },
     /// The §8.5.5.5(c) subdivision-relaxation net, read back at the target resolution by
     /// the §8.5.5.5(d) kernel — bilinear within the source quad, against each axis's own
-    /// **profile-arc fractions** (`axis[i]`, the fractional source index the §8.2.2.1.1
+    /// **profile-arc fractions** (`axis[i]`, the [`SourcePosition`] the §8.2.2.1.1
     /// read-back puts chain `i`'s target sample at). The kernel is the licensed Tier-2
     /// interior freedom (§8.5.5.7), and it is licensed for these interior rows *only* —
     /// the rim is never read back through it. Parametrising against the rim's own
     /// fractions is what keeps the interior consistent with the rim it meets.
     Relaxed {
         net: &'a AdjNet,
-        /// Per ring chain, `segments + 1` fractional source indices into the dense net.
-        axis: &'a [Vec<f32>],
+        /// Per ring chain, `segments + 1` [`SourcePosition`]s into the dense net — span
+        /// index and remainder carried apart, never summed.
+        axis: &'a [Vec<SourcePosition>],
         sectors: usize,
         segments: usize,
     },
@@ -58423,7 +59013,7 @@ enum AdjInterior<'a> {
     /// needs the corner's (non-existent, for curved `r`) circumsphere.
     Octant {
         net: &'a AdjNet,
-        axis: &'a [Vec<f32>],
+        axis: &'a [Vec<SourcePosition>],
         sectors: usize,
         segments: usize,
         exponent: f32,
@@ -58471,11 +59061,14 @@ impl AdjInterior<'_> {
                 }
                 // Sub-patch `i`'s `k` axis is chain `i` read forward; its `j` axis is chain
                 // `i − 1` read *backward* from `B_i`, so its source coordinate is the
-                // complement of that chain's index at target sample `segments − j`.
-                let resolution = (2 * net.half) as f32;
+                // reflection of that chain's position at target sample `segments − j`. Only
+                // the `j` axis reflects, and the reflection is the entire difference between
+                // them — including the sidedness, since it is what supplies `j`'s second
+                // snap application and hence its from-below arm.
+                let resolution = 2 * net.half;
                 let previous = (i + sectors - 1) % sectors;
-                let along_chain = axis[i][k];
-                let along_previous = resolution - axis[previous][segments - j];
+                let along_chain = axis[i][k].snapped();
+                let along_previous = ring_source_position(axis[previous][segments - j], resolution);
                 net.sample(i, along_previous, along_chain)
             }
             AdjInterior::Octant {
@@ -58489,10 +59082,11 @@ impl AdjInterior<'_> {
                 let unit = match net.welded_centre(*segments, j, k, half) {
                     Some(centre) => centre,
                     None => {
-                        let resolution = (2 * net.half) as f32;
+                        let resolution = 2 * net.half;
                         let previous = (i + sectors - 1) % sectors;
-                        let along_chain = axis[i][k];
-                        let along_previous = resolution - axis[previous][segments - j];
+                        let along_chain = axis[i][k].snapped();
+                        let along_previous =
+                            ring_source_position(axis[previous][segments - j], resolution);
                         net.sample(i, along_previous, along_chain)
                     }
                 };
@@ -59608,33 +60202,38 @@ impl AdjNet {
     /// it). Clamping instead would be the worse answer: it lands on the seam spoke, the far
     /// end of both axes the rules point at.
     ///
-    /// The real invariant is the chart bound, `0 ≤ j, k ≤ resolution` — which the clamp
-    /// below enforces, so the corners handed to [`AdjNet::at`] are always in the chart.
+    /// The real invariant is the chart bound, `0 ≤ j, k ≤ resolution`, and it is upheld by
+    /// the **arithmetic**, with no guard standing for it. A chain position carries
+    /// `index ≤ resolution − 1` by [`chord_fraction_source_positions`]'s contract, and a ring
+    /// position reaches `index == resolution` only through [`SourcePosition::reflected`]'s
+    /// zero-remainder arm, where `hi` collapses back onto `lo`. A normalisation written for
+    /// the far edge could therefore never fire; what it *would* do is discard the remainder
+    /// of a genuinely out-of-chart position and rewrite it into a plausible-looking one,
+    /// hiding it from [`AdjNet::at`]'s own bound assertion, which already covers both
+    /// coordinates and both `hi` lines.
     ///
-    /// A coordinate that lands *on* `half` keeps the cell below it, so a read that stays in
-    /// the quadrant never reaches for a corner it does not weight.
-    fn sample(&self, i: usize, j: f32, k: f32) -> Vec3 {
-        let half = self.half;
-        let resolution = 2 * half;
-        let top = resolution as f32;
-        let j = j.clamp(0.0, top);
-        let k = k.clamp(0.0, top);
-        let cell_origin = |coordinate: f32| {
-            let floor = coordinate.floor() as usize;
-            if coordinate <= half as f32 {
-                floor.min(half - 1)
-            } else {
-                floor.min(resolution - 1)
-            }
-        };
-        let j0 = cell_origin(j);
-        let k0 = cell_origin(k);
-        let tj = j - j0 as f32;
-        let tk = k - k0 as f32;
-        self.at(i, j0, k0) * ((1.0 - tj) * (1.0 - tk))
-            + self.at(i, j0, k0 + 1) * ((1.0 - tj) * tk)
-            + self.at(i, j0 + 1, k0) * (tj * (1.0 - tk))
-            + self.at(i, j0 + 1, k0 + 1) * (tj * tk)
+    /// **Both coordinates arrive as [`SourcePosition`] pairs and are consumed as pairs**: the
+    /// pair *is* the `⌊pos⌋` / `pos − ⌊pos⌋` split the kernel needs, so there is no floor to
+    /// take and — decisively — no `index as f32 + remainder` sum to round the weights
+    /// through. Two consequences remove special cases rather than adding them. The far edge
+    /// needs no clamp: a chain position of `resolution` arrives as `(resolution − 1, 1)`, and
+    /// a ring position of `resolution` as `(resolution, 0)` whose zero remainder collapses
+    /// `hi` back onto `lo`, so neither steps past the net's last line. And a zero remainder
+    /// needs no branch: its two `hi` terms carry the exact factor `0`, so the sum collapses
+    /// to a 1-D blend along the surviving line, and to a verbatim copy when both vanish. The
+    /// mirror-image caution matters as much: a remainder of exactly `1` is **routine**, so
+    /// nothing here may assert it away — at `remainder == 1` the two `lo` terms carry the
+    /// exact factor `0` and the read is the `hi` line, which is what the `(lo + 1, 0)`
+    /// spelling would have produced.
+    fn sample(&self, i: usize, ring: SourcePosition, chain: SourcePosition) -> Vec3 {
+        let ring_hi = ring.index + usize::from(ring.remainder > 0.0);
+        let chain_hi = chain.index + usize::from(chain.remainder > 0.0);
+        let tj = ring.remainder;
+        let tk = chain.remainder;
+        self.at(i, ring.index, chain.index) * ((1.0 - tj) * (1.0 - tk))
+            + self.at(i, ring.index, chain_hi) * ((1.0 - tj) * tk)
+            + self.at(i, ring_hi, chain.index) * (tj * (1.0 - tk))
+            + self.at(i, ring_hi, chain_hi) * (tj * tk)
     }
 
     /// The even target's welded centre `(i, half, half)`: the dense net's own centre vertex,
@@ -59690,15 +60289,15 @@ fn adj_interior_axis(
     profiles: &[RingChainProfile],
     segments: u32,
     resolution: u32,
-) -> Vec<Vec<f32>> {
+) -> Vec<Vec<SourcePosition>> {
     let seg = segments as usize;
     profiles
         .iter()
         .map(|profile| {
             if resolution == segments {
-                (0..=seg).map(|k| k as f32).collect()
+                (0..=seg).map(SourcePosition::at).collect()
             } else {
-                chord_fraction_indices(
+                chord_fraction_source_positions(
                     &profile.raw_positions(segments),
                     &profile.raw_positions(resolution),
                 )
@@ -59732,15 +60331,23 @@ fn adj_interior_axis(
 /// one repeated point either way, and it is its **successor** around the ring that reads the
 /// foreign row.
 fn adj_rim_source_row(
-    axis: &[Vec<f32>],
+    axis: &[Vec<SourcePosition>],
     sectors: usize,
     segments: usize,
     resolution: usize,
     i: usize,
-) -> Option<f32> {
+) -> Option<SourcePosition> {
     let previous = (i + sectors - 1) % sectors;
-    let row = resolution as f32 - axis[previous][segments];
-    (row != 0.0).then_some(row)
+    // The rim is the `j = 0` row of the same two-axis read, so it goes through the ring
+    // axis's own composite rather than a subtraction of its own. That composite is what
+    // makes the saturation test right: at the query `1` the across-span quotient is
+    // `span / span == 1.0` exactly, so the pair is the *upper*-endpoint spelling
+    // `(p − 1, 1)` and its **index never reaches `resolution`** — comparing the index
+    // against `resolution` would answer "saturating" on every well-conditioned table. The
+    // reflection carries `(p − 1, 1)` to `(resolution − p, 0)`, and *that* being the origin
+    // is exactly `g_{resolution − 1} < 1`, the guide's collapse condition.
+    let row = ring_source_position(axis[previous][segments], resolution);
+    (row != SourcePosition::ORIGIN).then_some(row)
 }
 
 /// Relax a general valence-`s` cap's coarse control net up to the working resolution the
