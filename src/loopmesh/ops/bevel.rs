@@ -28983,6 +28983,143 @@ mod tests {
         assert_eq!(chord_fraction_resample(&degenerate, &source), degenerate);
     }
 
+    /// BEVEL.md §8.5.5.5(d)'s `locate(q, g)`, stated as the definition rather than as a span
+    /// search: the **least** position at which the table's piecewise-linear interpolant
+    /// reaches the query.
+    ///
+    /// Every block below is a **spec fence, not a regression fence**: each pins a clause of
+    /// the definition that a scan-shaped spelling *can* get wrong — the plateau's index, the
+    /// collapsed head's missing `0/0`, the far end's spelling — but a span search can also
+    /// arrive at all three by other means, so passing them does not by itself distinguish
+    /// the two spellings. The case that does is
+    /// `a_hair_thin_final_chord_keeps_its_full_remainder_and_leaves_the_rim_on_the_polyline`.
+    ///
+    /// All of it is asserted in the pair frame — a value-form assertion would pass on the
+    /// plateau case whichever index the implementation chose, since the two spellings of an
+    /// integral position denote the same number.
+    #[test]
+    fn locate_takes_the_least_position_and_needs_no_guard_at_a_collapsed_head() {
+        // A plateau resolves to its FIRST index, and arrives as the upper endpoint of the
+        // span below it.
+        let plateau = [0.0, 0.25, 0.5, 0.5, 0.5, 1.0];
+        assert_eq!(
+            SourcePosition::locate(0.5, &plateau),
+            SourcePosition {
+                index: 1,
+                remainder: 1.0,
+            },
+            "position 2, the plateau's first index — not 4, its last, and not inside it",
+        );
+        assert_eq!(SourcePosition::locate(0.5, &plateau).value(), 2.0);
+
+        // `locate(0, g) = 0` on every table, including one whose first span is collapsed and
+        // whose across-span quotient would be `0/0`. Nothing is divided before the query is
+        // known to be the origin, so the case needs no guard — and a guard written on the
+        // span width would be a tolerance in a metric this subsection does not use.
+        let collapsed_head = [0.0, 0.0, 0.0, 1.0];
+        assert_eq!(
+            SourcePosition::locate(0.0, &collapsed_head),
+            SourcePosition::ORIGIN,
+        );
+        let origin = SourcePosition::locate(0.0, &collapsed_head);
+        assert!(origin.remainder.is_finite(), "a `0/0` would have been NaN");
+
+        // The far end is the upper-endpoint spelling on every table, so the index never
+        // reaches the axis's last sample.
+        for table in [collapsed_head, [0.0, 0.25, 0.5, 1.0]] {
+            let far = SourcePosition::locate(1.0, &table);
+            assert_eq!(
+                far,
+                SourcePosition {
+                    index: 2,
+                    remainder: 1.0,
+                },
+            );
+            assert_eq!(far.value(), 3.0);
+        }
+    }
+
+    /// The **collapsing** family of §8.9.5.4: a chain that concentrates its length before its
+    /// last sample and closes with one hair-thin final chord. Its table does not saturate —
+    /// `g_{resolution − 1} < 1` — so the guide's `j*_rim` collapses to zero and the next
+    /// chain's rim stays on the profile polyline.
+    ///
+    /// A division guard on the **span** breaks exactly here, and breaks by a whole index: at
+    /// the query `1` it forces the true remainder `1` to `0`, the reflection carries that to
+    /// `resolution − p + 1` instead of `0`, and the rim of a chain that should read its own
+    /// polyline is replanted onto an interior row of the relaxed net. A `1.19e-7` window on a
+    /// normalised chord fraction is a third tolerance in a third metric; there is one snap
+    /// rule and its unit is the remainder.
+    #[test]
+    fn a_hair_thin_final_chord_keeps_its_full_remainder_and_leaves_the_rim_on_the_polyline() {
+        let resolution = 4usize;
+        let segments = 3usize;
+        // The final span is one f32 quantum of `1.0` wide — strictly positive, and inside
+        // any absolute window an `f32::EPSILON` test would draw.
+        let hair = 1.0f32 - f32::EPSILON;
+        assert!(1.0 - hair > 0.0 && 1.0 - hair <= f32::EPSILON);
+        let collapsing = [0.0, 0.4, 0.8, hair, 1.0];
+
+        let far = SourcePosition::locate(1.0, &collapsing);
+        assert_eq!(
+            far,
+            SourcePosition {
+                index: 3,
+                remainder: 1.0,
+            },
+            "span / span is exactly 1.0 however thin the span is",
+        );
+        assert_eq!(
+            far.value(),
+            resolution as f32,
+            "the table does not saturate",
+        );
+
+        assert_eq!(
+            ring_source_position(far, resolution),
+            SourcePosition::ORIGIN,
+            "reflected through the resolution, a non-saturating table lands on row 0",
+        );
+        assert_eq!(
+            ring_source_position(
+                SourcePosition {
+                    index: 3,
+                    remainder: 0.0,
+                },
+                resolution,
+            ),
+            SourcePosition::at(1),
+            "the whole-index move a span-width guard would have produced instead",
+        );
+
+        let mut axis = vec![vec![SourcePosition::ORIGIN; segments + 1]; 2];
+        axis[0][segments] = far;
+        assert_eq!(
+            adj_rim_source_row(&axis, 2, segments, resolution, 1),
+            None,
+            "so the successor's rim is the 1-D read-back along the profile polyline",
+        );
+
+        // And the point read at that query is the polyline's far end, not the sample below
+        // it — the same defect, one level up, where it moves a rim vertex.
+        let points = [
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::X * 2.0,
+            Vec3::X * 3.0,
+            Vec3::X * 4.0,
+        ];
+        assert_eq!(
+            polyline_at_chord_fraction(&points, &collapsing, 1.0),
+            Vec3::X * 4.0,
+        );
+        assert_eq!(
+            polyline_at_chord_fraction(&points, &[0.0, 0.0, 0.5, 0.75, 1.0], 0.0),
+            Vec3::ZERO,
+            "and the collapsed head reads the first point rather than dividing by zero",
+        );
+    }
+
     /// BEVEL.md §8.5.5.5(d)'s two-axis read: sub-patch `i` consumes chain `i`'s table
     /// **forward** on the `k` axis and chain `i − 1`'s table **reversed** on the `j` axis.
     /// The reversal is an *index* mirror, so `[0, …, 0, 1]` presents as `[1, 0, …, 0]` — the
@@ -57792,22 +57929,31 @@ fn normalised_chord_fractions(points: &[Vec3]) -> Vec<f32> {
     fractions
 }
 
-/// Read a polyline at a normalised chord fraction: find the span holding `fraction`
-/// and interpolate linearly within it.
+/// Read a polyline at a normalised chord fraction: [`SourcePosition::locate`] gives the
+/// span and how far across it the fraction sits, and the point is the linear blend of that
+/// span's two ends.
+///
+/// `points` must hold at least two samples, and `fractions` must be that same polyline's
+/// [`normalised_chord_fractions`] table, so the located span index always addresses a real
+/// pair of ends. Every caller materialises its source at `segments + 1` samples with
+/// `segments >= 4`, so the floor states intent rather than naming a case to handle.
+///
+/// The span and remainder are derived by the same definition-first route the interior
+/// read-back uses, not by a span search of this function's own, so **the located pair**
+/// agrees between the two — the emitted rim and the interior positions that meet it are the
+/// same query answered at two levels. What each does with the pair afterwards differs: no
+/// snap happens here, whereas the interior read-back applies [`SourcePosition::snapped`]
+/// first (and [`ring_source_position`] applies it twice).
 fn polyline_at_chord_fraction(points: &[Vec3], fractions: &[f32], fraction: f32) -> Vec3 {
-    let last = points.len() - 1;
-    for j in 0..last {
-        if fraction <= fractions[j + 1] || j + 1 == last {
-            let span = fractions[j + 1] - fractions[j];
-            let t = if span <= f32::EPSILON {
-                0.0
-            } else {
-                (fraction - fractions[j]) / span
-            };
-            return points[j] + (points[j + 1] - points[j]) * t;
-        }
-    }
-    points[last]
+    debug_assert_eq!(
+        points.len(),
+        fractions.len(),
+        "a chord-fraction table must carry one entry per polyline sample",
+    );
+    let position = SourcePosition::locate(fraction, fractions);
+    let start = points[position.index];
+    let end = points[position.index + 1];
+    start + (end - start) * position.remainder
 }
 
 /// A position on a source axis, as the `(span index, remainder)` **pair** BEVEL.md
@@ -57858,6 +58004,56 @@ impl SourcePosition {
     /// epsilon test and never for the kernel. See the type's own docs for why.
     fn value(self) -> f32 {
         self.index as f32 + self.remainder
+    }
+
+    /// BEVEL.md §8.5.5.5(d)'s `locate(q, g)`: the **least** position at which `cumulative`'s
+    /// piecewise-linear interpolant reaches `query`.
+    ///
+    /// `cumulative` is non-decreasing, starts at `0` and ends at `1`; `query` lies in
+    /// `[0, 1]`. "Least" is the word doing the work — it resolves a plateau onto the
+    /// plateau's *first* index, which is the whole of the saturating / degenerate
+    /// distinction §8.9.5.4 turns on. "Find the span containing the query" is not a
+    /// definition: on a table with ties it names several spans and picks none.
+    ///
+    /// Stating it as the definition rather than as a scan retires two guards a span search
+    /// needs and this does not:
+    ///
+    /// * **No `0/0`.** `locate(0, g)` is the origin on *every* table, including one whose
+    ///   head is collapsed (`g_1 = 0`), because nothing has been divided at that point.
+    ///   That is the one case that made a division guard look load-bearing.
+    /// * **No division guard.** The partition point itself gives
+    ///   `cumulative[span_start] < query <= cumulative[reached]`, so it is the *selected
+    ///   span* — not merely some entry below the reached index — that has strictly positive
+    ///   width, and it has it on **every** table rather than only on well-conditioned ones.
+    ///   The difference of two distinct `f32`s is correctly rounded, so it cannot underflow
+    ///   to zero either. A guard here would
+    ///   have to name a window on the *span* — a third tolerance in a third metric, in the
+    ///   subsection whose thesis is that there is exactly one snap rule, on the remainder —
+    ///   and it would not be value-neutral: at `query = 1` on a chain that concentrates its
+    ///   length early and closes with one hair-thin final chord, forcing a true remainder of
+    ///   `1` to `0` is a **whole-index** move, which [`Self::reflected`] carries into the
+    ///   ring axis and which decides whether a rim row is read back at all.
+    ///
+    /// The returned index lies in `0 ..= cumulative.len() − 2`, so the axis's far end
+    /// arrives as `(last − 1, 1)` and never as `(last, 0)`.
+    fn locate(query: f32, cumulative: &[f32]) -> Self {
+        let reached = cumulative.partition_point(|&fraction| fraction < query);
+        // The table ends at `1` and no query exceeds it, so some entry always reaches the
+        // query. Assert rather than clamp: arriving here means a caller broke
+        // normalisation, and a clamp would hide that behind a plausible-looking position.
+        debug_assert!(
+            reached < cumulative.len(),
+            "a normalised chord table must reach every query asked of it",
+        );
+        if reached == 0 {
+            return Self::ORIGIN;
+        }
+        let span_start = reached - 1;
+        Self {
+            index: span_start,
+            remainder: (query - cumulative[span_start])
+                / (cumulative[reached] - cumulative[span_start]),
+        }
     }
 
     /// The one snap rule of §8.5.5.5(d): a *downward* attraction on the **remainder**.
@@ -57952,10 +58148,10 @@ fn ring_source_position(previous: SourcePosition, resolution: usize) -> SourcePo
 /// chord-fraction rule, read out one level up: `chord_fraction_resample` is this map
 /// composed with a lerp along the source span.
 ///
-/// This is the guide's `locate(q, g)`: the **least** position at which the source table's
-/// piecewise-linear interpolant reaches the query. "Least" is the word doing the work — it
-/// is what resolves a plateau onto its *first* index, which is the whole of the saturating /
-/// degenerate distinction §8.9.5.4 turns on.
+/// Each entry is [`SourcePosition::locate`] — the guide's `locate(q, g)` — asked of the
+/// source table at that target sample's own chord fraction. The definition, its plateau
+/// rule and the two guards it retires all live there; this function only supplies the pair
+/// of tables and the query order.
 ///
 /// This is what the §8.5.5.5(d) interior read-back parametrises against ("profile-arc
 /// fractions"): the target grid's `k` axis *is* its chain, so a target column sits over
@@ -57987,33 +58183,12 @@ fn ring_source_position(previous: SourcePosition, resolution: usize) -> SourcePo
 /// The returned index lies in `0 ..= last − 1`, so the axis's far end arrives as
 /// `(last − 1, 1.0)` and **never** as `(last, 0.0)`.
 fn chord_fraction_source_positions(raw: &[Vec3], source: &[Vec3]) -> Vec<SourcePosition> {
-    let last = source.len() - 1;
     let target_fractions = normalised_chord_fractions(raw);
     let source_fractions = normalised_chord_fractions(source);
-    let mut positions = Vec::with_capacity(raw.len());
-    for &fraction in target_fractions.iter() {
-        let mut position = SourcePosition {
-            index: last.saturating_sub(1),
-            remainder: 1.0,
-        };
-        for m in 0..last {
-            if fraction <= source_fractions[m + 1] || m + 1 == last {
-                let span = source_fractions[m + 1] - source_fractions[m];
-                let remainder = if span <= f32::EPSILON {
-                    0.0
-                } else {
-                    (fraction - source_fractions[m]) / span
-                };
-                position = SourcePosition {
-                    index: m,
-                    remainder,
-                };
-                break;
-            }
-        }
-        positions.push(position);
-    }
-    positions
+    target_fractions
+        .iter()
+        .map(|&fraction| SourcePosition::locate(fraction, &source_fractions))
+        .collect()
 }
 
 /// The §8.2.2.1.1 chord-fraction resample: each raw target sample carries a chord
